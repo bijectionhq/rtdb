@@ -571,6 +571,7 @@ contract SearchCorrectness {
         -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
         -- A partially admitted segment keeps its coverage frontier.
         -- Commit deltas and live postings read a selected text child once per Arrow batch and retain the existing input and page admission limits.
+        -- Each live posting page writes row ordinals and frequencies to their final columns and derives score bounds within each term's page-local span.
         -- If a query cannot cover the frontier within the accelerated tail budget, ordinary SQL evaluation supplies the answer.
 
     @invariant SearchFilesFromTheSnapshot
