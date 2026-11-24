@@ -96,6 +96,11 @@ impl BlockCatalog {
         bytes
     }
     pub fn publication_sha256(&self) -> Option<[u8; 32]> { self.publication_sha256 }
+    pub fn matches_checkpoint_root(&self, expected: [u8; 32], requires_manifest: bool) -> bool {
+        crate::certified_checkpoint::matches_catalog(
+            expected, self.publication_sha256, requires_manifest, self.wire.table_block_manifest.is_some(),
+        )
+    }
     pub fn as_proto(&self) -> &pb::Block { &self.wire }
     pub fn block_index(&self) -> BlockIndex { BlockIndex(self.wire.block_index.unwrap_or_default()) }
     pub fn boundary_term(&self) -> Term { Term(self.wire.term_id.unwrap_or_default()) }
@@ -107,7 +112,9 @@ impl BlockCatalog {
         self.wire.table_block_manifest.as_ref()?.sha256_by_oid.get(&oid).map(Vec::as_slice)
     }
     pub fn matches_table_block(&self, oid: u32, digest: &[u8; 32]) -> bool {
-        self.wire.table_block_manifest.is_none() || self.table_block_digest(oid) == Some(digest.as_slice())
+        self.wire.table_block_manifest.is_none() || crate::certified_checkpoint::matches_table(
+            self.table_block_digest(oid).and_then(|expected| expected.try_into().ok()), *digest,
+        )
     }
 
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> {
