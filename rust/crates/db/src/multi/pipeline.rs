@@ -56,7 +56,7 @@ struct Work {
 impl Work {
     fn key(&self) -> TxKey {
         TxKey {
-            namespace: self.scope.as_ref().map(|scope| scope.namespace),
+            namespace: self.request.receipt_namespace(self.scope.as_ref().map(|scope| scope.namespace)),
             key: self.request.key.clone(),
         }
     }

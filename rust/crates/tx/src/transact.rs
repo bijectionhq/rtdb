@@ -4,7 +4,10 @@ use bytes::Bytes;
 use rtdb_index::branches::{
     BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage, VisibleHistory,
 };
-pub use rtdb_index::branches::{CountRange, CustodyGroupId, CustodyPayload, IndexDefinition, Visibility};
+pub use rtdb_index::branches::{
+    CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation,
+    CustodyPlacementId, CustodyTarget, IndexDefinition, Visibility,
+};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
@@ -82,10 +85,19 @@ impl Transact {
         })
     }
 
+    fn is_response_release(&self) -> bool {
+        matches!(self.ops.as_slice(), [Op::CustodyRelease(_)])
+            && self.otherwise.is_empty() && self.guards.is_empty() && self.requires.is_empty()
+            && self.window == Window::default()
+    }
+
+    pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
+        scope.or_else(|| self.is_response_release().then_some(*b"rtdb/v1/custody-release-receipt\0"))
+    }
+
     fn has_unsealed_custody(&self) -> bool {
         self.ops.iter().chain(&self.otherwise).any(|op| {
-            let Op::Put { rows, .. } = op else { return false; };
-            rows.iter().any(|row| {
+            op.put_rows().iter().any(|row| {
                 !row.protected_columns.is_empty() && (row.custody_payload.is_none()
                     || row.protected_columns.iter().any(|column| row.cells.get(column).is_some()))
             })
@@ -212,12 +224,40 @@ pub enum Op {
     DropBranch { branch: Branch },
     CreateCustodyGroup { group: CustodyGroupId },
     RevokeCustodyGroup { group: CustodyGroupId, inventory_sha256: [u8; 32] },
+    ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
+    PlaceCustodyRow { branch: Branch, table: TableRef, row: Row, placement: CustodyPlacement },
+    CustodyRelease(CustodyRelease),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CustodyPlacement {
+    pub placement_id: CustodyPlacementId,
+    pub reservation: Option<[u8; 32]>,
+    pub carrier_column: String,
+    pub link_column: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commitments: Option<CustodyPlacementCommitments>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct CustodyPlacementCommitments {
+    pub carrier_sha256: [u8; 32],
+    pub link_sha256: Option<[u8; 32]>,
 }
 
 impl Op {
+    fn put_rows(&self) -> &[Row] {
+        match self {
+            Self::Put { rows, .. } => rows,
+            Self::PlaceCustodyRow { row, .. } => std::slice::from_ref(row),
+            _ => &[],
+        }
+    }
+
     fn uses_custody(&self) -> bool {
         match self {
-            Self::CreateCustodyGroup { .. } | Self::RevokeCustodyGroup { .. } => true,
+            Self::CreateCustodyGroup { .. } | Self::RevokeCustodyGroup { .. }
+            | Self::ReserveCustodyPlacement { .. } | Self::PlaceCustodyRow { .. } | Self::CustodyRelease(_) => true,
             Self::Put { rows, .. } => rows.iter().any(|row| row.custody_group.is_some() || !row.protected_columns.is_empty()),
             _ => false,
         }
@@ -517,17 +557,30 @@ impl TransactState {
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         validate_key(&request.key)?;
-        request.require_sealed_custody(features)?;
-        let receipt_namespace = authority.map(|authority| authority.receipt_namespace);
-        let canonical_request = request.canonical_request()?;
-        let fingerprint = request.custody_request_digest.unwrap_or_else(|| {
-            Sha256::digest(canonical_request.get().as_bytes()).into()
-        });
+        let receipt_namespace = request.receipt_namespace(authority.map(|authority| authority.receipt_namespace));
+        let (fingerprint, canonical_request) = match request.custody_request_digest {
+            Some(digest) => (digest, None),
+            None => {
+                let request = request.canonical_request()?;
+                (Sha256::digest(request.get().as_bytes()).into(), Some(request))
+            }
+        };
         if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
             if stored.fingerprint != fingerprint {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction"));
             }
             return Ok((Resolution::Answer(replay(&stored.receipt)), None));
+        }
+        if request.has_unsealed_custody() {
+            return Err(if !features.contains(&ROW_CUSTODY) {
+                feature_required(ROW_CUSTODY)
+            } else if request.ops.iter().chain(&request.otherwise).flat_map(Op::put_rows)
+                .any(|row| row.custody_group.is_some_and(|group| view.index.custody_revocation(group).is_some()))
+            {
+                operations::erased_custody_group()
+            } else {
+                Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed before admission")
+            });
         }
 
         if view.pending { return Err(pending_error()); }
@@ -578,6 +631,7 @@ impl TransactState {
             Ok((Resolution::Answer(receipt), None))
         } else {
             // For a timed write, `after` is the index once it settles at `position + 1`.
+            let canonical_request = canonical_request.map_or_else(|| request.canonical_request(), Ok)?;
             let record = TransactionRecord::Tx(ResolvedTransact {
                 fingerprint, receipt, effects, before, receipt_namespace, admitted_at: now,
                 request: Some(canonical_request),
@@ -596,7 +650,8 @@ impl TransactState {
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
             return Err(feature_required(TRANSACT_REQUIRES));
         }
-        if !features.contains(&ROW_CUSTODY) && request.uses_custody() {
+        // The response adapter supplies this internal operation after authenticating the original registry.
+        if !request.is_response_release() && !features.contains(&ROW_CUSTODY) && request.uses_custody() {
             return Err(feature_required(ROW_CUSTODY));
         }
         let Window { not_before, before } = request.window;

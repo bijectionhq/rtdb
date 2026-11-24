@@ -153,7 +153,7 @@ impl TransactPipeline {
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<Decision> {
-        let identity = TxKey { namespace: authority.map(|authority| authority.receipt_namespace), key: request.key.clone() };
+        let identity = TxKey { namespace: request.receipt_namespace(authority.map(|authority| authority.receipt_namespace)), key: request.key.clone() };
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
         if request.ops.is_empty() && request.otherwise.is_empty() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.

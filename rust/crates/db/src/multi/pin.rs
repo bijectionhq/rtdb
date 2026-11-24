@@ -75,9 +75,6 @@ impl MultiDatabase {
         }
         let transactions = self.durable_transactions();
         let cut = transactions.index().exact(basis)?;
-        if transactions.index().has_custody_groups() {
-            return Err(Anomaly::unsupported("rtdb/export-custody", "A protected export needs an admitted destination custody binding"));
-        }
         let checkpoint = transactions.encode_checkpoint_at(basis)?;
         let mut payload = Vec::with_capacity(EXACT_EXPORT.len() + 16 + checkpoint.len());
         payload.extend_from_slice(EXACT_EXPORT);

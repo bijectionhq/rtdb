@@ -177,6 +177,35 @@ message RevokeCustodyGroup {
   // invalidates the plan and refuses the whole transaction.
   bytes inventory_sha256 = 2;
 }
+message CustodyPlacementTarget {
+  string branch = 1;
+  string table = 2;
+  Cell id = 3;
+  // An explicit literal interval.
+  Interval valid = 4;
+}
+message ReserveCustodyPlacement {
+  bytes group = 1;
+  bytes original_occurrence_sha256 = 2;
+  bytes source_occurrence_sha256 = 3;
+  bytes destination = 4;
+  bytes link = 5;
+  CustodyPlacementTarget target = 6;
+  bytes review_sha256 = 7;
+  bytes carrier_sha256 = 8;
+  bytes link_sha256 = 9;
+}
+message PlaceCustodyRow {
+  string branch = 1;
+  string table = 2;
+  Row row = 3;
+  bytes placement_id = 4;
+  // Absent for the original occurrence.
+  optional bytes reservation_sha256 = 5;
+  string carrier_column = 6;
+  // Required for a reserved placement. Both named columns are protected binary cells.
+  optional string link_column = 7;
+}
 message Op {
   oneof op {
     Put put = 1;
@@ -189,6 +218,8 @@ message Op {
     DropBranch drop_branch = 8;
     CreateCustodyGroup create_custody_group = 9;
     RevokeCustodyGroup revoke_custody_group = 10;
+    ReserveCustodyPlacement reserve_custody_placement = 11;
+    PlaceCustodyRow place_custody_row = 12;
   }
 }
 message Otherwise { repeated uint32 failed = 1; }

@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
+use rtdb_index::branches::BranchIndex;
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
 use rtdb_tx::transact::{CustodyGroupId, ROW_CUSTODY, Receipt, Transact};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
@@ -84,6 +85,10 @@ impl ServingDriver for DefaultServing {
         let view = self.handle.view(At::Linearizable, cancellation).await?;
         let vault = self.tokens.authority().await?.custody_vault();
         super::custody::check_delivery(&view.index, &vault, groups).await
+    }
+
+    async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
+        Ok(self.handle.view(At::Linearizable, cancellation).await?.index)
     }
 
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {

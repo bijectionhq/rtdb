@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use super::*;
+use super::{*, custody_placement::ReservedPlacement};
 
 pub type CustodyGroupId = [u8; 16];
 
@@ -33,8 +33,16 @@ pub(super) struct CustodyMember {
 pub(super) struct CustodyGroup {
     #[serde(default)]
     created: Option<Basis>,
-    revoked: Option<Basis>,
+    pub(super) revoked: Option<Basis>,
     members: imbl::OrdSet<CustodyMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) original: Option<CustodyOccurrence>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    pub(super) reservations: Map<CustodyPlacementId, ReservedPlacement>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    pub(super) releases: Map<[u8; 32], CustodyRelease>,
+    #[serde(default)]
+    pub(super) live_releases: usize,
 }
 
 /// The classification and lifetime needed to reconstruct visible cut numbers.
@@ -45,15 +53,9 @@ pub(super) struct RetiredLabel {
 }
 
 impl CustodyGroup {
-    pub(super) fn checkpoint_at(&self, at: Basis) -> Option<Self> {
-        if self.created.is_some_and(|created| created > at) {
-            return None;
-        }
-        Some(Self {
-            created: self.created,
-            revoked: self.revoked,
-            members: self.members.iter().filter(|member| member.written <= at).cloned().collect(),
-        })
+    pub(super) fn has_occurrence(&self, group: CustodyGroupId, commitment: [u8; 32]) -> bool {
+        self.original.iter().chain(self.reservations.values().filter_map(|entry| entry.occurrence.as_ref()))
+            .any(|occurrence| occurrence.commitment(group) == commitment)
     }
 
     fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
@@ -76,6 +78,22 @@ impl CustodyGroup {
             hash.update(member.ordinal.to_be_bytes());
             placements += 1;
         }
+        if let Some(original) = self.original.as_ref().filter(|original| original.written <= at) {
+            hash.update(b"original\0");
+            hash.update(original.commitment(group));
+        }
+        for pending in self.reservations.values().filter(|pending| pending.at <= at) {
+            hash.update(b"reservation\0");
+            hash.update(pending.at.to_bytes());
+            hash.update(pending.reservation.commitment(at.incarnation(), group));
+            if let Some(occurrence) = pending.occurrence.as_ref().filter(|occurrence| occurrence.written <= at) {
+                hash.update([1]);
+                hash.update(occurrence.commitment(group));
+            } else {
+                hash.update([0]);
+                placements += 1;
+            }
+        }
         Some(CustodyInventory {
             group, placements, sha256: hash.finalize().into(),
             revoked_at: self.revoked.filter(|revocation| *revocation <= at),
@@ -89,6 +107,29 @@ impl BranchIndex {
     pub fn custody_group_live(&self, group: CustodyGroupId) -> Result<bool> {
         self.custody.get(&group).map(|group| group.revoked.is_none()).ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb/custody-group-unknown", "Unknown custody group")
+        })
+    }
+
+    pub(super) fn live_custody(&self, group: CustodyGroupId) -> Result<&CustodyGroup> {
+        if !self.custody_group_live(group)? {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The custody group has been revoked"));
+        }
+        Ok(&self.custody[&group])
+    }
+
+    pub(super) fn custody_placements(&self, at: Basis) -> impl Iterator<Item = CustodyPlacementEntry<'_>> + '_ {
+        self.custody.iter().flat_map(move |(&group, record)| {
+            let original = record.original.iter().filter(move |original| original.written <= at)
+                .map(move |original| CustodyPlacementEntry {
+                    group, placement_id: original.placement_id, enrolled: original.written, reservation: None, occurrence: Some(original),
+                });
+            let reserved = record.reservations.iter().filter(move |(_, entry)| entry.at <= at)
+                .map(move |(&placement_id, entry)| CustodyPlacementEntry {
+                    group, placement_id, enrolled: entry.at,
+                    reservation: Some(entry.reservation.commitment(at.incarnation(), group)),
+                    occurrence: entry.occurrence.as_ref().filter(|occurrence| occurrence.written <= at),
+                });
+            original.chain(reserved)
         })
     }
 

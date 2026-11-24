@@ -2272,7 +2272,10 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
             allocation_limit_bytes: 1 << 30,
             control,
             advertise_host: Some("127.0.0.1".into()),
-            hosted_task: None,
+            hosted_task: Some(rtdb_directory::HostedTask::new(
+                "arn:aws:ecs:us-east-1:123456789012:cluster/runtime-test",
+                "arn:aws:ecs:us-east-1:123456789012:task/runtime-test/0123456789abcdef0123456789abcdef",
+            ).unwrap()),
             availability_zone: "test-az".into(),
             engine_version: None,
             agent,
@@ -2375,6 +2378,21 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
             _ => None,
         }).collect();
         assert_eq!(values, vec![total]);
+    }
+
+    {
+        let client = common::connect(&address, "bravo").await;
+        client.simple_query("CREATE INDEX orders_total ON orders (total, _id)").await.unwrap();
+        let holder = replacement.0.as_ref().unwrap().server.node();
+        let database = holder.catalog().database("bravo").unwrap();
+        database.flush().await.unwrap();
+        holder.sync_all(DEADLINE, &CancellationToken::new()).await.unwrap();
+        database.build_artefacts().await.unwrap();
+        let prefix = rtdb_storage::ObjectKey::new(rtdb_format::keys::ORDERED_INDEX_ROOT).unwrap();
+        let store = database.object_store();
+        let manifest = store.list(Some(&prefix)).await.unwrap().into_iter()
+            .find(|object| object.key.as_str().contains("/manifests/")).unwrap();
+        assert!(store.get_fresh(&manifest.key).await.unwrap().starts_with(&[0xff; 4]));
     }
 
     replacement.0.take().unwrap().shutdown().await.unwrap();

@@ -37,7 +37,9 @@ entity Checkpoint {
 -- Every reader opens both JSON and Arrow IPC branch pages, revision directories, and checkpoint manifests within the current layout.
 -- Arrow reference publication starts after each reader in the installation can open both formats.
 -- A process-private in-memory store can publish Arrow references by default.
--- A durable or shared store requires the writer's compatibility setting to publish Arrow references.
+-- A hosted runtime-installed journal defaults to Arrow publication under its dual-format reader contract.
+-- Other durable or shared stores require the writer's explicit setting to publish Arrow references.
+-- An explicit JSON selection takes precedence over the publication default.
 -- A legacy checkpoint checksum binds the canonical JSON layout published by the writer.
 -- A newly published page can keep a reference to a page originally written in JSON.
 -- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.

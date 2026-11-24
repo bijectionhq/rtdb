@@ -12,57 +12,34 @@ impl Candidate<'_> {
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
                     for row in rows {
-                        if let Some(group) = row.custody_group {
-                            self.require_unrestricted()?;
-                            if !self.index.custody_group_live(group)? {
-                                return Err(erased_custody_group());
-                            }
-                        }
-                        if row.protected_columns.is_empty() != row.custody_payload.is_none()
-                            || row.custody_payload.is_some() && row.custody_group.is_none()
-                            || row.protected_columns.iter().any(|column| {
-                                row.cells.contains_key(column)
-                                    || definition.visibility.as_ref().is_some_and(|visibility| &visibility.column == column)
-                            })
-                        {
-                            return Err(Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed and distinct from clear columns and the visibility label"));
-                        }
-                        for column in &row.protected_columns {
-                            validate_column(column)?;
-                        }
-                        if let Some(visibility) = &definition.visibility
-                            && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
-                        {
-                            return Err(invalid_label());
-                        }
-                        if definition.visibility.is_some() && (!row.valid.is_some_and(ValidTime::is_literal)
-                            || row.cells.values().any(|cell| !matches!(cell, Cell::Value(_))))
-                        {
-                            return Err(labelled_time_error());
-                        }
-                        let valid = effective_valid(row.valid, cut.system_time)?;
-                        let resolve = |(name, value): (&String, &Cell)| (name.clone(), value.resolve(cut));
-                        let mut cells = if row.cells.keys().is_sorted() {
-                            row.cells.iter().map(resolve).collect::<StructFields<_>>()
-                        } else {
-                            row.cells.sorted().into_iter().map(resolve).collect()
-                        };
-                        if cells.contains_key("_id") {
-                            return Err(Anomaly::incorrect("rtdb/reserved-field", "The put supplies its ID separately"));
-                        }
-                        validate_cells(&definition, &cells)?;
-                        cells.insert("_id".into(), row.id.as_value());
-                        let expires_at = definition.ttl_micros.map(|ttl| expiry(cut.system_time, ttl)).transpose()?;
-                        self.authorize_write(branch, table, &row.id, valid, &definition, Some(&cells))?;
+                        let (valid, image) = self.put_image(branch, table, &definition, row)?;
                         if *if_absent && self.present(branch, table, &row.id, valid)? {
                             return Err(conflict("rtdb/already-present", "The put overlaps an existing row"));
                         }
-                        let image = RowImage {
-                            cells, expires_at, custody_group: row.custody_group,
-                            custody_payload: row.custody_payload.clone(),
-                        };
-                        self.write(branch, table, row.id.clone(), valid, Some(Arc::new(image)))?;
+                        self.write(branch, table, row.id.clone(), valid, Some(image))?;
                     }
+                }
+                Op::PlaceCustodyRow { branch, table, row, placement } => {
+                    self.require_unrestricted()?;
+                    self.index.writable(branch)?;
+                    let definition = self.write_definition(table)?;
+                    let (valid, image) = self.put_image(branch, table, &definition, row)?;
+                    let (Some(group), Some(payload), Some(commitments)) = (image.custody_group, &image.custody_payload, placement.commitments) else {
+                        return Err(Anomaly::incorrect("rtdb/custody-placement", "Custody placement requires a sealed carrier and its commitments"));
+                    };
+                    let occurrence = CustodyOccurrence {
+                        placement_id: placement.placement_id,
+                        target: CustodyTarget { branch: branch.clone(), table: table.clone(), id: row.id.clone(), valid },
+                        written: cut.basis,
+                        ordinal: self.index.next_custody_ordinal(),
+                        carrier_sha256: commitments.carrier_sha256,
+                        envelope_sha256: Sha256::digest(&payload.envelope).into(),
+                        reservation: placement.reservation,
+                        link_sha256: commitments.link_sha256,
+                    };
+                    self.index.check_custody_occurrence(group, &occurrence)?;
+                    self.write(branch, table, row.id.clone(), valid, Some(image))?;
+                    self.push(BranchEffect::ActivateCustodyOccurrence { group, occurrence })?;
                 }
                 Op::Delete { branch, table, ids, valid } => {
                     self.require_write_branch(branch)?;
@@ -144,17 +121,77 @@ impl Candidate<'_> {
                 }
                 Op::RevokeCustodyGroup { group, inventory_sha256 } => {
                     self.require_unrestricted()?;
-                    if self.index.custody_group_live(*group)? {
-                        let inventory = self.index.custody_inventory(*group).expect("live group has an inventory");
-                        if inventory.sha256 != *inventory_sha256 {
-                            return Err(conflict("rtdb/custody-inventory-changed", "The custody inventory changed after erasure was planned"));
-                        }
-                        self.push(BranchEffect::RevokeCustodyGroup { group: *group })?;
+                    let live = self.index.custody_group_live(*group)?;
+                    let inventory = self.index.custody_inventory(*group).expect("known group has an inventory");
+                    if inventory.sha256 != *inventory_sha256 {
+                        return Err(conflict("rtdb/custody-inventory-changed", "The custody inventory changed after erasure was planned"));
+                    }
+                    if live { self.push(BranchEffect::RevokeCustodyGroup { group: *group })?; }
+                }
+                Op::ReserveCustodyPlacement { group, reservation } => {
+                    self.require_unrestricted()?;
+                    if self.index.check_custody_reservation(*group, reservation)? {
+                        self.index.writable(&reservation.target.branch)?;
+                        self.write_definition(&reservation.target.table)?;
+                        self.push(BranchEffect::ReserveCustodyPlacement { group: *group, reservation: reservation.clone() })?;
+                    }
+                }
+                Op::CustodyRelease(release) => {
+                    self.require_unrestricted()?;
+                    if self.index.check_custody_release(*release, cut.system_time)? {
+                        self.push(BranchEffect::CustodyRelease(*release))?;
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    fn put_image(&mut self, branch: &str, table: &TableRef, definition: &BranchTable, row: &Row) -> Result<(Interval, Arc<RowImage>)> {
+        let cut = self.index.head();
+        if let Some(group) = row.custody_group {
+            self.require_unrestricted()?;
+            if !self.index.custody_group_live(group)? {
+                return Err(erased_custody_group());
+            }
+        }
+        if row.protected_columns.is_empty() != row.custody_payload.is_none()
+            || row.custody_payload.is_some() && row.custody_group.is_none()
+            || row.protected_columns.iter().any(|column| {
+                row.cells.contains_key(column)
+                    || definition.visibility.as_ref().is_some_and(|visibility| &visibility.column == column)
+            })
+        {
+            return Err(Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed and distinct from clear columns and the visibility label"));
+        }
+        for column in &row.protected_columns { validate_column(column)?; }
+        if let Some(visibility) = &definition.visibility
+            && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
+        {
+            return Err(invalid_label());
+        }
+        if definition.visibility.is_some() && (!row.valid.is_some_and(ValidTime::is_literal)
+            || row.cells.values().any(|cell| !matches!(cell, Cell::Value(_))))
+        {
+            return Err(labelled_time_error());
+        }
+        let valid = effective_valid(row.valid, cut.system_time)?;
+        let resolve = |(name, value): (&String, &Cell)| (name.clone(), value.resolve(cut));
+        let mut cells = if row.cells.keys().is_sorted() {
+            row.cells.iter().map(resolve).collect::<StructFields<_>>()
+        } else {
+            row.cells.sorted().into_iter().map(resolve).collect()
+        };
+        if cells.contains_key("_id") {
+            return Err(Anomaly::incorrect("rtdb/reserved-field", "The put supplies its ID separately"));
+        }
+        validate_cells(definition, &cells)?;
+        cells.insert("_id".into(), row.id.as_value());
+        let expires_at = definition.ttl_micros.map(|ttl| expiry(cut.system_time, ttl)).transpose()?;
+        self.authorize_write(branch, table, &row.id, valid, definition, Some(&cells))?;
+        Ok((valid, Arc::new(RowImage {
+            cells, expires_at, custody_group: row.custody_group, custody_payload: row.custody_payload.clone(),
+        })))
     }
 
     fn require_child(&self, branch: &str) -> Result<()> {
@@ -249,7 +286,12 @@ impl Candidate<'_> {
                         return Err(conflict("rtdb/merge-conflict", "The target changed a valid-time region written by the source"));
                     }
                     let image = event.image.clone().filter(|_| event.image_at(valid.lower()).is_some());
-                    if let Some(image) = &image { validate_cells(definition, &image.cells)?; }
+                    if let Some(image) = &image {
+                        if image.custody_group.is_some() {
+                            return Err(Anomaly::unsupported("rtdb/custody-placement", "Publishing a protected copy requires its own custody placement"));
+                        }
+                        validate_cells(definition, &image.cells)?;
+                    }
                     effects.push((table.clone(), id.clone(), valid, image));
                 }
             }
@@ -395,7 +437,7 @@ impl Candidate<'_> {
     }
 }
 
-fn erased_custody_group() -> Anomaly {
+pub(super) fn erased_custody_group() -> Anomaly {
     Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The custody group was revoked")
 }
 
