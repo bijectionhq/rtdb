@@ -124,7 +124,11 @@ message Cell {
   }
 }
 message Interval { optional sint64 from_micros = 1; optional sint64 to_micros = 2; }
-message Row { map<string, Cell> cells = 1; }
+message Row {
+  map<string, Cell> cells = 1;
+  // A 16-byte nonzero database-local custody group. Empty leaves the row unbound.
+  bytes custody_group = 2;
+}
 message Put { string branch = 1; string table = 2; repeated Row rows = 3; bool if_absent = 4; }
 message Delete { string branch = 1; string table = 2; repeated Cell ids = 3; Interval valid = 4; }
 message Erase { optional string branch = 1; string table = 2; repeated Cell ids = 3; }
@@ -157,6 +161,8 @@ message Fork { string child = 1; BranchBasis from = 2; bool writable = 3; option
 message Renew { string branch = 1; sint64 expires_at_micros = 2; }
 message Merge { string from = 1; string into = 2; }
 message DropBranch { string branch = 1; }
+message CreateCustodyGroup { bytes group = 1; }
+message RevokeCustodyGroup { bytes group = 1; }
 message Op {
   oneof op {
     Put put = 1;
@@ -167,6 +173,8 @@ message Op {
     Renew renew = 6;
     Merge merge = 7;
     DropBranch drop_branch = 8;
+    CreateCustodyGroup create_custody_group = 9;
+    RevokeCustodyGroup revoke_custody_group = 10;
   }
 }
 message Otherwise { repeated uint32 failed = 1; }

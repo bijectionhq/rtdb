@@ -601,6 +601,7 @@ mod tests {
                                     rows: vec![Row {
                                         id: EntityId::Integer(1),
                                         valid: None,
+                                        custody_group: None,
                                         cells: [("value".into(), Cell::Value(Value::I64(42)))]
                                             .into_iter()
                                             .collect(),

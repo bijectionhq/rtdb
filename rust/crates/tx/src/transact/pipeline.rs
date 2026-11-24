@@ -374,7 +374,7 @@ mod tests {
     fn keys(keys: Vec<TxKey>) -> Vec<Vec<u8>> { keys.into_iter().map(|key| key.key).collect() }
 
     fn put(n: u8, id: i64, if_absent: bool) -> Transact {
-        let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("{n}"))))]) };
+        let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("{n}"))))]), custody_group: None };
         Transact {
             key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
             ops: vec![Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent }],

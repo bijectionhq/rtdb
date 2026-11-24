@@ -23,6 +23,7 @@ fn put(n: u64) -> Transact {
     let row = Row {
         id: EntityId::Integer(n as i64),
         valid: None,
+        custody_group: None,
         cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("row-{n}"))))]),
     };
     Transact {

@@ -429,6 +429,7 @@ mod tests {
                 rows: vec![Row {
                     id: EntityId::Integer(1),
                     valid: None,
+                    custody_group: None,
                     cells: StructFields::from([(
                         "title".into(),
                         Cell::Value(Value::Utf8(title.into())),

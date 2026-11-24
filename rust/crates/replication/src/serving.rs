@@ -395,7 +395,7 @@ mod tests {
                 key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
                 requires: Vec::new(),
                 ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
-                    rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]) }] }],
+                    rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]), custody_group: None }] }],
             },
         }
     }

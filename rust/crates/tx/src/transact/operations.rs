@@ -12,6 +12,12 @@ impl Candidate<'_> {
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
                     for row in rows {
+                        if let Some(group) = row.custody_group {
+                            self.require_unrestricted()?;
+                            if !self.index.custody_group_live(group)? {
+                                return Err(erased_custody_group());
+                            }
+                        }
                         if let Some(visibility) = &definition.visibility
                             && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
                         {
@@ -35,7 +41,8 @@ impl Candidate<'_> {
                         if *if_absent && self.present(branch, table, &row.id, valid)? {
                             return Err(conflict("rtdb/already-present", "The put overlaps an existing row"));
                         }
-                        self.write(branch, table, row.id.clone(), valid, Some(Arc::new(RowImage { cells, expires_at })))?;
+                        let image = RowImage { cells, expires_at, custody_group: row.custody_group };
+                        self.write(branch, table, row.id.clone(), valid, Some(Arc::new(image)))?;
                     }
                 }
                 Op::Delete { branch, table, ids, valid } => {
@@ -101,6 +108,26 @@ impl Candidate<'_> {
                     self.require_unrestricted()?;
                     self.require_child(branch)?;
                     self.push(BranchEffect::Drop { branch: branch.clone() })?;
+                }
+                Op::CreateCustodyGroup { group } => {
+                    self.require_unrestricted()?;
+                    if *group == [0; 16] {
+                        return Err(Anomaly::incorrect("rtdb/invalid-custody-group", "A custody group needs a nonzero identity"));
+                    }
+                    match self.index.custody_group_live(*group) {
+                        Ok(true) => (),
+                        Ok(false) => return Err(erased_custody_group()),
+                        Err(error) if error.category == AnomalyCategory::NotFound => {
+                            self.push(BranchEffect::CreateCustodyGroup { group: *group })?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Op::RevokeCustodyGroup { group } => {
+                    self.require_unrestricted()?;
+                    if self.index.custody_group_live(*group)? {
+                        self.push(BranchEffect::RevokeCustodyGroup { group: *group })?;
+                    }
                 }
             }
         }
@@ -343,6 +370,10 @@ impl Candidate<'_> {
         }
         Ok(())
     }
+}
+
+fn erased_custody_group() -> Anomaly {
+    Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The custody group was revoked")
 }
 
 fn endpoints(history: &[&BranchEvent], within: Interval) -> Vec<Timestamp> {

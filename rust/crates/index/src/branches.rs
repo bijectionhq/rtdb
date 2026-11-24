@@ -12,7 +12,9 @@ use rtdb_types::{
 };
 use serde::{Deserialize, Serialize};
 
+mod custody;
 mod visibility;
+pub use custody::CustodyGroupId;
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,8 @@ impl Visibility {
 pub struct RowImage {
     pub cells: StructFields<Value>,
     pub expires_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_group: Option<CustodyGroupId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -113,6 +117,8 @@ pub enum BranchEffect {
     Drop { branch: Branch },
     Declare { table: TableRef, definition: BranchTable },
     Erase { branch: Option<Branch>, table: TableRef, id: EntityId },
+    CreateCustodyGroup { group: CustodyGroupId },
+    RevokeCustodyGroup { group: CustodyGroupId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +169,8 @@ pub struct BranchIndex {
     branches: Map<Branch, Arc<BranchData>>,
     #[serde(with = "entries")]
     catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    custody: Map<CustodyGroupId, Arc<custody::CustodyGroup>>,
     changed_catalog: Option<Basis>,
     erased: Option<Basis>,
     #[serde(skip)]
@@ -184,7 +192,7 @@ impl BranchIndex {
         Self {
             head, times: Map::unit(0, head.system_time),
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
-            catalog: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
+            catalog: Map::new(), custody: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
         }
     }
 
@@ -405,6 +413,11 @@ impl BranchIndex {
                 if event.cut != self.head {
                     return Err(Anomaly::fault("rtdb/event-cut", "Resolved event differs from the transaction cut"));
                 }
+                if let Some(group) = event.image.as_ref().and_then(|image| image.custody_group) {
+                    self.admit_custody_member(group, custody::CustodyMember {
+                        branch: branch.clone(), table: table.clone(), id: event.id.clone(), written: basis,
+                    })?;
+                }
                 let catalog = &mut self.catalog;
                 let definitions = catalog.entry(table.clone()).or_default();
                 if definitions.is_empty() {
@@ -453,6 +466,8 @@ impl BranchIndex {
                 }
                 self.erased = Some(basis);
             }
+            BranchEffect::CreateCustodyGroup { group } => self.create_custody_group(group)?,
+            BranchEffect::RevokeCustodyGroup { group } => self.revoke_custody_group(group)?,
         }
         Ok(())
     }

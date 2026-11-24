@@ -134,6 +134,7 @@ fn put(key: u8, id: i64, text: &str) -> Transact {
             rows: vec![Row {
                 id: EntityId::Integer(id),
                 valid: None,
+                custody_group: None,
                 cells: StructFields::from([("text".into(), Cell::Value(Value::Utf8(text.into())))]),
             }],
             if_absent: false,

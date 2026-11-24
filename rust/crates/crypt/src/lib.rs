@@ -1,6 +1,7 @@
 //! Database key generations and authenticated storage and journal envelopes.
 
 mod aead;
+mod custody;
 mod file;
 mod local;
 pub mod tokens;
@@ -12,6 +13,7 @@ use zeroize::Zeroizing;
 
 pub use file::FileKms;
 pub use local::LocalKms;
+pub use custody::CustodyVault;
 
 pub type DataKey = Zeroizing<[u8; 32]>;
 
@@ -46,6 +48,7 @@ pub enum Context {
     File { epoch: u64, seq: u64 },
     Manifest { epoch: u64, seq: u64 },
     Journal { lsn: u64 },
+    CustodyValue { binding: [u8; 32] },
 }
 
 const HEADER: &[u8; 6] = b"RTDBE\x01";
@@ -69,6 +72,10 @@ impl Context {
             Self::Journal { lsn } => {
                 bytes.push(3);
                 bytes.extend_from_slice(&lsn.to_be_bytes());
+            }
+            Self::CustodyValue { binding } => {
+                bytes.push(4);
+                bytes.extend_from_slice(&binding);
             }
         }
         bytes

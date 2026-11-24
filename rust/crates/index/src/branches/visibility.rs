@@ -256,6 +256,7 @@ fn visible_changes(
                 Arc::new(RowImage {
                     cells: image.cells.clone(),
                     expires_at: None,
+                    custody_group: image.custody_group,
                 })
             })
         };

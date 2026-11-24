@@ -4,7 +4,7 @@ use bytes::Bytes;
 use rtdb_index::branches::{
     BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage, VisibleHistory,
 };
-pub use rtdb_index::branches::{CountRange, IndexDefinition, Visibility};
+pub use rtdb_index::branches::{CountRange, CustodyGroupId, IndexDefinition, Visibility};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
@@ -84,6 +84,8 @@ pub struct Row {
     pub id: EntityId,
     pub valid: Option<Interval>,
     pub cells: StructFields<Cell>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody_group: Option<CustodyGroupId>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,6 +98,18 @@ pub enum Op {
     Renew { branch: Branch, expires_at: Timestamp },
     Merge { from: Branch, into: Branch },
     DropBranch { branch: Branch },
+    CreateCustodyGroup { group: CustodyGroupId },
+    RevokeCustodyGroup { group: CustodyGroupId },
+}
+
+impl Op {
+    fn uses_custody(&self) -> bool {
+        match self {
+            Self::CreateCustodyGroup { .. } | Self::RevokeCustodyGroup { .. } => true,
+            Self::Put { rows, .. } => rows.iter().any(|row| row.custody_group.is_some()),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -128,6 +142,7 @@ pub struct Receipt {
 pub const TIMED_TRANSACT: &str = "timed-transact";
 pub const LINEARIZABLE: &str = "linearizable";
 pub const TRANSACT_REQUIRES: &str = "transact.requires";
+pub const ROW_CUSTODY: &str = "row-custody";
 pub const REQUIREMENT_FAILED: &str = "rtdb/requirement-failed";
 
 #[derive(Clone, Copy)]
@@ -428,6 +443,9 @@ impl TransactState {
         }
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
             return Err(feature_required(TRANSACT_REQUIRES));
+        }
+        if !features.contains(&ROW_CUSTODY) && request.ops.iter().chain(&request.otherwise).any(Op::uses_custody) {
+            return Err(feature_required(ROW_CUSTODY));
         }
         let Window { not_before, before } = request.window;
         if not_before.zip(before).is_some_and(|(start, end)| start >= end) {

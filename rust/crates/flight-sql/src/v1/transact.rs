@@ -168,6 +168,12 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
             WireOp::DropBranch(drop) => Op::DropBranch {
                 branch: branch(drop.branch)?,
             },
+            WireOp::CreateCustodyGroup(create) => Op::CreateCustodyGroup {
+                group: custody_group(&create.group)?,
+            },
+            WireOp::RevokeCustodyGroup(revoke) => Op::RevokeCustodyGroup {
+                group: custody_group(&revoke.group)?,
+            },
         },
     )
 }
@@ -225,6 +231,7 @@ fn declaration(
 }
 
 fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status> {
+    let custody_group = (!row.custody_group.is_empty()).then(|| custody_group(&row.custody_group)).transpose()?;
     let mut fields = row.cells.into_iter().collect::<BTreeMap<_, _>>();
     let id = entity(fields.remove("_id"), memory)?;
     let from = fields.remove("_valid_from");
@@ -245,7 +252,16 @@ fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status
         id,
         valid,
         cells,
+        custody_group,
     })
+}
+
+fn custody_group(bytes: &[u8]) -> Result<[u8; 16], Status> {
+    let group = bytes.try_into().map_err(|_| error::incorrect("A custody group must contain 16 bytes"))?;
+    if group == [0; 16] {
+        return Err(error::incorrect("A custody group needs a nonzero identity"));
+    }
+    Ok(group)
 }
 
 /// A bound is signed microseconds, or a zoned Arrow timestamp; a naive timestamp names no instant.
@@ -387,7 +403,7 @@ mod tests {
             .map(|(name, column)| (name.to_owned(), wire(column))).collect();
         cells.insert("_id".into(), wire(Arc::new(Int64Array::from(vec![1]))));
         cells.insert("title".into(), wire(Arc::new(Int64Array::from(vec![7]))));
-        decode_row(proto::Row { cells: cells.into_iter().collect() }, &MemoryBudget::new(1 << 20))
+        decode_row(proto::Row { cells: cells.into_iter().collect(), custody_group: Vec::new() }, &MemoryBudget::new(1 << 20))
     }
 
     #[test]
