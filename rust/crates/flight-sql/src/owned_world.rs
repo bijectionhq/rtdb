@@ -42,6 +42,8 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
         &'a self, call: WorldCall<'a>, request: crate::FamilyRequest,
     ) -> BoxFuture<'a, Result<crate::FamilyReply>>;
 
+    fn supports_retired_original_family(&self) -> bool { false }
+
     fn retired_family_fence<'a>(
         &'a self, _call: WorldCall<'a>, _request: &'a crate::RetiredFamilyRequest,
     ) -> BoxFuture<'a, Result<bytes::Bytes>> {

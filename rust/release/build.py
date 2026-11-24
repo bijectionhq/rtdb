@@ -114,13 +114,23 @@ def native_executables(variant):
 
 def verify_hosted_protocol(image, compiled):
     protocol = compiled.get("hosted_protocol")
-    label = image.get("Config", {}).get("Labels", {}).get("io.rtdb.hosted-protocol")
+    labels = image.get("Config", {}).get("Labels", {})
+    label = labels.get("io.rtdb.hosted-protocol")
     if type(protocol) is not int or protocol < 1 or label != str(protocol):
         raise ValueError("packaged multi image hosted protocol differs from its executable")
     arrow = compiled.get("pgwire_arrow_copy_out")
-    arrow_label = image.get("Config", {}).get("Labels", {}).get("io.rtdb.pgwire-arrow-copy-out")
+    arrow_label = labels.get("io.rtdb.pgwire-arrow-copy-out")
     if (arrow is not None or arrow_label is not None) and (arrow is not True or arrow_label != "true"):
         raise ValueError("packaged multi image Arrow COPY OUT differs from its executable")
+    capabilities = compiled.get("capabilities")
+    attestation = labels.get("io.rtdb.capabilities")
+    if capabilities is not None or attestation is not None:
+        try:
+            if capabilities is not None and json.loads(attestation) == capabilities:
+                return
+        except (TypeError, ValueError):
+            pass
+        raise ValueError("packaged multi image capabilities differ from its executable")
 
 
 def extract_artifacts(commands, image, engine, output, variant=None):

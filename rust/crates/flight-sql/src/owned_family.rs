@@ -513,7 +513,8 @@ fn is_authenticated_original_attachment(owner: Owner, placement: Option<&str>, d
 
 impl Service {
     pub(crate) fn supports_retired_original_family(&self, call: &Call) -> bool {
-        self.0.config.owned_native_actions && self.0.config.owned_world_host.is_some()
+        self.0.config.owned_native_actions && self.0.config.owned_world_host.as_ref()
+            .is_some_and(|host| host.supports_retired_original_family())
             && !call.session.fresh_replica && call.session.audience_source().is_none()
             && is_authenticated_original_attachment(call.session.caller.owner, call.session.placed_database(), &call.database)
     }

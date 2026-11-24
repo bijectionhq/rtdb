@@ -19,6 +19,8 @@ mod query;
 mod tokens;
 
 const API: &str = "rtdb.v1";
+pub const OWNED_HOSTED_FEATURE: &str = "owned.hosted";
+pub const RETIRED_ORIGINAL_FAMILY_FEATURE: &str = "owned.retired-original-family";
 const MAX_PAGE_ROWS: u32 = 4096;
 const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -65,6 +67,12 @@ impl Service {
         let outcome = match action.r#type.as_str() {
             "rtdb.v1.Capabilities" => decode::<proto::CapabilitiesRequest>(action.body).map(|_| {
                 let mut features = Vec::new();
+                if self.supports_hosted_upload(&call) && self.0.config.owned_world_host.is_some() {
+                    features.push(OWNED_HOSTED_FEATURE.into());
+                }
+                if self.supports_retired_original_family(&call) {
+                    features.push(RETIRED_ORIGINAL_FAMILY_FEATURE.into());
+                }
                 if call.session.audience_source().is_none() && !call.session.fresh_replica {
                     features.extend(
                         [

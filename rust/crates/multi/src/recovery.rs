@@ -24,6 +24,7 @@ use crate::{
     archive::{self, CapturePoint},
     control::ControlKey,
     deployment::CellStorage,
+    family_custody::{FAMILY_CUSTODY_GRANT_BYTES, endorse_family_custody, grant_id, original_family_custody},
     install::Token,
     keys::KeyService,
 };
@@ -46,6 +47,13 @@ struct Request {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     CaptureCheckpoint,
+    ProtectedRootCustodyIdentity {
+        manifest_sha256: String,
+    },
+    EndorseProtectedRootCustody {
+        manifest_sha256: String,
+        grant: String,
+    },
     RetainServingReplay {
         manifest_sha256: String,
     },
@@ -141,6 +149,14 @@ enum Action {
 #[derive(Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum Reply {
+    ProtectedRootCustodyIdentity {
+        history: [u8; 32],
+        custody: [u8; 32],
+    },
+    ProtectedRootCustodyEndorsed {
+        grant_sha256: String,
+        endorsement: String,
+    },
     Captured {
         name: String,
         authority: Uuid,
@@ -344,6 +360,20 @@ impl RecoveryService {
         let discard = matches!(request.action, Action::DiscardCheckpointStage { .. });
         let transfer_only = matches!(request.action, Action::StageCheckpointTransfer { .. });
         match request.action {
+            Action::ProtectedRootCustodyIdentity { manifest_sha256 } => {
+                self.protected_root_capture(&installation, request.authority, request.capture, &manifest_sha256).await?;
+                let (history, custody) = original_family_custody(&installation, request.authority)?;
+                Ok(Reply::ProtectedRootCustodyIdentity { history, custody })
+            }
+            Action::EndorseProtectedRootCustody { manifest_sha256, grant } => {
+                let body = decode_family_custody_grant(&grant)?;
+                let (secret, point) = self.protected_root_capture(&installation, request.authority, request.capture, &manifest_sha256).await?;
+                let endorsement = endorse_family_custody(secret, &installation, request.authority, point.checkpoint, &body)?;
+                Ok(Reply::ProtectedRootCustodyEndorsed {
+                    grant_sha256: lower_hex(&grant_id(&body)),
+                    endorsement: lower_hex(&endorsement),
+                })
+            }
             Action::CaptureCheckpoint => {
                 let retained = archive::capture_receipt(
                     &installation,
@@ -744,6 +774,25 @@ impl RecoveryService {
         }
     }
 
+    async fn protected_root_capture(
+        &self, record: &DeploymentRecord, authority: Uuid, capture: Uuid, manifest: &str,
+    ) -> Result<(&crate::capability::CellSecret, CapturePoint)> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let secret = self.control.0.as_deref().filter(|_| self.hosted_task.is_some()).ok_or_else(unavailable)?;
+        let namespaces = record.storage_namespaces.as_ref().ok_or_else(unavailable)?;
+        if record.writer_pool().is_none() || !valid_manifest(manifest) {
+            return Err(unavailable());
+        }
+        archive::require_capture_open(record, capture)?;
+        let (point, accepted) = archive::capture_receipt(record, &self.archive, authority, capture)?.ok_or_else(unavailable)?;
+        if accepted != manifest || point.incarnation != record.incarnation || point.log_epoch != record.log_epoch
+            || point.checkpoint.system_time <= 0 || self.keys.namespace_id().await? != namespaces.keys
+        {
+            return Err(unavailable());
+        }
+        Ok((secret, point))
+    }
+
     async fn dispatch_capture_discard(&self, directory: Arc<dyn Directory>, request: Request) -> Result<Reply> {
         let Some(installation) = self.authorize(directory.as_ref(), &request).await? else {
             return Ok(Reply::Refused);
@@ -941,6 +990,25 @@ impl RecoveryService {
     }
 }
 
+fn decode_family_custody_grant(grant: &str) -> Result<[u8; FAMILY_CUSTODY_GRANT_BYTES]> {
+    let invalid = || Anomaly::incorrect("rtdb.multi/family-custody-grant", "Invalid RFC1 request encoding");
+    if grant.len() != FAMILY_CUSTODY_GRANT_BYTES * 2 { return Err(invalid()); }
+    let digit = |byte| match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(invalid()),
+    };
+    let mut body = [0; FAMILY_CUSTODY_GRANT_BYTES];
+    for (byte, encoded) in body.iter_mut().zip(grant.as_bytes().chunks_exact(2)) {
+        *byte = digit(encoded[0])? << 4 | digit(encoded[1])?;
+    }
+    Ok(body)
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn valid_manifest(digest: &str) -> bool {
     digest.len() == 43
         && URL_SAFE_NO_PAD
@@ -1058,6 +1126,71 @@ async fn write_reply(socket: &mut (impl AsyncWrite + Unpin), reply: &Reply) -> s
 mod tests {
     use super::*;
     use rtdb_directory::MemoryDirectory;
+
+    #[tokio::test]
+    async fn protected_root_issuer_requires_the_authenticated_original_capture() -> Result<()> {
+        let temporary = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(temporary.path().join("keys"))?);
+        let directory = MemoryDirectory::new();
+        let mut installation = DeploymentRecord::new("tenant", "cell", Vec::new(), 0);
+        installation.epoch = 1;
+        installation.storage_namespaces = Some(rtdb_directory::StorageNamespaces {
+            objects: Uuid::new_v4(), keys: keys.namespace_id().await?,
+        });
+        let authority = Uuid::parse_str(&installation.id).unwrap();
+        let capture = Uuid::new_v4();
+        let token = "c".repeat(64);
+        let mut service = RecoveryService {
+            token: Token::new(&token)?,
+            org: "cell".into(),
+            storage: CellStorage::Local { root: temporary.path().join("serving") },
+            archive: CellStorage::Local { root: temporary.path().join("archive") },
+            keys,
+            broker: None,
+            hosted_task: Some(HostedTask::new(
+                "arn:aws:ecs:us-east-1:123456789012:cluster/cell",
+                "arn:aws:ecs:us-east-1:123456789012:task/cell/11111111111111111111111111111111",
+            )?),
+            control: ControlKey(Some(Arc::new(crate::capability::CellSecret::new(&[3; 32])?))),
+            memory: MemoryBudget::new(4096),
+        };
+        let manifest = URL_SAFE_NO_PAD.encode([4; 32]);
+        installation.checkpoint_captures.insert(capture, rtdb_directory::CheckpointCapture {
+            archive: serde_json::to_string(&service.archive).unwrap(),
+            key_namespace: None,
+            incarnation: installation.incarnation,
+            log_epoch: installation.log_epoch,
+            checkpoint: rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 2, system_time: 10, root_sha256: Some([9; 32]) },
+            automatic_fork: false,
+            world_replay: None,
+            media_bound: true,
+            manifest_sha256: Some(manifest.clone()),
+            remote_disposal: None,
+        });
+        directory.create_deployment(installation).await?;
+        let request = |credential: &str, capture, digest: &str| Request {
+            token: credential.into(), name: "tenant".into(), authority, capture,
+            action: Action::ProtectedRootCustodyIdentity { manifest_sha256: digest.into() },
+        };
+        assert!(matches!(service.handle(directory.clone(), request(&token, capture, &manifest)).await,
+            Reply::ProtectedRootCustodyIdentity { .. }));
+        assert!(matches!(service.handle(directory.clone(), request("wrong", capture, &manifest)).await, Reply::Refused));
+        assert!(matches!(service.handle(directory.clone(), request(&token, Uuid::new_v4(), &manifest)).await, Reply::Refused));
+        assert!(matches!(service.handle(directory.clone(), request(&token, capture, &URL_SAFE_NO_PAD.encode([5; 32]))).await, Reply::Refused));
+        service.control = ControlKey::default();
+        assert!(matches!(service.handle(directory, request(&token, capture, &manifest)).await, Reply::Refused));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_endorsement_accepts_only_canonical_rfc1_bytes() -> Result<()> {
+        let body = [0xaf; FAMILY_CUSTODY_GRANT_BYTES];
+        let hex = lower_hex(&body);
+        assert_eq!(decode_family_custody_grant(&hex)?, body);
+        assert!(decode_family_custody_grant(&hex.to_uppercase()).is_err());
+        assert!(decode_family_custody_grant(&hex[..hex.len() - 2]).is_err());
+        Ok(())
+    }
 
     async fn bind_test_archive_media(service: &RecoveryService, owner: &DeploymentRecord, operation: Uuid) -> Result<()> {
         let deployment = owner.id.parse().unwrap();

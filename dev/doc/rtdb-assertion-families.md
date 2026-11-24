@@ -295,8 +295,14 @@ Successor release admission requires authenticated restore enrollment, an ordere
 
 ### `rtdb.owned.RetiredOriginalFamily.v1`
 
-Hosted protocol 227 operates on the still-hosted Original RTDB order for one held replay of an exact Root landing.
-The trusted hosted issuer endorses the exact `RFC1` grant after authenticating the target replay receipt.
+The `owned.retired-original-family` feature operates on the still-hosted Original RTDB order for one held replay of an exact Root landing.
+The current multi image attests the feature with `owned.hosted` under `rtdb.v1`.
+An authenticated read session can discover the retired-family feature in `rtdb.v1.Capabilities` on a configured Original holder.
+An approval worker authenticates the assigned target replay receipt and uses the existing Original recovery TLS client binding to request the endorsement.
+The `protected_root_custody_identity` recovery action returns the Original placed history and logical family custody for the selected capture and manifest.
+The `endorse_protected_root_custody` recovery action takes the exact lowercase-hex `RFC1` body and the same manifest, then returns its SHA-256 and the endorsement.
+The reaper checks the recovery credential, organization, Original installation, accepted capture, incarnation, capture time and key namespace.
+The installed CellSecret stays in RTDB's reaper and node.
 Original custody orders the grant and its replay authorization together under `fenced-family-custody/<grant SHA-256>` and `fenced-family-replay/<replay binding SHA-256>` in the Original restore control table.
 The grant binds the deployment incarnation, placed history, family vault, Original and target installations, archive fence and frontier, exact target replay receipt and Root activation.
 The holder checks both exact signed rows at a fresh Original barrier after the retired frontier.
@@ -307,6 +313,7 @@ Operation 1 wraps the family response-release operations and requires the exact 
 Operation 2 takes the exact promoted registration followed by the Original outer envelope and returns its row-unit-sealed contents.
 The response handoff rechecks the current grant, registry, family marker and cutoff.
 The Original carrier registry keeps the same release addresses and records the enrollment locator as creator and the controller's signed `family_custody_proof` for the exact live or disposed phase.
+The controller orders the disposed phase after the same response part has joined the Original row and family holds, and the provider acknowledges that ordered disposition on the same registration.
 The controller uses operation 4 to plan the exact order and operation 3 to submit its ordinary inline Root retirement decision with the sealed installation revision and a zero writer field.
 The ordered decision also requires the Original's authenticated hosted-control owner on the current attachment.
 The resolver matches the same current paired enrollment and closed Original authority before the existing ordered predicates authenticate the selected carrier and retirement inventory.
