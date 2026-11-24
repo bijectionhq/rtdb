@@ -346,13 +346,19 @@ rule TrieGcLoopRunsCycle {
 
 rule GarbageCollectTries {
     -- Run one cycle: collect garbage from every table in the table catalog.
-    -- The same cycle releases superseded logical search runs once the current checkpoint and all admitted readers have moved past their receipts and the collection lease has elapsed.
+    -- The same cycle releases superseded logical search runs once the current checkpoint and all admitted readers have moved past their receipts.
+    -- Stores without exact search-run retirement wait for the collection lease to elapse.
     -- Hosted release binds the provider publication to a catalog floor before acknowledgement.
     -- Directory collection marks all pages reachable from the current root, retained checkpoints, and captured readers.
     -- After its reader lease, a retired root can release its unmarked pages.
     -- Hosted fork and archive holds continue to protect the pages in their checkpoint closures.
     -- A replay checkpoint holds every page reached by each active entity directory.
     -- Term-directory pages have no retirement ledger: collection releases a stored page that no current, checkpointed or captured root reaches, once the reader lease has passed since it was first seen unreachable.
+    -- Hosted release of a retired search run or an exact sealed artefact waits for an open lineage, drained fork preparations, and the withdrawal of declared fork references to the publication.
+    -- An archive copy or admitted reference read retains a publication while its storage region holds it.
+    -- A version-scoped archive hold permits release only when the recorded provider version proves the publication is outside that hold.
+    -- The collector leaves a held run's retirement pending for a later cycle.
+    -- The reaper validates the current holds again under its physical retirement reservation.
     -- Tables are processed concurrently up to `tableParallelism`, with DELETE
     -- operations bounded across the cycle by `deleteParallelism`. Both bounds
     -- are out-of-spec implementation parameters (see TrieGarbageCollector.kt).

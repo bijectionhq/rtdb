@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_directory::{Checkpoint, DeploymentRecord, Directory, ExactRetirementGrant, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
 use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
+use rtdb_format::log::proto::PublishedObjectVersion;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectPublication, PhysicalObjectVersion, Result, S3TombstoneTarget, ServingPublication, StorageEpoch, TerminalObjectPublication};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectPublication, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneTarget, ServingPublication, StorageEpoch, TerminalObjectPublication};
 use uuid::Uuid;
 
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release, recovery_covers_release};
@@ -983,6 +984,33 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
 }
 
 const ARCHIVE_SOURCE_HELD: &str = "rtdb.multi/archive-source-held";
+
+pub(crate) async fn permits_search_release(directory: &dyn Directory, bucket: &dyn ObjectStore, owner: &DeploymentRecord,
+    store: &str, key: &ObjectKey, publication: Option<&PublishedObjectVersion>) -> Result<bool> {
+    let lineage = directory.lineage_state(&owner.lineage).await?;
+    if lineage.open_generation().is_none() || lineage.preparations().next().is_some() { return Ok(false); }
+
+    let target = ObjectKey::new(format!("{store}/{key}"))?;
+    let version = publication.filter(|publication| publication.terminal.is_none()).and_then(|publication| {
+        let bucket = publication.bucket.as_ref().filter(|bucket| !bucket.is_empty())?;
+        let key = publication.key.as_ref().filter(|key| !key.is_empty())?;
+        let version = publication.version.as_ref().filter(|version| rtdb_storage::remote::valid_object_version(version.as_bytes()))?;
+        Some(PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: bucket.clone(), endpoint: publication.endpoint.clone(), region: publication.region.clone() },
+            key: key.clone(), version: version.clone(),
+        })
+    });
+    if general_reference_holds(owner, &[&target])
+        || owner.storage_regions.values().any(|region| archived_source_holds(region, &[version.as_ref()]))
+    {
+        return Ok(false);
+    }
+    let deployments = directory.deployments().await?;
+    if reference_retains(bucket, &deployments, &owner.lineage, store, &[(key.as_str(), version.as_ref())]).await? {
+        return Ok(false);
+    }
+    Ok(lineage == directory.lineage_state(&owner.lineage).await?)
+}
 
 async fn reference_retains(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], lineage: &str,
     store: &str, files: &[(&str, Option<&PhysicalObjectVersion>)]) -> Result<bool> {

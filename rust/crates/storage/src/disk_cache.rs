@@ -368,6 +368,11 @@ impl ObjectStore for DiskCachedStore {
     }
     fn requires_search_publication(&self) -> bool { self.remote.requires_search_publication() }
     fn releases_exact_search_runs(&self) -> bool { self.remote.releases_exact_search_runs() }
+    async fn permits_search_release(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        let _scope = self.io.admit()?;
+        self.remote.permits_search_release(key, publication, cut).await
+    }
     async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         let _scope = self.io.admit()?;

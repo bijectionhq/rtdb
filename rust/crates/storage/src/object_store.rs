@@ -262,6 +262,9 @@ pub trait ObjectStore: Send + Sync {
     fn requires_search_publication(&self) -> bool { false }
     /// Whether installed search-run retirement uses the exact publication grant.
     fn releases_exact_search_runs(&self) -> bool { false }
+    /// Checks storage-side dependencies before attempting to release a retired search run.
+    async fn permits_search_release(&self, _key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> { Ok(true) }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() {

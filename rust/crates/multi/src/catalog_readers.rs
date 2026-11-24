@@ -5,6 +5,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, CatalogReader, DeploymentRecord, Directory, Lifecycle, StorageNamespaces, StorageRegion};
 use rtdb_format::keys::StorageRoot;
+use rtdb_format::log::proto::PublishedObjectVersion;
+use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, StorageEpoch};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
@@ -132,6 +134,17 @@ impl CatalogReaders {
                 && record.holder.is_some() && writer_epoch < record.epoch
                 && !record.storage_regions.contains_key(&region)
         }))
+    }
+
+    pub async fn permits_search_release(&self, bucket: &dyn ObjectStore, cut: CatalogCut, key: &ObjectKey,
+        publication: Option<&PublishedObjectVersion>) -> Result<bool> {
+        if !self.matches_cut(cut)? { return Err(closed()); }
+        let Some(record) = self.directory.deployment(&self.deployment).await? else { return Err(closed()); };
+        if !self.residence_is_open(&record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none() {
+            return Err(closed());
+        }
+        let store = format!("{}/{}", self.residence, self.storage_root);
+        crate::store::exact_retirement::permits_search_release(self.directory.as_ref(), bucket, &record, &store, key, publication).await
     }
 
     pub async fn advance(&self, installed: CatalogCut) -> Result<bool> {

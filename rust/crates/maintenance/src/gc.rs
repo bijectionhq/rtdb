@@ -355,7 +355,9 @@ impl TrieCollector {
             let Some((ArtefactOwner::Trie(owner), kind, id, generation)) = entry.slug.parse_artefact_key(object.key.as_str()) else { continue; };
             if !seals.contains(&owner) { continue; }
             if kind == rtdb_format::entity_history::KIND || (kind == "search" && id.ends_with("f16w")) {
-                if let Some(record) = catalog.trie(&entry.table, &owner).and_then(|trie| trie.artefact(&kind, &id, generation)) {
+                if let Some(record) = catalog.trie(&entry.table, &owner).and_then(|trie| trie.artefact(&kind, &id, generation))
+                    && self.store.permits_search_release(&object.key, record.published_version.as_ref(), cut).await?
+                {
                     self.store.release_search_run(&object.key, record.published_version.as_ref(), cut).await?;
                 }
             } else if kind == "search" && (id.ends_with("f15") || id.ends_with("f16h")) {
@@ -438,6 +440,7 @@ impl TrieCollector {
         for run in ready {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let key = ObjectKey::new(run.object_key(&entry.slug)?)?;
+            if !self.store.permits_search_release(&key, run.publication.as_ref(), cut).await? { continue; }
             if !self.store.release_search_run(&key, run.publication.as_ref(), cut).await? { continue; }
             let trie_key = TrieKey::l0(rtdb_types::BlockIndex(run.blocks[0]))?.to_string();
             let record = SearchRunChange { run: Some(run.clone()), retire_only: Some(true), ..Default::default() }.to_artefact()?;

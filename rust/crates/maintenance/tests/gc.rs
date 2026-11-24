@@ -805,6 +805,74 @@ fn a_reader_lease_must_exceed_its_margin() {
 }
 
 #[tokio::test]
+async fn retired_search_bodies_and_catalog_receipts_wait_for_store_holds() {
+    use rtdb_format::log::proto::{ArtefactRecord, ArtefactsAdded, ArtefactsRemoved, PublishedObjectVersion, SearchRun, SearchRunChange};
+    use rtdb_maintenance::ArtefactPublisher;
+    use rtdb_storage::object_store::StoredObject;
+    use rtdb_types::SourcePosition;
+
+    struct HeldStore { inner: Arc<MemoryStore>, held: AtomicBool }
+    #[async_trait]
+    impl ObjectStore for HeldStore {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
+        async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(prefix).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+        async fn permits_search_release(&self, _: &ObjectKey, _: Option<&PublishedObjectVersion>, _: Option<CatalogCut>) -> Result<bool> {
+            Ok(!self.held.load(Ordering::Relaxed))
+        }
+    }
+
+    struct SearchRemoval { table: TableRef, state: Arc<PartitionState> }
+    #[async_trait]
+    impl ArtefactPublisher for SearchRemoval {
+        async fn publish(&self, _: ArtefactsAdded) -> Result<SourcePosition> { panic!("no search upload is pending") }
+        async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> {
+            self.state.remove_artefacts(&self.table, message.entries.into_iter().map(|entry| {
+                (entry.trie_key.unwrap().parse::<TrieKey>().unwrap(), entry.record.unwrap())
+            }).collect());
+            Ok(SourcePosition(1))
+        }
+    }
+
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let l0 = TrieKey::l0(BlockIndex(0)).unwrap();
+    let run = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
+        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), ..Default::default() };
+    let body = ObjectKey::new(run.object_key(&entry.slug).unwrap()).unwrap();
+    let seal = ObjectKey::new(entry.slug.artefact_key(&l0, "search", "body~a1f16w", 1).unwrap()).unwrap();
+    let seal_record = ArtefactRecord { kind: Some("search".into()), definition_id: Some("body~a1f16w".into()),
+        definition_version: Some(1), ..Default::default() };
+    let run_record = SearchRunChange { run: Some(run), ..Default::default() }.to_artefact().unwrap();
+    let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(l0.clone(), 1, None).unwrap()], Timestamp(1)).unwrap()
+        .with_artefacts(&table, [(l0.clone(), seal_record), (l0, run_record)])
+        .with_retired_tables([table.clone()], Timestamp(2));
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let store = Arc::new(HeldStore { inner: Arc::new(MemoryStore::default()), held: AtomicBool::new(true) });
+    for key in [&body, &seal] { store.put(key, Bytes::from_static(b"body")).await.unwrap(); }
+    let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: store.inner.clone(), commits: Mutex::default() });
+    let observer = Arc::new(Observer::default());
+    let removal = Arc::new(SearchRemoval { table: table.clone(), state: state.clone() });
+    let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), unleased(), fixed_clock()).unwrap()
+        .with_search(removal, StorageVersion(0), StorageEpoch(0));
+    let stop = CancellationToken::new();
+    collector.collect_as_of(Timestamp(3), &stop).await.unwrap();
+    for key in [&body, &seal] { assert!(store.head(key).await.is_ok()); }
+    assert!(!state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().released());
+
+    store.held.store(false, Ordering::Relaxed);
+    collector.collect_as_of(Timestamp(3), &stop).await.unwrap();
+    for key in [&body, &seal] { assert!(matches!(store.head(key).await, Err(rtdb_storage::Error::MissingObject(_)))); }
+    assert_eq!(state.snapshot().trie_catalog().retired_search_runs(&table).count(), 0);
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     use rtdb_format::log::proto::{ArtefactsAdded, ArtefactsRemoved, SearchRun, SearchRunChange};
     use rtdb_maintenance::ArtefactPublisher;

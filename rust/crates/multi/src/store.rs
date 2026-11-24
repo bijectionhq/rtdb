@@ -19,7 +19,7 @@ use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Li
 use rtdb_format::{keys::StorageRoot, trie_retirement::InstalledRetirement};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, ObjectReadAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
-use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
+use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
@@ -1249,7 +1249,7 @@ async fn open_with_base(
     let own: Arc<dyn ObjectStore> = if base.objects.is_empty() {
         local
     } else {
-        let references = crate::reference::ReferencingStore::new(local, bucket, base);
+        let references = crate::reference::ReferencingStore::new(local, Arc::clone(&bucket), base);
         Arc::new(match custody {
             Some(custody) => references.with_custody(custody),
             None => references,
@@ -1260,7 +1260,9 @@ async fn open_with_base(
         Some(archive) => archive.with_serving(packed.clone()),
         None => packed.clone(),
     };
-    Ok(Arc::new(GarbageStore::new(store, clock, Some(packed))))
+    let mut garbage = GarbageStore::new(store, clock, Some(packed));
+    garbage.release_inventory = Some(bucket);
+    Ok(Arc::new(garbage))
 }
 
 struct FencedStore {
@@ -1470,6 +1472,7 @@ pub struct GarbageStore {
     index_pages: Option<HostedIndexPages>,
     catalog_readers: Option<CatalogReaders>,
     requires_search_publication: bool,
+    release_inventory: Option<crate::reference::Bucket>,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeMap<ObjectKey, Vec<PhysicalObjectVersion>>>,
     clock: Clock,
@@ -1481,7 +1484,7 @@ impl GarbageStore {
     pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self::new(inner, clock, None))) }
 
     fn new(inner: Arc<dyn ObjectStore>, clock: Clock, packing: Option<Arc<crate::packing::PackingStore>>) -> Self {
-        Self { inner, packing, index_pages: None, catalog_readers: None, requires_search_publication: false,
+        Self { inner, packing, index_pages: None, catalog_readers: None, requires_search_publication: false, release_inventory: None,
             loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
     }
 
@@ -1651,6 +1654,12 @@ impl ObjectStore for GarbageStore {
     }
     fn requires_search_publication(&self) -> bool { self.requires_search_publication }
     fn releases_exact_search_runs(&self) -> bool { self.catalog_readers.is_some() }
+    async fn permits_search_release(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<CatalogCut>) -> Result<bool> {
+        let Some(readers) = &self.catalog_readers else { return Ok(true); };
+        let Some((bucket, cut)) = self.release_inventory.as_deref().zip(cut) else { return Ok(false); };
+        readers.permits_search_release(bucket, cut, key, publication).await
+    }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
@@ -2287,6 +2296,83 @@ async fn reap_remote_paths(bucket: &dyn ObjectStore, deployments: &[DeploymentRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_release_waits_for_fork_preparation_archive_hold_and_declared_reference() {
+        use rtdb_directory::{ArchiveSourceHold, ForkPreparation, MemoryDirectory, StorageNamespaces};
+        use rtdb_format::{keys::CURRENT_STORAGE_VERSION, log::proto::PublishedObjectVersion};
+        use rtdb_storage::MemoryStore;
+        use rtdb_types::{PhysicalObjectPublication, ReplicaPosition, S3ObjectNamespace, StorageEpoch, TerminalObjectPublication};
+
+        let directory = MemoryDirectory::new();
+        let owner = Uuid::new_v4();
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let epoch = StorageEpoch(0);
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.holder = Some(MemberId::fresh());
+        record.storage_namespaces = Some(namespaces);
+        record.storage_regions.insert(owner, remote_storage_region(None, None));
+        let record = directory.create_deployment(record).await.unwrap();
+        let scope = format!("{}/{root}", record.storage_prefix());
+        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+        let mut store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
+        Arc::get_mut(&mut store).unwrap().catalog_readers = Some(CatalogReaders::new(
+            directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, owner, Some(record.epoch),
+        ));
+        let store = EncryptingStore::new(store, &[7; 32]).unwrap();
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
+        let body = key(&format!("tables/public$docs/search-runs/{}.f16.arrow", "a".repeat(64)));
+        let physical = key(&format!("{scope}/{body}"));
+        let namespace = S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None };
+        let publication = PublishedObjectVersion::from(PhysicalObjectPublication::Terminal(TerminalObjectPublication {
+            namespace: namespace.clone(), key: physical.to_string(), allocation: namespaces.objects, etag: "etag".into(),
+        }));
+        store.put(&body, Bytes::from_static(b"body")).await.unwrap();
+        assert!(store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+
+        let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
+        directory.change_lineage(&record.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
+        assert!(!store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+
+        let archive = Uuid::new_v4();
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.storage_regions.insert(archive, StorageRegion::ReferenceRead {
+                object: Some(physical.to_string()),
+                custody: ReplayCustody::Hosted { owner: None },
+                archive_source: Some(ArchiveSourceHold::new(namespace.clone(), BTreeMap::from([(physical.to_string(), "version".into())]))),
+            });
+            Ok(())
+        }).await.unwrap();
+        directory.change_lineage(&record.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
+        assert!(!store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        let versioned = |version: &str| PublishedObjectVersion::from(PhysicalObjectVersion {
+            namespace: namespace.clone(), key: physical.to_string(), version: version.into(),
+        });
+        assert!(!store.permits_search_release(&body, Some(&versioned("version")), Some(cut)).await.unwrap());
+        assert!(store.permits_search_release(&body, Some(&versioned("replacement")), Some(cut)).await.unwrap());
+
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.storage_regions.remove(&archive);
+            Ok(())
+        }).await.unwrap();
+        assert!(store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+
+        let mut child = DeploymentRecord::new("child", "acme", vec![], 0);
+        child.lineage.clone_from(&record.lineage);
+        let child = directory.create_deployment(child).await.unwrap();
+        let child_store = format!("{}/{root}", child.storage_prefix());
+        let base = crate::reference::Base { objects: BTreeMap::from([(body.to_string(), scope)]), ..Default::default() };
+        base.initialize(bucket.as_ref(), &child_store).await.unwrap();
+        assert!(!store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert_eq!(store.get(&body).await.unwrap(), Bytes::from_static(b"body"));
+
+        base.forget(bucket.as_ref(), &child_store, &BTreeSet::from([body.to_string()])).await.unwrap();
+        assert!(store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert!(store.release_search_run(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert!(store.list(Some(&body)).await.unwrap().is_empty());
+        assert!(bucket.head(&physical).await.is_ok());
+    }
 
     #[test]
     fn a_receipt_l0_needs_a_recovery_exclusion_and_a_successor() {

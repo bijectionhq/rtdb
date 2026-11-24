@@ -407,6 +407,10 @@ impl ObjectStore for EncryptingStore {
     }
     fn requires_search_publication(&self) -> bool { self.inner.requires_search_publication() }
     fn releases_exact_search_runs(&self) -> bool { self.inner.releases_exact_search_runs() }
+    async fn permits_search_release(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
+        self.inner.permits_search_release(key, publication, cut).await
+    }
     async fn release_search_run(
         &self,
         key: &ObjectKey,
