@@ -38,6 +38,9 @@ pub trait DatabaseEffects: Send + Sync {
 /// The driver, term appender and cloned handles can sample it concurrently.
 pub type ReplicationClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
+// The deployed clocks use the same UTC uncertainty budget as Multi.
+const SERVING_CLOCK_UNCERTAINTY_MICROS: i64 = 250_000;
+
 #[async_trait]
 pub trait ServingSearchBuilder: Send + Sync {
     async fn prepare(&self, snapshot: Snapshot, cancellation: &CancellationToken) -> Result<Option<ServingSearch>>;
@@ -606,14 +609,18 @@ impl ReplicationDriver {
         capacity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
+            self.drive_serving_terminal().await?;
             self.drive_placed_slot()?;
             self.prepare_polls();
             enum Event { ReplicaBatch(PartitionReplay, Result<TailPoll>), Replica, SourceBatch(PartitionReplay, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>), Capacity }
             let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
             let waiting_for_checkpoint = self.waiting_for_checkpoint();
             let placed_open = self.placed_slot.is_some();
+            let serving_timed = self.serving_holds_checkpoint();
+            let serving_recovery = self.serving.as_ref().is_some_and(NativeServing::recovering_timed);
             let accept_commands = self.leader.as_ref().is_none_or(|leader| {
-                (!waiting_for_checkpoint && !placed_open && leader.accepting_commands()) || leader.deferred_commands.len() < 128
+                (!waiting_for_checkpoint && !placed_open && !serving_timed && leader.accepting_commands())
+                    || leader.deferred_commands.len() < 128
             });
             let check_capacity = waiting_for_checkpoint && self.pending_block.is_none()
                 && self.leader.as_ref().is_some_and(|leader| leader.confirmed && leader.accepting());
@@ -623,8 +630,11 @@ impl ReplicationDriver {
             let mut empty_production = None;
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let ready_source = !waiting_for_checkpoint && !placed_open && leader.ready_source();
-                    let ready_deferred = !waiting_for_checkpoint && !placed_open && leader.accepting_commands() && !leader.deferred_commands.is_empty();
+                    let ready_source = !waiting_for_checkpoint && !placed_open && !serving_timed && leader.ready_source();
+                    let ready_deferred = !waiting_for_checkpoint && !placed_open && !serving_recovery && leader.accepting_commands()
+                        && leader.deferred_commands.front().is_some_and(|command| {
+                            !serving_timed || matches!(command, Command::ServingWrite { .. })
+                        });
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
                 }
                 None => (&mut empty_poll, &mut empty_job, &mut empty_resolution, &mut empty_production, false, false),
@@ -718,6 +728,30 @@ impl ReplicationDriver {
     }
     fn waiting_for_checkpoint(&self) -> bool {
         self.deferred_cut || self.required_append_bytes.is_some()
+    }
+
+    fn serving_holds_checkpoint(&self) -> bool {
+        self.serving.as_ref().is_some_and(NativeServing::holds_checkpoint)
+    }
+
+    async fn drive_serving_terminal(&mut self) -> Result<()> {
+        if self.placed_slot.is_some() || !self.leader.as_ref().is_some_and(|leader| {
+            leader.confirmed && leader.cycle.accepting() && leader.resolution.is_none()
+                && leader.awaiting_placed.is_none() && !leader.settling_placed
+        }) { return Ok(()); }
+        let Some(serving) = &mut self.serving else { return Ok(()); };
+        let now = (self.clock)();
+        let upper = Timestamp(now.0.saturating_add(SERVING_CLOCK_UNCERTAINTY_MICROS));
+        let messages = serving.progress_timed(now, upper)?;
+        if messages.is_empty() { return Ok(()); }
+        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+        leader.cycle.resolved(messages.len() as u64)?;
+        let block = self.partition.value().live().block_index();
+        for message in messages {
+            leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;
+        }
+        if leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+        Ok(())
     }
 
     fn adopted_boundary(&self) -> Option<LogOffset> {
@@ -1402,12 +1436,16 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => {
+                    let mut released_checkpoint = false;
                     if let Some(frame) = message.serving_record.as_deref() {
                         if message.src_msg_id.is_some() || message.placed_slot_reservation.is_some() || self.placed_slot.is_some() {
                             return Err(invalid("A serving record occupies its own replica position"));
                         }
                         let own = self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term);
-                        self.serving.as_mut().ok_or_else(serving::unavailable)?.apply(frame, own)?;
+                        let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
+                        let held = serving.holds_checkpoint();
+                        serving.apply(frame, own)?;
+                        released_checkpoint = held && !serving.holds_checkpoint();
                     } else if let Some(wire) = message.placed_slot_reservation.as_deref() {
                         if message.src_msg_id.is_some() || self.placed_slot.is_some() {
                             return Err(invalid("Placed receiver reservations must occupy a fresh control position"));
@@ -1436,6 +1474,9 @@ impl ReplicationDriver {
                         self.progress.applied(message.src_msg_id.map(SourcePosition), None, None)?;
                     }
                     self.complete_control(&record);
+                    if released_checkpoint && self.deferred_cut && self.leader.as_ref().is_some_and(|leader| leader.cycle.accepting()) {
+                        self.cut().await?;
+                    }
                 }
                 ReplicaBody::TriesDeleted(message) => {
                     if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff) {
@@ -1858,7 +1899,8 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn cut(&mut self) -> Result<()> {
-        if self.placed_slot.is_some() || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
+        if self.placed_slot.is_some() || self.serving_holds_checkpoint()
+            || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
             self.deferred_cut = true;
             return Ok(());
         }
@@ -1879,7 +1921,8 @@ impl ReplicationDriver {
     }
 
     fn enqueue_checkpoint_cut(&mut self) -> Result<()> {
-        if self.placed_slot.is_some() || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
+        if self.placed_slot.is_some() || self.serving_holds_checkpoint()
+            || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
             return Ok(());
         }
         self.deferred_cut = false;
@@ -1900,7 +1943,9 @@ impl ReplicationDriver {
             let _ = completion.send(status);
             return Ok(());
         }
-        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some();
+        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some()
+            || self.serving.as_ref().is_some_and(NativeServing::recovering_timed)
+            || self.serving_holds_checkpoint() && !matches!(&command, Command::ServingWrite { .. });
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }

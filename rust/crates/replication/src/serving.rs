@@ -5,7 +5,7 @@ use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
@@ -23,13 +23,13 @@ const LEGACY_FRAME_HEADER_BYTES: usize = 65;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches",
-    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "row-visibility", "tx-status", "sql.history",
+    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, TIMED_TRANSACT, "row-visibility", "tx-status", "sql.history",
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, "branches",
     "changes", "changes.progress-only", "tx-status", "sql.history",
 ];
-const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TRANSACT_REQUIRES, "row-visibility"];
+const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TRANSACT_REQUIRES, TIMED_TRANSACT, "row-visibility"];
 
 pub struct NativeServingScope {
     pub labels: LabelScope,
@@ -152,6 +152,8 @@ pub(crate) struct NativeServing {
     collect_checkpoints: bool,
     writer: Option<(Term, Arc<Mutex<WriterObjects>>)>,
     pending: BTreeMap<u64, Pending>,
+    enqueued_through: u64,
+    terminal: Option<(u64, Bytes)>,
     view: watch::Sender<NativeServingView>,
 }
 
@@ -159,6 +161,7 @@ struct Pending {
     frame: Bytes,
     completion: Completion,
     scope: Option<NativeServingScope>,
+    reconsider: Option<(TransactSubmission, VerifiedClaims)>,
 }
 
 pub(crate) struct ServingCheckpoint {
@@ -225,7 +228,11 @@ impl NativeServing {
             floor: fold.index().head().basis,
             changes: Arc::default(), compatible: true,
         });
-        Ok((Self { authority, fold: Some(fold), position, pipeline: None, deciding: false, collect_checkpoints, writer: None, pending: BTreeMap::new(), view }, receiver))
+        Ok((Self {
+            authority, fold: Some(fold), position, pipeline: None, deciding: false,
+            collect_checkpoints, writer: None, pending: BTreeMap::new(),
+            enqueued_through: position, terminal: None, view,
+        }, receiver))
     }
 
     pub(crate) fn checkpoint(&mut self, term: Term, confirmed: bool) -> Result<ServingCheckpoint> {
@@ -283,10 +290,67 @@ impl NativeServing {
                 Err(error) => { let _ = completion.send(Err(error)); }
                 Ok(Decision::Append { position, record }) => {
                     let frame = frame(position, &record);
-                    self.pending.insert(position, Pending { frame: frame.clone(), completion, scope: request.scope });
-                    messages.push(proto::NoOp { serving_record: Some(frame), ..Default::default() });
+                    self.pending.insert(position, Pending {
+                        frame, completion, scope: request.scope,
+                        reconsider: Some((request.submission, request.claims)),
+                    });
                 }
             }
+        }
+        self.enqueue_ready(&mut messages)?;
+        Ok(messages)
+    }
+
+    fn enqueue_ready(&mut self, messages: &mut Vec<proto::NoOp>) -> Result<()> {
+        loop {
+            let position = self.enqueued_through.checked_add(1).ok_or_else(invalid)?;
+            let Some(pending) = self.pending.get_mut(&position) else { return Ok(()); };
+            self.enqueued_through = position;
+            pending.reconsider = None;
+            messages.push(proto::NoOp { serving_record: Some(pending.frame.clone()), ..Default::default() });
+        }
+    }
+
+    pub(crate) fn holds_checkpoint(&self) -> bool {
+        self.durable().recover_pending().is_some()
+            || self.pipeline.as_ref().is_some_and(|pipeline| pipeline.awaiting_terminal().next().is_some())
+    }
+
+    pub(crate) fn recovering_timed(&self) -> bool {
+        self.pipeline.is_none() && self.durable().recover_pending().is_some()
+    }
+
+    pub(crate) fn progress_timed(&mut self, now: Timestamp, clock_upper: Timestamp) -> Result<Vec<proto::NoOp>> {
+        let Some(refusal @ TransactionRecord::Refuse { tx_lsn }) = self.durable().recover_pending() else {
+            return Ok(Vec::new());
+        };
+        if self.terminal.is_some() { return Ok(Vec::new()); }
+        let position = self.next_position()?;
+        let mut reconsider = Vec::new();
+        let record = match &mut self.pipeline {
+            Some(pipeline) => {
+                let terminal = pipeline.terminal(tx_lsn, clock_upper)?;
+                if terminal.position != position { return Err(invalid()); }
+                if !terminal.redecide.is_empty() {
+                    let dropped = self.pending.split_off(&position);
+                    if dropped.len() != terminal.redecide.len() { return Err(invalid()); }
+                    for pending in dropped.into_values() {
+                        let (submission, claims) = pending.reconsider.ok_or_else(invalid)?;
+                        reconsider.push((NativeRequest { submission, claims, scope: pending.scope }, pending.completion));
+                    }
+                }
+                terminal.record
+            }
+            None => refusal.encode()?,
+        };
+        let frame = frame(position, &record);
+        self.terminal = Some((position, frame.clone()));
+        self.enqueued_through = position;
+        let mut messages = vec![proto::NoOp { serving_record: Some(frame), ..Default::default() }];
+        if reconsider.is_empty() {
+            self.enqueue_ready(&mut messages)?;
+        } else {
+            messages.extend(self.decide_batch(now, reconsider)?);
         }
         Ok(messages)
     }
@@ -294,14 +358,23 @@ impl NativeServing {
     pub(crate) fn apply(&mut self, frame: &[u8], own: bool) -> Result<()> {
         let (position, bytes) = decode(frame)?;
         if position != self.next_position()? { return Err(invalid()); }
-        if own && self.pending.get(&position).is_none_or(|entry| entry.frame.as_ref() != frame) { return Err(invalid()); }
+        let own_terminal = own && self.terminal.as_ref().is_some_and(|(at, expected)| *at == position && expected.as_ref() == frame);
+        if own && !own_terminal && self.pending.get(&position).is_none_or(|entry| entry.frame.as_ref() != frame) {
+            return Err(invalid());
+        }
         let receipts = match &mut self.pipeline {
             Some(pipeline) if own => pipeline.acknowledge(position)?,
             Some(pipeline) => pipeline.recover(position, bytes)?.into_iter().collect(),
             None => self.fold.as_mut().ok_or_else(invalid)?.apply(position, TransactionRecord::decode(bytes)?)?.into_iter().collect(),
         };
-        if receipts.len() != 1 || receipts[0].basis.position() != position { return Err(invalid()); }
         self.position = position;
+        self.enqueued_through = self.enqueued_through.max(position);
+        if own_terminal { self.terminal = None; }
+        let mut receipts = receipts.into_iter();
+        let Some(receipt) = receipts.next() else {
+            return if self.durable().recover_pending().is_some() { Ok(()) } else { Err(invalid()) };
+        };
+        if receipts.next().is_some() || receipt.basis.position() != position { return Err(invalid()); }
         let index = self.durable().index();
         let cut = index.head();
         let changes = index.writes_at(cut.basis);
@@ -315,9 +388,12 @@ impl NativeServing {
             retained.push_back((cut, changes));
         });
         if own {
-            let receipt = receipts.into_iter().next().expect("one ordinary receipt");
-            let pending = self.pending.remove(&position).ok_or_else(invalid)?;
-            let _ = pending.completion.send(self.project_receipt(receipt, pending.scope.as_ref()));
+            let original = if own_terminal { position - 1 } else { position };
+            if let Some(pending) = self.pending.remove(&original) {
+                let _ = pending.completion.send(self.project_receipt(receipt, pending.scope.as_ref()));
+            } else if !own_terminal {
+                return Err(invalid());
+            }
         }
         Ok(())
     }
@@ -341,9 +417,11 @@ impl NativeServing {
     }
 
     pub(crate) fn withdraw(&mut self) {
-        if let Some(pipeline) = &mut self.pipeline {
-            let _ = pipeline.withdraw();
+        if let Some(pipeline) = self.pipeline.take() {
+            self.fold = Some(pipeline.into_durable());
         }
+        self.enqueued_through = self.position;
+        self.terminal = None;
         self.deciding = false;
         for (_, entry) in std::mem::take(&mut self.pending) {
             let _ = entry.completion.send(Err(interrupted()));
@@ -442,6 +520,68 @@ mod tests {
 
     fn unscoped(submission: TransactSubmission) -> NativeRequest {
         NativeRequest { submission, claims: VerifiedClaims::default(), scope: None }
+    }
+
+    #[tokio::test]
+    async fn timed_terminal_gates_replies_and_the_speculative_suffix() {
+        for (upper, settled) in [(Timestamp(55), true), (Timestamp(80), false)] {
+            let (mut leader, view) = NativeServing::open(authority(), None, false).unwrap();
+            let (mut follower, _) = NativeServing::open(authority(), None, false).unwrap();
+            let mut request = put(1);
+            request.transaction.window.before = Some(Timestamp(80));
+            let (done, mut result) = oneshot::channel();
+            let (later_done, mut later_result) = oneshot::channel();
+            let mut messages = leader.decide_batch(Timestamp(50), vec![
+                (unscoped(request), done),
+                (unscoped(put(2)), later_done),
+            ]).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert!(leader.holds_checkpoint());
+            let original = messages.pop().unwrap().serving_record.unwrap();
+            leader.apply(&original, true).unwrap();
+            follower.apply(&original, false).unwrap();
+            assert!(result.try_recv().is_err());
+            assert!(later_result.try_recv().is_err());
+            assert_eq!(view.borrow().index.head().basis.position(), 0);
+            assert_eq!(leader.status(&[1; 16], None).unwrap_err().code, "rtdb/transaction-pending");
+
+            let messages = leader.progress_timed(Timestamp(55), upper).unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(result.try_recv().is_err());
+            let terminal = messages[0].serving_record.as_deref().unwrap();
+            leader.apply(terminal, true).unwrap();
+            follower.apply(terminal, false).unwrap();
+            let receipt = result.await.unwrap().unwrap();
+            assert_eq!(receipt.basis.position(), 2);
+            assert_eq!(matches!(receipt.outcome, rtdb_tx::transact::Outcome::Then), settled);
+            assert_eq!(leader.status(&[1; 16], None).unwrap(), follower.status(&[1; 16], None).unwrap());
+            assert!(later_result.try_recv().is_err());
+            let later = messages[1].serving_record.as_deref().unwrap();
+            leader.apply(later, true).unwrap();
+            follower.apply(later, false).unwrap();
+            assert_eq!(later_result.await.unwrap().unwrap().basis.position(), 3);
+            assert!(!leader.holds_checkpoint());
+        }
+    }
+
+    #[tokio::test]
+    async fn takeover_refuses_the_replayed_original_even_inside_the_window() {
+        let (mut serving, _) = NativeServing::open(authority(), None, false).unwrap();
+        let mut request = put(1);
+        request.transaction.window.before = Some(Timestamp(80));
+        let (done, result) = oneshot::channel();
+        let message = serving.decide_batch(Timestamp(50), vec![(unscoped(request), done)])
+            .unwrap().remove(0).serving_record.unwrap();
+        serving.withdraw();
+        assert_eq!(result.await.unwrap().unwrap_err().category, AnomalyCategory::Interrupted);
+        serving.apply(&message, false).unwrap();
+        assert!(serving.recovering_timed());
+        let terminal = serving.progress_timed(Timestamp(51), Timestamp(52)).unwrap()
+            .remove(0).serving_record.unwrap();
+        serving.apply(&terminal, true).unwrap();
+        assert!(!serving.recovering_timed());
+        assert!(matches!(serving.status(&[1; 16], None).unwrap().outcome,
+            rtdb_tx::transact::Outcome::Refused { error } if error.code == "rtdb/timed-transaction-refused"));
     }
 
     #[tokio::test]

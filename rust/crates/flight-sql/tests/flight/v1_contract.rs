@@ -1498,6 +1498,11 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     assert_eq!(validated.basis, first.basis);
     let second_request = v1::TransactRequest {
         key: vec![3; 16],
+        require: vec![rtdb_tx::transact::TIMED_TRANSACT.into()],
+        window: Some(v1::Window {
+            not_before_micros: None,
+            before_micros: Some(running.node.now().0.saturating_add(30_000_000)),
+        }),
         ops: vec![v1::Op { op: Some(v1::op::Op::Fork(v1::Fork {
             child: "trial".into(), writable: true, expires_at_micros: None,
             from: Some(v1::BranchBasis { branch: "main".into(), basis: first.basis.clone() }),
@@ -1505,7 +1510,7 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
         ..Default::default()
     };
     let second = transact_wire(&mut client, second_request.clone()).await.unwrap();
-    assert_eq!(Basis::from_bytes(&second.basis.as_ref().unwrap().value).unwrap(), Basis::new(incarnation, 2));
+    assert_eq!(Basis::from_bytes(&second.basis.as_ref().unwrap().value).unwrap(), Basis::new(incarnation, 3));
     read.source.as_mut().unwrap().at = Some(v1::At { selection: second.basis.clone().map(Selection::AtLeast) });
     read.source.as_mut().unwrap().branch = "trial".into();
     assert_eq!(ints(&query(&mut client, read.clone()).await.0), [10, 20]);

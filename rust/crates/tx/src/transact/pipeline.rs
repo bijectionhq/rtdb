@@ -108,6 +108,8 @@ impl TransactPipeline {
     /// The acknowledged state. Reads, `TxStatus` and checkpoints use only this.
     pub fn durable(&self) -> &TransactState { &self.durable }
 
+    pub fn into_durable(self) -> TransactState { self.durable }
+
     pub fn next_position(&self) -> u64 { self.next_position }
 
     pub fn in_flight(&self) -> usize { self.in_flight.len() }
