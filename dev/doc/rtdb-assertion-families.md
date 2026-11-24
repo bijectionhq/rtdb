@@ -283,6 +283,8 @@ The private acceptance names that audience commitment and orders its current aut
 The initial admitted case is one unindexed, acceptance-valid keyed creation on an unchanged Root publication.
 The exact key must retain the reviewed protected incarnation and have no Root winner.
 The original registered execution receipt authenticates the sealed review commitment and the guest rerun command, which is sealed under the source family.
+The replay ciphertext has a fresh derived stage at the authoring Proposal, with relation `bj_fact_root_admission` and a 64-byte lowercase hexadecimal receipt-and-position commitment as its slot.
+The original vault admits this slot only at a live Proposal and includes its capability in the ordinary family fence inventory.
 The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
 The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
 
