@@ -652,7 +652,6 @@ impl TreeFile {
     }
 
     pub(super) async fn term_pages(&self, column: u32, names: &[String]) -> Result<Vec<Option<RecordBatch>>> {
-        use futures::{FutureExt, TryStreamExt};
         if self.format >= PACKED_FORMAT_VERSION && !table(&self.root, Table::Terms).is_empty() {
             return Ok(names.iter().map(|_| Some(self.root.clone())).collect());
         }
@@ -662,26 +661,10 @@ impl TreeFile {
             let mut positions: Vec<_> = names.iter().enumerate().map(|(i, name)| (term_key(column, name), i)).collect();
             positions.sort_unstable();
             let keys: Vec<_> = positions.iter().map(|(key, _)| key.as_slice()).collect();
-            match self.reader.find_sorted_keys(self.directories[&TERM], &keys).await {
-                Ok(pages) => {
-                    let mut requests = vec![None; names.len()];
-                    for ((_, position), page) in positions.into_iter().zip(pages) { requests[position] = page; }
-                    requests
-                },
-                Err(_) => {
-                    let mut in_flight = futures::stream::FuturesOrdered::new();
-                    let mut requests = Vec::with_capacity(names.len());
-                    for name in names {
-                        let key = term_key(column, name);
-                        in_flight.push_back(async move { self.reference(TERM, &key).await }.boxed());
-                        if in_flight.len() == 8 {
-                            requests.push(in_flight.try_next().await?.expect("queued term returns its reference"));
-                        }
-                    }
-                    while let Some(reference) = in_flight.try_next().await? { requests.push(reference); }
-                    requests
-                },
-            }
+            let pages = self.reader.find_sorted_keys(self.directories[&TERM], &keys).await?;
+            let mut requests = vec![None; names.len()];
+            for ((_, position), page) in positions.into_iter().zip(pages) { requests[position] = page; }
+            requests
         };
         let unique = requests.iter().flatten().copied().collect::<BTreeSet<_>>().into_iter().collect();
         let pages = self.reader.pages(unique, PageKind::Terms).await?;
@@ -805,11 +788,16 @@ impl TreeFile {
 
     pub(crate) async fn documents(&self) -> Result<Vec<LogicalDocument>> {
         let mut documents = Vec::new();
-        self.visit_documents(|document| { documents.push(document); Ok(()) }).await?;
+        self.visit_document_pages(|page| {
+            for document in page { documents.push(document?); }
+            Ok(())
+        }).await?;
         Ok(documents)
     }
 
-    pub(crate) async fn visit_documents(&self, mut visit: impl FnMut(LogicalDocument) -> Result<()> + Send) -> Result<()> {
+    pub(crate) async fn visit_document_pages(
+        &self, mut visit: impl FnMut(&mut dyn ExactSizeIterator<Item = Result<LogicalDocument>>) -> Result<()> + Send,
+    ) -> Result<()> {
         use rtdb_columnar::EntityIdRef;
         if self.format != LOGICAL_FORMAT_VERSION { return Err(corrupt("Expected a logical search run")); }
         let records = self.reader.leaves(self.directories[&DOCUMENT]).await?;
@@ -826,17 +814,18 @@ impl TreeFile {
             let fields = sequences.column(0).as_primitive::<UInt32Type>();
             let revisions = sequences.column(1).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search revision layout");
             let tokens = sequences.column(2).as_list::<i64>();
-            for row in 0..sequences.len() {
+            let mut documents = (0..sequences.len()).map(|row| {
                 let sql_id = if ids.is_valid(row) {
                     match EntityIdRef::from_handle_bytes(ids.value(row))? { EntityIdRef::Integer(id) => Some(id), _ => None }
                 } else { None };
-                visit(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
+                Ok(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
                     field: fields.value(row) as usize, revision: revisions.value(row).try_into().map_err(fault)?,
                     tokens: tokens.value(row).as_string::<i32>().clone(),
                     position: (Timestamp(sequences.column(3).as_primitive::<Int64Type>().value(row)),
                         super::read_event_position(sequences.column(5).as_ref(), row),
-                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) })?;
-            }
+                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) })
+            });
+            visit(&mut documents)?;
         }
         Ok(())
     }
@@ -883,6 +872,43 @@ mod tests {
     use rtdb_text::{Query, Scorer};
     fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Interval, TemporalBounds, Timestamp};
+
+    #[tokio::test]
+    async fn term_routing_reports_corruption_without_recharging_a_warm_ancestor() -> Result<()> {
+        use rtdb_storage::{MemoryStore, audience_work::{self, Limits}};
+
+        let key = term_key(0, "invoice");
+        let child = |page| Child { lower: key.clone(), upper: key.clone(), page };
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(&mut bytes, TREE_FORMAT_VERSION)?;
+        let leaf = writer.page([])?;
+        let lower = write_directory(&mut writer, vec![child(leaf)])?.page;
+        let root = write_directory(&mut writer, vec![child(lower)])?.page;
+        writer.finish()?;
+        bytes[lower.range()?.start as usize] ^= 1;
+        let length = bytes.len();
+        let pool = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), length));
+        let owner = PageOwner::new(&pool, ObjectKey::new("search/corrupt-term-directory")?, Arc::new(PageCache::new(length)));
+        let source = PageSource::Local { bytes: Buffer::from_vec(bytes), owner: Some(owner) };
+        let reader = TreeReader::new(source, length as u64, TREE_FORMAT_VERSION);
+        reader.page(root, PageKind::Directory).await?;
+        let tree = TreeFile {
+            reader,
+            root: RecordBatch::new_empty(Arc::clone(super::super::layout::schema(TREE_FORMAT_VERSION))),
+            directories: BTreeMap::from([(TERM, DirectoryRef { page: root, height: 2 })]),
+            routes: BTreeMap::new(),
+            format: TREE_FORMAT_VERSION,
+        };
+        let bytes_for = |page: PageRef| page.metadata as usize + page.body as usize;
+        let limits = Limits {
+            provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 0,
+            decode_bytes: bytes_for(root) + bytes_for(lower),
+        };
+        let names = ["invoice".to_owned()];
+        let error = audience_work::within(Some(limits), tree.term_pages(0, &names)).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.search/corrupt-file");
+        Ok(())
+    }
 
     #[test]
     fn row_run_pages_share_contiguous_buffers_and_preserve_ipc_bytes() -> Result<()> {

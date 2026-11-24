@@ -43,7 +43,31 @@ impl Default for Budget {
 pub struct Round { pub candidates: BTreeSet<Iid>, pub complete: bool }
 
 /// An opened generation and its clusters eligible under the partition filter, nearest centroid first.
-struct Opened { key: ObjectKey, clusters: Vec<Cluster>, order: Vec<usize>, probed: usize }
+struct Opened {
+    key: ObjectKey,
+    clusters: Vec<Cluster>,
+    probed: usize,
+    _allocation: Arc<MemoryReservation>,
+}
+
+impl Opened {
+    fn rank(key: &ObjectKey, directory: &Directory, probe: &[f32], partition: Option<Partition>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let eligible = || (0..directory.len()).filter(|&row| partition.is_none_or(|partition| directory.partition(row) == partition));
+        let count = eligible().count();
+        if count == 0 { return Ok(None); }
+        let held = (2 * size_of::<Self>()).saturating_add(key.as_str().len()).saturating_add(count.saturating_mul(size_of::<Cluster>()));
+        let bytes = held.saturating_add(count.saturating_mul(size_of::<(f64, usize)>()));
+        let mut allocation = memory.reserve(bytes)?;
+        let mut order = Vec::with_capacity(count);
+        order.extend(eligible().map(|row| (rows::unit_distance(probe, directory.centroid(row)), row)));
+        order.sort_unstable_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut clusters = Vec::with_capacity(count);
+        clusters.extend(order.iter().map(|&(_, row)| directory.cluster(row)));
+        drop(order);
+        Arc::get_mut(&mut allocation).expect("directory ranking owns its reservation").shrink_to(held)?;
+        Ok(Some(Self { key: key.clone(), clusters, probed: 0, _allocation: allocation }))
+    }
+}
 
 /// The nearest candidates of a probe across a definition's published generations and the frontier above them.
 /// Each round probes further clusters; the caller resolves the candidates at its cut and widens the shortlist
@@ -77,11 +101,9 @@ impl Shortlist {
             let bytes = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
             let directory = Directory::read(Buffer::from(Bytes::from_owner(bytes)), locator)?;
             if directory.dimensions != definition.dimensions { return Ok(None); }
-            let mut order: Vec<(f64, usize)> = directory.clusters.iter().enumerate()
-                .filter(|(_, cluster)| partition.is_none_or(|partition| cluster.partition == partition))
-                .map(|(index, cluster)| (rows::unit_distance(&probe, directory.centroid(cluster)), index)).collect();
-            order.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
-            opened.push(Opened { key: key.clone(), clusters: directory.clusters, order: order.into_iter().map(|(_, index)| index).collect(), probed: 0 });
+            if let Some(generation) = Opened::rank(key, &directory, &probe, partition, cut.memory)? {
+                opened.push(generation);
+            }
         }
         Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, scores, opened }))
     }
@@ -91,13 +113,11 @@ impl Shortlist {
         let bounds = cut.bounds;
         let dimensions = self.probe.len();
         for generation in &mut self.opened {
-            let probes = self.plan.probes(generation.order.len());
+            let probes = self.plan.probes(generation.clusters.len());
             let start = generation.probed.min(probes);
             generation.probed = generation.probed.max(probes);
             let key = &generation.key;
-            let clusters = &generation.clusters;
-            let blocks = futures::stream::iter(generation.order[start..probes].iter().copied().map(|index| {
-                let cluster = &clusters[index];
+            let blocks = futures::stream::iter(generation.clusters[start..probes].iter().map(|cluster| {
                 async move {
                     let bytes = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
                     Block::read(Buffer::from(Bytes::from_owner(bytes)), cluster, dimensions)
@@ -115,7 +135,7 @@ impl Shortlist {
             }
         }
         let Some((candidates, truncated)) = self.scores.nearest(self.plan.target()) else { return Ok(None) };
-        let complete = !truncated && self.opened.iter().all(|generation| generation.probed >= generation.order.len());
+        let complete = !truncated && self.opened.iter().all(|generation| generation.probed >= generation.clusters.len());
         Ok(Some(Round { candidates, complete }))
     }
 
@@ -279,6 +299,46 @@ mod tests {
 
     use super::*;
     use crate::definition::{Approximate, Method};
+
+    #[test]
+    fn directory_ranking_funds_only_the_selected_partitions_and_keeps_the_grants() {
+        use crate::{file::write_generation, rows::IndexedRows};
+        use rtdb_types::{EventHeader, EventOp};
+
+        let mut rows = IndexedRows::new(2);
+        let selected = Partition([1; 32]);
+        for id in 0..20u8 {
+            let partition = if id < 5 { selected } else { Partition([id; 32]) };
+            let header = EventHeader {
+                position: None, iid: Iid([id; 16]), system_from: Timestamp(0), commit_position: 0,
+                valid_time: Interval::ALL, op: EventOp::Put,
+            };
+            rows.push_unit(header, partition, &[1.0, 0.0]);
+        }
+        let mut bytes = Vec::new();
+        let locator = write_generation(rows, &mut bytes, &CancellationToken::new()).unwrap().locator;
+        let range = locator.directory_range();
+        let directory = Directory::read(Buffer::from_slice_ref(&bytes[range.start as usize..range.end as usize]), &locator).unwrap();
+        let expected: Vec<_> = (0..directory.len()).filter(|&row| directory.partition(row) == selected)
+            .map(|row| directory.cluster(row).range).collect();
+        assert!(!expected.is_empty() && expected.len() < directory.len());
+        let first = ObjectKey::new("ivf/generation-1").unwrap();
+        let second = ObjectKey::new("ivf/generation-2").unwrap();
+        let budget = MemoryBudget::new(1 << 20);
+        let a = Opened::rank(&first, &directory, &[1.0, 0.0], Some(selected), &budget).unwrap().unwrap();
+        let b = Opened::rank(&second, &directory, &[1.0, 0.0], Some(selected), &budget).unwrap().unwrap();
+        assert_eq!(a.clusters.iter().map(|cluster| cluster.range.clone()).collect::<Vec<_>>(), expected);
+        assert_eq!(budget.used_bytes(), a._allocation.bytes() + b._allocation.bytes());
+        drop(a);
+        assert_eq!(budget.used_bytes(), b._allocation.bytes());
+        drop(b);
+        assert_eq!(budget.used_bytes(), 0);
+
+        let limited = MemoryBudget::new(1);
+        let refused = Opened::rank(&first, &directory, &[1.0, 0.0], Some(selected), &limited).err().unwrap();
+        assert!(declined(&refused));
+        assert_eq!(limited.used_bytes(), 0);
+    }
 
     fn definition() -> VectorDefinition {
         VectorDefinition {

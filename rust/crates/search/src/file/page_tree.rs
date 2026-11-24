@@ -471,6 +471,8 @@ impl TreeReader {
 
     pub(super) async fn find_sorted_keys<K: AsRef<[u8]> + Sync>(&self, directory: DirectoryRef, keys: &[K]) -> Result<Vec<Option<PageRef>>> {
         if keys.is_empty() { return Ok(Vec::new()); }
+        // Bounded audience reads spend their allowance on one page at a time.
+        let concurrency = if audience_work::is_bounded() { 1 } else { 8 };
         let mut level = vec![(directory.page, 0..keys.len())];
         for _ in 0..directory.height {
             level = futures::stream::iter(level).map(|(page, rows)| async move {
@@ -483,7 +485,7 @@ impl TreeReader {
                     if first < last { following.push((child.page, rows.start + first..rows.start + last)); }
                 }
                 Ok::<_, rtdb_types::Anomaly>(following)
-            }).buffered(8).try_concat().await?;
+            }).buffered(concurrency).try_concat().await?;
         }
         let mut found = vec![None; keys.len()];
         for (page, rows) in level { found[rows].fill(Some(page)); }
