@@ -166,6 +166,10 @@ impl WorldProjectionCustody {
         Self { keys, deployment, incarnation, region: IoRegion::new(), original, cancellation }
     }
 
+    pub(super) async fn require_live_original(&self) -> Result<()> {
+        self.original.current(self.deployment, &self.cancellation).await.map(drop)
+    }
+
     async fn row<'a>(
         &self, relation: &OwnedRelation, id: &EntityId, fact: Option<&'a WorldFact>, memory: &Arc<MemoryBudget>, historical: bool,
     ) -> Result<SearchRow<'a>> {

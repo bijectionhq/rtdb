@@ -719,12 +719,23 @@ impl HeldCheckpointWorld {
 
     pub async fn parent_point_at(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, system: Timestamp,
+        original_scope: Option<PlacedAttemptScope>,
     ) -> Result<Option<WorldFact>> {
         self.check_relation(relation)?;
         if system > self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
-        let schema = self.historical_parent_schema(relation)?;
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let schema = if relation.name() == "fact_unit_column_payloads" {
+            if self.ancestor().is_some() || !original_scope.is_some_and(|scope| witness.matches_scope(scope)) {
+                return Err(OwnedWorld::unavailable());
+            }
+            let schema = self.world_point_schema(relation)?;
+            if !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
+            self.projections.require_live_original().await?;
+            schema
+        } else {
+            self.historical_parent_schema(relation)?
+        };
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, system).await?;
         let valid = Interval::at(valid)?;
         let (reply, result) = oneshot::channel();

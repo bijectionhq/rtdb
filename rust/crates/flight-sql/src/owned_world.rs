@@ -287,6 +287,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<Timestamp>>>;
     fn parent_point_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
+        original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn preflight_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], system: Timestamp,
