@@ -340,6 +340,9 @@
 -- The owner lowers those values to the installed catalog relation layout and submits the caller's ordered guards, rows and optional attempt marker in one SQL transaction under the caller's database authority.
 -- A synchronous reply carries the exact transaction ID, ordered system timestamp, session await token and ordered outcome, including the first reached assertion refusal.
 -- An interrupted response leaves the transaction outcome to the attempt marker and durable source observation.
+-- An ordinary authenticated Flight session may read a bound catalog projection through ScanCatalog.v1 under the SQL snapshot issued to the same principal and database.
+-- The held snapshot supplies the original read cut and clock, and each streamed Arrow result frame requires its delivery grant.
+-- The packed hosted decision accepts related Arrow runs in a shared stream and restores their scheduled order before the existing decision, control, and source admission.
 --
 -- == Boundaries ==
 --

@@ -8,7 +8,7 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
-pub(crate) use owned_batch::OWNED_IPC_HEADER;
+pub(crate) use owned_batch::{IpcFrames, OWNED_IPC_HEADER};
 
 use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
@@ -80,6 +80,15 @@ impl Service {
         use rtdb_storage::audience_work;
         if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
             return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
+        }
+        if action.r#type == crate::catalog_actions::SCAN_CATALOG {
+            if !self.0.config.owned_native_actions || !ipc_stream {
+                return Err(call.error(unsupported()));
+            }
+            if call.session.audience_source().is_some() {
+                return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
+            }
+            return self.scan_catalog_action(call, action.body).await;
         }
         if let Some(batch) = owned_batch::BatchKind::for_action(&action.r#type) {
             if call.session.audience_source().is_some() {
@@ -156,9 +165,15 @@ impl Service {
                 crate::catalog_actions::WATCH_RELATION => Ok(vec![Ok(Box::pin(self.watch_relation_action(&call, action.body)).await?)]),
                 crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
                 crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECIDE_HOSTED_V4 | crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1 => {
-                    let import_page = action_type == crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1;
-                    Ok(vec![Ok(self.decide_hosted_action(&call, &action.body, import_page).await?)])
+                crate::owned_actions::DECIDE_HOSTED_V4 | crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1
+                | crate::owned_actions::DECIDE_HOSTED_PACKED_V1 => {
+                    use crate::owned_actions::HostedDecisionWire;
+                    let wire = match action_type {
+                        crate::owned_actions::DECIDE_HOSTED_V4 => HostedDecisionWire::Original,
+                        crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1 => HostedDecisionWire::ImportPage,
+                        _ => HostedDecisionWire::Packed,
+                    };
+                    Ok(vec![Ok(self.decide_hosted_action(&call, &action.body, wire).await?)])
                 }
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),

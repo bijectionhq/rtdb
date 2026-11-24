@@ -1048,6 +1048,11 @@ Another eligible receiver can validate it after the original Flight session clos
 The deadline follows, with the physical cutoff and receiver clock certificate digest present when requested.
 The final streams contain the primary facts and hosted controls.
 
+`rtdb.owned.DecideHostedPacked.v1` uses the `DecideHosted.v4` envelope and controls, including the original refusal groups.
+Its primary facts section starts with a big-endian u16 run count and u16 stream count, followed by one u16 stream index per run in original execution order.
+Each stream has the ordinary relation and u32 IPC length framing and carries one Arrow batch for each scheduled occurrence of that stream.
+The owner expands this schedule before the shared decision path so interleaved operations keep their original ordinals.
+
 `rtdb.owned.DecideHostedImportPage.v1` uses the same authority, deadline, range evidence, and control checks as an ordinary live `DecideHosted.v4` with zero flags.
 Its length-prefixed fact stream begins with a big-endian u16 placement count and that many pairs of big-endian u16 values.
 Each pair names the number of inline runs preceding it and the number of consecutive page rows it consumes.
@@ -1120,6 +1125,9 @@ The placed Root fork form with clock selector 11 takes a public marker's origina
 == Catalog publication and watches
 
 The normal owned listener advertises `rtdb.owned.PublishCatalog.v1` and `rtdb.owned.WatchRelation.v1` through ListActions.
+It also advertises `rtdb.owned.ScanCatalog.v1`, which accepts a catalog statement with one Arrow argument row and the original SQL snapshot token as its first argument.
+It reads through that admitted snapshot under the caller's database authority and streams one result per Arrow IPC message when the request offers `x-rtdb-owned-ipc: stream-v1`.
+The existing catalog index stores its original hex keys for mixed client releases.
 Both actions use the database of the authenticated Flight session.
 
 For publication, the protobuf body has repeated preceding SQL statements (field 1), the Arrow IPC stream (bytes field 2) and an optional trailing marker statement (field 3).

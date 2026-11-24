@@ -203,7 +203,7 @@ fn ipc_message(body: &[u8]) -> Result<(usize, MessageHeader), Status> {
     Ok((8 + length + body_size, message.header_type()))
 }
 
-pub(super) struct IpcFrames(pub Bytes);
+pub(crate) struct IpcFrames(pub Bytes);
 
 impl Iterator for IpcFrames {
     type Item = Result<ActionResult, Status>;

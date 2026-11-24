@@ -2,11 +2,13 @@ mod hosted_control;
 mod prepared_landing;
 mod hosted_observation;
 mod import_page;
+mod packed_groups;
 mod unique;
 
 pub(crate) use hosted_control::{READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1, READ_HELD_HOSTED_CONTROL_V3, READ_HELD_ROOT_CATALOG_V1};
 pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, CONFIRM_HOSTED_SOURCE_V1, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
 pub(crate) use import_page::DECIDE_HOSTED_IMPORT_PAGE_V1;
+pub(crate) use packed_groups::DECIDE_HOSTED_PACKED_V1;
 pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
@@ -40,6 +42,13 @@ use crate::{
 pub(crate) const SEAL_HOSTED_RANGES_V1: &str = "rtdb.owned.SealHostedRanges.v1";
 pub(crate) const VALIDATE_FRESH_HOSTED_V1: &str = "rtdb.owned.ValidateFreshHosted.v1";
 pub(crate) const DECIDE_HOSTED_V4: &str = "rtdb.owned.DecideHosted.v4";
+
+#[derive(Clone, Copy)]
+pub(crate) enum HostedDecisionWire {
+    Original,
+    ImportPage,
+    Packed,
+}
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
@@ -1265,7 +1274,7 @@ impl Service {
     }
 
     pub(crate) async fn decide_hosted_action(
-        &self, call: &Call, envelope: &Bytes, import_page: bool,
+        &self, call: &Call, envelope: &Bytes, wire: HostedDecisionWire,
     ) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
         let (authority, body) = Self::installed_authority(envelope)?;
@@ -1274,7 +1283,7 @@ impl Service {
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
             return Err(invalid("Invalid hosted decision flags"));
         }
-        if import_page && *flags != 0 {
+        if matches!(wire, HostedDecisionWire::ImportPage) && *flags != 0 {
             return Err(invalid("A hosted import page requires an ordinary Root decision"));
         }
         let counted = *flags & 1 != 0;
@@ -1314,13 +1323,13 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, import_page).await
+        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, wire).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
-        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, import_page: bool,
+        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, format: HostedDecisionWire,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1345,18 +1354,28 @@ impl Service {
         let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
         let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
             .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
-        let (page, facts) = if import_page {
-            let (page, inline) = import_page::ImportPage::split(call, facts)?;
-            (Some(page), inline)
-        } else {
-            (None, facts)
+        let mut page = None;
+        let mut packed = None;
+        let facts = match format {
+            HostedDecisionWire::Original => facts,
+            HostedDecisionWire::ImportPage => {
+                let (import, inline) = import_page::ImportPage::split(call, facts)?;
+                page = Some(import);
+                inline
+            }
+            HostedDecisionWire::Packed => {
+                packed = Some(packed_groups::PackedGroups::parse(call, facts)?);
+                &[0, 0]
+            }
         };
         let fact_groups = ordered_group_count(facts)?;
         let _framing = call.reserve((fact_groups + MAX_COMMIT_GROUPS) * 512)?;
         let facts = owned_groups(facts, false, true)?;
         let controls = owned_groups(controls, true, false)?;
         let fact_relations = facts.iter().map(|(relation, _)| relation)
-            .chain(page.iter().map(import_page::ImportPage::relation)).collect::<BTreeSet<_>>();
+            .chain(page.iter().map(import_page::ImportPage::relation))
+            .chain(packed.iter().flat_map(packed_groups::PackedGroups::relations))
+            .collect::<BTreeSet<_>>();
         if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS {
             return Err(Status::permission_denied("Hosted control targets are outside the installed allowlist"));
         }
@@ -1402,6 +1421,8 @@ impl Service {
         let _facts = if let Some(page) = page {
             if replay { return Err(invalid("A hosted import page requires a live Root decision")); }
             page.decode(self, call, envelope, facts, &mut writes, &mut rows_left, effects)?
+        } else if let Some(packed) = packed {
+            packed.decode(self, call, envelope, &mut writes, &mut rows_left, effects)?
         } else {
             self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?
         };

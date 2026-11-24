@@ -6,21 +6,23 @@ use arrow_array::{
 };
 use arrow_buffer::Buffer;
 use arrow_flight::Result as ActionResult;
+use arrow_ipc::writer::StreamWriter;
 use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::ipc::OwnedStream;
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{LogicalType, ScalarType, TableRef, Value};
-use tonic::Status;
+use tonic::{Response, Status};
 
 use crate::{
     error::{arrow, cancelled, invalid, status, unsupported},
-    service::{Call, Service},
+    service::{Call, Output, Service},
     wire,
 };
 
 pub(crate) const PUBLISH_CATALOG: &str = "rtdb.owned.PublishCatalog.v1";
+pub(crate) const SCAN_CATALOG: &str = "rtdb.owned.ScanCatalog.v1";
 pub(crate) const WATCH_RELATION: &str = "rtdb.owned.WatchRelation.v1";
 const MAX_BODY: usize = 32 << 20;
 const INSERT_ROWS: usize = 128;
@@ -162,6 +164,108 @@ impl Service {
         Ok(ActionResult {
             body: wire::retain(receipt.encode_to_vec(), charge),
         })
+    }
+
+    pub(crate) async fn scan_catalog_action(
+        &self,
+        call: Call,
+        body: Bytes,
+    ) -> Result<Response<Output<ActionResult>>, Status> {
+        let open = async {
+            if body.len() > MAX_BODY {
+                return Err(Status::resource_exhausted("Catalog scan exceeds its request limit"));
+            }
+            let _request = call.reserve(wire::add(wire::mul(body.len(), 2)?, 4096)?)?;
+            let Statement { sql, args } = Statement::decode(body).map_err(arrow)?;
+            let stream = OwnedStream::read_buffer(Buffer::from(args), call.memory()).map_err(status)?;
+            let [batch] = stream.pages() else {
+                return Err(invalid("Expected one catalog scan argument batch"));
+            };
+            if batch.batch().num_rows() != 1
+                || batch.batch().columns().first()
+                    .and_then(|arg| arg.as_any().downcast_ref::<StringArray>())
+                    .is_none_or(|tokens| tokens.is_null(0) || tokens.value(0).is_empty())
+            {
+                return Err(invalid("A catalog scan requires the original SQL snapshot token"));
+            }
+            let arguments = SqlArguments::from_arrow(batch.clone(), call.memory()).map_err(status)?;
+            let connection = self.connection(&call, &call.database).await?;
+            let mut native = connection.borrow().await?;
+            let context = native.query_context_with(&call.cancellation, true).await.map_err(status)?;
+            let source = format!("SETTING SNAPSHOT_TOKEN = $1 {sql}");
+            let prepared = rtdb_node::PreparedSql::prepare(
+                &source, &context, crate::execute::options(&native),
+                rtdb_node::ResultSignaturePolicy::Dynamic,
+            ).map_err(status)?;
+            if prepared.is_dml() || prepared.parameter_count() != batch.batch().num_columns() {
+                return Err(invalid("Expected a bound catalog read"));
+            }
+            if let Some(cursor) = prepared.try_open_query_arrow(
+                Arc::clone(&context), batch, arguments.types(),
+            ).await.map_err(status)? {
+                return Ok(cursor);
+            }
+            let row = arguments.rows().next().ok_or_else(|| invalid("Missing catalog scan operands"))?.map_err(status)?;
+            let _values = row.iter().try_fold(4096, |size, value| {
+                wire::add(size, value.retained_bytes().map_err(status)?)
+            }).and_then(|size| call.reserve(size))?;
+            prepared.open_query_columns_typed(context, row.to_vec(), arguments.types()).await.map_err(status)
+        };
+        let mut cursor = call.cancellation.run_until_cancelled(open)
+            .await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
+        let memory = Arc::clone(call.memory());
+        let schema = wire::plan_schema(cursor.runtime_schema(), &memory)?;
+        let schema_bound = wire::schema_bound(&schema)?;
+        let schema_charge = call.reserve(schema_bound)?;
+        let mut writer = StreamWriter::try_new(Vec::new(), &schema).map_err(arrow)?;
+        let first = cursor.delivery_grant().await.map_err(status)?;
+        let (mut headers, cutoff) = call.delivery_headers(&first, true)?;
+        headers.insert(crate::actions::OWNED_IPC_HEADER, tonic::metadata::MetadataValue::from_static("stream-v1"));
+        let max_message = self.0.config.maximum_message_bytes;
+        let output: Output<ActionResult> = Box::pin(async_stream::try_stream! {
+            let mut left = MAX_BODY;
+            let schema_bytes = std::mem::take(writer.get_mut());
+            left = left.checked_sub(schema_bytes.len())
+                .ok_or_else(|| Status::resource_exhausted("Catalog scan schema exceeds its reply bound"))?;
+            let schema_frame = ActionResult { body: wire::retain(schema_bytes, schema_charge) };
+            if schema_frame.encoded_len() > max_message {
+                Err(Status::resource_exhausted("Catalog scan schema exceeds the Flight message limit"))?;
+            }
+            call.handoff_action(first, cutoff)?;
+            yield schema_frame;
+            loop {
+                let next = cursor.encode_next_batch(|batch| {
+                    let batch = rtdb_columnar::conform_batch(batch.clone(), &schema, &memory).map_err(status)?;
+                    let bytes = wire::mul(batch.batch().get_array_memory_size(), 6)?;
+                    let charge = call.reserve(wire::add(bytes, schema_bound)?)?;
+                    writer.write(batch.batch()).map_err(arrow)?;
+                    Ok::<_, Status>(wire::retain(std::mem::take(writer.get_mut()), charge))
+                });
+                let Some(encoded) = call.cancellation.run_until_cancelled(next)
+                    .await.ok_or_else(cancelled)?.map_err(status)? else { break };
+                let encoded = encoded.inspect_err(|_| cursor.record_consumer_error())?;
+                left = left.checked_sub(encoded.len())
+                    .ok_or_else(|| Status::resource_exhausted("Catalog scan exceeds its reply bound"))?;
+                for frame in crate::actions::IpcFrames(encoded) {
+                    let frame = frame?;
+                    if frame.encoded_len() > max_message {
+                        Err(Status::resource_exhausted("Catalog scan frame exceeds the Flight message limit"))?;
+                    }
+                    call.handoff_action(cursor.delivery_grant().await.map_err(status)?, cutoff)?;
+                    yield frame;
+                }
+            }
+            writer.finish().map_err(arrow)?;
+            if writer.get_ref().len() > left {
+                Err(Status::resource_exhausted("Catalog scan exceeds its reply bound"))?;
+            }
+            let charge = call.reserve(256)?;
+            call.handoff_action(cursor.delivery_grant().await.map_err(status)?, cutoff)?;
+            yield ActionResult { body: wire::retain(std::mem::take(writer.get_mut()), charge) };
+        });
+        let mut response = Response::new(output);
+        *response.metadata_mut() = headers;
+        Ok(response)
     }
 
     pub(crate) async fn watch_relation_action(

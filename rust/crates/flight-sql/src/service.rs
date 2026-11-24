@@ -538,7 +538,7 @@ impl FlightService for Service {
     async fn list_actions(&self, request: Request<flight::Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
         let call = self.call(&request, 0).await?;
         let actions = ["BeginSavepoint", "BeginTransaction", "CreatePreparedStatement", "ClosePreparedStatement", "CreatePreparedSubstraitPlan", "CancelQuery", "EndSavepoint", "EndTransaction"];
-        let catalog_actions = [crate::catalog_actions::PUBLISH_CATALOG, crate::catalog_actions::WATCH_RELATION];
+        let catalog_actions = [crate::catalog_actions::PUBLISH_CATALOG, crate::catalog_actions::WATCH_RELATION, crate::catalog_actions::SCAN_CATALOG];
         let catalog_enabled = self.0.config.owned_native_actions
             && !call.session.fresh_replica && call.session.audience_source().is_none();
         result_stream(call, actions.into_iter().chain(catalog_actions.into_iter().filter(|_| catalog_enabled))

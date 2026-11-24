@@ -1317,6 +1317,28 @@ async fn owned_import_page_preserves_hosted_effect_positions() {
         assert_eq!(ordinal(&mut client, &format!("new_{suffix}"), id).await, original);
     }
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner WHERE _id = 'root'").await[0], 0, 0), 3);
+    let batch = |id| RecordBatch::try_from_iter([
+        ("_id", Arc::new(StringArray::from(vec![id])) as ArrayRef),
+        ("_op", Arc::new(StringArray::from(vec!["create"])) as ArrayRef),
+    ]).unwrap();
+    let documents = [batch("a"), batch("b")];
+    let document_stream = write_arrow_stream(documents[0].schema_ref(), &documents, IpcWriteOptions::default()).unwrap();
+    let ordinary_packed = |schedule: [u16; 3]| {
+        let mut facts = [3u16, 2].into_iter().chain(schedule).flat_map(u16::to_be_bytes).collect::<Vec<_>>();
+        group(&mut facts, "packed_documents", &document_stream);
+        group(&mut facts, "packed_index", &creates(&["posting"]));
+        facts
+    };
+    control_revision = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
+    let action = "rtdb.owned.DecideHostedPacked.v1";
+    let error = client.action(action, request(ordinary_packed([0, 1, 1]), control_revision, 4)).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    client.action(action, request(ordinary_packed([0, 1, 0]), control_revision, 4)).await.unwrap();
+    for (suffix, id) in [("documents", "a"), ("index", "posting"), ("documents", "b")] {
+        let original = ordinal(&mut client, &format!("old_{suffix}"), id).await;
+        assert_eq!(ordinal(&mut client, &format!("packed_{suffix}"), id).await, original);
+    }
+    assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner WHERE _id = 'root'").await[0], 0, 0), 4);
     running.stop().await;
 }
 
@@ -2227,6 +2249,7 @@ async fn bulk_ingest_and_insert_select_preserve_fixed_float_embeddings() {
 
 const PUBLISH_CATALOG: &str = "rtdb.owned.PublishCatalog.v1";
 const WATCH_RELATION: &str = "rtdb.owned.WatchRelation.v1";
+const SCAN_CATALOG: &str = "rtdb.owned.ScanCatalog.v1";
 
 #[derive(Message)]
 struct CatalogPublication {
@@ -2377,12 +2400,44 @@ async fn catalog_actions_publish_exact_position_and_wake_a_separate_session() {
 }
 
 #[tokio::test]
+async fn catalog_scan_returns_bound_binary_at_the_original_snapshot() {
+    use arrow_array::BinaryArray;
+
+    let running = Running::start(Some("secret"), FlightConfig {
+        owned_native_actions: true, ..Default::default()
+    }).await;
+    let mut writer = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let mut reader = Client::connect(&running.server, Some("xtdb:secret")).await;
+    writer.update("INSERT INTO bj_kernel_writes RECORDS {_id: 'one', key: '00ff'}", None).await;
+    let original = writer.query("SELECT SNAPSHOT_TOKEN AS token").await;
+    let token = original[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0);
+    writer.update("INSERT INTO bj_kernel_writes RECORDS {_id: 'two', key: '01ff'}", None).await;
+    let scan = CatalogStatement {
+        sql: "SELECT CAST(key AS BYTEA) AS key FROM bj_kernel_writes WHERE key >= SUBSTRING(CAST($2 AS TEXT) FROM 3) ORDER BY key".into(),
+        args: catalog_ipc(&["_0", "_1"], vec![
+            Arc::new(StringArray::from(vec![token])),
+            Arc::new(BinaryArray::from_vec(vec![&[0, 0xff]])),
+        ]),
+    };
+    let mut request = reader.request(Action { r#type: SCAN_CATALOG.into(), body: scan.encode_to_vec().into() });
+    request.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
+    let result = reader.client.do_action(request).await.unwrap();
+    assert_eq!(result.metadata().get("x-rtdb-owned-ipc").unwrap(), "stream-v1");
+    let frames: Vec<_> = result.into_inner().try_collect().await.unwrap();
+    let ipc = frames.into_iter().flat_map(|frame| frame.body.to_vec()).collect::<Vec<_>>();
+    let rows = StreamReader::try_new(ipc.as_slice(), None).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(rows[0].column(0).as_any().downcast_ref::<BinaryArray>().unwrap().value(0), &[0, 0xff]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn catalog_actions_are_absent_when_owner_actions_are_disabled() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
     let request = client.request(arrow_flight::Empty {});
     let actions: Vec<_> = client.client.list_actions(request).await.unwrap().into_inner().try_collect().await.unwrap();
-    for name in [PUBLISH_CATALOG, WATCH_RELATION] {
+    for name in [PUBLISH_CATALOG, WATCH_RELATION, SCAN_CATALOG] {
         assert!(actions.iter().all(|action| action.r#type != name));
         assert_eq!(client.action(name, Bytes::new()).await.unwrap_err().code(), tonic::Code::Unimplemented);
     }
