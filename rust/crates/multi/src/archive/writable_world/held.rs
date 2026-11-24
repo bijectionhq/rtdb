@@ -2417,7 +2417,7 @@ impl<'a> InheritedRelation<'a> {
         let mut cursor = None;
         loop {
             let after = cursor.as_ref().map(|(key, _): &(String, Arc<MemoryReservation>)| key.as_str());
-            let page = self.overlay_identity_page(valid, after, 128).await?;
+            let page = self.overlay_identity_page(valid, after, 128, None).await?;
             *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
             for key in &page.keys {
                 let id = EntityId::String(key.clone());
@@ -2441,7 +2441,7 @@ impl<'a> InheritedRelation<'a> {
         let mut cursor = None;
         loop {
             let after = cursor.as_ref().map(|(key, _): &(String, Arc<MemoryReservation>)| key.as_str());
-            let page = self.overlay_identity_page(valid, after, 128).await?;
+            let page = self.overlay_identity_page(valid, after, 128, None).await?;
             *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
             for key in &page.keys {
                 let id = EntityId::String(key.clone());
