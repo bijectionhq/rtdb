@@ -3,7 +3,7 @@
 Run `~/.elan/bin/lake build` from `verification/multi`.
 Lake imports `Protocol`, `RecoveryCertificate`, `SelectionFence`, `ObjectWithdrawal`, and `JournalRefinement` from pinned Logkeeper main.
 It also compiles the upstream Study 111 `MaintenanceBound` and Study 113 `DisposalLease` directly from that checkout and imports RTDB's `ReaderRetention`.
-The pin is for the Lean reference.
+The Lean reference and Rust workspace use the same Logkeeper revision.
 
 ## X1 · Acknowledged transaction recovery
 

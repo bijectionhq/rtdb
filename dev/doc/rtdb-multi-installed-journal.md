@@ -302,7 +302,7 @@ The Lean models in `verification/multi/lean/OrderedCapacity.lean`, `OrderedJourn
 The capacity model compares the saturated ordinary window with and without a funded maintenance sequence.
 The journal model composes exact handoff, receipt retention, fresh read admission and release, checkpoint protection, provider disposition, and trim.
 The quorum lemmas state the assumptions on durable promises and agreement of higher ballots.
-The Lake package in `verification/multi` pins the Logkeeper Lean reference independently of the Rust workspace.
+The Lake package in `verification/multi` and the Rust workspace use the same Logkeeper revision.
 Run `lake build` from `verification/multi` to check the composition against that pinned revision and the directory's Lean toolchain.
 `RecoveryComposition.lean` relates the exact decoded append selected by the voter model to the receipt retained by the RTDB trace, including across a modeled transfer of the exact predecessor image to a repaired cohort.
 It also models publication and trim under custody authority.

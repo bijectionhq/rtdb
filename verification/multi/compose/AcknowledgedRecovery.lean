@@ -1,3 +1,4 @@
+import ExactReclamation
 import RecoveryComposition
 import NativeAppend
 import ReplayCertificate
@@ -135,17 +136,17 @@ theorem survivor_of_chosen_append
       exact ih (position := position) (by simpa using selected) (by simpa using survives) _
 
 def ExactCoverage (zoneOf : PhysicalVersion → Zone) (inventory : Key → PhysicalVersion → Prop)
-    (grants : Grant Key → Prop) (scope : Scope) (objects : PhysicalVersion → ObjectWithdrawal.State)
+    (grants : Grant Key → Prop) (scope : Scope) (objects : PhysicalVersion → ExactReclamation.OrderedState)
     (lost : Zone) (key : Key) : Prop :=
   ∃ physical, inventory key physical ∧ zoneOf physical ≠ lost ∧
-    (objects physical).fenced = false ∧ ∃ grant, grants grant ∧ Binds scope key physical grant
+    ¬ ObjectWithdrawal.fenced (objects physical) () ∧ ∃ grant, grants grant ∧ Binds scope key physical grant
 
 theorem replay_reads_have_unwithdrawn_survivors
     {zoneOf : PhysicalVersion → Zone}
     (ready : ZoneReady Certificate.dependencies zoneOf inventory grants scope selected (fun _ => True))
-    (withdrawalTrace : ∀ physical, ObjectWithdrawal.Trace ObjectWithdrawal.empty (objects physical))
+    (withdrawalTrace : ∀ physical, ObjectWithdrawal.Trace ExactReclamation.initialOrdered (objects physical))
     (registered : ∀ key physical grant, inventory key physical → grants grant →
-      Binds scope key physical grant → ∃ role, (objects physical).referenced role)
+      Binds scope key physical grant → ObjectWithdrawal.referenced (objects physical) ())
     (lost : Zone) :
     (∀ key, ReplayRead selected key → ExactCoverage zoneOf inventory grants scope objects lost key) ∧
     (∀ state, Reaches selected state → ∀ key ∈ state.demands,
@@ -154,13 +155,10 @@ theorem replay_reads_have_unwithdrawn_survivors
       ∃ grant, grants grant ∧ Binds scope key physical grant) →
       ExactCoverage zoneOf inventory grants scope objects lost key := by
     rintro key ⟨physical, present, survives, grant, held, binds⟩
-    obtain ⟨role, reference⟩ := registered key physical grant present held binds
-    have safe := ObjectWithdrawal.trace_preserves_separation (by simp [ObjectWithdrawal.Safe,
-      ObjectWithdrawal.empty]) (withdrawalTrace physical)
-    refine ⟨physical, present, survives, ?_, grant, held, binds⟩
-    cases fenced : (objects physical).fenced
-    · rfl
-    · exact False.elim (safe fenced role reference)
+    have reference := registered key physical grant present held binds
+    have safe := ObjectWithdrawal.trace_preserves_separation ExactReclamation.initial_ordered_is_safe
+      (withdrawalTrace physical)
+    exact ⟨physical, present, survives, fun fenced => (safe () fenced).2 reference, grant, held, binds⟩
   constructor
   · intro key reads
     exact available key (every_application_read_has_exact_held_coverage Certificate.dependencies
@@ -280,9 +278,9 @@ theorem acknowledged_transaction_survives_recovery
     (projection : RecoveryProjection semantics recovered.decisions selected scope read)
     (nativeAcknowledgement : NativeAppend.Binding semantics.source initial.record tx)
     (ready : ZoneReady Certificate.dependencies zoneOf inventory grants scope selected (fun _ => True))
-    (withdrawalTrace : ∀ physical, ObjectWithdrawal.Trace ObjectWithdrawal.empty (objects physical))
+    (withdrawalTrace : ∀ physical, ObjectWithdrawal.Trace ExactReclamation.initialOrdered (objects physical))
     (registered : ∀ key physical grant, inventory key physical → grants grant →
-      Binds scope key physical grant → ∃ role, (objects physical).referenced role)
+      Binds scope key physical grant → ObjectWithdrawal.referenced (objects physical) ())
     (lost : Zone) :
     recovered.decisions[position]? = some (.append initial.record) ∧
     (after.observed < initial.record.receipt.expiresAt.next →

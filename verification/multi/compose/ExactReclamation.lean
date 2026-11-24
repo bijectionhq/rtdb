@@ -52,8 +52,21 @@ inductive ReaderPhase where
   | idle | registered | admitted | running
   deriving DecidableEq
 
+abbrev OrderedState := ObjectWithdrawal.State Unit Nat
+
+def initialOrdered : OrderedState := ⟨fun _ _ _ => False, fun _ => none, False, 0, 0⟩
+
+theorem initial_ordered_is_safe : ObjectWithdrawal.Safe initialOrdered := by
+  simp [ObjectWithdrawal.Safe, ObjectWithdrawal.fenced, initialOrdered]
+
+def withdrawnOrdered : OrderedState := { initialOrdered with fence := fun _ => some 7 }
+
+theorem reaches_ordered_fence : ObjectWithdrawal.Step initialOrdered withdrawnOrdered :=
+  .withdraw initialOrdered () 7 ⟨id, fun ⟨_, _, held⟩ => held⟩
+    (by simp [ObjectWithdrawal.fenced, initialOrdered])
+
 structure State where
-  ordered : ObjectWithdrawal.State
+  ordered : OrderedState
   reader : ReaderPhase := .idle
   admissionClosed : Bool := false
   leaseExpired : Bool := false
@@ -66,18 +79,21 @@ def liveReadsSeen (s : State) : Bool := s.reader != .idle
 
 def noAdmittedRead (s : State) : Prop := s.reader = .idle ∨ s.reader = .registered
 
+def State.hasOrderedFence (s : State) : Bool := decide (s.ordered.fence () = some 7)
+
+theorem ordered_fence_persists {before after : OrderedState}
+    (step : ObjectWithdrawal.Step before after)
+    (fenced : decide (before.fence () = some 7) = true) :
+    decide (after.fence () = some 7) = true :=
+  decide_eq_true (ObjectWithdrawal.order_preserves_fence step (of_decide_eq_true fenced))
+
 def Safe (s : State) : Prop :=
   ObjectWithdrawal.Safe s.ordered ∧
-  (s.exactPresent = false → s.ordered.fenced = true ∧ s.admissionClosed = true ∧ noAdmittedRead s) ∧
+  (s.exactPresent = false → s.hasOrderedFence = true ∧ s.admissionClosed = true ∧ noAdmittedRead s) ∧
   (s.settled = true → s.exactPresent = false)
 
-theorem ordered_fence_persists {before after : ObjectWithdrawal.State}
-    (step : ObjectWithdrawal.Step before after) (fenced : before.fenced = true) :
-    after.fenced = true := by
-  cases step <;> first | rfl | exact fenced
-
 inductive Step : State → State → Prop where
-  | order (s : State) (ordered : ObjectWithdrawal.State)
+  | order (s : State) (ordered : OrderedState)
       (step : ObjectWithdrawal.Step s.ordered ordered) :
       Step s { s with ordered := ordered }
   | register (s : State) (idle : s.reader = .idle) : Step s { s with reader := .registered }
@@ -88,9 +104,9 @@ inductive Step : State → State → Prop where
       Step s { s with reader := .idle }
   | complete (s : State) (running : s.reader = .running) : Step s { s with reader := .idle }
   | expire (s : State) : Step s { s with leaseExpired := true }
-  | close (s : State) (fenced : s.ordered.fenced = true) : Step s { s with admissionClosed := true }
+  | close (s : State) (fenced : s.hasOrderedFence = true) : Step s { s with admissionClosed := true }
   | installReplacement (s : State) : Step s { s with replacementPresent := true }
-  | remove (s : State) (ready : MayDelete s.ordered.fenced s.admissionClosed (liveReadsSeen s) s.exactPresent)
+  | remove (s : State) (ready : MayDelete s.hasOrderedFence s.admissionClosed (liveReadsSeen s) s.exactPresent)
       (lost : Bool) : Step s { s with exactPresent := false, lostReply := lost }
   | reconcile (s : State) (listed : Bool) (absence : StableAbsence listed s.exactPresent) :
       Step s { s with settled := true }
@@ -137,12 +153,12 @@ theorem trace_preserves_a_present_replacement {start finish : State}
   | empty => exact present
   | next _ step preceding => cases step <;> first | rfl | exact preceding
 
-def initial : State := { ordered := ObjectWithdrawal.empty }
+def initial : State := { ordered := initialOrdered }
 def registered : State := { initial with reader := .registered }
 def admitted : State := { registered with reader := .admitted }
 def reading : State := { admitted with reader := .running }
 def expired : State := { reading with leaseExpired := true }
-def fenced : State := { expired with ordered := ObjectWithdrawal.withdrawn }
+def fenced : State := { expired with ordered := withdrawnOrdered }
 def blocked : State := { fenced with admissionClosed := true }
 def drained : State := { blocked with reader := .idle }
 def replaced : State := { drained with replacementPresent := true }
@@ -150,16 +166,16 @@ def replyLost : State := { replaced with exactPresent := false, lostReply := tru
 def settledAfterLoss : State := { replyLost with settled := true }
 
 theorem initial_is_safe : Safe initial := by
-  simp [Safe, initial, ObjectWithdrawal.Safe, ObjectWithdrawal.empty]
+  exact ⟨initial_ordered_is_safe, by simp [initial], by simp [initial]⟩
 
 theorem reaches_closed_census_with_expired_detached_read : Trace initial blocked :=
   .next (.next (.next (.next (.next (.next (.empty initial)
     (.register initial rfl)) (.admit registered rfl rfl rfl)) (.start admitted rfl)) (.expire reading))
-    (.order expired ObjectWithdrawal.withdrawn ObjectWithdrawal.reachable_fence)) (.close fenced rfl)
+    (.order expired withdrawnOrdered reaches_ordered_fence)) (.close fenced rfl)
 
 theorem closed_census_refuses_deletion_with_a_live_detached_read :
     Trace initial blocked ∧ DisposalLease.MayDispose 10 1 11 ∧
-      ¬ MayDelete blocked.ordered.fenced blocked.admissionClosed (liveReadsSeen blocked) blocked.exactPresent := by
+      ¬ MayDelete blocked.hasOrderedFence blocked.admissionClosed (liveReadsSeen blocked) blocked.exactPresent := by
   refine ⟨reaches_closed_census_with_expired_detached_read, (by decide : 10 + 1 ≤ 11), ?_⟩
   intro ready
   exact Bool.noConfusion ready.2.1.2
@@ -195,7 +211,7 @@ theorem path_only_retry_can_remove_a_replacement :
     .next reaches_replacement (.remove replaced ⟨rfl, ⟨rfl, rfl⟩, rfl⟩ true), ⟨rfl, rfl⟩, rfl, rfl⟩
 
 def DeleteAfterLeaseExpiry (s t : State) : Prop :=
-  s.ordered.fenced = true ∧ s.leaseExpired = true ∧ t = { s with exactPresent := false }
+  s.hasOrderedFence = true ∧ s.leaseExpired = true ∧ t = { s with exactPresent := false }
 
 theorem replacing_completion_with_expiry_deletes_during_a_read :
     ∃ bad, Trace initial blocked ∧ DeleteAfterLeaseExpiry blocked bad ∧ ¬ Safe bad :=

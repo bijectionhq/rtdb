@@ -231,18 +231,30 @@ private theorem complete_cut : JournalRefinement.CompleteCut recoveredJournal :=
   intro lsn entry _ present
   exact ⟨fun _ => true, by unfold JournalRefinement.Majority; decide, fun _ _ _ => present⟩
 
+private def heldOrdered : ExactReclamation.OrderedState :=
+  { ExactReclamation.initialOrdered with
+    references := fun name role owner =>
+      (name ∈ [()] ∧ role = .hold ∧ owner = 0) ∨ False }
+
+private theorem reaches_ordered_hold : ObjectWithdrawal.Step ExactReclamation.initialOrdered heldOrdered :=
+  .acquire ExactReclamation.initialOrdered [()] .hold 0
+    (by simp [ObjectWithdrawal.canAdmitReferences, ObjectWithdrawal.fenced, ExactReclamation.initialOrdered])
+
+private theorem held_reference : ObjectWithdrawal.referenced heldOrdered () :=
+  ⟨.hold, 0, .inl ⟨by simp, rfl, rfl⟩⟩
+
 theorem a_served_transaction_is_reachable_after_replacement_and_two_repairs (lost : Nat) :
     Continuation first last ∧ 11 ∈ read.result ∧
-      ExactCoverage zoneOf inventory grants scope (fun _ => ObjectWithdrawal.held) lost (.tailPayload 9) ∧
+      ExactCoverage zoneOf inventory grants scope (fun _ => heldOrdered) lost (.tailPayload 9) ∧
       (∃ voter ∈ recoveredJournal.members, voter - 2 ≠ lost ∧ recoveredJournal.copies voter 0 journalEntry) := by
   have initialInvariant : OrderedJournal.Invariant OrderedJournal.seed := by
     simp [OrderedJournal.Invariant, OrderedJournal.seed, OrderedJournal.seedCut]
   have recovered := acknowledged_transaction_survives_recovery acknowledged last two_repairs
     (.cons grant_step (.cons barrier_step (.nil _)))
     (OrderedJournal.step_preserves_checkpoint_and_holds initialInvariant append_step)
-    read projection nativeAcknowledgement ready (objects := fun _ => ObjectWithdrawal.held)
-    (fun _ => .next (.empty _) ObjectWithdrawal.reachable_hold)
-    (fun _ _ _ _ _ _ => ⟨.hold, .inl rfl⟩) lost
+    read projection nativeAcknowledgement ready (objects := fun _ => heldOrdered)
+    (fun _ => .next (.empty _) reaches_ordered_hold)
+    (fun _ _ _ _ _ _ => held_reference) lost
   obtain ⟨_, _, _, _, _, _, visible, covered⟩ := recovered
   refine ⟨two_repairs, visible rfl, covered _ (by simp [projection]), ?_⟩
   exact retained_journal_entry_survives_one_az complete_cut (fun voter => voter - 2) lost
@@ -354,19 +366,17 @@ theorem an_exact_grant_for_the_wrong_version_cannot_certify_recovery :
 
 theorem an_unregistered_certificate_can_name_only_withdrawn_versions :
     ZoneReady Certificate.dependencies zoneOf inventory grants scope plan (fun _ => True) ∧
-      (∀ _ : PhysicalVersion, ObjectWithdrawal.Trace ObjectWithdrawal.empty ObjectWithdrawal.withdrawn) ∧
-      ¬ ExactCoverage zoneOf inventory grants scope (fun _ => ObjectWithdrawal.withdrawn) 0 (.root 0) := by
-  refine ⟨ready, fun _ => .next (.empty _) ObjectWithdrawal.reachable_fence, ?_⟩
+      (∀ _ : PhysicalVersion, ObjectWithdrawal.Trace ExactReclamation.initialOrdered ExactReclamation.withdrawnOrdered) ∧
+      ¬ ExactCoverage zoneOf inventory grants scope (fun _ => ExactReclamation.withdrawnOrdered) 0 (.root 0) := by
+  refine ⟨ready, fun _ => .next (.empty _) ExactReclamation.reaches_ordered_fence, ?_⟩
   rintro ⟨_, _, _, openName, _⟩
-  contradiction
+  exact openName (by simp [ObjectWithdrawal.fenced, ExactReclamation.withdrawnOrdered])
 
 theorem dropping_either_withdrawal_guard_breaks_reference_separation :
-    (∃ state, ObjectWithdrawal.WithdrawWithoutReferences ObjectWithdrawal.held state ∧
-      ¬ ObjectWithdrawal.Safe state) ∧
-    (ObjectWithdrawal.AcquireWithoutFence ObjectWithdrawal.withdrawn ObjectWithdrawal.late ∧
-      ¬ ObjectWithdrawal.Safe ObjectWithdrawal.late) :=
-  ⟨ObjectWithdrawal.unchecked_withdrawal_violates_separation,
-    ObjectWithdrawal.unchecked_acquire_violates_separation⟩
+    ¬ ObjectWithdrawal.Safe { heldOrdered with fence := fun _ => some 7 } ∧
+    ¬ ObjectWithdrawal.Safe { ExactReclamation.withdrawnOrdered with references := heldOrdered.references } := by
+  constructor <;> intro safe <;>
+    exact (safe () (by simp [ObjectWithdrawal.fenced, ExactReclamation.withdrawnOrdered])).2 held_reference
 
 theorem a_missing_checkpoint_event_or_suffix_event_breaks_exact_replay :
     let logical := committed.foldl (applyDecision decodeTx noErasure) []
@@ -459,7 +469,14 @@ theorem opening_requires_the_recorded_ciphertext_and_its_key :
 theorem a_valid_decoded_detached_body_with_a_different_digest_is_refused :
     let substituted := { source with sha256 := fun _ => 99 }
     substituted.decode 72 = source.decode 72 ∧
-    NativeAppend.decodeAppend substituted (record 11) = none := by decide
+    NativeAppend.decodeAppend substituted (record 11) = none ∧
+    ¬ Nonempty (NativeAppend.Binding substituted (record 11) 11) := by
+  refine ⟨by decide, by decide, ?_⟩
+  rintro ⟨binding⟩
+  have decoded := NativeAppend.decodedAcknowledgement binding
+  have refused : NativeAppend.decodeAppend { source with sha256 := fun _ => 99 } (record 11) = none := by decide
+  rw [refused] at decoded
+  contradiction
 
 theorem an_alien_journal_cut_disagrees_even_with_the_same_frontier :
     let alien := { projectCut admission.cut with digest := 123 }
