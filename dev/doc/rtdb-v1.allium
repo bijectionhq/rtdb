@@ -24,6 +24,8 @@ surface StatelessDatabase {
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
         -- A basis orders cuts within the selected database incarnation.
+        -- The shared v1 encoding places the 16 incarnation bytes first, then the unsigned position as eight big-endian bytes.
+        -- Applied-position drivers supply their applied position in this field.
         -- The temporal read driver supplies a system-time boundary as the basis position.
         -- Exactly selects its named cut.
         -- AtLeast returns a cut at or beyond its requested basis.
