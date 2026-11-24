@@ -4,7 +4,7 @@ import ReplayCertificate
 import CheckpointReplay
 import Logkeeper.ObjectWithdrawal
 import Logkeeper.SelectionFence
-import MaintenanceBound
+import MaintenanceClassification
 import DisposalLease
 import ReaderRetention
 
@@ -270,11 +270,13 @@ theorem acknowledged_transaction_survives_recovery
     · exact baseAvailable key (.inl base)
     · exact tailAvailable replay reached key demanded
 
-theorem maintenance_reserve_survives_replacement (lane : MaintenanceBound.Lane)
-    (reached : MaintenanceBound.Reaches lane) :
-    lane.used ≤ 3 ∧ (lane.phase = .uploaded ∨ lane.used + 1 ≤ 3) :=
-  ⟨MaintenanceBound.grant_fencing_bounds_maintenance_by_three reached,
-    MaintenanceBound.a_three_record_reserve_always_admits_progress reached⟩
+theorem maintenance_reserve_survives_replacement {receiverBudget : Nat} (lane : MaintenanceBound.SettlementLane)
+    (reached : MaintenanceBound.SettlementReaches receiverBudget lane) :
+    lane.used ≤ MaintenanceBound.funded_records receiverBudget ∧
+      ∀ body, MaintenanceBound.maintenance_append_allowed lane.checkpoint.phase lane.slot body →
+        lane.used + MaintenanceBound.record_charge body ≤ MaintenanceBound.funded_records receiverBudget :=
+  ⟨Nat.le_trans (Nat.le_add_right _ _) (MaintenanceBound.settlement_lane_stays_funded reached),
+    MaintenanceBound.reachable_maintenance_append_fits reached⟩
 
 theorem disposed_worker_cannot_admit_read (leaseEnd drift now workerClock : Nat)
     (bounded : now ≤ workerClock + drift) (dispose : DisposalLease.MayDispose leaseEnd drift now) :

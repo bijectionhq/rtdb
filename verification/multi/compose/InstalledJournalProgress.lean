@@ -1,22 +1,28 @@
-import MaintenanceBound
+import MaintenanceClassification
 import DisposalLease
 
 set_option warningAsError true
 
 namespace InstalledJournalProgress
 
-theorem funded_maintenance_admits_next_record (lane : MaintenanceBound.Lane)
-    (reached : MaintenanceBound.Reaches lane) (awaitingRecord : lane.phase ≠ .uploaded)
+open MaintenanceBound
+
+theorem funded_maintenance_admits_next_record {receiverBudget : Nat} (lane : SettlementLane)
+    (reached : SettlementReaches receiverBudget lane) (body : ReplicaKind)
+    (allowed : maintenance_append_allowed lane.checkpoint.phase lane.slot body)
+    (charging : record_charge body = 1)
     (retainedCharge nextCharge maxRecordCharge fundedBytes : Nat)
     (retainedBound : retainedCharge ≤ lane.used * maxRecordCharge)
-    (nextBound : nextCharge ≤ maxRecordCharge) (funded : 3 * maxRecordCharge ≤ fundedBytes) :
+    (nextBound : nextCharge ≤ maxRecordCharge)
+    (funded : funded_records receiverBudget * maxRecordCharge ≤ fundedBytes) :
     retainedCharge + nextCharge ≤ fundedBytes := by
-  have room := (MaintenanceBound.a_three_record_reserve_always_admits_progress reached).resolve_left awaitingRecord
+  have room := reachable_maintenance_append_fits reached body allowed
+  rw [charging] at room
   calc
     retainedCharge + nextCharge ≤ lane.used * maxRecordCharge + maxRecordCharge :=
       Nat.add_le_add retainedBound nextBound
     _ = (lane.used + 1) * maxRecordCharge := by rw [Nat.add_mul, Nat.one_mul]
-    _ ≤ 3 * maxRecordCharge := Nat.mul_le_mul_right _ room
+    _ ≤ funded_records receiverBudget * maxRecordCharge := Nat.mul_le_mul_right _ room
     _ ≤ fundedBytes := funded
 
 def ReachesTime (clock : Nat → Nat) (start threshold : Nat) : Prop :=
@@ -61,17 +67,18 @@ theorem withdrawn_holds_are_eventually_disposed (leaseEnd drift clockError : Nat
       exact ⟨held, liveCustody n after, by unfold DisposalLease.MayDispose; omega⟩)
     exact ⟨n + 1, by omega, releases n chosen⟩
 
-private def awaitingUpload : MaintenanceBound.Lane := ⟨2, .boundary, 1⟩
+private def awaitingUpload : SettlementLane := ⟨⟨2, .boundary, 4⟩, .vacant, 0, 2⟩
 
-private theorem awaitingUpload_reachable : MaintenanceBound.Reaches awaitingUpload :=
-  .step .start (.boundary ⟨1, .idle, 1⟩ rfl)
+private theorem awaitingUpload_reachable : SettlementReaches 2 awaitingUpload :=
+  .step (.step second_inherited_slot (.fence _ rfl)) (.boundary _ rfl rfl)
 
 theorem funded_lane_admission_controls :
-    MaintenanceBound.Reaches awaitingUpload ∧ awaitingUpload.phase ≠ .uploaded ∧
-    (2 ≤ awaitingUpload.used * 1 ∧ 1 ≤ 1 ∧ ¬ (3 * 1 ≤ 2) ∧ ¬ (2 + 1 ≤ 2)) ∧
-    (2 ≤ awaitingUpload.used * 1 ∧ ¬ (2 ≤ 1) ∧ 3 * 1 ≤ 3 ∧ ¬ (2 + 2 ≤ 3)) ∧
-    (¬ (3 ≤ awaitingUpload.used * 1) ∧ 1 ≤ 1 ∧ 3 * 1 ≤ 3 ∧ ¬ (3 + 1 ≤ 3)) :=
-  ⟨awaitingUpload_reachable, by decide, by decide, by decide, by decide⟩
+    SettlementReaches 2 awaitingUpload ∧
+    maintenance_append_allowed awaitingUpload.checkpoint.phase awaitingUpload.slot .blockUploaded ∧
+    (4 ≤ awaitingUpload.used * 1 ∧ 1 ≤ 1 ∧ ¬ (funded_records 2 * 1 ≤ 4) ∧ ¬ (4 + 1 ≤ 4)) ∧
+    (4 ≤ awaitingUpload.used * 1 ∧ ¬ (2 ≤ 1) ∧ funded_records 2 * 1 ≤ 5 ∧ ¬ (4 + 2 ≤ 5)) ∧
+    (¬ (5 ≤ awaitingUpload.used * 1) ∧ 1 ≤ 1 ∧ funded_records 2 * 1 ≤ 5 ∧ ¬ (5 + 1 ≤ 5)) :=
+  ⟨awaitingUpload_reachable, rfl, by decide, by decide, by decide⟩
 
 private def frozen (_ : Nat) : Nat := 0
 

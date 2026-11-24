@@ -35,7 +35,7 @@ CFG
     printf '%s — %s (%s)\n' "$name" "$expected_message" "$focus"
 }
 
-run_case baseline none composed 'INVARIANTS MaintenanceAlwaysAdmitsNext TrimRequiresPublication DisposalRequiresElapsedLease CommitBindsCutAndDeadline
+run_case baseline none composed 'INVARIANTS MaintenanceAlwaysAdmitsNext SettlementAccounting TrimRequiresPublication DisposalRequiresElapsedLease CommitBindsCutAndDeadline
 PROPERTIES CheckpointEventuallyPublishes PublishedCheckpointEventuallyTrims WithdrawnHoldsEventuallyDisposed
            FreshReadEventuallyAdmitted RequestedErasureEventuallyCommits CleanSlotsEventuallyCommitErasure OpenReservationEventuallyCommitsErasure
            WriterEventuallyGranted WriterEventuallyReady' 0 'No error has been found'
@@ -50,7 +50,7 @@ while IFS='|' read -r focus law controls; do
         printf '  Stalled at %s\n' "$law"
     done
 done <<'LAWS'
-publication|CheckpointEventuallyPublishes|unfunded-lane unfunded-checkpoint-copy unfair-boundary unfair-upload unfair-prepare unfair-copy unfair-publish
+publication|CheckpointEventuallyPublishes|unfunded-lane unfunded-checkpoint-copy unfair-settlement unfair-boundary unfair-upload unfair-prepare unfair-copy unfair-publish
 trim|PublishedCheckpointEventuallyTrims|holds-never-release no-custodian unfair-trim
 disposal|WithdrawnHoldsEventuallyDisposed|unfair-tick unbounded-clock unfair-dispose
 read|FreshReadEventuallyAdmitted|no-usable-renewal unfair-renew no-reader-slot writer-displaced weak-read-fairness

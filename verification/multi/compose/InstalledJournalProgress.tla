@@ -6,14 +6,13 @@ CONSTANTS Mutation, Focus
 Zones == 1..3
 Slots == 0..1
 OldCut == 1
-BoundaryCut == OldCut + 1
-UploadCut == BoundaryCut + 1
 ClockError == 1
 Drift == 1
 LastLeaseEnd == 2
 Horizon == LastLeaseEnd + Drift + ClockError
 LeaseTicks == 2
-Reserve == IF Mutation = "unfunded-lane" THEN 2 ELSE 3
+ReceiverBudget == 2
+Reserve == 3 + ReceiverBudget - (IF Mutation = "unfunded-lane" THEN 1 ELSE 0)
 NoCut == 0
 NoCommit == [cut |-> NoCut, due |-> 0]
 
@@ -29,7 +28,9 @@ Init ==
                     THEN SUBSET (Zones \ {lostAZ}) ELSE {Zones \ {lostAZ}}
     /\ custodian = TRUE
     /\ writer = "vacant"
-    /\ checkpoint = [phase |-> "pending", used |-> 1, floor |-> NoCut]
+    /\ \E settled \in 0..1, inherited \in BOOLEAN :
+        checkpoint = [phase |-> "pending", used |-> 1 + settled, floor |-> NoCut,
+                       settled |-> settled, inherited |-> inherited]
     /\ pins = {"withdrawn", "overlap"}
     /\ leaseEnd \in {0, LastLeaseEnd}
     /\ time = [real |-> 0, journal |-> 0]
@@ -61,14 +62,21 @@ ConfirmWriter ==
 AwaitingBoundary == checkpoint.phase = "pending"
 AwaitingUpload == checkpoint.phase = "bounded"
 Published == checkpoint.phase \in {"published", "trimmed"}
+BoundaryCut == OldCut + checkpoint.settled + 1
+UploadCut == BoundaryCut + 1
 Trimmed == checkpoint.floor = BoundaryCut
 Room == checkpoint.used + 1 <= Reserve
-Head == CASE AwaitingBoundary -> OldCut
+Head == CASE AwaitingBoundary -> BoundaryCut - 1
           [] AwaitingUpload -> BoundaryCut
           [] OTHER -> UploadCut
 
+SettleInherited ==
+    /\ AwaitingBoundary /\ checkpoint.inherited /\ WriterReady /\ HasMajority /\ Room
+    /\ checkpoint' = [checkpoint EXCEPT !.inherited = FALSE, !.settled = @ + 1, !.used = @ + 1]
+    /\ UNCHANGED <<lostAZ, reachable, custodian, writer, pins, leaseEnd, time, read, erasure>>
+
 AppendBoundary ==
-    /\ AwaitingBoundary /\ WriterReady /\ HasMajority /\ Room
+    /\ AwaitingBoundary /\ ~checkpoint.inherited /\ WriterReady /\ HasMajority /\ Room
     /\ checkpoint' = [checkpoint EXCEPT !.phase = "bounded", !.used = @ + 1]
     /\ UNCHANGED <<lostAZ, reachable, custodian, writer, pins, leaseEnd, time, read, erasure>>
 
@@ -115,7 +123,7 @@ ReleaseHolds ==
 
 Trim ==
     /\ checkpoint.phase = "published" /\ pins = {} /\ CustodyAvailable
-    /\ checkpoint' = [phase |-> "trimmed", used |-> 1, floor |-> BoundaryCut]
+    /\ checkpoint' = [checkpoint EXCEPT !.phase = "trimmed", !.used = 1, !.floor = BoundaryCut]
     /\ UNCHANGED <<lostAZ, reachable, custodian, writer, pins, leaseEnd, time, read, erasure>>
 
 FreshReadAdmitted == read.cut # NoCut
@@ -178,6 +186,7 @@ DisplaceWriter ==
 
 Next ==
     \/ GrantWriter \/ ReplayGrant \/ ConfirmWriter
+    \/ SettleInherited
     \/ AppendBoundary \/ AppendUpload \/ PrepareCheckpoint \/ CopyCheckpoint \/ PublishCheckpoint
     \/ TickJournal \/ DisposeExpired \/ ReleaseHolds \/ Trim
     \/ RenewLease \/ AgeLease \/ AdmitFreshRead
@@ -185,7 +194,7 @@ Next ==
 
 GrantFairness == {"grant"}
 RecoveryFairness == GrantFairness \cup {"replay", "confirm"}
-PublicationFairness == RecoveryFairness \cup {"boundary", "upload", "prepare", "copy", "publish"}
+PublicationFairness == RecoveryFairness \cup {"settle", "boundary", "upload", "prepare", "copy", "publish"}
 DisposalFairness == {"tick", "dispose"}
 TrimFairness == DisposalFairness \cup {"release", "trim"}
 ReadFairness == {"renew", "read"}
@@ -208,6 +217,7 @@ Spec ==
     /\ WF_vars("grant" \in FairActions /\ Mutation # "unfair-grant" /\ GrantWriter)
     /\ WF_vars("replay" \in FairActions /\ Mutation # "unfair-replay" /\ ReplayGrant)
     /\ WF_vars("confirm" \in FairActions /\ Mutation # "unfair-confirm" /\ ConfirmWriter)
+    /\ WF_vars("settle" \in FairActions /\ Mutation # "unfair-settlement" /\ SettleInherited)
     /\ WF_vars("boundary" \in FairActions /\ Mutation # "unfair-boundary" /\ AppendBoundary)
     /\ WF_vars("upload" \in FairActions /\ Mutation # "unfair-upload" /\ AppendUpload)
     /\ WF_vars("prepare" \in FairActions /\ Mutation # "unfair-prepare" /\ PrepareCheckpoint)
@@ -224,6 +234,13 @@ Spec ==
     /\ WF_vars("commit" \in FairActions /\ Mutation # "unfair-commit" /\ CommitErasure)
 
 MaintenanceAlwaysAdmitsNext == (AwaitingBoundary \/ AwaitingUpload) => Room
+SettlementAccounting ==
+    /\ checkpoint.settled + (IF checkpoint.inherited THEN 1 ELSE 0) <= ReceiverBudget
+    /\ checkpoint.inherited => AwaitingBoundary
+    /\ checkpoint.used = (CASE AwaitingBoundary -> 1 + checkpoint.settled
+                           [] AwaitingUpload -> 2 + checkpoint.settled
+                           [] Trimmed -> 1
+                           [] OTHER -> 3 + checkpoint.settled)
 TrimRequiresPublication == Trimmed => Published /\ pins = {}
 DisposalRequiresElapsedLease == "withdrawn" \notin pins => MayDispose
 CommitBindsCutAndDeadline == ErasureCommitted =>
@@ -240,6 +257,7 @@ WriterEventuallyGranted == <>WriterGranted
 WriterEventuallyReady == <>WriterReady
 
 NoCompletedScenario ==
-    ~(Trimmed /\ read.cut = BoundaryCut /\ ErasureCommitted /\ WriterReady /\ leaseEnd = LastLeaseEnd)
+    ~(Trimmed /\ checkpoint.settled = ReceiverBudget /\ read.cut = BoundaryCut
+      /\ ErasureCommitted /\ WriterReady /\ leaseEnd = LastLeaseEnd)
 
 =============================================================================

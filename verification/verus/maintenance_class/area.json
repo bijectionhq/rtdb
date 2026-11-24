@@ -1,5 +1,5 @@
 {
-  "summary": "The production classifier charges only block boundaries and uploads during fenced checkpoint and grant progress, preserving Study 111's three-record bound at each eligible append.",
+  "summary": "The shipped fenced-mode classifier agrees with the Lean record charge for every replica body and preserves the Study 111 checkpoint bound plus the funded receiver settlement budget at each eligible append.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 2,
+  "min_verified_functions": 3,
   "controls": {
     "charge_fenced_no_op": {
       "defect": "A sequence-zero no-op without a source reference consumes maintenance.",
@@ -26,11 +26,11 @@
       "expect": [
         {
           "file": "verification/verus/maintenance_class/laws.rs",
-          "function": "classifier_refines_three_record_bound",
+          "function": "classifier_refines_record_charge",
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 1
+      "min_verified_functions": 2
     },
     "omit_boundary": {
       "defect": "BlockBoundary is routed to the ordinary lane.",
@@ -49,11 +49,11 @@
       "expect": [
         {
           "file": "verification/verus/maintenance_class/laws.rs",
-          "function": "classifier_refines_three_record_bound",
+          "function": "classifier_refines_record_charge",
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 1
+      "min_verified_functions": 2
     },
     "omit_upload": {
       "defect": "BlockUploaded is routed to the ordinary lane.",
@@ -72,11 +72,57 @@
       "expect": [
         {
           "file": "verification/verus/maintenance_class/laws.rs",
-          "function": "classifier_refines_three_record_bound",
+          "function": "classifier_refines_record_charge",
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 1
+      "min_verified_functions": 2
+    },
+    "omit_fenced_terminal": {
+      "defect": "The successor's terminal is routed to the ordinary lane.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "            && no_op.placed_slot_reservation is None,\n        ReplicaBody::ResolvedTx(_) => fenced_terminal,",
+          "replace": "            && no_op.placed_slot_reservation is None,\n        ReplicaBody::ResolvedTx(_) => false,"
+        },
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "            && message.placed_slot_reservation.is_none(),\n        ReplicaBody::ResolvedTx(_) => fenced_terminal,",
+          "replace": "            && message.placed_slot_reservation.is_none(),\n        ReplicaBody::ResolvedTx(_) => false,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/maintenance_class/laws.rs",
+          "function": "classifier_refines_record_charge",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "charge_current_terminal": {
+      "defect": "A current receiver's terminal consumes maintenance.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "            && no_op.placed_slot_reservation is None,\n        ReplicaBody::ResolvedTx(_) => fenced_terminal,",
+          "replace": "            && no_op.placed_slot_reservation is None,\n        ReplicaBody::ResolvedTx(_) => true,"
+        },
+        {
+          "file": "rust/crates/replication/src/maintenance_class.rs",
+          "find": "            && message.placed_slot_reservation.is_none(),\n        ReplicaBody::ResolvedTx(_) => fenced_terminal,",
+          "replace": "            && message.placed_slot_reservation.is_none(),\n        ReplicaBody::ResolvedTx(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/maintenance_class/laws.rs",
+          "function": "classifier_refines_record_charge",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
     }
   }
 }

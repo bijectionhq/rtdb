@@ -14,7 +14,20 @@ Route the installation through the installed manifest when the initial group, st
 
 1. Install an odd cohort of at least three Logkeeper voters in distinct failure zones. Give each voter an exclusive persistent volume and a distinct TLS certificate and receipt-signing key. The stage and selected image alternate between two preallocated slots on each volume. Size the volume for the two full slots, group metadata and filesystem overhead. The initialization command creates new media. Restarts use the serving command and recover the existing media.
 2. Give each daemon its local manifest with the identical group definition, exact voters and client certificate pins. Configure separate client identities for the administrator, each enrolled worker, the checkpoint custodian and gateways. Give the gateway principal the `route_reader` role. Keep client TLS keys and the voters' signing keys in independently mounted secret files.
-3. For an empty installation, choose a nonzero initial history fingerprint, an initial checkpoint with `next_lsn` zero, zero root, manifest and custody provider digests, and an allocation at revision one. Choose a distinct nonzero allocation for the initial write window at serial one. Fund the initial ordinary window from `retained_data_bytes - maintenance_bytes`. Ordinary appends cannot spend the maintenance portion. RTDB requires the maintenance portion to cover three maximum-sized encoded log records plus their journal framing: a retained previous upload and an in-flight block boundary and upload. A replacement writer takes its term from the journal grant and appends no claim, so repeated replacement or capacity demotion between checkpoints adds no maintenance record. The application frame limit must fit the largest permitted payload plus authenticated request and receipt framing. Fund ordinary replay holds for open cursor intervals and overlapping reads. Logkeeper reserves four additional paid control slots for startup suffix and root holds across one replacement. Leave enough paid headroom to append a flush marker while earlier replay users retain their holds. Set `serving_lease` and `clock_drift` in milliseconds. A worker serves bytes only within its renewed lease, and a withdrawn worker's holds become disposable once journal time passes its last lease end plus `clock_drift`. Choose `clock_drift` to bound clock rate error between the voters' proposer clocks and the workers' monotonic clocks over one lease.
+3. For an empty installation, choose a nonzero initial history fingerprint, an initial checkpoint with `next_lsn` zero, zero root, manifest and custody provider digests, and an allocation at revision one.
+   Choose a distinct nonzero allocation for the initial write window at serial one.
+   Fund the initial ordinary window from `retained_data_bytes - maintenance_bytes`.
+   Ordinary appends cannot spend the maintenance portion.
+   Checkpoint progress uses three maintenance records for the retained previous upload and an in-flight boundary and upload.
+   Fund their maximum framed charges, including references, plus headroom for fenced receiver settlements that can accumulate before trim.
+   A replacement writer takes its term from the journal grant and appends no term claim.
+   The application frame limit must fit the largest permitted payload plus authenticated request and receipt framing.
+   Fund ordinary replay holds for open cursor intervals and overlapping reads.
+   Logkeeper reserves four additional paid control slots for startup suffix and root holds across one replacement.
+   Leave enough paid headroom to append a flush marker while earlier replay users retain their holds.
+   Set `serving_lease` and `clock_drift` in milliseconds.
+   A worker serves bytes only within its renewed lease, and a withdrawn worker's holds become disposable once journal time passes its last lease end plus `clock_drift`.
+   Choose `clock_drift` to bound clock rate error between the voters' proposer clocks and the workers' monotonic clocks over one lease.
 4. Initialize and run the journal with the same RTDB Multi image, or use the standalone Logkeeper CLI with its ordered daemon feature. The journal does not need directory connectivity.
 
    ```sh
@@ -116,7 +129,7 @@ Publication and trim use the custodian identity independently of the writer gran
 Trim names the exact currently selected reconstructable root and retains every suffix still held by an overlapping read or attachment.
 Its receipt names the old floor and the resulting floor and totals the encoded bytes released by append class.
 Ordinary windows replenish from the reusable voter space reported by the installed journal.
-On ordinary capacity pressure, the driver pauses ordinary intake, preserves the previously accepted source prefix, and uses the maintenance lane for block boundaries and uploads.
+On ordinary capacity pressure, the driver pauses ordinary intake, preserves the previously accepted source prefix, and uses the maintenance lane for block boundaries, uploads, and fenced terminals that settle inherited receiver slots.
 The custodian queries the exact candidate cut and orders preparation without borrowing an ordinary read hold.
 
 An installed driver promotes after an empty replica read and a positive check of the current grant.
@@ -125,8 +138,12 @@ Promotion adds no claim to the replica log.
 The enrolled RTDB worker classifies typed replica records before sealing them, under its TLS credential.
 
 Progress assumes a reachable installed quorum, a live custodian and provider namespace, a funded checkpoint allocation, and eventual release or verified disposition of overlapping holds.
-Study 111's phase model budgets three maintenance records across any number of replacements, covering the retained upload plus the next boundary and its upload.
-The model assumes that the lane trims back to one retained upload after publication and that the workload has no inherited receiver fence to settle.
+Study 111 budgets three checkpoint records across any number of replacements, covering the retained upload plus the next boundary and its upload.
+A successor settles an inherited receiver slot before cutting the next boundary, even under ordinary append pressure.
+The extended accounting adds one record's worth of headroom per retained fenced settlement or open receiver slot in the funded interval.
+The driver admits one open slot at a time, and successive replacements can leave multiple settlements retained before trim.
+Apply the bound where the receiver budget covers those obligations and effective trim removes the settlements and leaves one retained upload.
+The receiver budget is a funding premise for progress, with deployment-specific sizing and admission still to qualify.
 The [maintenance classifier proof](../../verification/verus/maintenance_class/README.md) checks the contribution of each append to that bound.
 
 Local checkpoint staging uses the same shared allocation lock as readers and publishes each encrypted object by immutable creation.

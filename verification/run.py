@@ -1918,14 +1918,23 @@ def verify_fenced_replica_lean(args, scratch):
         {
             "charge-noop": (
                 "| .noOp | .ordinary => false", "| .noOp => true\n  | .ordinary => false",
-                ["classifier_refines_three_record_bound"],
+                ["classifier_refines_maintenance_bound"],
             ),
             "omit-upload-charge": (
                 "| .blockBoundary | .blockUploaded => true", "| .blockBoundary => true\n  | .blockUploaded => false",
                 ["classifier_charges_checkpoint_progress"],
             ),
+            "omit-fenced-terminal-charge": (
+                "| .resolvedTx fencedTerminal => fencedTerminal", "| .resolvedTx _ => false",
+                ["classifier_charges_only_fenced_terminals"],
+            ),
+            "fence-without-an-open-slot": (
+                "      lane.slot = .inherited →\n",
+                "      (lane.slot = .inherited ∨ lane.slot = .vacant) →\n",
+                ["settlement_preserves_receiver_budget"],
+            ),
         },
-        3,
+        9,
         os.environ | {"LEAN_PATH": str(dependencies)},
     )
 
