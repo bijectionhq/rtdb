@@ -238,6 +238,10 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
                         "ordered confirmation has no selected recovery closure")
             elif kind == "publish-checkpoint":
                 require(digest(event["root"]) and digest(event["manifest"]), "checkpoint lacks its root or manifest digest")
+            elif kind == "broker-certified-pointer":
+                broker_pointer(event)
+                require(event["range"] == [event["position"]] * 2 and digest(event["range_digest"]),
+                        "detached pointer has no exact certified interval")
             elif kind in {"admit-recovery", "finish-recovery", "read-retained-payload"}:
                 key = scope(event, ("installation", "stream", "epoch"))
                 if kind == "admit-recovery":
@@ -279,12 +283,20 @@ def exact_checkpoint(event, checkpoint, manifest):
             tuple(checkpoint["root"]), tuple(manifest))
 
 
+def broker_pointer(event):
+    require(event["position"] >= 0 and event["key"].startswith(event["residence"] + "/")
+            and digest(event["frame"]), "detached pointer has no exact committed frame")
+    return (*replica_scope(event), event["residence"], event["position"], event["key"],
+            json.dumps(event["publication"], sort_keys=True), tuple(event["frame"]))
+
+
 def verify_joined(captures):
     """Join independently captured owner events by immutable identity and authority revision."""
     for events in captures:
         verify_native(events, verify_catalog_history=False, verify_certificate_history=False)
     events = [event for capture in captures for event in capture]
     published, catalogs, installed_trims, dependencies, replay_holds, exclusions = {}, {}, {}, {}, {}, {}
+    certified_pointers = set()
     for event in events:
         kind = event["event"]
         if kind == "publish-checkpoint":
@@ -296,6 +308,8 @@ def verify_joined(captures):
             key = (*replica_scope(event), event["through"], tuple(event["anchor"]), frozenset(event["journals"]))
             revision = event["settled_revision"]
             installed_trims[key] = min(revision, installed_trims.get(key, revision))
+        elif kind == "broker-certified-pointer":
+            certified_pointers.add((*broker_pointer(event), event["revision"]))
         elif kind == "admit-recovery":
             key = (*replica_scope(event), event["residence"], event["hold"])
             hold = scope(event, ("first_required", "through", "revision"))
@@ -331,6 +345,9 @@ def verify_joined(captures):
             first, through, revision = replay_holds[hold]
             require(first <= event["position"] <= through and revision <= event["revision"],
                     "payload read is outside its admitted replay interval")
+            if event.get("frame") is not None:
+                require((*broker_pointer(event), event["revision"]) in certified_pointers,
+                        "broker read lacks the exact certified pointer")
             source = event.get("source_hold")
             if source is not None:
                 require(digest(event["frame"]), "broker read lacks its certified sealed frame")

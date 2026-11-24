@@ -186,7 +186,8 @@ Remote provider settlement still requires the existing clock-rate margin.
 The composed model distinguishes admission, partial handoff, time advancing while transport is paused, and refusal at expiry.
 Its negative control permits a socket write at the cutoff and violates the live-write invariant.
 
-Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. The new detached broker admits its own exact position hold before reading and retains it through provider drain. The checker joins that admission to the origin replay ticket and records the certified sealed frame. These changes have source review only.
+Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. The new detached broker admits its own exact position hold before reading and retains it through provider drain. The broker keeps its key grant through TLS payload delivery.
+The checker joins that admission to the origin replay ticket and requires a matching certified range, sealed frame and exact publication before accepting broker delivery. These changes have source review only.
 
 
 Installed receipt reclamation emits the ordered journal's withdrawal position and exact provider path and publication fingerprints.

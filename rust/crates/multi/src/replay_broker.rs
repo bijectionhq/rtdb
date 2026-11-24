@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::{CURRENT_STORAGE_VERSION, oversized_block_index, oversized_key}};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, log::{ReplicaPayload, ReplicaPayloadReference}};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, log::{ReplicaPayload, ReplicaPayloadReference}, sealing::{DeliveryIo, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, PhysicalObjectVersion, Result, StorageEpoch};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
@@ -33,6 +33,7 @@ use crate::{
 const MAX_HEADER: usize = 16 << 10;
 const MAX_BODY: usize = 64 << 20;
 const SOCKET_LIMIT: Duration = Duration::from_secs(30);
+const DELIVERY_INTERRUPTED: &str = "rtdb.multi/replay-broker-delivery-interrupted";
 const CAS_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -312,8 +313,8 @@ impl Service {
             let service = Arc::clone(&self);
             connections.spawn(async move {
                 let _slot = slot;
-                let Ok(mut socket) = socket_work(async { acceptor.accept(socket).await.map_err(transport) }).await else { return; };
-                if let Err(error) = service.dispatch(&mut socket).await {
+                let Ok(mut socket) = socket_work(async { acceptor.accept(DeliveryIo::new(socket)).await.map_err(transport) }).await else { return; };
+                if let Err(error) = service.dispatch(&mut socket).await && error.code != DELIVERY_INTERRUPTED {
                     let response = Response::Refused { category: error.category, code: error.code };
                     let _ = socket_work(send_header(&mut socket, &response)).await;
                 }
@@ -323,7 +324,7 @@ impl Service {
         result
     }
 
-    async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<TcpStream>) -> Result<()> {
+    async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>) -> Result<()> {
         let request: Request = socket_work(receive_header(socket)).await?;
         let verifier = match &request.action {
             Action::Publish { route, .. } if route.requires_transfer_credential() => &self.transfer_token,
@@ -349,7 +350,7 @@ impl Service {
 
     async fn read_for_ticket(
         &self, history: History, ticket: Uuid, position: i64, frame: &[u8], memory: &Arc<MemoryBudget>,
-        socket: Option<&mut tokio_rustls::server::TlsStream<TcpStream>>,
+        socket: Option<&mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>>,
     ) -> Result<ReplicaPayload> {
         let reference = decode_reference(frame)?;
         let region = Uuid::new_v4();
@@ -363,7 +364,21 @@ impl Service {
             let io = IoRegion::new();
             let held = HeldView::recovery(Arc::new((record.clone(), region, position)));
             let read = IoRegion::reading(held, async {
-                let (payload, sealed_frame) = self.read_body(&record, position, frame, &reference, Arc::clone(&io), memory).await?;
+                let plaintext = PlaintextView::new(memory.clone());
+                let (payload, sealed_frame) = plaintext.reading(
+                    self.read_body(&record, position, frame, &reference, Arc::clone(&io), memory),
+                ).await?;
+                let grant = plaintext.grant().await?;
+                if let Some(socket) = socket {
+                    grant.deliver(socket_work(async {
+                        send_header(socket, &Response::Payload { length: payload.as_ref().len() }).await?;
+                        socket.write_all(payload.as_ref()).await.map_err(transport)?;
+                        socket.flush().await.map_err(transport)
+                    })).await.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, DELIVERY_INTERRUPTED,
+                        "The detached replay body did not reach its socket within its grant"))?;
+                } else {
+                    grant.check()?;
+                }
                 crate::residence_trace::record("read-retained-payload", || serde_json::json!({
                     "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
                     "revision": record.version, "stream": record.stream("replica"), "epoch": record.log_epoch,
@@ -374,13 +389,6 @@ impl Service {
                         .filter(|source| matches!(source, StorageRegion::ReplicaReplay { .. }))
                         .map(|_| serde_json::json!({ "hold": ticket, "residence": record.storage_prefix() })),
                 }));
-                if let Some(socket) = socket {
-                    socket_work(async {
-                        send_header(socket, &Response::Payload { length: payload.as_ref().len() }).await?;
-                        socket.write_all(payload.as_ref()).await.map_err(transport)?;
-                        socket.flush().await.map_err(transport)
-                    }).await?;
-                }
                 Ok(payload)
             }).await;
             io.close_and_wait().await;
@@ -483,8 +491,16 @@ impl Service {
         }
         let files = self.open_store(record, io).await?;
         check_length(usize::try_from(files.head_fresh(reference.object()).await?.size).map_err(transport)?)?;
-        let sealed_frame = ring::digest::digest(&ring::digest::SHA256, &page[0].payload)
+        let sealed_frame: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &page[0].payload)
             .as_ref().try_into().expect("SHA-256 width");
+        crate::residence_trace::record("broker-certified-pointer", || serde_json::json!({
+            "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
+            "revision": record.version, "stream": record.stream("replica"), "epoch": record.log_epoch,
+            "residence": residence(record), "position": position, "range": proof.interval,
+            "range_digest": proof.digest_bytes(), "frame": sealed_frame,
+            "key": format!("{}/{}", residence(record), reference.object()),
+            "publication": reference.publication(),
+        }));
         Ok((reference.read_at(&files, memory).await?, sealed_frame))
     }
 

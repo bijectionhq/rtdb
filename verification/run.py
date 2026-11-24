@@ -5101,9 +5101,12 @@ def verify_native_payload_replay(args, source):
     read = next(event for event in events if event["event"] == "read-retained-payload")
     directory = [event for event in events if event["event"] != "read-retained-payload"]
     verify_joined([directory, [read]])
+    substituted_frame = read["frame"].copy()
+    substituted_frame[0] ^= 1
     for field, changed, expected in (
         ("hold", "another-ticket", "payload read lacks its exact replay hold"),
         ("position", read["position"] + 1, "payload read is outside its admitted replay interval"),
+        ("frame", substituted_frame, "broker read lacks the exact certified pointer"),
     ):
         corrupted = copy.deepcopy(read)
         corrupted[field] = changed
