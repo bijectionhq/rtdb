@@ -2362,7 +2362,7 @@ impl OwnedReadSession {
     pub async fn spatial_path_ready(&self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation) -> Result<bool> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let work = rtdb_spatial::path_ready(Arc::clone(&context), &self.owner, relation, path);
+        let work = Box::pin(rtdb_spatial::path_ready(Arc::clone(&context), &self.owner, relation, path));
         let ready = context.reading(work).await?;
         self.check_relation(relation)?;
         Ok(ready)
