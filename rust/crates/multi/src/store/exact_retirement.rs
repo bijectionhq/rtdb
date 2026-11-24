@@ -140,9 +140,9 @@ pub(super) async fn withdraw_inherited_release(
                 crate::residence_trace::record("fork-replacement-verified", || observation());
                 if !pack && witness.record.trie_floor.is_some() {
                     let record = witness.record.clone();
-                    let release = match replacement {
-                        PhysicalObjectPublication::Version(version) => StoredRelease::Exact { record, version, pack: None },
-                        PhysicalObjectPublication::Terminal(terminal) => StoredRelease::Terminal { record, terminal, pack: None },
+                    let release = match &replacement {
+                        PhysicalObjectPublication::Version(version) => StoredRelease::Exact { record, version: version.clone(), pack: None },
+                        PhysicalObjectPublication::Terminal(terminal) => StoredRelease::Terminal { record, terminal: terminal.clone(), pack: None },
                     };
                     let bytes = Bytes::from(serde_json::to_vec(&release).expect("a release serializes"));
                     let id = ring::digest::digest(&ring::digest::SHA256, &bytes);
