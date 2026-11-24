@@ -187,6 +187,13 @@ impl Value {
         }
     }
 
+    pub fn owned_entity_id(&self) -> Result<EntityId> {
+        match self {
+            Self::Binary(value) => Ok(EntityId::Binary(value.clone())),
+            _ => self.entity_id(),
+        }
+    }
+
     pub fn logical_type(&self) -> LogicalType {
         use ScalarType as S;
         let scalar = match self {

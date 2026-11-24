@@ -6,7 +6,7 @@ use bytes::Bytes;
 use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
     BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
-    copy_selected_cells, estimate_copy_cell_bytes, read_entity_id, visible_buffer_bytes,
+    copy_selected_cells, estimate_copy_cell_bytes, read_owned_entity_id, visible_buffer_bytes,
 };
 use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
@@ -596,7 +596,7 @@ pub async fn gather_document(
         let batch = source.batch();
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
-            if selected.is_some() || read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)? != id {
+            if selected.is_some() || read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)? != id {
                 return Err(missing());
             }
             let (index, field) = batch.schema_ref().column_with_name("_system_from").ok_or_else(missing)?;
@@ -868,7 +868,7 @@ pub(super) async fn visit_matches(
             if refined > MAX_REFINED_ROWS {
                 return Err(postings::work_limit());
             }
-            let id = read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
+            let id = read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
             if let PageOrder::Identity { after: Some(after) } = request.page
                 && id <= after
             {
@@ -928,7 +928,7 @@ fn selection_position(selected: &[SelectedHit], id: EntityIdRef<'_>, distance: O
         let mid = lower + (upper - lower) / 2;
         let hit = &selected[mid];
         let batch = hit.source.batch();
-        let previous = read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), hit.row)?;
+        let previous = read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), hit.row)?;
         let order = match (hit.distance_m, distance) {
             (Some(left), Some(right)) => left.total_cmp(&right).then_with(|| previous.cmp(&id)),
             _ => previous.cmp(&id),
@@ -1100,8 +1100,8 @@ mod tests {
         let batch = output.batch();
         let ids = batch.column(0).as_ref();
         let id_field = batch.schema_ref().field(0);
-        assert_eq!(read_entity_id(id_field, ids, 0)?, EntityIdRef::Keyword("first"));
-        assert_eq!(read_entity_id(id_field, ids, 1)?, EntityIdRef::String("second"));
+        assert_eq!(read_owned_entity_id(id_field, ids, 0)?, EntityIdRef::Keyword("first"));
+        assert_eq!(read_owned_entity_id(id_field, ids, 1)?, EntityIdRef::String("second"));
         assert!(batch.column_by_name("geometry").is_none());
         let payloads = batch.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(payloads.value(0).as_ptr(), winner_ptr);

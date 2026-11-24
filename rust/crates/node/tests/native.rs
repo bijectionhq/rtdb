@@ -12,7 +12,7 @@ use rtdb_node::*;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, EntityIds, SqlArguments, TransactionAuthorization, TxOp};
-use rtdb_types::{Anomaly, EntityId, Result, TableRef, Timestamp, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, EntityId, OwnedIdentityScan, Result, TableRef, Timestamp, TxBasis, TxId, Value};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -6201,17 +6201,80 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     assert_eq!(rows(version.timeline).await.len(), 1);
 
     let cut = old.system_time();
-    let keys = old.identity_page(&facts, cut, cut, None, 1).await.unwrap();
-    assert_eq!(keys.keys, vec!["key".to_owned()]);
+    let keys = old.identity_page(&facts, cut, cut, &OwnedIdentityScan::text(None), 1).await.unwrap();
+    assert_eq!(keys.keys, vec![fact.clone()]);
     assert!(keys.more);
-    let keys = old.identity_page(&facts, cut, cut, keys.keys.last().map(String::as_str), 1).await.unwrap();
-    assert_eq!(keys.keys, vec!["second-key".to_owned()]);
+    let keys = old.identity_page(&facts, cut, cut, &OwnedIdentityScan::seek(keys.keys.last().unwrap()).unwrap(), 1).await.unwrap();
+    assert_eq!(keys.keys, vec![second_key]);
     assert!(!keys.more);
-    assert!(old.identity_page(&facts, cut, Timestamp::MIN, None, 2).await.unwrap().keys.is_empty());
-    assert!(old.identity_page(&other, cut, cut, None, 1).await.is_err());
+    assert!(old.identity_page(&facts, cut, Timestamp::MIN, &OwnedIdentityScan::text(None), 2).await.unwrap().keys.is_empty());
+    assert!(old.identity_page(&other, cut, cut, &OwnedIdentityScan::text(None), 1).await.is_err());
 
     drop(old);
     drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn binary_owned_history_keeps_original_positions_and_refuses_duplicate_creates() {
+    use rtdb_types::{Interval, OwnedChangeKind, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("binary-facts").unwrap();
+    let short = EntityId::Binary(vec![0, 255]);
+    let long = EntityId::Binary(vec![0, 255, 0]);
+    let put = |id: &EntityId, from, to| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([("_id".into(), id.as_value())])], node.memory()).unwrap(),
+        valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)),
+    };
+    let first = writer.state_mut().execute_tx(
+        vec![put(&long, 10, 30), put(&short, 10, 15), put(&short, 20, 30)], AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(first.committed());
+    let rejected = writer.state_mut().execute_tx(
+        vec![put(&short, 12, 14)], AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert_eq!(rejected.error().unwrap().code, "rtdb.tx/exists");
+    let last = writer.state_mut().execute_tx(vec![TxOp::OwnedDelete {
+        relation: relation.clone(), id: short.clone(), valid_from: Some(Timestamp(20)), valid_to: Some(Timestamp(30)),
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert!(last.committed());
+
+    let held = writer.open_owned_read().await.unwrap();
+    let cut = first.tx_key().system_time;
+    let first_page = held.identity_page_all_valid(&relation, cut, &OwnedIdentityScan::Binary(None), 1).await.unwrap();
+    assert_eq!(first_page.keys, [short.clone()]);
+    assert!(first_page.more);
+    let next_page = held.identity_page_all_valid(&relation, cut, &OwnedIdentityScan::seek(&short).unwrap(), 1).await.unwrap();
+    assert_eq!(next_page.keys, [long.clone()]);
+    assert!(!next_page.more);
+    assert!(held.identity_page(&relation, cut, Timestamp(22), &OwnedIdentityScan::text(None), 2).await.is_err());
+
+    let mut original = held.open_root_cut_point(&relation, &short, first.tx_key(), Timestamp(22), false)
+        .await.unwrap().unwrap();
+    let original_row = original.next_batch().await.unwrap().unwrap();
+    let position = rtdb_query::owned_row_event_position(original_row.batch(), 0).unwrap();
+    assert_eq!(position.transaction, first.tx_key().tx_id);
+    let mut earlier = held.open_root_cut_point(&relation, &short, first.tx_key(), Timestamp(12), false)
+        .await.unwrap().unwrap();
+    let earlier_row = earlier.next_batch().await.unwrap().unwrap();
+    let earlier_position = rtdb_query::owned_row_event_position(earlier_row.batch(), 0).unwrap();
+    assert_eq!(earlier_position.transaction, position.transaction);
+    assert!(earlier_position.ordinal < position.ordinal);
+    let groups = held.changes(&relation, Timestamp::MIN, 16).await.unwrap().groups;
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].touches[2].id, short);
+    assert_eq!(groups[1].touches[0].kind, OwnedChangeKind::Delete);
+    assert_eq!(groups[1].touches[0].valid, Interval::from_micros(20, 30).unwrap());
+
+    drop(earlier);
+    drop(original);
+    drop(held);
+    drop(writer);
     stop(&node, driver).await;
 }
 

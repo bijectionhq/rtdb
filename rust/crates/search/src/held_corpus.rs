@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow_array::{Array, StringArray, UInt64Array};
+use arrow_array::{Array, BinaryArray, StringArray, UInt64Array};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
@@ -63,23 +63,43 @@ struct Match {
 /// Staged text shadows borrow the request batch through analysis.
 pub struct TextShadows<'a> {
     partitions: &'a UInt64Array,
-    ids: &'a StringArray,
+    ids: TextShadowIds<'a>,
     text: &'a StringArray,
+}
+
+#[derive(Clone, Copy)]
+enum TextShadowIds<'a> {
+    Text(&'a StringArray),
+    Binary(&'a BinaryArray),
+}
+
+impl<'a> TextShadowIds<'a> {
+    fn get(self, row: usize) -> Option<EntityIdRef<'a>> {
+        match self {
+            Self::Text(ids) => ids.is_valid(row).then(|| EntityIdRef::String(ids.value(row))),
+            Self::Binary(ids) => ids.is_valid(row).then(|| EntityIdRef::Binary(ids.value(row))),
+        }
+    }
 }
 
 impl<'a> TextShadows<'a> {
     pub fn try_new(
         partitions: &'a UInt64Array,
-        ids: &'a StringArray,
+        ids: &'a dyn Array,
         text: &'a StringArray,
-        admit_identity: impl Fn(usize, &str) -> bool,
+        admit_identity: impl Fn(usize, EntityIdRef<'a>) -> bool,
     ) -> Option<Self> {
         if partitions.len() != ids.len() || ids.len() != text.len() {
             return None;
         }
+        let ids = if let Some(ids) = ids.as_any().downcast_ref::<StringArray>() {
+            TextShadowIds::Text(ids)
+        } else {
+            TextShadowIds::Binary(ids.as_any().downcast_ref::<BinaryArray>()?)
+        };
         for row in 0..partitions.len() {
-            if partitions.is_null(row) || ids.is_null(row)
-                || !admit_identity(usize::try_from(partitions.value(row)).ok()?, ids.value(row))
+            if partitions.is_null(row)
+                || !admit_identity(usize::try_from(partitions.value(row)).ok()?, ids.get(row)?)
             {
                 return None;
             }
@@ -92,7 +112,7 @@ impl<'a> TextShadows<'a> {
         (0..partitions.len()).map(move |row| {
             (
                 partitions.value(row) as usize,
-                EntityIdRef::String(ids.value(row)),
+                ids.get(row).expect("admitted staged shadow identity"),
                 text.is_valid(row).then(|| text.value(row)),
             )
         })
@@ -244,7 +264,7 @@ impl HeldTextCorpus {
                 context.check_cancelled_at(row)?;
                 let id_bytes = rtdb_columnar::estimate_read_value_bytes(id_field, ids, row)?;
                 let _identity = self.memory.reserve(id_bytes.saturating_mul(2))?;
-                let physical = rtdb_columnar::read_entity_id(id_field, ids, row)?;
+                let physical = rtdb_columnar::read_owned_entity_id(id_field, ids, row)?;
                 let protected = sealed.then(|| crate::rank_family::RootProjectionId::parse(physical)).transpose()?;
                 let id = protected.as_ref().map_or(physical, |id| id.canonical()).into_owned();
                 if self.contains_shadow(partition, &id) { continue; }

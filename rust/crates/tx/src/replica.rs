@@ -148,6 +148,12 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
                 if id.iid() != batch.header(index)?.iid || id.handle_bytes().as_slice() != encoded {
                     return Err(invalid("Resolved owned event locality differs from its complete key"));
                 }
+                if matches!(&id, rtdb_types::EntityId::Binary(_)) {
+                    let event = batch.view().borrow_event(index)?;
+                    if event.header().op == EventOp::Put && event.put_identity()? != Some(rtdb_columnar::EntityIdRef::from(&id)) {
+                        return Err(invalid("Resolved owned put differs from its complete identity"));
+                    }
+                }
             }
         }
         let write = TableWrite::new(StructFields::new(), Some(batch)).with_declarations(declarations);

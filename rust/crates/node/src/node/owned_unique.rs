@@ -116,7 +116,7 @@ impl OwnedReadSession {
                 for row in 0..batch.num_rows() {
                     let size = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
                     let _charge = context.memory.reserve(size.saturating_add(4096))?;
-                    let id = rtdb_columnar::read_execution_value(field, values, row)?.entity_id()?;
+                    let id = rtdb_columnar::read_execution_value(field, values, row)?.owned_entity_id()?;
                     rtdb_query::owned_row_revision(batch, row, &id, &context.memory)?;
                     self.check_point_purge_floor(relation, &id, retained).await?;
                 }

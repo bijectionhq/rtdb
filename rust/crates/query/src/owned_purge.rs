@@ -208,6 +208,7 @@ fn complete_handle(id: &EntityId) -> Result<Vec<u8>> {
 fn exceeds_handle_bound(id: &EntityId) -> bool {
     matches!(id, EntityId::String(text) if text.len() >= OWNED_CHANGE_GROUP_BYTES)
         || matches!(id, EntityId::Keyword(text) if text.as_str().len() >= OWNED_CHANGE_GROUP_BYTES)
+        || matches!(id, EntityId::Binary(bytes) if bytes.len() >= OWNED_CHANGE_GROUP_BYTES)
 }
 
 fn bucket_id(id: &EntityId) -> EntityId {

@@ -638,7 +638,7 @@ impl WorldShadow {
     pub fn from_record(mut row: StructFields<Value>) -> Result<Self> {
         let unavailable = OwnedWorld::unavailable;
         let identity = row.remove("_id").ok_or_else(unavailable)?;
-        identity.entity_id()?;
+        identity.owned_entity_id()?;
         let fields = row.remove(Self::FIELDS).ok_or_else(unavailable)?;
         let fact = match fields {
             Value::Null => Self::Deleted,

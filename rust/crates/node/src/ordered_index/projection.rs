@@ -360,9 +360,9 @@ impl Changes {
                             return Err(format_error("Governed ordered put omitted its identity"));
                         };
                         let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, offset)?)?;
-                        let matches = match rtdb_columnar::read_entity_id(field, array, offset) {
+                        let matches = match rtdb_columnar::read_owned_entity_id(field, array, offset) {
                             Ok(borrowed) => borrowed == id,
-                            Err(_) => event.put_cell("_id", &LogicalType::Null)?.entity_id()? == id.into_owned(),
+                            Err(_) => event.put_cell("_id", &LogicalType::Null)?.owned_entity_id()? == id.into_owned(),
                         };
                         if !matches {
                             return Err(format_error("Governed ordered put differs from its physical identity"));

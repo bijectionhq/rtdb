@@ -2082,7 +2082,7 @@ impl<'a> OpenTransaction<'a> {
                     | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: false, .. }
                         if replaces_pin && !proposal_hold && relation.is_root_data() && documents.rows().len() == 1
                             && replacement.is_none() => {
-                        let id = crate::source::document_id(&documents.rows()[0], &self.context.memory)?;
+                        let id = crate::source::owned_document_id(&documents.rows()[0], &self.context.memory)?;
                         replacement = Some((relation, id));
                         root_rows += 1;
                     }
@@ -2090,7 +2090,7 @@ impl<'a> OpenTransaction<'a> {
                     | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: true, .. }
                         if (sibling_fork || (proposal_hold && !proposal_shorten)) && relation.is_root_data() && documents.rows().len() == 1
                             && replacement.is_none() => {
-                        let id = crate::source::document_id(&documents.rows()[0], &self.context.memory)?;
+                        let id = crate::source::owned_document_id(&documents.rows()[0], &self.context.memory)?;
                         replacement = Some((relation, id));
                         root_rows += 1;
                     }
@@ -2296,7 +2296,7 @@ impl<'a> OpenTransaction<'a> {
                 for row in write.documents.rows() {
                     use crate::hosted_control::OwnedDocumentRow;
                     let (id, _identity) = match row {
-                        OwnedDocumentRow::Values(row) => (crate::source::document_id(row, &self.context.memory)?, None),
+                        OwnedDocumentRow::Values(row) => (crate::source::owned_document_id(row, &self.context.memory)?, None),
                         OwnedDocumentRow::Arrow(documents, row) => {
                             let id = documents.owned_id_ref(row)?;
                             let reservation = self.context.memory.reserve(id.owned_payload_bytes().saturating_mul(4))?;
@@ -2344,7 +2344,7 @@ impl<'a> OpenTransaction<'a> {
                     _ => continue,
                 };
                 for document in documents.rows() {
-                    let id = crate::source::document_id(document, &self.context.memory)?;
+                    let id = crate::source::owned_document_id(document, &self.context.memory)?;
                     self.require_world_create_absence(owner, relation, relation, &id).await?;
                 }
             }
@@ -2989,7 +2989,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
             }
             for (document, iid) in documents.rows().iter().zip(iids) {
-                if crate::source::document_id(document, &self.context.memory)?.iid() != *iid {
+                if crate::source::owned_document_id(document, &self.context.memory)?.iid() != *iid {
                     return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
                 }
             }
@@ -3032,7 +3032,7 @@ impl<'a> OpenTransaction<'a> {
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
                     .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
-                let id = crate::source::document_id(row, &self.context.memory)?;
+                let id = crate::source::owned_document_id(row, &self.context.memory)?;
                 let shadow = rtdb_types::WorldShadow::from_record(row.clone())?;
                 match &shadow {
                     rtdb_types::WorldShadow::Present(fact) => validate_owned_schema(schema, fact)?,
@@ -3054,7 +3054,7 @@ impl<'a> OpenTransaction<'a> {
             }
             if bounded_held {
                 for row in documents.rows() {
-                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    let id = crate::source::owned_document_id(row, &self.context.memory)?;
                     self.reserve_bounded_period_write(relation, id)?;
                 }
             }
@@ -3094,14 +3094,14 @@ impl<'a> OpenTransaction<'a> {
                 }
                 validate_owned_schema(schema, row)?;
                 if let Some(context) = &context {
-                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    let id = crate::source::owned_document_id(row, &self.context.memory)?;
                     if !identities.insert(id.clone())
                         || rtdb_query::owned_purge_floor(Arc::clone(context), owner, relation, &id).await?.is_some()
                         || self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some()
                     { return Err(insert_exists()); }
                 }
                 if schema.requires_bounded_period() {
-                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    let id = crate::source::owned_document_id(row, &self.context.memory)?;
                     self.reserve_bounded_period_write(relation, id)?;
                 }
             }
@@ -3121,7 +3121,7 @@ impl<'a> OpenTransaction<'a> {
                             "rtdb.owned/validity-policy", "A bounded period belongs to the ordered operation",
                         ));
                     }
-                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    let id = crate::source::owned_document_id(row, &self.context.memory)?;
                     self.reserve_bounded_period_write(relation, id)?;
                 } else {
                     schema.require_write_validity(row_bounds)?;
@@ -3139,7 +3139,7 @@ impl<'a> OpenTransaction<'a> {
                 let mut next = rtdb_types::OwnedLifetimeFloor::at(lifetime, created)?;
                 next.swept_present_through = floor.swept_present_through;
                 for row in documents.rows() {
-                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    let id = crate::source::owned_document_id(row, &self.context.memory)?;
                     if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, &id).await?.is_some()
                         || self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some() {
                         return Err(insert_exists());
@@ -3663,13 +3663,13 @@ impl<'a> OpenTransaction<'a> {
         };
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
         for (index, document) in documents.rows().iter().enumerate() {
-            let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
+            let iid = match iids { Some(iids) => iids[index], None => crate::source::owned_document_id(document, &self.context.memory)?.iid() };
             let default_from = from.unwrap_or(self.terms_time);
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let valid_time = interval(row_from, row_to)?;
-            let id = crate::source::document_id(document, &self.context.memory)?;
+            let id = crate::source::owned_document_id(document, &self.context.memory)?;
             let kind = if relation.world().is_some() && rtdb_types::WorldShadow::is_tombstone(document) {
                 rtdb_types::OwnedChangeKind::Delete
             } else {

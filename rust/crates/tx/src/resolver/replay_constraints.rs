@@ -30,7 +30,7 @@ impl ConstraintMembers {
         };
         let mut event = Sha256::new();
         event.update(b"rtdb.hosted.constraint-member.v1\0");
-        frame(&mut event, id);
+        frame(&mut event, id.as_bytes());
         match member {
             ConstraintMember::Removed => event.update([0]),
             ConstraintMember::Occupancy { valid, holder } => {
@@ -41,6 +41,10 @@ impl ConstraintMembers {
                     None => event.update([0]),
                     Some(EntityId::String(holder)) => {
                         event.update([1]);
+                        frame(&mut event, holder.as_bytes());
+                    },
+                    Some(EntityId::Binary(holder)) => {
+                        event.update([2]);
                         frame(&mut event, holder);
                     },
                     Some(_) => return Err(invalid()),
@@ -68,9 +72,9 @@ impl ConstraintMembers {
     }
 }
 
-fn frame(image: &mut Sha256, value: &str) {
+fn frame(image: &mut Sha256, value: &[u8]) {
     image.update((value.len() as u64).to_be_bytes());
-    image.update(value.as_bytes());
+    image.update(value);
 }
 
 fn invalid() -> Anomaly {

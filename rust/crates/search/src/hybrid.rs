@@ -26,7 +26,7 @@ pub fn fuse_ranked(windows: &[(&str, &OwnedSearchBatch)], limit: usize, memory: 
         let ids = batch.column(0).as_ref();
         let partitions = batch.column(2).as_primitive::<UInt64Type>();
         for row in 0..batch.num_rows() {
-            let id = rtdb_columnar::read_entity_id(batch.schema_ref().field(0), ids, row)?;
+            let id = rtdb_columnar::read_owned_entity_id(batch.schema_ref().field(0), ids, row)?;
             let partition = usize::try_from(partitions.value(row)).map_err(|_| invalid())?;
             let contribution = 1.0 / (RANK_CONSTANT + (row + 1) as f64);
             let rank = u32::try_from(row + 1).map_err(|_| invalid())?;

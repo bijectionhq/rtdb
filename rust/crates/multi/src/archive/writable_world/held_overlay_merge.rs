@@ -1,25 +1,27 @@
 //! Covered seek pages over ordered writer shadows.
 use std::collections::BTreeMap;
 
-use arrow_array::{Array, BinaryArray, RecordBatch, StringArray};
+use arrow_array::{Array, BinaryArray, RecordBatch};
 use rtdb_node::{OwnedKeyBound, OwnedRangePage, OwnedRangeRequest};
 
 use super::*;
 
-type Key = (Vec<u8>, String);
+type Key = (Vec<u8>, EntityId);
 
 fn keys(page: &OwnedRangePage, path: &OwnedRelation) -> Result<Vec<Key>> {
     let Some(batch) = &page.batch else { return Ok(Vec::new()); };
     let batch = batch.batch();
     let path = batch.column_by_name(path.name()).and_then(|values| values.as_any().downcast_ref::<BinaryArray>())
         .ok_or_else(OwnedWorld::unavailable)?;
-    let ids = batch.column_by_name("_id").and_then(|values| values.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(OwnedWorld::unavailable)?;
-    if path.null_count() != 0 || ids.null_count() != 0 {
+    let (index, field) = batch.schema_ref().column_with_name("_id").ok_or_else(OwnedWorld::unavailable)?;
+    if path.null_count() != 0 || !matches!(field.data_type(), arrow_schema::DataType::Utf8 | arrow_schema::DataType::Binary) {
         return Err(OwnedWorld::unavailable());
     }
-    Ok(path.iter().flatten().zip(ids.iter().flatten())
-        .map(|(key, id)| (key.to_vec(), id.to_owned())).collect())
+    (0..path.len()).map(|row| {
+        let id = rtdb_columnar::read_owned_entity_id(field, batch.column(index).as_ref(), row)
+            .map_err(|_| OwnedWorld::unavailable())?;
+        Ok((path.value(row).to_vec(), id.into_owned()))
+    }).collect()
 }
 
 fn order(descending: bool, left: &Key, right: &Key) -> std::cmp::Ordering {
@@ -131,16 +133,16 @@ async fn merge_range(
             if coverage.as_ref().is_some_and(|edge| order(request.descending, key, edge).is_gt()) {
                 break;
             }
-            let id = EntityId::String(key.1.clone());
+            let id = &key.1;
             let mut masked = false;
             for newer in &layers[..origin] {
-                if newer.shadows(&id, valid).await? {
+                if newer.shadows(id, valid).await? {
                     masked = true;
                     break;
                 }
             }
             if masked { continue; }
-            let size = key.0.len().checked_add(key.1.len()).ok_or_else(unavailable)?;
+            let size = key.0.len().checked_add(key.1.retained_bytes()).ok_or_else(unavailable)?;
             bytes = bytes.checked_add(size).filter(|bytes| *bytes <= 8 << 20).ok_or_else(unavailable)?;
             retained.push(memory.reserve(size)?);
             output.push(key.clone());
@@ -152,7 +154,26 @@ async fn merge_range(
                 None
             } else {
                 let paths = Arc::new(BinaryArray::from_iter_values(output.iter().map(|key| key.0.as_slice())));
-                let ids = Arc::new(StringArray::from_iter_values(output.iter().map(|key| key.1.as_str())));
+                let id_field = schema.field_with_name("_id").map_err(|_| unavailable())?;
+                let ids: arrow_array::ArrayRef = match id_field.data_type() {
+                    arrow_schema::DataType::Binary => {
+                        let mut ids = arrow_array::builder::BinaryBuilder::with_capacity(output.len(), bytes);
+                        for (_, id) in &output {
+                            let EntityId::Binary(id) = id else { return Err(unavailable()); };
+                            ids.append_value(id);
+                        }
+                        Arc::new(ids.finish())
+                    }
+                    arrow_schema::DataType::Utf8 => {
+                        let mut ids = arrow_array::builder::StringBuilder::with_capacity(output.len(), bytes);
+                        for (_, id) in &output {
+                            let EntityId::String(id) = id else { return Err(unavailable()); };
+                            ids.append_value(id);
+                        }
+                        Arc::new(ids.finish())
+                    }
+                    _ => return Err(unavailable()),
+                };
                 let columns = schema.fields().iter().map(|field| -> arrow_array::ArrayRef {
                     if field.name() == "_id" { ids.clone() } else { paths.clone() }
                 }).collect::<Vec<_>>();
@@ -162,8 +183,8 @@ async fn merge_range(
             return Ok(OwnedRangePage { schema, batch });
         }
         let (key, id) = coverage.ok_or_else(unavailable)?;
-        _cursor_charge = Some(memory.reserve(key.len().saturating_add(id.len()).saturating_add(256))?);
-        cursor = Some(StructFields::from([(path.name().to_owned(), Value::Binary(key)), ("_id".into(), Value::Utf8(id))]));
+        _cursor_charge = Some(memory.reserve(key.len().saturating_add(id.retained_bytes()).saturating_add(256))?);
+        cursor = Some(StructFields::from([(path.name().to_owned(), Value::Binary(key)), ("_id".into(), id.as_value())]));
     }
     Err(unavailable())
 }
@@ -174,7 +195,7 @@ mod tests {
 
     #[test]
     fn both_writers_must_cover_the_returned_seek_prefix() {
-        let key = |n: u8| (vec![n], n.to_string());
+        let key = |n: u8| (vec![n], EntityId::Binary(vec![n]));
         let live = [key(1), key(3)];
         let frozen = [key(2), key(4)];
         assert_eq!(covered_edge([live.as_slice(), frozen.as_slice()], 2, false), Some(&live[1]));

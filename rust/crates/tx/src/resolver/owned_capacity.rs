@@ -348,7 +348,7 @@ pub(super) async fn period_population(
             let rows = batch.batch();
             for row in 0..rows.num_rows() {
                 context.check_cancelled_at(row)?;
-                let id = occupancy_value_at(&context.memory, rows, row, "_id", uncovered)?.entity_id()?;
+                let id = occupancy_value_at(&context.memory, rows, row, "_id", uncovered)?.owned_entity_id()?;
                 if !masked.contains(&id) {
                     count = count.checked_add(1).ok_or_else(overflow)?;
                 }

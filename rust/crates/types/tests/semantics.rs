@@ -45,6 +45,25 @@ fn iids_match_existing_arrow_golden_documents() {
 }
 
 #[test]
+fn binary_owned_handles_preserve_full_unsigned_byte_order_and_type() {
+    let keys: &[&[u8]] = &[&[], &[0], &[0, 0], &[0, 255], &[128], &[255]];
+    let ids: Vec<_> = keys.iter().map(|key| EntityId::Binary(key.to_vec())).collect();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    let handles: Vec<_> = ids.iter().map(EntityId::handle_bytes).collect();
+    assert!(handles.windows(2).all(|pair| pair[0] < pair[1]));
+    for ((id, handle), key) in ids.iter().zip(handles).zip(keys) {
+        assert_eq!(handle.split_first(), Some((&4, *key)));
+        assert_eq!(EntityId::from_handle_bytes(&handle).unwrap(), *id);
+        assert_eq!(id.as_value().owned_entity_id().unwrap(), *id);
+        assert_eq!(id.as_value().entity_id().unwrap_err().code, "xtdb/invalid-id");
+    }
+    let text = EntityId::String("00ff".into());
+    assert_ne!(text.handle_bytes(), ids[3].handle_bytes());
+    assert_ne!(text.iid(), ids[3].iid());
+    assert!(EntityId::from_handle_bytes(&[5, 0]).is_err());
+}
+
+#[test]
 fn keyword_lookups_include_the_native_write_digest_and_reference_digest() {
     let keyword = Keyword::parse(":solo").unwrap();
     let [native, reference] = EntityId::keyword_lookup_iids(keyword.as_str());

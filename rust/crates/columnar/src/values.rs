@@ -692,9 +692,13 @@ impl<'a> ColumnReader<'a> {
     pub fn read(&self, array: &dyn Array, row: usize) -> Result<Value> { read_typed(&self.logical, self.field, array, row) }
     pub fn logical(&self) -> &LogicalType { &self.logical }
 
+    pub fn read_owned_entity_id<'b>(&self, array: &'b dyn Array, row: usize) -> Result<Option<EntityIdRef<'b>>> {
+        read_selected(&self.logical, self.field, array, row, read_id::<false, true>)
+    }
+
     /// Reads a raw entity ID, returning absence for a null cell.
     pub fn read_entity_id<'b>(&self, array: &'b dyn Array, row: usize) -> Result<Option<EntityIdRef<'b>>> {
-        read_selected(&self.logical, self.field, array, row, read_id::<false>)
+        read_selected(&self.logical, self.field, array, row, read_id::<false, false>)
     }
 }
 
@@ -707,7 +711,11 @@ pub fn read_execution_entity_id_as<'a>(
         Some(logical) => logical,
         None => { derived = from_field(field)?; &derived }
     };
-    read_selected(logical, field, array, row, read_id::<true>)
+    read_selected(logical, field, array, row, read_id::<true, false>)
+}
+
+pub fn read_execution_owned_entity_id<'a>(field: &Field, array: &'a dyn Array, row: usize) -> Result<Option<EntityIdRef<'a>>> {
+    read_selected(&from_field(field)?, field, array, row, read_id::<true, true>)
 }
 
 /// `read_value` for a caller that has derived `logical` from `field` once, for many cells of the column.
@@ -765,11 +773,11 @@ fn read_selected<'a, T>(
     read_leaf(logical, field, array, row)
 }
 
-fn read_id<'a, const EXECUTION: bool>(
+fn read_id<'a, const EXECUTION: bool, const OWNED: bool>(
     logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize,
 ) -> Result<Option<EntityIdRef<'a>>> {
     if array.is_null(row) || *logical == LogicalType::Null { return Ok(None); }
-    if let Some(id) = borrow_id_scalar(logical, array, row, EXECUTION) { return Ok(Some(id)); }
+    if let Some(id) = borrow_id_scalar(logical, array, row, EXECUTION, OWNED) { return Ok(Some(id)); }
     match logical {
         LogicalType::Scalar(ScalarType::Binary) => { downcast::<BinaryArray>(array)?; }
         LogicalType::Scalar(ScalarType::FixedSizeBinary(_)) => { downcast::<FixedSizeBinaryArray>(array)?; }

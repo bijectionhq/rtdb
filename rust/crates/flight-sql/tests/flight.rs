@@ -2596,6 +2596,129 @@ async fn owned_arrow_writes_refuse_a_decimal_coefficient_outside_declared_precis
 }
 
 #[tokio::test]
+async fn binary_owned_flight_retains_identity_order_and_the_scalar_batch_refusal() {
+    use arrow_array::{Array, ArrayRef, BinaryArray, TimestampMicrosecondArray,
+        builder::{ListBuilder, StringBuilder}};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn request(prefix: &[u8], columns: Vec<(&str, ArrayRef)>) -> Bytes {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let mut body = prefix.to_vec();
+        body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+        body.into()
+    }
+    fn entries(rows: &[(u8, &[u8])]) -> Bytes {
+        let mut body = (rows.len() as u16).to_be_bytes().to_vec();
+        for &(selector, input) in rows {
+            body.push(selector);
+            body.extend_from_slice(&(input.len() as u32).to_be_bytes());
+            body.extend_from_slice(input);
+        }
+        body.into()
+    }
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let relation = b" items";
+    let low: &[u8] = &[0, 255];
+    let high: &[u8] = &[0, 255, 0];
+    let mut declaration = relation.to_vec();
+    declaration.extend_from_slice(br#"{"fields":[{"name":"value","type":{"kind":"i64"},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v1", declaration.into()).await.unwrap();
+    let mut columns = ListBuilder::new(StringBuilder::new());
+    columns.values().append_value("value");
+    columns.values().append_value("_id");
+    columns.append(true);
+    client.action("rtdb.owned.DeclarePath.v1", request(relation, vec![
+        ("_id", Arc::new(StringArray::from(vec!["by_value"]))),
+        ("columns", Arc::new(columns.finish())),
+    ])).await.unwrap();
+
+    let commit = request(&[relation.as_slice(), &i64::MAX.to_be_bytes()].concat(), vec![
+        ("_id", Arc::new(BinaryArray::from_iter_values([high, low]))),
+        ("_op", Arc::new(StringArray::from(vec!["create", "create"]))),
+        ("value", Arc::new(Int64Array::from(vec![9, 9]))),
+        ("_valid_from", Arc::new(TimestampMicrosecondArray::from_value(0, 2).with_timezone("UTC"))),
+    ]);
+    client.action("rtdb.owned.Commit.v1", commit.clone()).await.unwrap();
+    assert_eq!(client.action("rtdb.owned.Commit.v1", commit).await.unwrap_err().message(), "Insert overlaps an existing document");
+
+    let opened = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap().remove(0).body;
+    let hold = opened.slice(..16);
+    let system = i64::from_be_bytes(opened[16..24].try_into().unwrap());
+    let prefix = [hold.as_ref(), relation.as_slice()].concat();
+    let point = |id: ArrayRef| vec![("_id", id), ("valid_micros", Arc::new(Int64Array::from(vec![Some(system)])))];
+    let scalar_point = "rtdb.owned.ReadHeldPoint.v2";
+    let binary_point = request(&prefix, point(Arc::new(BinaryArray::from_iter_values([low]))));
+    let reply = client.action(scalar_point, binary_point.clone()).await.unwrap().remove(0).body;
+    let mut stream = StreamReader::try_new(reply.as_ref(), None).unwrap();
+    let original_position = stream.schema().metadata()["rtdb.owned.event_position"].clone();
+    let row = stream.next().unwrap().unwrap();
+    let ids = row.column_by_name("_id").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(ids.value(0), low);
+
+    let text_point = request(&prefix, point(Arc::new(StringArray::from(vec!["00ff"]))));
+    let text = client.action(scalar_point, text_point).await.unwrap().remove(0).body;
+    assert!(StreamReader::try_new(text.as_ref(), None).unwrap().next().is_none());
+    let historical = request(&[hold.as_ref(), &system.to_be_bytes(), relation.as_slice()].concat(),
+        point(Arc::new(BinaryArray::from_iter_values([low]))));
+    let historical = client.action("rtdb.owned.ReadHeldHistoricalPoint.v1", historical).await.unwrap().remove(0).body;
+    let history = StreamReader::try_new(historical.as_ref(), None).unwrap();
+    assert_eq!(history.schema().metadata()["rtdb.owned.event_position"], original_position);
+
+    let unknown = [0; 16];
+    let failure = client.action(scalar_point, Bytes::copy_from_slice(&unknown)).await.unwrap_err();
+    let input = client.request(Action {
+        r#type: "rtdb.owned.ReadPoints.v1".into(),
+        body: entries(&[(0, &binary_point), (0, &unknown), (0, &binary_point)]),
+    });
+    let mut results = client.client.do_action(input).await.unwrap().into_inner();
+    assert_eq!(results.message().await.unwrap().unwrap().body, reply);
+    let refused = results.message().await.unwrap_err();
+    assert_eq!((refused.code(), refused.message()), (failure.code(), failure.message()));
+
+    let compact = [prefix.as_slice(), &system.to_be_bytes(), low].concat();
+    let input = client.request(Action {
+        r#type: "rtdb.owned.ReadSelection.v1".into(),
+        body: entries(&[(9, &compact), (9, &compact)]),
+    });
+    let mut results = client.client.do_action(input).await.unwrap().into_inner();
+    assert_eq!(&results.message().await.unwrap().unwrap().body[..2], &[b'P', 1]);
+    assert_eq!(&results.message().await.unwrap().unwrap().body[..2], &[b'P', 0]);
+    assert!(results.message().await.unwrap().is_none());
+
+    let scan = |after| request(&prefix, vec![
+        ("system_micros", Arc::new(Int64Array::from(vec![system]))),
+        ("valid_micros", Arc::new(Int64Array::from(vec![system]))),
+        ("limit", Arc::new(Int64Array::from(vec![1]))),
+        ("after", Arc::new(BinaryArray::from(vec![after]))),
+    ]);
+    for (after, key, more) in [(None, low, "1"), (Some(low), high, "0")] {
+        let page = client.action("rtdb.owned.ReadHeldIdentityPage.v1", scan(after)).await.unwrap().remove(0).body;
+        let mut rows = StreamReader::try_new(page.as_ref(), None).unwrap();
+        assert_eq!(rows.schema().metadata()["rtdb.owned.identity_more"], more);
+        let batch = rows.next().unwrap().unwrap();
+        let ids = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(ids.value(0), key);
+    }
+    let range = request(&prefix, vec![
+        ("path", Arc::new(StringArray::from(vec!["by_value"]))),
+        ("lower", Arc::new(Int64Array::from(vec![9]))),
+        ("upper", Arc::new(Int64Array::from(vec![None]))),
+        ("limit", Arc::new(Int64Array::from(vec![2]))),
+    ]);
+    let first = client.action("rtdb.owned.ReadHeldRange.v1", range).await.unwrap().remove(0).body;
+    let mut rows = StreamReader::try_new(first.as_ref(), None).unwrap();
+    let batch = rows.next().unwrap().unwrap();
+    let ids = batch.column_by_name("_id").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(ids.iter().collect::<Vec<_>>(), [Some(low), Some(high)]);
+
+    client.action("rtdb.owned.CloseRead.v1", hold).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order() {
     use arrow_array::{ArrayRef, BinaryArray, BooleanArray, ListArray, NullArray, StructArray, UInt64Array,
         builder::{ListBuilder, StringBuilder}};

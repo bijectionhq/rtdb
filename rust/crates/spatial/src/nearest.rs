@@ -6,7 +6,7 @@ use arrow_array::{
 use arrow_buffer::{Buffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{
-    EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, read_entity_id, retain_buffer,
+    EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, read_owned_entity_id, retain_buffer,
 };
 use rtdb_query::{OwnedSpatialScan, QueryContext, open_owned_spatial_scan};
 use rtdb_types::{Anomaly, Iid, OwnedRelation, Result, Timestamp};
@@ -134,7 +134,7 @@ impl PreparedNearest {
                 for row in 0..batch.num_rows() {
                     context.check_cancelled_at(row)?;
                     let id =
-                        read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
+                        read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
                     let Some(&rank) = positions.get(&id) else {
                         continue;
                     };
@@ -238,7 +238,7 @@ pub(super) async fn gather_range(
             let batch = source.batch();
             for row in 0..batch.num_rows() {
                 context.check_cancelled_at(row)?;
-                let id = read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
+                let id = read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
                 let Some(&rank) = positions.get(&id) else { continue; };
                 let destination = &mut selected[rank];
                 if destination.is_some() { return Err(inconsistent_ranking()); }
@@ -367,6 +367,7 @@ impl RankingBuilder {
                 (2, &integer)
             }
             EntityIdRef::Uuid(value) => (3, value),
+            EntityIdRef::Binary(value) => (4, value),
         };
         let end = self
             .keys
