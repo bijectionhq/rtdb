@@ -34,7 +34,7 @@ pub(super) struct CustodyGroup {
     #[serde(default)]
     created: Option<Basis>,
     pub(super) revoked: Option<Basis>,
-    members: imbl::OrdSet<CustodyMember>,
+    pub(super) members: imbl::OrdSet<CustodyMember>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) original: Option<CustodyOccurrence>,
     #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
@@ -61,7 +61,7 @@ impl CustodyGroup {
         self.original.iter().chain(self.reservations.values().filter_map(|entry| entry.occurrence.as_ref()))
     }
 
-    fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
+    pub(super) fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
         if self.created.is_some_and(|created| created > at) { return None; }
         let mut hash = Sha256::new();
         hash.update(b"rtdb/v1/custody-inventory\0");
@@ -158,11 +158,11 @@ impl BranchIndex {
     }
 
     pub fn custody_inventory(&self, group: CustodyGroupId) -> Option<CustodyInventory> {
-        self.custody.get(&group)?.inventory(group, self.head.basis)
+        self.custody_inventory_at(group, self.head.basis)
     }
 
     pub(super) fn custody_inventories(&self, at: Basis) -> impl Iterator<Item = CustodyInventory> + '_ {
-        self.custody.iter().filter_map(move |(&id, group)| group.inventory(id, at))
+        self.custody.keys().filter_map(move |&id| self.custody_inventory_at(id, at))
     }
 
     pub fn custody_revocation_writes(&self, id: CustodyGroupId, cut: BranchCut) -> Result<Vec<BranchWrite>> {

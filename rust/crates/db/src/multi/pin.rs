@@ -4,8 +4,8 @@ use rtdb_crypt::{Kms, Plaintext, tokens::ExportTicket};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::{BranchCut, BranchIndex};
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
-use rtdb_tx::transact::TransactState;
-use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef, Timestamp, rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity}};
+use rtdb_tx::transact::{Outcome, Transact, TransactState};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity}};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -16,6 +16,24 @@ use super::{MultiDatabase, next, no_writer};
 const EXACT_EXPORT: &[u8; 5] = b"RTEX1";
 const MANAGED_EXPORT: &[u8; 5] = b"RTEX2";
 const MANAGED_HEADER_BYTES: usize = 16 + 32 + 16;
+
+#[derive(Clone, Copy)]
+enum Restore<'a> {
+    Plain,
+    Managed,
+    Native(&'a NativeCheckpointCustody),
+}
+
+/// Evidence read from the committed destination checkpoint and its readable generation.
+pub struct NativeCheckpointInstallation {
+    basis: Basis,
+    custody: NativeCheckpointCustody,
+}
+
+impl NativeCheckpointInstallation {
+    pub fn basis(&self) -> Basis { self.basis }
+    pub fn custody(&self) -> &NativeCheckpointCustody { &self.custody }
+}
 
 pub struct PinnedExport {
     pin: Pin,
@@ -114,9 +132,16 @@ impl MultiDatabase {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/export-pending-writes", "The writer is settling an admitted transaction"));
         }
         let transactions = self.durable_transactions();
+        if target.is_some() && transactions.index().native_checkpoint_pin_used(*id.as_bytes()) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/native-checkpoint-pin-used", "The source pin already belongs to a durable native transfer"));
+        }
         let cut = transactions.index().exact(basis)?;
         if target.is_none() { require_ordinary_inventory(transactions.index(), basis)?; }
-        let checkpoint = transactions.encode_checkpoint_at(basis)?;
+        let checkpoint = if target.is_some() && transactions.index().has_custody_groups() {
+            transactions.encode_native_checkpoint_at(basis)?
+        } else {
+            transactions.encode_checkpoint_at(basis)?
+        };
         let mut payload = Vec::with_capacity(EXACT_EXPORT.len() + 16 + target.map_or(0, |_| MANAGED_HEADER_BYTES) + checkpoint.len());
         if let Some(target) = target {
             payload.extend_from_slice(MANAGED_EXPORT);
@@ -207,21 +232,79 @@ impl MultiDatabase {
         if managed_binding(&image)? != Some((reservation.target, id)) || manifest_identity(pin.manifest) != reservation.source.manifest_sha256
             || exact_payload(&image)?.0.basis != reservation.source.basis || pin.until.is_some() || reservation.source.until.is_some()
         { return Err(managed_export_required()); }
+        let (cut, checkpoint) = exact_payload(&image)?;
+        if TransactState::decode_checkpoint(checkpoint, cut)?.index().has_custody_groups()
+            && !self.durable_transactions().index().native_checkpoint_forward(reservation)?
+                .is_some_and(|(_, destination)| destination.is_some())
+        {
+            return Err(native_terminal_required());
+        }
         self.require_authority(lease)?;
         self.append_control(lease, Record::Unpin { id }).await
+    }
+
+    pub async fn claim_native_checkpoint_copy(&mut self, reservation: ManagedCheckpointReservation) -> Result<NativeCheckpointCustody> {
+        self.require_managed_checkpoint_writer().await?;
+        if self.durable_transactions().index().native_checkpoint_forward(reservation)?.is_some() {
+            return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/native-checkpoint-copy-claimed", "The exact transfer already has a copy owner"));
+        }
+        let export = self.open_managed_checkpoint(reservation).await?;
+        let (_, checkpoint) = export.exact_checkpoint().await?;
+        checkpoint.require_native_checkpoint_receipts()?;
+        let groups = checkpoint.index().native_checkpoint_groups()?;
+        let vault = self.tokens.custody_vault();
+        for &(group, _) in &groups { vault.check_readable(group).await?; }
+        export.check_readable().await?;
+        let state = self.state();
+        let position = state.coordinates.position(next(state.head)?)?;
+        if self.writer.as_ref().ok_or_else(no_writer)?.pipeline.next_position() != position
+            || state.transactions.recover_pending().is_some()
+        {
+            return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/native-checkpoint-copy-pending", "The original writer is settling an admitted transaction"));
+        }
+        let enrolled_at = Basis::new(self.incarnation(), position);
+        let custody = NativeCheckpointCustody { reservation, groups, enrolled_at };
+        let receipt = self.transact(&Transact::native_custody_transfer(custody.clone(), None)).await?;
+        match receipt.outcome {
+            Outcome::Then if !receipt.replayed && receipt.basis == enrolled_at => Ok(custody),
+            Outcome::Refused { error } => Err(error),
+            _ => Err(native_terminal_required()),
+        }
+    }
+
+    pub async fn record_native_checkpoint_drain(&mut self, installed: NativeCheckpointInstallation) -> Result<()> {
+        let NativeCheckpointInstallation { basis, custody } = installed;
+        self.require_managed_checkpoint_writer().await?;
+        match self.durable_transactions().index().native_checkpoint_forward(custody.reservation)? {
+            Some((prior, Some(installed))) if prior == &custody && installed == basis => return Ok(()),
+            Some((prior, None)) if prior == &custody => (),
+            _ => return Err(native_terminal_required()),
+        }
+        let receipt = self.transact(&Transact::native_custody_transfer(custody, Some(basis))).await?;
+        match receipt.outcome {
+            Outcome::Then => Ok(()),
+            Outcome::Refused { error } => Err(error),
+            _ => Err(native_terminal_required()),
+        }
     }
 
     /// Install an independent backing for an exact export. The destination's
     /// journal and KMS own all bytes needed to recover after the append.
     pub async fn restore_export(&mut self, export: &PinnedExport) -> Result<BranchCut> {
         require_ordinary_pin(&export.image)?;
-        self.restore_exact_export(export, false).await
+        self.restore_exact_export(export, Restore::Plain).await
     }
 
     pub async fn restore_managed_checkpoint(&mut self, export: &PinnedExport, reservation: ManagedCheckpointReservation) -> Result<BranchCut> {
         export.require_managed_reservation(reservation)?;
         if self.incarnation() != reservation.target.incarnation { return Err(managed_export_required()); }
-        self.restore_exact_export(export, true).await
+        self.restore_exact_export(export, Restore::Managed).await
+    }
+
+    pub async fn restore_native_checkpoint(&mut self, export: &PinnedExport, custody: &NativeCheckpointCustody) -> Result<BranchCut> {
+        export.require_managed_reservation(custody.reservation)?;
+        if self.incarnation() != custody.reservation.target.incarnation { return Err(managed_export_required()); }
+        self.restore_exact_export(export, Restore::Native(custody)).await
     }
 
     pub async fn require_managed_checkpoint_writer(&mut self) -> Result<()> {
@@ -247,12 +330,12 @@ impl MultiDatabase {
         self.require_authority(lease)
     }
 
-    async fn restore_exact_export(&mut self, export: &PinnedExport, managed: bool) -> Result<BranchCut> {
+    async fn restore_exact_export(&mut self, export: &PinnedExport, restore: Restore<'_>) -> Result<BranchCut> {
         let source = export.image.id();
         if source.database == self.options.database {
             return Err(Anomaly::incorrect("rtdb/restore-same-deployment", "Restore needs a distinct deployment"));
         }
-        if !export.manifest().files.is_empty() {
+        if !export.manifest().files.is_empty() || matches!(restore, Restore::Native(_)) && !export.manifest().pins.is_empty() {
             return Err(Anomaly::unsupported("rtdb/export-files", "This export needs independent destination file placement"));
         }
         self.refresh().await?;
@@ -265,6 +348,8 @@ impl MultiDatabase {
         if let Some(origin) = state.coordinates.origin
             && origin.digest == source_identity
         {
+            let expected = match restore { Restore::Native(custody) => Some(custody), _ => None };
+            if state.transactions.index().inherited_custody() != expected { return Err(native_terminal_required()); }
             return state.transactions.index().exact(Basis::new(destination, origin.through));
         }
         if state.transactions.index().head().basis.position() != 0
@@ -277,8 +362,13 @@ impl MultiDatabase {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/restore-pending-writes", "The writer is settling an admitted transaction"));
         }
         let (source_cut, mut transactions) = export.exact_checkpoint().await?;
-        if !managed { require_ordinary_inventory(transactions.index(), source_cut.basis)?; }
-        transactions.restore_in(destination)?;
+        match restore {
+            Restore::Native(custody) => transactions.restore_native_checkpoint(custody)?,
+            Restore::Plain | Restore::Managed => {
+                if matches!(restore, Restore::Plain) { require_ordinary_inventory(transactions.index(), source_cut.basis)?; }
+                transactions.restore_in(destination)?;
+            }
+        }
         let cut = transactions.index().head();
         let coordinates = JournalCoordinates {
             offset: cut.basis.position().saturating_sub(through.0),
@@ -326,6 +416,13 @@ impl MultiDatabase {
         let basis = index.exact(Basis::new(self.incarnation(), origin.through))?.basis;
         self.check_generation(state.generation).await?;
         Ok((basis, index.clone(), state.generation))
+    }
+
+    pub async fn native_checkpoint_installation(&mut self, reservation: ManagedCheckpointReservation) -> Result<NativeCheckpointInstallation> {
+        let (basis, index, _) = self.require_managed_checkpoint_restore(reservation).await?;
+        let custody = index.inherited_custody().filter(|custody| custody.reservation == reservation)
+            .ok_or_else(native_terminal_required)?;
+        Ok(NativeCheckpointInstallation { basis, custody: custody.clone() })
     }
 
     /// Recovers the applied destination terminal even after the source pin has expired.
@@ -390,7 +487,7 @@ pub(super) fn require_ordinary_pin(image: &VerifiedManifest) -> Result<()> {
 }
 
 fn require_ordinary_inventory(index: &BranchIndex, basis: Basis) -> Result<()> {
-    if index.retained_images().any(|(_, table, event, _)| event.cut.basis <= basis && TableRef::owned_schema(&table.schema)) {
+    if index.retained_images().any(|(_, table, event, image)| event.cut.basis <= basis && BranchIndex::unowned_checkpoint_image(table, image)) {
         return Err(managed_export_required());
     }
     Ok(())
@@ -398,4 +495,8 @@ fn require_ordinary_inventory(index: &BranchIndex, basis: Basis) -> Result<()> {
 
 fn managed_export_required() -> Anomaly {
     Anomaly::unsupported("rtdb/managed-checkpoint-custody", "The checkpoint requires its exact managed custody reservation")
+}
+
+fn native_terminal_required() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb/native-checkpoint-terminal", "The native copy has no matching ordered destination terminal")
 }

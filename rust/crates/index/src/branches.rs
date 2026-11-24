@@ -8,13 +8,14 @@ type Map<K, V> = imbl::OrdMap<K, V>;
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Iid, Interval, LogicalType, Result, StructFields, TableRef,
     Timestamp, TxId, Value,
-    rtdb_v1::{At, Basis, Branch, ClaimEvidence, ClaimRegion, LabelScope, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, Basis, Branch, ClaimEvidence, ClaimRegion, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody},
 };
 use serde::{Deserialize, Serialize};
 
 mod custody;
 mod custody_placement;
 mod custody_release;
+mod custody_transfer;
 mod visibility;
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
 pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyTarget};
@@ -185,6 +186,7 @@ pub enum BranchEffect {
     ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
     ActivateCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence },
     CustodyRelease(CustodyRelease),
+    NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +246,10 @@ pub struct BranchIndex {
     classic_iids: Map<(TableRef, EntityId), Iid>,
     #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
     custody: Map<CustodyGroupId, Arc<custody::CustodyGroup>>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    custody_transfers: Map<[u8; 16], custody_transfer::Forward>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inherited_custody: Option<NativeCheckpointCustody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_custody_revocation: Option<Basis>,
     #[serde(default, skip_serializing_if = "imbl::OrdSet::is_empty")]
@@ -272,6 +278,7 @@ impl BranchIndex {
             head, times: Map::unit(0, head.system_time), classic_checkpoint: None,
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
             catalog: Map::new(), classic_iids: Map::new(), custody: Map::new(), latest_custody_revocation: None,
+            custody_transfers: Map::new(), inherited_custody: None,
             changed_catalog: None, erased: None, writes: Arc::default(),
             visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
         }
@@ -334,6 +341,11 @@ impl BranchIndex {
         if self.has_custody_groups() {
             return Err(Anomaly::unsupported("rtdb/restore-custody", "A protected restore needs an admitted destination custody binding"));
         }
+        self.rebase_history(incarnation);
+        Ok(())
+    }
+
+    fn rebase_history(&mut self, incarnation: [u8; 16]) {
         let rebase = |basis: Basis| Basis::new(incarnation, basis.position());
         self.head.basis = rebase(self.head.basis);
         self.classic_checkpoint = self.classic_checkpoint.map(rebase);
@@ -364,7 +376,6 @@ impl BranchIndex {
                 }
             }
         }
-        Ok(())
     }
 
     pub fn writes_at(&self, basis: Basis) -> Vec<BranchWrite> {
@@ -721,6 +732,7 @@ impl BranchIndex {
             BranchEffect::ReserveCustodyPlacement { group, reservation } => self.reserve_custody_placement(group, reservation)?,
             BranchEffect::ActivateCustodyOccurrence { group, occurrence } => self.activate_custody_occurrence(group, occurrence)?,
             BranchEffect::CustodyRelease(release) => self.apply_custody_release(release)?,
+            BranchEffect::NativeCustodyTransfer { custody, destination } => self.apply_native_custody_transfer(custody, destination)?,
         }
         Ok(())
     }

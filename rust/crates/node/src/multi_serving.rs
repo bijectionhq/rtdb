@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}, time::Duration}
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
-use rtdb_db::{ChangeHistory, MultiDatabase, PinnedExport, Role, WritePipeline};
+use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, PinnedExport, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, CustodyGroupId, CustodyWriterFence, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
@@ -10,7 +10,7 @@ use rtdb_tx::transact::{
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, MemoryBudget, Result, TableRef, Timestamp,
-    rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
+    rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity},
 };
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -113,6 +113,45 @@ impl MultiServing {
         self.database.lock().await.require_managed_checkpoint_writer().await
     }
 
+    pub async fn has_native_checkpoint_custody(&self) -> Result<bool> {
+        let mut database = self.database.lock().await;
+        let index = database.fresh_index().await?;
+        index.require_local_custody()?;
+        Ok(index.has_custody_groups())
+    }
+
+    pub async fn claim_native_checkpoint_copy(&self, reservation: ManagedCheckpointReservation) -> Result<NativeCheckpointCustody> {
+        self.database.lock().await.claim_native_checkpoint_copy(reservation).await
+    }
+
+    pub async fn restore_native_checkpoint(&self, export: &PinnedExport, custody: &NativeCheckpointCustody) -> Result<Basis> {
+        Ok(self.database.lock().await.restore_native_checkpoint(export, custody).await?.basis)
+    }
+
+    pub async fn record_native_checkpoint_drain(&self, installed: NativeCheckpointInstallation) -> Result<()> {
+        self.database.lock().await.record_native_checkpoint_drain(installed).await
+    }
+
+    pub async fn native_checkpoint_installation(&self, reservation: ManagedCheckpointReservation) -> Result<NativeCheckpointInstallation> {
+        self.database.lock().await.native_checkpoint_installation(reservation).await
+    }
+
+    pub async fn native_checkpoint_forward(&self, reservation: ManagedCheckpointReservation) -> Result<Option<(NativeCheckpointCustody, Option<Basis>)>> {
+        let (index, generation) = self.database.lock().await.fresh_view().await?;
+        self.database.lock().await.check_generation(generation).await?;
+        Ok(index.native_checkpoint_forward(reservation)?.map(|(custody, terminal)| (custody.clone(), terminal)))
+    }
+
+    pub async fn check_native_export_read(&self, custody: &NativeCheckpointCustody, destination: Basis, group: CustodyGroupId, occurrence: [u8; 32]) -> Result<()> {
+        let (index, generation) = self.database.lock().await.fresh_view().await?;
+        index.check_native_export_read(custody, destination, group, occurrence)?;
+        let vault = self.tokens.custody_vault();
+        for &(group, _) in &custody.groups { vault.check_readable(group).await?; }
+        let mut database = self.database.lock().await;
+        database.fresh_index().await?.check_native_export_read(custody, destination, group, occurrence)?;
+        database.check_generation(generation).await
+    }
+
     pub async fn open_managed_checkpoint(&self, reservation: ManagedCheckpointReservation) -> Result<PinnedExport> {
         self.database.lock().await.open_managed_checkpoint(reservation).await
     }
@@ -158,9 +197,7 @@ impl MultiServing {
     pub async fn transact_local(
         &self, mut request: Transact, scope: Option<ServingScope>,
     ) -> Result<Receipt> {
-        if request.contains_response_release() {
-            return Err(crate::serving::custody_release::release_unavailable());
-        }
+        require_ordinary_request(&request)?;
         if let Some(scope) = scope {
             return self.writes.transact_scoped(request, scope.labels, scope.receipt_namespace).await;
         }
@@ -173,9 +210,7 @@ impl MultiServing {
     async fn transact_routed(
         &self, request: Transact, scope: Option<ServingScope>, cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        if request.contains_response_release() {
-            return Err(crate::serving::custody_release::release_unavailable());
-        }
+        require_ordinary_request(&request)?;
         cancellation.run_until_cancelled(async {
             if let Some(route) = &self.route
                 && let Some(receipt) = route.forward(
@@ -261,6 +296,7 @@ impl ServingDriver for MultiServing {
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
+                index.require_local_custody()?;
                 let vault = index.has_custody_groups().then(|| self.tokens.custody_vault());
                 match scope.query(&index, source.clone(), now, &self.memory, vault.as_ref()).await {
                     Ok((mut view, raw)) => {
@@ -298,6 +334,7 @@ impl ServingDriver for MultiServing {
             let start = Instant::now();
             loop {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
+                index.require_local_custody()?;
                 let mut page = scope.changes(&index, &request)?;
                 let remaining = request.wait.saturating_sub(start.elapsed());
                 if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
@@ -323,6 +360,7 @@ impl ServingDriver for MultiServing {
         cancellation
             .run_until_cancelled(async {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
+                index.require_local_custody()?;
                 let at = if source.at == At::Linearizable {
                     At::Latest
                 } else {
@@ -377,6 +415,7 @@ impl ServingDriver for MultiServing {
             let mut database = self.database.lock().await;
             if !groups.is_empty() {
                 let index = database.fresh_index().await?;
+                index.require_local_custody()?;
                 crate::serving::custody::check_delivery(index, &self.tokens.custody_vault(), groups).await?;
             }
             if let Some(generation) = generation { database.check_generation(generation).await?; }
@@ -387,6 +426,7 @@ impl ServingDriver for MultiServing {
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
         cancellation.run_until_cancelled(async {
             let (index, generation) = self.database.lock().await.fresh_view().await?;
+            index.require_local_custody()?;
             self.database.lock().await.check_generation(generation).await?;
             Ok(index)
         }).await.ok_or_else(interrupted)?
@@ -413,6 +453,7 @@ impl ServingDriver for MultiServing {
             for &group in groups { vault.check_readable(group).await?; }
             let mut database = self.database.lock().await;
             let (index, current_generation) = database.fresh_view().await?;
+            index.require_local_custody()?;
             crate::serving::custody_release::check_release_cut(&index, writer, groups, crate::Clock::now(&crate::SystemClock))?;
             database.check_generation(current_generation).await?;
             if let Some(selected) = generation.filter(|selected| *selected != current_generation) {
@@ -425,6 +466,7 @@ impl ServingDriver for MultiServing {
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {
         cancellation.run_until_cancelled(async {
             let (index, _) = self.database.lock().await.fresh_view().await?;
+            index.require_local_custody()?;
             crate::serving::custody::reconcile_revocations(&index, &self.tokens.custody_vault(), crate::Clock::now(&crate::SystemClock)).await
         }).await.ok_or_else(interrupted)?
     }
@@ -459,6 +501,7 @@ impl ServingDriver for MultiServing {
                 loop {
                     let mut database = self.database.lock().await;
                     let history = database.fresh_history().await?;
+                    history.index.require_local_custody()?;
                     let page = changes_page(&history, &request, self.incarnation)?;
                     let remaining = request.wait.saturating_sub(start.elapsed());
                     if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
@@ -476,6 +519,16 @@ impl ServingDriver for MultiServing {
             .await
             .ok_or_else(interrupted)?
     }
+}
+
+fn require_ordinary_request(request: &Transact) -> Result<()> {
+    if request.contains_response_release() {
+        return Err(crate::serving::custody_release::release_unavailable());
+    }
+    if request.contains_native_custody_transfer() {
+        return Err(Anomaly::unsupported("rtdb/native-checkpoint-command", "Native copy enrollment requires the installed custody provider"));
+    }
+    Ok(())
 }
 
 fn changes_page(

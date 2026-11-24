@@ -90,6 +90,15 @@ pub struct ManagedCheckpointReservation {
     pub reserved_at: Basis,
 }
 
+/// The original journal's enrollment in a private destination checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCheckpointCustody {
+    pub reservation: ManagedCheckpointReservation,
+    pub groups: Vec<([u8; 16], [u8; 32])>,
+    pub enrolled_at: Basis,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum At {
     #[default]

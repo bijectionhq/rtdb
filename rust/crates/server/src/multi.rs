@@ -35,6 +35,7 @@ use crate::config::NodeConfiguration;
 
 mod catalog;
 mod managed_transfer;
+mod native_checkpoint;
 mod peer;
 use catalog::{Status, TransferExport};
 
@@ -54,6 +55,7 @@ pub struct MultiRuntime {
     backends: Backends,
     peer: Option<Arc<peer::Peer>>,
     managed_sources: Arc<BTreeMap<Uuid, Arc<dyn ManagedCheckpointSource>>>,
+    native_checkpoint_source: Option<native_checkpoint::NativeCheckpointSource>,
     managed_operations: TaskTracker,
 }
 
@@ -171,7 +173,9 @@ impl MultiRuntime {
             peers,
             _credential_slot: Some(Arc::new(lock)),
         };
-        Self::open(config, memory, databases, backends).await
+        let mut runtime = Self::open(config, memory, databases, backends).await?;
+        runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
+        Ok(runtime)
     }
 
     async fn open(
@@ -263,6 +267,7 @@ impl MultiRuntime {
             backends,
             peer,
             managed_sources: Arc::default(),
+            native_checkpoint_source: None,
             managed_operations: TaskTracker::new(),
         })
     }
@@ -399,17 +404,28 @@ impl MultiRuntime {
                                 "The fork basis belongs to a different source incarnation",
                             ));
                         }
-                        TransferExport::Fork {
-                            pin,
-                            basis,
-                            retain_until,
+                        let native = self.native_checkpoint_source.is_some()
+                            && !self.managed_sources.contains_key(&original.database)
+                            && self.ready_driver(source, original.database).await?.has_native_checkpoint_custody().await?;
+                        if native {
+                            if retain_until.is_some() || pin.is_nil() {
+                                return Err(Anomaly::incorrect("rtdb/native-checkpoint-pin", "A native custody fork requires a nonzero pin without a deadline"));
+                            }
+                            TransferExport::Managed { pin, basis, manifest: None }
+                        } else {
+                            TransferExport::Fork { pin, basis, retain_until }
                         }
                     }
                     DeploymentTransfer::ManagedFork { pin, basis } => {
                         if pin.is_nil() || basis.incarnation() != *original.database.as_bytes() {
                             return Err(managed_transfer::reservation_conflict());
                         }
-                        self.managed_source(original.database)?;
+                        self.require_managed_source(original.database)?;
+                        if !self.managed_sources.contains_key(&original.database)
+                            && !self.ready_driver(source, original.database).await?.has_native_checkpoint_custody().await?
+                        {
+                            return Err(native_checkpoint::inventory_required());
+                        }
                         TransferExport::Managed { pin, basis, manifest: None }
                     }
                 };
@@ -704,7 +720,7 @@ impl MultiRuntime {
     pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
         tokio::select! {
             result = self.drive_databases(node, stop) => result,
-            result = self.drive_managed_transfers(stop), if !self.managed_sources.is_empty() => result,
+            result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
             result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },
                 if self.peer.is_some() => result,
         }

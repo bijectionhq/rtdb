@@ -14,7 +14,7 @@ use rtdb_node::{
 use rtdb_tx::transact::{Receipt, Transact};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
-    rtdb_v1::{Basis, LabelScope, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
+    rtdb_v1::{Basis, LabelScope, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -81,6 +81,7 @@ enum Admission {
     },
     ManagedInstall { reservation: ManagedCheckpointReservation },
     ManagedRelease { destination: String, reservation: ManagedCheckpointReservation },
+    NativeCopy { destination: String, reservation: ManagedCheckpointReservation },
     Retire,
 }
 
@@ -103,6 +104,7 @@ enum Answer {
     Installed(Basis),
     ManagedPinned(PinnedCheckpointIdentity),
     ManagedReleased,
+    NativeCopyClaimed(NativeCheckpointCustody),
     Retired {
         terminal: u64,
         generation: u64,
@@ -257,6 +259,13 @@ impl Peer {
                 runtime.release_peer_managed_transfer(name, &destination, reservation).await?;
                 return Ok(Answer::ManagedReleased);
             }
+            Admission::NativeCopy { destination, reservation } => {
+                if frame.request.is_some() || reservation.source.basis.incarnation() != frame.incarnation {
+                    return Err(reservation_conflict());
+                }
+                let custody = runtime.claim_peer_native_copy(name, &destination, reservation).await?;
+                return Ok(Answer::NativeCopyClaimed(custody));
+            }
             Admission::Retire if frame.request.is_none() => {
                 let writer = runtime.ready_driver(name, incarnation).await?;
                 let event = writer.retire_deployment().await?;
@@ -404,6 +413,18 @@ impl Peer {
         {
             Some(Answer::ManagedReleased) => Ok(true),
             None => Ok(false),
+            _ => Err(unavailable()),
+        }
+    }
+
+    pub(super) async fn forward_native_copy(
+        &self, source: &str, destination: &str, reservation: ManagedCheckpointReservation,
+    ) -> Result<Option<NativeCheckpointCustody>> {
+        match self.forward(source.to_owned(), reservation.source.basis.incarnation(), None,
+            Admission::NativeCopy { destination: destination.to_owned(), reservation }).await?
+        {
+            Some(Answer::NativeCopyClaimed(custody)) if custody.reservation == reservation => Ok(Some(custody)),
+            None => Ok(None),
             _ => Err(unavailable()),
         }
     }

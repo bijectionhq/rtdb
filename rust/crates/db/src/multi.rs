@@ -23,7 +23,7 @@ mod pin;
 mod pipeline;
 mod rotation;
 mod retirement;
-pub use pin::PinnedExport;
+pub use pin::{NativeCheckpointInstallation, PinnedExport};
 pub use pipeline::WritePipeline;
 use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;

@@ -10,6 +10,10 @@
 -- The source pin has no deadline and the destination stays private until its original authority confirms the installed backing and both copy drains.
 -- A retry preserves the exact bound reservation through readiness and can recover the provider terminal after source pin release.
 -- An inherited carrier read requires the mounted original authority and the destination's held generation through delivery.
+-- A native custody fork selects the complete settled source cut and keeps original occurrence, placement and release identities under their source incarnation.
+-- The source orders one forward enrollment for the exact copy and includes it in every contributing group's revocation inventory and drain.
+-- The destination checkpoint retains the reciprocal enrollment and the source orders its drain after observing that readable backing.
+-- Inherited native custody stays behind the original group authority and the original response admission.
 
 external entity ConsumerClient {
     -- A caller with credentials for the selected database.

@@ -308,6 +308,126 @@ async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
 }
 
 #[tokio::test]
+async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain() {
+    use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments};
+    use sha2::{Digest, Sha256};
+
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    source.create().await.unwrap();
+    source.tick(&live(1)).await.unwrap();
+    let mut placements = Vec::new();
+    for n in [1, 2] {
+        let group = [n; 16];
+        let binding = [n; 32];
+        let carrier = vec![n; 12];
+        let vault = source.token_authority().custody_vault();
+        vault.create(group).await.unwrap();
+        let clear = serde_json::to_vec(&StructFields::from([("carrier".into(), Value::Binary(carrier.clone()))])).unwrap();
+        let envelope = vault.seal(group, binding, &clear).await.unwrap();
+        let occurrence = Op::PlaceCustodyRow {
+            branch: MAIN_BRANCH.into(), table: table(),
+            row: Row {
+                id: EntityId::Integer(i64::from(n)), valid: None, cells: StructFields::new(),
+                custody_group: Some(group), protected_columns: vec!["carrier".into()],
+                custody_payload: Some(CustodyPayload { binding, envelope: envelope.clone() }),
+            },
+            placement: CustodyPlacement {
+                placement_id: group, reservation: None, carrier_column: "carrier".into(), link_column: None,
+                commitments: Some(CustodyPlacementCommitments { carrier_sha256: Sha256::digest(carrier).into(), link_sha256: None }),
+            },
+        };
+        let mut write = request(n, Op::CreateCustodyGroup { group });
+        write.ops.push(occurrence);
+        let receipt = append_custody_fixture(&mut source, &write).await;
+        assert_eq!(receipt.outcome, Outcome::Then);
+        placements.push((group, receipt, envelope));
+    }
+    let (group, original, envelope) = &placements[0];
+    let (other_group, selected, _) = &placements[1];
+    let other_inventory = source.fresh_index().await.unwrap().custody_inventory(*other_group).unwrap().sha256;
+    let target_id = Uuid::from_u128(7);
+    let target = ManagedCheckpointTarget { incarnation: *target_id.as_bytes(), request: [8; 32] };
+    let pin = Uuid::from_u128(3);
+    assert_eq!(source.pin_checkpoint_at(pin, selected.basis, None).await.unwrap_err().code, "rtdb/export-custody");
+    assert_eq!(source.pin_managed_checkpoint(pin, original.basis, target).await.unwrap_err().code, "rtdb/native-checkpoint-cut");
+    let identity = source.pin_managed_checkpoint(pin, selected.basis, target).await.unwrap();
+    let reservation = ManagedCheckpointReservation { source: identity, target, reserved_at: Basis::new([6; 16], 4) };
+    assert_eq!(source.release_managed_checkpoint(reservation).await.unwrap_err().code, "rtdb/native-checkpoint-terminal");
+    let claim = source.claim_native_checkpoint_copy(reservation).await.unwrap();
+    assert_eq!(source.claim_native_checkpoint_copy(reservation).await.unwrap_err().code, "rtdb/native-checkpoint-copy-claimed");
+    assert_ne!(source.fresh_index().await.unwrap().custody_inventory(*other_group).unwrap().sha256, other_inventory);
+    let mut revoked_while_copying = source.fresh_index().await.unwrap().clone();
+    let head = revoked_while_copying.head();
+    revoked_while_copying.advance(rtdb_index::branches::BranchCut {
+        basis: Basis::new(head.basis.incarnation(), head.basis.position() + 1),
+        system_time: head.system_time.next().unwrap(),
+    }).unwrap();
+    revoked_while_copying.apply(BranchEffect::RevokeCustodyGroup { group: *other_group }).unwrap();
+    assert!(!revoked_while_copying.custody_releases_drained(*other_group));
+
+    let export = source.open_managed_checkpoint(reservation).await.unwrap();
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_2_IDENTITY))));
+    let mut target = cluster.node_for(target_id, 2, faults.clone());
+    target.create().await.unwrap();
+    target.tick(&live(2)).await.unwrap();
+    assert_eq!(target.restore_managed_checkpoint(&export, reservation).await.unwrap_err().code, "rtdb/restore-custody");
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(target.restore_native_checkpoint(&export, &claim).await.unwrap_err().category, AnomalyCategory::Interrupted);
+    drop(export);
+
+    let mut follower = cluster.node_for(target_id, 3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    let installation = follower.native_checkpoint_installation(reservation).await.unwrap();
+    let installed = installation.basis();
+    assert_eq!(installation.custody(), &claim);
+    let (_, view, _) = follower.require_managed_checkpoint_restore(reservation).await.unwrap();
+    assert_eq!(view.require_local_custody().unwrap_err().code, "rtdb/inherited-custody");
+    assert!(view.custody_inventory(*group).is_none());
+    let (inherited, occurrence) = view.native_inherited_carrier(MAIN_BRANCH, &table(), &EntityId::Integer(1), envelope).unwrap();
+    assert_eq!(inherited, *group);
+    assert_eq!(view.native_inherited_carrier(MAIN_BRANCH, &table(), &EntityId::Integer(2), envelope).unwrap_err().code, "rtdb/native-checkpoint-binding");
+    assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/native-checkpoint-binding");
+
+    source.record_native_checkpoint_drain(installation).await.unwrap();
+    source.release_managed_checkpoint(reservation).await.unwrap();
+    assert_eq!(source.pin_managed_checkpoint(pin, selected.basis, reservation.target).await.unwrap_err().code, "rtdb/native-checkpoint-pin-used");
+    source.checkpoint(Vec::new()).await.unwrap();
+    let mut original_follower = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    let original_view = original_follower.fresh_index().await.unwrap();
+    original_view.check_native_export_read(&claim, installed, inherited, occurrence).unwrap();
+    let (_, retained) = original_view.custody_read_occurrence(selected.basis, inherited, occurrence).unwrap();
+    assert_eq!(retained.written, original.basis);
+    assert_eq!(retained.receipt_key, original.key);
+
+    let stale = request(3, Op::RevokeCustodyGroup { group: *other_group, inventory_sha256: other_inventory });
+    let stale = append_custody_fixture(&mut source, &stale).await;
+    assert!(matches!(stale.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-inventory-changed"));
+    let inventory = source.fresh_index().await.unwrap().custody_inventory(*other_group).unwrap().sha256;
+    let revoke = request(4, Op::RevokeCustodyGroup { group: *other_group, inventory_sha256: inventory });
+    assert_eq!(append_custody_fixture(&mut source, &revoke).await.outcome, Outcome::Then);
+    assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/erased-under-view");
+}
+
+async fn append_custody_fixture(database: &mut MultiDatabase, request: &Transact) -> Receipt {
+    use rtdb_tx::transact::ROW_CUSTODY;
+    let lsn = next(database.state().head).unwrap();
+    let position = database.state().coordinates.position(lsn).unwrap();
+    let claims = database.tokens.verify_claims(request.claims()).await;
+    let Resolution::Append(prepared) = database.state().transactions
+        .resolve(request, position, (database.clock)(), &[ROW_CUSTODY], &claims).unwrap()
+    else { panic!("expected an ordered custody fixture"); };
+    let lease = database.authority().unwrap();
+    let record = Record::Tx { payload: prepared.record().encode().unwrap().to_vec(), objects: vec![] };
+    let receipt = database.append(lease, record).await.unwrap().unwrap();
+    let pipeline = database.new_pipeline().unwrap();
+    let writer = database.writer.as_mut().unwrap();
+    writer.pipeline = pipeline;
+    writer.acknowledged = lsn;
+    receipt
+}
+
+#[tokio::test]
 async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();

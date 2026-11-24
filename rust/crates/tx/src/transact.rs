@@ -12,7 +12,7 @@ pub use rtdb_index::branches::{
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
     Term, TimeUnit, Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
+    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, valid_branch_name},
 };
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::{RawValue, to_raw_value};
@@ -97,6 +97,20 @@ impl Transact {
 
     pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
         scope.or_else(|| self.is_response_release().then_some(CUSTODY_RELEASE_NAMESPACE))
+            .or_else(|| self.contains_native_custody_transfer().then(|| Sha256::digest(b"rtdb/v1/native-checkpoint-receipt\0").into()))
+    }
+
+    pub fn contains_native_custody_transfer(&self) -> bool {
+        self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::NativeCustodyTransfer { .. }))
+    }
+
+    pub fn native_custody_transfer(custody: NativeCheckpointCustody, destination: Option<Basis>) -> Self {
+        let key = native_custody_key(&custody, destination.is_some());
+        Self {
+            key, require: Vec::new(), window: Window::default(), guards: Vec::new(),
+            ops: vec![Op::NativeCustodyTransfer { custody, destination }], otherwise: Vec::new(),
+            requires: Vec::new(), custody_request_digest: None, request_memory: None,
+        }
     }
 
     pub fn require_sealed_custody(&self, features: &[&str]) -> Result<()> {
@@ -243,6 +257,16 @@ pub enum Op {
     CustodyRelease(CustodyRelease),
     #[serde(skip_deserializing)]
     AdmitCustodyResponse(CustodyResponseAdmission),
+    #[serde(skip_deserializing)]
+    NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
+}
+
+fn native_custody_key(custody: &NativeCheckpointCustody, installed: bool) -> Vec<u8> {
+    let mut hash = Sha256::new();
+    hash.update(b"rtdb/v1/native-checkpoint-command\0");
+    hash.update(custody.reservation.target.incarnation);
+    hash.update([u8::from(installed)]);
+    hash.finalize().to_vec()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -585,6 +609,32 @@ impl TransactState {
         self.encode_checkpoint_index(&index)
     }
 
+    pub fn encode_native_checkpoint_at(&self, basis: Basis) -> Result<Bytes> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        if self.pending_erasure.is_some() { return Err(erasure_pending()); }
+        self.require_native_checkpoint_receipts()?;
+        self.encode_checkpoint_index(&self.index.native_checkpoint_at(basis)?)
+    }
+
+    pub fn require_native_checkpoint_receipts(&self) -> Result<()> {
+        for (key, basis) in self.index.native_checkpoint_receipts() {
+            let receipt = self.tx_status(key)?;
+            if receipt.basis != basis || matches!(receipt.outcome, Outcome::Refused { .. }) {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/native-checkpoint-receipt", "A carrier has no matching original applied receipt"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn restore_native_checkpoint(&mut self, custody: &NativeCheckpointCustody) -> Result<()> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        if self.pending_erasure.is_some() { return Err(erasure_pending()); }
+        self.require_native_checkpoint_receipts()?;
+        self.index.restore_native_checkpoint(custody)?;
+        self.receipts.clear();
+        Ok(())
+    }
+
     /// Re-namespace the retained receipt coordinates along with their fold.
     pub fn restore_in(&mut self, incarnation: [u8; 16]) -> Result<()> {
         if self.pending.is_some() { return Err(pending_error()); }
@@ -731,6 +781,7 @@ impl TransactState {
         view: View<'_>, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
+        view.index.require_local_custody()?;
         validate_key(&request.key)?;
         let receipt_namespace = request.receipt_namespace(authority.map(|authority| authority.receipt_namespace));
         let (fingerprint, canonical_request) = match request.custody_request_digest {
@@ -833,6 +884,17 @@ impl TransactState {
             return Err(feature_required(ranked_index));
         }
         let response_release = request.is_response_release();
+        if request.contains_native_custody_transfer() {
+            let [Op::NativeCustodyTransfer { custody, destination }] = request.ops.as_slice() else {
+                return Err(native_custody_command_error());
+            };
+            if scope.is_some() || !request.otherwise.is_empty() || !request.guards.is_empty()
+                || !request.requires.is_empty() || request.window != Window::default()
+                || request.custody_request_digest.is_some() || request.key != native_custody_key(custody, destination.is_some())
+            {
+                return Err(native_custody_command_error());
+            }
+        }
         if request.uses_custody() {
             if request.contains_response_release() && (!response_release || scope.is_some()) {
                 return Err(Anomaly::incorrect("rtdb/custody-release", "Response release requires its original writer and private receipt namespace"));
@@ -981,6 +1043,10 @@ impl TransactState {
         debug_assert!(previous.is_none());
         Ok(receipt)
     }
+}
+
+fn native_custody_command_error() -> Anomaly {
+    Anomaly::incorrect("rtdb/native-checkpoint-command", "Native transfer requires one private ordered custody command")
 }
 
 fn erasure_pending() -> Anomaly {

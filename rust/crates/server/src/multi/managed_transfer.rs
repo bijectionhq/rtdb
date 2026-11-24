@@ -23,6 +23,11 @@ impl MultiRuntime {
             .ok_or_else(source_unavailable)
     }
 
+    pub(super) fn require_managed_source(&self, incarnation: Uuid) -> Result<()> {
+        if self.native_checkpoint_source.is_some() { return Ok(()); }
+        self.managed_source(incarnation).map(drop)
+    }
+
     pub(super) async fn drive_managed_transfers(&self, stop: &CancellationToken) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -40,7 +45,7 @@ impl MultiRuntime {
                 for (name, entry) in rows {
                     if let Status::TransferPending(pending) = entry.status
                         && matches!(pending.export, TransferExport::Managed { .. })
-                        && self.managed_sources.contains_key(&pending.incarnation)
+                        && self.require_managed_source(pending.incarnation).is_ok()
                     {
                         let result = self
                             .finish_managed_transfer(&name, entry.database, pending.request, stop)
@@ -87,7 +92,7 @@ impl MultiRuntime {
             if pending.request != request {
                 return Err(reservation_conflict());
             }
-            self.managed_source(pending.incarnation)?;
+            self.require_managed_source(pending.incarnation)?;
             let identity = self
                 .publish_managed_pin(
                     &pending.source,
@@ -206,8 +211,11 @@ impl MultiRuntime {
         if basis.incarnation() != *incarnation.as_bytes() {
             return Err(reservation_conflict());
         }
-        self.managed_source(incarnation)?;
+        self.require_managed_source(incarnation)?;
         let writer = self.ready_driver(source, incarnation).await?;
+        if !self.managed_sources.contains_key(&incarnation) && !writer.has_native_checkpoint_custody().await? {
+            return Err(super::native_checkpoint::inventory_required());
+        }
         writer
             .pin_managed_checkpoint(pin, basis, target, async {
                 let selected = self
@@ -275,6 +283,11 @@ impl MultiRuntime {
 
         let cancellation = CancellationToken::new();
         let source_id = Uuid::from_bytes(reservation.source.basis.incarnation());
+        if let Some(provider) = self.native_checkpoint_provider(name, &transfer) {
+            let basis = provider.install_or_recover(&destination).await?;
+            destination.require_managed_checkpoint_writer().await?;
+            return Ok(basis);
+        }
         let provider = self
             .managed_source(source_id)?
             .bind(reservation, &cancellation)?;
@@ -337,6 +350,9 @@ impl MultiRuntime {
         let source_id = Uuid::from_bytes(reservation.source.basis.incarnation());
         let writer = self.ready_driver(source, source_id).await?;
         writer.require_managed_checkpoint_writer().await?;
+        if let Some(provider) = self.native_checkpoint_provider(destination, &transfer) {
+            return provider.release_source(&writer).await;
+        }
         let cancellation = CancellationToken::new();
         self.managed_source(source_id)?
             .bind(reservation, &cancellation)?
@@ -359,13 +375,17 @@ impl MultiRuntime {
         let reservation = transfer.reservation;
         let source_id = Uuid::from_bytes(reservation.source.basis.incarnation());
         let destination = self.ready_driver(name, database).await?;
+        if let Some(provider) = self.native_checkpoint_provider(name, &transfer) {
+            return cancellation.run_until_cancelled(provider.require_read(&destination, read))
+                .await.ok_or_else(transfer_interrupted)?;
+        }
         self.managed_source(source_id)?
             .bind(reservation, cancellation)?
             .require_read(&destination, read)
             .await
     }
 
-    async fn managed_entry(&self, name: &str, database: Uuid) -> Result<catalog::Deployment> {
+    pub(super) async fn managed_entry(&self, name: &str, database: Uuid) -> Result<catalog::Deployment> {
         self.catalog
             .read()
             .await?

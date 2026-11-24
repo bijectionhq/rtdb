@@ -152,6 +152,10 @@ impl Candidate<'_> {
                     // The part receipt records admission while the existing promoted holds keep the drain charged.
                     self.index.check_custody_response_admission(admission)?;
                 }
+                Op::NativeCustodyTransfer { custody, destination } => {
+                    self.require_unrestricted()?;
+                    self.push(BranchEffect::NativeCustodyTransfer { custody: custody.clone(), destination: *destination })?;
+                }
             }
         }
         Ok(())
