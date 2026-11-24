@@ -73,6 +73,8 @@ entity Checkpoint {
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- Replay can retain decoded input pages through erase discovery and key projection within its memory budget.
+-- When retention is declined, replay can read exact IPC blocks from the held source in file order.
+-- Each range agrees with the observed file identity, and the replay releases its backing after key projection.
 -- A checkpoint's page scope is zero before the first captured erase, and one past the last source block containing an erase afterward.
 -- Every page reachable from a checkpoint uses that checkpoint's scope. Page addresses within the scope retain their source block.
 -- After the replacement checkpoint is published, collection releases older scopes and preserves pages staged in newer scopes.
