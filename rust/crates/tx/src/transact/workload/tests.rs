@@ -526,3 +526,62 @@ fn guarded_close_checks_cold_prerequisites_with_the_original_writer() {
         Reply::Predecessor(_)
     ));
 }
+
+#[test]
+fn custody_metadata_checks_the_named_groups_and_current_writer() {
+    let mut journal = Writer::new();
+    let (fence, writer) = begin(&mut journal);
+    let group = [21; 16];
+    let mut transaction = empty_transaction(vec![22; 16]);
+    transaction.ops.push(Op::CreateCustodyGroup { group });
+    let decision = journal
+        .pipeline
+        .decide(
+            &transaction,
+            journal.now,
+            &[ROW_CUSTODY],
+            &ClaimSealer::new(INCARNATION, [0; 32]),
+        )
+        .unwrap();
+    let Decision::Append { position, .. } = decision else {
+        panic!("expected append")
+    };
+    journal.pipeline.acknowledge(position).unwrap();
+    journal.now = journal.now.next().unwrap();
+
+    let read = |groups| Operation::ReadCustody {
+        fence: fence.clone(),
+        writer: writer.clone(),
+        groups,
+    };
+    assert_eq!(
+        journal
+            .turn(ABSENT, read(vec![group, group]))
+            .err()
+            .unwrap()
+            .code,
+        "rtdb/managed-workload-authority"
+    );
+    assert_eq!(
+        journal
+            .turn(ABSENT, read(vec![[20; 16]]))
+            .err()
+            .unwrap()
+            .code,
+        "rtdb/custody-group-unknown"
+    );
+    assert!(
+        matches!(journal.turn(ABSENT, read(vec![group])).unwrap(), Reply::ReadCut(cut)
+        if cut.basis.position() == position)
+    );
+    let close = Authority::CloseWriter {
+        fence: fence.clone(),
+        writer: writer.clone(),
+        closure: [23; 16],
+    };
+    applied(journal.turn(CLOSE, submit(close, 23, None)).unwrap(), CLOSE);
+    assert_eq!(
+        journal.turn(ABSENT, read(vec![group])).err().unwrap().code,
+        "rtdb/managed-workload-fence"
+    );
+}

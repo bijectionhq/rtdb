@@ -976,14 +976,16 @@ impl Service {
             };
             let (page, context) = if call.session.caller.principal.workload_grant().is_some() {
                 let started = tokio::time::Instant::now();
-                let (page, basis) = loop {
+                let (page, cut) = loop {
                     let (admitted, cut) = self.workload_root_cut(&call).await?;
-                    if !Arc::ptr_eq(&admitted, &database) { return Err(error::unavailable("The Original attachment changed")); }
+                    if !Arc::ptr_eq(&admitted, &database) || cut.custody_groups.is_some() {
+                        return Err(error::unavailable("The Original Changes attachment is unavailable"));
+                    }
                     let page = driver.changes_workload_root(change.clone(), cut.basis, &call.cancellation)
                         .await.map_err(error::anomaly)?;
                     let remaining = wait.saturating_sub(started.elapsed());
                     if !page.groups.is_empty() || until.is_some() && page.complete || remaining.is_zero() {
-                        break (page, cut.basis);
+                        break (page, cut);
                     }
                     call.cancellation.run_until_cancelled(tokio::time::sleep(remaining.min(Duration::from_millis(50))))
                         .await.ok_or_else(crate::error::cancelled).map_err(error::map_status)?;
@@ -991,9 +993,9 @@ impl Service {
                 let now = self.0.node.now();
                 let source = rtdb_node::serving::QuerySource {
                     branch: rtdb_types::rtdb_v1::MAIN_BRANCH.into(),
-                    at: rtdb_types::rtdb_v1::At::Exactly(basis), layer: rtdb_types::rtdb_v1::Layer::Merged,
+                    at: rtdb_types::rtdb_v1::At::Exactly(cut.basis), layer: rtdb_types::rtdb_v1::Layer::Merged,
                 };
-                let view = driver.query_workload_root(source, basis, now, &call.cancellation)
+                let view = driver.query_workload_root(source, cut, now, &call.cancellation)
                     .await.map_err(error::anomaly)?;
                 let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
                 (page, self.scoped_wire_context(&call, snapshot, now)?.with_plaintext())

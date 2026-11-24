@@ -100,6 +100,11 @@ pub enum Authority {
         fence: Fence,
         writer: Applied,
     },
+    ReadCustody {
+        fence: Fence,
+        writer: Applied,
+        groups: Vec<[u8; 16]>,
+    },
     Write {
         fence: Fence,
         writer: Applied,
@@ -184,6 +189,11 @@ impl Authority {
             Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => {
                 held(fence) && applied(writer)
             }
+            Self::ReadCustody {
+                fence,
+                writer,
+                groups,
+            } => held(fence) && applied(writer) && valid_groups(groups),
             Self::CustodyWrite {
                 fence,
                 writer,
@@ -224,6 +234,7 @@ impl Authority {
     pub fn assignment_binding(&self) -> Result<Option<[u8; 32]>> {
         let (fence, writer) = match self {
             Self::ReadRoot { fence, writer }
+            | Self::ReadCustody { fence, writer, .. }
             | Self::Write { fence, writer }
             | Self::CustodyWrite { fence, writer, .. }
             | Self::CloseWriterGuarded { fence, writer, .. } => (fence, writer),
@@ -257,6 +268,12 @@ impl Placement {
                 .as_ref()
                 .is_none_or(|a| a.assignment_id != [0; 16] && bounded(&a.holder))
     }
+}
+
+fn valid_groups(groups: &[[u8; 16]]) -> bool {
+    (1..=32).contains(&groups.len())
+        && groups.iter().all(|group| *group != [0; 16])
+        && groups.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 pub fn bounded(value: &str) -> bool {
@@ -313,6 +330,11 @@ pub enum Operation {
     ReadRoot {
         fence: Fence,
         writer: Applied,
+    },
+    ReadCustody {
+        fence: Fence,
+        writer: Applied,
+        groups: Vec<[u8; 16]>,
     },
     Predecessor(Predecessor),
 }
@@ -374,6 +396,27 @@ impl Request {
                     return Err(denied());
                 }
                 self.point.check_current(state, now, &authority)?;
+                Ok(Prepared::Answer(Reply::ReadCut(state.index.head())))
+            }
+            Operation::ReadCustody {
+                fence,
+                writer,
+                groups,
+            } => {
+                let authority = Authority::ReadCustody {
+                    fence: fence.clone(),
+                    writer: writer.clone(),
+                    groups: groups.clone(),
+                };
+                if !authority.valid(state.index.head().basis.incarnation()) {
+                    return Err(denied());
+                }
+                self.point.check_current(state, now, &authority)?;
+                for group in groups {
+                    if !state.index.custody_group_live(*group)? {
+                        return Err(stale());
+                    }
+                }
                 Ok(Prepared::Answer(Reply::ReadCut(state.index.head())))
             }
             Operation::Observe(fence) => {
@@ -742,6 +785,7 @@ impl Point {
                 self.fence(state, fence, now)?.applied
             }
             Authority::ReadRoot { fence, writer }
+            | Authority::ReadCustody { fence, writer, .. }
             | Authority::Write { fence, writer }
             | Authority::CustodyWrite { fence, writer, .. }
             | Authority::CloseWriter { fence, writer, .. }

@@ -149,7 +149,7 @@ impl Service {
         }
         if call.session.caller.principal.workload_grant().is_some() {
             let (_, cut) = self.workload_root_cut(call).await?;
-            let view = driver.query_workload_root(source, cut.basis, now, &call.cancellation).await.map_err(error::anomaly)?;
+            let view = driver.query_workload_root(source, cut, now, &call.cancellation).await.map_err(error::anomaly)?;
             return Ok((view, None));
         }
         let view = match visibility {
@@ -299,6 +299,12 @@ impl Service {
         ) {
             return Err(error::unsupported("managed-workload.read-root"));
         }
+        if workload.is_some_and(rtdb_auth::VerifiedWorkloadGrant::is_custody_reader)
+            && (!matches!(selection, Some(Selection::Exactly(_))) || request.track || request.page.is_some()
+                || request.observe_receiver_clock || request.observe_applied_position)
+        {
+            return Err(error::unsupported("managed-workload.read-custody"));
+        }
         if self.follower_only() {
             if matches!(selection, Some(Selection::Linearizable(_) | Selection::AsOfMicros(_))) {
                 return Err(error::unsupported("query.follower-source"));
@@ -398,13 +404,21 @@ impl Service {
         let scope = visibility.as_ref().map_or(raw_scope, |scope| {
             uuid::Uuid::from_bytes(scope.labels.main_read_incarnation(*raw_scope.as_bytes()))
         });
+        let workload_binding = workload.map(|grant| {
+            let driver = driver.ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
+            let (authority, _, _) = grant.assignment(&call.database, driver.incarnation(), self.0.node.now())
+                .map_err(error::anomaly)?;
+            authority.assignment_binding().map_err(error::anomaly)?
+                .ok_or_else(|| error::unsupported("managed-workload.read-root"))
+        }).transpose()?;
         let request_hash = {
             let _encoding = request.ranked_ivf.as_ref().map(|ranked| call.reserve(ranked.encoded_len())).transpose()?;
             let request_hash = fingerprint(&request);
-            if let Some(grant) = workload {
+            if let Some((grant, binding)) = workload.zip(workload_binding) {
                 let mut hash = Sha256::new();
                 hash.update(b"rtdb.v1/workload-root-query\0");
                 hash.update(grant.receipt_namespace());
+                hash.update(binding);
                 hash.update(request_hash);
                 hash.finalize().into()
             } else {
@@ -552,9 +566,8 @@ impl Service {
                 scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: claim_layer },
                 footprint,
             };
-            let claim = if workload.is_some() {
-                let (_, cut) = self.workload_root_cut(call).await?;
-                issuer.seal_workload_claim(&evidence, cut.binding).await
+            let claim = if let Some(binding) = workload_binding {
+                issuer.seal_workload_claim(&evidence, binding).await
             } else {
                 issuer.seal_claim(&evidence).await
             }.map_err(error::anomaly)?;

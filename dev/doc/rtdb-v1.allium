@@ -61,6 +61,7 @@ surface StatelessDatabase {
         -- A tracked Root claim binds the original placement and writer and can guard writes in that exact assignment.
         -- A custody write grant commits the exact submitted action and admits only checked main-branch custody enrollment and data operations.
         -- A custody occurrence keeps its original applied receipt lineage under the workload namespace.
+        -- A custody metadata reader names the live groups and observes only those groups and their placements at the selected original cut.
         -- Before a timed effect settles, the writer checks the original fence and the exclusive grant and request cutoffs again.
         -- A separate clear Root read grant names the same exact fence and writer receipt.
         -- Only the active local writer admits clear main Query and rechecks the authority at each frame handoff.

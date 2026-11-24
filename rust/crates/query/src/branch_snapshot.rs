@@ -19,13 +19,25 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
 pub fn branch_snapshot_with_ranked_artefacts(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>,
 ) -> Result<Snapshot> {
-    snapshot(view, memory, ready, None, clear_image)
+    snapshot(view, memory, ready, Contents::All, clear_image)
 }
 
 pub fn branch_primary_snapshot(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>, tables: &BTreeSet<TableRef>,
 ) -> Result<Snapshot> {
-    snapshot(view, memory, &BTreeSet::new(), Some(tables), clear_image)
+    snapshot(view, memory, &BTreeSet::new(), Contents::Primary(tables), clear_image)
+}
+
+pub fn branch_workload_clear_snapshot(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, tables: &BTreeSet<TableRef>,
+) -> Result<Snapshot> {
+    snapshot(view, memory, &BTreeSet::new(), Contents::WorkloadClear(tables), clear_image)
+}
+
+pub fn branch_workload_custody_snapshot(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, groups: &BTreeSet<[u8; 16]>,
+) -> Result<Snapshot> {
+    snapshot(view, memory, &BTreeSet::new(), Contents::WorkloadCustody(groups), clear_image)
 }
 
 fn clear_image(image: &RowImage) -> Result<StructFields<Value>> {
@@ -39,20 +51,32 @@ pub fn branch_snapshot_with(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>,
     open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
 ) -> Result<Snapshot> {
-    snapshot(view, memory, &BTreeSet::new(), None, open_image)
+    snapshot(view, memory, &BTreeSet::new(), Contents::All, open_image)
+}
+
+#[derive(Clone, Copy)]
+enum Contents<'a> {
+    All,
+    Primary(&'a BTreeSet<TableRef>),
+    WorkloadClear(&'a BTreeSet<TableRef>),
+    WorkloadCustody(&'a BTreeSet<[u8; 16]>),
 }
 
 fn snapshot(
-    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>,
-    selected_tables: Option<&BTreeSet<TableRef>>,
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>, contents: Contents<'_>,
     mut open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
 ) -> Result<Snapshot> {
+    let includes = |table: &TableRef| match contents {
+        Contents::All => true,
+        Contents::Primary(tables) | Contents::WorkloadClear(tables) => tables.contains(table),
+        Contents::WorkloadCustody(_) => false,
+    };
     let tables = Arc::new(TableCatalog::default());
     let tries = Arc::new(TrieCatalog::default());
     let mut live = Arc::new(LiveIndex::new(BlockIndex(0), None, TrieConfig::default()));
     let mut events = BTreeMap::new();
     for (table, _) in view.tables() {
-        if selected_tables.is_some_and(|tables| !tables.contains(table)) { continue; }
+        if !includes(table) { continue; }
         for id in view.ids(table) {
             for event in view.history(table, id) {
                 let target: &mut Vec<_> = events.entry(event.cut.basis).or_default();
@@ -90,19 +114,30 @@ fn snapshot(
         }
         if basis == head.basis {
             for (table, definition) in view.tables() {
-                if selected_tables.is_some_and(|tables| !tables.contains(table)) { continue; }
+                if !includes(table) { continue; }
                 let mut columns = definition.columns.clone();
                 columns.insert(WRITTEN_BASIS_COLUMN.into(), LogicalType::Scalar(ScalarType::Binary));
                 buffer.declare_table(table.clone(), columns.keys().cloned())?;
                 buffer.declare_document_types(table, &columns)?;
             }
-            if selected_tables.is_none() {
-                append_lineage(view, &mut buffer)?;
-                append_ordered_indexes(view, &mut buffer)?;
-                append_ranked_indexes(view, &mut buffer, ready)?;
-                append_count_constraints(view, &mut buffer)?;
-                append_custody_inventory(view, &mut buffer)?;
-                append_custody_placements(view, &mut buffer)?;
+            match contents {
+                Contents::All => {
+                    append_lineage(view, &mut buffer)?;
+                    append_ordered_indexes(view, &mut buffer, None)?;
+                    append_ranked_indexes(view, &mut buffer, ready)?;
+                    append_count_constraints(view, &mut buffer, None)?;
+                    append_custody_inventory(view, &mut buffer, None)?;
+                    append_custody_placements(view, &mut buffer, None)?;
+                }
+                Contents::WorkloadClear(tables) => {
+                    append_ordered_indexes(view, &mut buffer, Some(tables))?;
+                    append_count_constraints(view, &mut buffer, Some(tables))?;
+                }
+                Contents::WorkloadCustody(groups) => {
+                    append_custody_inventory(view, &mut buffer, Some(groups))?;
+                    append_custody_placements(view, &mut buffer, Some(groups))?;
+                }
+                Contents::Primary(_) => {}
             }
         }
         live = Arc::new(live.apply(&buffer.stage()?)?);
@@ -138,7 +173,9 @@ fn append_lineage(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Resu
     Ok(())
 }
 
-fn append_ordered_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+fn append_ordered_indexes(
+    view: &BranchView<'_>, buffer: &mut TransactionBuffer, tables: Option<&BTreeSet<TableRef>>,
+) -> Result<()> {
     let catalog = TableRef::new("xt", "ordered_indexes");
     let text = LogicalType::Scalar(ScalarType::Utf8);
     let columns = StructFields::from([
@@ -151,6 +188,7 @@ fn append_ordered_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer)
     buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
     buffer.declare_document_types(&catalog, &columns)?;
     for (table, definition) in view.tables() {
+        if tables.is_some_and(|tables| !tables.contains(table)) { continue; }
         for index in definition.indexes.values() {
             let basis = view.index_version(table, index).ok_or_else(|| {
                 Anomaly::fault("rtdb/index-version", "The index has no declaration at the selected cut")
@@ -168,7 +206,9 @@ fn append_ordered_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer)
     Ok(())
 }
 
-fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+fn append_count_constraints(
+    view: &BranchView<'_>, buffer: &mut TransactionBuffer, tables: Option<&BTreeSet<TableRef>>,
+) -> Result<()> {
     let catalog = TableRef::new("xt", "count_constraints");
     let text = LogicalType::Scalar(ScalarType::Utf8);
     let binary = LogicalType::Scalar(ScalarType::Binary);
@@ -190,6 +230,7 @@ fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffe
     buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
     buffer.declare_document_types(&catalog, &columns)?;
     for (table, name, range) in view.count_constraints() {
+        if tables.is_some_and(|tables| !tables.contains(table)) { continue; }
         let mut cells = count_constraint_row(table, name, range.valid_at, range.n);
         cells.insert("index_name".into(), Value::Utf8(range.index.clone()));
         cells.insert("lower_key".into(), range.lower.clone().map_or(Value::Null, Value::Binary));
@@ -197,6 +238,7 @@ fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffe
         buffer.put(catalog.clone(), cells, Interval::ALL)?;
     }
     for (table, name, rule) in view.grouped_constraints() {
+        if tables.is_some_and(|tables| !tables.contains(table)) { continue; }
         let mut cells = count_constraint_row(table, name, rule.valid_at, rule.n);
         cells.insert("group_column".into(), Value::Utf8(rule.column.clone()));
         cells.insert("prefix_bytes".into(), rule.prefix_bytes.map_or(Value::Null, |width| Value::U64(width.into())));
@@ -285,7 +327,9 @@ fn count_constraint_row(table: &TableRef, name: &str, valid_at: Option<Timestamp
     ])
 }
 
-fn append_custody_inventory(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+fn append_custody_inventory(
+    view: &BranchView<'_>, buffer: &mut TransactionBuffer, groups: Option<&BTreeSet<[u8; 16]>>,
+) -> Result<()> {
     let catalog = TableRef::new("xt", "custody_groups");
     let binary = LogicalType::Scalar(ScalarType::Binary);
     let columns = StructFields::from([
@@ -297,6 +341,7 @@ fn append_custody_inventory(view: &BranchView<'_>, buffer: &mut TransactionBuffe
     buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
     buffer.declare_document_types(&catalog, &columns)?;
     for entry in view.custody_inventories() {
+        if groups.is_some_and(|groups| !groups.contains(&entry.group)) { continue; }
         let cells = StructFields::from([
             ("_id".into(), Value::Utf8(format!("{:032x}", u128::from_be_bytes(entry.group)))),
             ("inventory_sha256".into(), Value::Binary(entry.sha256.to_vec())),
@@ -308,7 +353,9 @@ fn append_custody_inventory(view: &BranchView<'_>, buffer: &mut TransactionBuffe
     Ok(())
 }
 
-fn append_custody_placements(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+fn append_custody_placements(
+    view: &BranchView<'_>, buffer: &mut TransactionBuffer, groups: Option<&BTreeSet<[u8; 16]>>,
+) -> Result<()> {
     let catalog = TableRef::new("xt", "custody_placements");
     let binary = LogicalType::Scalar(ScalarType::Binary);
     let columns = StructFields::from([
@@ -342,6 +389,7 @@ fn append_custody_placements(view: &BranchView<'_>, buffer: &mut TransactionBuff
     buffer.declare_document_types(&catalog, &columns)?;
     let binary = |bytes: [u8; 32]| Value::Binary(bytes.to_vec());
     for entry in view.custody_placements() {
+        if groups.is_some_and(|groups| !groups.contains(&entry.group)) { continue; }
         let mut cells = StructFields::from([
             ("_id".into(), Value::Utf8(format!("{:032x}", u128::from_be_bytes(entry.placement_id)))),
             ("group_id".into(), Value::Binary(entry.group.to_vec())),

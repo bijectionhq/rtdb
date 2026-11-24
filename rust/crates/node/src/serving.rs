@@ -31,7 +31,7 @@ pub struct QuerySource {
 
 pub struct WorkloadReadCut {
     pub basis: Basis,
-    pub binding: [u8; 32],
+    pub custody_groups: Option<BTreeSet<CustodyGroupId>>,
 }
 
 pub struct QueryView {
@@ -239,7 +239,7 @@ pub trait ServingDriver: Send + Sync {
     }
 
     async fn query_workload_root(
-        &self, _source: QuerySource, _cut: Basis, _now: Timestamp, _cancellation: &CancellationToken,
+        &self, _source: QuerySource, _cut: WorkloadReadCut, _now: Timestamp, _cancellation: &CancellationToken,
     ) -> Result<QueryView> {
         Err(workload::denied())
     }

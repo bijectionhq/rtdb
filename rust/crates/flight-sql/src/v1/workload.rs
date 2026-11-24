@@ -18,13 +18,41 @@ impl Service {
         &self,
         call: &Call,
     ) -> Result<Arc<Database>, Status> {
+        self.workload_root_cut(call)
+            .await
+            .map(|(database, _)| database)
+    }
+
+    pub(super) async fn workload_root_cut(
+        &self,
+        call: &Call,
+    ) -> Result<(Arc<Database>, rtdb_node::serving::WorkloadReadCut), Status> {
         let (database, grant) = self.managed_workload_attachment(call)?;
         let driver = database.serving_driver().ok_or_else(denied)?;
         let (authority, point, expires_at) = grant
             .assignment(&call.database, driver.incarnation(), self.0.node.now())
             .map_err(error::anomaly)?;
-        let Authority::ReadRoot { fence, writer } = authority else {
-            return Err(denied());
+        let (operation, custody_groups) = match authority {
+            Authority::ReadRoot { fence, writer } => (
+                Operation::ReadRoot {
+                    fence: fence.clone(),
+                    writer: writer.clone(),
+                },
+                None,
+            ),
+            Authority::ReadCustody {
+                fence,
+                writer,
+                groups,
+            } => (
+                Operation::ReadCustody {
+                    fence: fence.clone(),
+                    writer: writer.clone(),
+                    groups: groups.clone(),
+                },
+                Some(groups.iter().copied().collect()),
+            ),
+            _ => return Err(denied()),
         };
         let reply = driver
             .managed_workload(
@@ -32,31 +60,24 @@ impl Service {
                     point: point.clone(),
                     namespace: grant.receipt_namespace(),
                     expires_at,
-                    operation: Operation::ReadRoot {
-                        fence: fence.clone(),
-                        writer: writer.clone(),
-                    },
+                    operation,
                 },
                 &call.cancellation,
             )
             .await
             .map_err(error::anomaly)?;
-        if !matches!(reply, workload::Reply::Placement(_)) {
+        let workload::Reply::ReadCut(cut) = reply else {
             return Err(denied());
-        }
+        };
         self.check_attachment(call, &database)?;
         grant
             .assignment(&call.database, driver.incarnation(), self.0.node.now())
             .map_err(error::anomaly)?;
-        let binding = authority
-            .assignment_binding()
-            .map_err(error::anomaly)?
-            .ok_or_else(denied)?;
         Ok((
             database,
             rtdb_node::serving::WorkloadReadCut {
                 basis: cut.basis,
-                binding,
+                custody_groups,
             },
         ))
     }

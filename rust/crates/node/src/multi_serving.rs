@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ROW_VISIBILITY,
-    ServingDriver, ServingScope, append_change_rows,
+    ServingDriver, ServingScope, WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
 
@@ -557,30 +557,34 @@ impl ServingDriver for MultiServing {
     }
 
     async fn query_workload_root(
-        &self, source: QuerySource, cut: Basis, now: Timestamp, cancellation: &CancellationToken,
+        &self, source: QuerySource, cut: WorkloadReadCut, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
         cancellation.run_until_cancelled(async {
             let (index, generation) = self.database.lock().await.fresh_view().await?;
             index.require_local_custody()?;
             if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged
-                || index.has_visibility_history() || cut.incarnation() != self.incarnation
+                || index.has_visibility_history() || cut.basis.incarnation() != self.incarnation
             {
                 return Err(workload::denied());
             }
             let basis = match source.at {
-                At::Exactly(basis) if basis.incarnation() == self.incarnation && basis <= cut => basis,
-                At::AtLeast(basis) if basis.incarnation() == self.incarnation && basis <= cut => cut,
-                At::Linearizable => cut,
+                At::Exactly(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => basis,
+                At::AtLeast(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => cut.basis,
+                At::Linearizable => cut.basis,
                 _ => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/basis-ahead",
                     "The requested basis is outside the admitted writer cut")),
             };
             let view = index.view(&source.branch, At::Exactly(basis), source.layer, now)?;
-            let snapshot = if index.has_custody_groups() {
+            let snapshot = if let Some(groups) = &cut.custody_groups {
+                if !matches!(source.at, At::Exactly(_)) { return Err(workload::denied()); }
+                for group in groups {
+                    if !index.custody_group_live(*group)? { return Err(workload::denied()); }
+                }
+                rtdb_query::branch_workload_custody_snapshot(&view, &self.memory, groups)?
+            } else {
                 let tables = view.tables().filter(|(table, _)| !index.has_custody_relation(table))
                     .map(|(table, _)| table.clone()).collect();
-                rtdb_query::branch_primary_snapshot(&view, &self.memory, &tables)?
-            } else {
-                rtdb_query::branch_snapshot(&view, &self.memory)?
+                rtdb_query::branch_workload_clear_snapshot(&view, &self.memory, &tables)?
             };
             self.database.lock().await.check_generation(generation).await?;
             Ok(QueryView {

@@ -313,7 +313,9 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                let allowed = if grant.is_root_reader() {
+                let allowed = if grant.is_custody_reader() {
+                    matches!(kind, CallKind::Handshake | CallKind::V1Query | CallKind::V1Capabilities)
+                } else if grant.is_root_reader() {
                     kind.allows_workload_root_read()
                 } else {
                     kind.allows_workload_grant()

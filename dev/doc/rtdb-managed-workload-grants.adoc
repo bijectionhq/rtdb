@@ -136,6 +136,8 @@ Converting a fixed-profile authority row requires an explicit installation trans
 | `fence`
 | `read-root`
 | `fence`, `writer`
+| `read-custody`
+| `fence`, `writer`, `groups`
 | `write`
 | `fence`, `writer`
 | `custody-write`
@@ -210,8 +212,9 @@ The separate `read-root` grant admits Capabilities, main merged Query and Change
 The active writer confirms the capture cut and checks the authorization again before each delivered frame.
 The ingress replica reads at or before that cut and verifies its local key generation through delivery.
 Query supports Exactly, AtLeast and Linearizable with its catalog restricted to the selected Original.
-A continuation binds the stable read grant namespace, and a tracked claim binds the exact placement and writer for its corresponding write role.
-Ordinary Query withholds relations that have held protected rows.
+A continuation binds the stable read grant namespace and the exact placement and writer.
+A tracked claim binds the same placement and writer for its corresponding write role.
+Ordinary Query serves clear relations and their ordered-index and constraint metadata.
 Ordinary Changes on an Original with custody requires a nonempty selection of clear relations.
 Branch control, protected reads, ranked queries and erasure use separate admission.
 
@@ -221,6 +224,12 @@ The writer validates both arms and the original fence before preparing custody p
 It rechecks the grant cutoff and fence at ordered effect admission.
 Exact custody evidence uses the original applied Basis and receipt key, including when the application receipt lives in a workload namespace.
 Use explicit `custody-write` receipt recovery and settlement authority for that namespace.
+
+A `read-custody` grant names 1 through 32 distinct, nonzero group UUIDs, sorted by their raw bytes.
+It serves Capabilities and main merged `Query Exactly` over named rows from `xt.custody_groups` and `xt.custody_placements`.
+The active writer checks the current assignment and all named groups before capture and delivery.
+The snapshot contains custody metadata for those groups only.
+It carries the enrolled and written Bases for checking the separately retained custody write receipt.
 
 Freeze the exact protobuf request body before the first positive submission and retain it with the namespace, key and family.
 The attempt digest is SHA-256 of the ASCII bytes `rtdb.v1/managed-workload-attempt`, a single zero byte, and that frozen body.
