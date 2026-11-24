@@ -1,7 +1,7 @@
 //! Builds a spill-free primary checkpoint from an authenticated SQL erasure cut.
 
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     io::Cursor,
     sync::Arc,
 };
@@ -20,7 +20,7 @@ use rtdb_index::{BlockPages, CatalogTrie, IndexBatch, LiveTable, TableWrite, Tri
 use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EventPosition, Iid, LogicalType, Result, StructFields, Value,
+    Anomaly, AnomalyCategory, EventOrigin, EventPosition, Iid, LogicalType, Result, StructFields, Value,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -112,6 +112,7 @@ impl SqlErasureSource {
                 memory: &self.memory,
                 rows: BTreeMap::new(),
                 targets,
+                inherited_erasure: self.inherited_erasure.as_ref(),
             };
             let retired = snapshot.trie_catalog().retired_as_of(&entry.table);
             if retired.is_none() {
@@ -214,12 +215,17 @@ struct Events<'a> {
     memory: &'a Arc<MemoryBudget>,
     rows: BTreeMap<EventPosition, (StoredEvent, Arc<MemoryReservation>)>,
     targets: BTreeMap<Iid, EventPosition>,
+    inherited_erasure: Option<&'a BTreeSet<EventOrigin>>,
 }
 
 impl Events<'_> {
     fn add(&mut self, batch: &EventBatch) -> Result<()> {
         for row in 0..batch.len() {
             let header = batch.header(row)?;
+            if let Some(origins) = self.inherited_erasure {
+                let origin = batch.origin(row)?.ok_or_else(|| invalid("A dependent event has no authenticated origin"))?;
+                if origins.contains(&origin) { continue; }
+            }
             let position = header
                 .position
                 .ok_or_else(|| invalid("A surviving event has no original transaction position"))?;
@@ -538,6 +544,7 @@ mod tests {
             memory: &memory,
             rows: BTreeMap::new(),
             targets: BTreeMap::from([(iid, position(3))]),
+            inherited_erasure: None,
         };
         rows.add(batch.view())?;
         let entry = TableEntry::new(1, TableRef::new("public", "orders"))?;

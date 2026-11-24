@@ -1,3 +1,5 @@
+mod erasure_ancestry;
+pub use erasure_ancestry::{EventCoordinate, ForkCoordinates, ForkEvents, ForkSide, InheritedEvents, decode_fork_events, encode_fork_events, erasure_subject, project_erasure_origins};
 mod admission;
 mod admission_step;
 mod appender;

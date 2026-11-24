@@ -1798,7 +1798,7 @@ impl NodeAgent {
                     Ok(false) => {},
                     Err(error) => tracing::warn!(code = %error.code, "SQL erasure initiation awaits its custody broker"),
                 }
-                if status.first_erasure.is_some() && let Some(broker) = self.replay_broker() {
+                if let Some(broker) = self.replay_broker() {
                     let cancellation = CancellationToken::new();
                     let _cancel = cancellation.clone().drop_guard();
                     let start = placement.start_committed_erasure(&self.node, &database, admission, broker,
@@ -1953,6 +1953,16 @@ impl Handler for NodeAgent {
                 Ok(()) => self.flush(&name).await,
                 Err(error) => Err(error),
             },
+            Request::EnrollInstalledFork { parent, child } => {
+                let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/installed-fork",
+                    "The custody node needs both installed fork routes");
+                let source = self.ordered.by_name(&parent).ok_or_else(unavailable)?;
+                let destination = self.ordered.by_name(&child).ok_or_else(unavailable)?;
+                let broker = self.replay_broker().ok_or_else(unavailable)?;
+                source.enroll_installed_fork(destination, broker, &self.keys, self.node.memory(),
+                    &self.ordered_releases).await?;
+                Ok(Response::InstalledForkEnrolled)
+            }
             Request::StageSqlErasure { name, request } => self.stage_sql_erasure(&name, request).await,
             Request::PinCheckpointSuffix { name, deployment, lease, capture, basis, expires_at_ms } =>
                 self.pin_checkpoint_suffix(&name, deployment, lease, capture, basis, expires_at_ms).await,

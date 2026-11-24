@@ -176,3 +176,9 @@ The published membership binds the source checkpoint and the original resolved s
 Local forks use the same broker reservation and exact inherited basis as hosted forks.
 A local stage holds the volume fence through publication.
 A rejected stage retains its custody reservation until Directory records disposal.
+Fork evidence binds the stable origins and paired logical coordinates of inherited events.
+The broker authenticates both root signers when enrolling installed fork evidence.
+It joins the signed source erase selectors against the source side of each enrolled edge and intersects those origins with the dependent history.
+Each dependent writer rebuilds its own certified head, preserving events authored on its branch.
+Rotation waits for signed readable successors from the complete installed cohort.
+A Directory-only root has no installed ordered rotation attachment.

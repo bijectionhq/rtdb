@@ -32,7 +32,7 @@ impl Signer {
         self.0.public_key().as_ref().try_into().expect("Ed25519 key width")
     }
 
-    fn sign(&self, statement: &[u8]) -> [u8; 64] {
+    pub(in crate::journal::hosted) fn sign(&self, statement: &[u8]) -> [u8; 64] {
         self.0.sign(statement).as_ref().try_into().expect("Ed25519 signature width")
     }
 }

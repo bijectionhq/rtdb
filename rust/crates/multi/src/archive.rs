@@ -1532,11 +1532,41 @@ fn fork_checkpoint(source: &DeploymentRecord, catalog: &BlockCatalog) -> Checkpo
     }
 }
 
+pub(crate) async fn checkpoint_fork_events(
+    plaintext: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch,
+    budget: Arc<rtdb_columnar::MemoryBudget>,
+) -> Result<rtdb_replication::ForkEvents> {
+    let path = key(&block_key(BlockIndex(checkpoint.block))?)?;
+    let catalog = BlockCatalog::decode(&plaintext.get_fresh(&path).await?)?;
+    verify_cut(&catalog, checkpoint, epoch)?;
+    let closure = catalog_objects(plaintext, &catalog, CheckpointContents::Replay).await?;
+    let sources = plan_checkpoint_copy(plaintext, closure, None).await?;
+    let mut events = rtdb_replication::ForkEvents::new(budget);
+    read_fork_events(plaintext, &catalog, &sources, &mut events).await?;
+    Ok(events)
+}
+
+async fn read_fork_events(
+    plaintext: &dyn ObjectStore, catalog: &BlockCatalog, sources: &[CheckpointCopySource],
+    inherited: &mut rtdb_replication::ForkEvents,
+) -> Result<()> {
+    let tables = catalog.table_entries()?.into_iter().map(|entry| (entry.slug.table_prefix(), entry.table))
+        .collect::<BTreeMap<_, _>>();
+    for member in sources {
+        let Some((prefix, _)) = member.name.as_str().split_once("/data/") else { continue; };
+        let Some(table) = tables.get(prefix) else { continue; };
+        let _body = inherited.budget().reserve(member.observed_bytes)?;
+        inherited.add_trie(table, member.read(plaintext).await?)?;
+    }
+    Ok(())
+}
+
 /// Called under the source lineage reservation. Verify every logical
 /// dependency and attach only its containing physical unit to the fork.
 pub(crate) async fn reference_fork_checkpoint(
     bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, keys: &dyn KeyService,
     child: &DeploymentRecord, selected: i64, io: Arc<IoRegion>,
+    inherited: Option<&mut rtdb_replication::ForkEvents>,
 ) -> Result<Checkpoint> {
     let version = checkpoint_storage_root()?;
     let root = format!("{}/{version}", source.storage_prefix());
@@ -1553,6 +1583,9 @@ pub(crate) async fn reference_fork_checkpoint(
     verify_plain_fork_catalog(source, selected, &catalog)?;
     let inventory = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
     let sources = plan_checkpoint_copy(&plaintext, inventory, None).await?;
+    if let Some(inherited) = inherited {
+        read_fork_events(&plaintext, &catalog, &sources, inherited).await?;
+    }
 
     let mut base = Base::default();
     for member in &sources {
@@ -3258,7 +3291,7 @@ mod tests {
         let mut shared = DeploymentRecord::new("shared", "org", Vec::new(), 0);
         shared.lineage = source.lineage.clone();
         keys.key(&source.key_id()).await?;
-        reference_fork_checkpoint(bucket.clone(), &source, &keys, &shared, fixture.point.checkpoint.block, IoRegion::new()).await?;
+        reference_fork_checkpoint(bucket.clone(), &source, &keys, &shared, fixture.point.checkpoint.block, IoRegion::new(), None).await?;
         keys.destroy(&source.key_id()).await?;
         let parent_raw = open_deployment_store(bucket.clone(), &scope(&source), PackDiscovery::List, wall_clock()).await?;
         let shared_raw = open_deployment_store(bucket.clone(), &scope(&shared), PackDiscovery::List, wall_clock()).await?;

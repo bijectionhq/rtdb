@@ -401,7 +401,7 @@ impl DatabaseFactory {
                 && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
                 decision_clock: self.decision_clock.clone(),
-                write_event_origins: event_history,
+                write_event_origins: event_history || !read_only && matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { .. }),
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {
                     crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),

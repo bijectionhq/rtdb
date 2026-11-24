@@ -652,6 +652,16 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
     )) {
         return Err(fork_unavailable(&source.name));
     }
+    let mut inherited = same_organisation.then(|| rtdb_replication::ForkEvents::new(
+        rtdb_columnar::MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes)
+    ));
+    if let Some(events) = &mut inherited {
+        for envelope in &tail {
+            if let rtdb_format::envelope::ReplicaBody::ResolvedTx(transaction) = &envelope.message {
+                events.add_replica(transaction)?;
+            }
+        }
+    }
     let inherited_tail = if same_organisation {
         use ring::digest::{Context, SHA256};
         let mut digest = Context::new(&SHA256);
@@ -704,7 +714,8 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             None => bucket,
         };
         let checkpoint = if same_organisation {
-            crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected, Arc::clone(&io)).await?
+            crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected,
+                Arc::clone(&io), inherited.as_mut()).await?
         } else {
             crate::archive::copy_fork_checkpoint(bucket, source, keys, &child, Some(selected), Arc::clone(&io)).await?
         };
@@ -716,10 +727,13 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
                 writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?;
             }
         }
-        if let (Some(broker), Some((transactions, suffix_digest))) = (custody_broker, inherited_tail)
+        if let (Some(broker), Some((transactions, suffix_digest)), Some(events)) =
+            (custody_broker, inherited_tail, inherited)
         {
+            let events = events.encode(crate::replay_broker::MAX_BODY)?;
+            let event_map = rtdb_format::catalog::publication_digest(&events);
             broker.record_fork_basis(crate::replay_broker::History::of(&child)?, fork_preparation,
-                crate::replay_broker::domain::ForkBasis { checkpoint, suffix_digest, transactions }).await?;
+                crate::replay_broker::domain::ForkBasis { checkpoint, suffix_digest, transactions, event_map }, events).await?;
         }
         Ok(checkpoint)
     }.await;

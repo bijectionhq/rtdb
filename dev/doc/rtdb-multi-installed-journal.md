@@ -144,7 +144,13 @@ Existing installed journals require a cutover to a freshly installed stream for 
 
 Certified SQL apply records the first committed erase with the broker.
 Ordinary checkpoint publication preserves that marker.
-An installed custodian automatically stages a successor when its root is the sole enrolled root and its exact rotation allocation is funded.
+An installed custodian automatically stages a successor when its exact rotation allocation is funded and the broker can authenticate the complete enrolled cohort.
+For an installed fork, run `custody-enroll-installed-fork` against a custody node with both installed routes and the original evidence credentials.
+The custodian opens both selected provider checkpoints and authenticates every inherited origin in the child's first allocation against the parent checkpoint.
+Both enrolled evidence keys sign the exact placement cuts and the same event inventory digest.
+Enroll the edge while both original fork checkpoints are selected and the domain is open.
+Dependent staging opens its own ordered head and removes the event origins projected by the broker.
+Every enrolled installed root must report its sealed successor before any root requests rotation.
 The installed custodian's erasure coordinator accepts an operation identity, custody domain and exact incumbent grant.
 Its custody adapter quiesces the incumbent writer, including unfinished appends and offloaded writes, and reconciles outstanding copy admissions.
 The adapter retains that fence through restart until the attempt has a durable resolution.

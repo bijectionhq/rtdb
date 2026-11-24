@@ -62,6 +62,38 @@ impl SqlIntent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceErasure {
+    pub operation: Operation,
+    pub source: Uuid,
+    pub history: [u8; 32],
+    pub original_head: [u8; 32],
+    pub selectors: [u8; 32],
+    pub transaction: rtdb_types::TransactionKey,
+    pub signature: Vec<u8>,
+}
+
+impl SourceErasure {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        statement(b"rtdb.custody/erasure-projection/v1\0",
+            &(self.operation, self.source, self.history, self.original_head, self.selectors, self.transaction))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootPrepared {
+    pub original_head: [u8; 32],
+    pub successor: [u8; 32],
+}
+
+impl RootPrepared {
+    pub fn signing_bytes(self, operation: Operation, root: Uuid, history: [u8; 32]) -> Result<Vec<u8>> {
+        statement(b"rtdb.custody/root-prepared/v1\0", &(operation, root, history, self))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootDrain {
@@ -161,6 +193,7 @@ pub struct ForkBasis {
     pub checkpoint: rtdb_directory::Checkpoint,
     pub suffix_digest: [u8; 32],
     pub transactions: u64,
+    pub event_map: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +207,28 @@ pub struct ForkEnrollment {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InstalledFork {
+    pub parent: ordered_logkeeper::ordered::Placement,
+    pub child: ordered_logkeeper::ordered::Placement,
+    pub parent_cut: [u8; 32],
+    pub child_cut: [u8; 32],
+    pub parent_manifest: [u8; 32],
+    pub child_manifest: [u8; 32],
+    pub event_map: [u8; 32],
+    pub parent_signature: Vec<u8>,
+    pub child_signature: Vec<u8>,
+}
+
+impl InstalledFork {
+    pub fn signing_bytes(&self, domain: Uuid) -> Result<Vec<u8>> {
+        statement(b"rtdb.custody/installed-fork-events/v1\0",
+            &(domain, self.parent, self.child, self.parent_cut, self.child_cut,
+                self.parent_manifest, self.child_manifest, self.event_map))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct State {
     domain: Uuid,
     generation: u64,
@@ -181,10 +236,13 @@ struct State {
     roots: BTreeMap<Uuid, Root>,
     duties: BTreeMap<Uuid, Work>,
     operation: Option<Operation>,
+    selection: Option<SourceErasure>,
     sql_intents: BTreeMap<Uuid, SqlIntent>,
     forks: BTreeMap<Uuid, ForkEnrollment>,
     pending_bases: BTreeMap<Uuid, ForkBasis>,
     ancestry: BTreeMap<Uuid, (ForkEnrollment, ForkBasis)>,
+    installed_forks: BTreeMap<Uuid, InstalledFork>,
+    root_preparations: BTreeMap<Uuid, RootPrepared>,
     root_drains: BTreeMap<Uuid, SignedRootDrain>,
     destruction: BTreeMap<Uuid, RootDestruction>,
     last_completed: Option<Completion>,
@@ -200,10 +258,13 @@ impl State {
             roots: BTreeMap::new(),
             duties: BTreeMap::new(),
             operation: None,
+            selection: None,
             sql_intents: BTreeMap::new(),
             forks: BTreeMap::new(),
             pending_bases: BTreeMap::new(),
             ancestry: BTreeMap::new(),
+            installed_forks: BTreeMap::new(),
+            root_preparations: BTreeMap::new(),
             root_drains: BTreeMap::new(),
             destruction: BTreeMap::new(),
             last_completed: None,
@@ -218,8 +279,23 @@ impl State {
         Ok(())
     }
 
+    fn can_start_sql(&self, source: Uuid) -> bool {
+        let mut reachable = BTreeSet::from([source]);
+        loop {
+            let before = reachable.len();
+            for edge in self.installed_forks.values() {
+                let (parent, child) = (edge.parent.deployment, edge.child.deployment);
+                if reachable.contains(&parent) || reachable.contains(&child) {
+                    reachable.extend([parent, child]);
+                }
+            }
+            if reachable.len() == before { break; }
+        }
+        !self.roots.is_empty() && self.roots.keys().all(|member| reachable.contains(member))
+    }
+
     fn view(&self) -> Result<View> {
-        let membership = fingerprint(b"rtdb.custody/domain-roots/v2\0", &(&self.roots, &self.ancestry))?;
+        let membership = fingerprint(b"rtdb.custody/domain-roots/v2\0", &(&self.roots, &self.ancestry, &self.installed_forks))?;
         let roster = self
             .duties
             .iter()
@@ -247,7 +323,12 @@ impl State {
         Ok(View {
             generation: self.generation,
             operation: self.operation,
-            next_sql: self.sql_intents.values().copied().next(),
+            next_sql: self.sql_intents.values().copied().find(|intent| self.operation.is_none_or(|operation|
+                intent.target().ok() == Some(operation.target))),
+            source_root: self.selection.as_ref().map(|source| source.source),
+            automatic_sql_source: self.sql_intents.keys().next().copied()
+                .filter(|source| self.sql_intents.len() == 1 && self.can_start_sql(*source)),
+            successors_ready: self.operation.is_some() && self.root_preparations.len() == self.roots.len(),
             ready_to_complete: self.operation.is_some() && self.destruction.len() == self.roots.len(),
             sole_root: self.roots.first_key_value().filter(|_| self.roots.len() == 1).map(|(root, _)| *root),
             membership,
@@ -328,7 +409,8 @@ impl State {
             Action::RecordForkBasis { child, history, preparation, basis } => {
                 let fork = self.forks.get(child).ok_or_else(|| conflict("The fork has no custody reservation"))?;
                 if directory_history(fork.child)? != *history || fork.preparation != *preparation
-                    || basis.checkpoint.root_sha256.is_none() || basis.checkpoint.boundary < 0 || basis.suffix_digest == [0; 32]
+                    || basis.checkpoint.root_sha256.is_none() || basis.checkpoint.boundary < 0
+                    || basis.suffix_digest == [0; 32] || basis.event_map == [0; 32]
                 {
                     return Err(conflict("The copied basis belongs to another fork preparation"));
                 }
@@ -355,6 +437,34 @@ impl State {
                 self.pending_bases.remove(&child);
                 self.forks.remove(&child);
             }
+            Action::EnrollInstalledFork { fork } => {
+                let parent = fork.parent.deployment;
+                let child = fork.child.deployment;
+                if let Some(prior) = self.installed_forks.get(&child) {
+                    return if prior == fork { Ok(()) } else { Err(conflict("A different ancestry owns this root")) };
+                }
+                self.require_open(self.generation)?;
+                if parent == child || self.ancestry.contains_key(&child)
+                    || [fork.parent_cut, fork.child_cut, fork.parent_manifest, fork.child_manifest, fork.event_map].contains(&[0; 32])
+                {
+                    return Err(conflict("Installed fork evidence lacks two distinct exact cuts"));
+                }
+                let mut ancestor = parent;
+                while let Some(edge) = self.installed_forks.get(&ancestor) {
+                    ancestor = edge.parent.deployment;
+                    if ancestor == child { return Err(conflict("Installed custody ancestry contains a cycle")); }
+                }
+                let bytes = fork.signing_bytes(self.domain)?;
+                for (placement, signature) in [(fork.parent, &fork.parent_signature), (fork.child, &fork.child_signature)] {
+                    let root = self.roots.get(&placement.deployment)
+                        .ok_or_else(|| conflict("The installed fork is outside custody membership"))?;
+                    if root.history != installed_history(placement)? {
+                        return Err(conflict("The installed fork recorded a different history"));
+                    }
+                    verify(root.verification_key, &bytes, signature)?;
+                }
+                self.installed_forks.insert(child, fork.clone());
+            }
             Action::RecordSql { generation, intent, signature } => {
                 if *generation != self.generation {
                     return Err(conflict("The SQL initiation belongs to a closed custody generation"));
@@ -378,13 +488,13 @@ impl State {
                     self.sql_intents.insert(root, *intent);
                 }
             }
-            Action::BeginSingleRootSql { operation, intent, verification_key } => {
+            Action::BeginSql { operation, intent, verification_key } => {
                 if operation.target != intent.target()? || operation.domain != self.domain
                     || self.sql_intents.get(&intent.placement.deployment) != Some(intent)
-                    || self.roots.len() != 1 || self.roots.get(&intent.placement.deployment)
+                    || self.sql_intents.len() != 1 || !self.can_start_sql(intent.placement.deployment) || self.roots.get(&intent.placement.deployment)
                         .is_none_or(|root| root.verification_key != *verification_key)
                 {
-                    return Err(conflict("The committed SQL erase has a different source or dependent roots"));
+                    return Err(conflict("The committed SQL erase has a different source or incomplete installed ancestry"));
                 }
                 self.apply(&Action::Begin {
                     operation: operation.erase, target: operation.target, generation: operation.generation,
@@ -416,6 +526,26 @@ impl State {
                     ));
                 }
                 self.operation = Some(closing);
+            }
+            Action::SelectSourceErasure { source } => {
+                if self.operation != Some(source.operation) || source.original_head == [0; 32]
+                    || source.selectors == [0; 32]
+                {
+                    return Err(conflict("The authenticated SQL selection belongs to another operation"));
+                }
+                let root = self.roots.get(&source.source)
+                    .filter(|root| root.history == source.history)
+                    .ok_or_else(|| conflict("The SQL selection belongs to a different root history"))?;
+                if self.sql_intents.get(&source.source).is_some_and(|intent|
+                    intent.transaction != source.transaction || intent.target().ok() != Some(source.operation.target))
+                {
+                    return Err(conflict("The SQL selection differs from the committed marker"));
+                }
+                verify(root.verification_key, &source.signing_bytes()?, &source.signature)?;
+                if self.selection.as_ref().is_some_and(|selected| selected != source) {
+                    return Err(conflict("A different source cut already owns this operation"));
+                }
+                self.selection = Some(source.clone());
             }
             Action::Admit {
                 generation,
@@ -506,6 +636,21 @@ impl State {
                     work.join = Some(join.clone());
                 }
             }
+            Action::PrepareRoot { operation, root, prepared, signature } => {
+                let member = self.roots.get(root).ok_or_else(|| conflict("The prepared root is outside the custody membership"))?;
+                if self.operation != Some(*operation) || prepared.original_head == [0; 32]
+                    || prepared.successor == [0; 32]
+                    || self.selection.as_ref().is_some_and(|source|
+                        source.source == *root && source.original_head != prepared.original_head)
+                {
+                    return Err(conflict("The prepared successor belongs to another ordered cut"));
+                }
+                verify(member.verification_key, &prepared.signing_bytes(*operation, *root, member.history)?, signature)?;
+                if self.root_preparations.get(root).is_some_and(|prior| prior != prepared) {
+                    return Err(conflict("The root already prepared a different successor"));
+                }
+                self.root_preparations.insert(*root, *prepared);
+            }
             Action::RootDrain {
                 operation,
                 root,
@@ -521,6 +666,11 @@ impl State {
                     .get(root)
                     .ok_or_else(|| conflict("The root is outside the closed membership"))?;
                 let drain = evidence.drain;
+                if self.root_preparations.get(root).is_some_and(|prepared|
+                    prepared.original_head != drain.original_head || prepared.successor != drain.successor)
+                {
+                    return Err(conflict("The root drained a different successor"));
+                }
                 if [
                     drain.original_head,
                     drain.successor,
@@ -615,7 +765,9 @@ impl State {
                     .checked_add(1)
                     .ok_or_else(|| conflict("The custody generation space is exhausted"))?;
                 self.operation = None;
+                self.selection = None;
                 self.duties.clear();
+                self.root_preparations.clear();
                 self.root_drains.clear();
                 self.destruction.clear();
             }
@@ -644,12 +796,14 @@ pub enum Action {
     RecordForkBasis { child: Uuid, history: [u8; 32], preparation: rtdb_directory::ForkPreparation, basis: ForkBasis },
     #[serde(skip)]
     FinishFork { fork: ForkEnrollment, published: bool },
+    #[serde(skip)]
+    EnrollInstalledFork { fork: InstalledFork },
     RecordSql {
         generation: u64,
         intent: SqlIntent,
         signature: Vec<u8>,
     },
-    BeginSingleRootSql {
+    BeginSql {
         operation: Operation,
         intent: SqlIntent,
         verification_key: [u8; 32],
@@ -659,6 +813,8 @@ pub enum Action {
         target: [u8; 32],
         generation: u64,
     },
+    #[serde(skip)]
+    SelectSourceErasure { source: SourceErasure },
     Admit {
         generation: u64,
         id: Uuid,
@@ -675,6 +831,7 @@ pub enum Action {
         id: Uuid,
         join: WorkJoin,
     },
+    PrepareRoot { operation: Operation, root: Uuid, prepared: RootPrepared, signature: Vec<u8> },
     RootDrain {
         operation: Operation,
         root: Uuid,
@@ -697,8 +854,9 @@ impl Action {
             Self::AuthorizeRoot { .. }
                 | Self::Enroll { .. }
                 | Self::Begin { .. }
-                | Self::BeginSingleRootSql { .. }
+                | Self::BeginSql { .. }
                 | Self::Admit { .. }
+                | Self::PrepareRoot { .. }
                 | Self::RootDrain { .. }
                 | Self::RootDestruction { .. }
                 | Self::Complete { .. }
@@ -712,6 +870,9 @@ pub struct View {
     pub generation: u64,
     pub operation: Option<Operation>,
     pub next_sql: Option<SqlIntent>,
+    pub source_root: Option<Uuid>,
+    pub automatic_sql_source: Option<Uuid>,
+    pub successors_ready: bool,
     pub ready_to_complete: bool,
     pub sole_root: Option<Uuid>,
     pub membership: [u8; 32],
@@ -843,6 +1004,49 @@ async fn load(store: &dyn ObjectStore, domain: Uuid) -> Result<State> {
     Ok(state)
 }
 
+pub(super) async fn verify_installed_fork(store: &dyn ObjectStore, authority: Uuid, fork: &InstalledFork) -> Result<()> {
+    let mut state = load(store, authority).await?;
+    state.apply(&Action::EnrollInstalledFork { fork: fork.clone() })
+}
+
+pub(super) async fn verify_source_erasure(store: &dyn ObjectStore, source: &SourceErasure) -> Result<()> {
+    let mut state = load(store, source.operation.domain).await?;
+    state.apply(&Action::SelectSourceErasure { source: source.clone() })
+}
+
+pub(super) struct ErasureProjection {
+    pub source: SourceErasure,
+    pub source_edges: Vec<(Uuid, [u8; 32], rtdb_replication::ForkSide)>,
+    pub dependent_edges: Vec<(Uuid, [u8; 32], rtdb_replication::ForkSide)>,
+}
+
+pub(super) async fn erasure_projection(
+    store: &dyn ObjectStore, operation: Operation, dependent: Uuid, history: [u8; 32],
+) -> Result<Option<ErasureProjection>> {
+    let state = load(store, operation.domain).await?;
+    if state.operation != Some(operation) || state.roots.get(&dependent).is_none_or(|root| root.history != history) {
+        return Err(conflict("The dependent root is outside the ordered erasure membership"));
+    }
+    let Some(source) = state.selection else { return Ok(None); };
+    if source.source == dependent {
+        return Err(conflict("The source root uses its original SQL selection"));
+    }
+    let side = |root, child| if root == child { rtdb_replication::ForkSide::Child } else { rtdb_replication::ForkSide::Parent };
+    let incident = |root| state.ancestry.values()
+        .filter(|(fork, _)| fork.parent.deployment == root || fork.child.deployment == root)
+        .map(|(fork, basis)| (fork.child.deployment, basis.event_map, side(root, fork.child.deployment)))
+        .chain(state.installed_forks.values()
+            .filter(|fork| fork.parent.deployment == root || fork.child.deployment == root)
+            .map(|fork| (fork.child.deployment, fork.event_map, side(root, fork.child.deployment))))
+        .collect::<Vec<_>>();
+    let source_edges = incident(source.source);
+    let dependent_edges = incident(dependent);
+    if source_edges.is_empty() || dependent_edges.is_empty() {
+        return Err(conflict("The enrolled root has no authenticated inherited event inventory"));
+    }
+    Ok(Some(ErasureProjection { source, source_edges, dependent_edges }))
+}
+
 pub(super) async fn pending_forks(store: &dyn ObjectStore, domain: Uuid) -> Result<Vec<ForkEnrollment>> {
     Ok(load(store, domain).await?.forks.into_values().collect())
 }
@@ -890,6 +1094,38 @@ mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
+    fn installed_sql_awaits_an_authenticated_edge_to_every_member() {
+        let mut state = State::new(Uuid::new_v4());
+        let parent_key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let child_key = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).unwrap();
+        let parent = ordered_logkeeper::ordered::Placement {
+            deployment: Uuid::new_v4(), incarnation: Uuid::new_v4(), group: Uuid::new_v4(), generation: 1,
+        };
+        let child = ordered_logkeeper::ordered::Placement { deployment: Uuid::new_v4(), ..parent };
+        for (placement, key) in [(parent, &parent_key), (child, &child_key)] {
+            state.apply(&Action::Enroll {
+                generation: 1, root: placement.deployment,
+                enrollment: Root {
+                    history: installed_history(placement).unwrap(), admission_key: [19; 32],
+                    verification_key: key.public_key().as_ref().try_into().unwrap(),
+                },
+            }).unwrap();
+        }
+        assert!(!state.can_start_sql(parent.deployment));
+        let mut fork = InstalledFork {
+            parent, child, parent_cut: [3; 32], child_cut: [4; 32],
+            parent_manifest: [5; 32], child_manifest: [6; 32], event_map: [9; 32],
+            parent_signature: Vec::new(), child_signature: Vec::new(),
+        };
+        let bytes = fork.signing_bytes(state.domain).unwrap();
+        fork.parent_signature = parent_key.sign(&bytes).as_ref().to_vec();
+        assert!(state.apply(&Action::EnrollInstalledFork { fork: fork.clone() }).is_err());
+        fork.child_signature = child_key.sign(&bytes).as_ref().to_vec();
+        state.apply(&Action::EnrollInstalledFork { fork }).unwrap();
+        assert!(state.can_start_sql(parent.deployment));
+    }
+
+    #[test]
     fn staged_fork_fences_domain_closure_until_publication_is_resolved() {
         let mut state = State::new(Uuid::new_v4());
         let parent = History {
@@ -920,7 +1156,7 @@ mod tests {
             checkpoint: rtdb_directory::Checkpoint {
                 block: 3, boundary: 9, source: 4, system_time: 10, root_sha256: Some([20; 32]),
             },
-            suffix_digest: [21; 32], transactions: 2,
+            suffix_digest: [21; 32], transactions: 2, event_map: [22; 32],
         };
         state.apply(&Action::RecordForkBasis {
             child: child.deployment, history: directory_history(child).unwrap(), preparation: fork.preparation, basis,

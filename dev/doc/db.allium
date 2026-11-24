@@ -23,6 +23,8 @@
 -- Source resolution admits that generation at the same durable predecessor and offered clock and adds order-assigned metadata.
 -- Replica read-back remains the visibility fence for the one selected success or refusal transaction.
 -- The installed writer reports the first admitted committed erase together with its replica position.
+-- Each managed replica effect carries its stable origin across fork replay.
+-- A dependent erase filters the authenticated origins at its own selected head.
 
 -- Two heads, two homes — callers choose:
 --   RESOLVED head (on the resolver): the highest transaction resolved, and so staged.

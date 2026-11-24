@@ -632,6 +632,22 @@ impl Node {
         &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
         transaction: TransactionKey, position: ReplicaPosition, cancellation: &CancellationToken,
     ) -> Result<rtdb_replication::SqlErasureSource> {
+        self.erasure_source(database, cut, checkpoint, transaction, Some(position), None, cancellation).await
+    }
+
+    pub async fn dependent_erasure_source(
+        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
+        transaction: TransactionKey, origins: std::collections::BTreeSet<rtdb_types::EventOrigin>,
+        cancellation: &CancellationToken,
+    ) -> Result<rtdb_replication::SqlErasureSource> {
+        self.erasure_source(database, cut, checkpoint, transaction, None, Some(origins), cancellation).await
+    }
+
+    async fn erasure_source(
+        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
+        transaction: TransactionKey, position: Option<ReplicaPosition>,
+        origins: Option<std::collections::BTreeSet<rtdb_types::EventOrigin>>, cancellation: &CancellationToken,
+    ) -> Result<rtdb_replication::SqlErasureSource> {
         let replay = cancellation.run_until_cancelled(
             rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
         ).await.ok_or_else(cancelled)??;
@@ -648,7 +664,15 @@ impl Node {
                     .await.ok_or_else(cancelled)??,
                 None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
             };
-            recovered.replay_sql_erasure(&database.logs, replay, transaction, position, store, cancellation).await
+            match (position, origins) {
+                (Some(position), None) => recovered.replay_sql_erasure(
+                    &database.logs, replay, transaction, position, store, cancellation,
+                ).await,
+                (None, Some(origins)) => recovered.replay_dependent_erasure(
+                    &database.logs, replay, transaction, origins, store, cancellation,
+                ).await,
+                _ => Err(crate::sql_snapshots::unretained()),
+            }
         }).await
     }
 

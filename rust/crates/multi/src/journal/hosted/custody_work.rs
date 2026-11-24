@@ -68,6 +68,10 @@ impl WorkOwner {
         self.domain
     }
 
+    pub(super) async fn erasure_active(&self) -> Result<bool> {
+        Ok(self.broker.custody_domain(self.domain, Action::Status).await?.operation.is_some())
+    }
+
     pub(super) async fn record_sql(&self, intent: domain::SqlIntent) -> Result<()> {
         let view = self.broker.custody_domain(self.domain, Action::Status).await?;
         if view.next_sql == Some(intent) { return Ok(()); }

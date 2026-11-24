@@ -520,6 +520,9 @@ contract LogService {
     @invariant InstalledJournalErasureCommit
         -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.
         -- Ordinary checkpoint selection preserves replay of that committed marker.
+        -- The broker authenticates the paired fork origins and the source cut for each dependent erasure.
+        -- Each dependent successor uses its own certified head.
+        -- The cohort provides signed readable successors before any root requests rotation.
         -- The custody authority closes new serving and copy admissions and retains that fence through restart until the erasure attempt is durably resolved.
         -- The incumbent drains outstanding appends before the custodian fixes the journal head.
         -- The clean successor at that head preserves surviving history and excludes targeted history and retired key dependencies from the full recovery closure.

@@ -304,7 +304,7 @@ An enrolled installed worker registers signed plaintext and egress duties with i
 The process signs the join after the last retained view, delivery, or provider operation releases the duty.
 Installed database attachments also retain signed plaintext duties through their serving store and replica log.
 The SQL submission entry checks broker admission before accepting new work.
-An installation with a configured custody signer automatically stages and rotates a sole enrolled root from its committed SQL marker.
+An installation with configured custody signers automatically stages and rotates a sole enrolled root or a cohort with authenticated installed ancestry from its committed SQL marker.
 Its custodian resumes the staged operation on restart and contributes signed root and provider dispositions after the joined drain.
 A source rewrite covers every authorized erase effect in its selected replica suffix.
 Shared hosted and local forks must reserve a broker member against their exact Directory stage before copying.
@@ -312,7 +312,13 @@ A standalone broker uses the same durable membership ledger as the networked rou
 The local volume lock fences a rejected stage until Directory can order disposal.
 The broker binds the inherited checkpoint and original resolved suffix to the member before Directory publication.
 It promotes the member after publication and removes a rejected reservation after disposal.
-Dependent-root survivor staging remains open.
+The broker records the stable origins and paired coordinates of inherited events with the fork basis.
+An installed source signs its committed erase selectors at the certified head.
+The broker verifies the recorded fork maps and projects the selected origins into each dependent history.
+A dependent writer rewrites its own exact head and drops only those inherited origins.
+The coordinator waits for every enrolled root to sign its staged successor before requesting rotation.
+Directory-only histories need the ordered erasure attachment before they can drive this switch.
+Overlapping SQL erasures on different enrolled roots wait for a single coordinated selection.
 
 |8
 |Transaction metadata retention.

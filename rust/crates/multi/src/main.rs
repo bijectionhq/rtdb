@@ -25,6 +25,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi stage-sql-erasure --name NAME --at HOLDER --operation FILE --cell-secret FILE\n\
        rtdb-multi custody-domain --domain UUID --action FILE --replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE [--replay-broker-custody-token-file FILE]
 \
+       rtdb-multi custody-enroll-installed-fork --parent NAME --child NAME --at CUSTODIAN --cell-secret FILE\n\
        rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE [--transfer-token-file FILE] [--custody-token-file FILE] --config FILE [--ecs-cluster ARN]\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
@@ -349,7 +350,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 198 } else { 54 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 199 } else { 55 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,
@@ -436,6 +437,19 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let receipt = broker.custody_domain(domain, command).await?;
             println!("{}", serde_json::to_string(&receipt).map_err(|error| usage(error.to_string()))?);
             Ok(())
+        }
+        "custody-enroll-installed-fork" => {
+            let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+            let response = rtdb_multi::control::call(arguments.required("at")?,
+                &rtdb_multi::control::Request::EnrollInstalledFork {
+                    parent: arguments.required("parent")?.to_owned(), child: arguments.required("child")?.to_owned(),
+                }, Duration::from_secs(35), &control).await?;
+            match response {
+                rtdb_multi::control::Response::InstalledForkEnrolled => Ok(()),
+                rtdb_multi::control::Response::Refused { code, message } =>
+                    Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, code, message)),
+                _ => Err(usage("The custodian returned a different fork enrollment response".into())),
+            }
         }
         "ordered-journal" | "initialize-ordered-journal" => {
             let failure = |error: Box<dyn std::error::Error + Send + Sync>| {

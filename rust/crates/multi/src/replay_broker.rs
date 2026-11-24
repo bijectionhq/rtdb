@@ -1,6 +1,6 @@
 //! The directory replay broker owns detached body storage and its unit-key vault.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -35,7 +35,7 @@ mod staging;
 mod transfer;
 
 const MAX_HEADER: usize = 16 << 10;
-const MAX_BODY: usize = 64 << 20;
+pub(crate) const MAX_BODY: usize = 64 << 20;
 const SOCKET_LIMIT: Duration = Duration::from_secs(30);
 const DELIVERY_INTERRUPTED: &str = "rtdb.multi/replay-broker-delivery-interrupted";
 const CAS_ATTEMPTS: usize = 8;
@@ -89,13 +89,17 @@ enum Action {
     ConfirmTransfer { route: PublishRoute, object: String },
     Domain { domain: Uuid, command: domain::Action },
     EnrollFork { child: History, preparation: rtdb_directory::ForkPreparation },
-    RecordForkBasis { preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis },
+    RecordForkBasis { preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis, length: usize },
+    SelectSourceErasure { proof: domain::SourceErasure, length: usize },
+    ProjectErasure { operation: domain::Operation, root: Uuid, history: [u8; 32] },
+    EnrollInstalledFork { domain: Uuid, fork: domain::InstalledFork, length: usize },
 }
 
 impl Action {
     fn uses_custody_token(&self) -> bool {
         matches!(self, Self::Domain { command, .. } if command.requires_custodian())
-            || matches!(self, Self::EnrollFork { .. } | Self::RecordForkBasis { .. })
+            || matches!(self, Self::EnrollFork { .. } | Self::RecordForkBasis { .. }
+                | Self::SelectSourceErasure { .. } | Self::ProjectErasure { .. } | Self::EnrollInstalledFork { .. })
     }
 
     fn uses_transfer_token(&self) -> bool {
@@ -112,6 +116,8 @@ enum Response {
     AppendAdmitted,
     Domain { view: domain::View },
     ForkEnrolled,
+    ErasureSelectionPending,
+    ErasureProjection { transaction: rtdb_types::TransactionKey, count: usize },
     Refused { category: AnomalyCategory, code: String },
 }
 
@@ -209,18 +215,76 @@ impl Client {
     }
 
     pub(crate) async fn record_fork_basis(
-        &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis,
+        &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis, events: Bytes,
     ) -> Result<()> {
         if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
             let service = Arc::clone(service);
-            return tasks.spawn(async move { service.record_domain_fork_basis(child, preparation, basis).await }).await.map_err(transport)?;
+            return tasks.spawn(async move { service.record_domain_fork_basis(child, preparation, basis, events).await }).await.map_err(transport)?;
         }
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
-        let mut socket = remote.connect(Some(child), Action::RecordForkBasis { preparation, basis }).await?;
+        check_length(events.len())?;
+        let mut socket = remote.connect(Some(child), Action::RecordForkBasis { preparation, basis, length: events.len() }).await?;
+        socket_work(async { socket.write_all(&events).await.map_err(transport) }).await?;
         match socket_work(read_response(&mut socket)).await? {
             Response::ForkEnrolled => Ok(()),
             _ => Err(invalid_frame()),
         }
+    }
+
+    pub async fn enroll_installed_fork(&self, domain: Uuid, fork: domain::InstalledFork, events: Bytes) -> Result<()> {
+        if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
+            let service = Arc::clone(service);
+            return tasks.spawn(async move { service.enroll_installed_fork(domain, fork, events).await }).await.map_err(transport)?;
+        }
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
+        check_length(events.len())?;
+        let mut socket = remote.connect(None, Action::EnrollInstalledFork { domain, fork, length: events.len() }).await?;
+        socket_work(async { socket.write_all(&events).await.map_err(transport) }).await?;
+        match socket_work(read_response(&mut socket)).await? {
+            Response::ForkEnrolled => Ok(()),
+            _ => Err(invalid_frame()),
+        }
+    }
+
+    pub(crate) async fn select_source_erasure(&self, proof: domain::SourceErasure, selectors: Bytes) -> Result<()> {
+        if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
+            let service = Arc::clone(service);
+            return tasks.spawn(async move { service.select_source_erasure(proof, selectors).await }).await.map_err(transport)?;
+        }
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
+        check_length(selectors.len())?;
+        let mut socket = remote.connect(None, Action::SelectSourceErasure { proof, length: selectors.len() }).await?;
+        socket_work(async { socket.write_all(&selectors).await.map_err(transport) }).await?;
+        match socket_work(read_response(&mut socket)).await? {
+            Response::AppendAdmitted => Ok(()),
+            _ => Err(invalid_frame()),
+        }
+    }
+
+    pub(crate) async fn projected_erasure(
+        &self, operation: domain::Operation, root: Uuid, history: [u8; 32],
+    ) -> Result<Option<(rtdb_types::TransactionKey, BTreeSet<rtdb_types::EventOrigin>)>> {
+        if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
+            let service = Arc::clone(service);
+            return tasks.spawn(async move { service.project_erasure(operation, root, history).await }).await.map_err(transport)?;
+        }
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
+        let mut socket = remote.connect(None, Action::ProjectErasure { operation, root, history }).await?;
+        let (transaction, count) = match socket_work(read_response(&mut socket)).await? {
+            Response::ErasureSelectionPending => return Ok(None),
+            Response::ErasureProjection { transaction, count } => (transaction, count),
+            _ => return Err(invalid_frame()),
+        };
+        let length = count.checked_mul(32).filter(|length| *length <= MAX_BODY).ok_or_else(invalid_frame)?;
+        let mut frame = vec![0; length];
+        socket_work(async { socket.read_exact(&mut frame).await.map_err(transport) }).await?;
+        let mut origins = BTreeSet::new();
+        for origin in frame.chunks_exact(32) {
+            if !origins.insert(rtdb_types::EventOrigin(origin.try_into().expect("event origin width"))) {
+                return Err(invalid_frame());
+            }
+        }
+        Ok(Some((transaction, origins)))
     }
 
     pub(crate) async fn read(
@@ -614,8 +678,35 @@ impl Service {
                 self.reserve_domain_fork(history.ok_or_else(refused)?, child, preparation).await?;
                 return socket_work(send_header(socket, &Response::ForkEnrolled)).await;
             }
-            Action::RecordForkBasis { preparation, basis } => {
-                self.record_domain_fork_basis(history.ok_or_else(refused)?, preparation, basis).await?;
+            Action::RecordForkBasis { preparation, basis, length } => {
+                let child = history.ok_or_else(refused)?;
+                let (events, _charge) = socket_work(receive_body(socket, length, &self.memory)).await?;
+                self.record_domain_fork_basis(child, preparation, basis, events).await?;
+                return socket_work(send_header(socket, &Response::ForkEnrolled)).await;
+            }
+            Action::SelectSourceErasure { proof, length } if history.is_none() => {
+                let (selectors, _charge) = socket_work(receive_body(socket, length, &self.memory)).await?;
+                self.select_source_erasure(proof, selectors).await?;
+                return socket_work(send_header(socket, &Response::AppendAdmitted)).await;
+            }
+            Action::ProjectErasure { operation, root, history: selected } if history.is_none() => {
+                let projection = self.project_erasure(operation, root, selected).await?;
+                let Some((transaction, origins)) = projection else {
+                    return socket_work(send_header(socket, &Response::ErasureSelectionPending)).await;
+                };
+                let length = origins.len().checked_mul(32).filter(|length| *length <= MAX_BODY)
+                    .ok_or_else(invalid_frame)?;
+                let _charge = self.memory.reserve(length)?;
+                let mut frame = Vec::with_capacity(length);
+                for origin in &origins { frame.extend_from_slice(&origin.0); }
+                return socket_work(async {
+                    send_header(socket, &Response::ErasureProjection { transaction, count: origins.len() }).await?;
+                    socket.write_all(&frame).await.map_err(transport)
+                }).await;
+            }
+            Action::EnrollInstalledFork { domain, fork, length } if history.is_none() => {
+                let (events, _charge) = socket_work(receive_body(socket, length, &self.memory)).await?;
+                self.enroll_installed_fork(domain, fork, events).await?;
                 return socket_work(send_header(socket, &Response::ForkEnrolled)).await;
             }
             action => action,
@@ -644,7 +735,9 @@ impl Service {
 
     async fn dispatch_work(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>, history: History, action: Action) -> Result<()> {
         match action {
-            Action::Domain { .. } | Action::EnrollFork { .. } | Action::RecordForkBasis { .. } => Err(refused()),
+            Action::Domain { .. } | Action::EnrollFork { .. } | Action::RecordForkBasis { .. }
+            | Action::SelectSourceErasure { .. } | Action::ProjectErasure { .. }
+            | Action::EnrollInstalledFork { .. } => Err(refused()),
             Action::Read { ticket, position, reference } => {
                 let frame = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
                 self.read_for_ticket(history, ticket, position, &frame, &self.memory, Some(socket)).await?;
@@ -729,8 +822,12 @@ impl Service {
     }
 
     async fn record_domain_fork_basis(
-        &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis,
+        &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis, events: Bytes,
     ) -> Result<()> {
+        check_length(events.len())?;
+        if rtdb_format::catalog::publication_digest(&events) != basis.event_map {
+            return Err(refused());
+        }
         let stage = self.current(child).await?;
         if stage.lifecycle != Lifecycle::Restoring || !stage.fork_stage.as_ref().is_some_and(|selected|
             selected.preparation == preparation && selected.source_lineage == stage.lineage)
@@ -748,11 +845,114 @@ impl Service {
         let authority = domain::directory_domain(self.namespace, &stage.org, &stage.lineage)?;
         let io = IoRegion::new();
         let store = self.storage.bucket(Arc::clone(&io)).await?;
-        let result = domain::execute(store.as_ref(), authority, domain::Action::RecordForkBasis {
-            child: child.deployment, history: domain::directory_history(child)?, preparation, basis,
-        }).await;
+        let result = async {
+            let _decode = self.memory.reserve(events.len().saturating_mul(4))?;
+            rtdb_replication::decode_fork_events(&events)?;
+            let key = fork_events_key(authority, child.deployment, basis.event_map)?;
+            let sealed = self.fork_event_store(Arc::clone(&store), &io, authority, child.deployment)?;
+            sealed.put(&key, events).await?;
+            domain::execute(store.as_ref(), authority, domain::Action::RecordForkBasis {
+                child: child.deployment, history: domain::directory_history(child)?, preparation, basis,
+            }).await
+        }.await;
         io.close_and_wait().await;
         result.map(drop)
+    }
+
+    async fn enroll_installed_fork(&self, authority: Uuid, fork: domain::InstalledFork, events: Bytes) -> Result<()> {
+        check_length(events.len())?;
+        if rtdb_format::catalog::publication_digest(&events) != fork.event_map { return Err(refused()); }
+        let io = IoRegion::new();
+        let bucket = self.storage.bucket(io.clone()).await?;
+        let result = async {
+            domain::verify_installed_fork(bucket.as_ref(), authority, &fork).await?;
+            let _decode = self.memory.reserve(events.len().saturating_mul(4))?;
+            rtdb_replication::decode_fork_events(&events)?;
+            let child = fork.child.deployment;
+            let store = self.fork_event_store(Arc::clone(&bucket), &io, authority, child)?;
+            store.put(&fork_events_key(authority, child, fork.event_map)?, events).await?;
+            domain::execute(bucket.as_ref(), authority, domain::Action::EnrollInstalledFork { fork }).await
+        }.await;
+        io.close_and_wait().await;
+        result.map(drop)
+    }
+
+    async fn select_source_erasure(&self, source: domain::SourceErasure, selectors: Bytes) -> Result<()> {
+        check_length(selectors.len())?;
+        if rtdb_format::catalog::publication_digest(&selectors) != source.selectors {
+            return Err(refused());
+        }
+        decode_erasure_selectors(&selectors)?;
+        let io = IoRegion::new();
+        let bucket = self.storage.bucket(io.clone()).await?;
+        let result = async {
+            domain::verify_source_erasure(bucket.as_ref(), &source).await?;
+            let authority = source.operation.domain;
+            let store = self.fork_event_store(Arc::clone(&bucket), &io, authority, source.source)?;
+            store.put(&source_erasure_key(&source)?, selectors).await?;
+            domain::execute(bucket.as_ref(), authority, domain::Action::SelectSourceErasure { source }).await
+        }.await;
+        io.close_and_wait().await;
+        result.map(drop)
+    }
+
+    async fn project_erasure(
+        &self, operation: domain::Operation, root: Uuid, history: [u8; 32],
+    ) -> Result<Option<(rtdb_types::TransactionKey, BTreeSet<rtdb_types::EventOrigin>)>> {
+        let io = IoRegion::new();
+        let store = self.storage.bucket(io.clone()).await?;
+        let result = async {
+            let Some(projection) = domain::erasure_projection(store.as_ref(), operation, root, history).await?
+                else { return Ok(None); };
+            let source_store = self.fork_event_store(Arc::clone(&store), &io, operation.domain, projection.source.source)?;
+            let (selectors, _selector_charge) = self.read_projection_record(
+                &source_store, &source_erasure_key(&projection.source)?, projection.source.selectors,
+            ).await?;
+            let targets = decode_erasure_selectors(&selectors)?;
+            let mut source = Vec::new();
+            for (child, basis, side) in projection.source_edges {
+                source.push((self.read_fork_events(Arc::clone(&store), &io, operation.domain, child, basis).await?, side));
+            }
+            let mut dependent = Vec::new();
+            for (child, basis, _) in projection.dependent_edges {
+                dependent.push(self.read_fork_events(Arc::clone(&store), &io, operation.domain, child, basis).await?);
+            }
+            let origins = rtdb_replication::project_erasure_origins(
+                &targets, source.iter().map(|((map, _), side)| (map, *side)), dependent.iter().map(|(map, _)| map),
+            );
+            Ok(Some((projection.source.transaction, origins)))
+        }.await;
+        io.close_and_wait().await;
+        result
+    }
+
+    async fn read_fork_events(
+        &self, bucket: Arc<dyn ObjectStore>, io: &Arc<IoRegion>, authority: Uuid, child: Uuid, event_map: [u8; 32],
+    ) -> Result<(rtdb_replication::InheritedEvents, Arc<rtdb_types::MemoryReservation>)> {
+        let store = self.fork_event_store(bucket, io, authority, child)?;
+        let key = fork_events_key(authority, child, event_map)?;
+        let (bytes, charge) = self.read_projection_record(&store, &key, event_map).await?;
+        let map = rtdb_replication::decode_fork_events(&bytes)?;
+        Ok((map, charge))
+    }
+
+    async fn read_projection_record(
+        &self, store: &dyn ObjectStore, key: &ObjectKey, digest: [u8; 32],
+    ) -> Result<(Bytes, Arc<rtdb_types::MemoryReservation>)> {
+        let size = usize::try_from(store.head_fresh(key).await?.size).map_err(|_| invalid_frame())?;
+        check_length(size)?;
+        let charge = self.memory.reserve(size.saturating_mul(4))?;
+        let bytes = store.get_fresh_exact(key, size).await?;
+        if rtdb_format::catalog::publication_digest(&bytes) != digest { return Err(refused()); }
+        Ok((bytes, charge))
+    }
+
+    fn fork_event_store(
+        &self, store: Arc<dyn ObjectStore>, io: &Arc<IoRegion>, authority: Uuid, child: Uuid,
+    ) -> Result<EncryptingStore> {
+        let scope = UnitScope::replay_objects(self.namespace, &format!("fork-ancestry/{authority}/{child}"), 0);
+        let ledger = UnitLedger::new(Arc::clone(&self.keys), scope, Arc::clone(io));
+        Ok(EncryptingStore::with_units(store, Arc::new(ledger)))
     }
 
     async fn fork_signer(&self, domain: Uuid, root: Uuid, purpose: &str) -> Result<ring::signature::Ed25519KeyPair> {
@@ -1256,6 +1456,46 @@ async fn read_response(socket: &mut (impl AsyncRead + Unpin)) -> Result<Response
         Response::Refused { category, code } => Err(Anomaly::new(category, code, "The detached replay broker refused the operation")),
         response => Ok(response),
     }
+}
+
+type ErasureSelectors = BTreeMap<[u8; 32], rtdb_types::EventPosition>;
+
+pub(crate) fn encode_erasure_selectors(source: &rtdb_replication::SqlErasureSource) -> Result<Bytes> {
+    let mut selected = ErasureSelectors::new();
+    for target in source.targets() {
+        if target.entity_key.is_some() { return Err(refused()); }
+        let subject = rtdb_replication::erasure_subject(&target.table, target.iid);
+        selected.entry(subject).and_modify(|cut| *cut = (*cut).max(target.before)).or_insert(target.before);
+    }
+    let mut encoded = Vec::new();
+    for (subject, position) in selected {
+        encoded.extend_from_slice(&subject);
+        encoded.extend_from_slice(&position.to_bytes());
+    }
+    check_length(encoded.len())?;
+    Ok(Bytes::from(encoded))
+}
+
+fn decode_erasure_selectors(input: &[u8]) -> Result<ErasureSelectors> {
+    let mut selected = ErasureSelectors::new();
+    if input.is_empty() || input.len() % 48 != 0 { return Err(invalid_frame()); }
+    let mut previous = None;
+    for record in input.chunks_exact(48) {
+        let (subject, position) = record.split_first_chunk::<32>().ok_or_else(invalid_frame)?;
+        if previous.is_some_and(|prior| prior >= *subject) { return Err(invalid_frame()); }
+        selected.insert(*subject, rtdb_types::EventPosition::from_bytes(position.try_into().map_err(|_| invalid_frame())?));
+        previous = Some(*subject);
+    }
+    Ok(selected)
+}
+
+fn source_erasure_key(proof: &domain::SourceErasure) -> Result<ObjectKey> {
+    Ok(ObjectKey::new(format!("~custody-erasure-selections/{}/{}/{}",
+        proof.operation.domain, proof.operation.erase, URL_SAFE_NO_PAD.encode(proof.selectors)))?)
+}
+
+fn fork_events_key(authority: Uuid, child: Uuid, digest: [u8; 32]) -> Result<ObjectKey> {
+    Ok(ObjectKey::new(format!("~custody-fork-ancestry/{authority}/{child}/{}", URL_SAFE_NO_PAD.encode(digest)))?)
 }
 
 fn check_length(length: usize) -> Result<()> {

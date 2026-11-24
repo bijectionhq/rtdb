@@ -4,7 +4,7 @@ use rtdb_format::{catalog::legacy_table_ref, envelope::{ReplicaBody, decode_repl
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::{Snapshot, StagedWrite};
 use rtdb_storage::{ObjectStore, object_store::ReadReservation};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventOrigin, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp, TransactionKey};
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, validate_uploaded_root}, driver::{additions, artefact_entries}};
@@ -65,6 +65,7 @@ pub struct SqlErasureSource {
     source_position: SourcePosition,
     transaction: TransactionKey,
     targets: Vec<ErasureTarget>,
+    pub(crate) inherited_erasure: Option<BTreeSet<EventOrigin>>,
     pub(crate) custody: Arc<dyn Send + Sync>,
     snapshot: Snapshot,
     pub(crate) store: Arc<dyn ObjectStore>,
@@ -125,8 +126,32 @@ impl RecoveredPartition {
         if !selected { return Err(missing_erasure()); }
         Ok(SqlErasureSource {
             authenticated_head, cut, checkpoint, source_position: self.progress.source_position, transaction,
-            targets, custody, snapshot: self.partition.snapshot(),
+            targets, inherited_erasure: None, custody, snapshot: self.partition.snapshot(),
             store, memory: Arc::clone(memory),
+            fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
+        })
+    }
+
+    /// Opens another root's certified head with the origins selected for that root.
+    pub async fn replay_dependent_erasure(
+        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, source: TransactionKey,
+        origins: BTreeSet<EventOrigin>, store: Arc<dyn ObjectStore>, cancellation: &CancellationToken,
+    ) -> Result<SqlErasureSource> {
+        let authenticated_head = replay.protected.suffix.as_ref().and_then(|range| range.authenticated_head)
+            .ok_or_else(missing_erasure)?;
+        let cut = replay.cut;
+        let checkpoint = replay.checkpoint;
+        let custody = self.replay_snapshot_suffix_with(logs, replay, cancellation, |_, write, committed| {
+            if committed && !erasure_targets(write, logs.memory())?.is_empty() {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/dependent-erasure-overlap",
+                    "The dependent root has an unresolved local erase at its cut"));
+            }
+            Ok(())
+        }, true).await?.ok_or_else(missing_erasure)?;
+        Ok(SqlErasureSource {
+            authenticated_head, cut, checkpoint, source_position: self.progress.source_position,
+            transaction: source, targets: Vec::new(), inherited_erasure: Some(origins),
+            custody, snapshot: self.partition.snapshot(), store, memory: Arc::clone(logs.memory()),
             fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
         })
     }

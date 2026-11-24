@@ -120,7 +120,7 @@ impl ResolvedTx {
     fn new(writes: StagedWrite, result: TransactionResult, input: ResolvedInput, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Self> {
         let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
         let reservation = context.memory.reserve(bound)?;
-        let writes = if context.write_event_origins && result.committed() && writes.row_count()? > 0 { writes.assign_event_origins(&context.memory)? } else { writes };
+        let writes = if context.write_event_origins && writes.row_count()? > 0 { writes.assign_event_origins(&context.memory)? } else { writes };
         Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, _reservation: reservation })
     }
 

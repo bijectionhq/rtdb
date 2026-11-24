@@ -380,17 +380,88 @@ fn worker_endpoints(peers: Vec<WorkerEndpoint>) -> Result<BTreeMap<Enrollment, W
     Ok(endpoints)
 }
 
+enum ErasureInput {
+    Source(crate::replay_broker::domain::SqlIntent),
+    Inherited { transaction: rtdb_types::TransactionKey, origins: std::collections::BTreeSet<rtdb_types::EventOrigin> },
+}
+
 impl Placement {
+    pub(crate) async fn enroll_installed_fork(
+        &self, child: &Self, broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>,
+        memory: &Arc<MemoryBudget>, tasks: &TaskTracker,
+    ) -> Result<()> {
+        let unavailable = || invalid("The installed fork needs both original provider authorities and custody signers");
+        let parent_owner = self.custody_work.as_ref().ok_or_else(unavailable)?;
+        let child_owner = child.custody_work.as_ref().ok_or_else(unavailable)?;
+        let (parent_custodian, parent_signer) = (
+            self.custodian.as_ref().ok_or_else(unavailable)?, self.erasure_signer.as_ref().ok_or_else(unavailable)?,
+        );
+        let (child_custodian, child_signer) = (
+            child.custodian.as_ref().ok_or_else(unavailable)?, child.erasure_signer.as_ref().ok_or_else(unavailable)?,
+        );
+        let parent = parent_custodian.placement();
+        let destination = child_custodian.placement();
+        let domain = parent_owner.domain();
+        if parent == destination || child_owner.domain() != domain
+            || child.record.parent.as_deref() != Some(self.record.id.as_str())
+        {
+            return Err(invalid("The installed child does not name its enrolled parent"));
+        }
+        let _parent_work = parent_owner.hold(erasure::CustodyWork::Copy, tasks).await?;
+        let _child_work = child_owner.hold(erasure::CustodyWork::Copy, tasks).await?;
+        let parent_route = parent_custodian.route().await?;
+        let child_route = child_custodian.route().await?;
+        let parent_cut = parent_route.checkpoint;
+        let child_cut = child_route.checkpoint;
+        if genesis(parent_cut) || child_cut.custody.revision != 2 || child_route.head != child_cut.cut
+            || parent_route.head != parent_cut.cut
+        {
+            return Err(invalid("Enrollment requires the original selected fork checkpoints and the child's first allocation"));
+        }
+        let io = IoRegion::new().child_holding(Some(Arc::new((_parent_work, _child_work))));
+        let result = async {
+            let parent_provider = self.checkpoint_custody(io.clone(), Arc::clone(keys)).await?;
+            let child_provider = child.checkpoint_custody(io.clone(), Arc::clone(keys)).await?;
+            let source = parent_provider.open(parent_cut).await?;
+            let destination_root = child_provider.open(child_cut).await?;
+            let parent_events = crate::archive::checkpoint_fork_events(source.store.as_ref(), source.checkpoint,
+                self.worker.log_epoch(), Arc::clone(memory)).await?;
+            let child_events = crate::archive::checkpoint_fork_events(destination_root.store.as_ref(),
+                destination_root.checkpoint, child.worker.log_epoch(), Arc::clone(memory)).await?;
+            if parent_custodian.route().await?.checkpoint != parent_cut || child_custodian.route().await?.checkpoint != child_cut {
+                return Err(invalid("The selected fork checkpoints changed during enrollment"));
+            }
+            let events = child_events.pair_with_parent(&parent_events)?.encode(crate::replay_broker::MAX_BODY)?;
+            let mut fork = crate::replay_broker::domain::InstalledFork {
+                parent, child: destination, parent_cut: super::head_identity(parent, parent_cut.cut),
+                child_cut: super::head_identity(destination, child_cut.cut),
+                parent_manifest: parent_cut.manifest, child_manifest: child_cut.manifest,
+                event_map: rtdb_format::catalog::publication_digest(&events),
+                parent_signature: Vec::new(), child_signature: Vec::new(),
+            };
+            let statement = fork.signing_bytes(domain)?;
+            fork.parent_signature = parent_signer.sign(&statement).to_vec();
+            fork.child_signature = child_signer.sign(&statement).to_vec();
+            broker.enroll_installed_fork(domain, fork, events).await
+        }.await;
+        io.close_and_wait().await;
+        result
+    }
+
     pub(crate) async fn checkpoint_precedes_erasure(
         &self, status: &rtdb_replication::DriverStatus, candidate: Option<RtdbCheckpoint>,
     ) -> Result<bool> {
-        let (Some(owner), Some(marker)) = (&self.custody_work, status.first_erasure) else { return Ok(true); };
-        owner.record_sql(crate::replay_broker::domain::SqlIntent {
-            placement: self.worker.placement(),
-            transaction: marker.transaction,
-            position: marker.position,
-        }).await?;
-        Ok(candidate.is_none_or(|candidate| candidate.boundary < marker.position.after_offset(self.worker.log_epoch())))
+        let Some(owner) = &self.custody_work else { return Ok(true); };
+        if let Some(marker) = status.first_erasure {
+            owner.record_sql(crate::replay_broker::domain::SqlIntent {
+                placement: self.worker.placement(),
+                transaction: marker.transaction,
+                position: marker.position,
+            }).await?;
+        }
+        if owner.erasure_active().await? { return Ok(false); }
+        Ok(status.first_erasure.is_none_or(|marker| candidate.is_none_or(|candidate|
+            candidate.boundary < marker.position.after_offset(self.worker.log_epoch()))))
     }
 
     pub(crate) async fn start_committed_erasure(
@@ -404,22 +475,33 @@ impl Placement {
         else { return Ok(()); };
         let domain = owner.domain();
         let view = broker.custody_domain(domain, Action::Status).await?;
-        let Some(intent) = view.next_sql.filter(|intent| intent.placement == custodian.placement()) else { return Ok(()); };
-        if view.sole_root != Some(intent.placement.deployment) { return Ok(()); }
-        let status = database.status();
-        if !status.first_erasure.is_some_and(|marker|
-            marker.transaction == intent.transaction && marker.position == intent.position)
-        {
-            return Ok(());
-        }
-        let target = intent.target()?;
-        let operation = Operation {
-            domain, generation: view.generation, target,
-            erase: uuid::Builder::from_random_bytes(target[..16].try_into().expect("operation identity width")).into_uuid(),
+        let placement = custodian.placement();
+        let intent = view.next_sql.filter(|intent| intent.placement == placement
+            && database.status().first_erasure.is_some_and(|marker|
+                marker.transaction == intent.transaction && marker.position == intent.position));
+        let (operation, input) = match (view.operation, intent) {
+            (Some(operation), Some(intent)) if intent.target()? == operation.target => (operation, ErasureInput::Source(intent)),
+            (Some(operation), _) if view.source_root.is_some_and(|root| root != placement.deployment) => {
+                let Some((transaction, origins)) = broker.projected_erasure(
+                    operation, placement.deployment, crate::replay_broker::domain::installed_history(placement)?,
+                ).await? else { return Ok(()); };
+                (operation, ErasureInput::Inherited { transaction, origins })
+            }
+            (None, Some(intent)) if view.automatic_sql_source == Some(placement.deployment) => {
+                let target = intent.target()?;
+                (Operation {
+                    domain, generation: view.generation, target,
+                    erase: uuid::Builder::from_random_bytes(target[..16].try_into().expect("operation identity width")).into_uuid(),
+                }, ErasureInput::Source(intent))
+            }
+            _ => return Ok(()),
         };
-        if view.operation.is_some_and(|closing| closing != operation) { return Ok(()); }
         let route = custodian.route().await?;
         if route.writer.grant != Some(admission.grant) || route.preparing.is_some_and(|entry| !entry.erasure) {
+            return Ok(());
+        }
+        if matches!(&input, ErasureInput::Inherited { .. }) && route.head == route.checkpoint.cut {
+            database.flush().await?;
             return Ok(());
         }
         let revision = route.checkpoint.custody.revision.checked_add(1)
@@ -431,10 +513,12 @@ impl Placement {
         if erasure::installed::Installed::load(&provider, signer, route.placement, operation).await?.is_some() {
             return Ok(());
         }
-        broker.custody_domain(domain, Action::BeginSingleRootSql {
-            operation, intent, verification_key: signer.public_key(),
-        }).await?;
-        self.stage_selected_erasure(node, database, admission, broker, keys, intent, operation, None, cancellation).await?;
+        if view.operation.is_none() && let ErasureInput::Source(intent) = &input {
+            broker.custody_domain(domain, Action::BeginSql {
+                operation, intent: *intent, verification_key: signer.public_key(),
+            }).await?;
+        }
+        self.stage_selected_erasure(node, database, admission, broker, keys, input, operation, None, cancellation).await?;
         Ok(())
     }
 
@@ -454,6 +538,18 @@ impl Placement {
             else { return Ok(()); };
         let coordinator = erasure::ErasureCoordinator::new(&self.worker, custodian, &provider, keys.as_ref(), broker, operation)?
             .with_custody_verification_key(signer.public_key())?;
+        let checkpoint = installed.staged.prepared.checkpoint;
+        let placement = custodian.placement();
+        let prepared = crate::replay_broker::domain::RootPrepared {
+            original_head: super::head_identity(placement, checkpoint.cut),
+            successor: checkpoint.manifest,
+        };
+        let history = crate::replay_broker::domain::installed_history(placement)?;
+        let signature = signer.sign(&prepared.signing_bytes(operation, placement.deployment, history)?).to_vec();
+        let ready = broker.custody_domain(owner.domain(), Action::PrepareRoot {
+            operation, root: placement.deployment, prepared, signature,
+        }).await?;
+        if !ready.successors_ready { return Ok(()); }
         let commit = coordinator.commit(&installed, installed.staged.prepared.erasure).await?;
         if coordinator.confirm_destruction(&installed, commit).await?.is_some() {
             let view = broker.custody_domain(owner.domain(), Action::Status).await?;
@@ -472,14 +568,14 @@ impl Placement {
         let intent = crate::replay_broker::domain::SqlIntent {
             placement: self.worker.placement(), transaction: request.transaction, position: request.position,
         };
-        self.stage_selected_erasure(node, database, admission, broker, keys, intent,
+        self.stage_selected_erasure(node, database, admission, broker, keys, ErasureInput::Source(intent),
             request.operation, Some(request.rotation), cancellation).await
     }
 
     async fn stage_selected_erasure(
         &self, node: &rtdb_node::Node, database: &rtdb_node::Database, admission: WriterAdmission,
         broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>,
-        intent: crate::replay_broker::domain::SqlIntent, operation: crate::replay_broker::domain::Operation,
+        input: ErasureInput, operation: crate::replay_broker::domain::Operation,
         rotation: Option<ordered_logkeeper::ordered::RequestId>, cancellation: &CancellationToken,
     ) -> Result<Checkpoint> {
         use crate::replay_broker::domain;
@@ -489,7 +585,9 @@ impl Placement {
         if self.custody_work.as_ref().map(custody_work::WorkOwner::domain) != Some(operation.domain) {
             return Err(invalid("The selected SQL writer is outside the installed custody domain"));
         }
-        if intent.placement != placement || intent.target()? != operation.target {
+        if let ErasureInput::Source(intent) = &input
+            && (intent.placement != placement || intent.target()? != operation.target)
+        {
             return Err(invalid("The SQL erasure marker differs from the broker's target"));
         }
         broker.custody_domain(operation.domain, domain::Action::AuthorizeRoot {
@@ -550,14 +648,29 @@ impl Placement {
             replica_epoch: epoch,
             through: position(route.head.next_lsn)?,
         };
-        let selection = node.sql_erasure_source(database, cut, checkpoint,
-            intent.transaction, intent.position, cancellation).await?;
+        let is_source = matches!(&input, ErasureInput::Source(_));
+        let selection = match input {
+            ErasureInput::Source(intent) => node.sql_erasure_source(database, cut, checkpoint,
+                intent.transaction, intent.position, cancellation).await?,
+            ErasureInput::Inherited { transaction, origins } => node.dependent_erasure_source(database,
+                cut, checkpoint, transaction, origins, cancellation).await?,
+        };
         let coordinator = erasure::ErasureCoordinator::new(&self.worker, custodian, &provider, keys.as_ref(), broker, operation)?;
         let staged = coordinator.stage_survivor(erasure::Erasure {
             placement, operation: operation.erase, custody_domain: operation.domain,
             incumbent: admission.grant, timing: erasure::ErasureTiming::OperationalTarget,
         }, rotation, reservation, &selection, cancellation).await?;
-        if self.erasure_signer.is_some() {
+        if let Some(signer) = &self.erasure_signer {
+            if is_source && broker.custody_domain(operation.domain, domain::Action::Status).await?.sole_root.is_none() {
+                let selectors = crate::replay_broker::encode_erasure_selectors(&selection)?;
+                let mut proof = domain::SourceErasure {
+                    operation, source: placement.deployment, history: domain::installed_history(placement)?,
+                    original_head: selection.authenticated_head(), transaction: selection.transaction(),
+                    selectors: rtdb_format::catalog::publication_digest(&selectors), signature: Vec::new(),
+                };
+                proof.signature = signer.sign(&proof.signing_bytes()?).to_vec();
+                broker.select_source_erasure(proof, selectors).await?;
+            }
             erasure::installed::Installed::remember(&provider, erasure::installed::Staged {
                 prepared: staged, base: route.checkpoint,
             }).await?;
