@@ -230,7 +230,7 @@ pub struct HeldCatalogRead {
     cut: Option<rtdb_types::CatalogCut>,
     registration: Option<Arc<dyn Send + Sync>>,
     catalog_file_paths: Option<Arc<[String]>>,
-    exact: bool,
+    checkpoint: Option<rtdb_types::CatalogCheckpoint>,
 }
 
 impl HeldCatalogRead {
@@ -240,7 +240,7 @@ impl HeldCatalogRead {
         match (self.cut, cut) {
             (Some(held), Some(cut)) => held.storage_version == cut.storage_version
                 && held.storage_epoch == cut.storage_epoch && held.replica_epoch == cut.replica_epoch
-                && if self.exact { held.through == cut.through } else { held.through <= cut.through },
+                && if self.checkpoint.is_some() { held.through == cut.through } else { held.through <= cut.through },
             (None, None) => true,
             _ => false,
         }
@@ -333,35 +333,40 @@ impl BufferPool {
             Some(paths) => self.store.retain_catalog_with_paths(cut, Arc::clone(paths)).await?,
             None => self.store.retain_catalog(cut).await?,
         };
-        self.finish_catalog_hold(cut, paths, registration, false)
+        self.finish_catalog_hold(cut, paths, registration, None)
     }
 
     pub async fn hold_anchored_catalog(
         &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint, paths: Option<Arc<[String]>>,
     ) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
         let registration = self.store.retain_anchored_catalog(cut, base, paths.clone()).await?;
-        self.finish_catalog_hold(Some(cut), paths, registration, true)
+        self.finish_catalog_hold(Some(cut), paths, registration, Some(base))
     }
 
     fn finish_catalog_hold(
         &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>,
-        registration: Option<Arc<dyn Send + Sync>>, exact: bool,
+        registration: Option<Arc<dyn Send + Sync>>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
     ) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
         if self.store.defers_trie_releases() && registration.is_none() {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-not-held",
                 "The coordinated storage provider returned no catalog hold"));
         }
-        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths, exact }))
+        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths, checkpoint }))
     }
 
     /// Re-admit the same scope through the current owner. The old cohort retains
     /// its original permit until its readers, provider tasks and deliveries drain.
     pub async fn renew_catalog(&self, held: &HeldCatalogRead) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
-        if !Arc::ptr_eq(&self.residence, &held.residence) || !held.is_registered() {
-            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
-                "The catalog hold does not belong to this storage residence"));
-        }
-        self.hold_catalog_with_paths(held.cut, held.catalog_file_paths.clone()).await
+        let closed = || rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
+            "The storage residence did not renew the catalog hold");
+        if !Arc::ptr_eq(&self.residence, &held.residence) || !held.is_registered() { return Err(closed()); }
+        let paths = held.catalog_file_paths.clone();
+        let renewed = match held.checkpoint {
+            Some(checkpoint) => self.hold_anchored_catalog(held.cut.ok_or_else(closed)?, checkpoint, paths).await?,
+            None => self.hold_catalog_with_paths(held.cut, paths).await?,
+        };
+        if !renewed.is_registered() { return Err(closed()); }
+        Ok(renewed)
     }
 
     pub fn holds_catalog(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>) -> bool {

@@ -1958,10 +1958,11 @@ rule ReapUnreachable {
 }
 
 -- Original replay pack retirement runs during the local cell sweep or through the hosted provider inventory.
--- A parked root can retire an older original pack after the grace while it holds the exact current replay archive and the source lineage.
--- The reaper checks every L0 member against the archived bytes and accepts checkpoint metadata for the pack's own older block.
+-- A parked root can retire an older original pack while it holds the exact current replay archive and the source lineage.
+-- The reaper checks each carried member against the archived bytes and accepts checkpoint metadata for the pack's own older block.
 -- The certified replica prefix passes the pack's boundary and ends before the published boundary.
--- Existing storage admissions, catalog readers, journal dependencies, and declared descendant references retain the original pack.
+-- Hosted serving readers admitted through that same archive can stay open if the authenticated archive supplies every payload member.
+-- Other storage admissions, journal dependencies, and declared descendant references retain the original pack.
 -- New serving admissions start at the published checkpoint and acquire the selected replay archive.
 -- The hosted reaper binds the pack index and every member observation to the same physical publication.
 -- It verifies the published successor root and waits for outstanding write leases to expire.

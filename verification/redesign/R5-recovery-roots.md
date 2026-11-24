@@ -170,7 +170,9 @@ Each member outside the replaced checkpoint metadata must have matching plaintex
 The parked selection closes generic fork admission. The lineage reservation protects an in-progress fork, and its published references protect the original pack.
 Age is no longer a condition of this replay-pack grant or of the checkpoint-metadata pack grant with exact release evidence for every member.
 The local reaper holds the maintenance lock, lineage reservation and archive region while verifying and unlinking the pack. Hosted retirement uses the same lineage authority with exact version settlement or enrolled terminal tombstone evidence.
-It requires drained storage and catalog readers, no declared descendant references, and a certified replica prefix that passes the old boundary while retaining the published boundary.
+Hosted readers can remain admitted when their region uses the same selected archive and the archive covers every payload member, including receipt L0.
+Raw readers still require drain.
+The grant also requires no declared descendant references and a certified replica prefix that passes the old boundary while retaining the published boundary.
 Only the physical original pack is erased, so the archive continues to serve the logical L0 descriptors.
 An in-place restore of an archive-backed installation must adopt a complete replay capture.
 A parked installation can advance its serving archive after restore and preserves the earlier restore receipt.
