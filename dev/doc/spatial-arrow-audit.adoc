@@ -31,7 +31,9 @@ Older wire versions accept their original stateless Arrow requests.
 | Nearest radius expansion
 | The fallback encoded the same query geometry and partition again when widening the radius.
 | Bijection retains the Arrow geometry, partition, and projection arrays and extends the distance window at the same held cut.
-The expanded ranking excludes the completed radius, including its boundary ties, and keeps the results and application scan budget from the probe.
+The nearest ranker opens a bounded series of local distance windows until it reaches the exact candidate bound or the requested radius.
+Each wider ranking excludes the completed radius, including its boundary ties, and keeps the results and application scan budget from earlier windows.
+Filters whose evaluation can fail retain the full-population traversal so that pruning preserves observable errors.
 
 | Held nearest pagination
 | Every ranked continuation reopened candidate pages and refined the same geometries.
