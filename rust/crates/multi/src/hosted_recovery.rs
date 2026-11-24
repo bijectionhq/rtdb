@@ -10,13 +10,33 @@ use crate::deployment::{ensemble_servers, write_quorum};
 use crate::replica_retention::{excluded_replay_start, replica_trim_through};
 
 pub(crate) fn replay_start(record: &DeploymentRecord, after: i64) -> rtdb_storage::Result<i64> {
-    if let Some(anchor) = &record.replica_anchor {
-        if anchor.interval[0] < 0 || anchor.interval[1] < anchor.interval[0] || anchor.interval[1] == i64::MAX {
-            return Err(Error::Task("The replica journal has an invalid trim anchor".into()));
-        }
-        if let Some((requested, first_retained)) = excluded_replay_start(after, anchor.interval[1]) {
-            return Err(Error::UnavailableLogRange { requested, first_retained });
-        }
+    first_after(after, replay_admission_floor(record)?)
+}
+
+pub(crate) fn journal_replay_start(record: &DeploymentRecord, after: i64) -> rtdb_storage::Result<i64> {
+    first_after(after, anchor_end(record.replica_anchor.as_deref())?)
+}
+
+pub(crate) fn replay_admission_floor(record: &DeploymentRecord) -> rtdb_storage::Result<i64> {
+    Ok(anchor_end(record.replica_anchor.as_deref())?.max(anchor_end(body_anchor(record))?))
+}
+
+pub(crate) fn body_anchor(record: &DeploymentRecord) -> Option<&JournalAnchor> {
+    record.replica_payload_trim.as_ref().filter(|work| work.belongs_to(record))
+        .and_then(|work| work.body_anchor.as_deref())
+}
+
+fn anchor_end(anchor: Option<&JournalAnchor>) -> rtdb_storage::Result<i64> {
+    let Some(anchor) = anchor else { return Ok(-1); };
+    if anchor.interval[0] < 0 || anchor.interval[1] < anchor.interval[0] || anchor.interval[1] == i64::MAX {
+        return Err(Error::Task("The replica history has an invalid recovery anchor".into()));
+    }
+    Ok(anchor.interval[1])
+}
+
+fn first_after(after: i64, floor: i64) -> rtdb_storage::Result<i64> {
+    if let Some((requested, first_retained)) = excluded_replay_start(after, floor) {
+        return Err(Error::UnavailableLogRange { requested, first_retained });
     }
     after.checked_add(1).filter(|first| *first >= 0)
         .ok_or_else(|| Error::Task("Invalid first required replica offset".into()))
@@ -92,21 +112,21 @@ impl ReplicaTrimPlan {
     }
 
     pub(crate) async fn authorize(mut self, directory: &dyn Directory, members: &BTreeMap<MemberId, MemberRecord>,
-        keys: &dyn crate::keys::KeyService, offloads: bool) -> Result<Option<ReplicaTrimGrant>> {
-        let servers = ensemble_servers(&self.record, members)?;
-        let stream = StreamConfig {
-            write_quorum: write_quorum(servers.len()), servers,
-            stream: self.record.stream("replica"), maximum_message_bytes: 4 << 20,
-        };
+        keys: &dyn crate::keys::KeyService, detached: bool) -> Result<Option<ReplicaTrimGrant>> {
+        let stream = replica_stream(&self.record, members)?;
         if let Some(proof) = checkpoint_decision(&self.record)? {
             // Keep this decision's exact suffix intact until a subsequent
             // publication leaves a newer authenticated recovery boundary.
             self.through.0 = self.through.0.min(proof.certificate.statement.prefix.predecessor);
-            if self.through.0 < 0
-                || self.record.replica_anchor.as_ref().is_some_and(|anchor| self.through.0 < anchor.interval[1])
-            {
-                return Ok(None);
-            }
+        }
+        if detached {
+            let Some(anchor) = body_anchor(&self.record) else { return Ok(None); };
+            self.through.0 = self.through.0.min(anchor.interval[1]);
+        }
+        if self.through.0 < 0
+            || self.record.replica_anchor.as_ref().is_some_and(|anchor| self.through.0 < anchor.interval[1])
+        {
+            return Ok(None);
         }
         let mut retirement = None;
         let mut changed = false;
@@ -120,51 +140,17 @@ impl ReplicaTrimPlan {
             self.through = LogOffset(pending.through);
             retirement = Some((self.record.id.clone(), pending.clone()));
         } else if anchor.is_none_or(|anchor| anchor.interval[1] < self.through.0) {
-            let transferred_first = self.record.checkpoint_transfer_activation.as_deref()
-                .and_then(|activation| activation.replica.bootstrap.terminal.fence.destination.checkpoint.boundary.checked_add(1));
-            let initial = if anchor.is_none() && transferred_first.is_none() {
-                Some(rtdb_logkeeper::certify_committed_prefix(&stream, self.through.0, None).await?)
-            } else { None };
-            let first = anchor.map(|anchor| anchor.interval[1] + 1).or(transferred_first)
-                .or_else(|| initial.as_ref().map(|proof| proof.interval[0])).unwrap_or(0);
-            self.through.0 = self.through.0.min(first.saturating_add(REPLICA_PAYLOAD_TRIM_BATCH - 1));
-            let prefix = anchor.map(|anchor| JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
-            let proof = if let Some(activation) = self.record.checkpoint_transfer_activation.as_deref() {
-                let stage = &activation.replica.bootstrap.terminal.fence.destination;
-                let first = stage.checkpoint.boundary.checked_add(1)
-                    .filter(|first| *first >= 0)
-                    .ok_or_else(|| Error::Task("The activated transfer has no exact replica genesis".into()))?;
-                if self.record.log_epoch != stage.source_log_epoch || self.through.0 < first
-                    || anchor.is_some_and(|anchor| anchor.interval[0] != first)
-                {
-                    return Ok(None);
-                }
-                if prefix.is_none() {
-                    rtdb_logkeeper::certify_committed_range(&stream, first, self.through.0).await?
-                } else {
-                    rtdb_logkeeper::certify_committed_prefix(&stream, self.through.0, prefix.as_ref()).await?
-                }
-            } else if let Some(initial) = initial.filter(|proof| proof.interval[1] == self.through.0) {
-                initial
-            } else {
-                rtdb_logkeeper::certify_committed_prefix(&stream, self.through.0, prefix.as_ref()).await?
-            };
-            let Some(digest) = proof.digest_bytes() else { return Ok(None); };
-            {
-                let mut candidates = self.record.replica_payload_trim.as_ref()
-                    .filter(|trim| trim.belongs_to(&self.record)).map(|trim| trim.candidates.clone()).unwrap_or_default();
-                let (journal_units, detached) = trim_census(
-                    &self.record, &stream, keys, first, self.through.0, offloads,
-                ).await?;
-                candidates.extend(detached);
-                if candidates.len() > MAX_PENDING_REPLICA_PAYLOADS { return Ok(None); }
-                let pending = ReplicaPayloadTrim { incarnation: self.record.incarnation, log_epoch: self.record.log_epoch,
-                    through: self.through.0, generation: self.record.storage_generation, applied: false, candidates, journal_units };
-                self.record.replica_payload_trim = Some(Box::new(pending.clone()));
-                retirement = Some((self.record.id.clone(), pending));
-            }
-            let root_incarnation = anchor.map_or(self.record.incarnation, |anchor| anchor.root_incarnation);
-            self.record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation, interval: proof.interval, digest }));
+            let Some((first, next_anchor)) = certified_batch(&self.record, &stream, anchor, self.through.0).await?
+                else { return Ok(None); };
+            self.through.0 = next_anchor.interval[1];
+            let (journal_units, _) = trim_census(&self.record, &stream, keys, first, self.through.0, false).await?;
+            let mut pending = current_work(&self.record);
+            pending.through = self.through.0;
+            pending.applied = false;
+            pending.journal_units = journal_units;
+            self.record.replica_payload_trim = Some(Box::new(pending.clone()));
+            retirement = Some((self.record.id.clone(), pending));
+            self.record.replica_anchor = Some(Box::new(next_anchor));
             changed = true;
         }
         let stored = if changed {
@@ -186,26 +172,110 @@ impl ReplicaTrimPlan {
             "anchor": scope.anchor, "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
             "first_required": stored.required_replica_offsets(rtdb_directory::now_ms()).collect::<Vec<_>>(),
         }));
-        if let Some(work) = stored.replica_payload_trim.as_ref().filter(|work| {
-            work.belongs_to(&stored) && work.through == anchor.interval[1] && !work.candidates.is_empty()
-        }) {
-            let residence = crate::replay_broker::residence(&stored);
-            crate::residence_trace::record("detached-recovery-fence", || serde_json::json!({
-                "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
-                "stream": stream.stream, "epoch": stored.log_epoch, "generation": stored.storage_generation,
-                "residence": residence, "revision": stored.version, "interval": anchor.interval,
-                "root_incarnation": anchor.root_incarnation, "anchor": anchor.digest,
-                "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
-                "candidates": work.candidates.iter().map(|candidate| serde_json::json!({
-                    "key": format!("{residence}/{}", candidate.key), "publication": candidate.version,
-                    "position": candidate.position, "frame": candidate.frame_sha256,
-                })).collect::<Vec<_>>(),
-            }));
-        }
         Ok(Some(ReplicaTrimGrant {
             stream, through: self.through, retirement, scope, residence_key: stored.key_id(),
         }))
     }
+}
+
+fn replica_stream(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<StreamConfig> {
+    let servers = ensemble_servers(record, members)?;
+    Ok(StreamConfig {
+        write_quorum: write_quorum(servers.len()), servers,
+        stream: record.stream("replica"), maximum_message_bytes: 4 << 20,
+    })
+}
+
+fn current_work(record: &DeploymentRecord) -> ReplicaPayloadTrim {
+    record.replica_payload_trim.as_deref().filter(|work| work.belongs_to(record)).cloned()
+        .unwrap_or_else(|| ReplicaPayloadTrim {
+            incarnation: record.incarnation, log_epoch: record.log_epoch, generation: record.storage_generation,
+            through: -1, applied: true, body_anchor: None, candidates: Vec::new(), journal_units: Vec::new(),
+        })
+}
+
+async fn certified_batch(record: &DeploymentRecord, stream: &StreamConfig, anchor: Option<&JournalAnchor>, through: i64)
+    -> Result<Option<(i64, JournalAnchor)>> {
+    let transferred = record.checkpoint_transfer_activation.as_deref()
+        .map(|activation| &activation.replica.bootstrap.terminal.fence.destination);
+    let transferred_first = if let Some(stage) = transferred {
+        let first = stage.checkpoint.boundary.checked_add(1).filter(|first| *first >= 0)
+            .ok_or_else(|| Error::Task("The activated transfer has no exact replica genesis".into()))?;
+        if record.log_epoch != stage.source_log_epoch || through < first
+            || anchor.is_some_and(|anchor| anchor.interval[0] != first)
+        {
+            return Ok(None);
+        }
+        Some(first)
+    } else {
+        None
+    };
+    let initial = if anchor.is_none() && transferred_first.is_none() {
+        Some(rtdb_logkeeper::certify_committed_prefix(stream, through, None).await?)
+    } else {
+        None
+    };
+    let first = anchor.map(|anchor| anchor.interval[1] + 1).or(transferred_first)
+        .or_else(|| initial.as_ref().map(|proof| proof.interval[0])).unwrap_or(0);
+    let through = through.min(first.saturating_add(REPLICA_PAYLOAD_TRIM_BATCH - 1));
+    if through < first { return Ok(None); }
+    let prefix = anchor.map(|anchor| JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
+    let proof = if let Some(initial) = initial.filter(|proof| proof.interval[1] == through) {
+        initial
+    } else if let Some(genesis) = transferred_first.filter(|_| prefix.is_none()) {
+        rtdb_logkeeper::certify_committed_range(stream, genesis, through).await?
+    } else {
+        rtdb_logkeeper::certify_committed_prefix(stream, through, prefix.as_ref()).await?
+    };
+    let Some(digest) = proof.digest_bytes() else { return Ok(None); };
+    let root_incarnation = anchor.map_or(record.incarnation, |anchor| anchor.root_incarnation);
+    Ok(Some((first, JournalAnchor { root_incarnation, interval: proof.interval, digest })))
+}
+
+/// Closes new body dependencies before physical trim. An already admitted
+/// suffix can finish and continues to protect exactly its covered positions.
+pub(crate) async fn advance_body_fence(
+    directory: &dyn Directory, members: &BTreeMap<MemberId, MemberRecord>, keys: &dyn crate::keys::KeyService,
+    record: DeploymentRecord, adopted_boundary: i64,
+) -> Result<Option<DeploymentRecord>> {
+    let Some(checkpoint) = record.checkpoint else { return Ok(Some(record)); };
+    let Some(proof) = checkpoint_decision(&record)? else { return Ok(Some(record)); };
+    let through = checkpoint.boundary.min(adopted_boundary).saturating_sub(1)
+        .min(proof.certificate.statement.prefix.predecessor);
+    let anchor = body_anchor(&record);
+    if through < 0 || anchor.is_some_and(|anchor| anchor.interval[1] >= through) {
+        return Ok(Some(record));
+    }
+    let stream = replica_stream(&record, members)?;
+    let Some((first, next_anchor)) = certified_batch(&record, &stream, anchor, through).await?
+        else { return Ok(Some(record)); };
+    let (_, detached) = trim_census(&record, &stream, keys, first, next_anchor.interval[1], true).await?;
+    let mut work = current_work(&record);
+    if work.candidates.len().saturating_add(detached.len()) > MAX_PENDING_REPLICA_PAYLOADS {
+        return Ok(Some(record));
+    }
+    work.candidates.extend(detached);
+    work.body_anchor = Some(Box::new(next_anchor));
+    let version = record.version;
+    let mut next = record;
+    next.replica_payload_trim = Some(Box::new(work));
+    let Cas::Applied(stored) = directory.replace_deployment(next, version).await? else { return Ok(None); };
+    let work = stored.replica_payload_trim.as_ref().expect("the CAS stored the detached census");
+    if !work.candidates.is_empty() {
+        let residence = crate::replay_broker::residence(&stored);
+        crate::residence_trace::record("detached-recovery-fence", || serde_json::json!({
+            "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+            "stream": stream.stream, "epoch": stored.log_epoch, "generation": stored.storage_generation,
+            "residence": residence, "revision": stored.version, "interval": next_anchor.interval,
+            "root_incarnation": next_anchor.root_incarnation, "anchor": next_anchor.digest,
+            "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
+            "candidates": work.candidates.iter().map(|candidate| serde_json::json!({
+                "key": format!("{residence}/{}", candidate.key), "publication": candidate.version,
+                "position": candidate.position, "frame": candidate.frame_sha256,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(Some(stored))
 }
 
 impl ReplicaTrimGrant {
@@ -334,6 +404,23 @@ mod tests {
         assert!(record.has_live_suffix_pins(10));
         record.storage_regions.remove(&hold);
         assert_eq!(planned(record), 9);
+    }
+
+    #[test]
+    fn detached_census_passes_a_finite_hold_without_closing_its_positions() {
+        let mut record = candidate();
+        record.storage_regions.insert(uuid::Uuid::new_v4(), StorageRegion::ReplicaReplay {
+            first_required: 3, through: 4, custody: ReplayCustody::Local,
+        });
+        let mut work = current_work(&record);
+        work.body_anchor = Some(Box::new(JournalAnchor { root_incarnation: 1, interval: [0, 8], digest: [3; 32] }));
+        record.replica_payload_trim = Some(Box::new(work));
+
+        assert!(record.requires_replica_offset(3, 0));
+        assert!(!record.requires_replica_offset(5, 0));
+        assert!(matches!(replay_start(&record, 4), Err(Error::UnavailableLogRange { first_retained: 9, .. })));
+        assert_eq!(journal_replay_start(&record, 2).unwrap(), 3);
+        assert_eq!(ReplicaTrimPlan::new(record, 10, -1, 0).unwrap().through, LogOffset(2));
     }
 
     #[test]

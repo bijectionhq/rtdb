@@ -926,6 +926,8 @@ pub struct ReplicaPayloadTrim {
     pub through: i64,
     pub generation: Option<uuid::Uuid>,
     pub applied: bool,
+    /// Certified prefix closed to new replay dependencies. Physical trims may lag it.
+    pub body_anchor: Option<Box<JournalAnchor>>,
     pub candidates: Vec<ReplicaPayloadCandidate>,
     /// One authenticated publication for each frame in this new trim interval.
     pub journal_units: Vec<ReplicaJournalUnit>,
@@ -1160,10 +1162,29 @@ impl DeploymentRecord {
 
     /// The intervals for the currently eligible recovery dependencies at this directory revision.
     pub fn replica_dependency_intervals(&self, now_ms: i64) -> impl Iterator<Item = [i64; 2]> + '_ {
-        self.storage_regions.values().filter_map(StorageRegion::replica_dependency_interval)
+        self.storage_regions.values().filter_map(|region| self.storage_region_replica_interval(region))
             .chain(self.capture_replica_offsets().map(|first| [first, i64::MAX]))
             .chain(self.live_replica_suffixes(now_ms)
                 .map(|pin| self.verified_suffix_interval(pin).unwrap_or([i64::MIN, i64::MAX])))
+    }
+
+    /// A copy inherits the authenticated interval of its admitted suffix pin.
+    /// Other operations retain their own independently admitted region.
+    pub fn storage_region_replica_interval(&self, region: &StorageRegion) -> Option<[i64; 2]> {
+        let [first, through] = region.replica_dependency_interval()?;
+        let suffix = match region {
+            StorageRegion::Local { checkpoint_suffix, .. } | StorageRegion::Remote { checkpoint_suffix, .. } => *checkpoint_suffix,
+            _ => None,
+        };
+        if let Some(suffix) = suffix
+            && let Some(pin) = self.checkpoint_suffix_pins.get(&suffix)
+            && region.holds_checkpoint_suffix(pin.capture, suffix)
+            && let Some([start, end]) = self.verified_suffix_interval(pin)
+            && start == first
+        {
+            return Some([start, end]);
+        }
+        Some([first, through])
     }
 
     /// Whether an eligible recovery dependency can still open this position.
@@ -1620,6 +1641,20 @@ fn prepare_checkpoint_transfer_activation(
 }
 
 fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
+    let body_anchor = |record: &DeploymentRecord| record.replica_payload_trim.as_ref()
+        .filter(|work| work.belongs_to(record)).and_then(|work| work.body_anchor.as_deref()).copied();
+    if current.incarnation == next.incarnation && current.log_epoch == next.log_epoch
+        && current.storage_generation == next.storage_generation
+        && let Some(prior) = body_anchor(current)
+        && body_anchor(next).is_none_or(|next| {
+            prior.root_incarnation != next.root_incarnation || prior.interval[0] != next.interval[0]
+                || prior.interval[1] > next.interval[1]
+                || (prior.interval[1] == next.interval[1] && prior.digest != next.digest)
+        })
+    {
+        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/recovery-fence",
+            "The detached replay dependency fence cannot reopen this history"));
+    }
     if current.checkpoint_transfer_fence != next.checkpoint_transfer_fence
         || current.checkpoint_transfer_terminal != next.checkpoint_transfer_terminal
         || current.checkpoint_transfer_bootstrap != next.checkpoint_transfer_bootstrap

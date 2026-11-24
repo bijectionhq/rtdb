@@ -51,7 +51,7 @@ impl<'a> ServingPayloads<'a> {
         if first < 0 || through < first || proof.stream != record.stream("replica")
             || proof.digest_bytes().is_none()
             || !record.storage_regions.get(&ticket).is_some_and(|hold| {
-                admits_position(hold, first) && admits_position(hold, through)
+                admits_position(record, hold, first) && admits_position(record, hold, through)
             })
         {
             return Err(suffix_unavailable());
@@ -418,7 +418,7 @@ pub(crate) async fn reseal_live_journal(
     use rtdb_storage::log::LogOffset;
 
     let (trim, through) = seal_recover_bounds(source_stream, source.epoch).await?;
-    let trim = LogOffset(source.replica_anchor.as_ref().map_or(trim.0, |anchor| anchor.interval[1].max(trim.0)));
+    let trim = LogOffset(trim.0.max(crate::hosted_recovery::replay_admission_floor(source)?));
     let first = LogOffset(trim.0.checked_add(1).ok_or_else(suffix_unavailable)?);
     if trim > through { return Err(suffix_unavailable()); }
     if first > through {
@@ -684,7 +684,9 @@ fn admit_copy(
     if record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != pin.incarnation) {
         return Err(suffix_unavailable());
     }
-    Ok(Some(crate::hosted_recovery::replay_start(record, pin.checkpoint.boundary)?))
+    // The installed pin already retains its original range. Starting its
+    // copy inherits that dependency while the storage region keeps it in use.
+    Ok(Some(crate::hosted_recovery::journal_replay_start(record, pin.checkpoint.boundary)?))
 }
 
 fn admit<'a>(

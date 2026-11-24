@@ -424,7 +424,7 @@ impl Service {
         let Some(grant) = owner.replica_payload_trim.as_ref().and_then(|work| work.candidates.iter()
             .find(|chosen| same_candidate(candidate, chosen))).and_then(|chosen| chosen.grant)
         else { return Ok(()); };
-        let anchor = owner.replica_anchor.as_deref().ok_or_else(refused)?;
+        let anchor = crate::hosted_recovery::body_anchor(&owner).ok_or_else(refused)?;
         let decision = crate::hosted_recovery::checkpoint_decision(&owner)?.ok_or_else(refused)?;
         let effect = || serde_json::json!({
             "lineage": owner.lineage, "installation": owner.id, "incarnation": owner.incarnation,
@@ -623,11 +623,19 @@ impl Service {
         for _ in 0..CAS_ATTEMPTS {
             let mut record = self.current(history).await?;
             if matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Deleted)
-                || !record.storage_regions.get(&ticket).is_some_and(|hold| admits_position(hold, position))
+                || !record.storage_regions.get(&ticket).is_some_and(|hold| admits_position(&record, hold, position))
             {
                 return Err(refused());
             }
-            crate::hosted_recovery::replay_start(&record, after)?;
+            // Redeem a reference under an existing dependency. The logical
+            // fence closes new dependencies, while the old ticket prevents the
+            // collector from moving this position's key or physical journal.
+            crate::hosted_recovery::journal_replay_start(&record, after)?;
+            if record.replica_payload_trim.as_ref().is_some_and(|work| work.belongs_to(&record)
+                && work.candidates.iter().any(|entry| entry.position == position && entry.grant.is_some()))
+            {
+                return Err(refused());
+            }
             let version = record.version;
             record.storage_regions.insert(region, StorageRegion::ReplicaReplay {
                 first_required: position, through: position, custody: self.custody.clone(),
@@ -721,7 +729,7 @@ fn permits_release(record: &DeploymentRecord, candidate: &ReplicaPayloadCandidat
         && candidate.position >= 0 && candidate.frame_sha256 != [0; 32]
         && crate::hosted_recovery::checkpoint_decision(record)?.is_some()
         && record.checkpoint.is_some_and(|root| root.boundary > candidate.position)
-        && record.replica_anchor.as_ref().is_some_and(|anchor|
+        && crate::hosted_recovery::body_anchor(record).is_some_and(|anchor|
             anchor.root_incarnation == record.incarnation && (anchor.interval[0]..=anchor.interval[1]).contains(&candidate.position))
         && record.replica_payload_trim.as_ref().is_some_and(|work| work.belongs_to(record)
             && work.candidates.iter().any(|chosen| same_candidate(candidate, chosen)))
@@ -781,12 +789,10 @@ pub(crate) fn residence(record: &DeploymentRecord) -> String {
     format!("replay-bodies/{}/{}", record.storage_prefix(), payload_log_epoch(record))
 }
 
-pub(crate) fn admits_position(hold: &StorageRegion, position: i64) -> bool {
-    match hold {
-        StorageRegion::ReplicaReplay { first_required, through, .. } =>
-            *first_required >= 0 && (*first_required..=*through).contains(&position),
-        region => region.first_required_replica().is_some_and(|first| (0..=position).contains(&first)),
-    }
+pub(crate) fn admits_position(record: &DeploymentRecord, hold: &StorageRegion, position: i64) -> bool {
+    record.storage_region_replica_interval(hold).is_some_and(|[first, through]| {
+        first >= 0 && (first..=through).contains(&position)
+    })
 }
 
 fn payload_log_epoch(record: &DeploymentRecord) -> i32 {

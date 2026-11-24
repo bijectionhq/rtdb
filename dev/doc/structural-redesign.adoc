@@ -204,7 +204,8 @@ Archive suffix capture, terminal transfer replay and timestamp-fork reads redeem
 Checkpoint transfer seeds detached bodies through a separate transfer credential and binds the destination provider publication into the re-sealed pointer.
 Cross-cell handoff retains the original replay interval and republishes each detached body under the destination broker before seeding its journal.
 The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
-The directory recovery fence still advances as a contiguous prefix. Exact inventories must let it advance past unrelated finite holds while preserving their covered positions.
+The detached dependency fence advances independently of physical journal trim and older finite replay holds. Old tickets preserve only their admitted positions. New replay admissions start above the fence, and the broker grants only positions outside every remaining dependency.
+Unbounded recovery routes still keep their required ranges in custody.
 Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
 Inline appends without new provider dependencies publish an empty reference set.
 Installed upload, trie, artefact and detached-body appends resolve their dependencies against the admitted replay catalog and attest the observed S3 publication addresses.

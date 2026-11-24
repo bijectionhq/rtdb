@@ -433,10 +433,6 @@ def verify_joined(captures):
             if event.get("frame") is not None:
                 require((*broker_pointer(event), event["revision"]) in certified_pointers,
                         "broker read lacks the exact certified pointer")
-                fence_scope = (*replica_scope(event), event["lineage"], event["residence"])
-                require(all(not first <= event["position"] <= through or event["revision"] < revision
-                            for first, through, revision in fences_by_residence.get(fence_scope, [])),
-                        "broker read follows the recovery fence for its exact position")
             source = event.get("source_hold")
             if source is not None:
                 require(digest(event["frame"]), "broker read lacks its certified sealed frame")
@@ -445,6 +441,10 @@ def verify_joined(captures):
                 source_first, source_through, source_revision = replay_holds[source_hold]
                 require(source_first <= event["position"] <= source_through and source_revision < revision,
                         "broker read exceeds its originating replay hold")
+                fence_scope = (*replica_scope(event), event["lineage"], event["residence"])
+                require(all(not first <= event["position"] <= through or source_revision < fence_revision
+                            for first, through, fence_revision in fences_by_residence.get(fence_scope, [])),
+                        "a newly admitted replay hold reopened a recovery dependency")
             if event["publication"] is not None:
                 publication = (*replica_scope(event), event["key"], json.dumps(event["publication"], sort_keys=True))
                 require(publication not in exclusions or event["revision"] < exclusions[publication],

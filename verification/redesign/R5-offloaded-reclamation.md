@@ -38,3 +38,9 @@ It treats the certified committed binding, exclusion of new legacy admissions, a
 TLC exhausts 80 distinct states.
 The eight controls reject an unbound append, missing reader tracking and compatibility fences, deletion on trim authorization, lost retirement intent, and deletion by key.
 The reachability cases settle after a lost append acknowledgement and restart between the physical trim and deletion, and after restart with the delete already applied.
+
+The directory keeps the certified detached dependency boundary separately from the physical journal trim anchor.
+A successor checkpoint permits the census to advance past a finite replay ticket while the broker keeps the positions covered by that ticket.
+The broker can redeem an already admitted dependency using the physical journal anchor, the original ticket and the exact frame proof.
+A new replay cannot open below the detached boundary. A copy from a registered suffix pin inherits its original authenticated interval.
+The pending census is bounded. Open-ended recovery scopes still protect their ranges through drain.
