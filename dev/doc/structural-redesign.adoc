@@ -210,6 +210,7 @@ Unbounded recovery routes still keep their required ranges in custody.
 Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
 Inline appends without new provider dependencies publish an empty reference set.
 Installed upload, trie, artefact and detached-body appends resolve their dependencies against the admitted replay catalog and attest the observed S3 publication addresses.
+Search replay references name the published run's physical key. A retirement-only search change adds no replay member.
 Unidentified provider addresses or unknown record types keep the journal fence closed.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.

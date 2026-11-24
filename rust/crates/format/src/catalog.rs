@@ -185,11 +185,24 @@ impl TrieDetails {
         files.insert(slug.metadata_key(&trie));
         if contents == CheckpointContents::Replay && state != TrieState::Garbage {
             for record in &self.artefacts {
-                files.insert(slug.recorded_artefact_key(&trie, record)?);
+                if let Some(path) = replay_artefact_file(slug, &trie, record)? { files.insert(path); }
             }
         }
         Ok(files)
     }
+}
+
+/// Resolves an installed artefact record to the file opened by its replayed catalog.
+pub fn replay_artefact_file(
+    slug: &TableSlug, trie: &TrieKey, record: &crate::log::proto::ArtefactRecord,
+) -> Result<Option<String>> {
+    if record.kind() == crate::search_manifest::RECORD_KIND {
+        let change = crate::log::proto::SearchRunChange::from_artefact(record)?;
+        if change.retire_only() { return Ok(None); }
+        let run = change.run.ok_or_else(|| invalid("Search publication has no replay run"))?;
+        return Ok(Some(run.object_key(slug)?));
+    }
+    Ok(Some(slug.recorded_artefact_key(trie, record)?))
 }
 
 impl TableBlock {

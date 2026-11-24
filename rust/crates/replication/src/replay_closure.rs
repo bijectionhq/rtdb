@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rtdb_format::{catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, envelope::{ReplicaBody, ReplicaEnvelope}, keys::{TableSlug, block_key}, log::proto};
+use rtdb_format::{catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref, replay_artefact_file}, envelope::{ReplicaBody, ReplicaEnvelope}, keys::{TableSlug, block_key}, log::proto};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, TableRef};
 
@@ -105,7 +105,9 @@ pub async fn tail_dependencies<E: Borrow<ReplicaEnvelope>>(base: ReplayBase<'_>,
                 {
                     for slug in table_slugs(&slugs, &table)? {
                         for (trie, record) in artefact_entries(&message.entries) {
-                            if let Ok(key) = slug.recorded_artefact_key(&trie, &record) { keys.insert(ObjectKey::new(key)?); }
+                            if let Some(key) = replay_artefact_file(slug, &trie, &record)? {
+                                keys.insert(ObjectKey::new(key)?);
+                            }
                         }
                     }
                 }
