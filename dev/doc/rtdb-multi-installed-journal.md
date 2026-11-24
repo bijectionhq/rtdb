@@ -56,6 +56,7 @@ The manifests contain arrays. A node entry includes:
 - `archive` with the independent terminal `CellStorage` configuration and `archive_prefix` beneath it.
 - `endpoints` with each eligible `enrollment` and its exact `control` and `pgwire` addresses. The node's advertised addresses must match these entries.
 - `checkpoint_reservations` with preassigned allocation UUIDs, the exact provider fingerprint in `custody.provider`, consecutive revisions starting after the installed checkpoint, and `usable_bytes` for each exact allocation. Fund peak old retention, the new copy and its metadata. Renew the reservation inventory before it runs out. Nodes and replacements must agree on an already prepared allocation.
+- For SQL erasure, `custody_work` supplies the broker domain UUID and the path to the enrolled PKCS#8 `admission_key`. The installed custodian also supplies `erasure_signing_key` with the separate PKCS#8 credential that matches the root's broker-enrolled evidence key. Provide the custody broker route and its privileged token to the custodian.
 - Optionally, `journal_window_bytes` to cap each automatically replenished append window. The actual funded amount is bounded by paid, currently reusable voter space.
 
 A gateway entry includes `name`, the exact `deployment` UUID, a `journal` scope with routing authority and credential paths, and the same enrolled worker endpoints. Native PGWire and ordinary Flight SQL follow the journal route, authenticate worker readiness, and compare it with the current grant. A Flight session must reconnect when the journal orders a different grant. The ordered installation currently serves fresh reads on the holder. The explicit frozen-snapshot selector and audience Flight use separate recovery paths.
@@ -141,6 +142,9 @@ Existing installed journals require a cutover to a freshly installed stream for 
 
 ### Clean checkpoint and erasure commit interface
 
+Certified SQL apply records the first committed erase with the broker.
+Ordinary checkpoint publication preserves that marker.
+An installed custodian automatically stages a successor when its root is the sole enrolled root and its exact rotation allocation is funded.
 The installed custodian's erasure coordinator accepts an operation identity, custody domain and exact incumbent grant.
 Its custody adapter quiesces the incumbent writer, including unfinished appends and offloaded writes, and reconciles outstanding copy admissions.
 The adapter retains that fence through restart until the attempt has a durable resolution.

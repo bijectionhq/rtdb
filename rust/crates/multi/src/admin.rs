@@ -653,6 +653,19 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
     )) {
         return Err(fork_unavailable(&source.name));
     }
+    let inherited_tail = if same_organisation {
+        use ring::digest::{Context, SHA256};
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/fork-original-resolved-suffix/v1\0");
+        for envelope in &tail {
+            let original = envelope.encode();
+            digest.update(&(original.len() as u64).to_be_bytes());
+            digest.update(&original);
+        }
+        Some((tail.len() as u64, digest.finish().as_ref().try_into().expect("SHA-256 width")))
+    } else {
+        None
+    };
     let child_stream = if tail.is_empty() {
         None
     } else {
@@ -686,11 +699,12 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             Some((_, _, target_io)) => storage.bucket(target_io.clone()).await?,
             None => bucket,
         };
-        if same_organisation {
-            crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected, Arc::clone(&io)).await?;
+        let inherited_checkpoint = if same_organisation {
+            Some(crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected, Arc::clone(&io)).await?)
         } else {
             crate::archive::copy_fork_checkpoint(bucket, source, keys, &child, Some(selected), Arc::clone(&io)).await?;
-        }
+            None
+        };
         keys.key(&child.key_id()).await?;
         if let Some(stream) = &child_stream {
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
@@ -698,6 +712,12 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             for envelope in tail {
                 writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?;
             }
+        }
+        if let (Some(broker), ForkPublication::Hosted(preparation), Some(checkpoint), Some((transactions, suffix_digest))) =
+            (custody_broker, preparation, inherited_checkpoint, inherited_tail)
+        {
+            broker.record_fork_basis(crate::replay_broker::History::of(&child)?, preparation,
+                crate::replay_broker::domain::ForkBasis { checkpoint, suffix_digest, transactions }).await?;
         }
         Ok(())
     }.await;

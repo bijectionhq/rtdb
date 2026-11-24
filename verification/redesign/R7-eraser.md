@@ -172,3 +172,4 @@ The installed provider uses a 120-second operational target and the existing cus
 A shared hosted fork reserves membership at the original broker before referencing or copying its checkpoint closure.
 A live Directory publication makes it a dependent root.
 A rejected stage retains the reservation until Directory disposal.
+The published membership binds the source checkpoint and the original resolved suffix before child transaction renumbering.

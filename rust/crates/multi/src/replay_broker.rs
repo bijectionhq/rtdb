@@ -89,12 +89,13 @@ enum Action {
     ConfirmTransfer { route: PublishRoute, object: String },
     Domain { domain: Uuid, command: domain::Action },
     EnrollFork { child: History, preparation: rtdb_directory::ForkPreparation },
+    RecordForkBasis { preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis },
 }
 
 impl Action {
     fn uses_custody_token(&self) -> bool {
         matches!(self, Self::Domain { command, .. } if command.requires_custodian())
-            || matches!(self, Self::EnrollFork { .. })
+            || matches!(self, Self::EnrollFork { .. } | Self::RecordForkBasis { .. })
     }
 
     fn uses_transfer_token(&self) -> bool {
@@ -193,6 +194,17 @@ impl Client {
     ) -> Result<()> {
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
         let mut socket = remote.connect(Some(parent), Action::EnrollFork { child, preparation }).await?;
+        match socket_work(read_response(&mut socket)).await? {
+            Response::ForkEnrolled => Ok(()),
+            _ => Err(invalid_frame()),
+        }
+    }
+
+    pub(crate) async fn record_fork_basis(
+        &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis,
+    ) -> Result<()> {
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
+        let mut socket = remote.connect(Some(child), Action::RecordForkBasis { preparation, basis }).await?;
         match socket_work(read_response(&mut socket)).await? {
             Response::ForkEnrolled => Ok(()),
             _ => Err(invalid_frame()),
@@ -596,6 +608,10 @@ impl Service {
                 self.reserve_domain_fork(history.ok_or_else(refused)?, child, preparation).await?;
                 return socket_work(send_header(socket, &Response::ForkEnrolled)).await;
             }
+            Action::RecordForkBasis { preparation, basis } => {
+                self.record_domain_fork_basis(history.ok_or_else(refused)?, preparation, basis).await?;
+                return socket_work(send_header(socket, &Response::ForkEnrolled)).await;
+            }
             action => action,
         };
         let history = history.ok_or_else(refused)?;
@@ -622,7 +638,7 @@ impl Service {
 
     async fn dispatch_work(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>, history: History, action: Action) -> Result<()> {
         match action {
-            Action::Domain { .. } | Action::EnrollFork { .. } => Err(refused()),
+            Action::Domain { .. } | Action::EnrollFork { .. } | Action::RecordForkBasis { .. } => Err(refused()),
             Action::Read { ticket, position, reference } => {
                 let frame = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
                 self.read_for_ticket(history, ticket, position, &frame, &self.memory, Some(socket)).await?;
@@ -682,6 +698,33 @@ impl Service {
         let io = IoRegion::new();
         let store = self.storage.bucket(io.clone()).await?;
         let result = domain::execute(store.as_ref(), authority, domain::Action::ReserveFork { fork }).await;
+        io.close_and_wait().await;
+        result.map(drop)
+    }
+
+    async fn record_domain_fork_basis(
+        &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis,
+    ) -> Result<()> {
+        let stage = self.current(child).await?;
+        if stage.lifecycle != Lifecycle::Restoring || !stage.hosted_fork_stage.as_ref().is_some_and(|selected|
+            selected.preparation == preparation && selected.source_lineage == stage.lineage)
+        {
+            return Err(refused());
+        }
+        let source = self.directory.deployment(stage.parent.as_deref().ok_or_else(refused)?).await?
+            .filter(|record| record.lineage == stage.lineage && record.org == stage.org)
+            .ok_or_else(refused)?;
+        if source.checkpoint.is_none_or(|published| basis.checkpoint.block > published.block
+            || (basis.checkpoint.block == published.block && basis.checkpoint != published))
+        {
+            return Err(refused());
+        }
+        let authority = domain::directory_domain(self.namespace, &stage.org, &stage.lineage)?;
+        let io = IoRegion::new();
+        let store = self.storage.bucket(Arc::clone(&io)).await?;
+        let result = domain::execute(store.as_ref(), authority, domain::Action::RecordForkBasis {
+            child: child.deployment, history: domain::directory_history(child)?, preparation, basis,
+        }).await;
         io.close_and_wait().await;
         result.map(drop)
     }

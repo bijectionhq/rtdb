@@ -1480,7 +1480,7 @@ fn verify_plain_fork_catalog(
 pub(crate) async fn reference_fork_checkpoint(
     bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, keys: &dyn KeyService,
     child: &DeploymentRecord, selected: i64, io: Arc<IoRegion>,
-) -> Result<()> {
+) -> Result<Checkpoint> {
     let version = checkpoint_storage_root()?;
     let root = format!("{}/{version}", source.storage_prefix());
     let child_root = format!("{}/{version}", child.storage_prefix());
@@ -1557,7 +1557,17 @@ pub(crate) async fn reference_fork_checkpoint(
             if member.witness.digest.is_some() { member.read(&target).await?; }
         }
     }
-    Ok(())
+    let boundary = catalog.boundary_replica_position()
+        .map_or(-1, |position| position.after_offset(StorageEpoch(source.log_epoch)));
+    let source_position = catalog.latest_source_position()
+        .map_or(-1, |position| position.after_offset(StorageEpoch(source.log_epoch)));
+    Ok(Checkpoint {
+        block: selected,
+        boundary,
+        source: source_position,
+        system_time: catalog.latest_completed_tx().map_or(i64::MIN, |transaction| transaction.system_time.0),
+        root_sha256: catalog.publication_sha256(),
+    })
 }
 
 pub(crate) async fn copy_fork_checkpoint(

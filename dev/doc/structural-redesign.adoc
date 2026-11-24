@@ -300,7 +300,8 @@ An installation with a configured custody signer automatically stages and rotate
 Its custodian resumes the staged operation on restart and contributes signed root and provider dispositions after the joined drain.
 A source rewrite covers every authorized erase effect in its selected replica suffix.
 Shared hosted forks must reserve a broker member against their exact Directory stage before copying.
-The broker promotes the member after Directory publication and removes a rejected reservation after disposal.
+The broker binds the inherited checkpoint and original resolved suffix to the member before Directory publication.
+It promotes the member after publication and removes a rejected reservation after disposal.
 Dependent-root survivor staging and local fork enrollment remain open.
 
 |8

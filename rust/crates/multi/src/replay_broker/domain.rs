@@ -157,6 +157,14 @@ struct Work {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ForkBasis {
+    pub checkpoint: rtdb_directory::Checkpoint,
+    pub suffix_digest: [u8; 32],
+    pub transactions: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkEnrollment {
     pub(super) parent: History,
     pub(super) child: History,
@@ -175,6 +183,8 @@ struct State {
     operation: Option<Operation>,
     sql_intents: BTreeMap<Uuid, SqlIntent>,
     forks: BTreeMap<Uuid, ForkEnrollment>,
+    pending_bases: BTreeMap<Uuid, ForkBasis>,
+    ancestry: BTreeMap<Uuid, (ForkEnrollment, ForkBasis)>,
     root_drains: BTreeMap<Uuid, SignedRootDrain>,
     destruction: BTreeMap<Uuid, RootDestruction>,
     last_completed: Option<Completion>,
@@ -192,6 +202,8 @@ impl State {
             operation: None,
             sql_intents: BTreeMap::new(),
             forks: BTreeMap::new(),
+            pending_bases: BTreeMap::new(),
+            ancestry: BTreeMap::new(),
             root_drains: BTreeMap::new(),
             destruction: BTreeMap::new(),
             last_completed: None,
@@ -207,7 +219,7 @@ impl State {
     }
 
     fn view(&self) -> Result<View> {
-        let membership = fingerprint(b"rtdb.custody/domain-roots/v1\0", &self.roots)?;
+        let membership = fingerprint(b"rtdb.custody/domain-roots/v2\0", &(&self.roots, &self.ancestry))?;
         let roster = self
             .duties
             .iter()
@@ -308,6 +320,19 @@ impl State {
                 }
                 self.forks.insert(child, *fork);
             }
+            Action::RecordForkBasis { child, history, preparation, basis } => {
+                let fork = self.forks.get(child).ok_or_else(|| conflict("The fork has no custody reservation"))?;
+                if directory_history(fork.child)? != *history || fork.preparation != *preparation
+                    || basis.checkpoint.root_sha256.is_none() || basis.checkpoint.boundary < 0 || basis.suffix_digest == [0; 32]
+                {
+                    return Err(conflict("The copied basis belongs to another fork preparation"));
+                }
+                match self.pending_bases.get(child) {
+                    Some(prior) if prior != basis => return Err(conflict("The fork already has a different basis")),
+                    Some(_) => (),
+                    None => { self.pending_bases.insert(*child, *basis); }
+                }
+            }
             Action::FinishFork { fork, published } => {
                 let child = fork.child.deployment;
                 let Some(current) = self.forks.get(&child) else { return Ok(()); };
@@ -315,10 +340,14 @@ impl State {
                     return Err(conflict("The custody enrollment changed before its directory decision"));
                 }
                 if *published {
+                    let basis = self.pending_bases.get(&child).copied()
+                        .ok_or_else(|| conflict("The published member has no authenticated inherited basis"))?;
                     self.apply(&Action::Enroll {
                         generation: self.generation, root: child, enrollment: fork.enrollment,
                     })?;
+                    self.ancestry.insert(child, (*fork, basis));
                 }
+                self.pending_bases.remove(&child);
                 self.forks.remove(&child);
             }
             Action::RecordSql { generation, intent, signature } => {
@@ -607,6 +636,8 @@ pub enum Action {
     #[serde(skip)]
     ReserveFork { fork: ForkEnrollment },
     #[serde(skip)]
+    RecordForkBasis { child: Uuid, history: [u8; 32], preparation: rtdb_directory::ForkPreparation, basis: ForkBasis },
+    #[serde(skip)]
     FinishFork { fork: ForkEnrollment, published: bool },
     RecordSql {
         generation: u64,
@@ -878,7 +909,19 @@ mod tests {
         state.apply(&Action::FinishFork { fork, published: false }).unwrap();
         assert!(!state.roots.contains_key(&child.deployment));
         state.apply(&reserve).unwrap();
-        state.apply(&Action::FinishFork { fork, published: true }).unwrap();
+        let published = Action::FinishFork { fork, published: true };
+        assert!(state.apply(&published).is_err());
+        let basis = ForkBasis {
+            checkpoint: rtdb_directory::Checkpoint {
+                block: 3, boundary: 9, source: 4, system_time: 10, root_sha256: Some([20; 32]),
+            },
+            suffix_digest: [21; 32], transactions: 2,
+        };
+        state.apply(&Action::RecordForkBasis {
+            child: child.deployment, history: directory_history(child).unwrap(), preparation: fork.preparation, basis,
+        }).unwrap();
+        state.apply(&published).unwrap();
+        assert_eq!(state.ancestry.get(&child.deployment), Some(&(fork, basis)));
         state.apply(&begin).unwrap();
         assert_eq!(state.roots.get(&child.deployment), Some(&root(child)));
     }

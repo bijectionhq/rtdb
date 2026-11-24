@@ -1818,6 +1818,7 @@ rule ReleaseReplicaReplay {
 -- A provider retry names the same publication until settlement is recorded.
 -- A checkpoint fork references checkpoint objects and gives any replayed payload its own journal custody.
 -- A shared hosted fork reserves custody membership against its exact directory preparation before copying.
+-- Membership binds the inherited checkpoint and certified original suffix before directory publication.
 -- The broker waits for directory publication or confirmed disposal of the rejected stage before closing domain membership.
 
 ------------------------------------------------------------
