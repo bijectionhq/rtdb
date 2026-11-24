@@ -75,6 +75,8 @@ pub struct HostedReplay {
     logical_at: u64,
     fingerprint: [u8; 32],
     commit_positions: Vec<u32>,
+    #[serde(default)]
+    assertion_lines: Option<ArchivedAssertionLines>,
     #[serde(skip)]
     lifetimes: Vec<ReplayLifetime>,
     #[serde(skip)]
@@ -85,6 +87,25 @@ pub struct HostedReplay {
     worlds: Vec<u8>,
     #[serde(skip)]
     direct_effects: Option<VecDeque<u32>>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchivedAssertionLines {
+    lines: Vec<[u8; 16]>,
+    by_position: Vec<u8>,
+}
+
+impl ArchivedAssertionLines {
+    fn matches_inventory(&self, count: usize) -> bool {
+        self.lines.len() <= 9 && self.by_position.len() == count
+            && self.lines.iter().enumerate().all(|(index, line)| !self.lines[..index].contains(line))
+            && self.by_position.iter().all(|&index| usize::from(index) < self.lines.len())
+    }
+
+    fn get(&self, position_index: usize) -> Option<[u8; 16]> {
+        self.lines.get(usize::from(*self.by_position.get(position_index)?)).copied()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -191,7 +212,11 @@ pub fn hosted_replay_controls<'a>(
     if let Some(effects) = effects {
         let body = control_body(effects, MAX_REPLAY_POSITIONS * 4)
             .filter(|_| effects.expected().is_none()).ok_or_else(replay_invalid)?;
-        replay.direct_effects = Some(decode_direct_effects(body, &replay.commit_positions)?);
+        let positions = decode_direct_effects(body, &replay.commit_positions)?;
+        for &position in positions.iter().filter(|&&position| position != 0) {
+            replay.require_assertion_line(position, [0; 16])?;
+        }
+        replay.direct_effects = Some(positions);
     }
     if let Some(lifetimes) = lifetimes {
         let encoded = control_body(lifetimes, MAX_REPLAY_LIFETIME_BYTES)
@@ -374,6 +399,15 @@ fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]>
 impl HostedReplay {
     pub(crate) fn commit_positions(&self) -> &[u32] { &self.commit_positions }
 
+    pub(crate) fn require_assertion_line(&self, position: u32, line: [u8; 16]) -> Result<()> {
+        if let Some(lines) = &self.assertion_lines
+            && self.commit_positions.binary_search(&position).ok().and_then(|index| lines.get(index)) != Some(line)
+        {
+            return Err(replay_invalid());
+        }
+        Ok(())
+    }
+
     pub(crate) fn direct_effect_count(&self) -> Option<usize> {
         self.direct_effects.as_ref().map(VecDeque::len)
     }
@@ -409,6 +443,7 @@ impl HostedReplay {
         self.commit_positions.len() <= MAX_REPLAY_POSITIONS
             && self.commit_positions.first().is_none_or(|first| *first != 0)
             && self.commit_positions.windows(2).all(|pair| pair[0] < pair[1])
+            && self.assertion_lines.as_ref().is_none_or(|lines| lines.matches_inventory(self.commit_positions.len()))
     }
 
     fn has_original_prefix(&self) -> bool {

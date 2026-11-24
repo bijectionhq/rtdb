@@ -293,6 +293,7 @@ impl OpenTransaction<'_> {
         if !effects.omitted_shadows.is_empty() {
             let mut omissions = Vec::with_capacity(effects.omitted_shadows.len() * 20);
             for (position, world) in effects.omitted_shadows {
+                replay.require_assertion_line(position.get(), world.0)?;
                 self.buffer.omit_archived_world_effect(position)?;
                 omissions.extend_from_slice(&position.get().to_be_bytes());
                 omissions.extend_from_slice(&world.0);
@@ -354,6 +355,7 @@ impl OpenTransaction<'_> {
                 recency: None,
             };
             if let Some(position) = shadow.position {
+                replay.require_assertion_line(position.get(), shadow.world.0)?;
                 self.buffer.append_archived_world_effect(&table, event, position)?;
             } else {
                 self.buffer.append_unpositioned_replay(&table, event)?;
