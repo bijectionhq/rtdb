@@ -1,7 +1,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, Value};
 
 use crate::{PreparedQuery, QueryContext, QueryCursor};
 
@@ -183,7 +183,7 @@ pub async fn open_owned_root_projection(
     if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns).await
+    open_constraint_projection(context, owner, relation, valid, columns, None).await
 }
 
 pub async fn open_owned_world_constraint_projection(
@@ -193,12 +193,26 @@ pub async fn open_owned_world_constraint_projection(
     if owner.is_empty() || relation.root_relation().is_none() || columns.is_empty() {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns).await
+    open_constraint_projection(context, owner, relation, valid, columns, None).await
+}
+
+/// Restrict a receiver projection to one complete installed identity prefix.
+pub async fn open_owned_root_prefix_projection(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid: Timestamp, columns: &[&str], prefix: &str,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || prefix.is_empty()
+        || !prefix.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'/' || byte == b'-')
+        || columns.first() != Some(&"_id")
+    {
+        return Err(address_unavailable());
+    }
+    open_constraint_projection(context, owner, relation, valid, columns, Some(prefix)).await
 }
 
 async fn open_constraint_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str],
+    valid: Timestamp, columns: &[&str], prefix: Option<&str>,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
@@ -209,14 +223,25 @@ async fn open_constraint_projection(
     let columns = columns.iter().enumerate().map(|(index, name)| Field {
         id: ColumnId(index as u32), name: (*name).into(), qualifier: None, qualified_only: false,
         unnamed: false, data_type: table.scan_column_type(name),
-    }).collect();
+    }).collect::<Vec<_>>();
+    let mut predicates = Vec::new();
+    if let Some(prefix) = prefix {
+        let mut upper = prefix.to_owned();
+        let last = upper.pop().ok_or_else(address_unavailable)?;
+        upper.push(char::from(last as u8 + 1));
+        let id = columns[0].expression();
+        predicates.extend([
+            Expr::binary(BinaryOp::GtEq, id.clone(), Expr::Literal(Value::Utf8(prefix.to_owned()))),
+            Expr::binary(BinaryOp::Lt, id, Expr::Literal(Value::Utf8(upper))),
+        ]);
+    }
     let scan = Arc::new(Relation::scan(Scan {
         table, columns,
         valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
             value: valid.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
         })),
         system_time: TemporalFilter::Default, clamp_valid_time: false,
-        iids: None, predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
+        iids: None, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }
@@ -691,6 +716,11 @@ async fn open_owned_table_point_with_edges(
     if assertion && !fields.contains(&"_assertion_ordinal") {
         fields.push("_assertion_ordinal");
     }
+    if assertion && name.table.table.split_once('-')
+        .is_some_and(|(_, relation)| relation == rtdb_types::OWNED_ATTEMPT_RELATION)
+    {
+        fields.push(rtdb_types::HOSTED_RECEIPT_TX_ID);
+    }
     if edges {
         for required in ["_valid_from", "_valid_to"] {
             if !fields.contains(&required) { fields.push(required); }
@@ -769,6 +799,20 @@ pub fn owned_row_revision(
         Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
         _ => Err(Anomaly::fault("rtdb.owned/row-revision", "Owned row revision is not a microsecond timestamp")),
     }
+}
+
+/// The source transaction of the winning assertion, read from the event header.
+pub fn owned_receipt_transaction(batch: &arrow_array::RecordBatch, row: usize) -> Result<rtdb_types::TxId> {
+    use arrow_array::{Array, Int64Array};
+
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/receipt-position",
+        "The retained receipt has no original transaction position");
+    let array = batch.column_by_name(rtdb_types::HOSTED_RECEIPT_TX_ID)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .filter(|array| row < array.len() && array.is_valid(row)).ok_or_else(unavailable)?;
+    let position = array.value(row);
+    if position < 0 { return Err(unavailable()); }
+    Ok(rtdb_types::TxId(position))
 }
 
 pub fn owned_row_assertion_ordinal(batch: &arrow_array::RecordBatch, row: usize) -> Result<Option<NonZeroU32>> {
@@ -936,7 +980,8 @@ pub async fn read_owned_world_clock_revision(
 pub struct ArchivedHeldClock {
     world: Iid,
     pin: Iid,
-    media_end: Timestamp,
+    media_end: TransactionKey,
+    source_root: TransactionKey,
     system: Timestamp,
     reading: Timestamp,
 }
@@ -946,7 +991,8 @@ impl ArchivedHeldClock {
         &self, ancestor: &rtdb_types::OwnedWorldAncestor, system: Timestamp,
     ) -> Result<Timestamp> {
         if self.world.0 != ancestor.world || self.pin.0 != ancestor.pin
-            || self.media_end != ancestor.basis.system_time || self.system != system
+            || self.media_end != ancestor.basis || self.source_root != ancestor.source_root
+            || self.system != system
             || !ancestor.covers(system, self.reading)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
@@ -959,9 +1005,26 @@ pub async fn read_archived_held_clock(
     context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
 ) -> Result<ArchivedHeldClock> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
-    let media_end = context.current_time.as_micros()?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
+    let media_end = snapshot.tx_basis().filter(|end| snapshot.system_time_cap() == Some(end.system_time))
+        .ok_or_else(unavailable)?;
+    if media_end.system_time != context.current_time.as_micros()? {
+        return Err(unavailable());
+    }
+    let (source, reading, _charge) = read_held_world_publication(context, owner, world, system).await?;
+    Ok(ArchivedHeldClock {
+        world, pin: source.pin, media_end, source_root: source.basis, system, reading,
+    })
+}
+
+/// Open the source registration and the actual clock event at the selected publication.
+pub async fn read_held_world_publication(
+    context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
+) -> Result<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)> {
+    let unavailable = rtdb_types::OwnedWorld::unavailable;
     let at = context.with_owned_system_cut(system, &context.cancellation)?;
-    let (source, _) = read_owned_world(Arc::clone(&at), owner, world).await?
+    let (source, charge) = read_owned_world(Arc::clone(&at), owner, world).await?
         .filter(|(source, _)| !source.dropped && source.ancestor.is_none()
             && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
             && source.basis.system_time < system)
@@ -969,7 +1032,7 @@ pub async fn read_archived_held_clock(
     let (reading, _) = read_owned_world_clock_revision(at, owner, world).await?
         .filter(|(reading, revision)| *revision == system && source.admits_clock_publication(*reading, *revision))
         .ok_or_else(unavailable)?;
-    Ok(ArchivedHeldClock { world, pin: source.pin, media_end, system, reading })
+    Ok((source, reading, charge))
 }
 
 /// Select an accepted Held or Proposal reading within a certified physical prefix.

@@ -36,8 +36,7 @@ impl CatalogRuntime for NodeCatalogRuntime {
         let empty = || Ok(CatalogRows::new(Vec::new(), self.node.memory().reserve(0)?));
         let Ok(database) = self.node.catalog().database("xtdb") else { return empty(); };
         let lease = self.node.catalog_read_lease(&database).await?;
-        let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
-        let snapshot = database.partition.open_snapshot(head);
+        let snapshot = database.partition.snapshot();
         crate::read_currency::require_current(database.name(), lease.as_deref())?;
         if !snapshot.contains_table(&TableRef::new("xt", "role_membership")) { return empty(); }
         let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;

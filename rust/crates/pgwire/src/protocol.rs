@@ -587,6 +587,7 @@ impl ProtocolSession {
             let Some(batch) = &query.batch else { break; };
             let schema = batch.batch().schema();
             let row = query.row;
+            let delivery = query.cursor.delivery_grant();
             let consumption: Result<()> = async {
                 let _scratch = memory.reserve(4096)?;
                 let mut body = DataRow::new(&memory)?;
@@ -602,20 +603,39 @@ impl ProtocolSession {
                         Some(encoded) => body.cell(encoded.as_slice())?,
                     }
                 }
-                writer.row_body(&body.bytes).await
+                let grant = delivery.await?;
+                grant.deliver(async {
+                    writer.row_body(&body.bytes).await?;
+                    if grant.is_bounded() { writer.flush().await?; }
+                    Ok(())
+                }).await.map_err(crate::wire::delivery_error)
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }
             query.row += 1; query.sent = query.sent.checked_add(1).ok_or_else(|| protocol("Result row count overflow"))?; emitted += 1;
         }
-        if limit != 0 && emitted == limit { writer.empty(b's').await?; writer.flush().await }
-        else { writer.string(b'C', &format!("{} {}", head(source), query.sent)).await }
+        let grant = query.cursor.delivery_grant().await?;
+        grant.deliver(async {
+            if limit != 0 && emitted == limit {
+                writer.empty(b's').await?;
+                writer.flush().await
+            } else {
+                writer.string(b'C', &format!("{} {}", head(source), query.sent)).await?;
+                if grant.is_bounded() { writer.flush().await?; }
+                Ok(())
+            }
+        }).await.map_err(crate::wire::delivery_error)?;
+        grant.observe_answer();
+        Ok(())
     }
 
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
         self.extended = false; self.portals.remove("");
         let permit = self.replay_permit.take();
         let result = self.simple_statements(source, permit, writer).await;
-        if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
+        if let Err(error) = result {
+            if error.anomaly().code == "xtdb.pgwire/connection-error" { return Err(error.anomaly().clone()); }
+            writer.error(error.anomaly(), self.environment()?.fallback(), false).await?;
+        }
         if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
     }

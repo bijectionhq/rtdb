@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
-use rtdb_storage::cache::BufferPool;
+use rtdb_storage::{cache::{BufferPool, HeldCatalogRead}, sealing::{PlaintextDelivery, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -16,10 +16,19 @@ pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<Bu
 
 /// Binds the physical catalog in this snapshot to the store that will serve its reads.
 pub async fn retain_catalog_snapshot(snapshot: Snapshot, storage: &BufferPool) -> Result<Snapshot> {
-    match storage.object_store().retain_catalog(snapshot.catalog_cut()).await? {
-        Some(permit) => Ok(snapshot.with_catalog_read(permit)),
-        None => Ok(snapshot),
+    let permit = hold_snapshot(&snapshot, storage).await?;
+    Ok(snapshot.with_catalog_read(permit))
+}
+
+async fn hold_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Arc<HeldCatalogRead>> {
+    let cut = snapshot.catalog_cut();
+    let paths = cut.and_then(|_| snapshot.compacted_primary_paths());
+    if let Some(hold) = snapshot.catalog_read_permit::<HeldCatalogRead>()
+        && storage.holds_catalog_with_primary(&hold, cut, paths.as_deref())
+    {
+        return Ok(hold);
     }
+    storage.hold_catalog_with_primary(cut, paths).await
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +59,7 @@ pub struct CatalogSnapshot {
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
     pub(crate) fragment_residence: Option<crate::FragmentResidence>,
     read_lease: Option<Arc<rtdb_storage::ReadLease>>,
+    read_view: Arc<tokio::sync::OnceCell<Arc<rtdb_storage::HeldView>>>,
 }
 
 impl CatalogSnapshot {
@@ -60,7 +70,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default() })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
@@ -76,6 +86,22 @@ impl CatalogSnapshot {
     /// Provider requests for this catalog's files begin only while the lease admits them.
     pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
     pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
+    pub(crate) async fn held_view(&self) -> Result<Arc<rtdb_storage::HeldView>> {
+        self.check_view_lease()?;
+        self.read_view.get_or_try_init(|| async {
+            let mut registrations = Vec::new();
+            for database in self.databases.values() {
+                for snapshot in &database.partitions {
+                    registrations.push(hold_snapshot(snapshot, &database.storage).await?);
+                }
+            }
+            Ok(Arc::new(rtdb_storage::HeldView::new(self.databases.clone(), registrations)))
+        }).await.map(Arc::clone)
+    }
+    pub(crate) fn check_view_lease(&self) -> Result<()> {
+        if let Some(lease) = &self.read_lease { lease.check()?; }
+        Ok(())
+    }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
     /// Reserves schema enumeration and joins before creating the returned table bindings.
     /// Clones of the result share its retained allocation charge.
@@ -198,8 +224,11 @@ pub struct QueryContext {
     pub(crate) application_name: Option<(Arc<str>, Arc<rtdb_columnar::MemoryReservation>)>,
     pub(crate) operator_root: Option<Arc<Self>>,
     pub(crate) read_basis: Option<Arc<crate::settings::ReadBasis>>,
+    pub(crate) snapshot_admission: Option<Arc<dyn crate::settings::SnapshotAdmission>>,
+    pub(crate) snapshot_tokens: Option<Arc<crate::settings::SnapshotTokenIssuer>>,
     pub(crate) accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>,
     pub(crate) query_cpu: Option<Arc<crate::QueryCpu>>,
+    plaintext: Option<Arc<PlaintextView>>,
 }
 
 impl QueryContext {
@@ -213,7 +242,7 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, accelerators: Arc::from(Vec::new()), query_cpu: None }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None }))
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(mut self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
@@ -268,8 +297,53 @@ impl QueryContext {
         self
     }
 
-    pub(crate) fn has_owned_read_guard(&self) -> bool {
-        self.catalog.owned_read_guard.is_some()
+    /// Holds the selected catalogs from before the first read through answer production.
+    pub async fn reading<T>(self: &Arc<Self>, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        self.check_cancelled()?;
+        let view = self.owner_cancellation.run_until_cancelled(
+            self.cancellation.run_until_cancelled(self.catalog.held_view()),
+        ).await.flatten().ok_or_else(cancelled)??;
+        let work = rtdb_storage::IoRegion::retaining(self.clone(), rtdb_storage::IoRegion::leased(self.catalog.read_lease(), work));
+        let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
+        let work = plaintext.reading(async {
+            for partition in self.catalog.databases.values().flat_map(|database| &database.partitions) {
+                if let Some(read) = partition.certified_read() {
+                    PlaintextView::track_certified_read(read)?;
+                }
+            }
+            let answer = work.await?;
+            self.grant_delivery(&plaintext).await?;
+            Ok(answer)
+        });
+        rtdb_storage::IoRegion::reading(view, work).await
+    }
+
+    pub(crate) fn with_plaintext(mut self: Arc<Self>) -> Arc<Self> {
+        if self.plaintext.is_none() {
+            let view = PlaintextView::new(Arc::clone(&self.memory));
+            Arc::make_mut(&mut self).plaintext = Some(view);
+        }
+        self
+    }
+
+    pub(crate) async fn delivery_grant(self: &Arc<Self>) -> Result<PlaintextDelivery> {
+        let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
+        let view = self.catalog.held_view().await?;
+        let lease = self.catalog.read_lease();
+        let work = rtdb_storage::IoRegion::leased(lease.clone(), self.grant_delivery(&plaintext));
+        let grant = rtdb_storage::IoRegion::reading(view.clone(), work).await?;
+        Ok(grant.holding(view, lease))
+    }
+
+    async fn grant_delivery(&self, plaintext: &PlaintextView) -> Result<PlaintextDelivery> {
+        self.check_cancelled()?;
+        let grant = self.owner_cancellation.run_until_cancelled(
+            self.cancellation.run_until_cancelled(plaintext.grant()),
+        ).await.flatten().ok_or_else(cancelled)??;
+        self.catalog.check_view_lease()?;
+        self.check_cancelled()?;
+        grant.check()?;
+        Ok(grant)
     }
 
     pub fn check_cancelled(&self) -> Result<()> {

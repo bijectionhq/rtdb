@@ -10,7 +10,7 @@ pub struct RowRef { pub segment: usize, pub row: u32 }
 pub struct EventRow<R> { pub header: EventHeader, pub source: R }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Head { iid: Iid, system_position: (Timestamp, u32), stream: usize, row: usize }
+struct Head { iid: Iid, system_position: (Timestamp, i128), stream: usize, row: usize }
 
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -33,12 +33,12 @@ impl<'a, R> EventMerge<'a, R> {
             for pair in rows.windows(2) {
                 let left = &pair[0].header;
                 let right = &pair[1].header;
-                if left.iid > right.iid || (left.iid == right.iid && left.system_position() < right.system_position()) {
+                if left.iid > right.iid || (left.iid == right.iid && left.precedence() < right.precedence()) {
                     return Err(Anomaly::incorrect("rtdb/event-order", format!("Segment {stream} is not ordered by IID and descending system position")));
                 }
             }
             if let Some(first) = rows.first() {
-                heads.push(Head { iid: first.header.iid, system_position: first.header.system_position(), stream, row: 0 });
+                heads.push(Head { iid: first.header.iid, system_position: first.header.precedence(), stream, row: 0 });
             }
         }
         Ok(Self { streams, heads })
@@ -52,7 +52,7 @@ impl<'a, R> Iterator for EventMerge<'a, R> {
         let result = &self.streams[head.stream][head.row];
         let row = head.row + 1;
         if let Some(next) = self.streams[head.stream].get(row) {
-            self.heads.push(Head { iid: next.header.iid, system_position: next.header.system_position(), stream: head.stream, row });
+            self.heads.push(Head { iid: next.header.iid, system_position: next.header.precedence(), stream: head.stream, row });
         }
         Some(result)
     }

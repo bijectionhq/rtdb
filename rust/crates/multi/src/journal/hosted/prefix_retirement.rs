@@ -19,6 +19,7 @@ use uuid::Uuid;
 use super::{Placement, genesis};
 use crate::deployment::CellStorage;
 use crate::journal::InstalledJournal;
+use crate::keys::KeyService;
 use crate::journal::prefix_retirement::{leases_expired, may_retire, superseded};
 
 pub(crate) const DESCRIPTOR: &str = "~grant";
@@ -92,6 +93,7 @@ struct Receipt {
     floor_lsn: u64,
     inspected_through_lsn: u64,
     settled_at_ms: i64,
+    key_scope_withdrawn: bool,
 }
 
 /// What one pass established for one superseded epoch.
@@ -252,7 +254,7 @@ async fn superseded_prefixes(provider: &Provider, placement: &Placement, route: 
 
 /// Retires every superseded serving prefix that the evidence covers and
 /// reports, per epoch, what this pass established.
-pub(crate) async fn retire(placement: &Placement, storage: &CellStorage) -> Result<Vec<(u64, Outcome)>> {
+pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &Arc<dyn KeyService>) -> Result<Vec<(u64, Outcome)>> {
     let Some(custodian) = placement.custodian.as_ref() else { return Ok(Vec::new()); };
     let route = custodian.route().await?;
     let Some(provider) = Provider::qualify(storage).await? else { return Ok(Vec::new()); };
@@ -284,10 +286,14 @@ pub(crate) async fn retire(placement: &Placement, storage: &CellStorage) -> Resu
     let mut outcomes = Vec::new();
     for (epoch, settled) in candidates {
         let prefix = grant_prefix(placement, epoch);
+        let objects = format!("{prefix}/{storage_root}");
+        let descriptor = descriptor_key(&objects)?;
         let outcome = retire_one(RetireOne {
             placement, bucket: bucket.as_ref(), provider: Some(&provider), identity, route: &route,
             retained: retained.as_ref(), independent, trimmed, epoch, prefix: &prefix, settled: &settled,
-            descriptor: &descriptor_key(&format!("{prefix}/{storage_root}"))?,
+            objects: &objects,
+            descriptor: &descriptor,
+            keys,
         }).await;
         outcomes.push((epoch, outcome.unwrap_or_else(Outcome::Failed)));
     }
@@ -306,11 +312,13 @@ struct RetireOne<'a> {
     epoch: u64,
     prefix: &'a str,
     settled: &'a ObjectKey,
+    objects: &'a str,
     descriptor: &'a ObjectKey,
+    keys: &'a Arc<dyn KeyService>,
 }
 
 async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
-    let RetireOne { placement, bucket, provider, identity, route, retained, independent, trimmed, epoch, prefix, settled, descriptor } = one;
+    let RetireOne { placement, bucket, provider, identity, route, retained, independent, trimmed, epoch, prefix, settled, objects, descriptor, keys } = one;
     let qualified = provider.is_some();
     let Some(provider) = provider else { return Ok(Outcome::Refused("unqualified provider")) };
     let intent_key = key(format!("{}/{RETIRED}/{epoch}", generation_root(placement)))?;
@@ -367,32 +375,44 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
         Provider::Local(root) => {
             let lock = lock.ok_or_else(|| unavailable("The local prefix lock was not acquired"))?;
             let lifecycle = lifecycle_path(root, prefix)?;
-            let marker = lifecycle.join(CLOSED);
             let digest = serde_json::to_vec(&intent).map_err(|error| Anomaly::fault("rtdb.multi/serving-prefix-retirement", error.to_string()))?;
+            let lifetime: Arc<dyn Send + Sync> = Arc::new(lock);
+            let io = IoRegion::new().child_holding(Some(lifetime));
+            let state = rtdb_storage::LocalStore::open_in(&lifecycle, Arc::clone(&io))?;
+            let closed = ObjectKey::new(CLOSED)?;
+            match state.get_fresh(&closed).await {
+                Ok(existing) if existing.as_ref() == digest.as_slice() => {}
+                Ok(_) => return Err(Anomaly::incorrect("rtdb.multi/serving-prefix-retirement", "Another retirement closed this serving prefix")),
+                Err(Error::MissingObject(_)) => state.put(&closed, Bytes::from(digest)).await?,
+                Err(error) => return Err(error.into()),
+            }
+            let volume = root.clone();
+            io.run_blocking(move || {
+                sync_up(&volume, lifecycle).map_err(|error| Error::Task(error.to_string()))
+            }).await?;
+            let ledger = super::storage::serving_ledger(
+                Arc::clone(keys), placement.worker.placement(), identity, objects, Arc::clone(&io),
+            );
+            ledger.withdraw_scope().await?;
             let root = root.clone();
             let prefix_path = root.join(ObjectKey::new(prefix)?.as_str());
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let _lock = lock;
-                match fs::read(&marker) {
-                    Ok(existing) if existing == digest => {}
-                    Ok(_) => return Err(Anomaly::incorrect("rtdb.multi/serving-prefix-retirement", "Another retirement closed this serving prefix")),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        fs::write(&marker, &digest).map_err(|error| local_error(&marker, error))?;
-                        File::open(&marker).and_then(|file| file.sync_all()).map_err(|error| local_error(&marker, error))?;
-                        sync_up(&root, lifecycle.clone())?;
-                    }
-                    Err(error) => return Err(local_error(&marker, error)),
-                }
+            io.run_blocking(move || {
                 match fs::remove_dir_all(&prefix_path) {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(local_error(&prefix_path, error)),
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(Error::Io { path: prefix_path.clone(), source }),
                 }
-                if let Some(parent) = prefix_path.parent() { sync_up(&root, parent.to_path_buf())?; }
+                if let Some(parent) = prefix_path.parent() {
+                    sync_up(&root, parent.to_path_buf()).map_err(|error| Error::Task(error.to_string()))?;
+                }
                 Ok(())
-            }).await.map_err(|error| Anomaly::fault("rtdb.multi/serving-prefix-retirement", error.to_string()))??;
+            }).await?;
         }
         Provider::ExactVersions(inventory) | Provider::Tombstones(inventory) => {
+            let ledger = super::storage::serving_ledger(
+                Arc::clone(keys), placement.worker.placement(), identity, objects, IoRegion::new(),
+            );
+            ledger.withdraw_scope().await?;
             if matches!(provider, Provider::ExactVersions(_)) {
                 inventory.purge(&scope).await?;
                 if !inventory.is_empty(&scope).await? || !bucket.list(Some(&scope)).await?.is_empty() {
@@ -424,6 +444,7 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
         floor_lsn: route.floor.next_lsn,
         inspected_through_lsn: route.head.next_lsn,
         settled_at_ms: rtdb_directory::now_ms(),
+        key_scope_withdrawn: true,
     }).await?;
     Ok(Outcome::Retired)
 }

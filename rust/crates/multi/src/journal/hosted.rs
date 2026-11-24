@@ -75,6 +75,7 @@ pub(crate) struct Placement {
     journal_window_bytes: Option<u64>,
     nomination: tokio::sync::Mutex<Option<Request>>,
     worker_disposal: tokio::sync::Mutex<Option<Request>>,
+    reader_opening: parking_lot::Mutex<std::sync::Weak<Held>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
     publication: tokio::sync::Mutex<Option<(Checkpoint, Cut)>>,
 }
@@ -151,17 +152,34 @@ struct Base {
 struct Attachment {
     name: String,
     deployment: Uuid,
-    admission: WriterAdmission,
+    admission: AttachmentAdmission,
     base: Base,
 }
 
-pub(crate) fn attachment_identity(value: &Any) -> Result<(String, u64)> {
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+enum AttachmentAdmission {
+    Writer { admission: WriterAdmission },
+    Reader { placement: ordered_logkeeper::ordered::Placement, epoch: u64, hold: Hold },
+}
+
+pub(crate) fn attachment_identity(value: &Any) -> Result<(String, Option<u64>)> {
     let attachment: Attachment =
         serde_json::from_slice(&value.value).map_err(|error| invalid(&error.to_string()))?;
-    Ok((
-        attachment.deployment.to_string(),
-        attachment.admission.grant.epoch,
-    ))
+    let epoch = match attachment.admission {
+        AttachmentAdmission::Writer { admission } => Some(admission.grant.epoch),
+        AttachmentAdmission::Reader { .. } => None,
+    };
+    Ok((attachment.deployment.to_string(), epoch))
+}
+
+pub(crate) fn reader_attachment(value: &Any) -> Result<Option<(ordered_logkeeper::ordered::Placement, u64, Enrollment)>> {
+    let attachment: Attachment =
+        serde_json::from_slice(&value.value).map_err(|error| invalid(&error.to_string()))?;
+    Ok(match attachment.admission {
+        AttachmentAdmission::Reader { placement, epoch, hold } => Some((placement, epoch, hold.owner)),
+        AttachmentAdmission::Writer { .. } => None,
+    })
 }
 
 impl Routes {
@@ -229,6 +247,7 @@ impl Routes {
                 journal_window_bytes: entry.journal_window_bytes,
                 nomination: Default::default(),
                 worker_disposal: Default::default(),
+                reader_opening: Default::default(),
                 checkpoint_reservations,
                 publication: Default::default(),
             });
@@ -263,9 +282,16 @@ impl Routes {
         let attachment: Attachment = serde_json::from_slice(&configuration.value)
             .map_err(|error| invalid(&error.to_string()))?;
         let placement = self.by_name(&attachment.name).filter(|placement| {
-            placement.worker.deployment() == attachment.deployment
-               && matches!(placement.worker.authority(), Authority::Worker { enrollment } if enrollment == attachment.admission.grant.enrollment)
-               && attachment.admission.recovery.owner == attachment.admission.grant.enrollment
+            if placement.worker.deployment() != attachment.deployment { return false; }
+            let Authority::Worker { enrollment } = placement.worker.authority() else { return false; };
+            match attachment.admission {
+                AttachmentAdmission::Writer { admission } => {
+                    admission.grant.enrollment == enrollment && admission.recovery.owner == enrollment
+                }
+                AttachmentAdmission::Reader { placement: expected, hold, .. } => {
+                    placement.worker.placement() == expected && hold.owner == enrollment
+                }
+            }
         }).ok_or_else(|| invalid("The database attachment addresses a different installed journal worker"))?;
         Ok((Arc::clone(placement), attachment))
     }
@@ -372,7 +398,7 @@ impl Placement {
 
     pub(crate) async fn publish_checkpoint(
         &self,
-        keys: &dyn crate::keys::KeyService,
+        keys: &Arc<dyn KeyService>,
         offered: Option<(WriterAdmission, RtdbCheckpoint)>,
         serving: &crate::deployment::CellStorage,
         memory: &Arc<MemoryBudget>,
@@ -392,9 +418,8 @@ impl Placement {
         {
             return Ok(None);
         }
-        let material = material(keys, &self.record).await?;
         let io = IoRegion::new();
-        let provider = self.checkpoint_custody(Arc::clone(&io), &material).await?;
+        let provider = self.checkpoint_custody(Arc::clone(&io), Arc::clone(keys)).await?;
         let requested = offered
             .map(|(admission, checkpoint)| {
                 let next = checkpoint
@@ -411,6 +436,13 @@ impl Placement {
         loop {
             let current = custodian.route().await?;
             let published = current.checkpoint;
+            if current.preparing.is_some_and(|pending| pending.erasure) {
+                return if requested.is_some() {
+                    Err(invalid("An erasure owner is preparing the next checkpoint"))
+                } else {
+                    Ok(None)
+                };
+            }
             if let Some((_, checkpoint, next)) = requested {
                 if published.cut.next_lsn > next {
                     return Ok(Some(provider.open(published).await?.checkpoint));
@@ -459,12 +491,12 @@ impl Placement {
                     let objects = storage::ReplicaObjects::for_custodian(
                         self,
                         serving,
-                        &material,
+                        Arc::clone(keys),
                         Arc::clone(&io),
                     )
                     .await?;
                     let Some(candidate) = discovery::discover(
-                        self, custodian, &provider, cut, &objects, (keys, &io), memory,
+                        self, custodian, &provider, cut, &objects, (keys.as_ref(), &io), memory,
                     )
                     .await?
                     else {
@@ -476,13 +508,13 @@ impl Placement {
             };
             if current.preparing.is_none() {
                 let source =
-                    storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                    storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
                         .await?;
-                provider
+                let references = provider
                     .preflight(&reservation, origin, source.as_ref())
                     .await?;
                 custodian
-                    .prepare_checkpoint(&current, origin.ordered(reservation)?)
+                    .prepare_checkpoint(&current, origin.ordered(reservation)?, references)
                     .await?;
             }
             let origin = provider.begin(&reservation, origin).await?;
@@ -494,14 +526,14 @@ impl Placement {
                         published,
                         reservation,
                         origin,
-                        (keys, &material),
+                        keys,
                         serving,
                         &io,
                         memory,
                     )
                     .await?;
                     let source =
-                        storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                        storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
                             .await?;
                     provider
                         .prepare(&reservation, origin, source.as_ref())
@@ -522,7 +554,7 @@ impl Placement {
         base: Checkpoint,
         reservation: Reservation,
         origin: Preparation,
-        (keys, material): (&dyn KeyService, &[u8]),
+        keys: &Arc<dyn KeyService>,
         serving: &crate::deployment::CellStorage,
         io: &Arc<IoRegion>,
         memory: &Arc<MemoryBudget>,
@@ -548,14 +580,14 @@ impl Placement {
         let key = JournalKey::new(custodian.placement(), boundary.grant.key_generation);
         let bytes = IoRegion::retaining(
             _page.clone(),
-            key.open(keys, io, boundary.payload.clone()),
+            key.open(keys.as_ref(), io, boundary.payload.clone()),
         ).await?;
         let envelope = ReplicaEnvelope::decode(&bytes)?
             .ok_or_else(|| invalid("The prepared checkpoint has an unknown boundary record"))?;
         let _offloaded;
         let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
             let objects =
-                storage::ReplicaObjects::for_custodian(self, serving, material, Arc::clone(io))
+                storage::ReplicaObjects::for_custodian(self, serving, Arc::clone(keys), Arc::clone(io))
                     .await?;
             let (resolved, charge) =
                 discovery::resolve_offload(envelope, boundary.grant.epoch, &objects, memory)
@@ -658,7 +690,7 @@ impl Placement {
 
     pub(crate) async fn retire_unheld_checkpoint(
         &self,
-        keys: &dyn crate::keys::KeyService,
+        keys: &Arc<dyn KeyService>,
     ) -> Result<()> {
         let Some(custodian) = self.custodian.as_ref() else {
             return Ok(());
@@ -672,8 +704,7 @@ impl Placement {
                 .close_checkpoint(&route, retired.checkpoint)
                 .await?;
         }
-        let material = material(keys, &self.record).await?;
-        let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
+        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
         let disposition = match &self.archive {
             crate::deployment::CellStorage::S3 { config } => {
                 provider.retire_s3(config, retired.checkpoint).await?
@@ -689,13 +720,20 @@ impl Placement {
         Ok(())
     }
 
+    pub(crate) async fn settle_serving_receipts(
+        &self, storage: &crate::deployment::CellStorage, keys: &Arc<dyn KeyService>,
+    ) -> Result<()> {
+        reclamation::settle_receipts(self, storage, keys).await
+    }
+
     /// Serving prefixes are separate from checkpoint archives: each belongs
     /// to one writer grant and is retired against the journal's evidence.
     pub(crate) async fn retire_serving_prefixes(
         &self,
         storage: &crate::deployment::CellStorage,
+        keys: &Arc<dyn KeyService>,
     ) -> Result<Vec<(u64, prefix_retirement::Outcome)>> {
-        prefix_retirement::retire(self, storage).await
+        prefix_retirement::retire(self, storage, keys).await
     }
 
     async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {
@@ -728,23 +766,23 @@ impl Placement {
     pub(crate) async fn checkpoint_custody(
         &self,
         io: Arc<IoRegion>,
-        material: &[u8],
+        keys: Arc<dyn KeyService>,
     ) -> Result<CheckpointCustody> {
-        let bucket = self.archive.bucket(io).await?;
+        let bucket = self.archive.bucket(Arc::clone(&io)).await?;
         let owner = archive_owner(&self.archive, bucket.as_ref(), &self.archive_prefix).await?;
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(crate::store::EncryptingStore::new(bucket, material)?);
         let custody = CheckpointCustody::new(
-            store,
+            bucket,
             self.archive_prefix.clone(),
             self.worker.placement(),
             self.worker.log_epoch(),
             owner,
+            keys,
+            io,
         );
         match &self.archive {
             crate::deployment::CellStorage::S3 { .. } => Ok(custody),
             crate::deployment::CellStorage::Local { root } => {
-                custody.on_local_volume(root, material)
+                custody.on_local_volume(root)
             }
         }
     }
@@ -752,22 +790,57 @@ impl Placement {
     pub(crate) async fn configuration(
         &self,
         admission: WriterAdmission,
-        keys: &dyn crate::keys::KeyService,
+        keys: &Arc<dyn KeyService>,
     ) -> Result<DatabaseConfig> {
         let chosen = admission.recovery.checkpoint;
         let checkpoint = if genesis(chosen) {
             None
         } else {
-            let material = material(keys, &self.record).await?;
-            let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
+            let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
             Some(provider.open(chosen).await?.checkpoint)
         };
         let attachment = Attachment {
             name: self.record.name.clone(),
             deployment: self.worker.deployment(),
-            admission,
+            admission: AttachmentAdmission::Writer { admission },
             base: Base { checkpoint },
         };
+        Self::database_configuration(attachment, false)
+    }
+
+    pub(crate) async fn reader_configuration(
+        &self, route: &Route, keys: &Arc<dyn KeyService>, tasks: &TaskTracker,
+    ) -> Result<(DatabaseConfig, Arc<Held>)> {
+        let request = self.worker.request(route, Command::ProtectRange {
+            from: route.checkpoint.cut.next_lsn,
+            through: route.head.next_lsn,
+        })?;
+        let recovery = Held::acquire(&self.worker, request, tasks).await?;
+        let hold = recovery.scope();
+        if hold.checkpoint != route.checkpoint || hold.start != route.checkpoint.cut || hold.through != route.head {
+            return Err(invalid("The requested cold reader basis changed"));
+        }
+        self.worker.read_lease(hold, route.writer.epoch).await?;
+        let checkpoint = if genesis(hold.checkpoint) { None } else {
+            let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+            Some(provider.open(hold.checkpoint).await?.checkpoint)
+        };
+        self.reader_opening.lock().clone_from(&Arc::downgrade(&recovery));
+        let config = Self::database_configuration(Attachment {
+            name: self.record.name.clone(),
+            deployment: self.worker.deployment(),
+            admission: AttachmentAdmission::Reader { placement: route.placement, epoch: route.writer.epoch, hold },
+            base: Base { checkpoint },
+        }, true)?;
+        Ok((config, recovery))
+    }
+
+    fn retained_reader(&self, hold: Hold) -> Result<Arc<Held>> {
+        self.reader_opening.lock().upgrade().filter(|active| active.scope() == hold)
+            .ok_or_else(|| invalid("The attachment lost its ordered recovery hold"))
+    }
+
+    fn database_configuration(attachment: Attachment, read_only: bool) -> Result<DatabaseConfig> {
         let encoded =
             serde_json::to_vec(&attachment).map_err(|error| invalid(&error.to_string()))?;
         Ok(DatabaseConfig {
@@ -782,6 +855,7 @@ impl Placement {
                 }),
                 epoch: Some(0),
             })),
+            mode: read_only.then_some(1),
             ..Default::default()
         })
     }
@@ -801,21 +875,26 @@ impl LogFactory for Logs {
         access: LogAccess,
         cancellation: CancellationToken,
     ) -> Result<OpenedLogs> {
-        if access != LogAccess::ReadWrite {
-            return Err(invalid(
-                "An installed writer attachment requires write log access",
-            ));
-        }
         let (placement, attachment) = self.routes.resolve(configuration)?;
         let material = material(self.keys.as_ref(), &placement.record).await?;
         let max_frame = crate::process::MAXIMUM_LOG_MESSAGE_BYTES;
+        let admission = match attachment.admission {
+            AttachmentAdmission::Writer { admission } if access == LogAccess::ReadWrite => admission,
+            AttachmentAdmission::Reader { epoch, hold, .. } if access == LogAccess::ReadOnly => {
+                let replica = JournalLog::open_reader(Arc::clone(&placement.worker), Arc::clone(&self.keys),
+                    epoch, placement.retained_reader(hold)?, max_frame, self.releases.clone()).await?;
+                return crate::logs::ordered_reader_opened(replica, &material, &placement.record, epoch,
+                    attachment.base.checkpoint, max_frame);
+            }
+            _ => return Err(invalid("The log access does not match its installed attachment")),
+        };
         let replica = JournalLog::open(
             Arc::clone(&placement.worker),
             Arc::clone(&self.keys),
-            attachment.admission,
+            admission,
             Held::pin(
                 Arc::clone(&placement.worker),
-                attachment.admission.recovery,
+                admission.recovery,
                 &self.releases,
             ),
             max_frame,
@@ -827,7 +906,7 @@ impl LogFactory for Logs {
             replica,
             &material,
             &placement.record,
-            attachment.admission,
+            admission,
             attachment.base.checkpoint,
             max_frame,
             cancellation,
@@ -837,7 +916,7 @@ impl LogFactory for Logs {
 }
 
 async fn material(
-    keys: &dyn crate::keys::KeyService,
+    keys: &dyn KeyService,
     record: &DeploymentRecord,
 ) -> Result<Vec<u8>> {
     keys.existing_key(&record.key_id())

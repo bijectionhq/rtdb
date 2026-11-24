@@ -3,15 +3,18 @@
 mod local;
 
 use super::InstalledJournal;
+use crate::keys::{KeyService, UnitLedger, UnitScope};
+use crate::store::{EncryptingStore, exact_retirement::installed_object_name};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, Placement, service::Route,
+    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, MAX_OBJECT_REFERENCES,
+    ObjectName, Placement, service::Route,
 };
 use ring::digest::{SHA256, digest};
 use rtdb_directory::Checkpoint as RtdbCheckpoint;
 use rtdb_format::{catalog::BlockCatalog, keys::block_key};
-use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore, object_store::StoredObject};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result, StorageEpoch};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,7 +28,9 @@ const MAX_MANIFEST_BYTES: usize = 16 << 20;
 /// An isolated immutable object namespace provisioned for one installed
 /// placement. Its store owns encryption and allocation admission.
 pub struct CheckpointCustody {
-    store: Arc<dyn ObjectStore>,
+    bucket: Arc<dyn ObjectStore>,
+    keys: Arc<dyn KeyService>,
+    io: Arc<IoRegion>,
     placement: Placement,
     epoch: StorageEpoch,
     prefix: ObjectKey,
@@ -75,6 +80,7 @@ impl Preparation {
             bytes.copy_from_slice(&field.to_be_bytes());
         }
         Ok(CheckpointPreparation {
+            erasure: false,
             checkpoint: self.through,
             root,
             source: self.writer,
@@ -151,14 +157,18 @@ pub struct OpenedCheckpoint {
 
 impl CheckpointCustody {
     pub fn new(
-        store: Arc<dyn ObjectStore>,
+        bucket: Arc<dyn ObjectStore>,
         prefix: ObjectKey,
         placement: Placement,
         epoch: StorageEpoch,
         provider: Fingerprint,
+        keys: Arc<dyn KeyService>,
+        io: Arc<IoRegion>,
     ) -> Self {
         Self {
-            store,
+            bucket,
+            keys,
+            io,
             placement,
             epoch,
             prefix,
@@ -167,22 +177,33 @@ impl CheckpointCustody {
         }
     }
 
-    pub(crate) fn on_local_volume(mut self, path: &Path, key: &[u8]) -> Result<Self> {
-        self.local = Some(local::LocalArchive::new(path, key)?);
+    pub(crate) fn on_local_volume(mut self, path: &Path) -> Result<Self> {
+        self.local = Some(local::LocalArchive::new(path)?);
         Ok(self)
+    }
+
+    fn ledger(&self, custody: Custody, io: Arc<IoRegion>) -> UnitLedger {
+        let mut residence = self.provider.to_vec();
+        residence.extend_from_slice(self.allocation(custody).as_bytes());
+        let scope = UnitScope::new(self.placement, b"checkpoint", &residence);
+        UnitLedger::new(Arc::clone(&self.keys), scope, io)
+    }
+
+    fn remote_store(&self, custody: Custody) -> EncryptingStore {
+        EncryptingStore::with_units(Arc::clone(&self.bucket), Arc::new(self.ledger(custody, Arc::clone(&self.io))))
     }
 
     async fn reader(&self, custody: Custody) -> Result<Arc<dyn ObjectStore>> {
         self.require_provider(custody)?;
         let Some(local) = &self.local else {
-            return Ok(Arc::clone(&self.store));
+            return Ok(Arc::new(self.remote_store(custody)));
         };
         let scope = self.allocation(custody);
         let allocation = local.acquire(&scope, false).await?;
         if allocation.closed().await?.is_some() {
             return Err(invalid("The local checkpoint archive is closed"));
         }
-        allocation.read_store()
+        allocation.read_store(self.ledger(custody, allocation.region()))
     }
 
     async fn put(
@@ -194,14 +215,15 @@ impl CheckpointCustody {
         self.require_provider(custody)
             .map_err(|error| Error::Task(error.to_string()))?;
         let Some(local) = &self.local else {
-            return self.store.put(key, body).await;
+            return self.remote_store(custody).put(key, body).await;
         };
         let scope = self.allocation(custody);
         let allocation = local
             .acquire(&scope, true)
             .await
             .map_err(|error| Error::Task(error.to_string()))?;
-        allocation.put(key, body).await
+        let ledger = self.ledger(custody, allocation.region());
+        allocation.put(&ledger, key, body).await
     }
 
     pub(crate) async fn pending(&self, reservation: &Reservation) -> Result<Option<Preparation>> {
@@ -286,19 +308,41 @@ impl CheckpointCustody {
         reservation: &Reservation,
         origin: Preparation,
         source: &dyn ObjectStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<ObjectName>> {
         self.require_provider(reservation.custody)?;
         let budget = Self::copy_budget(reservation)?;
         // A permanent size refusal must precede the first provider effect
         // and the ordered binding of a reservation to a source.
-        let _ = crate::archive::ordered_checkpoint_sources(
+        let members = crate::archive::ordered_checkpoint_sources(
             source,
             origin.checkpoint,
             self.epoch,
             budget,
         )
         .await?;
-        Ok(())
+        let mut references = Vec::with_capacity(members.len().saturating_add(2));
+        let custody = reservation.custody;
+        references.push(self.object_name(&self.intent(custody)?)?);
+        references.push(self.object_name(&self.manifest(custody)?)?);
+        for member in members {
+            references.push(self.object_name(&self.member(custody, &member.name)?)?);
+        }
+        references.sort_unstable();
+        references.dedup();
+        if references.len() > MAX_OBJECT_REFERENCES {
+            return Err(invalid("The checkpoint closure exceeds the journal's object reference bound"));
+        }
+        Ok(references)
+    }
+
+    fn object_name(&self, key: &ObjectKey) -> Result<ObjectName> {
+        if let Some((namespace, name)) = self.bucket.s3_publication_address(key) {
+            return installed_object_name(&namespace, &name);
+        }
+        if self.local.is_some() {
+            return Ok(fingerprint(&serde_json::to_vec(&("local-checkpoint", self.provider, key.as_str())).map_err(serialization)?));
+        }
+        Err(invalid("The checkpoint archive cannot identify an immutable allocation"))
     }
 
     pub(crate) async fn prepared(
@@ -462,11 +506,14 @@ impl CheckpointCustody {
             .ok_or_else(|| invalid("The checkpoint has no local archive owner"))?;
         let scope = self.allocation(chosen.custody);
         let allocation = local.acquire(&scope, true).await?;
+        let ledger = self.ledger(chosen.custody, allocation.region());
         if !allocation.require_disposition(chosen.manifest).await? {
-            let reader = allocation.read_store()?;
+            let reader = allocation.read_store(ledger.clone())?;
             self.read_manifest(reader.as_ref(), chosen).await?;
+            allocation.close(chosen.manifest).await?;
         }
-        allocation.retire(chosen.manifest).await?;
+        ledger.withdraw_scope().await?;
+        allocation.retire().await?;
         self.disposition(chosen)
     }
 
@@ -488,8 +535,9 @@ impl CheckpointCustody {
         let token = chosen.custody.allocation;
         let root = self.manifest(chosen.custody)?;
         let preparation = self.intent(chosen.custody)?;
+        let ledger = self.ledger(chosen.custody, Arc::clone(&self.io));
         if !effects.confirms(&root, token).await? {
-            let selected = self.read_manifest(self.store.as_ref(), chosen).await?;
+            let selected = self.read_manifest(&self.remote_store(chosen.custody), chosen).await?;
             for logical in selected.members.keys() {
                 let key = self.member(chosen.custody, &ObjectKey::new(logical.as_str())?)?;
                 effects.fence_create_only(&key, token).await?;
@@ -497,6 +545,7 @@ impl CheckpointCustody {
             effects.fence_create_only(&preparation, token).await?;
             effects.fence_create_only(&root, token).await?;
         }
+        ledger.withdraw_scope().await?;
         if !effects.confirms(&preparation, token).await? {
             return Err(invalid("The provider has not fenced the preparation"));
         }
@@ -507,7 +556,7 @@ impl CheckpointCustody {
         let token = chosen.custody.allocation;
         let scope = serde_json::to_vec(&self.scope()).map_err(serialization)?;
         let mut attestation = ring::digest::Context::new(&SHA256);
-        attestation.update(b"rtdb.multi.ordered-checkpoint-disposition/v1");
+        attestation.update(b"rtdb.multi.ordered-checkpoint-disposition/v2");
         attestation.update(&scope);
         attestation.update(token.as_bytes());
         attestation.update(&chosen.custody.revision.to_be_bytes());
@@ -603,6 +652,7 @@ impl ExactStore {
 
 #[async_trait]
 impl ObjectStore for ExactStore {
+    fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         Ok(self.observe_head(key).await?.value)
     }

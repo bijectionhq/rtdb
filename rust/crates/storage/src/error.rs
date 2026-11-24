@@ -46,7 +46,7 @@ pub enum Error {
     PermissionDenied { key: String, message: String },
     #[error("log writer at epoch {epoch} was deposed by a seal at epoch {promised}")]
     Deposed { epoch: u64, promised: u64 },
-    #[error("the held view requires an erased journal key generation")]
+    #[error("the held view requires an erased storage key")]
     ErasedUnderView,
     #[error("read lease expired at {deadline:?}; now {now}")]
     ReadLeaseExpired { deadline: Option<i64>, now: i64 },

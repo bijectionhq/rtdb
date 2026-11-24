@@ -257,6 +257,7 @@ pub struct LogkeeperLogConfig {
     pub transferred_source_through: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_intake_cut: Option<TransferIntakeCut>,
+    pub placed_transfer: Option<rtdb_types::PlacedTransfer>,
     pub write_quorum: usize,
 }
 
@@ -329,7 +330,7 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         replica_stream: record.stream("replica"),
         replica_seal_scope: record.replica_seal_scope(),
         epoch: record.epoch,
-        require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
+        require_read_index: record.linearizable_reads && matches!(role, Role::Holder | Role::Subscriber | Role::Compactor),
         placed_receipt_retirement: record.placed_receipt_retirement,
         log_epoch: record.log_epoch,
         transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
@@ -340,6 +341,8 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
             let terminal = &activation.replica.bootstrap.terminal;
             TransferIntakeCut { replica_through: terminal.replica_through, source_through: terminal.source_through }
         }),
+        placed_transfer: record.checkpoint_transfer_activation.as_ref()
+            .map(|activation| activation.replica.bootstrap.terminal.placed_transfer()),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
         previous_servers,
     };

@@ -1,6 +1,7 @@
 use std::{sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_flight::{Action, FlightDescriptor, FlightInfo, flight_service_client::FlightServiceClient, sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, EndTransaction, ProstMessageExt}};
+use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -29,6 +30,16 @@ impl Clock for ManualClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(
 struct HostedFixtureResources(rtdb_node::NativeResources);
 struct HostedFixtureReceipts(rtdb_types::PlacedAttemptScope);
 struct FixtureOwner;
+
+const FIXTURE_SOURCE_HISTORY: uuid::Uuid = uuid::Uuid::from_u128(0x16ac_65ba_78eb_4d4f_9871_7157_bf8a_7023);
+
+struct FixtureSourceFence;
+
+#[async_trait]
+impl rtdb_node::ReadFence for FixtureSourceFence {
+    async fn confirm(&self, _: &str) -> Result<()> { Ok(()) }
+    async fn confirm_hosted(&self, _: &rtdb_node::Database) -> Result<String> { Ok(FIXTURE_SOURCE_HISTORY.to_string()) }
+}
 
 #[async_trait]
 impl rtdb_node::SessionIdentity for FixtureOwner {
@@ -87,10 +98,13 @@ impl Running {
     async fn start_with_tracer(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
         Self::start_with_options(password, config, placements, tracer, NodeOptions::default()).await
     }
-    async fn start_with_options(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions) -> Self {
+    async fn start_with_options(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions) -> Self {
+        Self::start_with_fence(password, config, placements, tracer, options, None).await
+    }
+    async fn start_with_fence(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
-        let mut services = NodeServices { clock: node_clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        let mut services = NodeServices { clock: node_clock, tracer, read_fence, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         if config.hosted_controls.is_some() {
             services.resources = Arc::new(HostedFixtureResources(rtdb_node::NativeResources::default()));
         }
@@ -209,7 +223,7 @@ async fn placed_flight_sessions_scope_catalogs_tickets_and_handles_to_their_atta
 
     let info = first.info("SELECT 42::BIGINT AS n", None).await;
     let ticket = info.endpoint[0].ticket.clone().unwrap();
-    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::NotFound);
     assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 42);
 
     let transaction = first.begin().await;
@@ -341,6 +355,22 @@ async fn query_info_pins_read_only_and_announced_schema_matches_redeemed_rows() 
 }
 
 #[tokio::test]
+async fn query_ticket_keeps_an_empty_cut_and_the_original_clock() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let clock = client.info("SELECT CURRENT_TIMESTAMP(6) AS held_clock", None).await;
+    let before = client.redeem(&clock).await;
+    let query = "SELECT count(*) AS n FROM xt.txs FOR ALL VALID_TIME";
+    let empty = client.info(query, None).await;
+    client.update("INSERT INTO docs (_id,n) VALUES (1,10)", None).await;
+    let replayed = client.redeem(&clock).await;
+    assert_eq!(before, replayed);
+    assert_eq!(integer(&client.redeem(&empty).await[0], 0, 0), 0);
+    assert_eq!(integer(&client.query(query).await[0], 0, 0), 1);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_keeps_old_bind() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     let update = client.prepare("INSERT INTO docs (_id) VALUES (?)", None).await;
@@ -461,12 +491,15 @@ async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads()
 }
 
 #[tokio::test]
-async fn authenticated_handles_are_session_scoped_but_query_tickets_can_be_redeemed_by_another_caller() {
+async fn authenticated_handles_and_query_tickets_require_the_original_session() {
     let running = Running::start(Some("correct"), FlightConfig::default()).await;
     let mut first = Client::connect(&running.server, Some("xtdb:correct")).await; let mut second = Client::connect(&running.server, Some("xtdb:correct")).await;
     let handle = first.begin().await; assert_eq!(second.end(handle.clone(), true).await.unwrap_err().code(), tonic::Code::NotFound);
     first.end(handle, false).await.unwrap(); let info = first.info("SELECT 1::bigint AS n", None).await;
-    assert_eq!(integer(&second.redeem(&info).await[0], 0, 0), 1); running.stop().await;
+    let request = second.request(info.endpoint[0].ticket.clone().unwrap());
+    assert_eq!(second.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 1);
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -1023,7 +1056,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     ]);
     client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
 
-    let reply = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let reply = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
     let hold = &reply[0].body[..16];
     let valid = i64::from_be_bytes(reply[0].body[16..24].try_into().unwrap());
     let mut replace = relation.clone();
@@ -1130,7 +1163,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     assert_eq!(rtdb_columnar::read_entity_id(first.schema_ref().field(0), first.column(0).as_ref(), 0).unwrap(),
         rtdb_columnar::EntityIdRef::String("a"));
 
-    let other = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let other = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
     let mut capability = hold.to_vec();
     capability.extend_from_slice(token.as_bytes());
     let mut next = capability.clone();
@@ -1252,6 +1285,99 @@ async fn check_spatial_pages_at_the_original_cut() {
         assert_eq!(client.action(projected, request).await.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
     client.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(hold)).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_source_confirmation_checks_the_exact_prior_positions() {
+    let running = Running::start_with_fence(Some("secret"), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+            owner: "xtdb".into(),
+            relations: ["bj_installation".to_owned()].into(),
+        }),
+        ..FlightConfig::default()
+    }, &["application"], None, NodeOptions::default(), Some(Arc::new(FixtureSourceFence))).await;
+    let mut owner = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
+    let action = "rtdb.owned.ConfirmHostedSource.v1";
+    let request = |history: uuid::Uuid, positions: &[(i64, i64)]| {
+        let mut body = history.as_bytes().to_vec();
+        body.push(positions.len() as u8);
+        for (id, time) in positions {
+            body.extend_from_slice(&id.to_be_bytes());
+            body.extend_from_slice(&time.to_be_bytes());
+        }
+        Bytes::from(body)
+    };
+    let applied = |reply: &[arrow_flight::Result]| {
+        let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+        let rows = stream.next().unwrap().unwrap();
+        assert_eq!(rows.num_rows(), 1);
+        assert!(stream.next().is_none());
+        (integer(&rows, 0, 0), integer(&rows, 1, 0))
+    };
+    owner.update("INSERT INTO data RECORDS {_id: 'first'}", None).await;
+    let first = applied(&owner.action(action, request(FIXTURE_SOURCE_HISTORY, &[])).await.unwrap());
+    owner.update("INSERT INTO data RECORDS {_id: 'second'}", None).await;
+    let second = applied(&owner.action(action, request(FIXTURE_SOURCE_HISTORY, &[first])).await.unwrap());
+    assert!(second.0 > first.0 && second.1 >= first.1);
+    assert!(owner.action(action, request(FIXTURE_SOURCE_HISTORY, &[(first.0, first.1 - 1)])).await.is_err());
+    assert!(owner.action(action, request(uuid::Uuid::from_u128(1), &[])).await.is_err());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
+    let running = Running::start_with_placements(Some("secret"), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+            owner: "xtdb".into(),
+            relations: ["bj_relation_declarations".to_owned()].into(),
+        }),
+        ..FlightConfig::default()
+    }, &["application"]).await;
+    let mut owner = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
+    let mut other = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
+    for sql in [
+        "INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(0 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_relation_declarations RECORDS {_id: 'retired', table_name: 'retired', world: CAST(-1 AS BIGINT), declaration: X'02', names: [], _valid_from: TIMESTAMP '1970-01-01Z'}",
+    ] {
+        owner.update(sql, None).await;
+    }
+    let open = owner.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
+    let hold = &open[0].body[..16];
+    let request = |selector| Bytes::from([hold, &[selector]].concat());
+    let action = "rtdb.owned.ReadHeldRootCatalog.v1";
+    assert_eq!(other.action(action, request(7)).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(owner.action(action, request(0)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    owner.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(-1 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+
+    let reply = owner.action(action, request(7)).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    let held_micros = i64::from_be_bytes(open[0].body[16..24].try_into().unwrap());
+    assert_eq!(stream.schema().metadata()["rtdb.owned.present_micros"], held_micros.to_string());
+    let batch = stream.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column_by_name("_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap().value(0), "original");
+    assert_eq!(batch.column_by_name("declaration").unwrap().as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap().value(0), &[1]);
+    assert!(stream.next().is_none());
+
+    let next = owner.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
+    let reply = owner.action(action, Bytes::from([&next[0].body[..16], &[7]].concat())).await.unwrap();
+    let mut empty = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    assert!(empty.schema().field_with_name("declaration").is_ok());
+    assert!(empty.next().is_none());
+    owner.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(hold)).await.unwrap();
+    owner.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(&next[0].body[..16])).await.unwrap();
+
+    let records = (0..129).map(|row| {
+        format!("{{_id: 'row_{row}', table_name: 'table_{row}', world: CAST(0 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}}")
+    }).collect::<Vec<_>>().join(", ");
+    owner.update(&format!("INSERT INTO bj_relation_declarations RECORDS {records}"), None).await;
+    let overflow = owner.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
+    let request = Bytes::from([&overflow[0].body[..16], &[7]].concat());
+    assert_eq!(owner.action(action, request).await.unwrap_err().code(), tonic::Code::ResourceExhausted);
+    owner.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(&overflow[0].body[..16])).await.unwrap();
     running.stop().await;
 }
 
@@ -1409,17 +1535,18 @@ async fn serve_spatial_pair() {
         "standalone" => None,
         "placed" => Some(rtdb_flight_sql::HostedControlConfig {
             owner: "xtdb".into(),
-            relations: ["bj_installation", "bj_fact_root_owner", "bj_fact_root_program"].map(str::to_owned).into(),
+            relations: ["bj_installation", "bj_fact_root_owner", "bj_fact_root_program", "bj_relation_declarations"].map(str::to_owned).into(),
         }),
         mode => panic!("Unknown spatial fixture mode {mode}"),
     };
     let standalone = hosted_controls.is_none();
     let options = NodeOptions { file_size_target: 1, automatic_artefacts: false, ..NodeOptions::default() };
-    let running = Running::start_with_options(Some(&password), FlightConfig {
+    let fence = (!standalone).then(|| Arc::new(FixtureSourceFence) as Arc<dyn rtdb_node::ReadFence>);
+    let running = Running::start_with_fence(Some(&password), FlightConfig {
         owned_native_actions: true,
         hosted_controls,
         ..FlightConfig::default()
-    }, &["application"], None, options).await;
+    }, &["application"], None, options, fence).await;
     if standalone {
         std::fs::write(directory.join("listen"), running.server.address().to_string()).unwrap();
         wait_for(&directory, "standalone-verified").await;
@@ -1428,9 +1555,11 @@ async fn serve_spatial_pair() {
     }
     let mut client = Client::connect_with_database(&running.server, Some(&format!("xtdb:{password}")), Some("application")).await;
     for statement in [
+        "CREATE TABLE bj_fact_root_program (_id TEXT, generation BIGINT, artifact TEXT, closure_digest BYTEA, closure TEXT, application_schema TEXT, source_reference TEXT, environment_contract TEXT)",
         "INSERT INTO bj_installation RECORDS {_id: 'authority', _valid_from: TIMESTAMP '1970-01-01Z'}",
         "INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', layout_digest: X'01', _valid_from: TIMESTAMP '1970-01-01Z'}",
         "INSERT INTO bj_fact_root_program RECORDS {_id: 'active', generation: 1, application_schema: 'original', _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_relation_declarations RECORDS {_id: 'paired', table_name: 'paired_places', world: CAST(0 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}",
     ] {
         client.update(statement, None).await;
     }
@@ -1516,7 +1645,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
     for action in [
         "rtdb.owned.PublishWorldCut.v1", "rtdb.owned.DecideWorldCut.v1",
         "rtdb.owned.DecideHeldWorlds.v1",
-        "rtdb.owned.OpenWorldRead.v4", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
+        "rtdb.owned.OpenWorldRead.v5", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
         "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.ReadHeldWorldHead.v1",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",

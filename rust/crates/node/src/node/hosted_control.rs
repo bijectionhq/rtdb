@@ -1,12 +1,75 @@
 use std::sync::Arc;
 
-use rtdb_query::HostedControlPoint;
+use rtdb_query::{HostedControlPoint, QueryCursor};
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
-use super::OwnedReadSession;
+use super::{OwnedReadSession, prepare_query};
+
+#[derive(Clone, Copy)]
+pub enum RootCatalogRead {
+    Installation,
+    RestoreHold,
+    RestoreRelease,
+    Custody,
+    Owner,
+    Admission,
+    ProgramSchema,
+    Declarations,
+}
+
+impl RootCatalogRead {
+    pub fn relation(self) -> &'static str {
+        match self {
+            Self::Installation => "bj_installation",
+            Self::RestoreHold | Self::RestoreRelease => "bj_rtdb_restore_hold",
+            Self::Custody => "bj_rtdb_custody_binding",
+            Self::Owner => "bj_fact_root_owner",
+            Self::Admission => "bj_fact_root_admission",
+            Self::ProgramSchema => "bj_fact_root_program",
+            Self::Declarations => "bj_relation_declarations",
+        }
+    }
+
+    pub fn maximum_rows(self) -> usize {
+        match self {
+            Self::Declarations => 128,
+            _ => 1,
+        }
+    }
+
+    fn query(self) -> String {
+        let (columns, condition) = match self {
+            Self::Installation => ("incarnation, kind, writer, _system_from", "_id = 'authority'"),
+            Self::RestoreHold => ("binding", "_id = 'restore'"),
+            Self::RestoreRelease => ("_system_from", "_id = 'released'"),
+            Self::Custody => ("fingerprint", "_id = 'authority'"),
+            Self::Owner => ("layout_digest, audience_tablet, _system_from", "_id = 'root'"),
+            Self::Admission => ("admission, _system_from", "_id = 'application'"),
+            Self::ProgramSchema => (
+                "_id, generation, artifact, closure_digest, closure, application_schema, source_reference, environment_contract, _system_from",
+                "_id = 'active'",
+            ),
+            Self::Declarations => ("_id, table_name, world, declaration, _system_from, names", "world = 0"),
+        };
+        format!("SELECT {columns} FROM public.{} WHERE {condition} LIMIT {}", self.relation(), self.maximum_rows() + 1)
+    }
+}
 
 impl OwnedReadSession {
+    pub async fn open_root_catalog(&self, read: RootCatalogRead) -> Result<QueryCursor> {
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        let options = rtdb_sql::PrepareOptions {
+            default_timezone: self.context.timezone.clone(),
+            ..Default::default()
+        };
+        let cursor = prepare_query(&read.query(), &self.context, &options)?
+            .execute(Arc::clone(&self.context), Vec::new()).await?;
+        self.check()?;
+        Ok(cursor)
+    }
+
     /// Read an admitted ordinary control point on this original placed cut.
     pub async fn hosted_control_point(
         &self,

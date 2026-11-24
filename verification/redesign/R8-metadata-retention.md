@@ -92,17 +92,20 @@ Legacy application keys remain reusable after their window ends.
 Placed attempt redemption checks the installed receipt clock.
 An applied prefix remains a causal token independently of the attempt receipt.
 
-New source-log submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
+New source-log and external submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
 The immutable result row keeps the transaction coordinate, commit flag and structured result error.
 A newly resolved legacy-guard duplicate carries its original coordinate in the structured outcome, so historical redemption does not require keeping the expiring application key.
 A structured result error may carry application-provided context, including an assertion message.
 Redacting arbitrary historical error text is a separate policy from retiring user metadata.
 Current reads of `xt.txs.user_metadata` select the payload at the installed receipt clock, including when the requested system time is earlier.
 Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
-The collector retains a legacy key's predecessors while a newer interval of that key is still active.
-Formerly embedded metadata and metadata from external writers lack the new source admission record and need migration.
-Old readers omit newly separated metadata until they support the retained projection.
-Arbitrary user metadata has no typed association with another storage unit, so early privacy erasure of such an association still needs an explicit data contract.
+Legacy application keys use a separate stored identity per hour bucket, so a fresh use cannot keep the older receipt alive.
+Lookup checks the current and previous bucket against the ordered expiry.
+Existing stores that predate this layout require a reset to use it.
+The optional metadata field `rtdb_erasure_unit_v1` names one record as `{table: "public.table", id: ...}` or one owner-scoped Root record as `{owned_relation: "relation", id: ...}`.
+RTDB retains associated metadata only when the same transaction commits a put for that unit and carries no erase for it.
+Native ordinary SQL and document erases and governed Root erases stage erasures for the associated metadata in the same commit.
+This scope excludes indirect associations in free-form metadata and relation-wide disposal.
 For a placed deployment enrolled in the versioned outcome format, each frame carries its exact current outcome and at most 128 distinct older erasures per collection step.
 An operator confirms format support in every eligible serving and recovery image and parks the deployment before pinning a compatible engine.
 Check `rtdb-multi --build-info` for `placed_receipt_retirement: true`.
@@ -119,3 +122,51 @@ They grant no authority to delete an immutable source-log segment, a replica seg
 A physically retired scope requires an exact successor checkpoint, release of every recovery reference and entitlement, and settlement by each copy's custodian.
 An archive's recorded key withdrawal or empty-inventory receipt only attests its own authority and provider scope.
 A report on R8 must retain the physical-closure gap until all copy classes, versions and recovery holds are accounted for.
+
+## Successor copy closure
+
+The four engine retention tables compact into a single unpartitioned primary per table.
+Each job merges the first live L0 with its older primary inputs, so an erase can remove a receipt written into a different block or historical shard.
+The output excludes that receipt and the erase marker, while surviving entries keep their original coordinates.
+The installed successor retires the covered compacted files through ordinary trie collection.
+Replay checkpoints exclude covered receipt L0 files, and a compactor reset starts from the installed primary closure.
+An admitted suffix still requires the original objects for records it replays before that checkpoint.
+Placed intake releases the installed source prefix without waiting for later submissions.
+Native skip diagnostics keep the operation bytes and omit user metadata, retry guards, and the placed attempt seed.
+The original source still supplies the skipped attempt's ordered abort.
+
+In the hosted directory path, new receipt L0 data and metadata are loose objects with their own publication identities.
+Directory deployments can submit those objects to the current reaper.
+The versioned or terminal provider still has to identify the original publication precisely.
+The grant owner requires an authenticated successor, an installed catalog floor, released recovery references, and a certified replay anchor that excludes the receipt's removal position.
+Physical journal trim retains its own media obligations.
+
+For stopped Classic local storage, `retain-repair-base --reclaim-receipts` installs a verified detached recovery anchor and submits both covered log prefixes to the Classic deletion-grant owner.
+The grant validates the source and replica offsets against that checkpoint, overwrites covered payloads with durable retired framing, and deletes covered skip diagnostics after log settlement.
+The operation retains the boundary frame needed by replica repair.
+Classic loose receipt tries additionally require a retained repair anchor covering their removal cut.
+Directory-managed local receipt tries use the existing local custodian and certified recovery exclusion.
+The old-pack grant can settle a mixed pack whose independent replay manifest omits covered receipt L0 and authenticates every retained ordinary member.
+
+The Classic trie deletion grant settles S3 compacted receipt files by the exact versions captured at publication and retained in the installed retirement.
+The provider inventories the exact version before and after deletion, blocks a deletion that would expose older data, and refuses to withdraw a path slot while another version is visible.
+Classic streamed file publication also settles the private staging version after the conditional copy completes.
+The versioned grant requires original publication evidence for both the file and its release record.
+Other Classic providers lack this version-bound settlement.
+
+Maintenance on an active installed grant records receipt L0 publication identities and sends files from its installed trie-removal receipt to the existing reclamation queue.
+An inherited member remains the responsibility of its original grant.
+For versioned and enrolled terminal S3, the consumer authenticates the installed removal and successor and asks the installed journal to fence that exact publication. Only an ordered fence permits withdrawing its key slot and settling the recorded version or conditional terminal identity. The journal refuses while roots, suffixes or preparations are opaque or retain the object.
+
+The v3 suffix cutover resets installed data. V2 suffixes are outside the reader contract.
+M1 remains open for unbound Classic remote objects, installed providers without an exact publication witness, incomplete installed journal reference publication, and untracked media snapshots.
+Closure needs exact custodian settlement after the successor and its references are released.
+A captured archive's existing whole-capture settlement can run after release of its last entitlement.
+Held-world suffixes verify the original certified journal interval and all placed transaction witnesses before materializing the business projection.
+The archive manifest authenticates the original transaction coordinates and the original business table batches, including detached payloads.
+The source authority keeps retry state, and the held-world copy omits retry tables, attempt identities and their acceptance witnesses.
+An exact published checkpoint used for an owned held read verifies the original manifest digest and opens only its business members.
+Full checkpoint restores still require their complete replay inventory.
+Retiring a receipt-only checkpoint member requires its original custodian and a grant that accounts for its recovery entitlements.
+A quiet history still needs ordered receipt-clock progress to trigger collection.
+Early erasure of associated metadata enters the same copy-settlement path as expiry.

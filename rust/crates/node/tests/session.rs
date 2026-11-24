@@ -362,7 +362,7 @@ async fn read_basis_and_transaction_tokens_release_on_rollback() {
     let mut session = service.session();
     let baseline = service.memory.used_bytes();
     session.begin_with(TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings {
-        snapshot_token: OptionUpdate::Set(rtdb_format::basis::encode_time_basis(&TimeBasis::default())), ..Default::default()
+        snapshot_token: OptionUpdate::Set("rtdb-snapshot:00000000-0000-4000-8000-000000000001".into()), ..Default::default()
     })), ..Default::default() }).unwrap();
     assert!(service.memory.used_bytes() > baseline);
     session.read_basis().await.unwrap();

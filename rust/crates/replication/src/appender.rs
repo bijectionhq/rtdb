@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
 use rtdb_tx::{ResolvedTx, TransactionResult};
-use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, Term, TermSequence, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, PlacedTerminal, ReplicaPosition, Result, Term, TermSequence, Timestamp};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -25,6 +25,7 @@ pub(crate) struct AppendStamp {
 pub(crate) struct PendingWrite {
     pub body: WriteBody,
     pub block: BlockIndex,
+    placed_terminal: Option<PlacedTerminal>,
     append: OnceLock<AppendStamp>,
     completion: Mutex<Option<oneshot::Sender<Result<Applied>>>>,
     _reservation: Arc<MemoryReservation>,
@@ -32,18 +33,21 @@ pub(crate) struct PendingWrite {
 impl PendingWrite {
     pub fn new(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let extra = match &body { WriteBody::Resolved(..) => 1024, WriteBody::Message(body) => Self::message_bound(body)? };
-        Ok(Self::reserved(body, block, completion, memory.reserve(extra)?))
+        Ok(Self::reserved(body, block, completion, None, memory.reserve(extra)?))
+    }
+    pub fn placed(body: WriteBody, block: BlockIndex, terminal: PlacedTerminal, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Ok(Self::reserved(body, block, None, Some(terminal), memory.reserve(1024)?))
     }
     pub fn clone_message(body: &ReplicaBody, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(Self::message_bound(body)?)?;
-        Ok(Self::reserved(WriteBody::Message(body.clone()), block, None, reservation))
+        Ok(Self::reserved(WriteBody::Message(body.clone()), block, None, None, reservation))
     }
     fn message_bound(body: &ReplicaBody) -> Result<usize> {
         body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))
     }
-    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
-        Arc::new(Self { body, block, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
+    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, placed_terminal: Option<PlacedTerminal>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
+        Arc::new(Self { body, block, placed_terminal, append: OnceLock::new(), completion: Mutex::new(completion), _reservation: reservation })
     }
     pub fn append_stamp(&self) -> Option<&AppendStamp> { self.append.get() }
     pub fn sequence(&self) -> Option<TermSequence> { self.append_stamp().map(|stamp| stamp.sequence) }
@@ -147,7 +151,7 @@ impl ReplicaAppender {
                 _ = timer.tick(), if self.heartbeat && !start_with_confirmation && !self.logs.data_suspended() => {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
-                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
                     match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
                         Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None, None)),
                         Ok(None) => break Ok(()),
@@ -177,6 +181,11 @@ impl ReplicaAppender {
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let mut envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
+                    if let Some(terminal) = request.write.placed_terminal
+                        && let ReplicaBody::ResolvedTx(tx) = &mut envelope.message
+                    {
+                        tx.placed_slot_terminal = Some(terminal.encode());
+                    }
                     let _search_copy = if let WriteBody::Resolved(_, Some(delta)) = &request.write.body
                         && let ReplicaBody::ResolvedTx(tx) = &mut envelope.message
                         && tx.acceptance_stage.is_none()
@@ -295,7 +304,7 @@ mod tests {
     async fn ordinary_append_receipt_failure_stops_pump_and_fails_its_completion() {
         let (handle, appender, memory) = pump(Duration::from_secs(60));
         let (sender, receiver) = oneshot::channel();
-        let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1) })), BlockIndex(0), Some(sender), &memory).unwrap();
+        let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1), ..Default::default() })), BlockIndex(0), Some(sender), &memory).unwrap();
         handle.enqueue(write).unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), appender.run(None)).await.unwrap().unwrap_err();
         assert!(error.message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
@@ -311,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn durability_measurement_uses_the_ordered_stamp_and_excludes_failed_acknowledgements() {
         let (_handle, appender, _) = pump(Duration::from_secs(60));
-        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
         let receipt = appender.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(110)).await.unwrap();
         let samples = Arc::new(Mutex::new(Vec::new()));
         let observer: DurableCommitObserver = {
@@ -366,7 +375,7 @@ mod tests {
         let pump = tokio::spawn(appender.run(None));
         for source in 0..20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(source) })), BlockIndex(0), None, &memory).unwrap();
+            let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(source), ..Default::default() })), BlockIndex(0), None, &memory).unwrap();
             handle.enqueue(write).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;

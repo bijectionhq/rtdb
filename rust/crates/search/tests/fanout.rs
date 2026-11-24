@@ -16,7 +16,7 @@ fn rows(seed: u64) -> Vec<SearchRow> {
     let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as usize };
     (0..DOCUMENTS).map(|document| {
         let tokens = (0..20).map(|_| format!("w{}", next() % VOCABULARY)).collect();
-        SearchRow { identity: None, iid: [(document / 8) as u8; 16], system_from: -(document as i64), valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(tokens)] }
+        SearchRow { position: None, identity: None, iid: [(document / 8) as u8; 16], system_from: -(document as i64), valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(tokens)] }
     }).collect()
 }
 

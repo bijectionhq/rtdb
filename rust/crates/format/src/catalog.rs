@@ -258,13 +258,18 @@ impl TableBlock {
         Self { wire: Arc::new(wire), charge: self.charge.clone() }
     }
 
-    pub fn checkpoint_trie_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {
+    pub fn checkpoint_trie_files(&self, entry: &TableEntry, contents: CheckpointContents) -> Result<BTreeSet<String>> {
         let mut files = BTreeSet::new();
         for detail in self.trie_details() {
-            files.append(&mut detail.checkpoint_files(slug, contents)?);
+            if entry.table.stores_expiring_transaction_metadata()
+                && detail.trie_state == Some(TrieState::Garbage as i32)
+            {
+                continue;
+            }
+            files.append(&mut detail.checkpoint_files(&entry.slug, contents)?);
         }
         if contents == CheckpointContents::Replay {
-            for run in &self.wire.search_runs { files.insert(run.object_key(slug)?); }
+            for run in &self.wire.search_runs { files.insert(run.object_key(&entry.slug)?); }
         }
         Ok(files)
     }

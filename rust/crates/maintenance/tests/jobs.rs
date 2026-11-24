@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use rtdb_format::keys::TrieKey;
 use rtdb_index::{CatalogTrie, TrieCatalog, TrieState};
 use rtdb_maintenance::{available_jobs, RecencyMode};
@@ -47,8 +46,7 @@ fn historical_leveling_fills_a_partial_or_waits_for_four_inputs() {
 #[test]
 fn outputs_are_named_in_the_catalogs_epoch_so_a_reset_never_reuses_a_name() {
     let before = catalog(&[("l00-rc-b00", 10), ("l00-rc-b01", 10)]);
-    let table = TableRef::new("public", "foo");
-    let after = before.reset_to_l0(BTreeMap::from([(table.clone(), before.current_tries(&table).into_iter().cloned().collect())])).unwrap();
+    let (after, _) = before.reset_from_primary(before.clone(), rtdb_types::BlockIndex(2), Timestamp(101)).unwrap();
     let planned = |catalog: &TrieCatalog| available_jobs(catalog).unwrap().into_iter().map(|job| job.output).collect::<Vec<_>>();
     let (old, new) = (planned(&before), planned(&after));
     assert!(!old.is_empty());

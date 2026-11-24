@@ -1,3 +1,4 @@
+use rtdb_format::data::EncodedEvent;
 use rtdb_format::{data::PageEvent, metadata::MetadataNode};
 use rtdb_types::{Iid, Result};
 use super::{InputSegment, row_heap};
@@ -86,7 +87,8 @@ impl<'a> RowHeap<'a> {
             TieOrder::Legacy => (0, 0, 0),
             TieOrder::Scan => (page.source_precedence, event.page_ordinal(), stream),
         };
-        (u128::from_be_bytes(event.iid.0), event.system_from.0, event.commit_position, priority, ordinal, leaf)
+        let (_, order) = event.header().precedence();
+        (u128::from_be_bytes(event.iid.0), event.system_from.0, order, priority, ordinal, leaf)
     }
 
     pub fn next(&mut self) -> Option<row_heap::Head> {

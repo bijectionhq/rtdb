@@ -91,15 +91,6 @@ impl LocalCatalogLedger {
         Ok(true)
     }
 
-    pub(crate) fn permits_retirement(&self, cut: CatalogCut) -> Result<bool> {
-        let _gate = self.lock()?;
-        if cut.replica_epoch != self.replica_epoch || !self.floor()?.is_some_and(|floor| covers(floor, cut)) {
-            return Ok(false);
-        }
-        self.sync_ledger()?;
-        Ok(true)
-    }
-
     pub(crate) fn install_repair_anchor(&self, next: LocalRepairAnchor) -> Result<()> {
         let _gate = self.lock()?;
         if !next.well_formed() {
@@ -126,7 +117,25 @@ impl LocalCatalogLedger {
         self.sync_ledger()
     }
 
+    pub(crate) fn hold_recovery_open(&self) -> Result<File> {
+        let path = self.directory.join("recovery-open");
+        let gate = self.open_gate(&path)?;
+        FileExt::lock_shared(&gate).map_err(|error| Error::io(path, error))?;
+        Ok(gate)
+    }
+
+    pub(crate) fn try_lock_recovery_deletion(&self) -> Result<Option<File>> {
+        let path = self.directory.join("recovery-open");
+        let gate = self.open_gate(&path)?;
+        match FileExt::try_lock_exclusive(&gate) {
+            Ok(()) => Ok(Some(gate)),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(Error::io(path, error).into()),
+        }
+    }
+
     pub(crate) fn collect_recovery_file(&self, block: BlockIndex, remove: impl FnOnce() -> crate::Result<()>) -> Result<()> {
+        let Some(_recovery) = self.try_lock_recovery_deletion()? else { return Ok(()); };
         let _gate = self.lock()?;
         let first = self.repair_anchor()?.map(|anchor| anchor.block.0);
         match repair_anchor_decision::collect_recovery_file(first, block.0) {
@@ -168,12 +177,16 @@ impl LocalCatalogLedger {
     }
 
     fn lock(&self) -> Result<File> {
-        fs::create_dir_all(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
         let path = self.directory.join("lock");
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
-            .open(&path).map_err(|error| Error::io(&path, error))?;
+        let file = self.open_gate(&path)?;
         FileExt::lock_exclusive(&file).map_err(|error| Error::io(path, error))?;
         Ok(file)
+    }
+
+    fn open_gate(&self, path: &Path) -> Result<File> {
+        fs::create_dir_all(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
+        Ok(OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(path).map_err(|error| Error::io(path, error))?)
     }
 
     fn floor(&self) -> Result<Option<CatalogCut>> {
@@ -198,16 +211,16 @@ fn remove_ticket(path: &Path) -> Result<()> {
     }
 }
 
-fn well_formed(cut: CatalogCut) -> bool {
+pub(crate) fn well_formed(cut: CatalogCut) -> bool {
     cut.through.after_offset(cut.replica_epoch) >= 0
         || ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1).ok() == Some(cut.through)
 }
 
-fn same_storage(left: CatalogCut, right: CatalogCut) -> bool {
+pub(crate) fn same_storage(left: CatalogCut, right: CatalogCut) -> bool {
     left.storage_version == right.storage_version && left.storage_epoch == right.storage_epoch
 }
 
-fn covers(reader: CatalogCut, floor: CatalogCut) -> bool {
+pub(crate) fn covers(reader: CatalogCut, floor: CatalogCut) -> bool {
     well_formed(reader) && same_storage(reader, floor) && reader.replica_epoch == floor.replica_epoch
         && reader.through >= floor.through
 }

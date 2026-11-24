@@ -147,6 +147,9 @@ Verus 0.2026.11.20.9da409b verified three shipped decisions for the shared claim
 **Cross-holder source inspection.**
 The claim uses the ordinary holder directory client off-turn.
 Each data action uses the independent audience read path to check current standing, and an authenticated close can act on the original session without opening a native connection.
+The holder recovers the directory checkpoint at attachment time.
+Audience captures confirm their own pinned catalog and projected floor under the current writer epoch, so a later directory maintenance checkpoint does not govern a held audience read.
+The audience Flight contract refuses the whole-Root publication head and the provider-issuer control in reads and confirmation.
 The holder fixes the 180-second deadline before its claim attempt, and the installed listener requests a sweep every 10 seconds.
 The 190-second registry-retirement bound assumes a progressing monotonic clock and that the installed listener completes an expiry sweep within 10 seconds of the deadline.
 Physical release also requires retained I/O to drain and the directory to accept or observe the fenced release, or exact task-stop evidence to arrive.

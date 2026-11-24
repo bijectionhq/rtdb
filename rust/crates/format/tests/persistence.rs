@@ -7,7 +7,7 @@ use prost::Message;
 use rtdb_format::{basis, columns, data::{EventBatch, StoredEvent, StoredOperation, build_event_batch}, envelope::SourceMessage, ipc, keys::*};
 use rtdb_format::catalog::{BlockCatalog, FIRST_TABLE_OID, TableBlock};
 use rtdb_format::generated::xtdb::{block::proto::Block, log::proto as pb};
-use rtdb_types::{BlockIndex, EventOp, Iid, Instant, Interval, ListKind, LogicalType, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, TimeBasis, Timestamp, TxBasis, TxId, Value};
+use rtdb_types::{BlockIndex, EventOp, Iid, Interval, ListKind, LogicalType, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp, TxBasis, TxId, Value};
 
 #[test]
 fn partition_roots_preserve_the_single_partition_namespace() {
@@ -174,13 +174,9 @@ fn legacy_block_names_allocate_oids_in_name_order() {
 }
 
 #[test]
-fn basis_tokens_keep_partition_order_and_nanoseconds() {
+fn await_tokens_keep_partition_order() {
     let tx = TxBasis { databases: BTreeMap::from([("xtdb".into(), vec![TxId(0), TxId(42)])]) };
     assert_eq!(basis::decode_tx_basis(&basis::encode_tx_basis(&tx)).unwrap(), tx);
-    let time = TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![None, Some(Instant::new(-1, 999_999_999).unwrap()), Some(Instant::new(1, 1).unwrap())])]) };
-    assert_eq!(basis::decode_time_basis(&basis::encode_time_basis(&time)).unwrap(), time);
-    let epoch = TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(Instant::new(0, 0).unwrap())])]) };
-    assert_eq!(basis::decode_time_basis(&basis::encode_time_basis(&epoch)).unwrap().databases["xtdb"], [None]);
     assert!(basis::decode_tx_basis("invalid%%").is_err());
 }
 
@@ -204,10 +200,10 @@ fn nested_column_types_keep_bottom_null_and_missing_distinct() {
 
 fn events() -> Vec<StoredEvent> {
     vec![
-        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(3), valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None },
-        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(2), valid_time: Interval::from_micros(10, 20).unwrap(), operation: StoredOperation::Delete, recency: None },
-        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(12))])), recency: None },
-        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(7))])), recency: None },
+        StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(3), valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None },
+        StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(2), valid_time: Interval::from_micros(10, 20).unwrap(), operation: StoredOperation::Delete, recency: None },
+        StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(12))])), recency: None },
+        StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(7))])), recency: None },
     ]
 }
 
@@ -289,7 +285,7 @@ fn uuid_columns_round_trip_through_arrow_file_and_stream() {
 #[test]
 fn uuid_put_documents_are_read_back_through_the_event_schema() {
     let uuid = Value::Uuid(std::array::from_fn(|index| 0xa0 | index as u8));
-    let put = |iid: u8, id: Value| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("ref".into(), id)])), recency: None };
+    let put = |iid: u8, id: Value| StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("ref".into(), id)])), recency: None };
     let events = vec![put(1, uuid), put(2, Value::Null), put(3, Value::Uuid([0; 16]))];
     let fields = BTreeMap::from([("ref".into(), LogicalType::Scalar(ScalarType::Uuid).maybe())]);
     let batch = build_event_batch(&events, Some(fields.into()), None).unwrap();
@@ -326,7 +322,7 @@ fn live_pages_carry_the_put_leg_last_and_only_once_a_document_is_written() {
 #[test]
 fn put_columns_keep_the_order_their_fields_were_first_seen() {
     let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("system_time".into(), LogicalType::Scalar(ScalarType::I64)), ("committed".into(), LogicalType::Scalar(ScalarType::Bool))]);
-    let put = StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
+    let put = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
         operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("system_time".into(), Value::I64(2)), ("committed".into(), Value::Bool(true))])) };
     let batch = build_event_batch(&[put], Some(fields), None).unwrap();
     let arrow_schema::DataType::Union(legs, _) = batch.schema().field_with_name("op").unwrap().data_type().clone() else { panic!("op is a union") };

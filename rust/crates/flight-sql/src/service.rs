@@ -30,6 +30,8 @@ pub(crate) struct Inner {
     pub sessions: Registry<String, Session>,
     pub transactions: Registry<Bytes, Transaction>,
     pub prepared: Registry<Bytes, Prepared>,
+    pub query_tickets: Registry<Uuid, crate::execute::QueryTicket>,
+    pub query_ticket_slots: Arc<Semaphore>,
     pub owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
     pub owned_world_reads: Registry<Bytes, crate::owned_actions::OwnedWorldReadResource>,
     pub owned_read_slots: Arc<Semaphore>,
@@ -136,7 +138,7 @@ impl Service {
                 transport,
             })
         } else { None };
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
@@ -155,14 +157,14 @@ impl Service {
         if let Some(audience) = &self.0.audience {
             audience.sessions.sweep();
         }
-        self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
+        self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.query_tickets.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
         self.publish();
     }
     pub fn close(&self) {
         if let Some(audience) = &self.0.audience {
             audience.sessions.close();
         }
-        self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
+        self.0.query_tickets.close(); self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
         self.publish();
     }
     pub fn publish(&self) {
@@ -237,6 +239,9 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
+            if session.fresh_replica && !matches!(kind, CallKind::Action) {
+                return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
+            }
             if session.audience_source() != audience_source
                 || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::AudienceCleanup)
             {
@@ -258,15 +263,18 @@ impl Service {
             let catalog = self.0.node.catalog();
             let placed_name = || requested_database.filter(|name| !name.is_empty())
                 .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"));
-            let (peer, verified_attachment) = if let Some(proof) = forwarded_peer {
+            let (peer, verified_attachment, fresh_replica) = if let Some(proof) = forwarded_peer {
                 let verifier = self.0.config.forwarded_peer.as_ref()
                     .ok_or_else(|| auth::unauthenticated("This listener does not accept forwarded peers"))?;
                 let proof = proof.to_str().map_err(|_| auth::unauthenticated("Invalid forwarded peer proof"))?;
                 let attachment = catalog.database(placed_name()?).map_err(status)?;
-                let peer = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
-                (Some(peer.to_string()), Some(attachment))
+                let (peer, fresh_replica) = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
+                if fresh_replica && (!is_handshake || audience_source.is_some()) {
+                    return Err(Status::permission_denied("A replica route requires its fresh Flight handshake"));
+                }
+                (Some(peer.to_string()), Some(attachment), fresh_replica)
             } else {
-                (request.remote_addr().map(|address| address.ip().to_string()), None)
+                (request.remote_addr().map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
             let placement = if catalog.is_placed() {
@@ -288,7 +296,7 @@ impl Service {
             let memory = audience.map_or(self.memory(), |audience| &audience.memory);
             let mint = |audience_slot| -> Result<Arc<Session>, Status> {
                 let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
-                    placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
+                    placement.as_ref(), fresh_replica, audience_slot, memory.reserve(capacity).map_err(status)?));
                 sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
                     self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
                 Ok(session)
@@ -436,6 +444,32 @@ pub(crate) fn result_stream<T: Send + 'static>(call: Call, values: Vec<Result<T,
     let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
 }
 
+pub(crate) fn action_result_stream(
+    call: Call, values: Vec<Result<flight::Result, Status>>,
+    plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
+) -> Result<Response<Output<flight::Result>>, Status> {
+    let headers = call.response(())?.metadata().clone();
+    let stream: Output<flight::Result> = Box::pin(futures::stream::unfold(
+        (call, values.into_iter(), plaintext, false),
+        |(call, mut values, plaintext, stopped)| async move {
+            if stopped { return None; }
+            let value = values.next()?;
+            let result = call.cancellation.run_until_cancelled(async {
+                let value = value?;
+                let grant = plaintext.grant().await.map_err(status)?;
+                grant.check().map_err(status)?;
+                grant.observe_answer();
+                Ok(value)
+            }).await.unwrap_or_else(|| Err(cancelled()));
+            let stop = result.is_err();
+            Some((result, (call, values, plaintext, stop)))
+        },
+    ));
+    let mut response = Response::new(stream);
+    *response.metadata_mut() = headers;
+    Ok(response)
+}
+
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = Output<flight::HandshakeResponse>;
@@ -462,8 +496,8 @@ impl FlightService for Service {
         let descriptor = request.into_inner(); let cmd = command(&descriptor.cmd).map_err(|error| call.error(error))?;
         let work = async {
             let (schema, ticket) = match cmd {
-                Command::CommandStatementQuery(command) => { let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?; self.query_info(connection, &command.query, None).await? }
-                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let params = prepared.params.lock().expect("parameters lock").clone(); let connection = self.scoped(&call, &prepared.scope).await?; self.query_info(connection, &prepared.sql, params).await? }
+                Command::CommandStatementQuery(command) => { let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?; self.query_info(&call, connection, &command.query, None).await? }
+                Command::CommandPreparedStatementQuery(command) => { let prepared = self.prepared(&call, &command.prepared_statement_handle)?; let params = prepared.params.lock().expect("parameters lock").clone(); let connection = self.scoped(&call, &prepared.scope).await?; self.query_info(&call, connection, &prepared.sql, params).await? }
                 command => (self.metadata_schema(&command)?, command.into_any().encode_to_vec().into()),
             };
             Ok::<_, Status>(flight::FlightInfo { schema: wire::schema_message(&schema, self.memory())?, flight_descriptor: Some(descriptor), endpoint: vec![flight::FlightEndpoint { ticket: Some(flight::Ticket { ticket }), ..Default::default() }], total_records: -1, total_bytes: -1, ordered: false, app_metadata: Bytes::new() })
@@ -522,8 +556,8 @@ mod tests {
         }
         for action in [
             crate::owned_actions::PREPARE_APPLIED_READ_V3,
-            crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4,
-            crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5,
+            crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5,
+            crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6,
             "closesession",
         ] {
             assert!(matches!(CallKind::action(true, action), CallKind::Action));

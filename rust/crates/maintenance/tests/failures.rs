@@ -285,7 +285,7 @@ async fn actual_metadata_upload_failure_preserves_storage_anomaly_and_emits_the_
         let input = TrieKey::l0(BlockIndex(0)).unwrap(); let output: TrieKey = "l01-rc-b00".parse().unwrap();
         let data_key = ObjectKey::new(slug.data_key(&output)).unwrap(); let metadata_key = ObjectKey::new(slug.metadata_key(&output)).unwrap();
         let store = Arc::new(DenyUpload { inner: MemoryStore::default(), denied: metadata_key.clone(), local, uploads: Mutex::new(Vec::new()) });
-        let rows = [StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
+        let rows = [StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(1))])), recency: None }];
         let data = build_event_batch(&rows, Some(StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
         let mut metadata = MetadataBuilder::new(false, true); metadata.write_leaf(&data).unwrap();

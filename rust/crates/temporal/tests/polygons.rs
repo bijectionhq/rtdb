@@ -6,7 +6,7 @@ use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, MemoryBudget, Tem
 fn times(values: &[i64]) -> Vec<Timestamp> { values.iter().copied().map(Timestamp).collect() }
 fn interval(lower: i64, upper: i64) -> Interval { Interval::from_micros(lower, upper).unwrap() }
 fn event(iid: u8, system_from: i64, lower: i64, upper: i64, op: EventOp) -> EventHeader {
-    EventHeader { commit_position: 0, iid: Iid([iid; 16]), system_from: Timestamp(system_from), valid_time: interval(lower, upper), op }
+    EventHeader { position: None, commit_position: 0, iid: Iid([iid; 16]), system_from: Timestamp(system_from), valid_time: interval(lower, upper), op }
 }
 fn polygon(valid_times: &[i64], ceilings: &[i64]) -> Polygon {
     Polygon::new(times(valid_times), times(ceilings)).unwrap()

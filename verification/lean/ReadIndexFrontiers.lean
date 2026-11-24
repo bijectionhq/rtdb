@@ -2,63 +2,82 @@ import Std
 
 namespace RTDB.ReadIndexFrontiers
 
-inductive Reply where
-  | observed (heldBeforeCall heldAtReply : Bool)
-  | missing (heldBeforeCall : Bool)
-  deriving DecidableEq
+structure Cut where
+  history : Nat
+  entries : List Nat
+  deriving DecidableEq, Repr
 
-def priorVotes : List Reply → Nat
-  | [] => 0
-  | .observed prior _ :: rest | .missing prior :: rest => prior.toNat + priorVotes rest
+def Extends (later earlier : Cut) : Prop :=
+  later.history = earlier.history ∧ ∃ suffix, later.entries = earlier.entries ++ suffix
 
-def observedVotes : List Reply → Nat
-  | [] => 0
-  | .missing _ :: rest => observedVotes rest
-  | .observed _ held :: rest => held.toNat + observedVotes rest
+theorem extension_transitive {a b c : Cut} (ab : Extends a b) (bc : Extends b c) :
+    Extends a c := by
+  obtain ⟨abHistory, abSuffix, abEntries⟩ := ab
+  obtain ⟨bcHistory, bcSuffix, bcEntries⟩ := bc
+  exact ⟨abHistory.trans bcHistory, bcSuffix ++ abSuffix, by
+    rw [abEntries, bcEntries, List.append_assoc]⟩
 
-def missingVotes : List Reply → Nat
-  | [] => 0
-  | .observed _ _ :: rest => missingVotes rest
-  | .missing _ :: rest => 1 + missingVotes rest
+variable {Journal : Type}
 
-def upperVotes (replies : List Reply) : Nat :=
-  observedVotes replies + missingVotes replies
+def Intersects (install probe : Journal → Prop) : Prop :=
+  ∃ journal, install journal ∧ probe journal
 
-def Consistent : List Reply → Prop
-  | [] => True
-  | .observed prior held :: rest => prior.toNat ≤ held.toNat ∧ Consistent rest
-  | .missing _ :: rest => Consistent rest
+def Installed (voters : Journal → Prop) (cut : Cut) (durable : Journal → Cut) : Prop :=
+  ∀ journal, voters journal → Extends (durable journal) cut
 
-theorem completed_position_is_below_the_read_bound
-    (replies : List Reply) (quorum : Nat) (consistent : Consistent replies)
-    (completed : quorum ≤ priorVotes replies) : quorum ≤ upperVotes replies := by
-  suffices priorVotes replies ≤ upperVotes replies from Nat.le_trans completed this
-  clear completed quorum
-  induction replies with
-  | nil => simp [priorVotes, upperVotes, observedVotes, missingVotes]
-  | cons reply rest ih =>
-    cases reply with
-    | observed prior held =>
-      simp only [Consistent] at consistent
-      have le := ih consistent.2
-      simp only [priorVotes, upperVotes, observedVotes, missingVotes] at le ⊢
-      omega
-    | missing prior =>
-      have le := ih consistent
-      cases prior <;>
-        simp [priorVotes, upperVotes, observedVotes, missingVotes] at le ⊢ <;> omega
+/-- Probe samples may occur at different times. Each accepted reply extends
+that journal's installed cut at invocation. -/
+theorem selected_covers_prior_installation
+    {install probe : Journal → Prop} {prior selected : Cut}
+    {durable sampled : Journal → Cut}
+    (intersection : Intersects install probe)
+    (installed : Installed install prior durable)
+    (monotone : ∀ j, probe j → Extends (sampled j) (durable j))
+    (maximum : ∀ j, probe j → Extends selected (sampled j)) :
+    Extends selected prior := by
+  obtain ⟨journal, wrote, answered⟩ := intersection
+  exact extension_transitive (maximum journal answered)
+    (extension_transitive (monotone journal answered) (installed journal wrote))
 
-theorem complete_observation_excludes_a_minority_tail
-    (replies : List Reply) (quorum : Nat) (complete : missingVotes replies = 0)
-    (minority : observedVotes replies < quorum) : upperVotes replies < quorum := by
-  simp [upperVotes, complete, minority]
+/-- Every admission to exposure establishes the same premise a writer has
+to establish before replying. -/
+theorem successive_reads_are_monotone
+    {firstInstall secondProbe : Journal → Prop} {firstRead secondRead : Cut}
+    {atInvocation sampled : Journal → Cut}
+    (intersection : Intersects firstInstall secondProbe)
+    (beforeExposure : Installed firstInstall firstRead atInvocation)
+    (monotone : ∀ j, secondProbe j → Extends (sampled j) (atInvocation j))
+    (maximum : ∀ j, secondProbe j → Extends secondRead (sampled j)) :
+    Extends secondRead firstRead :=
+  selected_covers_prior_installation intersection beforeExposure monotone maximum
 
-theorem missing_reply_can_hide_a_completed_position :
-    let replies : List Reply := [.observed true true, .observed false false, .missing true]
-    priorVotes replies = 2 ∧ observedVotes replies = 1 ∧ upperVotes replies = 2 := by decide
+inductive Handoff : Cut → Cut → Prop
+  | same (cut : Cut) : Handoff cut cut
+  | activate {old floor newer : Cut} (sealed : Handoff old floor) (installed : Extends newer floor) :
+      Handoff old newer
 
-#print axioms completed_position_is_below_the_read_bound
-#print axioms complete_observation_excludes_a_minority_tail
-#print axioms missing_reply_can_hide_a_completed_position
+theorem handoff_preserves_installed_prefix {old new : Cut} (handoff : Handoff old new) :
+    Extends new old := by
+  induction handoff with
+  | same cut => exact ⟨rfl, [], by simp⟩
+  | activate _ installed ancestor => exact extension_transitive installed ancestor
+
+def readFrom (replicas : List Nat) : Nat := replicas.foldl max 0
+
+theorem single_installation_permits_read_inversion :
+    readFrom [1, 0] = 1 ∧ readFrom [0, 0] = 0 := by decide
+
+theorem matching_offsets_do_not_bind_history :
+    let original := ({ history := 1, entries := [7] } : Cut)
+    let foreign := ({ history := 2, entries := [7] } : Cut)
+    original.entries.length = foreign.entries.length ∧ ¬ Extends foreign original := by
+  simp [Extends]
+
+#print axioms extension_transitive
+#print axioms selected_covers_prior_installation
+#print axioms successive_reads_are_monotone
+#print axioms handoff_preserves_installed_prefix
+#print axioms single_installation_permits_read_inversion
+#print axioms matching_offsets_do_not_bind_history
 
 end RTDB.ReadIndexFrontiers

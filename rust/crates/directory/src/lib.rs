@@ -296,6 +296,9 @@ pub struct DeploymentRecord {
     /// Commitment to this checkpoint's recovery inventory in this residence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_manifest_sha256: Option<[u8; 32]>,
+    /// The portable journal publication carried by this exact recovery inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_decision: Option<Box<CheckpointDecision>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_anchor: Option<Box<JournalAnchor>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +419,9 @@ pub struct CatalogReader {
     pub replica_epoch: i32,
     /// Exact and restored captures can have no installed replica cut.
     pub cut: Option<rtdb_types::CatalogCut>,
+    /// Complete for compacted primary paths within this captured catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_primary_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +479,7 @@ pub enum StorageRegion {
     },
     ReplicaReplay {
         first_required: i64,
+        through: i64,
         custody: ReplayCustody,
     },
     /// A fork has admitted provider I/O against this physical residence.
@@ -557,6 +564,14 @@ impl StorageRegion {
             Self::Remote { closed: true, .. } | Self::ReferenceRead { .. }
             | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => None,
             Self::ReplicaReplay { first_required, .. } => Some(*first_required),
+        }
+    }
+
+    pub fn requires_replica_offset(&self, offset: i64) -> bool {
+        match self {
+            Self::ReplicaReplay { first_required, through, .. } =>
+                *first_required < 0 || *through < *first_required || (*first_required..=*through).contains(&offset),
+            region => region.first_required_replica().is_some_and(|first| first <= offset),
         }
     }
 
@@ -879,6 +894,13 @@ pub struct Checkpoint {
     pub root_sha256: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointDecision {
+    pub checkpoint: Checkpoint,
+    pub manifest: [u8; 32],
+    pub stable: Vec<u8>,
+}
+
 /// The digest of an inclusive replica interval, rooted in its first physical residence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalAnchor {
@@ -895,12 +917,24 @@ pub struct ReplicaPayloadTrim {
     pub journals: BTreeSet<JournalEndpoint>,
     pub applied: bool,
     pub candidates: Vec<ReplicaPayloadCandidate>,
+    /// One authenticated publication for each frame in this new trim interval.
+    pub journal_units: Vec<ReplicaJournalUnit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaJournalUnit {
+    pub position: i64,
+    pub frame_sha256: [u8; 32],
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaPayloadCandidate {
     pub key: String,
     pub position: i64,
+    /// Digest of the sealed frame at this position in the certified journal.
+    pub frame_sha256: [u8; 32],
     pub version: rtdb_types::PhysicalObjectVersion,
 }
 
@@ -952,8 +986,19 @@ pub struct CheckpointTransferTerminal {
     pub replica_through: i64,
     pub source_through: i64,
     pub basis: rtdb_types::TransactionKey,
+    pub placed_debt: Option<rtdb_types::PlacedTransferDebt>,
     pub replica_sha256: Option<[u8; 32]>,
     pub lifetime_floors_sha256: [u8; 32],
+}
+
+impl CheckpointTransferTerminal {
+    pub fn placed_transfer(&self) -> rtdb_types::PlacedTransfer {
+        rtdb_types::PlacedTransfer {
+            after: self.fence.destination.checkpoint.boundary,
+            through: self.replica_through,
+            debt: self.placed_debt.clone(),
+        }
+    }
 }
 
 /// Target-owned durable replay input authenticated against a source receipt.
@@ -1006,7 +1051,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
-            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
+            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
 
@@ -1090,22 +1135,38 @@ impl DeploymentRecord {
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
         self.storage_regions.values().filter_map(StorageRegion::first_required_replica)
-            .chain(self.checkpoint_captures.values().filter(|capture| {
-                capture.world_replay.is_some() && capture.incarnation == self.incarnation
-                    && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted
-            }).map(|capture| capture.checkpoint.boundary.checked_add(1).filter(|offset| *offset >= 0).unwrap_or(0)))
-            .chain(self.checkpoint_suffix_pins.values()
-                .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
-                .map(|pin| {
-                    if pin.incarnation == self.incarnation && pin.log_epoch == self.log_epoch {
-                        match pin.checkpoint.boundary.checked_add(1) {
-                            Some(first) if first >= 0 && first == pin.journal_interval[0] => first,
-                            _ => 0,
-                        }
-                    } else {
-                        0
-                    }
-                }))
+            .chain(self.capture_replica_offsets())
+            .chain(self.live_replica_suffixes(now_ms)
+                .map(|pin| self.verified_suffix_interval(pin).map_or(0, |interval| interval[0])))
+    }
+
+    /// Whether an eligible recovery dependency can still open this position.
+    pub fn requires_replica_offset(&self, offset: i64, now_ms: i64) -> bool {
+        self.storage_regions.values().any(|region| region.requires_replica_offset(offset))
+            || self.capture_replica_offsets().any(|first| first <= offset)
+            || self.live_replica_suffixes(now_ms).any(|pin| {
+                self.verified_suffix_interval(pin).is_none_or(|[first, through]| (first..=through).contains(&offset))
+            })
+    }
+
+    fn capture_replica_offsets(&self) -> impl Iterator<Item = i64> + '_ {
+        self.checkpoint_captures.values().filter(|capture| {
+            capture.world_replay.is_some() && capture.incarnation == self.incarnation
+                && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted
+        }).map(|capture| capture.checkpoint.boundary.checked_add(1).filter(|offset| *offset >= 0).unwrap_or(0))
+    }
+
+    fn live_replica_suffixes(&self, now_ms: i64) -> impl Iterator<Item = &CheckpointSuffixPin> + '_ {
+        self.checkpoint_suffix_pins.values()
+            .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
+    }
+
+    fn verified_suffix_interval(&self, pin: &CheckpointSuffixPin) -> Option<[i64; 2]> {
+        let first = pin.checkpoint.boundary.checked_add(1)?;
+        let through = pin.replica_through;
+        (pin.incarnation == self.incarnation && pin.log_epoch == self.log_epoch
+            && first >= 0 && through >= first && pin.journal_interval == [first, through])
+            .then_some([first, through])
     }
 
     /// Oversized replica records keep their payloads in the serving store
@@ -1155,6 +1216,12 @@ pub trait AudienceSeatClaim: Send + Sync {
 
 #[async_trait]
 pub trait Directory: Send + Sync {
+    async fn receiver_clock(&self, _domain: uuid::Uuid) -> Result<Option<ReceiverClockSample>> {
+        Err(Anomaly::unsupported("rtdb.directory/clock-authority", "The directory has no receiver clock authority"))
+    }
+    async fn publish_receiver_clock(&self, _domain: uuid::Uuid, _publisher: uuid::Uuid, _observation: rtdb_types::Timestamp) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.directory/clock-authority", "The directory has no receiver clock authority"))
+    }
     /// Permanently excludes an installed journal's deployment ID from directory admission.
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()>;
     /// Stores a new deployment; refuses if its id or name is taken.
@@ -1273,14 +1340,19 @@ fn fork_conflict() -> Anomaly {
 
 mod reference_revision;
 mod lineage;
-pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
+pub use lineage::{ExactRetirementGrant, ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
 use lineage::{StoredLineage, lineage_busy};
+
+mod receiver_clock;
+mod receiver_clock_step;
+pub use receiver_clock::ReceiverClockSample;
+use receiver_clock::CLOCK_PREFIX;
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
 const AUDIENCE_SEAT_PREFIX: &str = "~audience-seat/";
 
 fn reserved_deployment_name(name: &str) -> bool {
-    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(AUDIENCE_SEAT_PREFIX)
+    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(AUDIENCE_SEAT_PREFIX) || name.starts_with(CLOCK_PREFIX)
 }
 
 fn require_deployment_name(name: &str) -> Result<()> {
@@ -1418,6 +1490,17 @@ fn prepare_checkpoint_transfer_terminal(
     {
         return Err(transfer_changed());
     }
+    if let Some(debt) = &terminal.placed_debt {
+        let slot = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
+        let epoch = rtdb_types::StorageEpoch(stage.source_log_epoch);
+        if debt.term <= 0 || debt.reserved_at <= stage.checkpoint.boundary
+            || debt.reserved_at > terminal.replica_through
+            || slot.attempt.position().epoch() != epoch
+            || slot.attempt.position().offset() <= terminal.source_through
+        {
+            return Err(transfer_changed());
+        }
+    }
     if let Some(existing) = source.checkpoint_transfer_terminal.as_deref() {
         return if existing == terminal { Ok(source.clone()) } else { Err(transfer_changed()) };
     }
@@ -1510,6 +1593,7 @@ fn prepare_checkpoint_transfer_activation(
     next.replica_journals = replica.journals.iter().cloned().collect();
     next.checkpoint = Some(stage.checkpoint);
     next.recovery_manifest_sha256 = Some(activation.recovery_manifest_sha256);
+    next.checkpoint_decision = None;
     Ok(next)
 }
 
@@ -1582,6 +1666,8 @@ pub struct MemoryDirectory {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    receiver_clocks: BTreeMap<uuid::Uuid, ReceiverClockSample>,
     deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -1689,6 +1775,20 @@ impl MemoryDirectory {
 
 #[async_trait]
 impl Directory for MemoryDirectory {
+    async fn receiver_clock(&self, domain: uuid::Uuid) -> Result<Option<ReceiverClockSample>> {
+        Ok(self.state()?.receiver_clocks.get(&domain).copied())
+    }
+
+    async fn publish_receiver_clock(&self, domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp) -> Result<()> {
+        let mut state = self.state()?;
+        let previous = state.receiver_clocks.get(&domain).copied();
+        if let Some(sample) = ReceiverClockSample::advance(previous, domain, publisher, observation)? {
+            state.receiver_clocks.insert(domain, sample);
+            self.persist(&mut state)?;
+        }
+        Ok(())
+    }
+
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         let id = installed_journal_id(id)?;
         let mut state = self.state()?;

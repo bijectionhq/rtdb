@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -7,7 +7,7 @@ use http_body_util::{Either, Empty};
 use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, service::service_fn};
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, now_ms};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
 use rtdb_flight_sql::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
 use rtdb_flight_sql::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS};
 use rtdb_types::{Anomaly, Result};
@@ -22,7 +22,8 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, control, gateway::{De
 
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
-const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v3";
+const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v5";
+const FRESH_HEADER: &str = "x-rtdb-fresh-read";
 const HANDSHAKE: &str = "/arrow.flight.protocol.FlightService/Handshake";
 const DO_ACTION: &str = "/arrow.flight.protocol.FlightService/DoAction";
 const MAXIMUM_HEADER_BYTES: u32 = 8 * 1024;
@@ -37,6 +38,15 @@ struct Target {
     address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enrollment: Option<ordered_logkeeper::ordered::Enrollment>,
+    replica: Option<FreshReplica>,
+    ordered_reader: Option<ordered_logkeeper::ordered::Placement>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FreshReplica {
+    stream: String,
+    log_epoch: i32,
+    storage_prefix: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,16 +235,20 @@ impl Router {
         Ok(token)
     }
 
-    async fn first_target(&self, selector: &str) -> std::result::Result<Target, Status> {
+    async fn first_target(&self, selector: &str, fresh: bool) -> std::result::Result<Target, Status> {
         let (name, installation) = database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?;
         if let Some(audience) = self.audience {
+            if fresh { return Err(Status::permission_denied("The reserved audience has its own admission")); }
             return self.audience_target(name, installation, audience).await;
+        }
+        if fresh {
+            return self.fresh_target(name, installation).await;
         }
         if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
             if installation.is_some_and(|id| id != installed.deployment) {
                 return Err(Status::not_found("No matching installed Flight SQL deployment"));
             }
-            let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, |worker, _| async move {
+            let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, true, |worker, _| async move {
                 let reply = control::call(&worker.control, &control::Request::FlightEndpoint,
                     self.timeout, &self.control).await?;
                 match reply {
@@ -243,7 +257,7 @@ impl Router {
                 }
             }).await.map_err(|_| moved())?;
             let target = Target { name: name.to_owned(), deployment: installed.deployment.to_string(),
-                holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment) };
+                holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment), replica: None, ordered_reader: None };
             self.validate(&target).await?;
             return Ok(target);
         }
@@ -260,7 +274,56 @@ impl Router {
         let reply = control::call(control, &control::Request::FlightEndpoint, self.timeout, &self.control).await
             .map_err(|_| Status::unavailable("The holder did not report a Flight SQL endpoint"))?;
         let control::Response::FlightEndpoint { address } = reply else { return Err(Status::unavailable("The holder has no Flight SQL endpoint")); };
-        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None })
+        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None, replica: None, ordered_reader: None })
+    }
+
+    /// Resolve an eligible subscriber and let the receiver establish its own cut.
+    async fn fresh_target(&self, name: &str, installation: Option<Uuid>) -> std::result::Result<Target, Status> {
+        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+            if installation.is_some_and(|id| id != installed.deployment) {
+                return Err(Status::not_found("No matching installed Flight SQL deployment"));
+            }
+            let read = crate::gateway::route_ordered_reader(name, installed, &self.options).await.map_err(|_| moved())?;
+            let target = Target {
+                name: name.into(), deployment: installed.deployment.to_string(),
+                holder: MemberId(read.worker.enrollment.worker.to_string()),
+                address: read.flight.ok_or_else(moved)?, epoch: read.epoch,
+                enrollment: Some(read.worker.enrollment), replica: None, ordered_reader: Some(read.placement),
+            };
+            self.validate(&target).await?;
+            return Ok(target);
+        }
+        let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
+            .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id))
+            .ok_or_else(|| Status::not_found("No matching local Flight SQL deployment"))?;
+        if !record.linearizable_reads || record.lifecycle != Lifecycle::Live || record.move_from.is_some() {
+            return Err(moved());
+        }
+        let members: BTreeMap<_, _> = self.directory.members().await.map_err(directory_error)?
+            .into_iter().map(|member| (member.id.clone(), member)).collect();
+        for replica in crate::deployment::read_replicas(&record, &members, now_ms()) {
+            let Some(control) = replica.control_address.as_deref() else { continue; };
+            let subscription = control::Request::SubscribeFresh { name: name.to_owned() };
+            if !matches!(control::call(control, &subscription, self.timeout, &self.control).await,
+                Ok(control::Response::Subscribed { .. }))
+            {
+                continue;
+            }
+            let Ok(control::Response::FlightEndpoint { address }) = control::call(
+                control, &control::Request::FlightEndpoint, self.timeout, &self.control,
+            ).await else { continue; };
+            let target = Target {
+                name: record.name.clone(), deployment: record.id.clone(),
+                holder: replica.id.clone(), epoch: record.epoch, address, enrollment: None,
+                ordered_reader: None,
+                replica: Some(FreshReplica {
+                    stream: record.stream("replica"), log_epoch: record.log_epoch,
+                    storage_prefix: record.storage_prefix(),
+                }),
+            };
+            if self.validate(&target).await.is_ok() { return Ok(target); }
+        }
+        Err(Status::unavailable("No fresh Flight subscriber is available"))
     }
 
     async fn audience_target(
@@ -282,17 +345,34 @@ impl Router {
             return Err(moved());
         }
         let address = audience_holder_address(&member.address, route.holder_port)?;
-        Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None })
+        Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None, replica: None, ordered_reader: None })
     }
 
     async fn validate(&self, target: &Target) -> std::result::Result<(), Status> {
         if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(&target.name)) {
             let Some(enrollment) = target.enrollment.filter(|id| installed.endpoints.contains_key(id)) else { return Err(moved()); };
             let route = installed.journal.route().await.map_err(|_| moved())?;
-            return if target.deployment == installed.deployment.to_string() && route.writer.grant
-                .is_some_and(|grant| grant.epoch == target.epoch && grant.enrollment == enrollment) { Ok(()) } else { Err(moved()) };
+            if target.deployment != installed.deployment.to_string() || route.writer.epoch != target.epoch {
+                return Err(moved());
+            }
+            return if target.ordered_reader.is_some_and(|scope| scope == route.placement)
+                || target.ordered_reader.is_none() && route.writer.grant.is_some_and(|grant| grant.enrollment == enrollment)
+            { Ok(()) } else { Err(moved()) };
         }
-        if target.enrollment.is_some() { return Err(moved()); }
+        if let Some(replica) = &target.replica {
+            let Some(record) = self.directory.deployment(&target.deployment).await.map_err(directory_error)? else { return Err(moved()); };
+            if record.name != target.name || record.epoch != target.epoch || record.log_epoch != replica.log_epoch
+                || record.stream("replica") != replica.stream || record.storage_prefix() != replica.storage_prefix
+                || !record.linearizable_reads || record.lifecycle != Lifecycle::Live || record.move_from.is_some()
+            {
+                return Err(moved());
+            }
+            let members: BTreeMap<_, _> = self.directory.members().await.map_err(directory_error)?
+                .into_iter().map(|member| (member.id.clone(), member)).collect();
+            return if crate::deployment::read_replicas(&record, &members, now_ms())
+                .iter().any(|member| member.id == target.holder) { Ok(()) } else { Err(moved()) };
+        }
+        if target.enrollment.is_some() || target.ordered_reader.is_some() { return Err(moved()); }
         let (record, member) = tokio::try_join!(self.directory.deployment(&target.deployment), self.directory.member(&target.holder)).map_err(directory_error)?;
         let current = record.zip(member).is_some_and(|(record, member)| {
             record.name == target.name && record.epoch == target.epoch && holder_is_current(&record, &member)
@@ -312,6 +392,14 @@ impl Router {
             && cookie != bearer { return Err(Status::unauthenticated("Flight SQL cookie and bearer route disagree")); }
         let selector = single_header(request.headers(), DATABASE_HEADER)?;
         let route = bearer.or(cookie).map(|token| self.decode(token)).transpose()?;
+        let fresh = match single_header(request.headers(), FRESH_HEADER)? {
+            Some("1") if route.is_none() && request.uri().path() == HANDSHAKE => true,
+            Some(_) => return Err(Status::permission_denied("A fresh Flight route is fixed at its handshake")),
+            None => false,
+        };
+        if route.as_ref().is_some_and(|route| route.target.replica.is_some() || route.target.ordered_reader.is_some()) && request.uri().path() != DO_ACTION {
+            return Err(Status::permission_denied("The fresh Flight route carries owned reads"));
+        }
         let parse_audience = |value: &str| AudienceFlightConfig::parse(value)
             .map_err(|_| Status::invalid_argument("Invalid Flight audience reservation"));
         let requested_audience = single_header(request.headers(), AUDIENCE_FLIGHT_HEADER)?
@@ -364,7 +452,7 @@ impl Router {
                     if self.audience.is_none() { self.validate(&route.target).await?; }
                     Ok((route.target, Some(route.session)))
                 }
-                None => self.first_target(selector.expect("a new session has a selector")).await.map(|target| (target, None)),
+                None => self.first_target(selector.expect("a new session has a selector"), fresh).await.map(|target| (target, None)),
             }
         };
         let (target, session) = tokio::time::timeout(self.timeout, routing).await
@@ -379,6 +467,7 @@ impl Router {
         headers.remove(header::COOKIE);
         headers.remove(FORWARDED_PEER_HEADER);
         headers.remove(AUDIENCE_FLIGHT_HEADER);
+        headers.remove(FRESH_HEADER);
         headers.remove(AUDIENCE_SEAT_HEADER);
         if let Some(seat) = seat {
             headers.insert(AUDIENCE_SEAT_HEADER, header_value(&seat.to_string())?);
@@ -391,12 +480,22 @@ impl Router {
             headers.insert(header::COOKIE, header_value(&format!("{COOKIE}={session}"))?);
             if has_bearer { headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {session}"))?); }
         } else {
-            headers.insert(FORWARDED_PEER_HEADER, header_value(&self.secret.flight_peer(&target.deployment, target.epoch, remote))?);
+            let peer = match (&target.replica, target.ordered_reader) {
+                (Some(replica), None) => self.secret.fresh_flight_peer(
+                    &target.deployment, target.epoch, replica.log_epoch, &replica.stream, &replica.storage_prefix, remote,
+                ),
+                (None, Some(placement)) => self.secret.ordered_reader_peer(
+                    placement, target.epoch, target.enrollment.ok_or_else(moved)?, remote,
+                ),
+                (None, None) => self.secret.flight_peer(&target.deployment, target.epoch, remote),
+                (Some(_), Some(_)) => return Err(moved()),
+            };
+            headers.insert(FORWARDED_PEER_HEADER, header_value(&peer)?);
         }
         let path = request.uri().path_and_query().ok_or_else(|| Status::invalid_argument("Invalid Flight SQL request path"))?.clone();
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
-        let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
+        let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL attachment disconnected"))?;
         self.rewrite_response(response.headers_mut(), target, audience, seat)?;
         Ok(response.map(|body| Either::Right(RoutedBody { body, admission, _deployment: deployment })))
     }
@@ -418,6 +517,9 @@ impl Router {
         let seat = seat.map(|seat| seat.to_string());
         if seat.as_deref() != single_header(headers, AUDIENCE_SEAT_HEADER)? {
             return Err(Status::unavailable("The holder did not acknowledge the exact Flight audience seat"));
+        }
+        if target.replica.is_some() || target.ordered_reader.is_some() {
+            headers.insert(FRESH_HEADER, HeaderValue::from_static("1"));
         }
         let route = self.encode(&SessionRoute { target, session, audience })?;
         headers.insert(header::SET_COOKIE, header_value(&format!("{COOKIE}={route}"))?);

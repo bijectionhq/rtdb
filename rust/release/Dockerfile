@@ -64,7 +64,7 @@ ENV TZ=UTC
 STOPSIGNAL SIGTERM
 
 FROM runtime-environment AS multi
-LABEL io.rtdb.hosted-protocol=84 io.rtdb.pgwire-arrow-copy-out=true
+LABEL io.rtdb.hosted-protocol=146 io.rtdb.pgwire-arrow-copy-out=true
 RUN apt-get update \
     && apt-get install --no-install-recommends -y curl jq netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
@@ -72,6 +72,7 @@ COPY --from=multi-build /source/rust/target/release/rtdb-multi /usr/local/bin/rt
 COPY --chmod=0555 rust/release/multi-entrypoint.sh /usr/local/bin/rtdb-multi-entrypoint
 USER rtdb
 ENTRYPOINT ["/usr/local/bin/rtdb-multi-entrypoint"]
+LABEL io.rtdb.held-root-catalog=true
 
 FROM runtime-environment AS runtime
 COPY --from=build /source/rust/target/release/rtdb /usr/local/bin/rtdb

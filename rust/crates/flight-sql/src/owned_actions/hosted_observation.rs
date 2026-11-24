@@ -3,7 +3,8 @@ use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
 pub(crate) const PREPARE_APPLIED_READ_V3: &str = "rtdb.owned.PrepareAppliedRead.v3";
-pub(crate) const CONFIRM_APPLIED_HOSTED_V5: &str = "rtdb.owned.ConfirmAppliedHosted.v5";
+pub(crate) const CONFIRM_APPLIED_HOSTED_V6: &str = "rtdb.owned.ConfirmAppliedHosted.v6";
+pub(crate) const CONFIRM_HOSTED_SOURCE_V1: &str = "rtdb.owned.ConfirmHostedSource.v1";
 
 pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadFloor, &[u8]), Status> {
     let (history, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Applied read requires a history"))?;
@@ -55,6 +56,29 @@ fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Stat
 }
 
 impl Service {
+    pub(crate) async fn confirm_hosted_source_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let (history, suffix) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("The hosted source confirmation requires a history"))?;
+        let history = Uuid::from_bytes(*history);
+        let floor = if suffix == [0] {
+            None
+        } else {
+            let (floor, rest) = applied_read_floor(body)?;
+            if !rest.is_empty() { return Err(invalid("Unexpected hosted source confirmation data")); }
+            Some(floor)
+        };
+        let connection = self.connection(call, &call.database).await?;
+        let native = connection.borrow().await?;
+        require_idle(&native)?;
+        let applied = native.confirm_hosted_source_prefix(history, floor.as_ref()).await.map_err(status)?;
+        let rows = RecordBatch::try_from_iter_with_nullable([
+            ("tx_id", Arc::new(Int64Array::from(vec![applied.map(|key| key.tx_id.0)])) as ArrayRef, true),
+            ("system_time_micros", Arc::new(Int64Array::from(vec![applied.map(|key| key.system_time.0)])), true),
+        ]).map_err(arrow)?;
+        self.owned_stream_reply_in(call.memory(), rows.schema_ref(), std::slice::from_ref(&rows))
+    }
+
     pub(crate) async fn prepare_applied_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         let source = call.session.audience_source().ok_or_else(unsupported)?;
         let (floor, rest) = applied_read_floor(body)?;
@@ -104,19 +128,25 @@ impl Service {
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
         let (controls, _control_charges) =
             self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        for control in &controls {
+            if let EntityId::String(id) = control.id() {
+                hosted_control::require_audience_control(&call.session, &control.table().table, id)?;
+            }
+        }
         let until = Timestamp(i64::from_be_bytes(*deadline));
         let covered = held.snapshot.confirm_applied_hosted_read(scope, &floor, until, &controls, point.as_ref())
             .await.map_err(status)?;
         let bytes = match covered {
-            Some(covered) => {
-                let mut bytes = Vec::with_capacity(16);
-                bytes.extend_from_slice(&covered.tx_id.0.to_be_bytes());
-                bytes.extend_from_slice(&covered.system_time.0.to_be_bytes());
+            Some(confirmation) => {
+                let mut bytes = Vec::with_capacity(24);
+                bytes.extend_from_slice(&confirmation.covered.tx_id.0.to_be_bytes());
+                bytes.extend_from_slice(&confirmation.covered.system_time.0.to_be_bytes());
+                bytes.extend_from_slice(&confirmation.observed_at.0.to_be_bytes());
                 Bytes::from(bytes)
             }
             None => Bytes::from_static(&[0]),
         };
-        Ok(ActionResult { body: wire::retain(bytes, call.reserve(16)?) })
+        Ok(ActionResult { body: wire::retain(bytes, call.reserve(24)?) })
     }
 
     pub(crate) async fn observe_held_hosted_action(

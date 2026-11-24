@@ -938,16 +938,50 @@ impl EntityIds {
     pub fn ids(&self) -> &[EntityId] { &self.ids }
 }
 
+pub(crate) enum MetadataErasureUnit {
+    Table { table: TableRef, id: EntityId },
+    Owned { relation: rtdb_types::OwnedRelation, id: EntityId },
+}
+
+impl MetadataErasureUnit {
+    fn parse(value: &Value) -> Result<Option<Self>> {
+        let Value::Struct(metadata) = value else { return Ok(None); };
+        let Some(target) = metadata.get("rtdb_erasure_unit_v1") else { return Ok(None); };
+        let invalid = || Anomaly::incorrect("rtdb.tx/metadata-erasure-unit",
+            "Metadata erasure requires one table or owned relation and an exact entity ID");
+        let Value::Struct(fields) = target else { return Err(invalid()); };
+        if fields.len() != 2 { return Err(invalid()); }
+        let id = fields.get("id").ok_or_else(invalid)?.entity_id()?;
+        let unit = match (fields.get("table"), fields.get("owned_relation")) {
+            (Some(Value::Utf8(table)), None) => {
+                let table = TableRef::parse(table)?;
+                if crate::source::is_reserved_write_schema(&table.schema) { return Err(invalid()); }
+                Self::Table { table, id }
+            }
+            (None, Some(Value::Utf8(relation))) => {
+                let relation = rtdb_types::OwnedRelation::new(relation)?;
+                if !relation.is_root_data() { return Err(invalid()); }
+                Self::Owned { relation, id }
+            }
+            _ => return Err(invalid()),
+        };
+        Ok(Some(unit))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UserMetadata { value: Arc<Value>, _reservation: Arc<MemoryReservation> }
 impl UserMetadata {
     pub fn new(mut value: Value, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if !matches!(value, Value::Struct(_)) { return Err(Anomaly::incorrect("xtdb/invalid-user-metadata", "Transaction metadata must be a document")); }
         value.admit_object_dates()?;
+        MetadataErasureUnit::parse(&value)?;
         let reservation = memory.reserve(value.retained_bytes()?.checked_add(128).ok_or_else(overflow)?)?;
         Ok(Self { value: Arc::new(value), _reservation: reservation })
     }
     pub fn value(&self) -> &Value { &self.value }
+
+    pub(crate) fn erasure_unit(&self) -> Result<Option<MetadataErasureUnit>> { MetadataErasureUnit::parse(self.value()) }
 
     pub(crate) fn requires_ordered_system_time(&self) -> bool {
         matches!(
@@ -1274,6 +1308,13 @@ pub enum OwnedPeriodEffect {
     Delete(EntityId),
 }
 
+/// A temporal target from a held live clock, anchored to an ordered data cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedClockSlot {
+    pub through: TxId,
+    pub reading: Timestamp,
+}
+
 #[derive(Clone, Debug)]
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
@@ -1296,7 +1337,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
     OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<rtdb_types::TimedJournalCutoff> },
-    OwnedClockSlot { predecessor: TransactionKey },
+    OwnedClockSlot { slot: OwnedClockSlot },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,

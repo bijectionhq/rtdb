@@ -27,6 +27,8 @@ const MAX_LINE: u64 = 64 << 20;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Op {
+    ReceiverClock { domain: uuid::Uuid },
+    PublishReceiverClock { domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp },
     CreateDeployment { record: DeploymentRecord },
     StageHostedFork { child: DeploymentRecord, preparation: ForkPreparation },
     CreateFork { child: DeploymentRecord, expected_parent: Version, #[serde(default)] preparation: Option<ForkPublication> },
@@ -52,13 +54,15 @@ enum Op {
 impl Op {
     /// A read may be resent after a lost connection; a write may already have applied.
     fn is_read(&self) -> bool {
-        matches!(self, Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. } | Self::LineageState { .. })
+        matches!(self, Self::ReceiverClock { .. } | Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. } | Self::LineageState { .. })
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Reply {
+    ReceiverClock(Option<crate::ReceiverClockSample>),
+    ReceiverClockPublished,
     InstalledJournalReserved,
     Deployment(DeploymentRecord),
     OptionalDeployment(Option<DeploymentRecord>),
@@ -103,6 +107,11 @@ struct Response { id: u64, result: std::result::Result<Reply, Anomaly> }
 
 async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
     Ok(match op {
+        Op::ReceiverClock { domain } => Reply::ReceiverClock(directory.receiver_clock(domain).await?),
+        Op::PublishReceiverClock { domain, publisher, observation } => {
+            directory.publish_receiver_clock(domain, publisher, observation).await?;
+            Reply::ReceiverClockPublished
+        }
         Op::ReserveInstalledJournal { id } => {
             directory.reserve_installed_journal(id).await?;
             Reply::InstalledJournalReserved
@@ -442,6 +451,20 @@ fn protocol(reply: Reply) -> Anomaly {
 
 #[async_trait]
 impl Directory for RemoteDirectory {
+    async fn receiver_clock(&self, domain: uuid::Uuid) -> Result<Option<crate::ReceiverClockSample>> {
+        match self.call(Op::ReceiverClock { domain }).await? {
+            Reply::ReceiverClock(sample) => Ok(sample),
+            other => Err(protocol(other)),
+        }
+    }
+
+    async fn publish_receiver_clock(&self, domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp) -> Result<()> {
+        match self.call(Op::PublishReceiverClock { domain, publisher, observation }).await? {
+            Reply::ReceiverClockPublished => Ok(()),
+            other => Err(protocol(other)),
+        }
+    }
+
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         match self.call(Op::ReserveInstalledJournal { id }).await? {
             Reply::InstalledJournalReserved => Ok(()),

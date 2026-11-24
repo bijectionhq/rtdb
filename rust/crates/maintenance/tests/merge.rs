@@ -12,6 +12,65 @@ use rtdb_types::{BlockIndex, Iid, Interval, LogicalType, ScalarType, StorageEpoc
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn receipt_compaction_removes_an_older_payload_and_keeps_its_surviving_peer() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let table = TableRef::new("xt", "bounded_retry_receipts");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let slug = tables.entry(&table).unwrap().slug.clone();
+    let old = TrieKey::new(1, None, Vec::new(), BlockIndex(0)).unwrap();
+    let input = TrieKey::l0(BlockIndex(1)).unwrap();
+    let put = |iid, value| StoredEvent { position: None,
+        origin: None, commit_position: 0, entity_key: None,
+        iid, system_from: Timestamp(10), valid_time: Interval::from_micros(10, 20).unwrap(),
+        operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))])),
+        recency: None,
+    };
+    let expired = put(Iid([1; 16]), 100);
+    let retained = put(Iid([2; 16]), 200);
+    let erase = StoredEvent { position: None,
+        system_from: Timestamp(20), valid_time: Interval::ALL, operation: StoredOperation::Erase,
+        ..expired.clone()
+    };
+    let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let mut catalog = TrieCatalog::new(1).unwrap();
+    for (key, events) in [(old.clone(), vec![expired, retained.clone()]), (input.clone(), vec![erase])] {
+        let data = build_event_batch(&events, Some(fields.clone()), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, true);
+        metadata.write_leaf(&data).unwrap();
+        let (metadata, _) = metadata.finish().unwrap();
+        let bytes = write_file(&data.schema(), &[data]).unwrap();
+        let size = bytes.len() as i64;
+        store.put(&ObjectKey::new(slug.data_key(&key)).unwrap(), bytes.into()).await.unwrap();
+        store.put(&ObjectKey::new(slug.metadata_key(&key)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        let trie = rtdb_index::CatalogTrie::notification(key, size, None).unwrap();
+        catalog = catalog.with_tries(table.clone(), [trie], Timestamp(20)).unwrap();
+    }
+    let jobs = rtdb_maintenance::available_jobs(&catalog).unwrap();
+    let [job] = jobs.as_slice() else { panic!("expected one receipt compaction"); };
+    assert!(job.inputs.contains(&old));
+    assert!(job.inputs.contains(&input));
+
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog.clone(), tables, TrieConfig::default()).unwrap()));
+    let executor = SegmentCompactor::new(store.clone(), state, MemoryBudget::new(64 * 1024 * 1024),
+        StorageVersion(6), StorageEpoch(0), MergeConfig {
+            temporary_directory: temporary.path().into(), ..Default::default()
+        }).unwrap();
+    let notice = executor.execute(job, &CancellationToken::new()).await.unwrap();
+    let next = rtdb_index::CatalogTrie::from_proto(&notice.tries[0]).unwrap();
+    let catalog = catalog.with_tries(table.clone(), [next], Timestamp(30)).unwrap();
+    let current = catalog.current_tries(&table);
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].key, job.output);
+    let bytes = store.get(&ObjectKey::new(slug.data_key(&job.output)).unwrap()).await.unwrap();
+    let mut reader = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+    assert_eq!(reader.page_count(), 1);
+    let page = EventBatch::new(reader.read_page(0).unwrap()).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.read_event(0).unwrap(), retained);
+}
+
+#[tokio::test]
 async fn mixed_trie_depths_preserve_every_row_in_the_requested_partition() {
     use rtdb_format::data::build_event_batch_with_recency;
 
@@ -24,7 +83,7 @@ async fn mixed_trie_depths_preserve_every_row_in_the_requested_partition() {
         keys.iter().map(|key| {
             let mut iid = [0; 16];
             iid[0] = *key;
-            StoredEvent {
+            StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: None,
@@ -111,7 +170,7 @@ async fn scan_tie_cutover_reuses_existing_legacy_bytes_and_publishes_new_bytes_a
     let mut inputs = Vec::new();
     for value in [2, 1] {
         let key = TrieKey::new(1, None, Vec::new(), BlockIndex(value)).unwrap();
-        let rows = [StoredEvent {
+        let rows = [StoredEvent { position: None,
             origin: None,
             commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
@@ -168,7 +227,7 @@ async fn same_time_clipping_and_erase_preserve_the_surrounding_history() {
     let store = Arc::new(MemoryStore::default());
     let a = Iid([1; 16]);
     let b = Iid([2; 16]);
-    let row = |iid, system, lower, upper, operation| StoredEvent { origin: None, commit_position: 0, entity_key: None,
+    let row = |iid, system, lower, upper, operation| StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None,
         iid, system_from: Timestamp(system), valid_time: Interval::from_micros(lower, upper).unwrap(), operation, recency: None,
     };
     let put = |value| StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))]));
@@ -243,7 +302,7 @@ async fn l0_merge_splits_one_history_across_recency_files_and_pages() {
     let fields = BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
     let week = 7 * 86_400_000_000i64;
     let rows: Vec<_> = (1..=13).rev().map(|time| if time <= 6 { time } else { week + time })
-        .map(|time| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(time), valid_time: Interval::new(Timestamp(0), Timestamp::MAX).unwrap(),
+        .map(|time| StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(time), valid_time: Interval::new(Timestamp(0), Timestamp::MAX).unwrap(),
         operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(time))])), recency: None }).collect();
     let data = build_event_batch(&rows, Some(fields.into()), None).unwrap();
     let mut metadata = MetadataBuilder::new(false, true);
@@ -303,7 +362,7 @@ async fn compressed_data_and_metadata_compact_with_identical_retry_bytes() {
         let temporary = tempfile::tempdir().unwrap();
         let table = TableRef::new("public", "compressed"); let slug = TableSlug::for_unrecorded_table(&table).unwrap();
         let input = TrieKey::l0(BlockIndex(0)).unwrap(); let store = Arc::new(MemoryStore::default());
-        let rows = vec![StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(42))])), recency: None }];
+        let rows = vec![StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(42))])), recency: None }];
         let data = build_event_batch(&rows, Some(StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
         let mut metadata = MetadataBuilder::new(false, true); metadata.write_leaf(&data).unwrap(); let (metadata, _) = metadata.finish().unwrap();
         for (key, bytes) in [(ObjectKey::new(slug.data_key(&input)).unwrap(), write_file(&data.schema(), &[data]).unwrap()), (ObjectKey::new(slug.metadata_key(&input)).unwrap(), metadata.write().unwrap())] {
@@ -370,7 +429,7 @@ async fn compaction_preserves_raw_decimal_coefficients_in_current_and_historical
     let store = Arc::new(MemoryStore::default());
     let ty = LogicalType::Scalar(ScalarType::Decimal { precision: -1, scale: i32::MAX, bit_width: 128 });
     let fields = BTreeMap::from([("value".into(), ty)]);
-    let events: Vec<_> = [123i128, 456].into_iter().enumerate().map(|(index, coefficient)| StoredEvent {
+    let events: Vec<_> = [123i128, 456].into_iter().enumerate().map(|(index, coefficient)| StoredEvent { position: None,
         origin: None,
         commit_position: 0,
         entity_key: None,

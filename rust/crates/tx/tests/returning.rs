@@ -17,7 +17,7 @@ async fn ignore_returning_keys_3668_mutates_and_reads_the_same_transaction() {
     let memory = MemoryBudget::new(1 << 28);
     {
         let state = PartitionState::empty(Default::default()).unwrap();
-        let context = ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authorization), execution_observer: None, tracer: None };
+        let context = ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authorization), execution_observer: None, tracer: None };
         let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &memory).unwrap();
         let operations = [
             "INSERT INTO docs (_id,foo) VALUES (1,'bar') RETURNING * EXCLUDE foo",

@@ -24,9 +24,14 @@
 -- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
 -- Query and transaction snapshots register at the partition owner's state boundary.
 -- An admitted provider operation retains that registration through completion, including after caller cancellation.
+-- Query execution carries the selected storage registration through provider admission and checks its lease before returning a memory or provider answer.
 -- Compactor reset starts a new naming epoch, so a deletion authorized before it can never reach an output planned after it.
 --
--- Query snapshots on every node also hold a bounded read lease, because another node's collector cannot see them.
+-- Query and fragment snapshots on coordinated storage register with the catalog floor before storage access.
+-- An admitted capture retains that registration through its provider requests.
+-- Compaction and stored artefact builds register their input catalogs on coordinated storage.
+-- A fallback build registers the catalog it recaptures for its own reads.
+-- Replicated snapshots on uncoordinated storage hold a bounded read lease.
 -- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
 -- A node confirms any pending observation its catalog has already applied before deciding whether to sample the tip again.
 -- A snapshot captured after that confirmation may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`.
@@ -38,17 +43,26 @@
 -- A replicated query or delegated fragment without a current lease is refused at snapshot admission.
 -- An admitted snapshot still checks the lease before beginning each provider request.
 -- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
--- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
+-- In Multi, an installed trie release can settle as soon as its floor, recovery coverage and provider publication authorize retirement.
+-- Path releases and checkpoint pack collection still use a separate grace.
 -- Local Multi can also erase an original L0 pack under independent replay archive custody.
 -- That erasure retains logical L0 descriptors so ordered-index replay can resolve the same inputs.
 -- Native nodes with a local journal and local storage share a catalog floor at the storage root.
 -- Catalog admission and floor advancement use the same filesystem lock.
 -- A reader's shared ticket lock retains its catalog until its last provider operation completes or its process exits.
--- The collector persists the floor before releasing files from the installed receipt.
+-- The collector submits an installed receipt to the storage owner.
+-- The classic grant binds that receipt's immutable file identities to the storage owner.
+-- The current conservative decision persists the admission floor before issuing the grant.
+-- A native local trie deletion grant holds the recovery gate exclusively through the physical deletion.
+-- A startup hold shares that gate through checkpoint discovery and cursor admission.
 -- A capture in the floor's journal must supply a cut at or above the durable floor.
 -- A successor journal can open from the latest durable checkpoint after offline replacement.
 -- Held catalogs from the predecessor and opaque captures delay the successor floor.
 -- Installing the successor floor fences earlier journals.
+-- Classic remote storage orders holds and floor advancement on one conditional-write object in the storage root.
+-- The object sequence advances even when rescinding an absent hold after an uncertain registration.
+-- A remote hold remains through its last admitted provider request.
+-- Loss of the holder without a drain retains its ticket.
 -- An exclusive compactor reset resumes cut publication after it adopts its new naming epoch.
 -- The installed prefix covers the new catalog before the reset completes.
 -- A coordinated reset stages the compacted file identities with the successor block and naming epoch before adoption.
@@ -67,6 +81,11 @@
 -- The cell reaper admits the release when its directory observation carries that residence and namespace and covers the installed cut in the same storage root and journal.
 -- The published recovery inventory must cover the installed removal.
 -- Older recovery and metadata admissions retain the released files until their provider work drains.
+-- A coordinated receipt L0 release requires a successor omitting the compacted input.
+-- Directory custody authenticates the exact publication and uses the certified replay anchor to exclude the removal position.
+-- On Classic local storage, the same grant owner requires the retained repair anchor and the exclusive recovery gate before deleting a receipt L0.
+-- Offline classic log-prefix settlement compares the retained root and locks both journal files.
+-- It overwrites covered payloads in place and disposes of skipped diagnostics through the selected source position.
 -- Files in that plan release in artefact, data and metadata order.
 -- An interrupted release retains the plan so a successor can retry the files before releasing the intent marker.
 -- Hosted collection waits for an installed catalog cut before selecting a batch.

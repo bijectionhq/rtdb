@@ -42,9 +42,8 @@ struct ReaderRequest {
     answer: oneshot::Sender<Result<()>>,
 }
 
-#[derive(Clone, Copy)]
 enum ReaderChange {
-    Register { reader: Uuid, cut: Option<CatalogCut> },
+    Register { reader: Uuid, cut: Option<CatalogCut>, paths: Option<Arc<[String]>> },
     Release { reader: Uuid, uncertain: bool },
 }
 
@@ -56,6 +55,10 @@ impl CatalogReaders {
     }
 
     pub async fn retain(&self, cut: Option<CatalogCut>) -> Result<Arc<dyn Send + Sync>> {
+        self.retain_with_primary(cut, None).await
+    }
+
+    pub async fn retain_with_primary(&self, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>) -> Result<Arc<dyn Send + Sync>> {
         let matches_cut = match cut {
             Some(cut) => self.matches_cut(cut)?,
             None => true,
@@ -66,7 +69,7 @@ impl CatalogReaders {
         let (release, drained) = oneshot::channel::<()>();
         let worker = self.clone();
         self.tasks.spawn(async move {
-            let result = worker.change(ReaderChange::Register { reader, cut }).await;
+            let result = worker.change(ReaderChange::Register { reader, cut, paths }).await;
             let opened = result.is_ok();
             let uncertain = result.as_ref().err().is_some_and(|error| !matches!(
                 error.code.as_str(), CLOSED | CATALOG_NOT_CURRENT | "rtdb.multi/unknown-installation"
@@ -115,34 +118,46 @@ impl CatalogReaders {
     }
 
     pub async fn advance(&self, installed: CatalogCut) -> Result<bool> {
+        Ok(self.close_admission(installed, &[None]).await?.1[0])
+    }
+
+    pub async fn admit_trie_release(&self, installed: CatalogCut) -> Result<Option<CatalogAdmissionFloor>> {
+        let (floor, allowed) = self.close_admission(installed, &[None]).await?;
+        Ok(allowed[0].then_some(floor))
+    }
+
+    /// Serializes closing old admissions with testing the current holders for each file.
+    pub async fn close_admission(&self, installed: CatalogCut, paths: &[Option<&str>]) -> Result<(CatalogAdmissionFloor, Vec<bool>)> {
         if !self.matches_cut(installed)? { return Err(closed()); }
+        let floor = CatalogAdmissionFloor {
+            residence: self.residence.clone(), object_namespace: self.namespaces.objects, cut: installed,
+        };
+        let has_exact_witness = paths.iter().any(Option::is_some);
         let record = update_installation(self.directory.as_ref(), &self.deployment, |record| {
             if !self.residence_is_open(record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none() {
                 return Err(closed());
             }
-            if self.floor(record).is_some_and(|floor| floor >= installed.through) { return Ok(()); }
-            let all_readers_allow = record.catalog_readers.values().filter(|reader| {
-                reader.storage_root == self.storage_root && reader.replica_epoch == self.replica_epoch.0
-            }).all(|reader| admits_after_floor(reader.cut.map(|cut| cut.through.0), Some(installed.through.0)));
-            if all_readers_allow {
-                record.catalog_admission_floors.insert(self.storage_root.clone(), CatalogAdmissionFloor {
-                    residence: self.residence.clone(), object_namespace: self.namespaces.objects, cut: installed,
-                });
+            if self.floor(record).is_none_or(|existing| existing < installed.through)
+                && (has_exact_witness || readers_allow(record, &self.storage_root, installed, None))
+            {
+                record.catalog_admission_floors.insert(self.storage_root.clone(), floor.clone());
             }
             Ok(())
         }).await?;
-        Ok(self.floor(&record).is_some_and(|floor| floor >= installed.through))
-    }
-
-    pub async fn trie_release_floor(&self, installed: CatalogCut) -> Result<CatalogAdmissionFloor> {
-        if !self.matches_cut(installed)? { return Err(closed()); }
-        let record = self.directory.deployment(&self.deployment).await?.ok_or_else(closed)?;
-        if !self.residence_is_open(&record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none()
-            || self.floor(&record).is_none_or(|floor| floor < installed.through)
+        let closed = self.floor(&record).is_some_and(|existing| existing >= installed.through);
+        let allowed: Vec<_> = paths.iter().map(|path| closed && readers_allow(&record, &self.storage_root, installed, *path)).collect();
+        if self.floor(&record) == Some(installed.through)
+            && (has_exact_witness || readers_allow(&record, &self.storage_root, installed, None))
         {
-            return Err(closed());
+            let event = if has_exact_witness { "close-catalog-admission" } else { "advance-floor" };
+            crate::residence_trace::record(event, || serde_json::json!({
+                "lineage": record.lineage, "installation": self.deployment, "residence": self.residence, "namespace": self.namespaces.objects,
+                "root": self.storage_root, "revision": record.version, "epoch": self.replica_epoch,
+                "through": installed.through, "eligible_paths": paths.iter().zip(&allowed)
+                    .filter_map(|(path, allowed)| allowed.then_some(*path).flatten()).collect::<Vec<_>>(),
+            }));
         }
-        Ok(CatalogAdmissionFloor { residence: self.residence.clone(), object_namespace: self.namespaces.objects, cut: installed })
+        Ok((floor, allowed))
     }
 
     pub fn matches_release(&self, floor: &CatalogAdmissionFloor) -> bool {
@@ -154,7 +169,7 @@ impl CatalogReaders {
         let (answer, result) = oneshot::channel();
         let start = {
             let mut pending = self.pending.lock();
-            let queue = match change {
+            let queue = match &change {
                 ReaderChange::Register { .. } => &mut pending.registrations,
                 ReaderChange::Release { .. } => &mut pending.releases,
             };
@@ -198,7 +213,7 @@ impl CatalogReaders {
         let mut current = self.directory.deployment(&self.deployment).await?;
         for _ in 0..8 {
             let Some(mut record) = current else {
-                return Ok(batch.iter().map(|request| match request.change {
+                return Ok(batch.iter().map(|request| match &request.change {
                     ReaderChange::Register { .. } => Err(closed()),
                     ReaderChange::Release { .. } => Ok(()),
                 }).collect());
@@ -206,15 +221,15 @@ impl CatalogReaders {
             let mut needs_cas = false;
             let mut answers = Vec::with_capacity(batch.len());
             for request in batch {
-                match request.change {
-                    ReaderChange::Register { reader, cut } => {
-                        let result = self.register(&mut record, reader, cut);
+                match &request.change {
+                    ReaderChange::Register { reader, cut, paths } => {
+                        let result = self.register(&mut record, *reader, *cut, paths.as_deref());
                         needs_cas |= result.is_ok();
                         answers.push(result);
                     }
                     ReaderChange::Release { reader, uncertain } => {
                         // An absent reader can still have an in-flight admission against this version.
-                        needs_cas |= record.catalog_readers.remove(&reader).is_some() || uncertain;
+                        needs_cas |= record.catalog_readers.remove(reader).is_some() || *uncertain;
                         answers.push(Ok(()));
                     }
                 }
@@ -222,27 +237,77 @@ impl CatalogReaders {
             if !needs_cas { return Ok(answers); }
             let version = record.version;
             match self.directory.replace_deployment(record, version).await? {
-                Cas::Applied(_) => return Ok(answers),
+                Cas::Applied(stored) => {
+                    for (request, _) in batch.iter().zip(&answers).filter(|(_, answer)| answer.is_ok()) {
+                        let (event, hold, cut) = match &request.change {
+                            ReaderChange::Register { reader, cut, .. } => ("catalog-hold", reader, *cut),
+                            ReaderChange::Release { reader, .. } => ("catalog-release", reader, None),
+                        };
+                        crate::residence_trace::record(event, || serde_json::json!({
+                            "lineage": stored.lineage, "installation": self.deployment, "residence": self.residence,
+                            "namespace": self.namespaces.objects, "root": self.storage_root, "revision": stored.version,
+                            "epoch": self.replica_epoch, "hold": hold, "through": cut.map(|cut| cut.through),
+                            "primary_paths": stored.catalog_readers.get(hold)
+                                .and_then(|registration| registration.compacted_primary_paths.as_deref()),
+                        }));
+                    }
+                    return Ok(answers);
+                }
                 Cas::Conflict(fresh) => current = fresh,
             }
         }
         Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/catalog-readers-contended", "The installation changed while updating its catalog readers"))
     }
 
-    fn register(&self, record: &mut DeploymentRecord, reader: Uuid, cut: Option<CatalogCut>) -> Result<()> {
+    fn register(&self, record: &mut DeploymentRecord, reader: Uuid, cut: Option<CatalogCut>, paths: Option<&[String]>) -> Result<()> {
         if !self.residence_is_open(record) { return Err(closed()); }
         if !admits_after_floor(cut.map(|cut| cut.through.0), self.floor(record).map(|floor| floor.0)) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, CATALOG_NOT_CURRENT,
                 "The captured catalog precedes this residence's installed admission floor"));
         }
+        let paths = paths.filter(|paths| cut.is_some()
+            && paths.windows(2).all(|window| window[0] < window[1])
+            && paths.iter().all(|path| rtdb_format::keys::is_compacted_primary_file(path))
+            && primary_path_charge(paths) <= rtdb_types::CATALOG_PRIMARY_PATH_BYTES
+            && record.catalog_readers.values().filter_map(|reader| reader.compacted_primary_paths.as_deref())
+                .map(primary_path_charge).fold(primary_path_charge(paths), usize::saturating_add) <= PRIMARY_PATH_LEDGER_BYTES);
+        let store = format!("{}/{}/", self.residence, self.storage_root);
+        if record.storage_regions.values().any(|region| match region {
+            StorageRegion::ExactRetirement { object, .. } => object.strip_prefix(&store)
+                .is_some_and(|path| rtdb_format::keys::is_compacted_primary_file(path)
+                    && paths.is_none_or(|paths| contains_path(paths, path))),
+            _ => false,
+        }) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, CATALOG_NOT_CURRENT,
+                "The captured catalog intersects a physical retirement in progress"));
+        }
         record.catalog_readers.insert(reader, CatalogReader {
             owner: self.owner, storage_root: self.storage_root.clone(), replica_epoch: self.replica_epoch.0, cut,
+            compacted_primary_paths: paths.map(<[String]>::to_vec),
         });
         Ok(())
     }
 
 }
 
+pub(crate) fn readers_allow(record: &DeploymentRecord, storage_root: &str, installed: CatalogCut, path: Option<&str>) -> bool {
+    record.catalog_readers.values().filter(|reader| {
+        reader.storage_root == storage_root && reader.replica_epoch == installed.replica_epoch.0
+    }).all(|reader| match path {
+        Some(path) => reader.compacted_primary_paths.as_ref().is_some_and(|paths| !contains_path(paths, path)),
+        None => admits_after_floor(reader.cut.map(|cut| cut.through.0), Some(installed.through.0)),
+    })
+}
+
+fn contains_path(paths: &[String], path: &str) -> bool {
+    paths.binary_search_by(|member| member.as_str().cmp(path)).is_ok()
+}
+
+fn primary_path_charge(paths: &[String]) -> usize {
+    paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
+}
+
+const PRIMARY_PATH_LEDGER_BYTES: usize = 64 * 1024;
 const MAX_READER_CHANGES: usize = 64;
 const CLOSED: &str = "rtdb.multi/catalog-reader-closed";
 const CATALOG_NOT_CURRENT: &str = "rtdb.node/catalog-not-current";
@@ -387,6 +452,40 @@ mod tests {
         drop(current);
         readers.tasks.close();
         tokio::time::timeout(Duration::from_secs(5), readers.tasks.wait()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_old_catalog_holds_only_the_compacted_files_it_can_open() {
+        let (readers, directory, origin) = serving().await;
+        let old = CatalogCut {
+            storage_version: CURRENT_STORAGE_VERSION, storage_epoch: StorageEpoch(0), replica_epoch: readers.replica_epoch,
+            through: ReplicaPosition::from_epoch_offset(readers.replica_epoch, 0).unwrap(),
+        };
+        let installed = CatalogCut {
+            through: ReplicaPosition::from_epoch_offset(readers.replica_epoch, 1).unwrap(),
+            ..old
+        };
+        let held_path = rtdb_format::keys::TableSlug::recorded("public$held").unwrap()
+            .data_key(&"l01-rc-b00".parse().unwrap());
+        let unrelated_path = rtdb_format::keys::TableSlug::recorded("public$unrelated").unwrap()
+            .data_key(&"l01-rc-b00".parse().unwrap());
+        let hold = readers.retain_with_primary(Some(old), Some(vec![held_path.clone()].into())).await.unwrap();
+
+        let (_, allowed) = readers.close_admission(installed, &[Some(&held_path)]).await.unwrap();
+        assert_eq!(allowed, [false]);
+        assert_eq!(readers.retain(Some(old)).await.err().unwrap().code, CATALOG_NOT_CURRENT);
+        let (_, allowed) = readers.close_admission(installed, &[Some(&held_path), Some(&unrelated_path), None]).await.unwrap();
+        assert_eq!(allowed, [false, true, false]);
+        assert!(!readers.advance(installed).await.unwrap());
+
+        let current = directory.deployment(&origin.id).await.unwrap().unwrap();
+        assert_eq!(current.catalog_readers.len(), 1);
+        assert_eq!(current.catalog_admission_floors[&readers.storage_root].cut, installed);
+        drop(hold);
+        readers.tasks.close();
+        readers.tasks.wait().await;
+        let (_, allowed) = readers.close_admission(installed, &[Some(&held_path)]).await.unwrap();
+        assert_eq!(allowed, [true]);
     }
 
     #[tokio::test]

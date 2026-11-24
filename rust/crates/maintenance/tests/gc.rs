@@ -254,12 +254,13 @@ impl ObjectStore for CatalogFloorStore {
         self.proposals.lock().unwrap().push(installed);
         Ok(!self.blocked.load(Ordering::Relaxed))
     }
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
         let installed = rtdb_format::trie_retirement::InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        if !self.advance_catalog_floor(installed.cut()).await? { return Ok(false); }
         let mut files: Vec<_> = installed.files().iter().collect();
         files.sort_by_key(|file| file.release_order());
         for file in files { self.delete(&ObjectKey::new(&file.key)?).await?; }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -561,11 +562,6 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
     collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap()[1], vec![preserved.key]);
     for key in &pinned_objects { assert!(store.head(key).await.is_err()); }
-
-    let collection = state.trie_collection();
-    state.reset_to_l0(BTreeMap::new()).expect("a reset no longer waits for collection, since it names every later output anew");
-    assert_eq!(state.value().trie_catalog().naming_epoch(), collection.current().trie_catalog().naming_epoch() + 1);
-    drop(collection);
 }
 
 struct ObservedStore {

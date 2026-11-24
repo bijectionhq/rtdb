@@ -13,8 +13,7 @@ use super::WorldReadmission;
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP5";
-const POSITIONED_MAGIC: &[u8] = b"BJWP6";
+const MAGIC: &[u8] = b"BJWP6";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
@@ -116,9 +115,7 @@ impl ArchivedWorld {
 
 impl ReplayWorlds {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        let positioned = bytes.starts_with(POSITIONED_MAGIC);
-        let magic = if positioned { POSITIONED_MAGIC } else { MAGIC };
-        let mut input = Input(bytes.strip_prefix(magic).ok_or_else(invalid)?);
+        let mut input = Input(bytes.strip_prefix(MAGIC).ok_or_else(invalid)?);
         let registrations = input.count()?;
         let mut worlds = Self::default();
         let mut ids = BTreeSet::new();
@@ -150,11 +147,7 @@ impl ReplayWorlds {
         }
         let mut positions = BTreeSet::new();
         for _ in 0..shadows {
-            let position = if positioned {
-                NonZeroU32::new(u32::from_be_bytes(input.fixed()?))
-            } else {
-                None
-            };
+            let position = NonZeroU32::new(u32::from_be_bytes(input.fixed()?));
             if position.is_some_and(|position| !positions.insert(position)) {
                 return Err(invalid());
             }
@@ -200,7 +193,7 @@ impl ReplayWorlds {
                 fields,
             });
         }
-        let omitted = if positioned { input.count()? } else { 0 };
+        let omitted = input.count()?;
         let total = registrations + clocks + shadows + omitted;
         if total == 0 || total > MAX_EFFECTS {
             return Err(invalid());
@@ -266,7 +259,7 @@ mod tests {
 
     #[test]
     fn replay_world_inventory_refuses_duplicate_or_unqualified_omissions() {
-        let mut body = POSITIONED_MAGIC.to_vec();
+        let mut body = MAGIC.to_vec();
         for count in [0u32, 0, 0, 1] {
             body.extend_from_slice(&count.to_be_bytes());
         }
@@ -276,7 +269,7 @@ mod tests {
         let replay = ReplayWorlds::decode(&body).unwrap();
         assert_eq!(replay.omitted_shadows.get(&ordinal), Some(&Iid([1; 16])));
 
-        let omitted_count = POSITIONED_MAGIC.len() + 3 * 4;
+        let omitted_count = MAGIC.len() + 3 * 4;
         body[omitted_count..omitted_count + 4].copy_from_slice(&2u32.to_be_bytes());
         body.extend_from_slice(&ordinal.get().to_be_bytes());
         body.extend_from_slice(&[2; 16]);

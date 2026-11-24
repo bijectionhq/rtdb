@@ -17,7 +17,7 @@ Every agent works in RTDB (`github.com/bijectionhq/rtdb`), not Bijection, and fo
 - **Evidence standard:** every claim needs a passing baseline, a negative control that fails at the declared function or invariant, and, for a design model, a reachability witness and stated bounds. Production proofs verify the shipped source, not a copy.
 - **Ledger:** record each result in `verification/results/2026-11-21.adoc` and update the area's row in the design doc's *Reproduction and current evidence* table. Sentence per line in docs.
 - **Tests:** run the affected crates' suites before landing; a change to indexing, compaction or GC also needs the native replays. macOS has no `timeout` command, so a `timeout N cargo …` check silently runs nothing.
-- **Landing:** conventional commits, rebased onto the latest main, pushed straight to `main`. Rebuild after every rebase before pushing: peers occasionally land commits that break compilation. When a peer has already fixed the same thing, drop your commit (`git rebase --skip`) instead of merging both.
+- **Landing:** conventional commits, rebased onto the latest main, pushed straight to `main`. Review affected source after each rebase and follow the active owner authorization for execution. When a peer has already fixed the same thing, drop your commit (`git rebase --skip`) instead of merging both.
 - **Before starting a workstream:** read the last day of `git log origin/main` for its area. Several peer sessions are active, and an obligation may already be closed.
 
 ## Owner decisions
@@ -27,12 +27,12 @@ The second review narrows the fork decision to shared custody and defines how er
 
 | Decision | Outcome |
 | --- | --- |
-| Read basis and resumption | A basis is a logical coordinate (transaction lower bound plus optional system-time cap). An admitted handle keeps its captured view for its lifetime and is never resumed; a client re-admits at the same basis, and the answer may differ only by erasures committed in between. |
+| Read basis and resumption | An await token is a causal lower bound. A time cap filters a captured prefix. SNAP-1 reopens only an authenticated exact applied cut with its original selectors and query clock, subject to current scope, retention and custody. Fresh admissions can include later corrections beneath the same cap. |
 | Reader lifetime | Readers are protected by renewable holds on the residence ledger (R4). Until R4 lands, bounded monotonic leases (default 1 h, 1 min margin) protect them. |
 | Erasure versus admitted views | A view admitted before an erasure keeps its answers until the erasure deadline (≤ 120 s); after that a read that needs destroyed key material fails with `rtdb/erased-under-view`. SNAP-1 and DUR-1 are amended accordingly. |
 | Forks | Erasure reaches shared history within its key custody domain. Independently keyed copies have their own erasure authority. |
-| Future system time | A client may not supply a system time later than the source log's append time (tolerance zero). Landed. |
-| Retry identities | Required for transaction submit, scoped to (database, principal, key) with a body digest and a conflict outcome. Landed. |
+| Future system time | Explicit system time lies between the preceding SQL system time and the original source-log append observation, inclusive. SQL system time may tie. Live decisions use the independent installed clock. |
+| Retry identities | An exact transaction retry is scoped to its registered receiver, database and principal, with a body digest and a conflict outcome. An owned publication orders its separate slot witness with the guarded decision and effects. Business intent and application command comparison belong to the application boundary. |
 | Transaction metadata | Retained only for the receipt window, and erasable with its unit before then (R8). |
 | Physical erasure and non-interference | OPT-2 is in scope with the declared bound; OPT-3 only for rows and search scores of fresh views. |
 | XTDB compatibility | Not a constraint. |
@@ -45,7 +45,7 @@ W1, W2, W4 and W6 can start now and in parallel; W7 runs alongside all of them, 
 | --- | --- | --- | --- | --- |
 | W1 | Reader entitlement on every read and delete path | SNAP-1, GC-1, GC-2, LIVE-2 | R4 supersedes the lease mechanism | Every read path holds a lease, hold or registry entry, and every deletion path waits for it; native replays and Verus laws for each |
 | W2 | Recovery holds and root closure across authorities | DUR-2, GC-1 | — | Recovery keeps a usable root and log suffix under concurrent collection on every authority and deletion path |
-| W3 | Commit and replica path from admission to applied state | TX-1, TX-2, DUR-1 | — | Each acknowledgement is tied to the same applied outcome after failover and replay, and stale-term and premature-ack mutations fail |
+| W3 | Certified commit decisions and protected applied fresh cuts | TX-1, TX-2, SNAP-1, DUR-1 | W1 for capture custody | Acknowledgement and successive fresh reads preserve quorum-installed cuts through recovery. Fair quorum service can answer while an uncertified tail is stalled. |
 | W4 | Temporal composition end to end | TIME-1, TIME-2 | — | Production contracts for event order, visitor shells and range decomposition refine the Lean reference |
 | W5 | Compaction refinement | COMPACT-1 | W4 for the history relation | Merged output refines the input history through every publication route, including retry and restart |
 | W6 | Ranked search completeness | FTS-1, FTS-2 | — | Planner, visibility and index provably supply a complete frontier, and native postings refine the modelled summaries |
@@ -121,16 +121,18 @@ Goal: every successful acknowledgement names an admitted, applied batch that rec
 
 **Already in place:** Verus checks replica admission, system-time assignment (including the bound by the log clock) and the first-required-offset rule; compiler controls reject forging the admission witness; TLC compares serialized, validated and blind resolution.
 
+Enrolled Classic journals sign the exact candidate digest with retained Ed25519 keys. The writer acknowledges after quorum installation, and authenticated fresh probes can stabilize a decision on journals that lack its bytes. Replay checks the actual digest or a local original vote. The directory records portable coverage with a checkpoint and checks that coverage on startup and trim. Sealed recovery checks retained decisions before copying the selected history. The ordered provider binds its protected barrier to the reader's enrollment and invocation. The Classic successor's inherited floor, cold ordered reader attachment and full applied-answer correspondence remain open proof obligations.
+
 **Start from:** `replication/src/{admission,admission_step,driver,appender}.rs`, `tx/src/{resolver,system_time}.rs`; Verus areas `replica_admission`, `system_time`.
 
 **Open obligations:**
 
-1. Model the boundary from resolving and staging, through durable read-back and atomic publication, to acknowledgement.
+1. Check `ActiveLogletReadIndex` and its controls for payload-only acknowledgement, single-copy exposure, digest binding, exact apply, trim and disjoint activation. The model includes write-back after loss of the publisher, a silent journal and ambiguous guarded settlement with an advancing clock. Refine probe and member authentication, checkpoint authority and successor installation to the implementation, including delayed durable replies, copied or cutoff-equal votes and exclusion inferred from silence.
 2. Replay injected crashes at each transition natively.
 3. Prove the partition publication transitions, scan coverage, and the composition from token to effect.
 4. Trace replica decoding, deferred delivery, oversized payload resolution, leader and follower apply, and recovery imports.
 5. Audit every resolver constructor for committed, staged and transaction-local views.
-6. Durable-to-resolved handoff across all providers, and which imported histories satisfy strict system-time ordering.
+6. Durable-to-resolved handoff across providers. DUR-1 preserves the original positions, append observation, decision clock and outcome through replay, including an unresolved guarded tail. Controls drop the explicit zero-lead bound, resample the clock on replay and count copied or late votes.
 
 **Done when:** stale-term and premature-acknowledgement mutations fail, and the evidence ties each acknowledgement to the same applied outcome after failover.
 
@@ -144,10 +146,19 @@ Goal: every point and range read in production agrees with the bitemporal refere
 
 **Open obligations:**
 
-1. Audit event ordering at every producer of temporal events.
+1. For TIME-1, select by original position and system-time cap, break ties by original position and ordinal, and preserve same-time steps at their positional cuts.
 2. Write end-to-end contracts for the resource and visitor shells around the verified decisions.
 3. Prove the observable decomposition of range answers into the verified point decisions.
-4. Full bitemporal preservation, including same-time conflicts and erasures, beyond the generated trace family.
+4. For TIME-2 and SNAP-1, prove preservation of the original winner or explicit erasure across suffix extension, compaction, recovery and nested forks.
+5. Exercise the 10/20/15/40 correction, tied times across a cut and expiry during idleness.
+6. Compare paired histories with independent clock samples and the same funded observation schedule. Controls use order as the clock, floor the clock only on writes, charge hidden work to public turns, reopen on cap plus await, collapse tied positions and substitute an older winner after erasure.
+
+The [exact-cut model](tla/ExactTemporalCut.tla) and [Lean selection laws](lean/ExactTemporalCut.lean) exercise the position and cap distinction.
+The model includes no-lead, position-tie, erased-winner and cap-plus-await controls, with reachability cases for late correction, ties and erasure.
+The native resolver imports the ordinary SQL history-time functions proved by [Verus](verus/system_time/proof.rs).
+The directory clock and the runtime publisher call the transition functions in [receiver clock](verus/receiver_clock/proof.rs).
+The hosted receiver stores the observation in its ordered result row. Replica application installs the stored rows without taking a new decision reading.
+The SQL token owner retains the catalog and its interpretation in the issuing native node. Durable cross-residence re-admission, fully position-addressed owned writes and derived indexes, and funded appointments remain open production refinements.
 
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 
@@ -190,7 +201,14 @@ Goal: accelerated MATCH returns the reference scan's rows, and ranked early term
 
 ## W7 · Effect-path and bypass audit
 
-Goal: no production effect can bypass the verified decision that is supposed to admit it.
+Goal: every production effect passes through its owning admission and decision.
+
+For placed audit coverage, model provisional intake, durable scope-owned credit, exact receiver admission, terminal effect or fence, and authentic succession.
+The source model [PlacedReceiverSlots](tla/PlacedReceiverSlots.tla) covers expiry with pending receiver debt and fair settlement after recovery.
+Its configurations are unexecuted.
+Fail controls for use of volatile admission, split terminal append, late copies after a fence, reclaim of pending credit on expiry, and reissue from a stale cut.
+Trace native and hosted paths through intake, the resolver, replica decoding and apply, checkpoint installation, status and causal redemption.
+A parent or exporter's offer supplies evidence only for its own boundary.
 
 The design doc's *Production boundary and responsibilities* table names one owner per area: replica admission and apply, resolution and overlay, temporal resolution, compaction and catalog, read entitlement and GC, storage and recovery, cache, and search. For each area:
 
@@ -207,7 +225,10 @@ Goal: state and witness the progress guarantees RTDB adopts, and verify the opti
 
 1. LIVE-1: give an eligible request in stable service a progress witness, plus a mutation that disables the needed progress step or fairness assumption.
 2. LIVE-2: show that a retired generation becomes reclaimable after its last obligation ends; this shares a witness with W1 item 6.
-3. OPT-1: run acceptance program A12 (lose the reply, restart, retry the same identity and a different body) against the engine-owned receipts, and verify the receipt decision in Verus.
+3. OPT-1: exercise reply loss, repair, and same- and changed-body retries against engine-owned receipts.
+   For owned publications, establish that the decision, slot witness and consequences share one original position, repair applies current custody masks, and successors require authenticated exclusion and transfer before accepting inherited work.
+   Controls remove the fence at restore or use SQL metadata expiry as evidence of exclusion.
+   Application equality and schedule coverage refine their own owners over this transaction order.
 4. OPT-2 and OPT-3: verify the eraser (R7) against the storage inventory: logs, checkpoints, object versions, caches, replicas, exports, backups and keys.
 
 **Done when:** each adopted claim has its witness and its mutation.

@@ -124,13 +124,15 @@ impl TrieCollector {
     }
 
     pub async fn default_garbage_as_of(&self) -> Result<Option<Timestamp>> {
-        let prefix = ObjectKey::new("blocks").map_err(crate::invalid)?;
-        let blocks: Vec<_> = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?.into_iter().filter(|block| block.key.as_str().ends_with(".binpb")).collect();
-        let Some(index) = blocks.len().checked_sub(self.config.blocks_to_keep) else { return Ok(None); };
-        let block = BlockCatalog::decode(&self.store.get(&blocks[index].key).await.map_err(crate::invalid)?)?;
-        let Some(tx) = block.latest_completed_tx() else { return Ok(None); };
-        let duration = i64::try_from(self.config.garbage_lifetime.as_nanos().div_ceil(1000)).map_err(crate::invalid)?;
-        Ok(Some(Timestamp(tx.system_time.0.checked_sub(duration).ok_or_else(|| crate::invalid("Garbage lifetime exceeds timestamp range"))?)))
+        IoRegion::reading_recovery(self.store.as_ref(), async {
+            let prefix = ObjectKey::new("blocks").map_err(crate::invalid)?;
+            let blocks: Vec<_> = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?.into_iter().filter(|block| block.key.as_str().ends_with(".binpb")).collect();
+            let Some(index) = blocks.len().checked_sub(self.config.blocks_to_keep) else { return Ok(None); };
+            let block = BlockCatalog::decode(&self.store.get(&blocks[index].key).await.map_err(crate::invalid)?)?;
+            let Some(tx) = block.latest_completed_tx() else { return Ok(None); };
+            let duration = i64::try_from(self.config.garbage_lifetime.as_nanos().div_ceil(1000)).map_err(crate::invalid)?;
+            Ok(Some(Timestamp(tx.system_time.0.checked_sub(duration).ok_or_else(|| crate::invalid("Garbage lifetime exceeds timestamp range"))?)))
+        }).await
     }
 
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
@@ -168,11 +170,21 @@ impl TrieCollector {
             let collection = Arc::clone(&collection);
             async move {
                 let mut eligible = collection.eligible(&entry.table, as_of);
-                eligible.extend(collection.eligible_l0_artefacts(&entry.table, as_of).cloned());
-                let (seals, keys): (Vec<_>, Vec<_>) = match self.leased_out(&entry.table, eligible) {
-                    Ok(keys) => keys,
+                let receipt_l0 = self.store.releases_receipt_l0() && entry.table.stores_expiring_transaction_metadata();
+                if receipt_l0 {
+                    eligible.extend(collection.eligible_receipt_l0(&entry.table, as_of).cloned());
+                } else {
+                    eligible.extend(collection.eligible_l0_artefacts(&entry.table, as_of).cloned());
+                }
+                let coordinated = self.store.defers_trie_releases();
+                let (due, timed): (Vec<_>, Vec<_>) = eligible.into_iter()
+                    .partition(|key| coordinated && (key.level() > 0 || receipt_l0));
+                let timed = match self.leased_out(&entry.table, timed) {
+                    Ok(ready) => ready,
                     Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
-                }.into_iter().partition(|key| key.level() == 0);
+                };
+                let (seals, keys): (Vec<_>, Vec<_>) = due.into_iter().chain(timed)
+                    .partition(|key| key.level() == 0 && !receipt_l0);
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection.clone(), async {
                     self.collect_table(&entry, &keys, &groups, cut, collection.current().trie_catalog(), &release).await?;
@@ -306,7 +318,11 @@ impl TrieCollector {
     async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &TrieCatalog, release: &FileRelease) -> Result<()> {
         let deletes = release.slots.as_ref();
         let cancellation = &release.cancellation;
-        if keys.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
+        if keys.iter().any(|key| key.level() == 0)
+            && !(self.store.releases_receipt_l0() && entry.table.stores_expiring_transaction_metadata())
+        {
+            return Err(crate::invalid("This store cannot release L0 recovery files for the table"));
+        }
         let chunk_size = self.config.chunk_size;
         // A shared file belongs in the receipt of the last batch removing members
         // of its group. Keep group releases before releases of their data files.

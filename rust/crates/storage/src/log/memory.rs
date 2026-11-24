@@ -5,7 +5,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use rtdb_types::Timestamp;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
@@ -35,6 +35,7 @@ struct Shared {
     progress: Progress,
     maximum_message_bytes: usize,
     timestamps: Arc<dyn AppendTimestampSource>,
+    retained: Option<Arc<Semaphore>>,
 }
 
 pub struct MemoryLog { shared: Arc<Shared> }
@@ -45,18 +46,24 @@ impl MemoryLog {
     }
 
     pub fn with_timestamp_source(maximum_message_bytes: usize, timestamps: Arc<dyn AppendTimestampSource>) -> Self {
-        Self { shared: Arc::new(Shared {
-            records: Mutex::new(Records { first: 0, next: 0, values: VecDeque::new() }),
-            progress: Progress::new(LogOffset(-1)), maximum_message_bytes, timestamps,
-        }) }
+        Self::empty(maximum_message_bytes, LogOffset(0), timestamps, None)
     }
 
     /// An empty log whose first record takes offset `next`, for a log that continues positions a previous owner assigned.
     pub fn starting_at(maximum_message_bytes: usize, next: LogOffset) -> Self {
+        Self::empty(maximum_message_bytes, next, Arc::new(SuppliedTimestamp), None)
+    }
+
+    pub fn bounded_starting_at(maximum_message_bytes: usize, next: LogOffset, maximum_retained_bytes: usize) -> Self {
+        let retained = Arc::new(Semaphore::new(maximum_retained_bytes.min(Semaphore::MAX_PERMITS)));
+        Self::empty(maximum_message_bytes, next, Arc::new(SuppliedTimestamp), Some(retained))
+    }
+
+    fn empty(maximum_message_bytes: usize, next: LogOffset, timestamps: Arc<dyn AppendTimestampSource>, retained: Option<Arc<Semaphore>>) -> Self {
         let next = next.0.max(0);
         Self { shared: Arc::new(Shared {
             records: Mutex::new(Records { first: next, next, values: VecDeque::new() }),
-            progress: Progress::new(LogOffset(next - 1)), maximum_message_bytes, timestamps: Arc::new(SuppliedTimestamp),
+            progress: Progress::new(LogOffset(next - 1)), maximum_message_bytes, timestamps, retained,
         }) }
     }
 
@@ -86,7 +93,15 @@ impl MemoryLog {
         self.shared.progress.latest()?;
         let next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         // Release the producer's allocation charge once this log owns the payload.
-        let payload = Bytes::copy_from_slice(&payload);
+        let payload = if let Some(retained) = &self.shared.retained {
+            let required = payload.len().saturating_add(LOG_RECORD_OVERHEAD_BYTES);
+            let unavailable = || Error::AppendCapacity { required_bytes: required as u64 };
+            let charge = u32::try_from(required).map_err(|_| unavailable())?;
+            let credit = Arc::clone(retained).try_acquire_many_owned(charge).map_err(|_| unavailable())?;
+            Bytes::from_owner(RetainedPayload { bytes: payload.to_vec(), _credit: credit })
+        } else {
+            Bytes::copy_from_slice(&payload)
+        };
         let timestamp = sample(&payload)?;
         let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
         records.next = next;
@@ -96,6 +111,15 @@ impl MemoryLog {
         let _ = sender.send(Ok(metadata));
         Ok(AppendReceipt::new(durable))
     }
+}
+
+struct RetainedPayload {
+    bytes: Vec<u8>,
+    _credit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for RetainedPayload {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
 }
 
 fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
@@ -284,5 +308,27 @@ mod tests {
         assert_eq!(appended.offset, LogOffset(42));
         let mut tail = log.tail(LogOffset(41)).await.unwrap();
         assert_eq!(tail.poll(Duration::from_millis(10)).await.unwrap()[0].metadata.offset, LogOffset(42));
+    }
+}
+
+
+#[cfg(test)]
+mod retained_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_read_copy_holds_intake_credit_after_trim() {
+        let log = MemoryLog::bounded_starting_at(1024, LogOffset(0), LOG_RECORD_OVERHEAD_BYTES + 1);
+        log.enqueue(Bytes::from_static(b"a"), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        let records = log.read_range(LogOffset(0), LogOffset(1)).await.unwrap();
+        log.truncate_before(LogOffset(1)).unwrap();
+        assert!(matches!(
+            log.enqueue(Bytes::from_static(b"b"), Timestamp(0)).await,
+            Err(Error::AppendCapacity { .. }),
+        ));
+        assert_eq!(log.latest().unwrap(), LogOffset(0));
+        drop(records);
+        let receipt = log.enqueue(Bytes::from_static(b"b"), Timestamp(0)).await.unwrap();
+        assert_eq!(receipt.durable().await.unwrap().offset, LogOffset(1));
     }
 }

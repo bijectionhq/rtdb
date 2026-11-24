@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use sha2::{Digest, Sha256};
 
-use crate::{Anomaly, Result, SourcePosition};
+use crate::{Anomaly, Result, SourcePosition, TransactionKey};
 
 const SCOPE_BYTES: usize = 40;
 const SEED_BYTES: usize = SCOPE_BYTES + 16;
@@ -132,6 +132,89 @@ impl PlacedAttempt {
         digest.update(self.encode());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
     }
+}
+
+/// Exact receiver reservation reconstructed from its original replica record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedReservation {
+    pub attempt: PlacedAttempt,
+    pub submitted_at: crate::Timestamp,
+    pub commitment: [u8; 32],
+}
+
+impl PlacedReservation {
+    pub fn new(attempt: PlacedAttempt, submitted_at: crate::Timestamp, source: &[u8]) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb/placed-receiver-input/v1\0");
+        digest.update(attempt.encode());
+        digest.update(submitted_at.0.to_be_bytes());
+        digest.update(source);
+        Self { attempt, submitted_at, commitment: digest.finalize().into() }
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        let mut wire = Vec::with_capacity(ATTEMPT_BYTES + 40);
+        wire.extend(self.attempt.encode());
+        wire.extend(self.submitted_at.0.to_be_bytes());
+        wire.extend(self.commitment);
+        wire
+    }
+
+    pub fn decode(wire: &[u8]) -> Result<Self> {
+        if wire.len() != ATTEMPT_BYTES + 40 { return Err(invalid()); }
+        let attempt = PlacedAttempt::decode(&wire[..ATTEMPT_BYTES])?;
+        let submitted_at = crate::Timestamp(i64::from_be_bytes(
+            wire[ATTEMPT_BYTES..ATTEMPT_BYTES + 8].try_into().map_err(|_| invalid())?,
+        ));
+        let commitment = wire[ATTEMPT_BYTES + 8..].try_into().map_err(|_| invalid())?;
+        Ok(Self { attempt, submitted_at, commitment })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedTerminal {
+    pub commitment: [u8; 32],
+    pub fenced: bool,
+}
+
+impl PlacedTerminal {
+    pub fn encode(self) -> Vec<u8> {
+        let mut wire = Vec::with_capacity(33);
+        wire.push(u8::from(self.fenced));
+        wire.extend(self.commitment);
+        wire
+    }
+
+    pub fn decode(wire: &[u8]) -> Result<Self> {
+        let (kind, commitment) = wire.split_first().ok_or_else(invalid)?;
+        if *kind > 1 { return Err(invalid()); }
+        Ok(Self { commitment: commitment.try_into().map_err(|_| invalid())?, fenced: *kind == 1 })
+    }
+}
+
+/// The unmatched reservation in a certified Original replica suffix.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacedTransferDebt {
+    pub term: i64,
+    pub reserved_at: i64,
+    pub reservation: Vec<u8>,
+}
+
+/// The held destination's exact replica interval and Original debt census.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacedTransfer {
+    pub after: i64,
+    pub through: i64,
+    pub debt: Option<PlacedTransferDebt>,
+}
+
+/// Original disposition at the deciding receiver, before retry remapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedDecision {
+    pub key: TransactionKey,
+    pub committed: bool,
 }
 
 fn invalid() -> Anomaly {

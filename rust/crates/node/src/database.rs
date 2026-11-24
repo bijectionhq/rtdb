@@ -38,6 +38,7 @@ pub struct Database {
     read_only: bool,
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
+    pub(crate) resolve: Arc<ResolveContext>,
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
@@ -90,26 +91,90 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
+    pub(crate) fn replica_read_deployment(&self) -> Option<uuid::Uuid> {
+        self.replica_read_index.as_ref()?.deployment()
+    }
+
+    pub(crate) fn has_replica_read_index(&self) -> bool {
+        self.replica_read_index.is_some()
+    }
+
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
-        let Some(read_index) = &self.replica_read_index else { return Ok(()); };
-        let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
-            format!("This replica of {} could not establish a fresh snapshot", self.name));
+        if let Some(index) = &self.replica_read_index {
+            self.confirm_replica_cut(index.as_ref(), cancellation).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn capture_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
+        let Some(index) = &self.replica_read_index else { return Ok(self.partition.snapshot()); };
+        // The reader can sample again if apply already passed its selection.
+        // Each retry is a fresh confirmation within the original invocation.
+        for _ in 0..3 {
+            let (barrier, position) = self.confirm_replica_cut(index.as_ref(), cancellation).await?;
+            let snapshot = match position {
+                Some(through) => self.partition.published_snapshot(CatalogCut {
+                    storage_version: self.logs.storage_version,
+                    storage_epoch: self.logs.storage_epoch,
+                    replica_epoch: self.logs.replica_epoch,
+                    through,
+                }),
+                None => Some(self.partition.snapshot()).filter(|snapshot| {
+                    snapshot.catalog_cut().is_none() && snapshot.tx_basis().is_none()
+                }),
+            };
+            if let Some(snapshot) = snapshot {
+                return tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+                    _ = self.cancellation.cancelled() => Err(self.replica_behind()),
+                    retained = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage) => {
+                        let retained = retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+                        if let Some(read) = &barrier.certified_read {
+                            if retained.catalog_cut().is_none_or(|cut| cut.through.after_offset(cut.replica_epoch) != read.through) {
+                                return Err(self.replica_behind());
+                            }
+                            read.observe("certified-catalog-capture");
+                            Ok(retained.with_certified_read(read.clone()))
+                        } else {
+                            Ok(retained)
+                        }
+                    }
+                };
+            }
+        }
+        Err(self.replica_behind())
+    }
+
+    fn replica_behind(&self) -> Anomaly {
+        Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
+            format!("This replica of {} could not establish a fresh snapshot", self.name))
+    }
+
+    async fn confirm_replica_cut(&self, read_index: &dyn ReplicaReadIndex, cancellation: &CancellationToken)
+        -> Result<(crate::ProtectedReadIndex, Option<ReplicaPosition>)>
+    {
         let confirm = async {
-            let barrier = read_index.protect().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
-            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
             let mut status = self.watch_status();
+            let applied = status.borrow().installed.map_or(-1, |prefix| {
+                prefix.replica.after_offset(self.logs.replica_epoch)
+            });
+            let barrier = read_index.protect(rtdb_storage::log::LogOffset(applied)).await
+                .map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+            let confirmed = if barrier.offset.0 == -1 { None } else {
+                Some(ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?)
+            };
             let applied = status.wait_for(|status| status.role == Role::Stopped
-                || barrier.offset.0 == -1
-                || status.installed.is_some_and(|prefix| prefix.replica >= position));
-            let status = tokio::time::timeout(barrier.wait, applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
-            if status.role == Role::Stopped { return Err(behind()); }
-            drop(barrier);
-            Ok(())
+                || confirmed.is_none_or(|position| status.installed.is_some_and(|prefix| prefix.replica >= position)));
+            let status = tokio::time::timeout(barrier.wait, applied).await
+                .map_err(|_| self.replica_behind())?.map_err(|_| self.replica_behind())?;
+            if status.role == Role::Stopped { return Err(self.replica_behind()); }
+            Ok((barrier, confirmed))
         };
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
-            _ = self.cancellation.cancelled() => Err(behind()),
+            _ = self.cancellation.cancelled() => Err(self.replica_behind()),
             result = confirm => result,
         }
     }
@@ -239,6 +304,7 @@ pub(crate) struct DatabaseFactory {
     pub memory: Arc<MemoryBudget>,
     pub cache: Arc<CacheBudget>,
     pub clock: Arc<dyn Clock>,
+    pub decision_clock: Option<Arc<dyn rtdb_tx::DecisionClock>>,
     pub authorization: Arc<dyn TransactionAuthorization>,
     pub observer: Arc<dyn CollectionObserver>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
@@ -290,6 +356,8 @@ impl DatabaseFactory {
         let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let checkpoint_metadata = resources.checkpoint_metadata.take();
+        let recovery_storage = Arc::clone(&resources.store);
+        let local_recovery = recovery_storage.local_maintenance_store().filter(|store| store.defers_trie_releases());
         let assembly = async {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
@@ -306,7 +374,8 @@ impl DatabaseFactory {
                 return Err(Anomaly::fault("rtdb.node/checkpoint-await-cut", "The opened checkpoint does not establish its await-token cut"));
             }
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
-                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
+                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?
+                .with_placed_transfer(opened_logs.placed_transfer)?;
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
             } else {
@@ -329,6 +398,7 @@ impl DatabaseFactory {
             let event_history = !read_only && self.options.artefact_threads != 0
                 && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
+                decision_clock: self.decision_clock.clone(),
                 write_event_origins: event_history,
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {
@@ -347,7 +417,7 @@ impl DatabaseFactory {
             replication_options.may_lead &= !read_only;
             replication_options.external_source = configuration.external_source.is_some();
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
-            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
+            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
                 self.artefact_kinds.iter().map(|kind| {
@@ -408,7 +478,7 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage,
+            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
@@ -417,10 +487,17 @@ impl DatabaseFactory {
                 artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };
-        let opened = match checkpoint_metadata {
-            Some(hold) => IoRegion::retaining(hold, assembly).await,
-            None => assembly.await,
-        };
+        let opened = async {
+            let hold = match (checkpoint_metadata, local_recovery) {
+                (Some(hold), _) => Some(hold),
+                (None, Some(store)) => Some(store.hold_recovery_open().await?),
+                (None, None) => None,
+            };
+            match hold {
+                Some(hold) => IoRegion::reading(rtdb_storage::HeldView::recovery(hold), assembly).await,
+                None => assembly.await,
+            }
+        }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
     }
@@ -642,7 +719,7 @@ impl MaintenanceSupervisor {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
             // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
-            if self.options.replication.enabled {
+            if self.options.replication.enabled && !self.store.defers_trie_releases() {
                 if let Ok(lease) = self.options.garbage.reader_lease_micros() {
                     let observed_at = self.clock.monotonic_micros();
                     let installed = current.installed.map(|prefix| prefix.replica);

@@ -35,9 +35,10 @@ fn table_block_clones_keep_the_decoded_schema_charged() {
 
 #[test]
 fn replay_checkpoint_lists_active_search_roots_alongside_primary_closure() {
-    use rtdb_format::{catalog::CheckpointContents, keys::TableSlug, log::proto::{RetiredSearchRun, SearchRun}};
+    use rtdb_format::{catalog::CheckpointContents, log::proto::{RetiredSearchRun, SearchRun}};
 
-    let slug = TableSlug::recorded("public$example").unwrap();
+    let entry = TableEntry::new(16_384, TableRef::new("public", "example")).unwrap();
+    let slug = &entry.slug;
     let run = |id| SearchRun { definition_id: Some("examplef16".into()), definition_version: Some(3), blocks: vec![0],
         digest: Some(vec![id; 32]), file_size: Some(100), locator: Some(vec![1]), source_rows: Some(1), ..Default::default() };
     let active = run(5);
@@ -47,9 +48,9 @@ fn replay_checkpoint_lists_active_search_roots_alongside_primary_closure() {
     let block = TableBlock::decode(&block.encode()).unwrap();
     assert_eq!(block.as_proto().search_runs, [active.clone()]);
     assert_eq!(block.as_proto().retired_search_runs, [retired]);
-    let replay = block.checkpoint_trie_files(&slug, CheckpointContents::Replay).unwrap();
-    assert_eq!(replay.into_iter().collect::<Vec<_>>(), [active.object_key(&slug).unwrap()]);
-    assert!(block.checkpoint_trie_files(&slug, CheckpointContents::Primary).unwrap().is_empty());
+    let replay = block.checkpoint_trie_files(&entry, CheckpointContents::Replay).unwrap();
+    assert_eq!(replay.into_iter().collect::<Vec<_>>(), [active.object_key(slug).unwrap()]);
+    assert!(block.checkpoint_trie_files(&entry, CheckpointContents::Primary).unwrap().is_empty());
 }
 
 #[test]
@@ -77,10 +78,11 @@ fn a_table_block_manifest_covers_exactly_the_recorded_oids() {
 fn replay_closure_preserves_l0_inputs_and_usable_artefacts() {
     use std::collections::BTreeSet;
     use prost::Message;
-    use rtdb_format::{catalog::CheckpointContents, keys::{TableSlug, TrieKey}, log::proto::{ArtefactRecord, ArtefactScope, TrieDetails, TrieState}};
+    use rtdb_format::{catalog::CheckpointContents, keys::TrieKey, log::proto::{ArtefactRecord, ArtefactScope, TrieDetails, TrieState}};
     use rtdb_types::BlockIndex;
 
-    let slug = TableSlug::recorded("public$example").unwrap();
+    let entry = TableEntry::new(16_384, TableRef::new("public", "example")).unwrap();
+    let slug = &entry.slug;
     let l0 = TrieKey::l0(BlockIndex(1)).unwrap();
     let retired = TrieKey::new(1, None, Vec::new(), BlockIndex(2)).unwrap();
     let live = TrieKey::new(2, None, vec![0], BlockIndex(3)).unwrap();
@@ -99,10 +101,17 @@ fn replay_closure_preserves_l0_inputs_and_usable_artefacts() {
         ..Default::default()
     }.encode_to_vec()).unwrap();
     let primary = [slug.data_key(&live), slug.metadata_key(&live), slug.data_key(&nascent), slug.metadata_key(&nascent)];
-    assert_eq!(block.checkpoint_trie_files(&slug, CheckpointContents::Primary).unwrap(), BTreeSet::from(primary.clone()));
+    assert_eq!(block.checkpoint_trie_files(&entry, CheckpointContents::Primary).unwrap(), BTreeSet::from(primary.clone()));
     let mut replay = BTreeSet::from(primary);
     replay.extend([slug.data_key(&l0), slug.metadata_key(&l0), slug.recorded_artefact_key(&live, &own).unwrap(),
         slug.recorded_artefact_key(&live, &group).unwrap()]);
-    assert_eq!(block.checkpoint_trie_files(&slug, CheckpointContents::Replay).unwrap(), replay,
+    assert_eq!(block.checkpoint_trie_files(&entry, CheckpointContents::Replay).unwrap(), replay,
         "replay closure must include retained L0 and one copy per usable artefact");
+
+    let receipt = TableEntry::new(16_385, TableRef::new("xt", "bounded_retry_receipts")).unwrap();
+    let receipt_files = block.checkpoint_trie_files(&receipt, CheckpointContents::Replay).unwrap();
+    assert!(!receipt_files.contains(&receipt.slug.data_key(&l0)));
+    assert!(!receipt_files.contains(&receipt.slug.metadata_key(&l0)));
+    assert!(receipt_files.contains(&receipt.slug.data_key(&live)));
+    assert!(receipt_files.contains(&receipt.slug.data_key(&nascent)));
 }

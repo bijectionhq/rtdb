@@ -273,8 +273,8 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
         }
     } else {
         crate::RetirementWork::S3 {
-            deployment: parent.id.clone(), target: target.clone(), release: release.clone(), legacy_receipt: None,
-            version: version(&target, "original"), release_version: Some(version(&release, "record")),
+            deployment: parent.id.clone(), target: target.clone(), release: release.clone(),
+            version: version(&target, "original"), release_version: version(&release, "record"),
         }
     };
     let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope, work };

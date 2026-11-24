@@ -1,5 +1,6 @@
 use rtdb_columnar::read_value;
-use rtdb_types::{Anomaly, Result, TimeUnit, TxId, Timestamp, Value};
+use rtdb_types::{Anomaly, Iid, Result, TableRef, TimeUnit, TxId, Timestamp, Value};
+use sha2::{Digest, Sha256};
 
 use super::OpenTransaction;
 use crate::idempotency_window::advance_retry_clock;
@@ -26,10 +27,15 @@ impl OpenTransaction<'_> {
     /// The predecessor belongs to this installed history, including any staged transactions.
     pub(super) async fn observe_retention_clock(&self, appended: Timestamp) -> Result<RetentionClock> {
         let snapshot = self.buffer.base_snapshot();
-        let Some(predecessor) = snapshot.tx_basis() else { return Ok(RetentionClock::observe(None, appended)); };
+        let Some(predecessor) = snapshot.tx_basis() else {
+            return Ok(RetentionClock::observe(None, self.decision.map_or(appended, |sample| sample.instant)));
+        };
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let previous = installed_receipt_time(context, predecessor).await?;
-        Ok(RetentionClock::observe(previous, appended))
+        Ok(match self.decision {
+            Some(sample) => RetentionClock { time: sample.instant, previous },
+            None => RetentionClock::observe(previous, appended),
+        })
     }
 }
 
@@ -50,16 +56,9 @@ pub async fn installed_receipt_time(
         "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ?",
         vec![Value::I64(head.tx_id.0), system_time()],
     ).await?;
-    let exact = match point {
-        Some(clock) => Some(clock),
-        None => read_receipt_clock_row(&context,
-            "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE system_time = ?",
-            vec![system_time()],
-        ).await?,
-    };
-    if let Some(Some(exact)) = exact { return Ok(Some(exact)); }
+    if let Some(Some(exact)) = point { return Ok(Some(exact)); }
 
-    // Legacy replay can advance the installed head without a transaction row carrying the clock.
+    // A copied prefix can preserve its transaction row under the original source ID.
     Ok(read_receipt_clock_row(&context,
         "SELECT MAX(receipt_time) FROM xt.txs FOR ALL VALID_TIME WHERE system_time <= ?",
         vec![system_time()],
@@ -98,7 +97,37 @@ async fn read_receipt_clock_row(
 
 fn clock_error(message: &str) -> Anomaly { Anomaly::fault("rtdb.tx/retention-clock", message) }
 
+pub(super) const METADATA_ERASURE_UNIT: &str = "metadata_erasure_unit";
+
+pub(super) fn metadata_erasure_key(table: &TableRef, iid: Iid, key: Option<&[u8]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb/transaction-metadata-erasure/v1");
+    for field in [table.schema.as_bytes(), table.table.as_bytes(), key.unwrap_or(&iid.0)] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 impl OpenTransaction<'_> {
+    pub(super) async fn retire_unit_metadata(&mut self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<()> {
+        let receipts = super::receipts_table();
+        if !self.buffer.base_snapshot().column_names(&receipts).contains(METADATA_ERASURE_UNIT) { return Ok(()); }
+        let value = Value::Utf8(metadata_erasure_key(table, iid, key));
+        let mut cursor = self.open_query(
+            "SELECT _id FROM xt.idempotency_receipts FOR ALL VALID_TIME WHERE metadata_erasure_unit = ?",
+            vec![value],
+        ).await?;
+        while let Some(page) = cursor.next_batch().await? {
+            let batch = page.batch();
+            for row in 0..batch.num_rows() {
+                let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), row)?.entity_id()?;
+                self.buffer.erase(receipts.clone(), &id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn historical_guard_original(&self, key: &str, submitted_at: Timestamp) -> Result<Option<rtdb_types::TransactionKey>> {
         let markers = rtdb_types::TableRef::new("public", "rtdb_idempotency_keys");
         if !self.snapshot()?.contains_table(&markers) { return Ok(None); }
@@ -119,7 +148,7 @@ impl OpenTransaction<'_> {
     }
 
     /// Progressively replaces expired payloads with committed erase events.
-    /// Reused legacy keys are grouped by their newest interval before erasure.
+    /// Legacy retries admitted in different windows have independent stored identities.
     pub(super) async fn retire_expired_receipts(&mut self, clock: RetentionClock) -> Result<()> {
         if !clock.collect_at(self.tx_key().tx_id) { return Ok(()); }
         let observed = clock.time;

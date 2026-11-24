@@ -501,6 +501,21 @@ contract LogService {
         -- Writer replacement preserves the current key generation, including across a vacant writer state.
         -- An operation that needs a revoked journal payload key returns rtdb/erased-under-view.
 
+    @invariant InstalledObjectsUsePublicationKeySlots
+        -- The installed journal placement, immutable provider namespace, purpose and object name select each slot.
+        -- The key vault conditionally provisions the slot before object publication and preserves tombstones.
+        -- Detached replica objects use their original writer namespace.
+        -- Checkpoint preparation seals the manifest and copied members under new slots scoped to the allocation.
+        -- A selected checkpoint opens against its exact manifest and the allocation's own slots.
+        -- Checkpoint retirement closes the original selection and withdraws its listed key dependencies after its existing holds drain.
+        -- Local and S3 checkpoint and serving-prefix retirement close their key namespace and settle its exact slot census.
+        -- The S3 vault registers a slot before its key create can effect and freezes every registration shard before settling its slots.
+        -- The terminal slot tombstone excludes delayed provider creates at that identity.
+        -- A checkpoint capture combines each independently held slot with its capture authority before opening a file or replay record.
+        -- Ordered transfer manifests, replica segments and detached bodies use distinct slots under destination custody.
+        -- Serving storage releases bodies only within a journal-issued serving lease.
+        -- A detached replica object reader uses the lease captured at its admission for cryptography.
+
     @invariant InstalledJournalErasureCommit
         -- The custody authority closes new serving and copy admissions and retains that fence through restart until the erasure attempt is durably resolved.
         -- The incumbent drains outstanding appends before the custodian fixes the journal head.
@@ -513,9 +528,10 @@ contract LogService {
         -- Appends under the previous grant are fenced at the rotation cut.
         -- The erasure commit requires durable evidence of a clean root at or after that cut and a clean suffix in every crash-selectable slot.
         -- Subsequent recovery slot selection preserves that evidence's exclusion of older roots.
-        -- The commit publishes its identity and arms revocation of the old generation at the same decision.
-        -- An admitted view retains its answer until its deadline, at most 120 seconds after the commit.
-        -- A held view requiring erased material then returns rtdb/erased-under-view.
+        -- The commit publishes its identity, closes admission and durably records the old generation's destruction obligations at the same decision.
+        -- A view admitted before the fence can finish within its original exclusive grant deadline.
+        -- A fixed deadline requires a bounded custody drain followed by a bounded destruction and evidence tail.
+        -- A held view requiring withdrawn material returns rtdb/erased-under-view.
 
     @invariant InstalledCheckpointPrecedesTrim
         -- A checkpoint custodian supplies the exact immutable provider manifest for one reconstructable RTDB checkpoint and journal cut.
@@ -577,9 +593,12 @@ contract LogService {
         -- A standalone authority addresses its journal by the retained journal ID.
         -- Only the process holding the journal can reach that transport.
 
-    @invariant CommitIsAWriteQuorum
-        -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
-        -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
+    @invariant VisibilityRequiresAnInstalledDecision
+        -- Payload votes authenticate distinct physical journals, the active configuration and the exact recoverable prefix digest.
+        -- The decision certificate binds the predecessor and admissible evidence.
+        -- Each installer durably records the full compatible certificate in its local journal order.
+        -- Append receipts require a quorum of installations. Transaction replies and external effects also require exact application.
+        -- Sealing retains installed certificates and potentially chosen ordinary values, and activation installs the recovered prefix and dependencies on the successor quorum.
 
     @invariant GuardedAppendRequiresALiveUpperSample
         -- Before a guarded append takes a log position or dispatches a record, the writer samples its live clock in append order.
@@ -659,13 +678,20 @@ contract LogService {
         -- Before writing, the holder activates a durable write quorum for the epoch, the member identities and the configured quorum size.
         -- A journal acknowledges activation only at its promised and synced epoch and records at most one ensemble for that epoch.
         -- A higher promise revokes the activation.
-        -- A positive read-index reply requires that activation and reports the last held and published positions after preceding journal work is durable.
-        -- A read index requires an intersecting write quorum of positive replies.
-        -- Its upper bound includes every position that could have been held by a write quorum before the read began.
-        -- Unobserved journal slots count as possible holders, so each additional positive reply can rule out a minority tail.
-        -- A published position or a position held by a full observed quorum can discharge that uncertainty.
-        -- If the round cannot settle the uncertainty within its confirmation grace, it returns the conservative bound.
-        -- A subscriber waits for committed application through the result before taking its query snapshot.
+        -- A positive reply requires that activation and binds the fresh invocation nonce to the greatest installed decision in the same local order.
+        -- The reader selects the greatest compatible decision from an intersecting quorum of distinct positive replies.
+        -- The selected cut must have quorum installation before exposure. The reader can complete installation of its exact certificate.
+        -- An installer already ahead can attest a verified extension without changing the reader's selection.
+        -- The admitted read index binds the stream, history, epoch, ensemble, cut and exact prefix digest.
+        -- A serving attachment acquires replay protection and waits for same-history application through the cut before capturing that exact snapshot.
+        -- Fresh basis capture retains protection through execution and transfer. Raw staged tips do not constrain selection.
+
+    @invariant BrokeredDetachedBodyUsesTheCommittedPosition
+        -- A sealed directory journal frame commits the digest of its detached reference.
+        -- The broker admits one position under a current replay ticket and retains its own directory region through delivery and provider drain.
+        -- It matches the supplied reference to the quorum-certified frame and verifies the exact provider publication and body digest.
+        -- The detached storage namespace and unit-key vault belong to the broker.
+        -- A cross-cell successor reseals detached bodies under its broker and binds the returned publication into the new committed frame.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
@@ -675,6 +701,8 @@ contract LogService {
         -- A replica that cannot extend the saved digest across contiguous positions cannot contribute proof.
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
+    -- The hosted directory path stores receipt L0 data and metadata as separate publications.
+    -- An exact retirement of a covered receipt L0 requires a certified recovery exclusion through its removal and an independent published recovery root.
 
     @invariant DroppedStreamsAreTerminal
         -- A drop at the deletion epoch durably removes the stream from the server's readable and writable state.
@@ -711,6 +739,7 @@ contract ObjectStorage {
     @invariant OnlyTheReaperDeletes
         -- No node, gateway or worker holds a credential that can delete.
         -- The reaper deletes objects after a reachability release or a completed ordered-page retirement fence.
+        -- Directory-managed exact removal consumes a grant obtained from the lineage revision authorizing the same retirement token and publications.
 
     @invariant VisibilityIsByReference
         -- An object has effect only once a committed log record or a published manifest references it.
@@ -1368,6 +1397,8 @@ rule ResolveAndAppend {
     -- The holder resolves against its state, pipelining later transactions against speculative state.
     -- An asynchronous submission returns an authenticated, opaque receipt for the deployment history, writer epoch, local sequence, principal and fresh nonce.
     -- A placed session accepts only receipts and causal tokens from the same deployment history and principal.
+    -- The holder keeps intake records until their source positions are installed from the replica log.
+    -- It releases the installed intake prefix independently of subsequent submissions.
     -- The resolved replica record carries the exact attempt identity.
     -- Only its durable applied outcome supplies a causal basis.
     when: TxArrived(holding, tx, key)
@@ -1508,6 +1539,8 @@ rule ConsumeIntake {
 -- The read loads only the checkpoint closure, with no replay of the serving tail.
 -- A writable checkpoint world durably pins that capture before ordering its owner-scoped registration.
 -- A held child of Root starts at the exact archived Root publication, even if Root has since advanced.
+-- A child at its parent's retained Root publication may start its own Held writer at the inherited reading.
+-- Its independent pin owns the same Root media and its registry entry binds the original parent registration prefix.
 -- The child's registration, its application ownership custody, the request receipt and any Root facts order together.
 -- A world opens against an authenticated attachment when the durable pin and ordered registration name the same cut and remain live.
 -- Child writes are confined to one world, and the ordered resolver checks that world's expiry before applying any writes.
@@ -1709,6 +1742,7 @@ rule PublishCheckpoint {
 }
 
 rule TrimCertifiedReplicaPrefix {
+    -- The prefix owner retains its authenticated journal unit census before trim and withdraws those slots through the original vault.
     -- The checkpoint's boundary record supplies the intake position on reopen.
     -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
     -- A separately captured suffix retains its capture until explicit archive retirement.
@@ -1893,8 +1927,13 @@ rule ReapUnreachable {
     -- A hosted path sweep withdraws eligible inherited references and preserves the provider payloads and release markers.
     -- Owned hosted payloads and markers wait for provider retirement authority.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.
+    -- An exact trie or replica payload release can settle as soon as its durable admission and recovery checks allow it.
+    -- Path and checkpoint-metadata pack releases still use the grace below.
     -- A retired logical search run carries its provider publication and the installed catalog floor before a hosted release can be recorded.
-    -- A hosted pack is erased by exact version after the indexed members of that same version each have a mature release.
+    -- Every indexed member of a hosted pack needs a mature release for the same publication.
+    -- A versioned pack is erased by its exact version.
+    -- An enrolled terminal pack is replaced by a conditional tombstone after an entity-tag-bound index read.
+    -- The same terminal observation mechanism opens the successor root and checks its published digest before authorization.
     -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
     -- The owner CAS checks the pack's block and the greatest covered metadata block against its current checkpoint and holds.
     -- An exact absence observation permits residual member release markers to settle while a replacement pack remains available.
@@ -3040,6 +3079,7 @@ rule RetainServingReplayArchive {
 }
 
 rule StageHistoricalCheckpoint {
+    -- Primary members and the sealed inventory have separate slots in the stage vault.
     when: HistoricalCheckpointStageRequested(capture, target, operation)
 
     requires: ExactRetainedCapture(capture)
@@ -3210,7 +3250,7 @@ rule BeginCellMove {
 
 rule MoveCutover {
     -- The destination accepts placements only after the cell map switches to it.
-    -- The destination's first holder imports the sealed source log before it can serve.
+    -- The destination verifies the certified retained interval and reseals each frame into its own slots before it can serve.
     -- A retry after the switch finishes publication and leaves the source tombstone.
     -- Forks in the source cell retain access to every object they share.
     -- Verify the destination's root owner, checkpoint catalog, required trie metadata and trie envelopes against its own storage generation.
@@ -3398,6 +3438,9 @@ actor Gateway {
     -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
     -- A displaced session authorizes cleanup on its original holder.
     -- Every new data action checks current placement standing.
+    -- An audience placement must recover its commissioning checkpoint before it serves.
+    -- Each prepared capture checks its catalog pin and projected transaction floor while standing is fenced by the current holder and writer epoch.
+    -- Audience actions exclude the whole-Root publication head and the provider-issuer control.
     -- An audience historical Root page scans at most five forward nominations under the prepared read, at equal valid and system coordinates less than 60 seconds before the hold.
     -- A detached audience operation polls with the same action and turn allowances as its admitting call.
     -- Each provider attempt spends its work charge from the action allowance and from the shared turn allowance when present.

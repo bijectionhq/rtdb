@@ -35,6 +35,7 @@ impl TableBinding {
         match name {
             "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
             "_assertion_ordinal" if self.name.table.is_owned_event_data() => LogicalType::Scalar(ScalarType::I64),
+            rtdb_types::HOSTED_RECEIPT_TX_ID => LogicalType::Scalar(ScalarType::I64).maybe(),
             "_valid_from" | "_system_from" => timestamp(),
             "_valid_to" | "_system_to" => timestamp().maybe(),
             _ => self.columns.get(name).cloned().unwrap_or(LogicalType::Null),

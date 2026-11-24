@@ -10,7 +10,7 @@ use rtdb_types::{BlockIndex, EventOrigin, Iid, Interval, Timestamp};
 #[test]
 fn history_ranges_keep_mixed_event_identities_and_reject_unbound_bytes() {
     let stable = EventOrigin::at([3; 16], 11, BlockIndex(8));
-    let events = [None, Some(stable)].into_iter().enumerate().map(|(row, origin)| StoredEvent {
+    let events = [None, Some(stable)].into_iter().enumerate().map(|(row, origin)| StoredEvent { position: None,
         iid: Iid([row as u8; 16]), system_from: Timestamp(40), valid_time: Interval::ALL,
         operation: StoredOperation::Delete, recency: None, entity_key: None, commit_position: 0, origin,
     }).collect::<Vec<_>>();
@@ -44,7 +44,7 @@ fn history_ranges_keep_mixed_event_identities_and_reject_unbound_bytes() {
 fn forward_witness_requires_the_same_logical_event() {
     let origin = EventOrigin::at([3; 16], 11, BlockIndex(8));
     let iid = Iid([1; 16]);
-    let event = StoredEvent {
+    let event = StoredEvent { position: None,
         iid, system_from: Timestamp(40), valid_time: Interval::ALL, operation: StoredOperation::Delete,
         recency: None, entity_key: None, commit_position: 0, origin: Some(origin),
     };

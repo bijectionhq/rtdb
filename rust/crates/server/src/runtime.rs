@@ -29,6 +29,7 @@ impl TransactionAuthorization for HostedTransactionAuthority {
 
 /// What a node placed by an outside authority needs beyond its configuration.
 pub struct PlacedOptions {
+    pub decision_clock: Option<Arc<dyn rtdb_tx::DecisionClock>>,
     /// Log factories for the placed databases' logs, by protobuf type name.
     pub log_factories: Vec<(String, Arc<dyn rtdb_node::LogFactory>)>,
     /// Storage factories for the placed databases' object stores, by protobuf type name.
@@ -154,6 +155,7 @@ impl ServerDriver {
             None => resources,
         };
         let compaction_relay = placed.as_ref().and_then(|placed| placed.compaction_relay.clone());
+        let decision_clock = placed.as_ref().and_then(|placed| placed.decision_clock.clone());
         let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
@@ -165,7 +167,7 @@ impl ServerDriver {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
-        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter,
+        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter, decision_clock,
             ..NodeServices::local_with_search_format(authority, metrics.clone(), auth.clone(), metrics.clone(), config.search.write_format) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;

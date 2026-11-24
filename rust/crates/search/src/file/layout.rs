@@ -66,6 +66,7 @@ impl Table {
                 ("iid", T::FixedSizeBinary(16), false), ("system_from", T::Int64, false),
                 ("valid_from", T::Int64, false), ("valid_to", T::Int64, false), ("op", T::UInt8, false),
                 ("entity_key", T::Binary, true),
+                ("event_position", T::FixedSizeBinary(rtdb_types::EventPosition::WIDTH), true),
             ])),
             Self::Runs => ("runs", fields([
                 ("iid", T::FixedSizeBinary(16), false), ("token_length", T::UInt32, false),
@@ -141,10 +142,12 @@ impl Table {
                 ("column", T::UInt32, false), ("revision", T::FixedSizeBinary(32), false),
                 ("tokens", list_type(T::Utf8), false),
                 ("system_from", T::Int64, false), ("commit_position", T::UInt32, false),
+                ("event_position", T::FixedSizeBinary(rtdb_types::EventPosition::WIDTH), true),
             ])),
             Self::Erases => ("erases", fields([
                 ("iid", T::FixedSizeBinary(16), false),
                 ("system_from", T::Int64, false), ("commit_position", T::UInt32, false),
+                ("event_position", T::FixedSizeBinary(rtdb_types::EventPosition::WIDTH), true),
             ])),
         };
         Field::new(name, list_type(T::Struct(fields)), false)

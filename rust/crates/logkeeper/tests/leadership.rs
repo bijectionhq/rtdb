@@ -73,11 +73,11 @@ async fn a_slow_replica_does_not_delay_a_durable_recovery_quorum() {
     }).await.unwrap();
     ensemble.stop(0).await;
     let reader = open_reader(proxied, CancellationToken::new()).await.unwrap();
-    assert_eq!(reader.read_index(2).await.unwrap(), LogOffset(1));
+    assert_eq!(reader.read_index(2).await.unwrap().through(), LogOffset(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests_were_lost() {
+async fn payload_votes_do_not_release_a_receipt_when_decision_requests_are_lost() {
     let ensemble = Ensemble::start(3).await;
     let config = ensemble.config("unpublished-tip");
     let mut before = Vec::new();
@@ -89,10 +89,17 @@ async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests
     let initial = StreamConfig { servers: before.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config.clone() };
     let previous = open_writer(initial.clone(), 1, CancellationToken::new()).await.unwrap();
     for proxy in &before { proxy.drop_commits(); }
-    assert_eq!(append(previous.as_ref(), "first", 1).await.offset, LogOffset(0));
+    let pending = previous.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while before.iter().map(CountingProxy::commits).sum::<usize>() < 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("the payload quorum started decision publication");
+    assert_eq!(previous.latest().unwrap(), LogOffset(-1));
     let reader = open_reader(initial, CancellationToken::new()).await.unwrap();
-    assert_eq!(reader.latest().unwrap(), LogOffset(-1));
-    assert_eq!(reader.read_index(1).await.unwrap(), LogOffset(0));
+    assert_eq!(reader.read_index(1).await.unwrap().through(), LogOffset(-1));
+    drop(pending);
+    drop(previous);
 
     let proxied = StreamConfig { servers: after.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config.clone() };
     after[2].drop_commits();
@@ -136,9 +143,79 @@ async fn an_active_read_index_ignores_an_append_held_only_by_a_minority() {
     }).await.expect("the first journal durably accepted the partial append");
 
     assert_eq!(writer.latest().unwrap(), committed);
-    assert_eq!(reader.read_index(1).await.unwrap(), committed);
+    proxies[2].hold(true);
+    drop(writer);
+    let index = tokio::time::timeout(Duration::from_secs(1), reader.read_index(1)).await
+        .expect("a live quorum answers without the writer or silent journal").unwrap();
+    assert_eq!(index.through(), committed);
     assert_eq!(reader.read_range(LogOffset(0), LogOffset(2)).await.unwrap()[0].payload, "committed");
     drop(in_flight);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_installs_a_partial_decision_before_another_quorum_can_serve() {
+    let ensemble = Ensemble::start(3).await;
+    let mut writer_routes = Vec::new();
+    let mut first_routes = Vec::new();
+    let mut second_routes = Vec::new();
+    let members = |proxies: &[CountingProxy]| {
+        proxies.iter().enumerate().map(|(slot, proxy)| {
+            let journal = std::fs::read_to_string(ensemble.directories[slot].path().join("JOURNAL_ID")).unwrap();
+            JournalEndpoint::Member { address: proxy.address.to_string(), journal }
+        }).collect()
+    };
+    for address in &ensemble.addresses {
+        writer_routes.push(CountingProxy::start(*address).await);
+        first_routes.push(CountingProxy::start(*address).await);
+        second_routes.push(CountingProxy::start(*address).await);
+    }
+    let config = || ensemble.config("read-installs-decision");
+    let writer = open_writer(
+        StreamConfig { servers: members(&writer_routes), ..config() }, 1, CancellationToken::new(),
+    ).await.unwrap();
+    let baseline = append(writer.as_ref(), "baseline", 1).await.offset;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for slot in 0..3 {
+            let journal = open_reader(ensemble.config_of(&[slot], "read-installs-decision"), CancellationToken::new()).await.unwrap();
+            while journal.read_range(baseline, LogOffset(1)).await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }).await.expect("the whole ensemble joined the active loglet");
+    let staged = writer_routes.iter().map(CountingProxy::accepted_appends).collect::<Vec<_>>();
+    let installed = writer_routes[0].accepted_commits();
+    for route in &writer_routes[1..] { route.drop_commits(); }
+    writer_routes[1].drop_appends();
+    let pending = writer.enqueue(Bytes::from_static(b"partial decision"), Timestamp(2)).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while writer_routes[0].accepted_commits() == installed
+            || [0, 2].into_iter().any(|server| writer_routes[server].accepted_appends() == staged[server])
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("one journal installed the decision, another holds the bytes, and one holds neither");
+    assert_eq!(writer.latest().unwrap(), baseline);
+    let local = open_reader(ensemble.config_of(&[0], "read-installs-decision"), CancellationToken::new()).await.unwrap();
+    assert!(local.read_range(LogOffset(1), LogOffset(2)).await.unwrap().is_empty());
+    drop(pending);
+    drop(writer);
+
+    let first = open_reader(
+        StreamConfig { servers: members(&first_routes), ..config() }, CancellationToken::new(),
+    ).await.unwrap();
+    first_routes[2].hold(true);
+    let read = tokio::time::timeout(Duration::from_secs(2), first.read_index(1)).await.unwrap().unwrap();
+    assert_eq!(read.through(), LogOffset(1));
+    assert!(first_routes[1].commits() > 0);
+    assert!(read.decision().is_some_and(|decision| decision.authentic()));
+
+    let second = open_reader(
+        StreamConfig { servers: members(&second_routes), ..config() }, CancellationToken::new(),
+    ).await.unwrap();
+    second_routes[0].hold(true);
+    let read = tokio::time::timeout(Duration::from_secs(2), second.read_index(1)).await.unwrap().unwrap();
+    assert_eq!(read.through(), LogOffset(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -150,7 +227,7 @@ async fn the_recovered_predecessor_cannot_confirm_a_successor_read_index() {
     let previous_config = config(&[0, 1, 2]);
     let previous = open_writer(previous_config.clone(), 1, CancellationToken::new()).await.unwrap();
     let previous_reader = open_reader(previous_config.clone(), CancellationToken::new()).await.unwrap();
-    assert_eq!(previous_reader.read_index(1).await.unwrap(), LogOffset(-1));
+    assert_eq!(previous_reader.read_index(1).await.unwrap().through(), LogOffset(-1));
     let first = append(previous.as_ref(), "first", 1).await.offset;
 
     let current_config = config(&[1, 2, 3]);
@@ -160,9 +237,9 @@ async fn the_recovered_predecessor_cannot_confirm_a_successor_read_index() {
     assert!(previous_reader.read_index(2).await.is_err());
 
     let current = open_reader(config(&[3, 1, 2]), CancellationToken::new()).await.unwrap();
-    assert_eq!(current.read_index(2).await.unwrap(), first);
+    assert_eq!(current.read_index(2).await.unwrap().through(), first);
     let second = append(moved.as_ref(), "second", 2).await.offset;
-    assert_eq!(current.read_index(2).await.unwrap(), second);
+    assert_eq!(current.read_index(2).await.unwrap().through(), second);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -302,7 +379,7 @@ async fn a_replacement_with_the_same_history_has_no_authority_to_confirm_or_reti
     let writer = open_writer(bound.clone(), 1, CancellationToken::new()).await.unwrap();
     let offset = append(writer.as_ref(), "original", 1).await.offset;
     let reader = open_reader(bound.clone(), CancellationToken::new()).await.unwrap();
-    assert_eq!(reader.read_index(1).await.unwrap(), offset);
+    assert_eq!(reader.read_index(1).await.unwrap().through(), offset);
     drop(writer);
     ensemble.stop(0).await;
 
@@ -327,6 +404,6 @@ async fn a_replacement_with_the_same_history_has_no_authority_to_confirm_or_reti
     let route = CountingProxy::start(address).await;
     let rerouted = StreamConfig { servers: vec![JournalEndpoint::Member { address: route.address.to_string(), journal }], ..bound };
     let reader = open_reader(rerouted, CancellationToken::new()).await.unwrap();
-    assert_eq!(reader.read_index(1).await.unwrap(), offset);
+    assert_eq!(reader.read_index(1).await.unwrap().through(), offset);
     ensemble.stop(0).await;
 }

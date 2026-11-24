@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::basis::{decode_time_basis, decode_tx_basis, encode_time_basis, encode_tx_basis};
+use rtdb_format::basis::{decode_tx_basis, encode_tx_basis};
 use rtdb_plan::AccessMode;
 use rtdb_tx::{SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata};
 use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxBasis, TxId, Value};
@@ -22,8 +22,11 @@ pub trait SessionService: Send + Sync {
     fn now(&self) -> Timestamp;
     /// Supplies the query clock; implementations with finer precision override the microsecond clock lift.
     fn query_instant(&self) -> Instant { self.now().into() }
+    async fn fresh_query_instant(&self) -> Result<Instant> { Ok(self.query_instant()) }
     fn snapshot_basis(&self) -> Result<TimeBasis>;
-    async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<TimeBasis> { self.snapshot_basis() }
+    async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<(TimeBasis, Option<ReplicaQueryCapture>)> {
+        Ok((self.snapshot_basis()?, None))
+    }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
     async fn await_client_token(&self, token: Option<&str>, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<String>> {
         self.await_basis(token.map(decode_tx_basis).transpose()?, timeout, cancellation).await?;
@@ -40,15 +43,29 @@ pub trait SessionService: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ReplicaQueryCapture {
+    pub(crate) attachment: std::sync::Weak<crate::Database>,
+    pub(crate) snapshot: Arc<rtdb_index::Snapshot>,
+}
+
+impl PartialEq for ReplicaQueryCapture {
+    fn eq(&self, other: &Self) -> bool {
+        self.attachment.ptr_eq(&other.attachment) && Arc::ptr_eq(&self.snapshot, &other.snapshot)
+    }
+}
+
+impl Eq for ReplicaQueryCapture {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryBasis {
     pub snapshot: TimeBasis,
+    pub replica_capture: Option<ReplicaQueryCapture>,
+    pub resume_token: Option<String>,
+    pub has_await_floor: bool,
     pub snapshot_time: Option<Timestamp>,
     pub current_time: Instant,
     pub timezone: String,
-}
-impl QueryBasis {
-    pub fn snapshot_token(&self) -> String { encode_time_basis(&self.snapshot) }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -227,7 +244,9 @@ enum Lifecycle { Open(Option<Transaction>), Closed }
 struct RetainedBasis { basis: QueryBasis, _reservation: Arc<MemoryReservation> }
 impl RetainedBasis {
     fn copy(basis: &QueryBasis, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let mut bytes = basis.timezone.capacity().checked_add(256).ok_or_else(allocation_overflow)?;
+        let mut bytes = basis.timezone.capacity().checked_add(256)
+            .and_then(|bytes| bytes.checked_add(basis.resume_token.as_ref().map_or(0, String::capacity)))
+            .ok_or_else(allocation_overflow)?;
         for (name, values) in &basis.snapshot.databases {
             bytes = bytes.checked_add(name.capacity()).and_then(|bytes| bytes.checked_add(values.capacity().checked_mul(std::mem::size_of::<Option<rtdb_types::Instant>>())?)).and_then(|bytes| bytes.checked_add(256)).ok_or_else(allocation_overflow)?;
         }
@@ -524,14 +543,26 @@ impl Session {
     }
     async fn pin(&self, options: &ReadOptions) -> Result<(QueryBasis, Option<String>)> {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
-        let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
-        let snapshot = match &options.snapshot_token {
-            Some(token) => decode_time_basis(token)?,
-            None => self.service.fresh_snapshot_basis(&self.cancellation).await?,
-        };
         let world_time = self.parameter("bijection.at").map(world_clock).transpose()?;
-        let current_time = world_time.or(options.clock_time).unwrap_or_else(|| self.service.query_instant());
-        Ok((QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time, timezone: self.effective_timezone().to_owned() }, applied))
+        let has_await_floor = token.is_some();
+        if options.snapshot_token.is_some() && (has_await_floor || options.snapshot_time.is_some() || options.clock_time.is_some() || world_time.is_some()) {
+            return Err(crate::sql_snapshots::unretained());
+        }
+        let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
+        let current_time = match world_time.or(options.clock_time) {
+            Some(time) => time,
+            None if options.snapshot_token.is_some() => Instant::default(),
+            None => self.cancellation.run_until_cancelled(self.service.fresh_query_instant()).await
+                .ok_or_else(|| Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb/cancelled", "Snapshot admission was cancelled"))??,
+        };
+        let (snapshot, replica_capture, resume_token) = match &options.snapshot_token {
+            Some(snapshot_token) => (TimeBasis::default(), None, Some(snapshot_token.to_string())),
+            None => {
+                let (basis, capture) = self.service.fresh_snapshot_basis(&self.cancellation).await?;
+                (basis, capture, None)
+            }
+        };
+        Ok((QueryBasis { snapshot, replica_capture, resume_token, has_await_floor, snapshot_time: options.snapshot_time, current_time, timezone: self.effective_timezone().to_owned() }, applied))
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
         self.revalidate().await?;
@@ -590,7 +621,7 @@ impl Session {
         }
         let current_time = self.parameter("bijection.at").map(world_clock).transpose()?
             .unwrap_or_else(|| self.service.query_instant());
-        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, snapshot_time: None, current_time, timezone: self.effective_timezone().to_owned() })
+        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time, timezone: self.effective_timezone().to_owned() })
     }
     pub(crate) fn require_open_world(&self) -> Result<()> {
         if self.parameter("bijection.at").is_some() {

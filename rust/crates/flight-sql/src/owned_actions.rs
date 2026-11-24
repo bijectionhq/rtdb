@@ -2,8 +2,8 @@ mod hosted_control;
 mod hosted_observation;
 mod unique;
 
-pub(crate) use hosted_control::READ_HELD_HOSTED_CONTROL_V2;
-pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V5, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
+pub(crate) use hosted_control::{READ_HELD_HOSTED_CONTROL_V2, READ_HELD_ROOT_CATALOG_V1};
+pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, CONFIRM_HOSTED_SOURCE_V1, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
 pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
@@ -18,8 +18,8 @@ use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, Own
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{HeldSpatialNearest, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
-use rtdb_tx::{ArrowDocuments, Documents, OwnedRelativePeriod, TxOp};
-use rtdb_types::{EntityId, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
+use rtdb_types::{EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -220,10 +220,11 @@ fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<
 }
 
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
-pub(crate) const OPEN_OWNED_SCOPED_READ_V1: &str = "rtdb.owned.OpenOwnedScopedRead.v1";
+pub(crate) const OPEN_OWNED_SCOPED_READ_V2: &str = "rtdb.owned.OpenOwnedScopedRead.v2";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
-pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
-pub(crate) const OPEN_APPLIED_OWNED_READ_V4: &str = "rtdb.owned.OpenAppliedRead.v4";
+pub(crate) const OPEN_OWNED_READ_V3: &str = "rtdb.owned.OpenRead.v3";
+pub(crate) const OPEN_FRESH_OWNED_READ_V2: &str = "rtdb.owned.OpenFreshRead.v2";
+pub(crate) const OPEN_APPLIED_OWNED_READ_V5: &str = "rtdb.owned.OpenAppliedRead.v5";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_FIXED_POINT_V1: &str = "rtdb.owned.ReadHeldFixedPoint.v1";
@@ -256,7 +257,7 @@ pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPa
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
-pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V3: &str = "rtdb.owned.PrepareHeldWorldOverlay.v3";
+pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V4: &str = "rtdb.owned.PrepareHeldWorldOverlay.v4";
 pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
@@ -265,7 +266,7 @@ pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
 pub(crate) const RETAIN_REPLAYED_WORLD_V3: &str = "rtdb.owned.RetainReplayedWorld.v3";
-pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
+pub(crate) const OPEN_WORLD_READ_V5: &str = "rtdb.owned.OpenWorldRead.v5";
 pub(crate) const READ_HELD_WORLD_HEAD_V1: &str = "rtdb.owned.ReadHeldWorldHead.v1";
 pub(crate) const SELECT_HELD_WORLD_PARENT_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldParentAsOf.v1";
 pub(crate) const HELD_WORLD_PARENT_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentPointAt.v1";
@@ -281,6 +282,7 @@ pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V3: &str = "rtdb.owned.PublishHeld
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const DECIDE_WORLD_CUT_V1: &str = "rtdb.owned.DecideWorldCut.v1";
 pub(crate) const DECIDE_HELD_WORLDS_V1: &str = "rtdb.owned.DecideHeldWorlds.v1";
+pub(crate) const SWITCH_PREPARED_PROPOSAL_V1: &str = "rtdb.owned.SwitchPreparedProposal.v1";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -645,7 +647,7 @@ fn audience_point_admitted(
     relation == projection
         || (recovering && relation.name() == "fact_layout_readiness")
         || (relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
-            && matches!(id, EntityId::String(id) if id == "head" || id == "sync_receipt_head"
+            && matches!(id, EntityId::String(id) if id == "sync_receipt_head"
                 || id.strip_prefix("fact_partition_head:") == Some(projection.name())))
 }
 
@@ -1024,17 +1026,15 @@ impl Service {
     }
 
     pub(crate) async fn offer_clock_slot_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        let (tick, trailing) = self.owned_clock_slot(call, body).await?;
+        let (slot, trailing) = self.owned_clock_slot(call, body).await?;
         if !trailing.is_empty() {
             return Err(invalid("A clock slot takes one original hold handle"));
         }
-        let reading = rtdb_tx::clock_slot_reading(tick.system_time).ok_or_else(Self::clock_slot_missed)?;
-        Ok(ActionResult { body: wire::retain(reading.0.to_be_bytes().to_vec(), call.reserve(8)?) })
+        Ok(ActionResult { body: wire::retain(slot.reading.0.to_be_bytes().to_vec(), call.reserve(8)?) })
     }
 
-    async fn wait_for_clock_slot(&self, call: &Call, tick: rtdb_types::TransactionKey) -> Result<(), Status> {
-        let reading = rtdb_tx::clock_slot_reading(tick.system_time).ok_or_else(Self::clock_slot_missed)?;
-        let delay = reading.0.saturating_sub(self.0.node.now().0);
+    async fn wait_for_clock_slot(&self, call: &Call, slot: OwnedClockSlot) -> Result<(), Status> {
+        let delay = slot.reading.0.saturating_sub(self.0.node.now().0);
         if delay > 1_000_000 {
             return Err(Self::clock_slot_missed());
         }
@@ -1048,7 +1048,7 @@ impl Service {
 
     async fn owned_clock_slot<'a>(
         &self, call: &Call, body: &'a [u8],
-    ) -> Result<(rtdb_types::TransactionKey, &'a [u8]), Status> {
+    ) -> Result<(OwnedClockSlot, &'a [u8]), Status> {
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing clock slot hold"))?;
@@ -1059,10 +1059,12 @@ impl Service {
         let cut = original.snapshot.fork_cut(scope).await.map_err(|error| {
             if error.code == "rtdb.world/unavailable" { Self::clock_slot_missed() } else { status(error) }
         })?;
-        if cut.live().is_none() {
-            return Err(Status::failed_precondition("An ordered clock slot requires a live placed Root hold"));
-        }
-        Ok((original.snapshot.present(), body))
+        let through = cut.live().ok_or_else(|| Status::failed_precondition(
+            "An ordered clock slot requires a live placed Root hold",
+        ))?.tx_id;
+        let observed = original.snapshot.query_time().map_err(status)?;
+        let reading = rtdb_tx::clock_slot_reading(observed).ok_or_else(Self::clock_slot_missed)?;
+        Ok((OwnedClockSlot { through, reading }, body))
     }
 
     pub(crate) async fn decide_hosted_action(
@@ -1101,7 +1103,7 @@ impl Service {
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
-        refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<rtdb_types::TransactionKey>,
+        refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1140,7 +1142,7 @@ impl Service {
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len() + usize::from(slot.is_some()))
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging, journal_before }];
-        writes.extend(slot.map(|predecessor| TxOp::OwnedClockSlot { predecessor }));
+        writes.extend(slot.map(|slot| TxOp::OwnedClockSlot { slot }));
         writes.extend(conditions);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
@@ -1559,17 +1561,25 @@ impl Service {
         drop(worlds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
-        self.owned_tx_reply(outcome.tx_key())
+        self.owned_tx_reply(&native, outcome.tx_key()).await
     }
 
-    fn owned_tx_reply(&self, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
+    async fn owned_tx_reply(&self, native: &NativeSession, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
+        let original = native.owned_commit_observation(tx).await.map_err(status)?;
+        let mut clock = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(1, rtdb_tx::DecisionObservation::WIDTH);
+        match original {
+            Some(sample) => clock.append_value(sample.encode()).map_err(arrow)?,
+            None => clock.append_null(),
+        }
         let schema = Arc::new(Schema::new(vec![
             Field::new("tx_id", DataType::Int64, false),
             Field::new("system_time_micros", DataType::Int64, false),
+            Field::new("decision_clock", DataType::FixedSizeBinary(rtdb_tx::DecisionObservation::WIDTH), true),
         ]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
             Arc::new(Int64Array::from(vec![tx.tx_id.0])),
             Arc::new(Int64Array::from(vec![tx.system_time.0])),
+            Arc::new(clock.finish()),
         ]).map_err(arrow)?;
         self.owned_action_reply(&schema, Some(&batch))
     }
@@ -1578,6 +1588,32 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if !body.is_empty() { return Err(invalid("Owned read open takes an empty body")); }
         self.retain_new_owned_read(call, None, 0).await
+    }
+
+    pub(crate) async fn open_fresh_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if call.session.placed_database() != Some(call.database.as_str()) || call.session.audience_source().is_some() {
+            return Err(Status::permission_denied("A fresh owned read requires its ordinary placed session"));
+        }
+        let (deployment, suffix) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Fresh read requires a deployment"))?;
+        let deployment = Uuid::from_bytes(*deployment);
+        if self.0.config.reserved_applied_source == Some(deployment) {
+            return Err(Status::permission_denied("This source requires a reserved Flight session"));
+        }
+        let required = if matches!(suffix, [0]) {
+            None
+        } else {
+            let (floor, rest) = hosted_observation::applied_read_floor(body)?;
+            if !rest.is_empty() { return Err(invalid("Unexpected fresh read data")); }
+            Some(floor)
+        };
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        let snapshot = native.open_fresh_owned_read(deployment, required.as_ref()).await.map_err(status)?;
+        self.retain_owned_read(call, snapshot, Some(permit), true, 0)
     }
 
     pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1681,11 +1717,12 @@ impl Service {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
         let handle = Uuid::new_v4();
-        let mut reply = Vec::with_capacity(if include_transaction { 32 } else { 24 });
+        let mut reply = Vec::with_capacity(if include_transaction { 40 } else { 24 });
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.system_time().0.to_be_bytes());
         if include_transaction {
             reply.extend_from_slice(&snapshot.present().tx_id.0.to_be_bytes());
+            reply.extend_from_slice(&snapshot.query_time().map_err(status)?.0.to_be_bytes());
         }
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
@@ -1757,7 +1794,7 @@ impl Service {
                     return Err(Status::permission_denied("The relation is outside the prepared audience projection"));
                 }
             },
-            READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 => &held.audience_work,
+            READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V6 => &held.audience_work,
             _ => return Err(unsupported()),
         };
         work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
@@ -1900,7 +1937,7 @@ impl Service {
         let mut replies = Vec::with_capacity(2);
         for system in [before, group] {
             let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(call.memory(), system, valid, &id, cursor, None, Some(&columns), |_| Ok(None)).await?;
+            let reply = self.finish_owned_point_inner(call.memory(), system, valid, &id, cursor, None, Some(&columns), None, |_| Ok(None)).await?;
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -3066,7 +3103,7 @@ impl Service {
         ).await.map_err(status)?;
         if let Some(error) = committed.error() { return Err(status(error.clone())); }
         if !committed.committed() { return Err(Status::aborted("Owned expiry did not commit")); }
-        self.owned_tx_reply(committed.tx_key())
+        self.owned_tx_reply(&session, committed.tx_key()).await
     }
 
     pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -3303,7 +3340,13 @@ impl Service {
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a held world"))?;
         let (system, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Overlay preparation requires an exact system publication"))?;
         let (child, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a child identity"))?;
-        let retain_until = Timestamp(i64::from_be_bytes(rest.try_into().map_err(|_| invalid("Overlay preparation requires a retention deadline"))?));
+        let (until, mode) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Overlay preparation requires a retention deadline"))?;
+        let retain_until = Timestamp(i64::from_be_bytes(*until));
+        let writable = match mode {
+            [0] => false,
+            [1] => true,
+            _ => return Err(invalid("Overlay preparation requires its exact clock mode")),
+        };
         let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
@@ -3316,7 +3359,7 @@ impl Service {
         let charge = call.reserve(4096)?;
         let prepared = host.prepare_world_overlay(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            cut, Uuid::from_bytes(*child), retain_until,
+            cut, Uuid::from_bytes(*child), retain_until, writable,
         ).await.map_err(status)?;
         held.snapshot.check().map_err(status)?;
         let body = serde_json::to_vec(&prepared).map_err(|_| Status::internal("Could not encode prepared overlay"))?;
@@ -3413,7 +3456,7 @@ impl Service {
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
         reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
         if let Some((world, system)) = snapshot.ancestor() {
-            reply.push(3);
+            reply.push(if snapshot.clock_mode().is_writable() { 4 } else { 3 });
             reply.extend_from_slice(&world.0);
             reply.extend_from_slice(&system.0.to_be_bytes());
         } else {
@@ -3752,6 +3795,12 @@ impl Service {
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Retaining a Held publication requires its physical revision"))?;
         let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
+        let (mode, body) = body.split_first().ok_or_else(|| invalid("The child has no clock mode"))?;
+        let requested = match mode {
+            0 => rtdb_node::WorldClockRequest::Retained,
+            1 => rtdb_node::WorldClockRequest::Held { start: None },
+            _ => return Err(invalid("The child has an invalid clock mode")),
+        };
         let (until, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no expiry"))?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no commit deadline"))?;
         let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("The retained child has no attempt identity"))?;
@@ -3784,7 +3833,7 @@ impl Service {
             Uuid::nil(), None, Timestamp(i64::from_be_bytes(*until)),
             rtdb_node::OwnedWorldFork {
                 world: child, pin: child, previous: None, sibling: None, cut,
-                requested: rtdb_node::WorldClockRequest::Retained,
+                requested,
                 deadline, attempt: attempt.to_owned(), fingerprint: *fingerprint, controls, root: None,
             },
         ).await.map_err(status)?;
@@ -4010,7 +4059,7 @@ impl Service {
         if publish_root {
             held.snapshot.check().map_err(status)?;
             deadline = deadline.min(held.snapshot.evidence_until());
-            if held.snapshot.present().system_time >= deadline {
+            if held.snapshot.query_time().map_err(status)? >= deadline {
                 return Err(Status::failed_precondition("Root hold is outside the fork deadline"));
             }
         }
@@ -4041,7 +4090,7 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
@@ -4088,7 +4137,7 @@ impl Service {
             let ([kind], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world publication effect"))?;
             rows_left = rows_left.checked_sub(count * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
             let resource = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-            if resource.snapshot.ancestor().is_some() && *kind != 2 {
+            if !resource.snapshot.clock_mode().is_writable() && *kind != 2 {
                 return Err(unsupported());
             }
             let (checks, charge) = resource.conditions(call, world, nonces)?;
@@ -4196,6 +4245,9 @@ impl Service {
         let delete_root = *root_kind == 4;
         let proposal_overlay = *root_kind == 5;
         let proposal_land = *root_kind == 6;
+        if proposal_land != prepared_proposal || (proposal_land && slot.is_none()) {
+            return Err(invalid("A prepared Proposal switch requires its landing and offered clock"));
+        }
         if !proposal_land && counts.iter().any(|condition| matches!(
             condition, TxOp::OwnedCheckCapacity { at_most, .. } if *at_most < 0
         )) {
@@ -4298,7 +4350,7 @@ impl Service {
         } else {
             None
         };
-        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls) {
+        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls, !terminal_proposal) {
             return Err(invalid("A Proposal overlay requires checked hosted settlement"));
         }
         if proposal_close && !rtdb_tx::proposal_close_controls(&controls) {
@@ -4315,7 +4367,7 @@ impl Service {
         }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
-        if let Some(tick) = slot {
+        if let Some(tick) = slot.filter(|_| !proposal_land) {
             self.wait_for_clock_slot(call, tick).await?;
         }
         let connection = self.connection(call, &call.database).await?;
@@ -4329,7 +4381,7 @@ impl Service {
         }
         if let Some(read) = &root_read {
             read.snapshot.check().map_err(status)?;
-            if read.snapshot.present().system_time >= deadline
+            if read.snapshot.query_time().map_err(status)? >= deadline
                 || ((delete_root || proposal_overlay || proposal_land || proposal_close) && (deadline > read.snapshot.evidence_until()
                     || read.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none()))
             {
@@ -4348,7 +4400,7 @@ impl Service {
             sections, root, observed, *fingerprint, controls, deadline,
         ).await.map_err(status)?;
         drop(observations);
-        self.owned_tx_reply(committed)
+        self.owned_tx_reply(&session, committed).await
     }
 
     fn decode_world_writes(
@@ -4460,18 +4512,23 @@ impl Service {
             evidence.map(|evidence| held.remember(call, relation, evidence)).transpose()
         }).transpose().map(Option::flatten);
         let memory = origin.map_or(self.memory(), |(call, _)| call.memory());
-        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, witness).await?;
+        let attempt = (origin.is_some() && !snapshot.is_scoped_root()
+            && relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION
+            && origin.is_some_and(|(call, _)| call.session.audience_source().is_none()))
+            .then_some(snapshot);
+        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
     async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
-        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, |_| Ok(None)).await
+        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, None, |_| Ok(None)).await
     }
 
     async fn finish_owned_point_inner(
         &self, memory: &Arc<MemoryBudget>, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
         lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
+        attempt: Option<&OwnedReadSession>,
         witness: impl FnOnce(Option<Timestamp>) -> Result<Option<Uuid>, Status>,
     ) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
@@ -4509,7 +4566,22 @@ impl Service {
                 Some(batch.batch().project(&fields).map_err(arrow)?)
             } else { None };
             let rows = projected.as_ref().unwrap_or_else(|| batch.batch());
-            let schema = with_point_witness(rows.schema_ref(), witness(until)?);
+            let mut schema = with_point_witness(rows.schema_ref(), witness(until)?);
+            if let Some(attempt) = attempt {
+                use std::fmt::Write;
+                let tx_id = rtdb_query::owned_receipt_transaction(rows, 0).map_err(status)?;
+                let key = TransactionKey { tx_id, system_time: revision };
+                let mut metadata = schema.metadata().clone();
+                metadata.insert("rtdb.owned.receipt_tx_id".into(), tx_id.0.to_string());
+                if let Some(observation) = attempt.owned_attempt_observation(key).await.map_err(status)? {
+                    let mut encoded = String::with_capacity(rtdb_tx::DecisionObservation::WIDTH as usize * 2);
+                    for byte in observation.encode() {
+                        write!(encoded, "{byte:02x}").expect("String writes are infallible");
+                    }
+                    metadata.insert("rtdb.owned.receipt_clock".into(), encoded);
+                }
+                schema = schema.with_metadata(metadata);
+            }
             let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
@@ -4550,7 +4622,7 @@ impl Service {
             }
         }
         let columns: Vec<_> = schema.fields().iter().enumerate()
-            .filter(|(_, field)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal"))
+            .filter(|(_, field)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal" | rtdb_types::HOSTED_RECEIPT_TX_ID))
             .map(|(index, _)| index).collect();
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))
@@ -4806,6 +4878,7 @@ mod audience_projection_tests {
         assert!(audience_point_admitted(&visible, &visible, &id("doc"), false));
         assert!(!audience_point_admitted(&visible, &hidden, &id("doc"), false));
         assert!(audience_point_admitted(&visible, &markers, &id("fact_partition_head:visible"), false));
+        assert!(!audience_point_admitted(&visible, &markers, &id("head"), false));
         assert!(!audience_point_admitted(&visible, &markers, &id("fact_partition_head:hidden"), false));
         assert!(!audience_point_admitted(&visible, &readiness, &id("layout"), false));
         assert!(audience_point_admitted(&visible, &readiness, &id("layout"), true));

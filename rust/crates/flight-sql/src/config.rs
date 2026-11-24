@@ -99,7 +99,8 @@ impl AudienceFlightConfig {
 }
 
 pub trait FlightPeerVerifier: std::fmt::Debug + Send + Sync {
-    fn verify(&self, proof: &str, attachment: &Database) -> Result<IpAddr>;
+    /// Checks the forwarded peer and reports whether the route is restricted to fresh reads.
+    fn verify(&self, proof: &str, attachment: &Database) -> Result<(IpAddr, bool)>;
 }
 
 /// The installed hosted principal and its finite ordinary control table allowlist.

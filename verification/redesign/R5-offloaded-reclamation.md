@@ -9,39 +9,25 @@ Age-based deletion could strand the follower even when it named the exact object
 A second schedule loses an append reply after commit and therefore needs to discover its publication from the certified history.
 A third schedule restarts after physical trim or provider deletion but before receiving the reply.
 
-## Required production boundary
+## Approved production boundary
 
-1. Bind a distinct allocation's immutable provider version to the authenticated oversized frame and its committed journal position.
-   Keep the provider completion, frame digest, incarnation, journal and storage scope together.
-   Persist the candidate(s) with the certified prefix before any record needed to reconstruct them can be trimmed.
-   A committed frame found during certification qualifies even if append acknowledgement was lost.
-   An absent pending append remains outside this collector until a separate durable fence establishes that it cannot commit later.
-2. Give ordinary tails and finite replay or copy readers a position-scoped hold before delivery.
-   The replay authority rejects a new hold below the authorized frontier.
-   Decoding, payload fetch and cancellation retain the same hold until provider drain.
-   A compatibility cut must also close new admissions for legacy readers and drain all existing legacy scopes that could still use the object.
-   Every participating maintenance binary must exclude offloaded payloads from age-based collection.
-3. Persist retirement intent and the exact covered bound before calling logkeeper trim.
-   Match physical trim evidence to the history and journal identities of the authorization, including any old journal that could still supply permitted reads.
-   On restart, re-observe or idempotently settle the same physical trim before publishing a deletion grant.
-4. Retire only the provider version named by that grant.
-   Require the same holds to protect inherited or transferred versions until independent custody has been verified.
-   Keep the intent through provider confirmation of that version's absence.
-   The qualified collector leaves legacy payloads without a publication witness retained.
+1. Bind every detached payload to the authenticated frame, original history, installation incarnation, stream, committed position and immutable provider identity.
+   Persist that binding and its candidate evidence before retiring any record needed to reconstruct it.
+   An ambiguous append remains in staging custody until commitment is certified or the writer is fenced against later acceptance.
+2. Verify a durable successor checkpoint and full recovery closure through the acknowledged prefix, with sufficient redundant custody and the authentic resume token.
+   Select the covering route and install the recovery dependency fence in the same non-rollback authority.
+   The fence binds the original stream and interval across physical journals, including a journal discovered or restored later.
+3. Require a brokered, position-scoped capability for delivery, replay, repair, archive, fork and transfer before dereferencing a frame.
+   The broker mediates the complete data and key path.
+   Retain admitted work through drain and refuse new access through excluded pointers.
+   A returned journal rejoins under current authority with verified coverage.
+4. Issue one deletion grant per unreachable immutable publication once all actual dependencies drain and future use is excluded.
+   Provider settlement consumes the same grant after interruption or ambiguous replies.
+   Physical journal trim and media destruction have their own authorities and settlement evidence.
 
-The directory owns the paired retirement intent and admission frontier.
-A replay hold and a deletion grant are immutable values owned by the reader region or settlement operation that consumes them.
-The logkeeper and versioned object provider execute their respective effects.
-The reaper schedules retries while the durable intent remains present.
-
-The serving path now retains each offloaded tail or range delivery through its provider operation.
-The certified versioned-S3 path installs exact candidates in the directory compare-and-swap that advances its admission frontier.
-The placement owner persists completion after every known physical journal returns a synchronous trim acknowledgement.
-Legacy and non-fsync journal replies cannot satisfy this step.
-The lineage reaper matches each release against that durable candidate and retries settlement against the same provider version.
-A bounded outstanding inventory stops trim before it loses unretired candidates.
-The opt-in rollout requires every serving and recovery reader to support the new envelope.
-Local objects, unversioned buckets and references without an exact publication witness stay outside this collection path.
+The current directory-managed versioned S3 collector still awaits durable physical trim responses.
+That implementation does not yet supply the dependency-fence guarantee.
+A quorum trim or a missing historical medium supplies no access-exclusion evidence by itself.
 
 ## Bounded check
 

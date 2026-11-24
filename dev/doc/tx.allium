@@ -29,8 +29,8 @@
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
 -- A pgwire portal can encode numeric coefficients and structured JSON, JSON-LD, and Transit results from their Arrow cells.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
--- A versioned Flight SQL run ticket carries Arrow IPC arguments within its binary frame.
--- The Flight SQL server also redeems run tickets issued with the earlier JSON envelope.
+-- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
+-- The authenticated session and original attachment authorize redemption of its ticket.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
@@ -81,14 +81,12 @@
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
 -- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
--- An idle native session in autocommit mode with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
--- The reservation records its transaction outcome, advances the session's await token, and changes no application table.
--- Transactions that resolve later in that database history use strictly greater system times.
--- A placed hosted Root hold offers a reading five hundred milliseconds after its reserved transaction.
--- A hosted commit at the offer assigns that time only when it advances the ordered history and its source append falls in the first second after the offered reading, inclusive at the start.
--- An intervening transaction that reaches the offered reading invalidates the offer.
--- A missed offer publishes no application effects.
--- Holding an offer does not block unrelated submissions.
+-- The authenticated history position orders decisions, and the operation ordinal orders effects inside a decision.
+-- SQL system time is nondecreasing and can tie.
+-- The receiver judges live preconditions with a fresh certified reading of its installed independent clock domain.
+-- A deadline is exclusive.
+-- A funded turn can bind an attempt to an advertised grid reading and a half-open service window.
+-- A missed window publishes no effects at a replacement reading and leaves an uncertain original attempt to settlement.
 -- Typed create-only document inserts check absence over their valid-time intervals in the ordered transaction view.
 -- An overlap aborts the entire transaction.
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
@@ -96,9 +94,9 @@
 -- An owned create or replacement enforces that schema at the ordering cut.
 -- A creation-lifetime relation declares its immutable acceptance extent before any fact exists.
 -- Its original ordered creation fixes the exclusive expiry and reserves the full identity across that expiry.
--- A live point uses the store-issued present and reports the fact's exclusive expiry.
+-- A live point uses the live admission clock reading and reports the fact's exclusive expiry.
 -- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
--- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its ordered system time and have no valid end.
+-- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
 -- The declaration is immutable and must precede the first fact.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
 -- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
@@ -115,13 +113,13 @@
 -- Owned erase refuses governed paths and another mutation of the same identity in the commit.
 -- Owned point reads compare the complete stored identity before yielding any row.
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
--- Owned point reads use the principal's namespace at a reserved present.
+-- Owned point reads use the principal's namespace at the admitted exact cut.
 -- Ordered owned mutations reserve permanent addresses using the canonical IID and deterministic collision probes.
 -- A protected registry records each locator's complete typed identity with the fact write.
 -- Point reads and ordered checks open the registry at the same cut as the fact and verify its complete stored identity.
 -- An existing relation without a complete registry refuses owned access.
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
--- A historical point uses the held catalog and the same identity registry at the requested system time.
+-- A historical point uses the held catalog and the same identity registry within the admitted cut and its requested system-time cap.
 -- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
 -- A declared ordered path on an empty relation validates bounds against the held schema and has exact zero cardinality before the first fact.
@@ -131,13 +129,13 @@
 -- Events in other owner relations leave the witness valid.
 -- An owned root mutation appends its owner relation's next dense change group in the same committed transaction.
 -- The first tracked group shares its transaction with the relation's feed floor.
--- A held feed page seeks by exclusive system time and returns complete groups in transaction order.
--- Its coverage ends at the last returned group when truncated or at the reserved present when exhausted.
+-- A held feed page seeks by exclusive position and returns complete groups in transaction order.
+-- Its coverage ends at the last returned group when truncated or at the admitted cut when exhausted.
 -- A regional held feed retains touches whose complete identities and valid extents intersect the requested region.
 -- It advances coverage over all source groups it examined and can return an empty page with an advanced cursor.
 -- A regional held world feed selects one admitted local relation and anchors that coverage to the held world and the requested upper cut.
--- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
--- A held merged feed seeks the selected owner relations at one cut and groups their visible touches by ordered system time.
+-- An empty relation is covered through the admitted cut, and a request crossing untracked events or a missing group is refused.
+-- A held merged feed seeks the selected owner relations at one cut and groups their visible touches by original transaction position.
 -- A capped page publishes only whole visible commits, and a nonempty page resumes at its last visible commit.
 -- An owned root relation may declare a cap for each distinct fixed-length prefix of its binary fact key.
 -- A populated relation can initialize its first cap when validity always begins at acceptance and has an open end.
@@ -155,7 +153,22 @@
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
 -- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
--- An exceeded bound aborts the entire group, including the writes and counter deltas.
+-- A checked Proposal settlement binds a count condition to its own world and evaluates the complete counted prefix across the retained parent and final overlay.
+-- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
+-- The private Proposal slot carries the held Root's through-position and a separate receiver-clock target.
+-- A positioned receiver evaluates the half-open slot using its independent clock observation.
+-- The staged history coordinate also has to fit between the previous owned coordinate and source append.
+-- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
+-- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
+-- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.
+-- In a Proposal, local period rows and absence shadows mask the same identity in the held parent at that cut.
+-- An installed sample projection folds the complete assertion population per series in accepted order and counts each surviving sample coordinate once.
+-- A later retraction removes a point or span and a later append establishes membership again.
+-- For a reviewed landing prefix the receiver admits exclusions only for later sample assertions carried by the candidate.
+-- Fixed-label protected count guards use the complete carrier identity population with ordered row or unit fences and row expiry metadata.
+-- The protected membership projection reads no carrier body.
+-- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
+-- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
 -- A replacement outside every current Root capacity predicate does not increase a covered count.
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
@@ -198,6 +211,8 @@
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- A held position point or valid window excludes assertions from the first masked position through the end of one commit before resolving the winners.
 -- A Root point or valid window reports the stored ordinal of each positioned winner through its owned read response.
+-- An ordered index keeps separate revision roots for tied historical times and applies the held cut through its original transaction.
+-- Rebuilding an ordered index suppresses assertions before the full erasure position, including earlier assertions at the same historical time.
 -- A held position read still honours live ordered erasure and returns no commit evidence.
 -- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
 -- Its ordered condition checks the original parent pin and Root purge frontier.
@@ -225,7 +240,7 @@
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
 -- Key conflicts expose neither the occupied key nor its holder.
 -- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.
--- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
+-- DML evaluates CURRENT_TIMESTAMP at the recorded receiver decision reading when resolving the ordered transaction.
 -- An ordinary SQL transaction can assert that this time precedes an exclusive bound.
 -- Subsequent SQL mutations can use the same time plus intervals in values, encoded keys and validity endpoints.
 -- An idle native SQL session can set bijection.at to a fixed instant.
@@ -233,7 +248,7 @@
 -- The session refuses writes until the setting is cleared.
 -- A native SQL insert can put many documents in one operation with distinct valid-time bounds.
 -- The documents retain their input order, including overlapping assertions for the same identity.
--- A null start defaults to the assigned system time and a null end defaults to the open end.
+-- A null start defaults to the receiver decision reading and a null end defaults to the open end.
 -- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.
 --
 -- == Frontend parity (the point of this spec) ==
@@ -250,7 +265,11 @@
 --      COPY FROM STDIN with an Arrow format submits Arrow document batches.
 --      Without an explicit transaction, each input batch commits separately.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
---      An implicit basis on a linearizable subscriber follows the installed replica prefix confirmed by its active loglet.
+--      An implicit linearizable basis names the exact, held, applied certified cut selected during the invocation by active-loglet quorum probes.
+--      The selected decision must have quorum installation before exposure, including when the receiver has to complete installation.
+--      The cut covers all prior quorum-installed decisions and completed fresh reads of the same history.
+--      A silent writer and uncertified staged suffix add no dependency when a quorum, hold and selected applied cut are available.
+--      A replay-safe unpinned read may retry within the same lineage before output, with its causal floor and audience intact.
 --      A read transaction retains its captured basis across later statements.
 --      Each explicit snapshot token identifies the basis the caller selected.
 --      The gateway restores the mutable settings and token before replaying prepared statements or resuming application work.
@@ -269,6 +288,9 @@
 -- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
 -- SHOW rtdb_hosted_source_barrier is the hosted variant and returns the confirmed deployment identity.
 -- It requires a current holder with linearizable reads, a recovered directory checkpoint, and a fresh quorum confirmation.
+-- The ordinary hosted Flight source confirmation uses the same barrier before checking the original positions at one admitted catalog cut.
+-- The authenticated placed control owner supplies the deployment identity and up to four exact transaction ID and system-time pairs.
+-- The Flight reply carries the sampled applied position as Arrow columns only when the cut proves every supplied position.
 --
 -- == Boundaries ==
 --
@@ -362,28 +384,21 @@ value TxBasisToken {
     -- it; each read threads it through. See: database/encodeTxBasisToken.
 }
 
-value TimeBasisToken {
-    -- An opaque snapshot token: per-database latest-completed system-times, the upper bound
-    -- on the data a read observes. Captured from the Database catalog at a transaction's
-    -- first query to pin its snapshot. See: database/encodeTimeBasisToken, Database.Catalog.snapshotToken.
+value ExactSnapshotToken {
+    -- An opaque authenticated reference to a captured applied cut, including empty partitions, original history, catalog and ancestry.
+    -- The reference binds interpretation and authorization scope, temporal selectors, the exact query clock and timezone.
+    -- Use requires current authorization, custody and an available hold.
 }
 
 value ReadBasis {
-    -- The pinned point-in-time a transaction's reads observe, fixed at the transaction's
-    -- first query (snapshot isolation from that query on). The pin awaits the effective
-    -- await_token (so the snapshot reflects this connection's own writes), then sets
-    -- snapshot_token to the resulting latest-completed snapshot and clock_time to the
-    -- current-time at the pin; the ReadOnly characteristics declared at BEGIN override
-    -- individual fields.
-    -- The options are grammar-scoped to READ ONLY (readOnlyTxOption in the SQL grammar).
-    --   snapshot_token — the data snapshot's upper bound, a TimeBasisToken (per-database
-    --                    latest-completed system-times). Distinct from the await_token, which
-    --                    is a TxBasisToken of message-ids the read awaits before snapshotting.
-    --   snapshot_time  — observe state as of a wall-clock instant.
-    --   clock_time     — pin the transaction's notion of "now", retaining nanosecond precision.
-    snapshot_token: TimeBasisToken?
+    -- The first query of a transaction pins an exact applied cut and its evaluation context.
+    -- A fresh admission satisfies the effective causal prerequisite, waits for apply and obtains the residence hold.
+    -- The system-time cap filters events only inside that cut.
+    -- An exact re-admission checks the issued cut and interpretation before opening storage.
+    -- A conflicting selector or a causal requirement beyond that cut refuses.
+    snapshot_token: ExactSnapshotToken
     snapshot_time: Timestamp?
-    clock_time: Timestamp?
+    clock_time: Timestamp
 }
 
 value Unspecified {
@@ -393,10 +408,10 @@ value Unspecified {
 value ReadOnly {
     -- Characteristics declared by BEGIN or SET TRANSACTION READ ONLY, evaluated then and held until the first query pins the read basis.
     -- Each absent option takes its default at the pin.
-    --   snapshot_token / snapshot_time / clock_time — override the corresponding ReadBasis field.
+    -- A snapshot token selects its original cap, clock and timezone. Fresh admission can specify a cap and evaluation clock.
     --   await_token — overrides the connection's await_token for this transaction's pin.
     --                 Validated (decoded) when declared; the await itself happens at the pin.
-    snapshot_token: TimeBasisToken?
+    snapshot_token: ExactSnapshotToken?
     snapshot_time: Timestamp?
     clock_time: Timestamp?
     await_token: TxBasisToken?
@@ -407,24 +422,35 @@ value CommitOpts {
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at.
-    --                   It must advance the history and must not be later than the source log's append time for the record.
-    --                   A later explicit time aborts the transaction with rtdb/future-system-time.
-    --                   The engine projects automatic history time strictly forward even at equal or regressed append timestamps.
+    --                   It must be at least the preceding system time and at most the authenticated source-log append observation for the original record.
+    --                   A later explicit time aborts with rtdb/future-system-time.
+    --                   Automatic history time is the maximum of the preceding value and the append observation, or the append observation at genesis.
     --   user_metadata — per-transaction metadata.
-    --                   New source-log submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.
+    --                   Lookup covers the current and previous buckets and checks the exclusive expiry.
+    --                   A typed metadata association names one ordinary record or an exact record in the submitting owner's Root.
+    --                   Its payload is retained only when the transaction commits a put for that record without erasing it.
+    --                   An ordered record erase erases its associated metadata in the same commit.
     --                   The installed catalog determines retention even when a query selects an earlier system time.
     --                   A settled retry keeps its original causal coordinate after that metadata expires.
-    --                   An idempotency_key field names a retry identity scoped to the database and principal: a same-body retry within the receipt window is answered with the original's outcome, and a different body aborts with rtdb/idempotency-conflict.
-    --                   Within one installed history, receipt admission and expiry use the greatest source-log append time observed through the transaction being resolved.
+    --                   An idempotency_key field names an exact transaction retry identity scoped to the registered receiver, database and authenticated principal.
+    --                   The hosted named-await carrier binds the Original task owner, request address and descriptor to the ordered command.
+    --                   A hosted function completion orders its fate with the application writes and substitutes the exact refusal fate when the resolver chooses the constraint refusal.
+    --                   A same-body retry within the receipt window returns the original outcome and a changed body aborts with rtdb/idempotency-conflict.
+    --                   Application owners register business intents and compare any labelled commands at their own decision boundaries.
+    --                   Within one installed history, receipt admission and expiry use the original certified decision reading.
     --                   The native rtdb_retry_v1 field takes a document with a lowercase 32-hex-digit nonce and an integer not_after_micros.
     --                   Its principal-scoped identity includes that exclusive UTC-microsecond deadline, which is within one hour of the admission clock.
     --                   A same-body retry before expiry returns the first terminal outcome, including an abort.
     --                   A different body returns rtdb/idempotency-conflict, and any retry at or after expiry returns rtdb/idempotency-expired.
-    --                   The engine uses a nondecreasing clock of observed bounded-request log timestamps, preserved across restarts.
+    --                   The engine uses an independently advanced certified clock with a durable monotone floor across restarts.
     --                   A new operation uses a fresh identity, and rtdb_retry_v1 is mutually exclusive with idempotency_key.
     --                   PgWire exposes the native protocol with SHOW rtdb_bounded_retry = 1, checked on each new connection before a bounded submission.
-    --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
-    --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.
+    --                   For an owned publication, the deciding history orders the guarded decision and slot witness with the effects.
+    --                   Repair retains the original slot and position and applies current custody masks.
+    --                   A successor installs authenticated exclusion and transfer evidence before admitting inherited work.
+    --                   SQL retry metadata expiry ends readback. Owned execution exclusion survives through its separate fence.
     --   async         — true: commit submits without awaiting; false: execute-and-await.
     --                    The begin-time default; a COMMIT SYNC / COMMIT ASYNC (see CommitMode)
     --                    overrides it for that one commit.
@@ -851,9 +877,8 @@ rule SetTransactionIsolationOnly {
 
 rule FirstQueryPinsReadBasis {
     -- First query in a Pending tx pins the read basis and opens Reading. The pin awaits the
-    -- effective await_token — the ReadOnly characteristics' override, else the connection's —
-    -- then captures the latest-completed snapshot and the current-time; any option set in the
-    -- ReadOnly characteristics overrides its default.
+    -- effective causal prerequisite before capture or verifies that the exact basis already covers it.
+    -- Admission confirms current scope and obtains a hold before opening storage.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: connection.tx != null
     requires: connection.tx.mode = Pending
@@ -862,10 +887,11 @@ rule FirstQueryPinsReadBasis {
     ensures:
         let opts = connection.tx.characteristics
         connection.tx.mode = Reading
-        connection.tx.read_basis = ReadBasis(
-            snapshot_token: opts?.snapshot_token ?? Database.snapshotToken,
-            snapshot_time: opts?.snapshot_time,
-            clock_time: opts?.clock_time ?? now
+        connection.tx.read_basis = Database.admitReadBasis(
+            exact: opts?.snapshot_token,
+            await: opts?.await_token ?? connection.await_token,
+            cap: opts?.snapshot_time,
+            clock: opts?.clock_time
         )
         connection.tx.await_token = opts?.await_token
 }
@@ -1013,10 +1039,11 @@ rule ManualLazyOpenQuery {
             failed: false,
             tx_default_tz: connection.default_tz,
             session_default_tz: connection.default_tz,
-            read_basis: ReadBasis(
-                snapshot_token: Database.snapshotToken,
-                snapshot_time: null,
-                clock_time: now
+            read_basis: Database.admitReadBasis(
+                exact: null,
+                await: connection.await_token,
+                cap: null,
+                clock: null
             ),
             await_token: null
         )
@@ -1100,10 +1127,11 @@ rule AutoCommitQuery {
 
     ensures:
         Database.openSnapshot(
-            basis: ReadBasis(
-                snapshot_token: connection.await_token,
-                snapshot_time: null,
-                clock_time: now
+            basis: Database.admitReadBasis(
+                exact: null,
+                await: connection.await_token,
+                cap: null,
+                clock: null
             )
         )
 
@@ -1199,12 +1227,25 @@ rule CommitWriting {
 }
 
 -- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
--- A placed attempt receipt stops redeeming after the installed ordered receipt clock reaches its exclusive expiry.
--- A placed COMMIT SYNC sets the connection await token to an applied replica prefix after reading the exact attempt outcome.
--- An applied prefix remains a causal basis after attempt receipt expiry.
--- In the versioned placed outcome format, admitted writers collect expired attempt rows as ordered erasures.
--- Before pinning an implicit read basis, an attempt receipt is redeemed and an applied token waits for its installed prefix.
--- A supplied snapshot token still caps the history visible to the read.
+-- The holder's bounded memory intake contains provisional offers.
+-- A placed submit acknowledges only after observing the exact ordered reservation or its terminal witness.
+-- Covered effectful admission reserves the original slot and funds its terminal witness under the exact request binding.
+-- Exact retry redeems the original slot, and a retired issuance namespace excludes recreation.
+-- The effect or refusal and the receiver's exact terminal witness occupy one ordered record.
+-- Closure competes in that order and excludes all late copies at that receiver if it wins.
+-- An internal append receipt requires durable decision installation on a quorum.
+-- COMMIT SYNC returns an applied replica prefix containing the exact quorum-installed witness.
+-- Strict guarded admission counts only original durable votes from its recorded roster with an admissible upper sample strictly before cutoff.
+-- The same decision installation gates visibility.
+-- A fenced attempt with missing evidence remains unknown unless durable evidence excludes an original timely quorum.
+-- A missing witness or exclusive receipt expiry leaves unresolved obligations charged and does not settle the effect.
+-- The Original terminal transfer receipt binds the certified replica interval and the exact unmatched receiver reservation.
+-- The destination verifies the census while held and retains the original slot through publication.
+-- The successor orders the inherited slot's fence before opening fresh receiver admission.
+-- An applied prefix remains a causal basis after receipt expiry.
+-- An ordered erasure can collect settled evidence after its retention, holds and export obligations end.
+-- Before pinning an implicit read basis, redeem the attempt and wait for its exact installed applied prefix.
+-- A supplied exact snapshot token fixes the original applied cut and evaluation context.
 -- A frozen placed attachment confirms await tokens from its own admitted checkpoint before pinning the read basis.
 
 rule CommitNoOp {
@@ -1403,6 +1444,12 @@ invariant ReadBasisPinnedAtFirstQuery {
     true
 }
 
+@invariant ExactSnapshotReAdmission
+    -- Re-admission selects the original authenticated cuts and their original winners, subject to live custody.
+    -- Later positions cannot enter the cut even when their system time matches or precedes its cap.
+    -- Empty partitions remain empty.
+    -- A required unavailable dependency refuses without substituting another cut or an older winner.
+
 @invariant ExactQueryClock
     -- The read basis retains the accepted clock instant, including its nanosecond fraction, across subsequent queries and frontend ticket serialization.
     -- Typed local timestamps resolve in the transaction's effective timezone before the clock is pinned.
@@ -1561,15 +1608,6 @@ surface ConnectionLifecycle {
 ---- Open Questions
 
 open question "AutoCommitDml stamps opts with user and default_tz only (no system_time). Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"
-
-open question "Which token does AutoCommitQuery supply as snapshot_token?"
-    -- ReadBasis declares a TimeBasisToken, while AutoCommitQuery supplies the connection's TxBasisToken.
-    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, Connection.queryBasis uses Database.Catalog.snapshotToken after preparation has awaited the connection's writes.
-
-open question "What isolation does a null partition time in a pinned read basis provide?"
-    -- A Reading transaction retains the token captured by its first query, including null entries for partitions with no completed transaction.
-    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, query.clj retains those entries and operator/scan.clj leaves their system-time dimension unconstrained.
-    -- A later query can therefore observe transactions applied after the first query while retaining the same null token entry.
 
 open question "Should pgwire cancellation require the BackendKeyData secret as well as the connection identifier?"
     -- The pinned frontend sends a zero secret and routes CancelRequest by connection identifier alone.

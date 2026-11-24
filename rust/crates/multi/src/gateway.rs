@@ -343,7 +343,13 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
         if router.deployment.as_deref().is_some_and(|id| Uuid::parse_str(id).ok() != Some(installed.deployment)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
         }
-        let (server, worker, epoch) = route_ordered(name, installed, options, |worker, probe| async move {
+        if router.read_only && !prefer_holder
+            && let Ok(read) = route_ordered_reader(name, installed, options).await
+        {
+            let server = connect_serving(&read.worker.pgwire, &read.worker.control, read.probe, options).await?;
+            return Ok((server, Some(read.worker.control), read.epoch, installed.deployment.to_string()));
+        }
+        let (server, worker, epoch) = route_ordered(name, installed, options, !router.read_only || prefer_holder, |worker, probe| async move {
             connect_serving(&worker.pgwire, &worker.control, probe, options).await
         }).await?;
         return Ok((server, Some(worker.control), epoch, installed.deployment.to_string()));
@@ -419,10 +425,45 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
+pub(crate) struct OrderedReaderRoute {
+    pub worker: crate::journal::hosted::WorkerEndpoint,
+    pub placement: ordered_logkeeper::ordered::Placement,
+    pub epoch: u64,
+    pub flight: Option<String>,
+    probe: Option<u64>,
+}
+
+pub(crate) async fn route_ordered_reader(
+    name: &str, installed: &crate::journal::hosted::GatewayPlacement, options: &GatewayOptions,
+) -> Result<OrderedReaderRoute> {
+    let view = installed.journal.route().await?;
+    let incumbent = view.writer.grant.map(|grant| grant.enrollment);
+    let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect(
+        "rtdb.multi/ordered-gateway", "An ordered reader needs its cell route credential"))?;
+    let key = control::ControlKey(options.capabilities.clone());
+    for worker in installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent) {
+        let request = Request::SubscribeOrderedFresh {
+            name: name.into(), placement: view.placement, enrollment: worker.enrollment, epoch: view.writer.epoch,
+        };
+        let Ok((Response::OrderedRead { address, flight, proof }, probe)) =
+            control::call_with_pgwire_probe(&worker.control, request, options.control_timeout, &key).await else { continue; };
+        if address == worker.pgwire && secret.verify_route(&control::ordered_read_binding(
+            name, view.placement, worker.enrollment, view.writer.epoch, &address, flight.as_deref(),
+        ), &proof) {
+            return Ok(OrderedReaderRoute {
+                worker: worker.clone(), placement: view.placement, epoch: view.writer.epoch, flight, probe,
+            });
+        }
+    }
+    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/ordered-reader",
+        "No enrolled worker could open the ordered read basis"))
+}
+
 pub(crate) async fn route_ordered<T, Open>(
     name: &str,
     installed: &crate::journal::hosted::GatewayPlacement,
     options: &GatewayOptions,
+    allow_takeover: bool,
     open: impl Fn(crate::journal::hosted::WorkerEndpoint, Option<u64>) -> Open + Send,
 ) -> Result<(T, crate::journal::hosted::WorkerEndpoint, u64)>
 where
@@ -436,7 +477,7 @@ where
     let key = control::ControlKey(options.capabilities.clone());
     let installed_incumbent = incumbent.and_then(|owner| installed.endpoints.get(&owner));
     let candidates = installed_incumbent.into_iter()
-        .chain(installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent));
+        .chain(installed.endpoints.values().filter(|worker| allow_takeover && Some(worker.enrollment) != incumbent));
     let mut refused = None;
     for worker in candidates {
         let takeover = Some(worker.enrollment) != incumbent;

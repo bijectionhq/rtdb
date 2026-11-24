@@ -34,6 +34,7 @@ struct Bundle {
 impl Bundle {
     fn write(directory: &Path, name: &str, rows: Vec<&Row>, basis: Timestamp) -> Self {
         let mut rows: Vec<_> = rows.into_iter().map(|row| SearchRow {
+            position: None,
             identity: None, iid: EntityId::Integer(id(row)).iid().0,
             system_from: basis.0,
             valid_from: Timestamp::MIN.0,

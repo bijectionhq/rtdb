@@ -4,6 +4,8 @@
 -- Merges small tries into larger ones for better query performance.
 -- The consumer of this work is the scan operator.
 -- It reads the trie catalog to understand which files it has to read for a given query.
+-- On a residence with coordinated retirement, a compaction job admits its live inputs under the catalog floor before opening them.
+-- The hold follows admitted provider requests through cancellation.
 -- Native compaction reserves the temporary buffers for each authenticated input range or for a whole-object input before downloading it.
 --
 -- This assumes understanding of the "Building a Bitemporal Index" trilogy:
@@ -142,6 +144,9 @@ config {
 -- Owned landing assertions retain their valid-time intervals and commit positions.
 -- A redacted owned event retains its original origin, system position and full valid-time interval.
 -- The redacted event participates in the ceiling at that position and preserves older history outside its effect.
+-- An expiring transaction metadata table merges its earliest live L0 with all older active primary inputs into one unpartitioned successor.
+-- Its merge consumes ordered erase events to exclude older puts, then omits those erase events from the complete successor.
+-- The installed successor supersedes its covered inputs irrespective of the ordinary partial-file size limit.
 -- L0 normalization retains the latest erase marker and excludes every older event for the same entity.
 -- Other exact entity keys in the same IID bucket remain eligible for normalization.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.

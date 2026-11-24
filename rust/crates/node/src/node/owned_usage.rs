@@ -88,7 +88,7 @@ impl OwnedReadSession {
         }
         let ordered = crate::ordered_index::owned_file_bytes(&context, &self.database, &self.owner, &mut totals);
         let measured = tokio::time::timeout(Duration::from_secs(2),
-            rtdb_storage::IoRegion::leased(context.catalog.read_lease(), ordered)).await;
+            context.reading(ordered)).await;
         if matches!(measured, Ok(Ok(()))) {
             for (relation, row) in relations.iter().zip(&mut rows) {
                 row.ordered_index_bytes = totals.get(&relation.table(&self.owner)).copied();

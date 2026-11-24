@@ -459,6 +459,7 @@ pub(crate) fn integer_sql_id(event: &EventRef<'_>) -> Option<i64> {
 pub(crate) fn test_row(row: IndexedRow<'_>) -> Result<SearchRow> {
     let IndexedRow { header, key, values, .. } = row;
     Ok(SearchRow {
+        position: header.position,
         identity: key.as_deref().map(EntityIdRef::from_handle_bytes).transpose()?.map(EntityIdRef::into_owned),
         iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
         valid_to: header.valid_time.upper().0, op: header.op,
@@ -492,7 +493,7 @@ impl SearchPage for ArrowSearchPage {
         }
         let origin = event.origin();
         let mut indexed = search_row(event, columns, self.with_identity, self.seal.as_ref(), self.mode)?;
-        if self.mode == crate::file::BuildMode::Postings {
+        if self.mode == crate::file::BuildMode::Postings && indexed.header.position.is_none() {
             indexed.header.commit_position = logical::posting_position(indexed.header, origin, row)?;
         }
         Ok(indexed)
@@ -560,7 +561,7 @@ mod tests {
     #[test]
     fn a_uuid_column_does_not_certify_a_mismatched_physical_iid() {
         let id = [1; 16];
-        let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent {
+        let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             iid, entity_key: None, system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
@@ -599,7 +600,7 @@ mod tests {
             ])),
             StoredOperation::Delete,
             StoredOperation::Erase,
-        ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+        ].into_iter().enumerate().map(|(index, operation)| StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: Some(Arc::from(identities[index].handle_bytes())),
@@ -623,6 +624,7 @@ mod tests {
                 Some(_) => Some(vec![]),
             }).collect();
             SearchRow {
+                position: header.position,
                 identity: Some(identities[row].clone()),
                 iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
                 valid_to: header.valid_time.upper().0, op: header.op, values,
@@ -640,7 +642,7 @@ mod tests {
             Arc::new(StringArray::from(vec!["indexed text"])),
             Arc::new(StringArray::from(vec!["%"])),
         ], None);
-        let header = rtdb_types::EventHeader {
+        let header = rtdb_types::EventHeader { position: None,
             iid: Iid([0; 16]), system_from: Timestamp(10), commit_position: 0, valid_time: Interval::ALL, op: EventOp::Put,
         };
         let memory = MemoryBudget::new(1 << 20);

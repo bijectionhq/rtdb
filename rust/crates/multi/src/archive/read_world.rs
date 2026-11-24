@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::{
     ArchiveKey, ArchivedObject, CellStorage, KeyService, PrefixedStore, archive_witness,
     capture_receipt, inconsistent, key, observe_archive_object, read, read_object, replica_suffix, require_capture_open, stage,
-    read_archive_lifetime_floors, unavailable, verified_archive,
+    read_archive_lifetime_floors, unavailable, verified_archive, verified_held_archive,
 };
 
 /// Reopenable locator for one independently retained published cut.
@@ -189,7 +189,8 @@ where
 }
 
 pub(super) struct TerminalReplay<'a> {
-    pub storage: &'a CellStorage,
+    pub broker: Option<&'a crate::replay_broker::Client>,
+    pub source_region: Uuid,
     pub source_io: Arc<rtdb_storage::IoRegion>,
     pub fence: &'a rtdb_directory::CheckpointTransferFence,
     pub stream: &'a rtdb_logkeeper::StreamConfig,
@@ -208,7 +209,7 @@ pub(super) async fn with_registered_capture_replay<T, F, Fut>(
     run: F,
 ) -> Result<T>
 where
-    F: FnOnce(Arc<QueryContext>, TransactionKey, Option<i64>) -> Fut,
+    F: FnOnce(Arc<QueryContext>, TransactionKey, Option<replica_suffix::TerminalReplayFrontier>) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     if !resources.node.owned_relations {
@@ -250,7 +251,8 @@ where
         }
         Ok((capture, suffix))
     };
-    stage::with_region(
+    let plaintext = rtdb_storage::sealing::PlaintextView::new(Arc::clone(resources.memory));
+    let read = stage::with_region(
         directory,
         keys,
         &deployment,
@@ -275,8 +277,13 @@ where
                         "The archive belongs to another captured checkpoint",
                     ));
                 }
-                let (manifest, cipher) =
-                    verified_archive(bucket.clone(), &capture, selected.manifest, keys, Arc::clone(&region)).await?;
+                let held = !selected.require_replay && terminal.is_none()
+                    && suffix.as_ref().is_none_or(|pin| pin.custody == rtdb_directory::CheckpointSuffixCustody::World);
+                let (manifest, cipher) = if held {
+                    verified_held_archive(bucket.clone(), &capture, selected.manifest, keys, Arc::clone(&region)).await?
+                } else {
+                    verified_archive(bucket.clone(), &capture, selected.manifest, keys, Arc::clone(&region)).await?
+                };
                 if selected.require_replay {
                     if manifest.format != rtdb_format::catalog::CheckpointContents::Replay {
                         return Err(inconsistent("An installation serving from a replay archive requires a complete replay restore"));
@@ -317,14 +324,12 @@ where
                     root_sha256: capture.checkpoint.root_sha256,
                 };
                 let source_floor = SourcePosition::from_epoch_offset(epoch, capture.checkpoint.source)?;
-                let mut recovered = blocks
-                    .recover(
-                        resources.node.trie,
-                        source_floor,
-                        rtdb_types::Timestamp(capture.checkpoint.system_time),
-                        BlockDiscovery::AtPublished(checkpoint),
-                    )
-                    .await?;
+                let now = Timestamp(capture.checkpoint.system_time);
+                let mut recovered = if held {
+                    blocks.recover_held(resources.node.trie, source_floor, now, checkpoint).await?
+                } else {
+                    blocks.recover(resources.node.trie, source_floor, now, BlockDiscovery::AtPublished(checkpoint)).await?
+                };
                 let base_snapshot = recovered.partition.snapshot();
                 let base_basis = base_snapshot.tx_basis()
                     .filter(|basis| basis.system_time.0 == capture.checkpoint.system_time)
@@ -364,7 +369,7 @@ where
                 }
                 let terminal_source = if let Some(terminal) = terminal {
                     Some(replica_suffix::replay_certified_terminal(
-                        &record, terminal.storage, Arc::clone(&terminal.source_io), keys, terminal.stream, terminal.certificate, terminal.fence,
+                        &record, terminal.broker, terminal.source_region, Arc::clone(&terminal.source_io), keys, terminal.stream, terminal.certificate, terminal.fence,
                         terminal.through, &mut recovered, &memory,
                     ).await?)
                 } else {
@@ -393,8 +398,10 @@ where
                 run(context, basis, terminal_source).await
             })).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
         },
-    )
-    .await
+    );
+    let answer = plaintext.reading(read).await?;
+    plaintext.grant().await?;
+    Ok(answer)
 }
 
 /// The accepted inventory is the only source of bytes for a world read.

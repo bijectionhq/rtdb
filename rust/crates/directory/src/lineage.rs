@@ -6,6 +6,23 @@ use uuid::Uuid;
 
 use crate::{Checkpoint, DeploymentRecord, HostedTask, Lifecycle, StorageRegion, Version, next_reference_revision, reference_revision};
 
+/// Permission to remove the exact publications in one durable retirement.
+///
+/// ```compile_fail
+/// fn forge(retirement: &rtdb_directory::LineageRetirement) -> rtdb_directory::ExactRetirementGrant<'_> {
+///     rtdb_directory::ExactRetirementGrant { retirement, revision: 0 }
+/// }
+/// ```
+pub struct ExactRetirementGrant<'a> {
+    retirement: &'a LineageRetirement,
+    revision: Version,
+}
+
+impl<'a> ExactRetirementGrant<'a> {
+    pub fn retirement(&self) -> &'a LineageRetirement { self.retirement }
+    pub fn revision(&self) -> Version { self.revision }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageRetirement {
     pub token: Uuid,
@@ -32,8 +49,7 @@ impl LineageRetirement {
 
     fn matches_fence(&self, owner: &DeploymentRecord) -> bool {
         let (target, marker) = match &self.work {
-            RetirementWork::S3 { target, release, release_version, .. } => (target, release_version.as_ref().map(|_| release)),
-            RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
+            RetirementWork::S3 { target, release, .. } | RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
             RetirementWork::ReplayPack { target, capture, .. }
             | RetirementWork::ReplayPackTombstone { target, capture, .. } => {
                 return matches!(owner.storage_regions.get(&self.token), Some(StorageRegion::ReplayPackRetirement { object, capture: held })
@@ -47,7 +63,7 @@ impl LineageRetirement {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum RetirementWork {
     Local { local_volume: [u8; 32] },
     S3 {
@@ -55,10 +71,7 @@ pub enum RetirementWork {
         target: String,
         release: String,
         version: PhysicalObjectVersion,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        release_version: Option<PhysicalObjectVersion>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        legacy_receipt: Option<String>,
+        release_version: PhysicalObjectVersion,
     },
     Tombstones {
         deployment: String,
@@ -243,6 +256,13 @@ impl LineageState {
     }
     pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_) | Admission::ErasingTombstones { .. }) }
 
+    /// An observation of the authorized lineage also suffices after a lost reply.
+    pub fn exact_retirement_grant(&self, requested: &LineageRetirement) -> Option<ExactRetirementGrant<'_>> {
+        let retirement = self.retirement()?;
+        (self.exact_erasure_authorized() && retirement == requested)
+            .then_some(ExactRetirementGrant { retirement, revision: self.version })
+    }
+
     pub fn tombstone_upload(&self, token: Uuid, key: &str) -> Result<Option<&str>> {
         Ok(self.tombstone_uploads(token, key)?.get(key).map(String::as_str))
     }
@@ -290,10 +310,7 @@ impl LineageState {
     }
 
     pub(crate) fn settle_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<(DeploymentRecord, Self)> {
-        // An older exact-version attempt may already have cleared its data-only fence.
-        let matching_fence = retirement.matches_fence(owner)
-            || matches!(retirement.work, RetirementWork::S3 { release_version: None, .. })
-                && !owner.storage_regions.contains_key(&retirement.token);
+        let matching_fence = retirement.matches_fence(owner);
         let ready = match &self.admission {
             Admission::Erasing(current) => current == retirement && !current.work.uses_tombstones(),
             Admission::ErasingTombstones { retirement: current, uploads } => current == retirement && uploads.is_empty(),
