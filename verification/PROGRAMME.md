@@ -166,7 +166,13 @@ The stored Held ancestor separates the selected publication position from the ar
 Owned journal entries bind transaction positions to their relation-local sequence and through-event count.
 Range revalidation examines intervening publications by position, and a relation-local version opens the timeline at its original position.
 Merged Flight change requests and replies carry held publication edges, allowing partial pages inside a tied SQL time band.
-The app projection still needs its scope-local revision and continuation interface. Provider-wide replay correspondence, remaining owned history addressing and funded appointments remain proof obligations.
+Hosted historical Root holds select the marker's original position and certify each journal floor against it.
+Root point and ordered path touch reads use adjacent transaction prefixes at one history time.
+The receiver reads the ordered funded seat and compares its window and booking commitment to the create-only terminal receipt, including the constraint-refusal path.
+The system-time proofs call the production seat and slot predicates, compare two admitted physical histories at the same advertised grid reading, and include controls for a foreign booking and a retimed terminal.
+The guarded append owns the authenticated original quorum and physical cutoff.
+The payer and the app own service admission, exact recovery disclosure and the scheduled answer-or-cover boundary.
+Provider-wide replay correspondence, the remaining owned history addresses and public version and continuation projections, and full cross-service timing correspondence remain open.
 
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 

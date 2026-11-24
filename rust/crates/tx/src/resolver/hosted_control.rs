@@ -3,6 +3,18 @@ use rtdb_types::{EntityId, OwnedRelation};
 
 use super::*;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FundedSeat {
+    until: u64,
+    offer: [u8; 32],
+}
+
+fn funded_booking_missing() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/funded-booking",
+        "The ordered mutation seat differs from the original funded booking")
+}
+
 impl OpenTransaction<'_> {
     pub(super) async fn check_hosted_controls(
         &mut self,
@@ -15,8 +27,29 @@ impl OpenTransaction<'_> {
             _ => None,
         });
         if controls.clone().next().is_none() {
-            return Ok(());
+            return if self.clock_slot.is_some_and(|slot| slot.funded) {
+                Err(funded_booking_missing())
+            } else {
+                Ok(())
+            };
         }
+        let funded = self.clock_slot.filter(|slot| slot.funded).map(|slot| {
+            let mut terminals = controls.clone().filter(|control| {
+                control.name() == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE && !control.is_check()
+            });
+            let terminal = terminals.next().filter(|control| control.expected().is_none())
+                .and_then(|control| control.replacement()).ok_or_else(funded_booking_missing)?;
+            let Some(Value::Binary(evidence)) = terminal.get("funded_clock") else {
+                return Err(funded_booking_missing());
+            };
+            let (reading, booking) = evidence.split_first_chunk::<8>().ok_or_else(funded_booking_missing)?;
+            let booking: [u8; 32] = booking.try_into().map_err(|_| funded_booking_missing())?;
+            if terminals.next().is_some() || booking == [0; 32] {
+                return Err(funded_booking_missing());
+            }
+            Ok((slot.reading, Timestamp(i64::from_be_bytes(*reading)), booking))
+        }).transpose()?;
+        let mut funded_seat_seen = false;
         let readmission = crate::hosted_control::world_readmission_control(controls.clone())?;
         let unavailable = || {
             Anomaly::new(
@@ -178,15 +211,34 @@ impl OpenTransaction<'_> {
                     "A hosted control row must appear once per commit",
                 ));
             }
+            let booked_seat = funded.filter(|_| control.name() == "bj_fact_root_admission"
+                && matches!(control.id(), EntityId::String(id) if id == "funded_mutation_seat:v1"));
             let point = rtdb_query::read_hosted_control_point(
                 Arc::clone(&context),
                 table,
                 control.id(),
-                replay.as_ref().is_some_and(|replay| replay.requires_base_payload(control)),
+                booked_seat.is_some() || replay.as_ref().is_some_and(|replay| replay.requires_base_payload(control)),
             )
             .await?;
             if let Some(replay) = &replay {
                 replay.check_base(control, point.row.as_ref().map(|(row, _)| row.batch()))?;
+            }
+            if let Some((offered, terminal, booking)) = booked_seat {
+                let (row, _) = point.row.as_ref().ok_or_else(funded_booking_missing)?;
+                let row = row.batch();
+                let (column, field) = row.schema_ref().column_with_name("admission").ok_or_else(funded_booking_missing)?;
+                let Value::Binary(body) = rtdb_columnar::read_value(field, row.column(column).as_ref(), 0)? else {
+                    return Err(funded_booking_missing());
+                };
+                let seat: FundedSeat = serde_json::from_slice(&body).map_err(|_| funded_booking_missing())?;
+                let end = i64::try_from(seat.until).map_err(|_| funded_booking_missing())?;
+                if end % 1_000 != 0 || !crate::system_time::original_funded_seat(
+                    offered.0, terminal.0, end / 1_000,
+                    control.is_check() && control.expected().is_some(), booking == seat.offer,
+                ) {
+                    return Err(funded_booking_missing());
+                }
+                funded_seat_seen = true;
             }
             let revision = point.row.map(|(_, revision)| revision);
             if !super::control_order::revision_matches(
@@ -198,6 +250,9 @@ impl OpenTransaction<'_> {
                     "An observed hosted control changed before ordering",
                 ));
             }
+        }
+        if funded.is_some() && !funded_seat_seen {
+            return Err(funded_booking_missing());
         }
         if let Some(replay) = &replay {
             self.restore_owned_lifetime_floors(replay, &context).await?;

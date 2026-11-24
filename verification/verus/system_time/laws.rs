@@ -1,4 +1,4 @@
-use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
 use vstd::prelude::*;
 
 verus! {
@@ -157,5 +157,27 @@ pub fn the_offered_reading_requires_the_original_clock_lineage() {
     assert(!accepts_clock_lineage(true, 2, 2, 5, 5, 1_100_000, 200_000));
     assert(accepts_clock_lineage(true, 3, 2, 8, 5, 1_100_000, 200_000));
 }
+
+pub fn funded_seat_and_receipt_name_one_advertised_reading() {
+    assert(original_funded_seat(1_000_000, 1_000_000, 2_000_000, true, true));
+    assert(!original_funded_seat(1_000_000, 1_000_001, 2_000_000, true, true));
+    assert(!original_funded_seat(1_000_000, 1_000_000, 2_000_000, true, false));
+    assert(!original_funded_seat(1_000_000, 1_000_000, 2_000_000, false, true));
+    assert(!original_funded_seat(1_000_000, 1_000_000, 2_000_001, true, true));
+}
+
+pub fn distinct_publications_on_the_same_grid_materialize_the_same_terms(
+    left_predecessor: i64, right_predecessor: i64, left_append: i64, right_append: i64,
+)
+    requires 1 <= left_predecessor < right_predecessor,
+        1_000_000 <= left_append, 1_000_000 <= right_append,
+{
+    let left = clock_slot_admits(1, left_predecessor, 1_000_000, left_append, 1_000_001);
+    let right = clock_slot_admits(1, right_predecessor, 1_000_000, right_append, 1_899_999);
+    assert(left && right);
+    assert(acceptance_relative_time(Some(1_000_000), Some(1_000_001), left_append)
+        == acceptance_relative_time(Some(1_000_000), Some(1_899_999), right_append));
+}
+
 
 }

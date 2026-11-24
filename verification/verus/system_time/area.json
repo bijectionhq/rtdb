@@ -9,6 +9,38 @@
   ],
   "min_verified_functions": 28,
   "controls": {
+    "substitute_the_ordered_funded_booking": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& seat_check && same_booking\n}",
+          "replace": "&& seat_check\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "original_funded_seat",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "retime_the_terminal_funded_receipt": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "receipt == reading && reading.checked_add(CLOCK_SLOT_WIDTH)",
+          "replace": "reading.checked_add(CLOCK_SLOT_WIDTH)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "original_funded_seat",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
     "substitute_the_receiver_clock_domain": {
     "mutate": [
       {

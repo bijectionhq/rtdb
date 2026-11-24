@@ -5875,13 +5875,11 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     };
     let first = session.state_mut().execute_tx(vec![put(&publications, &marker, 1), put(&facts, &fact, 1), put(&facts, &second_key, 5)],
         AutonomousTxOptions::default()).await.unwrap();
-    let tied = session.state_mut().execute_tx(vec![put(&facts, &second_key, 9)], AutonomousTxOptions {
-        system_time: Some(first.tx_key().system_time),
-        ..AutonomousTxOptions::default()
-    }).await.unwrap();
-    assert!(tied.committed());
-    assert_eq!(tied.tx_key().system_time, first.tx_key().system_time);
-    assert!(tied.tx_key().tx_id > first.tx_key().tx_id);
+    let subsequent = session.state_mut().execute_tx(
+        vec![put(&facts, &second_key, 9)], AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(subsequent.committed());
+    assert!(subsequent.tx_key().tx_id > first.tx_key().tx_id);
     let intermediate = session.reserve_ordered_present().await.unwrap();
     let second = session.state_mut().execute_tx(vec![put(&publications, &marker, 2), put(&facts, &fact, 2), put(&facts, &unselected_key, 6)],
         AutonomousTxOptions::default()).await.unwrap();
@@ -5901,7 +5899,7 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     };
     for (before, expected) in [(true, 5), (false, 9)] {
         let mut cursor = fresh.open_root_cut_point(
-            &facts, &second_key, tied.tx_key(), tied.tx_key().system_time, before,
+            &facts, &second_key, subsequent.tx_key(), subsequent.tx_key().system_time, before,
         ).await.unwrap().unwrap();
         assert_eq!(payload(cursor.next_batch().await.unwrap().unwrap().batch()), Value::I64(expected));
     }

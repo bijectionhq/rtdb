@@ -14,5 +14,7 @@ const CORRESPONDENCE: &[&str] = &[
     include_str!("../../../rust/crates/tx/src/decision_clock.rs"),
     include_str!("../../../rust/crates/tx/src/source.rs"),
     include_str!("../../../rust/crates/tx/src/resolver.rs"),
+    include_str!("../../../rust/crates/node/src/node/funded_mutation_clock.rs"),
+    include_str!("../../../rust/crates/tx/src/resolver/hosted_control.rs"),
     include_str!("../../../rust/crates/tx/src/resolver/prepared_landing.rs"),
 ];

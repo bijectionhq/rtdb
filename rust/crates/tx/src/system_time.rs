@@ -163,6 +163,18 @@ pub(crate) fn accepts_clock_lineage(
         && (earlier_seq != seq || (earlier_epoch == epoch && earlier_time == time))
 }
 
+// The receipt carries the same booking commitment as the ordered seat.
+#[cfg_attr(verus_keep_ghost, verus_spec(admitted => ensures
+    admitted == (receipt == reading && reading as int + 1_000_000 == seat_until as int
+        && seat_check && same_booking),
+))]
+pub(crate) fn original_funded_seat(
+    reading: i64, receipt: i64, seat_until: i64, seat_check: bool, same_booking: bool,
+) -> bool {
+    receipt == reading && reading.checked_add(CLOCK_SLOT_WIDTH) == Some(seat_until)
+        && seat_check && same_booking
+}
+
 #[cfg(not(verus_keep_ghost))]
 pub(crate) fn clock_slot_time(
     slot: crate::OwnedClockSlot,

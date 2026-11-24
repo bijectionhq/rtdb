@@ -178,6 +178,11 @@ impl QueryContext {
             .with_owned_position_cut(through.tx_id)
     }
 
+    /// The exact position already admitted for an owned archive view.
+    pub fn owned_position_cut(&self) -> Option<TxId> {
+        self.catalog.owned_transaction_cut
+    }
+
     /// Probes a prefix of the captured history without inventing a SQL time for its endpoint.
     pub fn with_owned_position_cut(mut self: Arc<Self>, through: TxId) -> Result<Arc<Self>> {
         self.check_cancelled()?;

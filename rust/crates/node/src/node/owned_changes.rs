@@ -798,7 +798,8 @@ impl OwnedReadSession {
         self.require_scoped_relation(relation)?;
         let mut page = read_versions_at_cut(
             self.journal_context(relation)?, &self.owner, relation, id,
-            self.system_time(), request, || self.relation_context(relation),
+            self.system_time(), self.historical_publication().map(|cut| cut.tx_id),
+            request, || self.relation_context(relation),
         ).await?;
         page.witness = self.relation_witness(relation)?;
         Ok(page)
@@ -1060,12 +1061,15 @@ pub async fn archived_versions_at_cut(
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
     if snapshot.system_time_cap() != Some(context.current_time.as_micros()?) { return Err(change_feed_uncovered()); }
-    read_versions_at_cut(Arc::clone(&context), owner, relation, id, selected, request, || Ok(Arc::clone(&context))).await
+    read_versions_at_cut(
+        Arc::clone(&context), owner, relation, id, selected, context.owned_position_cut(),
+        request, || Ok(Arc::clone(&context)),
+    ).await
 }
 
 async fn read_versions_at_cut(
     journal_context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
-    selected: Timestamp, request: OwnedVersionRequest,
+    selected: Timestamp, selected_position: Option<TxId>, request: OwnedVersionRequest,
     timeline_context: impl Fn() -> Result<Arc<rtdb_query::QueryContext>>,
 ) -> Result<OwnedVersionPage> {
     let OwnedVersionRequest {
@@ -1124,10 +1128,14 @@ async fn read_versions_at_cut(
     if let Some(journal) = journal {
         validate_journal_head(&journal_context, owner, relation, journal.head_revision, journal.head)
             .await?;
-        let first = journal_boundary(&journal_context, owner, relation, &journal, system.lower())
-            .await?;
-        let end = journal_boundary(&journal_context, owner, relation, &journal, system.upper())
-            .await?;
+        let first = journal_boundary_for(&journal_context, owner, relation, &journal, |header| {
+            header.publication.system_time < system.lower()
+                && selected_position.is_none_or(|through| header.publication.tx_id <= through)
+        }).await?;
+        let end = journal_boundary_for(&journal_context, owner, relation, &journal, |header| {
+            header.publication.system_time < system.upper()
+                && selected_position.is_none_or(|through| header.publication.tx_id <= through)
+        }).await?;
         if first > end {
             return Err(change_feed_uncovered());
         }
@@ -1207,14 +1215,6 @@ async fn read_versions_at_cut(
         return Err(change_feed_uncovered());
     }
     Ok(page)
-}
-
-async fn journal_boundary(
-    context: &Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
-    journal: &CoveredJournal, time: Timestamp,
-) -> Result<i64> {
-    journal_boundary_for(context, owner, relation, journal,
-        |header| header.publication.system_time < time).await
 }
 
 async fn journal_boundary_for(
