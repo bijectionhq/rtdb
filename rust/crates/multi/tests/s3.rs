@@ -499,7 +499,7 @@ async fn a_cell_move_refuses_overlapping_s3_locations() {
     let east = Cell::start_on(Some(storage.clone()), vec![], None, None, Some((map.clone(), "east".into()))).await;
     let west = Cell::start_in("west", map.clone(), 0).await;
     let (east_keys, west_keys) = (east.keys(), west.keys());
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &storage, keys: &east_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
     let deployment = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap().1;
     let CellStorage::S3 { mut config } = storage.clone() else { unreachable!() };
     let pack_prefix = format!("{}/v06/~packs", deployment.storage_prefix());
@@ -508,7 +508,7 @@ async fn a_cell_move_refuses_overlapping_s3_locations() {
     let packs = rtdb_storage::ObjectKey::new(pack_prefix).unwrap();
     let nested = CellStorage::S3 { config };
     for destination in [&storage, &nested] {
-        let to = admin::CellHandle { name: "west", directory: &west.directory, storage: destination, keys: &west_keys, maximum_deployments: 10 };
+        let to = admin::CellHandle { name: "west", directory: &west.directory, storage: destination, keys: &west_keys, broker: None, maximum_deployments: 10 };
         let error = admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/shared-cell-storage");
         assert_eq!(east.directory.deployment(&deployment.id).await.unwrap().as_ref(), Some(&deployment));

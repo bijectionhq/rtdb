@@ -3180,17 +3180,11 @@ impl KeyService for InterruptedInstall {
     async fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment).await }
     async fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment).await }
     async fn existing_key(&self, deployment: &str) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_key(deployment).await }
-    fn retain_deployment_delivery(&self, id: String, material: &[u8; 32])
-        -> rtdb_types::Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
-    {
-        self.keys.retain_deployment_delivery(id, material)
-    }
     async fn grant_deployment_key(&self, deployment: &str, binding: [u8; 32]) -> rtdb_storage::Result<rtdb_multi::keys::UnitOutput> {
         self.keys.grant_deployment_key(deployment, binding).await
     }
     async fn copy(&self, from: &str, to: &str) -> rtdb_types::Result<()> { self.keys.copy(from, to).await }
     async fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment).await }
-    async fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key).await }
     async fn sign_deletion(&self, facts: rtdb_directory::DeletionFacts) -> rtdb_types::Result<rtdb_directory::DeletionRecord> { self.keys.sign_deletion(facts).await }
     async fn deletion_verification_key(&self) -> rtdb_types::Result<String> { self.keys.deletion_verification_key().await }
 
