@@ -5,6 +5,7 @@ use std::{
 
 use arrow_buffer::Buffer;
 use arrow_flight::FlightData;
+use arrow_schema::DataType;
 use prost::Message;
 use rtdb_columnar::MemoryBudget;
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
@@ -300,6 +301,28 @@ impl Parameters {
             types,
         })
     }
+
+    fn can_bind_arrow(&self) -> bool {
+        let batch = self.batch.batch();
+        !batch.columns().is_empty()
+            && batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .all(|(field, column)| {
+                    field.metadata().is_empty()
+                        && matches!(
+                            field.data_type(),
+                            DataType::Boolean
+                                | DataType::Int8
+                                | DataType::Int16
+                                | DataType::Int32
+                                | DataType::Int64
+                        )
+                        && column.is_valid(0)
+                })
+    }
 }
 
 async fn open_query(
@@ -316,6 +339,14 @@ async fn open_query(
     let types = parameters.types.as_slice();
     let arguments =
         wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
+    if parameters.can_bind_arrow()
+        && let Some(cursor) = prepared
+            .try_open_query_arrow(Arc::clone(&context), &parameters.batch, types)
+            .await
+            .map_err(error::anomaly)?
+    {
+        return Ok(cursor);
+    }
     let row = arguments
         .rows()
         .next()
@@ -340,7 +371,24 @@ async fn open_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, UInt64Array};
+
+    #[test]
+    fn arrow_execution_requires_present_plain_booleans_and_signed_integers() {
+        let memory = MemoryBudget::new(1 << 20);
+        let signed = Arc::new(Int64Array::from(vec![Some(42)])) as ArrayRef;
+        for (other, expected) in [
+            (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, true),
+            (Arc::new(Int64Array::from(vec![None])) as ArrayRef, false),
+            (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, false),
+        ] {
+            let batch = RecordBatch::try_from_iter([("a", signed.clone()), ("b", other)]).unwrap();
+            let ipc = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+                .unwrap();
+            let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
+            assert_eq!(parameters.can_bind_arrow(), expected);
+        }
+    }
 
     #[test]
     fn parameter_values_keep_their_input_allocation_and_both_charges() {
