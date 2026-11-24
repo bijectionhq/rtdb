@@ -53,12 +53,23 @@ pub struct CountRange {
     pub n: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupedCount {
+    pub column: String,
+    pub prefix_bytes: Option<u32>,
+    pub equals: BTreeMap<String, Vec<u8>>,
+    pub valid_at: Option<Timestamp>,
+    pub n: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchTable {
     pub columns: StructFields<LogicalType>,
     pub indexes: BTreeMap<String, IndexDefinition>,
     pub ttl_micros: Option<u64>,
     pub constraints: BTreeMap<String, CountRange>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub grouped_constraints: BTreeMap<String, GroupedCount>,
     pub generation: u64,
     pub dropped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -653,6 +664,12 @@ impl<'a> BranchView<'a> {
         })
     }
 
+    pub fn grouped_constraints(&self) -> impl Iterator<Item = (&TableRef, &str, &GroupedCount)> {
+        self.tables().filter(move |_| !self.index.visibility_projection).flat_map(|(table, definition)| {
+            definition.grouped_constraints.iter().map(move |(name, rule)| (table, name.as_str(), rule))
+        })
+    }
+
     pub fn table(&self, table: &TableRef) -> Option<&BranchTable> {
         self.index.definition(table, self.cut.basis).filter(|definition| !definition.dropped)
     }
@@ -750,6 +767,32 @@ impl<'a> BranchView<'a> {
             }
         }
         Ok(true)
+    }
+
+    pub fn grouped_count_at_most(&self, table: &TableRef, rule: &GroupedCount, default_at: Timestamp) -> Result<bool> {
+        let at = rule.valid_at.unwrap_or(default_at);
+        let mut counts = BTreeMap::<&[u8], u64>::new();
+        let invalid = || Anomaly::incorrect("rtdb/constraint-key", "A qualifying row needs a binary group key of the declared width");
+        for id in self.ids(table) {
+            let Some(image) = self.row(table, id, at).and_then(|event| event.image_at(at)) else { continue; };
+            if !rule.equals.iter().all(|(column, expected)| binary_cell(image.cells.get(column)) == Some(expected.as_slice())) {
+                continue;
+            }
+            let key = binary_cell(image.cells.get(&rule.column)).ok_or_else(invalid)?;
+            let width = rule.prefix_bytes.map_or(key.len(), |width| width as usize);
+            let key = key.get(..width).ok_or_else(invalid)?;
+            let count = counts.entry(key).or_default();
+            if *count == rule.n { return Ok(false); }
+            *count += 1;
+        }
+        Ok(true)
+    }
+}
+
+fn binary_cell(value: Option<&Value>) -> Option<&[u8]> {
+    match value {
+        Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => Some(bytes),
+        _ => None,
     }
 }
 

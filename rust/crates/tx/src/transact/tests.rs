@@ -464,6 +464,35 @@ fn branch_tombstones_hold_the_fork_cut_and_merge_rejects_overlap() {
 }
 
 #[test]
+fn grouped_count_rejects_only_a_qualifying_bucket_over_capacity() {
+    let mut state = TransactState::new(INCARNATION);
+    let rule = GroupedCount {
+        column: "key".into(), prefix_bytes: Some(1), equals: BTreeMap::from([("active".into(), vec![1])]),
+        valid_at: None, n: 1,
+    };
+    let grouped = |id, key: &[u8], active| {
+        let mut op = put(MAIN_BRANCH, id, "value");
+        let Op::Put { rows, .. } = &mut op else { unreachable!() };
+        rows[0].cells.insert("key".into(), Cell::Value(Value::Binary(key.to_vec())));
+        rows[0].cells.insert("active".into(), Cell::Value(Value::Binary(vec![active])));
+        op
+    };
+    assert_eq!(commit(&mut state, 1, &request(1, vec![Op::Declare {
+        table: table(), change: Declaration::GroupedConstraint { name: "per-prefix".into(), rule },
+    }])).outcome, Outcome::Then);
+    assert_eq!(commit(&mut state, 2, &request(2, vec![
+        grouped(1, b"a1", 1), grouped(2, b"b1", 1), grouped(3, b"a2", 0),
+    ])).outcome, Outcome::Then);
+    assert!(matches!(commit(&mut state, 3, &request(3, vec![grouped(4, b"a3", 1)])).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/grouped-count-constraint"));
+    assert_eq!(commit(&mut state, 4, &request(4, vec![
+        Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(1)], valid: None },
+        grouped(4, b"a3", 1),
+    ])).outcome, Outcome::Then);
+    assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 40), [2, 3, 4]);
+}
+
+#[test]
 fn declarations_and_branch_lifetimes_are_ordered_with_writes() {
     let mut state = TransactState::new(INCARNATION);
     let index = IndexDefinition { name: "key".into(), column: "key".into(), additional_columns: Vec::new() };

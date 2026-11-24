@@ -66,6 +66,13 @@ surface StatelessDatabase {
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.
         -- A binary or text range guard can name a single-column index, and an unbounded count can name a compound index.
 
+    @guarantee CountConstraintCatalog
+        -- A count range limits one ordered index interval.
+        -- A grouped count limits every qualifying binary key or key prefix at the constraint's valid time.
+        -- Binary predicates select qualifying rows by equality on the named columns.
+        -- The writer checks the final state of the selected arm before committing its effects.
+        -- An unrestricted Query reads the installed typed definitions in xt.count_constraints at its selected cut.
+
     @guarantee TransactionRelativeValidTime
         -- Put and Delete on unlabelled tables may name a valid-time endpoint as a signed offset from the transaction time.
         -- The writer resolves both endpoints against the receipt's system time and records the resolved interval.

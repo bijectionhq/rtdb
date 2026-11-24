@@ -166,12 +166,20 @@ message CountRangeConstraint {
   optional sint64 valid_at_micros = 4;
   uint64 n = 5;
 }
+message GroupedCountConstraint {
+  string column = 1;
+  optional uint32 prefix_bytes = 2;
+  map<string, bytes> equals = 3;
+  optional sint64 valid_at_micros = 4;
+  uint64 n = 5;
+}
 message Constraint {
   string name = 1;
   string expression = 2;
   oneof change {
     CountRangeConstraint count_range = 3;
     google.protobuf.Empty drop = 4;
+    GroupedCountConstraint grouped_count = 5;
   }
 }
 message Visibility { string column = 1; }

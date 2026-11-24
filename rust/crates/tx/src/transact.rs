@@ -6,7 +6,7 @@ use rtdb_index::branches::{
 };
 pub use rtdb_index::branches::{
     CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation,
-    CustodyPlacementId, CustodyTarget, IndexDefinition, Visibility,
+    CustodyPlacementId, CustodyTarget, GroupedCount, IndexDefinition, Visibility,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
@@ -283,6 +283,7 @@ pub enum Declaration {
     Index(IndexDefinition),
     Ttl(Option<u64>),
     Constraint { name: String, range: Option<CountRange> },
+    GroupedConstraint { name: String, rule: GroupedCount },
     Drop,
     Visibility(Visibility),
     SingleLabelPerTx,
@@ -319,6 +320,7 @@ pub const RELATIVE_VALID_TIME: &str = "transact.relative-valid-time";
 pub const ROW_CUSTODY: &str = "row-custody";
 pub const PHYSICAL_ERASURE: &str = "erasure";
 pub const COUNT_RANGE_CONSTRAINT: &str = "declare.constraint.count-range";
+pub const GROUPED_COUNT_CONSTRAINT: &str = "declare.constraint.grouped-count";
 pub const REQUIREMENT_FAILED: &str = "rtdb/requirement-failed";
 
 #[derive(Clone, Copy)]

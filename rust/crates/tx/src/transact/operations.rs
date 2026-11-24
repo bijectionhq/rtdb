@@ -387,10 +387,25 @@ impl Candidate<'_> {
                     if &range.table != table || !definition.indexes.contains_key(&range.index) {
                         return Err(Anomaly::incorrect("rtdb/invalid-constraint", "Declare the constraint's range index on the same table"));
                     }
+                    if definition.grouped_constraints.contains_key(name) {
+                        return Err(conflict("rtdb/constraint-exists", "The name belongs to a grouped constraint"));
+                    }
                     definition.constraints.insert(name.clone(), range.clone());
                 } else {
                     definition.constraints.remove(name);
+                    definition.grouped_constraints.remove(name);
                 }
+            }
+            Declaration::GroupedConstraint { name, rule } => {
+                if name.is_empty() || rule.prefix_bytes == Some(0) {
+                    return Err(Anomaly::incorrect("rtdb/invalid-constraint", "A grouped constraint needs a name and a positive prefix width"));
+                }
+                validate_column(&rule.column)?;
+                for column in rule.equals.keys() { validate_column(column)?; }
+                if definition.constraints.contains_key(name) {
+                    return Err(conflict("rtdb/constraint-exists", "The name belongs to a range constraint"));
+                }
+                definition.grouped_constraints.insert(name.clone(), rule.clone());
             }
             Declaration::Drop => definition = BranchTable {
                 generation: cut.basis.position(), dropped: true,
@@ -426,13 +441,18 @@ impl Candidate<'_> {
     pub(super) fn check_constraints(&self) -> Result<()> {
         let cut = self.index.head();
         for (table, definition) in self.index.tables(cut.basis) {
-            if definition.constraints.is_empty() { continue; }
+            if definition.constraints.is_empty() && definition.grouped_constraints.is_empty() { continue; }
             for branch in self.index.active_names(cut.system_time) {
                 if !self.declared.contains(table) && !self.touched.contains(branch) { continue; }
                 let view = self.view(branch, Layer::Merged)?;
                 for (name, range) in &definition.constraints {
                     if !view.count_at_most(range, cut.system_time)? {
                         return Err(conflict("rtdb/count-constraint", format!("Count constraint {name} failed on branch {branch}")));
+                    }
+                }
+                for (name, rule) in &definition.grouped_constraints {
+                    if !view.grouped_count_at_most(table, rule, cut.system_time)? {
+                        return Err(conflict("rtdb/grouped-count-constraint", format!("Grouped count constraint {name} failed on branch {branch}")));
                     }
                 }
             }

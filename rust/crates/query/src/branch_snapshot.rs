@@ -150,7 +150,11 @@ fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffe
         ("schema_name".into(), text.clone()),
         ("table_name".into(), text.clone()),
         ("constraint_name".into(), text.clone()),
-        ("index_name".into(), text),
+        ("index_name".into(), text.clone()),
+        ("group_column".into(), text.clone()),
+        ("predicate_columns".into(), LogicalType::list(text)),
+        ("predicate_values".into(), LogicalType::list(binary.clone())),
+        ("prefix_bytes".into(), LogicalType::Scalar(ScalarType::U64)),
         ("lower_key".into(), binary.clone()),
         ("upper_key".into(), binary),
         ("valid_at_micros".into(), LogicalType::Scalar(ScalarType::I64)),
@@ -159,21 +163,33 @@ fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffe
     buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
     buffer.declare_document_types(&catalog, &columns)?;
     for (table, name, range) in view.count_constraints() {
-        let id = format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table);
-        let cells = StructFields::from([
-            ("_id".into(), Value::Utf8(id)),
-            ("schema_name".into(), Value::Utf8(table.schema.clone())),
-            ("table_name".into(), Value::Utf8(table.table.clone())),
-            ("constraint_name".into(), Value::Utf8(name.into())),
-            ("index_name".into(), Value::Utf8(range.index.clone())),
-            ("lower_key".into(), range.lower.clone().map_or(Value::Null, Value::Binary)),
-            ("upper_key".into(), range.upper.clone().map_or(Value::Null, Value::Binary)),
-            ("valid_at_micros".into(), range.valid_at.map_or(Value::Null, |at| Value::I64(at.0))),
-            ("maximum".into(), Value::U64(range.n)),
-        ]);
+        let mut cells = count_constraint_row(table, name, range.valid_at, range.n);
+        cells.insert("index_name".into(), Value::Utf8(range.index.clone()));
+        cells.insert("lower_key".into(), range.lower.clone().map_or(Value::Null, Value::Binary));
+        cells.insert("upper_key".into(), range.upper.clone().map_or(Value::Null, Value::Binary));
+        buffer.put(catalog.clone(), cells, Interval::ALL)?;
+    }
+    for (table, name, rule) in view.grouped_constraints() {
+        let mut cells = count_constraint_row(table, name, rule.valid_at, rule.n);
+        cells.insert("group_column".into(), Value::Utf8(rule.column.clone()));
+        cells.insert("prefix_bytes".into(), rule.prefix_bytes.map_or(Value::Null, |width| Value::U64(width.into())));
+        cells.insert("predicate_columns".into(), Value::list(rule.equals.keys().cloned().map(Value::Utf8).collect()));
+        cells.insert("predicate_values".into(), Value::list(rule.equals.values().cloned().map(Value::Binary).collect()));
         buffer.put(catalog.clone(), cells, Interval::ALL)?;
     }
     Ok(())
+}
+
+fn count_constraint_row(table: &TableRef, name: &str, valid_at: Option<Timestamp>, maximum: u64) -> StructFields<Value> {
+    let id = format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table);
+    StructFields::from([
+        ("_id".into(), Value::Utf8(id)),
+        ("schema_name".into(), Value::Utf8(table.schema.clone())),
+        ("table_name".into(), Value::Utf8(table.table.clone())),
+        ("constraint_name".into(), Value::Utf8(name.into())),
+        ("valid_at_micros".into(), valid_at.map_or(Value::Null, |at| Value::I64(at.0))),
+        ("maximum".into(), Value::U64(maximum)),
+    ])
 }
 
 fn append_custody_inventory(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {

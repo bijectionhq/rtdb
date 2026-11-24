@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_tx::transact::{
-    self as tx, Cell, CountRange, Declaration, Guard, IndexDefinition, Op, Row, Transact, Version,
+    self as tx, Cell, CountRange, Declaration, GroupedCount, Guard, IndexDefinition, Op, Row, Transact, Version,
     CustodyPlacement, CustodyReservation, CustodyTarget, ValidTime, ValidTimeBound, When, Window,
 };
 use rtdb_types::{
@@ -277,6 +277,16 @@ fn declaration(
                         n: count.n,
                     }),
                     Some(ConstraintChange::Drop(())) => None,
+                    Some(ConstraintChange::GroupedCount(count)) => return Ok(Declaration::GroupedConstraint {
+                        name: constraint.name,
+                        rule: GroupedCount {
+                            column: count.column,
+                            prefix_bytes: count.prefix_bytes,
+                            equals: count.equals.into_iter().collect(),
+                            valid_at: count.valid_at_micros.map(Timestamp),
+                            n: count.n,
+                        },
+                    }),
                     None => return Err(error::incorrect("Constraint needs a count range or an explicit drop")),
                 };
                 Declaration::Constraint { name: constraint.name, range }
