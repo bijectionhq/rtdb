@@ -1407,6 +1407,16 @@ mod tests {
         settle_fork_pin(&mut installation, pin, &held, true);
         settle_fork_pin(&mut installation, pin, &held, false);
         assert_eq!(installation.checkpoint_worlds[&pin], binding);
+
+        let prepared = Uuid::new_v4();
+        let mut child = binding;
+        child.fork_reservation = Some(WorldForkReservation::Prepared);
+        child.world = prepared;
+        installation.checkpoint_worlds.insert(prepared, child.clone());
+        reserve_fork_pin(&mut installation, prepared, &child, token, true)?;
+        let held = installation.checkpoint_worlds[&prepared].clone();
+        settle_fork_pin(&mut installation, prepared, &held, false);
+        assert!(!installation.checkpoint_worlds.contains_key(&prepared));
         Ok(())
     }
 

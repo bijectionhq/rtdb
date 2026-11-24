@@ -814,17 +814,15 @@ pub(crate) fn installed_authority_control<'a>(
 
 /// Bind the required wire proof to its exact primary control before submission.
 pub fn bind_installed_authority(
-    controls: &mut [HostedControlWrite], proof: Option<HostedAuthority>,
+    controls: &mut [HostedControlWrite], proof: HostedAuthority,
 ) -> Result<()> {
     let (index, control) = installed_authority_control(controls.iter())?;
-    if let Some(proof) = proof {
-        if control.expected() != Some(proof.revision) { return Err(authority_required()); }
-        controls[index].document = HostedControlDocument::Row(StructFields::from([
-            ("_id".into(), Value::Utf8(INSTALLATION_AUTHORITY_ID.into())),
-            ("incarnation".into(), Value::Binary(proof.incarnation.to_vec())),
-            ("writer".into(), Value::Binary(proof.writer.to_vec())),
-        ]));
-    }
+    if control.expected() != Some(proof.revision) { return Err(authority_required()); }
+    controls[index].document = HostedControlDocument::Row(StructFields::from([
+        ("_id".into(), Value::Utf8(INSTALLATION_AUTHORITY_ID.into())),
+        ("incarnation".into(), Value::Binary(proof.incarnation.to_vec())),
+        ("writer".into(), Value::Binary(proof.writer.to_vec())),
+    ]));
     Ok(())
 }
 
@@ -978,11 +976,9 @@ impl HostedControlWrite {
         }
     }
 
-    pub(crate) fn installed_authority(&self) -> Result<Option<HostedAuthority>> {
-        match self.source_row() {
-            Some(row) if row.len() > 1 => HostedAuthority::from_control(self.expected, row).map(Some),
-            _ => Ok(None),
-        }
+    pub(crate) fn installed_authority(&self) -> Result<HostedAuthority> {
+        let row = self.source_row().ok_or_else(authority_required)?;
+        HostedAuthority::from_control(self.expected, row)
     }
 
     pub(crate) fn arrow_replacement(&self) -> Option<&crate::ArrowDocuments> {

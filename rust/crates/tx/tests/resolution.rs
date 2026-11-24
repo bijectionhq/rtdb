@@ -1341,7 +1341,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
             authority.clone(), scope, Some(Timestamp(stamp)),
             StructFields::from([("_id".into(), Value::Utf8("authority".into()))]),
         ).unwrap()];
-        rtdb_tx::bind_installed_authority(&mut controls, Some(rtdb_tx::HostedAuthority::decode(&bytes).unwrap())).unwrap();
+        rtdb_tx::bind_installed_authority(&mut controls, rtdb_tx::HostedAuthority::decode(&bytes).unwrap()).unwrap();
         let [control] = controls;
         TxOp::HostedControl(control)
     };

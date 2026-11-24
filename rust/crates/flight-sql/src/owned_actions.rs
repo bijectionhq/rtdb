@@ -37,7 +37,6 @@ use crate::{
 
 pub(crate) const SEAL_HOSTED_RANGES_V1: &str = "rtdb.owned.SealHostedRanges.v1";
 pub(crate) const VALIDATE_FRESH_HOSTED_V1: &str = "rtdb.owned.ValidateFreshHosted.v1";
-pub(crate) const DECIDE_HOSTED_V3: &str = "rtdb.owned.DecideHosted.v3";
 pub(crate) const DECIDE_HOSTED_V4: &str = "rtdb.owned.DecideHosted.v4";
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
@@ -286,15 +285,10 @@ pub(crate) const HELD_WORLD_AT_PREFLIGHT_V2: &str = "rtdb.owned.PreflightHeldWor
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V4: &str = "rtdb.owned.PublishHeldWorldRetention.v4";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V5: &str = "rtdb.owned.PublishHeldWorldRetention.v5";
-pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
-pub(crate) const DECIDE_WORLD_CUT_V1: &str = "rtdb.owned.DecideWorldCut.v1";
 pub(crate) const DECIDE_WORLD_CUT_V2: &str = "rtdb.owned.DecideWorldCut.v2";
-pub(crate) const DECIDE_HELD_WORLDS_V1: &str = "rtdb.owned.DecideHeldWorlds.v1";
 pub(crate) const DECIDE_HELD_WORLDS_V2: &str = "rtdb.owned.DecideHeldWorlds.v2";
-pub(crate) const SWITCH_PREPARED_PROPOSAL_V1: &str = "rtdb.owned.SwitchPreparedProposal.v1";
 pub(crate) const SWITCH_PREPARED_PROPOSAL_V2: &str = "rtdb.owned.SwitchPreparedProposal.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
@@ -1228,18 +1222,17 @@ impl Service {
         hosted_observation::confirmation_reply(call, confirmation)
     }
 
-    fn installed_authority(body: &[u8], typed: bool) -> Result<(Option<rtdb_tx::HostedAuthority>, &[u8]), Status> {
-        if !typed { return Ok((None, body)); }
+    fn installed_authority(body: &[u8]) -> Result<(rtdb_tx::HostedAuthority, &[u8]), Status> {
         let (authority, rest) = body.split_first_chunk::<{ rtdb_tx::HostedAuthority::WIDTH }>()
             .ok_or_else(|| invalid("Missing installed authority proof"))?;
-        Ok((Some(rtdb_tx::HostedAuthority::decode(authority).map_err(status)?), rest))
+        Ok((rtdb_tx::HostedAuthority::decode(authority).map_err(status)?, rest))
     }
 
     pub(crate) async fn decide_hosted_action(
-        &self, call: &Call, envelope: &Bytes, typed: bool,
+        &self, call: &Call, envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
-        let (authority, body) = Self::installed_authority(envelope, typed)?;
+        let (authority, body) = Self::installed_authority(envelope)?;
         let ([flags], body) = body.split_first_chunk::<1>()
             .ok_or_else(|| invalid("Missing hosted decision flags"))?;
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
@@ -1288,7 +1281,7 @@ impl Service {
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
-        funded: Option<&rtdb_node::FundedMutationClock>, authority: Option<rtdb_tx::HostedAuthority>,
+        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -4115,10 +4108,10 @@ impl Service {
         }
     }
 
-    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, body: &[u8], typed: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let (authority, body) = Self::installed_authority(body, typed)?;
+        let (authority, body) = Self::installed_authority(body)?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
         let (publication, body) = split_world_publication(body)?;
         let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
@@ -4173,8 +4166,8 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, charge) })
     }
 
-    pub(crate) async fn publish_world_cut_action(&self, call: &Call, envelope: &Bytes, publish_root: bool, typed: bool) -> Result<ActionResult, Status> {
-        let (authority, body) = Self::installed_authority(envelope, typed)?;
+    pub(crate) async fn publish_world_cut_action(&self, call: &Call, envelope: &Bytes, publish_root: bool) -> Result<ActionResult, Status> {
+        let (authority, body) = Self::installed_authority(envelope)?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no held root handle"))?;
@@ -4439,11 +4432,11 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool, typed: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
-        let (authority, body) = Self::installed_authority(envelope, typed)?;
+        let (authority, body) = Self::installed_authority(envelope)?;
         let ([flags], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world decision flags"))?;
         if *flags & !7 != 0 { return Err(invalid("Invalid world decision flags")); }
         let (slot, body) = if *flags & 1 != 0 {

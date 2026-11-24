@@ -1557,6 +1557,10 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
         Bytes::from(request)
     };
     let action = "rtdb.owned.DecideHosted.v4";
+    let mut generic = i64::MAX.to_be_bytes().to_vec();
+    generic.extend(groups(&[("places", &hook)]));
+    let denied = client.action("rtdb.owned.Commit.v2", generic.into()).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     let omitted = client.action(action, request(first_claim, 0x11, false)).await.unwrap_err();
     assert!(omitted.message().contains("requires the installed authority check"), "{omitted}");
 

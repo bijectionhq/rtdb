@@ -4058,7 +4058,7 @@ mod tests {
             let mut proof = [0x11; crate::HostedAuthority::WIDTH];
             proof[..8].copy_from_slice(&installed_at.system_time.0.to_be_bytes());
             proof[8..24].fill(7);
-            crate::bind_installed_authority(&mut authority, Some(crate::HostedAuthority::decode(&proof)?))?;
+            crate::bind_installed_authority(&mut authority, crate::HostedAuthority::decode(&proof)?)?;
             let [authority] = authority;
             let operations = vec![
                 TxOp::HostedControl(authority),
