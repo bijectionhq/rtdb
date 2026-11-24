@@ -7,7 +7,7 @@ Hosted protocol 215 adds the scope and enrolment actions and position admission.
 
 ## Model
 
-A family is the private custody record of one protected row's Proposal original and all of its copies.
+A family is the private custody record of one protected row's original and all of its copies.
 Its members are:
 
 * the original occurrence, enrolled with its assertion and row capability before ordering and bound to its position after publication;
@@ -77,7 +77,7 @@ Reply: deployment `uuid`, current incarnation (u64, nonzero), Root line (16).
 
 Request: the authoring prefix of `SealWorldOverlayRow.v1`, with no plaintext.
 
-Enrols the original assertion and capability at the exact authoring slot of a registered Proposal world.
+Enrols the original assertion and capability at the exact authoring slot of a registered writable Proposal or Held world.
 An enrolled original can seal and register derived rows before it has a position.
 An exact retry succeeds and a conflicting enrolment is refused.
 
@@ -93,7 +93,7 @@ The member retains its position, and every enrolled rewrite stage stays in the f
 
 Request: family `uuid`, original `occurrence`.
 
-Binds the enrolled Proposal original to its position after the placed writer observes the ordered publication, including when recovering a successful attempt.
+Binds the enrolled original to its position after the placed writer observes the ordered publication, including when recovering a successful attempt.
 An exact retry succeeds.
 A different original under the same family is refused with `rtdb.multi/assertion-family-mismatch`.
 A fenced family refuses with `rtdb/erased-under-view`, and a position with a durable denial refuses the same way.

@@ -13,7 +13,7 @@ use rtdb_flight_sql::{
 use rtdb_directory::DeploymentRecord;
 use rtdb_node::NativeSession;
 use rtdb_storage::IoRegion;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, PlacedAttemptScope, Result, WorldClockMode};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, PlacedAttemptScope, Result};
 use uuid::Uuid;
 
 use crate::keys::{
@@ -63,8 +63,7 @@ impl Scope {
                 positions = [Some(reservation.source), Some(placement.position)];
                 None
             }
-            FamilyRequest::EnrollOriginal(row) => Some((row.world, true)),
-            FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, false)),
+            FamilyRequest::EnrollOriginal(row) | FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, true)),
             FamilyRequest::Scope | FamilyRequest::RegisterDerived { .. } | FamilyRequest::SealWorldRow { .. }
             | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
         };
@@ -74,9 +73,9 @@ impl Scope {
             .chain(world);
         let Some(first) = worlds.next() else { return Ok(()); };
         let snapshot = session.open_owned_read().await?;
-        for (world, proposal) in std::iter::once(first).chain(worlds) {
+        for (world, enrolling) in std::iter::once(first).chain(worlds) {
             if world.is_nil() || snapshot.world_registration(Iid(*world.as_bytes())).await?
-                .is_none_or(|(record, _)| !record.mode.is_writable() || (proposal && record.mode != WorldClockMode::Proposal))
+                .is_none_or(|(record, _)| !record.mode.is_writable() || (enrolling && record.dropped))
             {
                 return Err(scope_mismatch("The assertion position or authoring world belongs to another line"));
             }
