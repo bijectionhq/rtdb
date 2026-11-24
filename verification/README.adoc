@@ -158,6 +158,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * link:verus/installed_custodian_retention/README.md[Installed custodian retention] checks the exclusive checkpoint cut, exact trim target and disposal-before-trim attempt order.
 * link:verus/survivor_checkpoint/README.md[Survivor checkpoint] checks the shipped event and member decisions against a Lean exact-head filter and a native conformance fixture.
 * link:verus/fork_custody/README.md[Fork custody] checks the shipped dependent-fork release guards and models dependent and independent publication in Lean.
+* link:verus/installed_append_binding/README.md[Installed append binding] checks the chosen result guards, exact ciphertext selection, recorded key generation and detached-frame decoder.
+  The link:multi/compose/README.md[Lean composition] relates those decisions to the chosen prefix through the barrier and to a typed replay of the selected checkpoint and suffix.
 * link:verus/installed_adapter/README.md[Installed adapter contract] checks the exact request identities against a named Lean reference and records Logkeeper's admission preconditions at RTDB's pin.
 * link:verus/framing_decoders/area.json[Framing decoders] imports the Rust functions used for source and replica envelopes, replica retirement attempts, journal framing and Flight audience seats.
   On 2026-11-24, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 56 items, and all 27 mutations failed at their declared laws.

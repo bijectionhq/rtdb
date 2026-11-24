@@ -171,37 +171,85 @@ theorem replay_reads_have_unwithdrawn_survivors
       zoneOf inventory grants scope selected _ ready reached key demanded lost trivial)
 
 structure ReplaySemantics (Tx : Type) where
-  frameFor : Protocol.Append → Option (NativeAppend.Frame Tx)
+  source : NativeAppend.DecodeSource Tx
   committedTargets : Nat → Tx → Bool
   authenticatesPlan : Scope → OrderedJournal.Checkpoint → Protocol.DataCut → Selection → Prop
   checkpointEvents : ReplayClosure.Checkpoint → List Tx
   replayEvents : Selection → List Tx → List Tx
 
 def ReplaySemantics.decodeTx (semantics : ReplaySemantics Tx) : Protocol.Append → Option Tx :=
-  NativeAppend.decodeAppend semantics.frameFor
+  NativeAppend.decodeAppend semantics.source
+
+inductive TypedReplay (semantics : ReplaySemantics Tx) :
+    List Protocol.Decision → List ReplayClosure.Record → List Tx → List Tx → Prop
+  | done : TypedReplay semantics [] [] events events
+  | transaction : record.body = .resolvedTx → semantics.decodeTx append = some tx →
+      TypedReplay semantics history records (events ++ [tx]) result →
+      TypedReplay semantics (.append append :: history) (record :: records) events result
+  | maintenance : record.body ≠ .resolvedTx → semantics.decodeTx append = none →
+      TypedReplay semantics history records events result →
+      TypedReplay semantics (.append append :: history) (record :: records) events result
+  | control : TypedReplay semantics history records
+      (events.filter fun tx => !(semantics.committedTargets digest tx)) result →
+      TypedReplay semantics (.control digest :: history) records events result
+
+theorem TypedReplay.fidelity (replayed : TypedReplay semantics history records events result) :
+    result = history.foldl (applyDecision semantics.decodeTx semantics.committedTargets) events := by
+  induction replayed with
+  | done => rfl
+  | transaction _ decoded _ rest => simpa [applyDecision, decoded] using rest
+  | maintenance _ decoded _ rest => simpa [applyDecision, decoded] using rest
+  | control _ rest => exact rest
+
+inductive CheckpointReplay (semantics : ReplaySemantics Tx) :
+    Option ReplayClosure.Checkpoint → List Protocol.Decision → Prop
+  | genesis : CheckpointReplay semantics none []
+  | restored : TypedReplay semantics history records [] (semantics.checkpointEvents base) →
+      CheckpointReplay semantics (some base) history
+
+theorem CheckpointReplay.fidelity (replayed : CheckpointReplay semantics base history) :
+    (base.map semantics.checkpointEvents).getD [] =
+      history.foldl (applyDecision semantics.decodeTx semantics.committedTargets) [] := by
+  cases replayed with
+  | genesis => rfl
+  | restored applied => exact applied.fidelity
 
 /-- The decision count is a logical coordinate and can advance on control commands without advancing the data LSN. -/
 structure RecoveryProjection (semantics : ReplaySemantics Tx) (history : List Protocol.Decision)
     (selected : Selection) (scope : Scope) (read : ReadProjection (List Tx) history state) where
   checkpointDecisionCount : Nat
   checkpointInHistory : checkpointDecisionCount ≤ history.length
-  journalAgreesAtReadCut : state.chosen read.cut.next = some (projectCut read.cut)
   exactScopeCut : scope.orderedCut = read.cut.next
   selectedRoot : (selected.checkpoint.map (·.root)).getD 0 = read.hold.base.root
   authenticPlan : semantics.authenticatesPlan scope read.hold.base read.cut selected
   nativeReadKeys : List Key
   typedReads : ∀ key ∈ nativeReadKeys, (∃ base, selected.checkpoint = some base ∧ BaseRead base key) ∨
     ∃ replay, Reaches selected replay ∧ key ∈ replay.demands
-  checkpointFidelity : (selected.checkpoint.map semantics.checkpointEvents).getD [] =
-    (history.take checkpointDecisionCount).foldl
-      (applyDecision semantics.decodeTx semantics.committedTargets) []
-  suffixFidelity :
-    semantics.replayEvents selected (((selected.checkpoint.map semantics.checkpointEvents).getD [])) =
-      (history.drop checkpointDecisionCount).foldl
-        (applyDecision semantics.decodeTx semantics.committedTargets)
-        (((selected.checkpoint.map semantics.checkpointEvents).getD []))
+  checkpointAtCut : read.hold.base.cut =
+    projectCut (InstalledRead.dataCut read.seed (history.take checkpointDecisionCount))
+  checkpointReplay : CheckpointReplay semantics selected.checkpoint (history.take checkpointDecisionCount)
+  suffixReplay : TypedReplay semantics (history.drop checkpointDecisionCount) selected.suffix
+    ((selected.checkpoint.map semantics.checkpointEvents).getD [])
+    (semantics.replayEvents selected ((selected.checkpoint.map semantics.checkpointEvents).getD []))
   readUsesReplay : read.stateMeaning read.cut =
     semantics.replayEvents selected (((selected.checkpoint.map semantics.checkpointEvents).getD []))
+
+theorem RecoveryProjection.checkpointFidelity
+    {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) history state}
+    (projection : RecoveryProjection semantics history selected scope read) :
+    (selected.checkpoint.map semantics.checkpointEvents).getD [] =
+      (history.take projection.checkpointDecisionCount).foldl
+        (applyDecision semantics.decodeTx semantics.committedTargets) [] :=
+  projection.checkpointReplay.fidelity
+
+theorem RecoveryProjection.suffixFidelity
+    {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) history state}
+    (projection : RecoveryProjection semantics history selected scope read) :
+    semantics.replayEvents selected ((selected.checkpoint.map semantics.checkpointEvents).getD []) =
+      (history.drop projection.checkpointDecisionCount).foldl
+        (applyDecision semantics.decodeTx semantics.committedTargets)
+        ((selected.checkpoint.map semantics.checkpointEvents).getD []) :=
+  projection.suffixReplay.fidelity
 
 theorem recovery_read_is_exact_history
     {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) history state}
@@ -224,14 +272,13 @@ theorem recovered_query_observes_exact_history
 
 theorem acknowledged_transaction_survives_recovery
     {ledger : Ledger Voter} {zoneOf : PhysicalVersion → Zone} {semantics : ReplaySemantics Tx}
-    (initial : RecordedAppend ledger before position) (recovered : ChosenHistory)
+    (initial : ChosenAppend ledger position) (recovered : ChosenHistory)
     (chosenPath : Continuation ⟨Voter, ledger, initial.certifiedPrefix⟩ recovered)
-    (journalPath : OrderedJournal.Trace readers activations before after)
-    (journalInvariant : OrderedJournal.Invariant before)
+    (journalPath : OrderedJournal.Trace readers activations (initial.recordedState previous) after)
+    (journalInvariant : OrderedJournal.Invariant (initial.recordedState previous))
     (read : ReadProjection (List Tx) recovered.decisions after)
     (projection : RecoveryProjection semantics recovered.decisions selected scope read)
-    (sameInstallation : read.cut.placement = initial.record.receipt.attempt.placement)
-    (nativeAcknowledgement : NativeAppend.Binding semantics.frameFor initial.record tx)
+    (nativeAcknowledgement : NativeAppend.Binding semantics.source initial.record tx)
     (ready : ZoneReady Certificate.dependencies zoneOf inventory grants scope selected (fun _ => True))
     (withdrawalTrace : ∀ physical, ObjectWithdrawal.Trace ObjectWithdrawal.empty (objects physical))
     (registered : ∀ key physical grant, inventory key physical → grants grant →
@@ -253,11 +300,11 @@ theorem acknowledged_transaction_survives_recovery
   have selectedAppend := selected_decision_survives_extension
     (continuation_preserves_chosen_prefix chosenPath) initial.selected
   have invariant := OrderedJournal.protected_through_trace journalInvariant journalPath
-  refine ⟨selectedAppend, recorded_append_reissues_while_live initial journalPath,
+  refine ⟨selectedAppend, recorded_append_reissues_while_live (chosen_result_projection initial previous) journalPath,
     invariant.2.2.2 _ read.admitted.1, OrderedJournal.read_cannot_serve_an_unapplied_barrier read.admitted,
     fun same => OrderedJournal.read_cannot_serve_same_position_with_alien_digest
-      read.admitted projection.journalAgreesAtReadCut same,
-    ⟨InstalledRead.exactReadCut read.barrier read.ordered, sameInstallation,
+      read.admitted read.journalAgreesAtReadCut same,
+    ⟨InstalledRead.exactReadCut read.barrier read.ordered, read.sameInstallation selectedAppend rfl,
       InstalledRead.readCoversAcknowledgement read.barrier read.ordered selectedAppend⟩, ?_, ?_⟩
   · intro survives
     rw [recovery_read_is_exact_history projection]
@@ -293,6 +340,10 @@ theorem leased_read_finishes_before_reclamation
   ReaderRetention.lease_read_finishes_before_reclamation admitted retired started readerClock
     skewBound ioBound duration lifetime admittedBeforeRetirement clockBound admission completionBound
 
+#print axioms TypedReplay.fidelity
+#print axioms CheckpointReplay.fidelity
+#print axioms RecoveryProjection.checkpointFidelity
+#print axioms RecoveryProjection.suffixFidelity
 #print axioms continuation_preserves_chosen_prefix
 #print axioms selected_decision_survives_extension
 #print axioms recovered_history_keeps_committed_fence

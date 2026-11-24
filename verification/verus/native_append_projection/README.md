@@ -21,8 +21,7 @@ The Verus law `decode_chosen_frame` preserves the whole Prost body, term default
 `decodedEvent` projects a resolved transaction from that body and `decodeAppend` applies this projection to the frame bound to the chosen append.
 A control or an unopened oversized payload yields no transaction event.
 
-`Binding.chosen` connects the authenticated ordered result to the exact `Protocol.Append` in the certified history.
-`Binding.opened` connects the chosen bytes to the opened frame, including any digest-bound offload.
-`Binding.resolved` connects the resolved protobuf body to its logical transaction event.
-The frame proof uses the existing Prost and stage-check leaves.
-End-to-end ciphertext authenticity and generation opening, the detached-payload fetch and checks, and the Arrow and logical effect decoder in `rtdb_tx::decode_replica` remain outside the verified frame projection.
+[Installed append binding](../installed_append_binding/README.md) checks selected ciphertext, recorded key identity and detached-frame validation.
+`DecodeSource.openedFrame` and `resolveDetached` state those operations in Lean.
+The verified projection uses the existing Prost and stage-check leaves.
+The provider and authenticated-opening contracts supply the bytes, and the Arrow and logical effect decoder in `rtdb_tx::decode_replica` remains a separate refinement.

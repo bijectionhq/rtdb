@@ -1,0 +1,165 @@
+{
+  "summary": "Check the shipped installed append result guards, recorded journal key selection, and digest-bound detached-frame decoding.",
+  "flags": [
+    "--no-external-by-default",
+    "--edition",
+    "2024",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "journal_identity",
+    "--verify-module",
+    "detached",
+    "--verify-module",
+    "decoder",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "replay_cursor"
+  ],
+  "foreign_contracts": [
+    "prost-log-message",
+    "sha256-detached-replica"
+  ],
+  "min_verified_functions": 26,
+  "controls": {
+    "accept_another_decision_position": {
+      "defect": "Accept a result from a different decision position.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/append_selection.rs",
+          "find": "    ensures selected == if result_position == decision_position { Some(result) } else { None },",
+          "replace": "    ensures selected == Some(result),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/append_selection.rs",
+          "find": "    if result_position == decision_position { Some(result) } else { None }\n",
+          "replace": "    Some(result)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_append_binding/laws.rs",
+          "function": "chosen_result_projection",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "ignore_the_pending_lsn": {
+      "defect": "Accept a result at the current writer head even if the original request names another LSN.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/append_selection.rs",
+          "find": " && result_lsn == expected_next && result_lsn == writer_next),",
+          "replace": " && result_lsn == writer_next),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/append_selection.rs",
+          "find": "    same_class && result_lsn == expected_next && result_lsn == writer_next",
+          "replace": "    same_class && result_lsn == writer_next"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_append_binding/laws.rs",
+          "function": "chosen_result_projection",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "use_writer_epoch_as_key_generation": {
+      "defect": "Open the ciphertext under the recorded writer epoch instead of its recorded key generation.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/keys/journal_identity.rs",
+          "find": "        key.generation == grant.key_generation,",
+          "replace": "        key.generation == grant.epoch,"
+        },
+        {
+          "file": "rust/crates/multi/src/keys/journal_identity.rs",
+          "find": "    journal_key(placement, grant.key_generation)",
+          "replace": "    journal_key(placement, grant.epoch)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_append_binding/laws.rs",
+          "function": "opens_under_recorded_key",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "ignore_detached_digest": {
+      "defect": "Decode fetched bytes with the right term and sequence even when their digest differs.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/detached.rs",
+          "find": "        && (reference.payload_sha256 matches Some(expected) ==> expected@ == sha256(bytes))\n",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/format/src/envelope/detached.rs",
+          "find": "        if let Some(expected) = &reference.payload_sha256 {\n            if !digest_matches(expected.as_slice(), bytes) {\n                return Err(Anomaly::fault(\"rtdb.format/oversized-payload-mismatch\", \"Oversized payload bytes differ from their replica reference\"));\n            }\n        }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_append_binding/laws.rs",
+          "function": "resolves_detached_payload",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "accept_alien_detached_sequence": {
+      "defect": "Accept a detached frame with a different term sequence.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/detached.rs",
+          "find": "        && payload.term_sequence == proxy.term_sequence\n",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/format/src/envelope/detached.rs",
+          "find": "        if payload.term.0 != self.term.0 || !same_sequence {",
+          "replace": "        if payload.term.0 != self.term.0 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_append_binding/laws.rs",
+          "function": "resolves_detached_payload",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "allow_an_alien_ciphertext_cut": {
+      "defect": "Deliver a sealed record whose cut differs from the prepared successor.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/replay_cursor.rs",
+          "find": "    selected == if exact_checkpoint && exact_through && exact_record_cut",
+          "replace": "    selected == if exact_checkpoint && exact_through"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/replay_cursor.rs",
+          "find": "    if exact_checkpoint && exact_through && exact_record_cut",
+          "replace": "    if exact_checkpoint && exact_through"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_append_binding/laws.rs",
+          "function": "retains_the_exact_ciphertext",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    }
+  }
+}

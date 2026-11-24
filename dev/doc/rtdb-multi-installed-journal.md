@@ -298,6 +298,9 @@ Concrete wire decoding, durable media steps, provider evidence, and semantic fid
 The [X1 composition](../../verification/multi/compose/README.md) checks acknowledged transaction recovery and visibility under its named Lean hypotheses and records the corresponding production evidence and open refinements.
 The fresh-read proofs cover the signed hold selection, exact catalog cut gate and captured query input.
 The logical history ends at the chosen Barrier decision, and a catalog publication that has advanced past that cut requires a fresh admission.
+The [installed append binding harness](../../verification/verus/installed_append_binding/README.md) checks the result guards, exact ciphertext selection, recorded key generation and detached decoder.
+The Lean composition derives the barrier head and the preserved exact cut from the projected chosen prefix.
+It derives the checkpoint and suffix equalities from typed execution witnesses that the native archive and replay driver must realize.
 
 The standalone Logkeeper Verus harness includes the admission functions used by the production command reducer and compact-image decoder. It covers the checked debits, the trim gate, and the expiry and fingerprint decisions that govern exact reissue. The full codec round trip and the disk and network boundaries also need their own evidence.
 

@@ -1,6 +1,7 @@
 import Logkeeper.Protocol
 import OrderedJournal
 import InstalledRead
+import NativeAppend
 
 set_option warningAsError true
 
@@ -12,10 +13,7 @@ abbrev Ledger (Voter : Type) := PrefixAgreement.Ledger Voter Protocol.Decision
 
 abbrev projectCut := InstalledRead.projectCut
 
-/-- Project one shared decision into the RTDB receipt table. Placement and
-request identity are explicit inputs to the worker's interpretation. -/
-def projectAttempt (receipt : Protocol.AppendReceipt) : OrderedJournal.Attempt :=
-  ⟨receipt.attempt.issuer, receipt.attempt.nonce, receipt.expiresAt.next⟩
+abbrev projectAttempt := InstalledRead.projectAttempt
 
 def projectReceipt (receipt : Protocol.AppendReceipt) : OrderedJournal.Receipt :=
   ⟨receipt.requestDigest, projectCut receipt.cut⟩
@@ -28,6 +26,31 @@ structure RecordedAppend (ledger : Ledger Voter) (state : OrderedJournal.State)
   placement : record.receipt.cut.placement = record.receipt.attempt.placement
   expiryPlacement : record.receipt.expiresAt.placement = record.receipt.attempt.placement
   decoded : state.receipts (projectAttempt record.receipt) = some (projectReceipt record.receipt)
+
+structure ChosenAppend (ledger : Ledger Voter) (position : Nat) where
+  certifiedPrefix : Protocol.Seal ledger
+  nativeRecord : NativeAppend.ChosenRecord
+  resultAtDecision : NativeAppend.chosenResultAt nativeRecord.resultPosition (position + 1) = true
+  atResult : certifiedPrefix.decisions[nativeRecord.resultPosition - 1]? = some (.append (NativeAppend.nativeAppend nativeRecord))
+
+def ChosenAppend.record (initial : ChosenAppend ledger position) : Protocol.Append :=
+  NativeAppend.nativeAppend initial.nativeRecord
+
+theorem ChosenAppend.selected (initial : ChosenAppend ledger position) :
+    initial.certifiedPrefix.decisions[position]? = some (.append initial.record) := by
+  have same : initial.nativeRecord.resultPosition = position + 1 := by
+    simpa [NativeAppend.chosenResultAt] using initial.resultAtDecision
+  have index : initial.nativeRecord.resultPosition - 1 = position := by omega
+  exact (congrArg (fun i => initial.certifiedPrefix.decisions[i]?) index.symm).trans initial.atResult
+
+def ChosenAppend.recordedState (initial : ChosenAppend ledger position) (previous : OrderedJournal.State) :
+    OrderedJournal.State :=
+  OrderedJournal.recordAppend previous (projectAttempt initial.record.receipt) (projectReceipt initial.record.receipt)
+
+def chosen_result_projection (initial : ChosenAppend ledger position) (previous : OrderedJournal.State) :
+    RecordedAppend ledger (initial.recordedState previous) position :=
+  ⟨initial.certifiedPrefix, initial.record, initial.selected, rfl, rfl,
+    by simp [ChosenAppend.recordedState, OrderedJournal.recordAppend, OrderedJournal.update]⟩
 
 theorem recorded_append_reissues_while_live
     (initial : RecordedAppend ledger before position)
@@ -80,6 +103,7 @@ structure ReadProjection (Meaning : Type) (history : List Protocol.Decision)
   seed : Protocol.DataCut
   ordered : InstalledRead.OrderedDataHistory seed history
   barrier : InstalledRead.FreshBarrier seed history
+  admissionPath : ∃ activations, OrderedJournal.Trace barrier.readerSlots activations barrier.admitted state
   actual : OrderedJournal.Cut
   admitted : OrderedJournal.CanServe state barrier.hold actual
   stateMeaning : Protocol.DataCut → Meaning
@@ -93,6 +117,18 @@ def ReadProjection.cut (read : ReadProjection Meaning history state) : Protocol.
 def ReadProjection.hold (read : ReadProjection Meaning history state) : OrderedJournal.Hold := read.barrier.hold
 
 def ReadProjection.result (read : ReadProjection Meaning history state) : Meaning := read.capture.meaning
+
+theorem ReadProjection.journalAgreesAtReadCut (read : ReadProjection Meaning history state) :
+    state.chosen read.cut.next = some (projectCut read.cut) := by
+  obtain ⟨_, path⟩ := read.admissionPath
+  have atHead := read.barrier.projected.headAtAdmission.2
+  exact OrderedJournal.trace_preserves_chosen_cut (.cons read.barrier.step path) atHead (Nat.le_refl _)
+
+theorem ReadProjection.sameInstallation (read : ReadProjection Meaning history state)
+    {position : Nat} {record : Protocol.Append} (selected : history[position]? = some (.append record))
+    (placement : record.receipt.cut.placement = record.receipt.attempt.placement) :
+    read.cut.placement = record.receipt.attempt.placement :=
+  (InstalledRead.chosen_append_placement read.ordered selected).symm.trans placement
 
 theorem ReadProjection.usesSelectedCut (read : ReadProjection Meaning history state) :
     read.result = read.stateMeaning read.cut := by
@@ -120,6 +156,9 @@ theorem prepared_checkpoint_and_trim_need_no_writer
       advancing covered unheld
   exact ⟨trimmed, .cons publishStep (.cons trimStep (.nil trimmed)), rfl, rfl, rfl⟩
 
+#print axioms chosen_result_projection
+#print axioms ReadProjection.journalAgreesAtReadCut
+#print axioms ReadProjection.sameInstallation
 #print axioms recorded_append_reissues_while_live
 #print axioms recovery_reissues_exact_chosen_append
 #print axioms recovery_reissues_append_after_cohort_repair

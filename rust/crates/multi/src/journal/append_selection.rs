@@ -1,9 +1,22 @@
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use crate::AppendClass;
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+#[cfg(not(verus_keep_ghost))]
 use ordered_logkeeper::ordered::AppendClass;
 
+#[cfg_attr(verus_keep_ghost, verus_spec(selected =>
+    ensures selected == if result_position == decision_position { Some(result) } else { None },
+))]
 pub(super) fn chosen_result_at<T>(result: T, result_position: u64, decision_position: u64) -> Option<T> {
     if result_position == decision_position { Some(result) } else { None }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(matches =>
+    ensures matches == (result_class == pending_class && result_lsn == expected_next && result_lsn == writer_next),
+))]
 pub(super) fn matches_pending_append(
     result_class: AppendClass,
     pending_class: AppendClass,

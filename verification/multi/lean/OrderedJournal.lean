@@ -113,16 +113,18 @@ def ReaderCount (s : State) : Nat := s.holdBook.countP (fun h => !h.activation)
 
 def ActivationCount (s : State) : Nat := s.holdBook.countP (fun h => h.activation)
 
+def recordAppend (s : State) (attempt : Attempt) (receipt : Receipt) : State :=
+  {s with
+    head := receipt.cut
+    chosen := update s.chosen receipt.cut.next (some receipt.cut)
+    receipts := update s.receipts attempt (some receipt)}
+
 inductive Step (readerSlots activationSlots : Nat) : State → State → Prop where
   | append (s : State) (cohort writer : Nat) (attempt : Attempt) (receipt : Receipt)
       (auth : Current s cohort writer) (quorum : s.quorum = true)
       (issuer : attempt.issuer = writer) (fresh : s.receipts attempt = none)
       (next : receipt.cut.next = s.head.next + 1) :
-      Step readerSlots activationSlots s
-        {s with
-          head := receipt.cut
-          chosen := update s.chosen receipt.cut.next (some receipt.cut)
-          receipts := update s.receipts attempt (some receipt)}
+      Step readerSlots activationSlots s (recordAppend s attempt receipt)
   | expire (s : State) (observed : Nat) (forward : s.observed ≤ observed) :
       Step readerSlots activationSlots s
         {s with
@@ -193,6 +195,20 @@ inductive Trace (readerSlots activationSlots : Nat) : State → State → Prop w
   | cons : Step readerSlots activationSlots s t → Trace readerSlots activationSlots t u →
       Trace readerSlots activationSlots s u
 
+theorem trace_preserves_chosen_cut (path : Trace readers activations before after)
+    (present : before.chosen cut.next = some cut) (within : cut.next ≤ before.head.next) :
+    after.chosen cut.next = some cut := by
+  induction path with
+  | nil => exact present
+  | cons step _ rest =>
+    cases step <;> try exact rest present within
+    case append cohort writer attempt receipt auth quorum issuer fresh next tail =>
+      have distinct : cut.next ≠ receipt.cut.next := by omega
+      exact rest (by simpa [recordAppend, update, distinct] using present)
+        (show cut.next ≤ receipt.cut.next by omega)
+
+#print axioms trace_preserves_chosen_cut
+
 theorem step_preserves_checkpoint_and_holds (before : Invariant s)
     (step : Step readerSlots activationSlots s t) : Invariant t := by
   obtain ⟨covered, head, selected, held⟩ := before
@@ -202,7 +218,7 @@ theorem step_preserves_checkpoint_and_holds (before : Invariant s)
     refine ⟨covered, ?_, ?_, held⟩
     · change s.published.cut.next ≤ receipt.cut.next
       omega
-    · simpa [update, different] using selected
+    · simpa [recordAppend, update, different] using selected
   case grant =>
     refine ⟨covered, head, selected, ?_⟩
     intro h member
@@ -301,7 +317,7 @@ theorem live_receipt_survives_step (retained : s.receipts attempt = some r)
     · have contradiction := retained
       rw [same, fresh] at contradiction
       contradiction
-    · simpa [update, same] using retained
+    · simpa [recordAppend, update, same] using retained
   case expire observed forward =>
     simpa [Nat.not_le.mpr live] using retained
 

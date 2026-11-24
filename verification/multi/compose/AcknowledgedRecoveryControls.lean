@@ -65,14 +65,22 @@ private def chosen (voters : List Nat) (enough : JournalRefinement.Majority vote
 
 private def first := chosen [0, 1, 2] (by unfold JournalRefinement.Majority; decide)
 private def successor := chosen [1, 2, 3] (by unfold JournalRefinement.Majority; decide)
-private def last := chosen [2, 3, 4] (by unfold JournalRefinement.Majority; decide)
+private def afterGrant : List Protocol.Decision := committed ++ [.control 100]
+
+private def last : ChosenHistory :=
+  ⟨Nat, ledgerOf [2, 3, 4] afterGrant,
+    certificate _ _ _ (by unfold JournalRefinement.Majority; decide) List.prefix_rfl⟩
+
+private def installedBase : Protocol.Seal last.ledger :=
+  certificate [2, 3, 4] afterGrant committed (by unfold JournalRefinement.Majority; decide)
+    ⟨[.control 100], rfl⟩
 
 private theorem two_repairs : Continuation first last := by
   have installed : Continuation first successor :=
     .repair .start (evidence _ _ (by unfold JournalRefinement.Majority; decide)) (evidence _ _ (by unfold JournalRefinement.Majority; decide))
       ⟨first.certificate, successor.certificate, rfl⟩ (by decide) (by decide)
   exact .repair installed (evidence _ _ (by unfold JournalRefinement.Majority; decide)) (evidence _ _ (by unfold JournalRefinement.Majority; decide))
-    ⟨successor.certificate, last.certificate, rfl⟩ (by decide) (by decide)
+    ⟨successor.certificate, installedBase, rfl⟩ (by decide) (by decide)
 
 private def attempt := projectAttempt (record 11).receipt
 private def receipt := projectReceipt (record 11).receipt
@@ -86,10 +94,9 @@ private def appended : OrderedJournal.State :=
 private theorem append_step : OrderedJournal.Step 1 1 OrderedJournal.seed appended :=
   .append OrderedJournal.seed 1 0 attempt receipt ⟨rfl, rfl, rfl⟩ rfl rfl rfl rfl
 
-private def acknowledged : RecordedAppend first.ledger appended 0 :=
-  ⟨first.certificate, record 11, rfl, rfl, rfl, by
-    change OrderedJournal.update OrderedJournal.seed.receipts attempt (some receipt) attempt = some receipt
-    simp [OrderedJournal.update]⟩
+private def acknowledged : ChosenAppend first.ledger 0 :=
+  ⟨first.certificate, ⟨1, ⟨⟨1, 1⟩, 0, 7⟩, 5, 11, 1, 8, 9, 9,
+    .ordinary, 0, 1⟩, rfl, rfl⟩
 
 private def promoted : OrderedJournal.State :=
   { appended with
@@ -110,15 +117,23 @@ private def readSeed : Protocol.DataCut := ⟨(record 11).receipt.cut.placement,
 
 private def invocation : InstalledRead.Invocation := ⟨6, 9⟩
 
+private theorem grant_step : OrderedJournal.Step 1 1 appended promoted :=
+  .grant _ 1 0 8 ⟨rfl, rfl, rfl⟩ rfl (by decide)
+
+private theorem barrier_step : OrderedJournal.Step 1 1 promoted serving :=
+  .barrier _ 1 1 6 ⟨rfl, rfl, rfl⟩ rfl (by decide)
+
 private def admission : InstalledRead.FreshBarrier readSeed last.decisions :=
-  ⟨promoted, 1, invocation, invocation, [⟨5, 9⟩], by decide, rfl, 2, 3, by decide, rfl⟩
+  ⟨promoted, 1, invocation, invocation, [⟨5, 9⟩], by decide, rfl, 2, 3, by decide,
+    .control (.append (.genesis rfl) append_step) grant_step rfl, 1, ⟨rfl, rfl, rfl⟩, rfl, 1, by decide⟩
 
 private def published : InstalledRead.PublishedCatalog (List Nat) := ⟨admission.cut, [11]⟩
 
 private def read : ReadProjection (List Nat) last.decisions serving where
   seed := readSeed
-  ordered := .append rfl rfl .empty
+  ordered := .append rfl rfl (.control .empty)
   barrier := admission
+  admissionPath := ⟨1, .nil _⟩
   actual := receipt.cut
   admitted := ⟨by simp [serving, admission, InstalledRead.FreshBarrier.hold, replayHold, invocation], chosen_cut, Nat.le_refl _⟩
   stateMeaning := fun _ => [11]
@@ -130,22 +145,33 @@ private def read : ReadProjection (List Nat) last.decisions serving where
 private def base : ReplayClosure.Checkpoint := ⟨0, []⟩
 private def plan : Selection := ⟨some base, ⟨1, 1⟩, [], [.oversized 9 .resolvedTx]⟩
 private def scope : Scope := ⟨1, 1, 2⟩
-private def frameFor (append : Protocol.Append) : Option (NativeAppend.Frame Nat) :=
-  if append = record 11 then some (NativeAppend.decodeFrame (some 1) (some 0) (some (.resolvedTx 11)))
-  else none
+private def payload : NativeAppend.ChosenPayload := ⟨3, 70⟩
 
-private def nativeAcknowledgement : NativeAppend.Binding frameFor (record 11) 11 where
-  record := ⟨⟨⟨1, 1⟩, 0, 7⟩, 5, 11, ⟨⟨1, 1⟩, 1, 8⟩, ⟨⟨1, 1⟩, 9, 9⟩, .ordinary, 1⟩
-  chosen := rfl
-  frame := NativeAppend.decodeFrame (some 1) (some 0) (some (.resolvedTx 11))
-  opened := by decide
-  resolved := rfl
-private def decodeTx := NativeAppend.decodeAppend frameFor
+private def source : NativeAppend.DecodeSource Nat where
+  chosenPayload := fun append => if append = record 11 then some payload else none
+  openPayload := fun key bytes =>
+    if key = ⟨(record 11).receipt.attempt.placement, 3⟩ ∧ bytes = 70 then some 71 else none
+  decode := fun bytes =>
+    if bytes = 71 then some (NativeAppend.decodeFrame (some 1) (some 0) (some (.oversized (some 85))))
+    else if bytes = 72 then some (NativeAppend.decodeFrame (some 1) (some 0) (some (.resolvedTx 11)))
+    else none
+  detachedBytes := fun _ => some 72
+  sha256 := (· + 13)
+
+private def nativeAcknowledgement : NativeAppend.Binding source (record 11) 11 where
+  payload := payload
+  selected := by decide
+  plaintext := 71
+  decrypted := by decide
+  delivery := .detached (term := some 1) (sequence := some 0) (digest := some 85) (bytes := 72)
+    (by decide) rfl rfl (by decide)
+
+private def decodeTx := NativeAppend.decodeAppend source
 
 private def noErasure (_ _ : Nat) : Bool := false
 
 private def semantics : ReplaySemantics Nat :=
-  { frameFor := frameFor
+  { source := source
     committedTargets := noErasure
     authenticatesPlan := fun atScope checkpoint cut selected =>
       atScope = scope ∧ checkpoint = OrderedJournal.seed.published ∧
@@ -156,12 +182,12 @@ private def semantics : ReplaySemantics Nat :=
 private def projection : RecoveryProjection semantics last.decisions plan scope read where
   checkpointDecisionCount := 0
   checkpointInHistory := by decide
-  journalAgreesAtReadCut := chosen_cut
   exactScopeCut := rfl
   selectedRoot := rfl
   authenticPlan := ⟨rfl, rfl, rfl, rfl⟩
-  checkpointFidelity := rfl
-  suffixFidelity := by decide
+  checkpointAtCut := rfl
+  checkpointReplay := .restored .done
+  suffixReplay := .transaction rfl (by decide) (.control .done)
   readUsesReplay := by decide
   nativeReadKeys := [.root 0, .tailPayload 9]
   typedReads := by
@@ -211,14 +237,10 @@ theorem a_served_transaction_is_reachable_after_replacement_and_two_repairs (los
       (∃ voter ∈ recoveredJournal.members, voter - 2 ≠ lost ∧ recoveredJournal.copies voter 0 journalEntry) := by
   have initialInvariant : OrderedJournal.Invariant OrderedJournal.seed := by
     simp [OrderedJournal.Invariant, OrderedJournal.seed, OrderedJournal.seedCut]
-  have grant : OrderedJournal.Step 1 1 appended promoted :=
-    .grant _ 1 0 8 ⟨rfl, rfl, rfl⟩ rfl (by decide)
-  have barrier : OrderedJournal.Step 1 1 promoted serving :=
-    .barrier _ 1 1 6 ⟨rfl, rfl, rfl⟩ rfl (by decide)
   have recovered := acknowledged_transaction_survives_recovery acknowledged last two_repairs
-    (.cons grant (.cons barrier (.nil _)))
+    (.cons grant_step (.cons barrier_step (.nil _)))
     (OrderedJournal.step_preserves_checkpoint_and_holds initialInvariant append_step)
-    read projection rfl nativeAcknowledgement ready (objects := fun _ => ObjectWithdrawal.held)
+    read projection nativeAcknowledgement ready (objects := fun _ => ObjectWithdrawal.held)
     (fun _ => .next (.empty _) ObjectWithdrawal.reachable_hold)
     (fun _ _ _ _ _ _ => ⟨.hold, .inl rfl⟩) lost
   obtain ⟨_, _, _, _, _, _, visible, covered⟩ := recovered
@@ -416,6 +438,79 @@ theorem a_control_or_an_unopened_offload_has_no_decoded_acknowledgement :
       (some (.control : NativeAppend.Body Nat))) = none ∧
     NativeAppend.decodedEvent (NativeAppend.decodeFrame (some 1) (some 0)
       (some (.oversized (some 17) : NativeAppend.Body Nat))) = none ∧
-    NativeAppend.decodeAppend frameFor (record 12) = none := by decide
+    NativeAppend.decodeAppend source (record 12) = none := by decide
+
+theorem a_result_at_another_position_cannot_bind_the_chosen_acknowledgement :
+    last.decisions[0]? = some (.append (record 11)) ∧
+    NativeAppend.chosenResultAt 1 1 = true ∧
+    NativeAppend.chosenResultAt 0 1 = false ∧ NativeAppend.chosenResultAt 2 1 = false := by decide
+
+theorem changing_the_chosen_debit_loses_the_payload_binding :
+    let alien := { record 11 with debit := ⟨.ordinary, 2⟩ }
+    source.chosenPayload alien = none ∧ NativeAppend.decodeAppend source alien = none := by decide
+
+theorem opening_requires_the_recorded_ciphertext_and_its_key :
+    let append := record 11
+    let wrongKey := { NativeAppend.recordedKey append payload with generation := 4 }
+    source.openPayload wrongKey payload.ciphertext = none ∧
+    source.openPayload (NativeAppend.recordedKey append payload) 72 = none ∧
+    source.openedFrame append = source.decode 71 := by decide
+
+theorem a_valid_decoded_detached_body_with_a_different_digest_is_refused :
+    let substituted := { source with sha256 := fun _ => 99 }
+    substituted.decode 72 = source.decode 72 ∧
+    NativeAppend.decodeAppend substituted (record 11) = none := by decide
+
+theorem an_alien_journal_cut_disagrees_even_with_the_same_frontier :
+    let alien := { projectCut admission.cut with digest := 123 }
+    alien.next = read.cut.next ∧ serving.chosen alien.next ≠ some alien := by decide
+
+theorem a_foreign_installation_cannot_contain_the_chosen_acknowledgement :
+    ¬ InstalledRead.OrderedDataHistory { readSeed with placement := ⟨2, 1⟩ } last.decisions := by
+  intro ordered
+  have placement := InstalledRead.chosen_append_placement ordered (position := 0)
+    (acknowledged := record 11) rfl
+  exact (by decide : (record 11).receipt.cut.placement ≠ ⟨2, 1⟩) placement
+
+theorem a_stale_head_cannot_project_the_chosen_prefix :
+    ¬ InstalledRead.PrefixProjection readSeed last.decisions OrderedJournal.seed := by
+  intro projected
+  have atHead := projected.headAtAdmission.1
+  exact (by decide : OrderedJournal.seed.head ≠
+    projectCut (InstalledRead.dataCut readSeed last.decisions)) atHead
+
+theorem a_restored_checkpoint_can_absorb_the_chosen_transaction :
+    CheckpointReplay { semantics with checkpointEvents := fun _ => [11] } (some base) committed :=
+  .restored (.transaction (record := .oversized 9 .resolvedTx) rfl (by decide) .done)
+
+theorem an_image_missing_a_chosen_transaction_cannot_restore_the_checkpoint :
+    ¬ CheckpointReplay semantics (some base) committed := by
+  intro restored
+  exact (by decide : ([] : List Nat) ≠ committed.foldl (applyDecision decodeTx noErasure) [])
+    restored.fidelity
+
+theorem equal_typed_dependency_keys_do_not_justify_dropping_a_suffix_transaction :
+    (∃ replay, Reaches plan replay ∧ replay.remaining = [] ∧ replay.work = [] ∧
+      replay.demands = tailKeys plan) ∧ ¬ TypedReplay semantics last.decisions plan.suffix [] [] := by
+  constructor
+  · let fetched := { Replay.start plan with
+      work := [.resolvedTx], remaining := [], demands := [.tailPayload 9] }
+    have fetchedBody : Reaches plan fetched :=
+      .step .start (.admit (Replay.start plan) (.oversized 9 .resolvedTx) [] rfl rfl)
+    exact ⟨{fetched with work := []}, .step fetchedBody (.skip fetched .resolvedTx [] rfl), rfl, rfl, rfl⟩
+  · intro replayed
+    exact (by decide : ([] : List Nat) ≠ last.decisions.foldl (applyDecision decodeTx noErasure) [])
+      replayed.fidelity
+
+#print axioms a_result_at_another_position_cannot_bind_the_chosen_acknowledgement
+#print axioms changing_the_chosen_debit_loses_the_payload_binding
+#print axioms opening_requires_the_recorded_ciphertext_and_its_key
+#print axioms a_valid_decoded_detached_body_with_a_different_digest_is_refused
+#print axioms an_alien_journal_cut_disagrees_even_with_the_same_frontier
+#print axioms a_foreign_installation_cannot_contain_the_chosen_acknowledgement
+#print axioms a_stale_head_cannot_project_the_chosen_prefix
+#print axioms a_restored_checkpoint_can_absorb_the_chosen_transaction
+#print axioms an_image_missing_a_chosen_transaction_cannot_restore_the_checkpoint
+#print axioms equal_typed_dependency_keys_do_not_justify_dropping_a_suffix_transaction
 
 end RTDB.Recovery.X1.Controls
