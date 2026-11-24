@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -39,8 +40,8 @@ impl Default for Budget {
     fn default() -> Self { Self { max_uncovered_bytes: 64 << 20, max_candidates: 65_536 } }
 }
 
-/// One round of the shortlist: the candidates to resolve, and whether every eligible row has been considered.
-pub struct Round { pub candidates: BTreeSet<Iid>, pub complete: bool }
+/// One round of the shortlist: distinct candidates in IID order, and whether every eligible row has been considered.
+pub struct Round { pub candidates: Vec<Iid>, pub complete: bool }
 
 /// An opened generation and its clusters eligible under the partition filter, nearest centroid first.
 struct Opened {
@@ -258,6 +259,20 @@ struct Scores {
     allocation: Arc<MemoryReservation>,
 }
 
+struct ScoredIid {
+    iid: Iid,
+    distance: f64,
+}
+
+impl Ord for ScoredIid {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance.total_cmp(&other.distance).then_with(|| self.iid.cmp(&other.iid))
+    }
+}
+impl PartialOrd for ScoredIid { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+impl PartialEq for ScoredIid { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl Eq for ScoredIid {}
+
 impl Scores {
     fn new(memory: &Arc<MemoryBudget>, limit: usize) -> Result<Self> {
         Ok(Self { by_iid: BTreeMap::new(), admitted: 0, limit, overflowed: false, allocation: memory.reserve(0)? })
@@ -274,7 +289,7 @@ impl Scores {
         }
         if self.by_iid.len() == self.admitted {
             let admitted = self.admitted.saturating_add(256).min(self.limit);
-            // The grant covers the score tree, ordering scratch and one returned IID set.
+            // The grant covers the score tree, the selection heap and one IID round, including the held projection's set.
             Arc::get_mut(&mut self.allocation).expect("Scores own their allocation")
                 .grow_to(admitted.saturating_mul(192))?;
             self.admitted = admitted;
@@ -283,14 +298,20 @@ impl Scores {
         Ok(())
     }
 
-    fn nearest(&self, target: usize) -> Option<(BTreeSet<Iid>, bool)> {
+    fn nearest(&self, target: usize) -> Option<(Vec<Iid>, bool)> {
         if self.overflowed { return None; }
         if self.by_iid.len() <= target {
             return Some((self.by_iid.keys().copied().collect(), false));
         }
-        let mut ranked = self.by_iid.iter().collect::<Vec<_>>();
-        ranked.sort_unstable_by(|(left, d1), (right, d2)| d1.total_cmp(d2).then(left.cmp(right)));
-        let candidates = ranked.into_iter().take(target).map(|(iid, _)| *iid).collect();
+        let mut scores = self.by_iid.iter().map(|(&iid, &distance)| ScoredIid { iid, distance });
+        let mut nearest = BinaryHeap::from(scores.by_ref().take(target).collect::<Vec<_>>());
+        for candidate in scores {
+            if let Some(mut worst) = nearest.peek_mut() && candidate < *worst {
+                *worst = candidate;
+            }
+        }
+        let mut candidates: Vec<_> = nearest.into_iter().map(|score| score.iid).collect();
+        candidates.sort_unstable();
         Some((candidates, true))
     }
 }
@@ -309,6 +330,8 @@ pub fn declined(error: &Anomaly) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
     use rtdb_types::{Interval, LogicalType, ScalarType, StructFields, TableRef, Timestamp, Value};
 
@@ -443,28 +466,52 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn the_shortlist_widens_over_previously_scored_candidates() -> Result<()> {
+    #[tokio::test]
+    async fn the_shortlist_widens_over_previously_scored_candidates() -> Result<()> {
         let iid = |byte| Iid([byte; 16]);
-        let mut plan = probe::Plan::new(0.9, 1);
         let memory = MemoryBudget::new(1 << 20);
-        let mut scores = Scores::new(&memory, 128)?;
+        let budget = Budget { max_candidates: 128, ..Budget::default() };
+        let mut scores = Scores::new(&memory, budget.max_candidates)?;
         for byte in 1..=70 { scores.add(iid(byte), f64::from(byte))?; }
         scores.add(iid(64), 100.0)?;
         assert_eq!(scores.by_iid.len(), 70);
         assert_eq!(scores.by_iid[&iid(64)], 64.0);
-        let (kept, truncated) = scores.nearest(plan.target()).unwrap();
-        assert_eq!(kept.len(), 64);
-        assert!(!kept.contains(&iid(65)));
-        assert!(truncated);
-        assert!(plan.widen(128));
-        let (kept, truncated) = scores.nearest(plan.target()).unwrap();
-        assert_eq!(kept.len(), 70);
-        assert!(kept.contains(&iid(65)));
-        assert!(!truncated);
+
+        let snapshot = rtdb_index::PartitionValue::loaded(Default::default(), Default::default(), Default::default())?.snapshot();
+        let storage = Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 0));
+        let cancellation = CancellationToken::new();
+        let point = Interval::at(Timestamp(10))?;
+        let cut = Cut { snapshot: &snapshot, storage: &storage, memory: &memory, cancellation: &cancellation,
+            bounds: TemporalBounds { valid_time: point, system_time: point } };
+        let mut shortlist = Shortlist {
+            probe: vec![1.0, 0.0], plan: probe::Plan::new(0.9, 1), budget, partition: None, scores, opened: Vec::new(),
+        };
+        let first = shortlist.round(cut, None).await?.unwrap();
+        assert_eq!(first.candidates, (1..=64).map(iid).collect::<Vec<_>>());
+        assert!(!first.complete);
+        drop(first);
+
+        assert!(shortlist.widen());
+        let final_round = shortlist.round(cut, None).await?.unwrap();
+        assert_eq!(final_round.candidates, (1..=70).map(iid).collect::<Vec<_>>());
+        assert!(final_round.complete);
+        assert!(!shortlist.widen());
+        drop(final_round);
         assert!(memory.used_bytes() > 0);
-        drop(scores);
+        drop(shortlist);
         assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn the_truncated_shortlist_breaks_distance_ties_by_iid() -> Result<()> {
+        let iid = |byte| Iid([byte; 16]);
+        let mut scores = Scores::new(&MemoryBudget::new(8192), 8)?;
+        for (id, distance) in [(1, 2.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 0.0), (6, -0.0)] {
+            scores.add(iid(id), distance)?;
+        }
+        assert_eq!(scores.nearest(3), Some((vec![iid(2), iid(5), iid(6)], true)));
+        assert_eq!(scores.nearest(1), Some((vec![iid(6)], true)));
         Ok(())
     }
 
@@ -475,7 +522,7 @@ mod tests {
         scores.add(first, 2.0)?;
         scores.add(first, 1.0)?;
         assert_eq!(scores.by_iid[&first], 1.0);
-        assert_eq!(scores.nearest(1), Some((BTreeSet::from([first]), false)));
+        assert_eq!(scores.nearest(1), Some((vec![first], false)));
         scores.add(Iid([2; 16]), 0.0)?;
         assert_eq!(scores.by_iid.len(), 1);
         assert!(scores.nearest(1).is_none());
