@@ -310,6 +310,7 @@ pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWo
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
+pub(crate) const HELD_WORLD_SHARED_COLUMN_CENSUS_V1: &str = "rtdb.owned.ReadHeldWorldSharedColumnCensus.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
@@ -4908,6 +4909,40 @@ impl Service {
         let reply = self.owned_action_reply(&schema, Some(&rows))?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_world_shared_column_census_action(
+        &self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none()
+            || !self.supports_hosted_upload(call)
+        {
+            return Err(unsupported());
+        }
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, body) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Shared field census has no held world"))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
+        let (valid, body) = body.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Shared field census has no valid instant"))?;
+        let valid = Timestamp(i64::from_be_bytes(*valid));
+        let (length, body) = body.split_first_chunk::<2>()
+            .ok_or_else(|| invalid("Shared field census has no Root carrier scope"))?;
+        let (root, world) = body.split_at_checked(usize::from(u16::from_be_bytes(*length)))
+            .ok_or_else(|| invalid("Incomplete shared field census scope"))?;
+        let root = std::str::from_utf8(root).map_err(|_| invalid("Invalid Root carrier scope"))?;
+        let world = std::str::from_utf8(world).map_err(|_| invalid("Invalid world carrier scope"))?;
+        let (page, witness) = held.snapshot.shared_column_census(scope, valid, root, world).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
+        let _copy = call.reserve(bytes)?;
+        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
+        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let nonce = held.remember(call, witness, false)?;
+        let schema = rows.schema_ref().as_ref().clone().with_metadata(
+            [(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string())].into()
+        );
+        self.owned_point_reply_in(self.memory(), &schema, Some(&rows), held.snapshot.present(), valid,
+            None, None, reply_format)
     }
 
     pub(crate) async fn held_world_identities_action(

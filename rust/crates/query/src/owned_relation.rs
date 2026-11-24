@@ -510,15 +510,28 @@ pub async fn owned_identity_candidates(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
     valid: Timestamp, after: Option<&str>, fetch: usize,
 ) -> Result<OwnedIdentityCandidates> {
+    owned_identity_candidates_in_prefix(context, owner, relation, system, valid, after, fetch, None).await
+}
+
+/// Read an exact bounded identity page in a caller-admitted opaque scope.
+pub async fn owned_identity_candidates_in_prefix(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
+    valid: Timestamp, after: Option<&str>, fetch: usize, prefix: Option<&str>,
+) -> Result<OwnedIdentityCandidates> {
     let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/world-identities",
         "The held world identity candidates exceed their exact coverage or byte bound");
-    if !(1..=129).contains(&fetch) || relation.is_world_catalog() { return Err(unavailable()); }
+    if !(1..=129).contains(&fetch) || relation.is_world_catalog()
+        || prefix.is_some_and(|prefix| prefix.is_empty() || !prefix.is_ascii() || prefix.ends_with('\x7f')
+            || after.is_some_and(|after| !after.starts_with(prefix)))
+    {
+        return Err(unavailable());
+    }
     let context = owned_context_at_system(context, system)?;
     let mut charges = vec![context.memory.reserve(fetch * 128)?];
     let mut keys: Vec<String> = Vec::with_capacity(fetch);
     let mut remaining: usize = 8 << 20;
     if let Some(mut cursor) = open_owned_identity_candidates(
-        Arc::clone(&context), owner, relation, system, valid, after, None, fetch as i64,
+        Arc::clone(&context), owner, relation, system, valid, after, prefix, fetch as i64,
     ).await? {
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
@@ -531,7 +544,9 @@ pub async fn owned_identity_candidates(
                 let Value::Utf8(key) = rtdb_columnar::read_execution_value(field, array, row)? else {
                     return Err(unavailable());
                 };
-                if keys.len() == fetch || keys.last().map(String::as_str).or(after).is_some_and(|prior| prior >= key.as_str()) {
+                if keys.len() == fetch || prefix.is_some_and(|prefix| !key.starts_with(prefix))
+                    || keys.last().map(String::as_str).or(after).is_some_and(|prior| prior >= key.as_str())
+                {
                     return Err(unavailable());
                 }
                 let id = EntityId::String(key.clone());

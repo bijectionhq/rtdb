@@ -119,17 +119,31 @@ impl OwnedReadSession {
         self.world_identity_candidates_at(world, relation, self.present.system_time, valid, after, fetch).await
     }
 
+    pub async fn world_identity_candidates_in_prefix(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
+        after: Option<&str>, fetch: usize, prefix: &str,
+    ) -> Result<rtdb_query::OwnedIdentityCandidates> {
+        self.world_identity_candidates_on(world, relation, self.present.system_time, valid, after, fetch, Some(prefix)).await
+    }
+
     pub(super) async fn world_identity_candidates_at(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
         after: Option<&str>, fetch: usize,
+    ) -> Result<rtdb_query::OwnedIdentityCandidates> {
+        self.world_identity_candidates_on(world, relation, system, valid, after, fetch, None).await
+    }
+
+    async fn world_identity_candidates_on(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
+        after: Option<&str>, fetch: usize, prefix: Option<&str>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         let (admitted, _charge) = self.world_registration(world).await?
             .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         let context = self.relation_context(relation)?;
         let relation = relation.in_world(admitted.id)?;
-        let page = rtdb_query::owned_identity_candidates(
-            Arc::clone(&context), &self.owner, &relation, system, valid, after, fetch,
+        let page = rtdb_query::owned_identity_candidates_in_prefix(
+            Arc::clone(&context), &self.owner, &relation, system, valid, after, fetch, prefix,
         ).await?;
         context.check_cancelled()?;
         Ok(page)

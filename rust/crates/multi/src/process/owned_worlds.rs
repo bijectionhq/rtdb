@@ -241,6 +241,14 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::measure(self, relation, path, request))
     }
+    fn shared_column_census<'a>(
+        &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp, root_prefix: &'a str, world_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<(WorldIdentityPage, OwnedWorldWitness)>> {
+        Box::pin(async move {
+            let (page, witness) = HeldCheckpointWorld::shared_column_census(self, scope, valid, root_prefix, world_prefix).await?;
+            Ok((WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations }, witness))
+        })
+    }
     fn parent_identity_page_at<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
