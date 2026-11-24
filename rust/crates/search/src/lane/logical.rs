@@ -849,6 +849,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ObjectStore for PublicationRequired {
         fn requires_search_publication(&self) -> bool { true }
+        async fn search_staging_owner(&self) -> Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> { self.0.search_staging_owner().await }
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.0.head(key).await }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.0.get(key).await }
         async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.0.get_range(key, range).await }
