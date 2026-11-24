@@ -36,8 +36,8 @@ async fn get<M: Message + Name, R: Message + Default>(
     let last = frames.pop().expect("typed trailer");
     assert!(last.data_header.is_empty() && last.data_body.is_empty());
     let trailer = R::decode(last.app_metadata).expect("protobuf stream trailer");
-    let schema = arrow_ipc::root_as_message(&frames.first().expect("Arrow schema").data_header)
-        .unwrap();
+    let schema =
+        arrow_ipc::root_as_message(&frames.first().expect("Arrow schema").data_header).unwrap();
     assert!(schema.header_as_schema().is_some());
     let stream = futures::stream::iter(frames.into_iter().map(Ok));
     let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream)
@@ -83,7 +83,11 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let caps = v1::CapabilitiesResponse::decode(reply[0].body.clone()).unwrap();
     assert_eq!(caps.api, "rtdb.v1");
     assert!(caps.features.iter().any(|feature| feature == "query.track"));
-    assert!(caps.features.iter().any(|feature| feature == "changes.progress-only"));
+    assert!(
+        caps.features
+            .iter()
+            .any(|feature| feature == "changes.progress-only")
+    );
     assert_eq!(caps.limits.unwrap().min_key_bytes, 16);
     client
         .update(
@@ -325,10 +329,16 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
 
     let tx = client.begin().await;
     client
-        .update("INSERT INTO wire_a (_id, n) VALUES (1, 10), (2, 20)", Some(tx.clone()))
+        .update(
+            "INSERT INTO wire_a (_id, n) VALUES (1, 10), (2, 20)",
+            Some(tx.clone()),
+        )
         .await;
     client
-        .update("INSERT INTO wire_z (_id, n) VALUES (1, 30)", Some(tx.clone()))
+        .update(
+            "INSERT INTO wire_z (_id, n) VALUES (1, 30)",
+            Some(tx.clone()),
+        )
         .await;
     client.end(tx, true).await.unwrap();
     let (_, earlier) = query(&mut client, input("SELECT 1 LIMIT 0")).await;
@@ -378,11 +388,22 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
                 assert_eq!(times.value(row), expected_time);
                 assert!(batch.column(2).as_boolean().value(row));
                 assert!(keys.is_valid(row) && after.is_valid(row) && before.is_null(row));
-                let key = StreamReader::try_new(keys.value(row), None).unwrap().next().unwrap().unwrap();
-                let after = StreamReader::try_new(after.value(row), None).unwrap().next().unwrap().unwrap();
+                let key = StreamReader::try_new(keys.value(row), None)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                let after = StreamReader::try_new(after.value(row), None)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(key.num_rows(), 1);
                 assert_eq!(after.num_rows(), 1);
-                assert_eq!(key.column(0).as_ref(), after.column_by_name("_id").unwrap().as_ref());
+                assert_eq!(
+                    key.column(0).as_ref(),
+                    after.column_by_name("_id").unwrap().as_ref()
+                );
             }
         }
         assert!(!images.complete);
@@ -412,8 +433,14 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
         assert_eq!(progress, ordinary);
 
         request.images = v1::Images::Keys as i32;
-        let status = get::<_, v1::ChangesTrailer>(&mut client, request).await.unwrap_err();
-        error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        let status = get::<_, v1::ChangesTrailer>(&mut client, request)
+            .await
+            .unwrap_err();
+        error(
+            status,
+            v1::AnomalyCategory::Incorrect,
+            "rtdb/invalid-request",
+        );
     }
 
     let mut request = v1::ChangesRequest {
@@ -438,7 +465,9 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
 
     request.after = later.basis.clone();
     request.wait_millis = Some(10);
-    let (rows, timeout) = get::<_, v1::ChangesTrailer>(&mut client, request).await.unwrap();
+    let (rows, timeout) = get::<_, v1::ChangesTrailer>(&mut client, request)
+        .await
+        .unwrap();
     assert!(rows.is_empty());
     assert_eq!(timeout.through, later.basis);
     assert!(timeout.complete);
@@ -754,6 +783,9 @@ struct AppliedFixture {
     state: std::sync::Mutex<rtdb_tx::transact::TransactState>,
     claims: rtdb_types::rtdb_v1::ClaimSealer,
     memory: Arc<MemoryBudget>,
+    admission: std::sync::Mutex<Option<(uuid::Uuid, Timestamp, Bytes)>>,
+    waiting: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -800,10 +832,16 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
 
     async fn transact(
         &self,
-        request: rtdb_tx::transact::Transact,
+        request: rtdb_node::serving::TransactSubmission,
         _: &tokio_util::sync::CancellationToken,
     ) -> Result<rtdb_tx::transact::Receipt> {
         use rtdb_tx::transact::{Resolution, TransactionRecord};
+        if request.source.ends_with(&[0xf8, 0x07, 0x01]) {
+            *self.admission.lock().unwrap() =
+                Some((request.attempt, request.submitted_at, request.source));
+            self.waiting.notify_one();
+            self.release.notified().await;
+        }
         let mut state = self.state.lock().unwrap();
         let cut = state.index().head();
         let now = if cut.basis.position() == 0 {
@@ -812,7 +850,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             cut.system_time.next()?
         };
         match state.resolve(
-            &request,
+            &request.transaction,
             cut.basis.position() + 1,
             now,
             self.features(),
@@ -946,10 +984,13 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
         state: std::sync::Mutex::new(rtdb_tx::transact::TransactState::new(FIXTURE_INCARNATION)),
         claims: rtdb_types::rtdb_v1::ClaimSealer::new(FIXTURE_INCARNATION, [9; 32]),
         memory: MemoryBudget::new(1 << 27),
+        admission: Default::default(),
+        waiting: Default::default(),
+        release: Default::default(),
     });
     let resources = Arc::new(AppliedFixtureResources {
         native: Default::default(),
-        driver,
+        driver: driver.clone(),
     });
     let running = Running::start_with_resources(
         None,
@@ -983,16 +1024,44 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
         }
     };
     let key = vec![1; 16];
-    let first = transact_wire(
-        &mut client,
-        v1::TransactRequest {
-            key: key.clone(),
-            ops: vec![put("main", 1, false)],
-            ..Default::default()
-        },
+    let mut original = v1::TransactRequest {
+        key: key.clone(),
+        ops: vec![put("main", 1, false)],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    original.extend([0xf8, 0x07, 0x01]);
+    let original: Bytes = original.into();
+    let mut same_session = Client {
+        client: client.client.clone(),
+        headers: client.headers.clone(),
+    };
+    let raw = original.clone();
+    let held =
+        tokio::spawn(async move { same_session.action("rtdb.v1.Transact", raw).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(3), driver.waiting.notified())
+        .await
+        .unwrap();
+    let (attempt, submitted, admitted) = driver.admission.lock().unwrap().clone().unwrap();
+    assert!(!attempt.is_nil());
+    assert!(submitted > Timestamp::MIN);
+    assert_eq!(admitted, original);
+    let independent = tokio::time::timeout(
+        Duration::from_secs(3),
+        transact_wire(
+            &mut client,
+            v1::TransactRequest {
+                key: vec![9; 16],
+                ..Default::default()
+            },
+        ),
     )
     .await
+    .unwrap()
     .unwrap();
+    assert_eq!(independent.outcome, Some(v1::receipt::Outcome::Then(())));
+    driver.release.notify_one();
+    let first = v1::Receipt::decode(held.await.unwrap()[0].body.clone()).unwrap();
     let replay = transact_wire(
         &mut client,
         v1::TransactRequest {
@@ -1019,6 +1088,9 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
 
     let mut read = input("SELECT n FROM wire_applied ORDER BY n");
     read.track = true;
+    read.source.as_mut().unwrap().at = Some(v1::At {
+        selection: first.basis.clone().map(Selection::AtLeast),
+    });
     let (rows, main) = query(&mut client, read.clone()).await;
     assert_eq!(ints(&rows), [10]);
     assert_eq!(main.basis, first.basis);
