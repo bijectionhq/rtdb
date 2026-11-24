@@ -182,8 +182,18 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
                 if distinct || !residuals.is_empty() { return Ok(None); }
                 let Expr::Call { name, args, .. } = &first.expr else { return Ok(None) };
                 let [Expr::Column { id, .. }, query, ..] = args.as_slice() else { return Ok(None) };
-                if !matches!(args.len(), 2 | 3) { return Ok(None) }
                 let Ok(analyzer) = rtdb_plan::call_analyzer(name, args) else { return Ok(None) };
+                let arity = rtdb_plan::analyzer_index(name, args.len()).unwrap_or(args.len());
+                let corpus = match &args[..arity] {
+                    [_, _] => None,
+                    [_, _, documents, tokens, frequencies] => {
+                        let [Some(documents), Some(tokens), Some(frequencies)] =
+                            [documents, tokens, frequencies].map(rank_constant)
+                        else { return Ok(None); };
+                        Some(Box::new([documents, tokens, frequencies]))
+                    }
+                    _ => return Ok(None),
+                };
                 if !first.descending || !name.eq_ignore_ascii_case("search_score")
                     || !matches!(query, Expr::Literal(_) | Expr::Parameter { .. })
                     || !scan.columns.iter().any(|field| field.id == *id) { return Ok(None); }
@@ -200,7 +210,7 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
                     _ => None,
                 };
                 scan.top_k = Some(rtdb_plan::ScanTopK {
-                    column: *id, query: query.clone(), analyzer, limit: limit.clone(), offset: offset.cloned(), score: None, ascending_id,
+                    column: *id, query: query.clone(), corpus, analyzer, limit: limit.clone(), offset: offset.cloned(), score: None, ascending_id,
                 });
             }
             return Ok(Some(Arc::new(Relation::scan(scan)?)));
@@ -208,6 +218,16 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
         _ => return Ok(None),
     };
     Ok(Some(Arc::new(Relation::new(relation.schema().clone(), node)?)))
+}
+
+fn rank_constant(expression: &Expr) -> Option<Expr> {
+    match expression {
+        Expr::Parameter { .. } | Expr::Literal(_) => Some(expression.clone()),
+        Expr::List(items) => Some(Expr::Literal(rtdb_types::Value::list(items.iter().map(|item| {
+            match item { Expr::Literal(value) => Some(value.clone()), _ => None }
+        }).collect::<Option<_>>()?))),
+        _ => None,
+    }
 }
 
 fn add_ranked_score(

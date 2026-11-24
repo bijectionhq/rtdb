@@ -62,8 +62,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             ("search_score", [text, Value::Utf8(query), documents, total, frequencies]) => {
                 let query = parse_query(query, analyzer, context)?;
                 let (length, counts, _) = document_terms(&query, text, false, context)?;
-                let corpus = explicit_corpus(&query, documents, total, frequencies)?;
-                Ok(Value::F64(Scorer::new(query, Some(&corpus)).score(&counts, length)))
+                Ok(Value::F64(search_corpus_scorer(query, documents, total, frequencies)?.score(&counts, length)))
             }
             _ => Ok(Value::Null),
         }
@@ -131,6 +130,11 @@ fn explicit_corpus(
         tokens,
         frequencies,
     })
+}
+
+pub fn search_corpus_scorer(query: Query, documents: &Value, tokens: &Value, frequencies: &Value) -> Result<Scorer> {
+    let corpus = explicit_corpus(&query, documents, tokens, frequencies)?;
+    Ok(Scorer::new(query, Some(&corpus)))
 }
 
 #[cfg(test)]

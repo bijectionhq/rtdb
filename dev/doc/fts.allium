@@ -351,7 +351,7 @@ rule RepairUnreadableSearchFile {
 -- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.
 -- Its Arrow inputs supply each pair from the selected UTF-8 positions.
 -- Each id and body is prefixed with its byte length so the input has one spelling.
--- Ranked pruning applies to the two-argument form.
+-- Ranked pruning applies to unit scoring and to explicit statistics supplied as literals or bound parameters.
 --
 -- A definition covers a MATCH when it indexes the MATCH's column under the MATCH's analyzer; a column indexed only under another analyzer is scanned.
 -- Live postings, the commit's search delta and serving postings are kept per table, column and analyzer.
@@ -394,7 +394,7 @@ rule RepairUnreadableSearchFile {
 -- Dense posting runs expand score-bounded windows in priority order.
 -- A missing or unreadable term directory schedules repair and uses each run's authenticated locator for term membership.
 --
--- A point scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, can rank at one query frontier.
+-- A point scan whose rows feed only projections and then a bounded descending SEARCH_SCORE sort, with a MATCH on the same column, can rank at one query frontier.
 --
 --   1. The query accounts for every partition in its pinned view before choosing a cutoff.
 --      Unopened sources and live suffixes without a bound, and exact work for uncovered history, have unbounded rank.

@@ -149,6 +149,9 @@ fn rewrite_scan(scan: &mut Scan, mut rewrite: impl FnMut(&mut Expr) -> Result<()
     for item in &mut scan.matches { rewrite(&mut item.query)?; }
     if let Some(top_k) = &mut scan.top_k {
         rewrite(&mut top_k.query)?;
+        if let Some(corpus) = &mut top_k.corpus {
+            for bound in corpus.iter_mut() { rewrite(bound)?; }
+        }
         rewrite(&mut top_k.limit)?;
         if let Some(offset) = &mut top_k.offset { rewrite(offset)?; }
     }

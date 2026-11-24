@@ -95,10 +95,10 @@ impl ScanAccelerator for SearchAccelerator {
         let Some(column) = request.scan.columns.iter().find(|field| field.id == top.column).map(|field| field.name.as_str()) else { return Ok(None); };
         let Some((matched_column, matching, definition)) = self.match_definition(&request).await? else { return Ok(None); };
         if matched_column != column { return Ok(None); }
-        let Some(scoring) = request.constants.search_query(&top.query, top.analyzer).await? else { return Ok(None); };
+        let Some(scoring) = request.ranked_scorer(top).await? else { return Ok(None); };
         if top.analyzer != definition.analyzer { return Ok(None); }
         let Some(limit) = request.ranked_prefix_len(top).await else { return Ok(None); };
-        let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching.query().clone(), Arc::clone(scoring.scorer()),
+        let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching.query().clone(), scoring,
             top.ascending_id, limit, Narrowing::default()).await;
         match result {
             Ok(source) => Ok(source.map(|source| source as Box<dyn rtdb_query::RankSource + 'a>)),
@@ -1151,15 +1151,14 @@ impl SearchAccelerator {
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         if top_k.analyzer != definition.analyzer { work.decline = Some("unsupported-order"); return Ok(None) }
-        let Some(scoring) = request.constants.search_query(&top_k.query, top_k.analyzer).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
+        let Some(scoring) = request.ranked_scorer(top_k).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
         let Some(limit) = request.ranked_prefix_len(top_k).await else { work.decline = Some("unsupported-limit"); return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let scoring = scoring.scorer();
         if !options.estimate_first && !options.baseline {
             let (ranked, io) = crate::file::observe_tree_io(Box::pin(async {
                 let ranking = rtdb_query::QueryRanking::new(std::num::NonZeroUsize::new(limit).expect("nonempty prefix"), 1, request.memory)?;
                 let source = Box::pin(tree::PartitionRankSource::open(self, *request, definition.clone(), column, top_k.column, matching.clone(),
-                    Arc::clone(scoring), top_k.ascending_id, limit, options));
+                    Arc::clone(&scoring), top_k.ascending_id, limit, options));
                 let Some(source) = rtdb_query::run_rank_partition(&ranking, 0, source, request.cancellation).await?
                     else { return Ok(None); };
                 let tried_ranking = work.tried_ranking;
@@ -1223,7 +1222,7 @@ impl SearchAccelerator {
                 if candidates.scored % 128 == 0 {
                     reserve_ranking(&mut candidates.scratch, candidates.scored.saturating_add(128))?;
                 }
-                candidates.push(header.iid, matched.score(scoring), id);
+                candidates.push(header.iid, matched.score(&scoring), id);
                 Ok(candidates.scored <= self.max_candidates)
             })?;
             if !complete {
@@ -1284,7 +1283,7 @@ impl SearchAccelerator {
             if work.verification_rounds == 16 { work.decline = Some("verification-budget"); return Ok(None); }
             work.verification_rounds += 1;
             if cfg!(feature = "experiments") { work.verifier_rows += iids.len(); }
-            let scores = request.verifier.score_visible(iids, top_k.column, ascending_id, scoring).await?;
+            let scores = request.verifier.score_visible(iids, top_k.column, ascending_id, &scoring).await?;
             verified.extend(scores.ranked().map(|(iid, score, id)| (RankKey::integer(score, id), iid)));
         }
         if let Some(kth) = verified_cutoff(&mut verified, limit) {

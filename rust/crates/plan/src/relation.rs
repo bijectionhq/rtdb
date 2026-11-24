@@ -43,6 +43,8 @@ pub struct Scan {
 pub struct ScanTopK {
     pub column: ColumnId,
     pub query: Expr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus: Option<Box<[Expr; 3]>>,
     #[serde(with = "analyzer_name")]
     pub analyzer: rtdb_text::Analyzer,
     pub limit: Expr,

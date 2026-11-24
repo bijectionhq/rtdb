@@ -1528,6 +1528,13 @@ async fn randomized_ranked_windows_over_partitions_match_exhaustive_sql() {
             assert_eq!(frontier.fallback.load(Ordering::Relaxed), 0, "{statement}");
         }
     }
+    let query = "SELECT _id, payload, SEARCH_SCORE(body, 'invoice overdue', 200, 800, ARRAY[90, 15]) AS score
+        FROM docs WHERE MATCH(body, 'invoice') AND bucket <> 3 ORDER BY score DESC, _id";
+    let everything = partition_search(&partitions, database.storage(), query, None).await;
+    let page = partition_search(&partitions, database.storage(), &format!("{query} LIMIT 5 OFFSET 3"), Some(frontier.clone())).await;
+    assert_eq!(page, everything[3..8]);
+    assert_eq!(frontier.opened.load(Ordering::Relaxed), partitions.len());
+    assert_eq!(frontier.fallback.load(Ordering::Relaxed), 0);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

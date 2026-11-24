@@ -18,6 +18,7 @@ Refuse the result if the sentinel is reached.
 Use `MATCH(body, query[, analyzer])` for phrase-aware hits and `COUNT(*)` on that same predicate for the total before paging.
 Use `SEARCH_SCORE(body, query, documents, tokens, frequencies[, analyzer])` to order those hits by descending score and complete identity before applying offset and limit.
 A direct MATCH on an indexed column can use indexed narrowing, including when the score uses supplied corpus statistics.
+The bounded score window can use indexed ranking when the corpus statistics are bound parameters or literals and the MATCH and score use the same indexed analyzer and column.
 
 ## Exact float32 nearest
 

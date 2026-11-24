@@ -85,6 +85,19 @@ impl<'a> ScanRequest<'a> {
         usize::try_from(crate::limit_bounds::sort_prefix_len(offset, Some(fetch))).ok()
     }
 
+    pub async fn ranked_scorer(&self, top: &rtdb_plan::ScanTopK) -> Result<Option<Arc<rtdb_text::Scorer>>> {
+        let Some(query) = self.constants.search_query(&top.query, top.analyzer).await? else { return Ok(None); };
+        let Some(corpus) = &top.corpus else { return Ok(Some(Arc::clone(query.scorer()))); };
+        let [documents, tokens, frequencies] = &**corpus;
+        let (Some(documents), Some(tokens), Some(frequencies)) = (
+            self.constants.constant(documents).await?,
+            self.constants.constant(tokens).await?,
+            self.constants.constant(frequencies).await?,
+        ) else { return Ok(None); };
+        let scorer = rtdb_expr::search_corpus_scorer(query.query().clone(), &documents, &tokens, &frequencies);
+        Ok(scorer.ok().map(Arc::new))
+    }
+
     pub fn ranked_id_is_uuid(&self, id: ColumnId) -> bool {
         let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
         self.scan.columns.iter().any(|field| field.id == id && field.name == "_id" && field.data_type == uuid)
