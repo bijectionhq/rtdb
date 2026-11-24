@@ -499,6 +499,29 @@ impl OwnedReadSession {
         Ok(OwnedWorldVersionRead { held: self, world, relation, id, publication: commit.publication })
     }
 
+    /// Read the scoped journal sequence together with the exact publication
+    /// that assigned it. Reading the header consumes no touch payloads.
+    pub async fn table_publication_sequence(
+        &self, relation: &OwnedRelation, publication: TransactionKey,
+    ) -> Result<u64> {
+        if relation.world().is_some() || relation.is_world_catalog() {
+            return Err(change_feed_uncovered());
+        }
+        self.require_scoped_relation(relation)?;
+        self.admit_access().await?;
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(change_feed_uncovered());
+        };
+        let journal = self.covered_journal(snapshot, relation, self.present.system_time)
+            .await?.ok_or_else(change_feed_uncovered)?;
+        if journal.head.publication != publication {
+            return Err(change_feed_uncovered());
+        }
+        self.check_live_change_relations(std::slice::from_ref(relation))?;
+        u64::try_from(journal.head_revision).map_err(|_| change_feed_uncovered())
+    }
+
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
         self.relation_release_guard_for(relations, true)?()
     }

@@ -319,6 +319,7 @@ pub(crate) const READ_HELD_WORLD_REGION_CHANGES_V1: &str = "rtdb.owned.ReadHeldW
 pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorageUsage.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V2: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v2";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V4: &str = "rtdb.owned.ReadHeldMergedChanges.v4";
+pub(crate) const HELD_TABLE_PUBLICATION_SEQUENCE_V1: &str = "rtdb.owned.ReadHeldTablePublicationSequence.v1";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
 pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
 pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
@@ -1909,7 +1910,7 @@ impl Service {
             .ok_or_else(|| invalid("The audience observation has no original read handle"))?;
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let work = match action {
-            HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 => {
+            HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 => {
                 if request.len() > 16 * 1024 {
                     return Err(invalid("The audience projection request exceeds its carrier bound"));
                 }
@@ -3302,6 +3303,24 @@ impl Service {
         held.snapshot.check().map_err(status)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_table_publication_sequence_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Table publication sequence requires a held handle"))?;
+        let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, request) = split_relation(request)?;
+        let (publication, trailing) = split_world_publication(request)?;
+        if !trailing.is_empty() { return Err(invalid("Unexpected table publication fields")); }
+        if call.session.audience_source().is_some() && relation != call.session.audience_projection()?.relation {
+            return Err(Status::permission_denied("The relation is outside the prepared audience projection"));
+        }
+        let sequence = held.snapshot.table_publication_sequence(&relation, publication).await.map_err(status)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(ActionResult { body: wire::retain(sequence.to_be_bytes().to_vec(), call.reserve(8)?) })
     }
 
     pub(crate) async fn held_owned_merged_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {

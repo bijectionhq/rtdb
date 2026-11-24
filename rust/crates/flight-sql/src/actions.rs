@@ -42,6 +42,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | HELD_OWNED_STORAGE_USAGE_V1
         | HELD_OWNED_MERGED_CHANGES_DESCENDING_V2
         | HELD_OWNED_MERGED_CHANGES_V4
+        | HELD_TABLE_PUBLICATION_SEQUENCE_V1
         | HELD_OWNED_CHANGES_V3
         | READ_HELD_UNIQUE_V1
         | READ_HELD_UNIQUE_WINDOW_V1
@@ -64,7 +65,7 @@ fn fresh_replica_action(action: &str) -> bool {
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_TABLE_PUBLICATION_SEQUENCE_V1, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
         use rtdb_storage::audience_work;
         if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
             return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
@@ -82,7 +83,7 @@ impl Service {
                             Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS))
                         }
                     },
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V6 =>
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V6 =>
                         Some(self.audience_read_work(&call, &action.r#type, &action.body)?),
                     _ => None,
                 })
@@ -100,7 +101,7 @@ impl Service {
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
                     PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V5 | CONFIRM_APPLIED_HOSTED_V6 => {}
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 => {
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V2 => {
                         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
                         let attachment = attachment.ok_or_else(unsupported)?;
                         self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
@@ -197,6 +198,7 @@ impl Service {
                 crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 => Ok(vec![Ok(self.held_world_region_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 => Ok(vec![Ok(self.held_owned_storage_usage_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
+                HELD_TABLE_PUBLICATION_SEQUENCE_V1 => Ok(vec![Ok(self.held_table_publication_sequence_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V4 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 => Ok(vec![Ok(self.held_expiry_candidates_action(&call, &action.body).await?)]),
                 crate::owned_actions::APPLY_HELD_EXPIRY_V1 => Ok(vec![Ok(self.apply_held_expiry_action(&call, &action.body).await?)]),
