@@ -105,6 +105,7 @@ impl Catalog {
                 rows,
                 ..
             },
+            suffix @ ..,
         ] = request.ops.as_slice()
         else {
             return Err(invalid_catalog());
@@ -116,6 +117,22 @@ impl Catalog {
             || !request.otherwise.is_empty()
         {
             return Err(invalid_catalog());
+        }
+        match suffix {
+            [] => (),
+            [Op::Put {
+                branch,
+                table,
+                rows: reverse,
+                if_absent: true,
+            }] if branch.as_str() == MAIN_BRANCH
+                && table == &incarnations()
+                && reverse.len() == 1
+                && matches!(rows[0].cells.get("database"),
+                    Some(Cell::Value(Value::Uuid(uuid))) if reverse[0].id == EntityId::Uuid(*uuid))
+                && matches!((&rows[0].id, reverse[0].cells.get("deployment")),
+                    (EntityId::String(name), Some(Cell::Value(Value::Utf8(owner)))) if name == owner) => (),
+            _ => return Err(invalid_catalog()),
         }
         self.database.lock().await.transact(request).await
     }
@@ -174,7 +191,7 @@ impl Catalog {
         let selected = read(&mut control)
             .await?
             .remove(name)
-            .ok_or_else(invalid_catalog)?;
+            .ok_or_else(conflict)?;
         check_identity(selected, database)
     }
 
@@ -632,7 +649,7 @@ async fn write(
             [b"erased".as_slice(), &confirmed.0.to_be_bytes()].concat()
         }
     };
-    let request = Transact {
+    let mut request = Transact {
         key: identity(&phase, database, name).as_bytes().to_vec(),
         require: Vec::new(),
         window: Window::default(),
@@ -661,6 +678,37 @@ async fn write(
         custody_request_digest: None,
         request_memory: None,
     };
+    if expect == Version::Absent {
+        // A second name could be admitted on another peer after its catalog
+        // read. Reserve both identities in the same ordered decision.
+        let id = EntityId::Uuid(*database.as_bytes());
+        request.key = identity(&[b"claim-incarnation/".as_slice(), &phase].concat(), database, name)
+            .as_bytes()
+            .to_vec();
+        request.guards.push(Guard::Version {
+            branch: MAIN_BRANCH.into(),
+            table: incarnations(),
+            id: id.clone(),
+            valid_at: None,
+            expect: Version::Absent,
+        });
+        request.ops.push(Op::Put {
+            branch: MAIN_BRANCH.into(),
+            table: incarnations(),
+            rows: vec![Row {
+                id,
+                valid: None,
+                custody_group: None,
+                protected_columns: Vec::new(),
+                custody_payload: None,
+                cells: StructFields::from([(
+                    "deployment".into(),
+                    Cell::Value(Value::Utf8(name.into())),
+                )]),
+            }],
+            if_absent: true,
+        });
+    }
     let receipt = if let Some(peer) = &catalog.peer
         && let Some(receipt) = peer.forward_catalog(catalog.incarnation, &request).await?
     {
@@ -701,6 +749,10 @@ fn table() -> TableRef {
     TableRef::new("public", "deployments")
 }
 
+fn incarnations() -> TableRef {
+    TableRef::new("public", "deployment_incarnations")
+}
+
 fn check_identity(entry: Deployment, database: Uuid) -> Result<Deployment> {
     if entry.database == database {
         Ok(entry)
@@ -709,7 +761,7 @@ fn check_identity(entry: Deployment, database: Uuid) -> Result<Deployment> {
     }
 }
 
-fn conflict() -> Anomaly {
+pub(super) fn conflict() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Conflict,
         "rtdb/multi-catalog-conflict",

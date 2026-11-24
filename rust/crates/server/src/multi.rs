@@ -266,13 +266,19 @@ impl MultiRuntime {
         Box::new(move |native| Arc::new(ServingResources { native, runtime }))
     }
 
-    async fn provision(&self, name: &str) -> Result<DatabaseConfig> {
+    async fn provision(&self, name: &str, expected: Option<Uuid>) -> Result<(DatabaseConfig, Uuid)> {
         validate_deployment_name(name)?;
-        let id = self
-            .bootstrap
-            .get(name)
-            .copied()
+        let bootstrap = self.bootstrap.get(name).copied();
+        let registered = self.catalog.read().await?.get(name).map(|entry| entry.database);
+        let id = expected
+            .or(bootstrap)
+            .or(registered)
             .unwrap_or_else(|| self.catalog.deployment_id(name));
+        if bootstrap.is_some_and(|configured| configured != id)
+            || self.bootstrap.iter().any(|(owner, configured)| owner != name && *configured == id)
+        {
+            return Err(catalog::conflict());
+        }
         let selected = self.catalog.reserve(name, id).await?;
         match selected.status {
             Status::Reserved | Status::Ready => (),
@@ -285,7 +291,7 @@ impl MultiRuntime {
         if selected.status == Status::Reserved {
             self.catalog.mark_ready(name, id).await?;
         }
-        Ok(self.configuration.clone())
+        Ok((self.configuration.clone(), id))
     }
 
     async fn export(
@@ -1020,8 +1026,8 @@ struct ServingResources {
 
 #[async_trait::async_trait]
 impl ResourceFactory for ServingResources {
-    async fn provision_managed_database(&self, name: &str) -> Result<DatabaseConfig> {
-        self.runtime.provision(name).await
+    async fn provision_managed_database(&self, name: &str, expected: Option<Uuid>) -> Result<(DatabaseConfig, Uuid)> {
+        self.runtime.provision(name, expected).await
     }
 
     async fn export_managed_database(
@@ -1336,7 +1342,7 @@ mod tests {
                     && matches!(
                         action,
                         DeploymentAdminAction::Create {
-                            deployment: "reports"
+                            deployment: "reports" | "duplicate"
                         } | DeploymentAdminAction::Export { deployment: "xtdb" }
                             | DeploymentAdminAction::Restore {
                                 source: "xtdb",
@@ -1445,18 +1451,40 @@ mod tests {
                 let rejected = admin
                     .create(CreateDeploymentRequest {
                         deployment: "another".into(),
+                        incarnation: None,
                     })
                     .await
                     .unwrap_err();
                 assert_eq!(rejected.category, AnomalyCategory::Forbidden);
+                let incarnation = Uuid::from_u128(0x7f_a7);
                 let create = CreateDeploymentRequest {
                     deployment: "reports".into(),
+                    incarnation: Some(incarnation.as_bytes().to_vec()),
                 };
+                let first = admin.create(create.clone()).await.unwrap();
+                assert_eq!(first.deployment, "reports");
+                assert_eq!(first.incarnation, *incarnation.as_bytes());
+                assert_eq!(admin.create(create).await.unwrap(), first);
                 assert_eq!(
-                    admin.create(create.clone()).await.unwrap().deployment,
-                    "reports"
+                    admin.create(CreateDeploymentRequest {
+                        deployment: "reports".into(),
+                        incarnation: None,
+                    }).await.unwrap(),
+                    first,
                 );
-                assert_eq!(admin.create(create).await.unwrap().deployment, "reports");
+                for request in [
+                    CreateDeploymentRequest {
+                        deployment: "reports".into(),
+                        incarnation: Some(vec![2; 16]),
+                    },
+                    CreateDeploymentRequest {
+                        deployment: "duplicate".into(),
+                        incarnation: Some(incarnation.as_bytes().to_vec()),
+                    },
+                ] {
+                    let error = admin.create(request).await.unwrap_err();
+                    assert_eq!(error.category, AnomalyCategory::Conflict);
+                }
                 let receipt = driver
                     .transact(
                         Transact {

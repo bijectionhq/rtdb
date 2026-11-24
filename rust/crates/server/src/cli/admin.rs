@@ -72,6 +72,7 @@ impl AdminOptions {
         let operation = match (verb.as_str(), args.as_slice()) {
             ("create", [deployment]) => Operation::Create(proto::CreateDeploymentRequest {
                 deployment: (*deployment).into(),
+                incarnation: None,
             }),
             ("delete", [deployment]) => Operation::Delete(proto::DeleteDeploymentRequest {
                 deployment: (*deployment).into(),

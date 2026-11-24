@@ -103,14 +103,16 @@ impl Service {
                         },
                     )
                     .map_err(error::anomaly)?;
-                self.0
+                let expected = request.incarnation.as_deref().map(deployment_incarnation).transpose()?;
+                let incarnation = self.0
                     .node
-                    .create_managed_deployment(request.deployment.clone())
+                    .create_managed_deployment(request.deployment.clone(), expected)
                     .await
                     .map_err(error::anomaly)?;
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: None,
+                    incarnation: incarnation.as_bytes().to_vec(),
                 }
                 .encode_to_vec())
             }
@@ -240,6 +242,7 @@ impl Service {
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: Some(basis_wire(basis)),
+                    incarnation: Vec::new(),
                 }
                 .encode_to_vec())
             }
@@ -317,6 +320,7 @@ impl Service {
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: Some(basis_wire(basis)),
+                    incarnation: Vec::new(),
                 }
                 .encode_to_vec())
             }
@@ -353,4 +357,11 @@ fn pin(bytes: &[u8]) -> Result<Uuid, Status> {
         .ok()
         .filter(|pin| !pin.is_nil())
         .ok_or_else(|| error::incorrect("A nonzero checkpoint pin ID is required"))
+}
+
+fn deployment_incarnation(bytes: &[u8]) -> Result<Uuid, Status> {
+    Uuid::from_slice(bytes)
+        .ok()
+        .filter(|incarnation| !incarnation.is_nil())
+        .ok_or_else(|| error::incorrect("A nonzero deployment incarnation UUID is required"))
 }

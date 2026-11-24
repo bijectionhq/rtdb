@@ -158,7 +158,7 @@ pub enum DeploymentTransfer {
 pub trait ResourceFactory: Send + Sync {
     fn supports_default_local_restore(&self) -> bool { false }
     /// Provisions or recovers an ordered registration before the node attaches it.
-    async fn provision_managed_database(&self, _name: &str) -> Result<DatabaseConfig> {
+    async fn provision_managed_database(&self, _name: &str, _expected: Option<uuid::Uuid>) -> Result<(DatabaseConfig, uuid::Uuid)> {
         Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
     }
 

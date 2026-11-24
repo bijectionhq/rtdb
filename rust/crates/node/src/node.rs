@@ -1202,14 +1202,20 @@ impl Node {
         result.await.map_err(|_| closed())?
     }
     /// Creates or reopens a database through the deployment host's durable registration.
-    pub async fn create_managed_deployment(&self, name: String) -> Result<()> {
+    pub async fn create_managed_deployment(&self, name: String, expected: Option<uuid::Uuid>) -> Result<uuid::Uuid> {
         self.ensure_open()?;
         if !self.catalog.is_managed() {
             return Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"));
         }
-        let configuration = self.factory.resources.provision_managed_database(&name).await?;
+        let (configuration, incarnation) = self.factory.resources.provision_managed_database(&name, expected).await?;
         let database = self.database_or_attach(name, configuration).await?.ok_or_else(closed)?;
-        self.catalog.with_current_attachment(&database, || Ok(()))
+        self.catalog.with_current_attachment(&database, || {
+            if database.serving_driver().is_some_and(|driver| driver.incarnation() == *incarnation.as_bytes()) {
+                Ok(incarnation)
+            } else {
+                Err(Anomaly::fault("rtdb/deployment-incarnation", "The attachment differs from the ordered deployment registration"))
+            }
+        })
     }
 
     /// Returns an export ordered by the managed source deployment's writer.

@@ -11,10 +11,16 @@ service Admin {
   rpc ExportCheckpoint(ExportCheckpointRequest) returns (CheckpointExport);
   rpc RestoreDeployment(RestoreDeploymentRequest) returns (Deployment);
 }
-message CreateDeploymentRequest { string deployment = 1; }
+message CreateDeploymentRequest {
+  string deployment = 1;
+  // The owner's 16-byte nonzero UUID. When omitted, use the catalog identity.
+  optional bytes incarnation = 2;
+}
 message Deployment {
   string deployment = 1;
   rtdb.v1.Basis basis = 2;
+  // The attached database incarnation confirmed by CreateDeployment.
+  bytes incarnation = 3;
 }
 message DeleteDeploymentRequest { string deployment = 1; }
 message ErasureProof { string deployment = 1; bytes proof = 2; sint64 unreadable_by_micros = 3; }
