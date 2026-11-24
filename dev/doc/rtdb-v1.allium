@@ -51,6 +51,14 @@ surface StatelessDatabase {
         -- Each issuer's verified subject and grant retain their receipt identity across the corresponding single-provider and combined profiles.
         -- The assignment issuer and configured Original authority point supply the ordered peer profile.
 
+    @guarantee IndependentScopedAudienceIssuer
+        -- The combined native Multi listener can enroll a third dedicated HTTPS origin and private roots for audience credentials.
+        -- A reserved prefix selects this origin before token exchange and is disjoint from both workload prefixes.
+        -- The audience issuer supplies an expiring label scope bound to the exact database name and incarnation with read labels and an empty write set.
+        -- Audience calls use the verified scoped route and retain the same projected coordinates and receipt identity.
+        -- Protected proof capture requires a separate positive grant in the label scope.
+        -- Release and disposal use the separately authenticated Original custody authority.
+
     @guarantee ManagedWorkloadAssignment
         -- A bounded issuer grant authorizes one exact operation on the Original incarnation.
         -- The deployment owner configures the original main-branch authority point.

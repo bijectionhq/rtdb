@@ -24,14 +24,7 @@ impl WorkloadIssuerConfig {
         issuer_ca_pem: String,
         grants: WorkloadGrantConfig,
     ) -> Result<Self> {
-        if !oidc::workload_issuer_url(&issuer_url)
-            || issuer_ca_pem.trim().is_empty()
-            || issuer_ca_pem.len() > 64 * 1024
-        {
-            return Err(invalid(
-                "Managed workload issuers require an HTTPS issuer URL and a private CA bundle up to 64 KiB",
-            ));
-        }
+        validate_issuer(&issuer_url, &issuer_ca_pem)?;
         Ok(Self {
             issuer_url,
             issuer_ca_pem,
@@ -48,9 +41,40 @@ impl WorkloadIssuerConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct ScopedAudienceIssuerConfig {
+    issuer_url: Url,
+    issuer_ca_pem: String,
+    client_id_prefix: String,
+}
+
+impl ScopedAudienceIssuerConfig {
+    pub fn new(issuer_url: Url, issuer_ca_pem: String, client_id_prefix: String) -> Result<Self> {
+        validate_issuer(&issuer_url, &issuer_ca_pem)?;
+        if !workload_grant::valid_client_id_prefix(&client_id_prefix) {
+            return Err(invalid(
+                "The scoped audience issuer requires a bounded client ID prefix",
+            ));
+        }
+        Ok(Self {
+            issuer_url,
+            issuer_ca_pem,
+            client_id_prefix,
+        })
+    }
+
+    pub fn issuer_url(&self) -> &Url {
+        &self.issuer_url
+    }
+    pub fn client_id_prefix(&self) -> &str {
+        &self.client_id_prefix
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ManagedWorkloadOidcConfig {
     create: WorkloadIssuerConfig,
     assignment: WorkloadIssuerConfig,
+    scoped_audience: Option<ScopedAudienceIssuerConfig>,
 }
 
 impl ManagedWorkloadOidcConfig {
@@ -62,9 +86,7 @@ impl ManagedWorkloadOidcConfig {
         }
         let create_prefix = create.grants.client_id_prefix();
         let assignment_prefix = assignment.grants.client_id_prefix();
-        if create_prefix.starts_with(assignment_prefix)
-            || assignment_prefix.starts_with(create_prefix)
-        {
+        if prefixes_overlap(create_prefix, assignment_prefix) {
             return Err(invalid(
                 "Create and assignment client ID prefixes must be disjoint",
             ));
@@ -74,7 +96,28 @@ impl ManagedWorkloadOidcConfig {
                 "Only the assignment issuer requires the configured Original authority point",
             ));
         }
-        Ok(Self { create, assignment })
+        Ok(Self {
+            create,
+            assignment,
+            scoped_audience: None,
+        })
+    }
+
+    pub fn with_scoped_audience(mut self, scope: ScopedAudienceIssuerConfig) -> Result<Self> {
+        for workload in [&self.create, &self.assignment] {
+            if scope.issuer_url.origin() == workload.issuer_url.origin() {
+                return Err(invalid(
+                    "The scoped audience issuer requires a distinct HTTPS origin",
+                ));
+            }
+            if prefixes_overlap(&scope.client_id_prefix, workload.grants.client_id_prefix()) {
+                return Err(invalid(
+                    "The scoped audience and workload client ID prefixes must be disjoint",
+                ));
+            }
+        }
+        self.scoped_audience = Some(scope);
+        Ok(self)
     }
 
     pub fn create(&self) -> &WorkloadIssuerConfig {
@@ -83,11 +126,15 @@ impl ManagedWorkloadOidcConfig {
     pub fn assignment(&self) -> &WorkloadIssuerConfig {
         &self.assignment
     }
+    pub fn scoped_audience(&self) -> Option<&ScopedAudienceIssuerConfig> {
+        self.scoped_audience.as_ref()
+    }
 }
 
 pub(crate) struct ManagedWorkloadOidc {
     create: Arc<oidc::Provider>,
     assignment: Arc<oidc::Provider>,
+    scoped_audience: Option<Arc<oidc::Provider>>,
 }
 
 impl ManagedWorkloadOidc {
@@ -98,31 +145,39 @@ impl ManagedWorkloadOidc {
         timeout: Duration,
         maximum_response_bytes: usize,
     ) -> Result<Self> {
-        let transport = |issuer: &WorkloadIssuerConfig| {
-            NativeHttp::with_issuer_ca(
+        let transport = |_: &Url, ca: &str| -> Result<Arc<dyn HttpTransport>> {
+            Ok(Arc::new(NativeHttp::with_issuer_ca(
                 Arc::clone(&memory),
                 timeout,
                 maximum_response_bytes,
-                Some(&issuer.issuer_ca_pem),
-            )
-            .map(Arc::new)
+                Some(ca),
+            )?))
         };
-        let create_http = transport(&config.create)?;
-        let assignment_http = transport(&config.assignment)?;
-        Self::discover(config, memory, clock, create_http, assignment_http).await
+        Self::discover(config, &memory, clock, transport).await
     }
 
     async fn discover(
         config: ManagedWorkloadOidcConfig,
-        memory: Arc<MemoryBudget>,
+        memory: &Arc<MemoryBudget>,
         clock: Arc<dyn Clock>,
-        create_http: Arc<dyn HttpTransport>,
-        assignment_http: Arc<dyn HttpTransport>,
+        transport: impl Fn(&Url, &str) -> Result<Arc<dyn HttpTransport>>,
     ) -> Result<Self> {
+        let create_http = transport(&config.create.issuer_url, &config.create.issuer_ca_pem)?;
+        let assignment_http = transport(
+            &config.assignment.issuer_url,
+            &config.assignment.issuer_ca_pem,
+        )?;
+        let scoped = config
+            .scoped_audience
+            .map(|scope| {
+                let http = transport(&scope.issuer_url, &scope.issuer_ca_pem)?;
+                Ok::<_, Anomaly>((scope, http))
+            })
+            .transpose()?;
         let create = oidc::Provider::open_workload(
             config.create.issuer_url,
             config.create.grants,
-            Arc::clone(&memory),
+            Arc::clone(memory),
             Arc::clone(&clock),
             create_http,
         )
@@ -130,21 +185,42 @@ impl ManagedWorkloadOidc {
         let assignment = oidc::Provider::open_workload(
             config.assignment.issuer_url,
             config.assignment.grants,
-            memory,
-            clock,
+            Arc::clone(memory),
+            Arc::clone(&clock),
             assignment_http,
         )
         .await?;
-        Ok(Self { create, assignment })
+        let scoped_audience = match scoped {
+            Some((scope, http)) => Some(
+                oidc::Provider::open_scoped_audience(
+                    scope.issuer_url,
+                    scope.client_id_prefix,
+                    Arc::clone(memory),
+                    clock,
+                    http,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            create,
+            assignment,
+            scoped_audience,
+        })
     }
 
     pub async fn verify(&self, id: &str, secret: &str) -> Result<Arc<Principal>> {
         let (provider, permits): (_, fn(&VerifiedWorkloadGrant) -> bool) = match (
             self.create.workload_config(id),
             self.assignment.workload_config(id),
+            self.scoped_audience
+                .as_ref()
+                .filter(|provider| provider.accepts_scoped_audience(id)),
         ) {
-            (Some(_), None) => (&self.create, VerifiedWorkloadGrant::is_create),
-            (None, Some(_)) => (&self.assignment, VerifiedWorkloadGrant::is_assignment),
+            (Some(_), None, None) => (&self.create, VerifiedWorkloadGrant::is_create),
+            (None, Some(_), None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment),
+            (None, None, Some(provider)) => return provider.client_credentials(id, secret).await,
             _ => return Err(workload_grant::invalid_grant()),
         };
         let principal = provider.client_credentials(id, secret).await?;
@@ -153,6 +229,19 @@ impl ManagedWorkloadOidc {
         }
         Err(workload_grant::invalid_grant())
     }
+}
+
+fn validate_issuer(url: &Url, ca: &str) -> Result<()> {
+    if !oidc::scoped_issuer_url(url) || ca.trim().is_empty() || ca.len() > 64 * 1024 {
+        return Err(invalid(
+            "Managed OIDC issuers require an HTTPS issuer URL and a private CA bundle up to 64 KiB",
+        ));
+    }
+    Ok(())
+}
+
+fn prefixes_overlap(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 fn invalid(message: &str) -> Anomaly {
@@ -176,6 +265,7 @@ mod tests {
 
     const CREATE: &str = "https://create.example.invalid/";
     const ASSIGNMENT: &str = "https://assignment.example.invalid/";
+    const AUDIENCE: &str = "https://audience.example.invalid/";
 
     struct FixedClock;
     impl Clock for FixedClock {
@@ -189,7 +279,7 @@ mod tests {
         prefix: &'static str,
         discovery: Value,
         token_status: u16,
-        claim: Value,
+        userinfo: Value,
         requests: AtomicUsize,
         memory: Arc<MemoryBudget>,
     }
@@ -204,7 +294,7 @@ mod tests {
             Self {
                 origin,
                 prefix,
-                claim,
+                userinfo: json!({"sub": "subject", "rtdb_workload_grant": claim}),
                 memory: Arc::clone(memory),
                 token_status: 200,
                 requests: AtomicUsize::new(0),
@@ -254,10 +344,7 @@ mod tests {
                 } => {
                     assert_eq!(url.as_str(), format!("{}userinfo", self.origin));
                     assert_eq!(token.expose(), "fixture-token");
-                    (
-                        200,
-                        json!({"sub": "subject", "rtdb_workload_grant": self.claim}),
-                    )
+                    (200, self.userinfo.clone())
                 }
             };
             HttpResponse::new(status, body, &self.memory)
@@ -266,7 +353,8 @@ mod tests {
 
     fn config() -> ManagedWorkloadOidcConfig {
         let grants = |prefix: &str| WorkloadGrantConfig::new("cell".into(), prefix.into()).unwrap();
-        let point = Point::new("public.app_installation", "authority".into(), Timestamp(0)).unwrap();
+        let point =
+            Point::new("public.app_installation", "authority".into(), Timestamp(0)).unwrap();
         let issuer = |url: &str, grants| {
             WorkloadIssuerConfig::new(url.parse().unwrap(), "mock CA".into(), grants).unwrap()
         };
@@ -297,16 +385,34 @@ mod tests {
         let memory = Arc::clone(&create.memory);
         let providers = ManagedWorkloadOidc::discover(
             config(),
-            Arc::clone(&memory),
+            &memory,
             Arc::new(FixedClock),
-            create,
-            assignment,
+            transports(&create, &assignment, None),
         )
         .await
         .unwrap();
         Authenticator {
             authentication: Authentication::ManagedWorkloadOidc(providers),
             memory,
+        }
+    }
+
+    fn transports<'a>(
+        create: &'a Arc<Issuer>,
+        assignment: &'a Arc<Issuer>,
+        audience: Option<&'a Arc<Issuer>>,
+    ) -> impl Fn(&Url, &str) -> Result<Arc<dyn HttpTransport>> + 'a {
+        move |issuer, ca| {
+            let transport = match issuer.as_str() {
+                CREATE => create,
+                ASSIGNMENT => assignment,
+                AUDIENCE => {
+                    assert_eq!(ca, "audience CA");
+                    audience.expect("scoped audience transport")
+                }
+                _ => panic!("unexpected issuer"),
+            };
+            Ok(transport.clone())
         }
     }
 
@@ -461,10 +567,9 @@ mod tests {
             let assignment = Arc::new(Issuer::new(ASSIGNMENT, "assignment-", claim(true), &memory));
             let result = ManagedWorkloadOidc::discover(
                 config(),
-                Arc::clone(&memory),
+                &memory,
                 Arc::new(FixedClock),
-                create.clone(),
-                assignment.clone(),
+                transports(&create, &assignment, None),
             )
             .await;
             assert_eq!(
@@ -472,6 +577,105 @@ mod tests {
                 "xtdb.authn/oidc-discovery-failed"
             );
             assert_eq!((create.requests(), assignment.requests()), (1, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_audience_only_accepts_an_expiring_label_reader_from_its_own_issuer() {
+        let memory = MemoryBudget::new(8 << 20);
+        let incarnation = [7; 16];
+        let scope = json!({"database":"db", "incarnation":incarnation, "read":[[6]], "write":[], "protected_reads":true});
+        let create = Arc::new(Issuer::new(CREATE, "create-", claim(false), &memory));
+        let mut assignment = Issuer::new(ASSIGNMENT, "assignment-", claim(true), &memory);
+        assignment.userinfo = json!({"sub":"subject", "rtdb_label_scope":scope});
+        let assignment = Arc::new(assignment);
+        let mut writing = scope.clone();
+        writing["write"] = json!([[6]]);
+        for (userinfo, allowed) in [
+            (json!({"sub":"subject", "rtdb_label_scope":scope}), true),
+            (json!({"sub":"subject"}), false),
+            (json!({"sub":"subject", "rtdb_label_scope":writing}), false),
+            (
+                json!({"sub":"subject", "rtdb_workload_grant":claim(true)}),
+                false,
+            ),
+            (
+                json!({"sub":"subject", "rtdb_label_scope":scope, "rtdb_workload_grant":null}),
+                false,
+            ),
+        ] {
+            let mut audience = Issuer::new(AUDIENCE, "audience-", Value::Null, &memory);
+            audience.userinfo = userinfo;
+            let audience = Arc::new(audience);
+            let config = config()
+                .with_scoped_audience(
+                    ScopedAudienceIssuerConfig::new(
+                        AUDIENCE.parse().unwrap(),
+                        "audience CA".into(),
+                        "audience-".into(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let providers = ManagedWorkloadOidc::discover(
+                config,
+                &memory,
+                Arc::new(FixedClock),
+                transports(&create, &assignment, Some(&audience)),
+            )
+            .await
+            .unwrap();
+            let before = (create.requests(), assignment.requests());
+            let result = providers.verify("audience-client", "fixture").await;
+            assert_eq!((create.requests(), assignment.requests()), before);
+            assert_eq!(audience.requests(), 3);
+            if allowed {
+                let principal = result.unwrap();
+                let scope = principal.label_scope().unwrap();
+                scope.admit("db", incarnation).unwrap();
+                assert!(scope.admit("other", incarnation).is_err());
+                assert!(scope.admit("db", [8; 16]).is_err());
+                assert!(scope.permits_protected_reads());
+                assert!(principal.workload_grant().is_none());
+                assert!(principal.revalidate(Timestamp(1_000_000)).await.is_err());
+                assert!(
+                    principal
+                        .authorize_database("db", rtdb_node::DatabaseAccess::Write)
+                        .is_err()
+                );
+                assert!(
+                    providers
+                        .verify("assignment-client", "fixture")
+                        .await
+                        .is_err()
+                );
+                assert_eq!(audience.requests(), 3);
+                let legacy = Authenticator::open(
+                    AuthConfig::OpenIdConnect(OidcConfig {
+                        issuer_url: AUDIENCE.parse().unwrap(),
+                        issuer_ca_pem: None,
+                        client_id: "service-client".into(),
+                        client_secret: Secret::new("unused"),
+                        rules: vec![MethodRule::any(Method::ClientCredentials)],
+                        workload_grants: None,
+                    }),
+                    Arc::clone(&memory),
+                    Arc::new(FixedClock),
+                    audience,
+                )
+                .await
+                .unwrap();
+                let previous = legacy
+                    .verify_client_credentials("audience-client", "fixture")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    scope.receipt_namespace(),
+                    previous.label_scope().unwrap().receipt_namespace()
+                );
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 }

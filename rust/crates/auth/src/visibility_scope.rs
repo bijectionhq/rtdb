@@ -4,6 +4,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::LabelScop
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+pub(super) const CLAIM: &str = "rtdb_label_scope";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeClaim {
@@ -115,7 +117,7 @@ impl VerifiedLabelScope {
     }
 }
 
-fn invalid_scope() -> Anomaly {
+pub(super) fn invalid_scope() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Forbidden,
         "rtdb.auth/label-scope",

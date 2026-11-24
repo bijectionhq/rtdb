@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use rtdb_auth::{AddressBlock, AuthConfig, GrantedAccess, ManagedWorkloadOidcConfig, Method, MethodRule, OidcConfig, PasswordHash, Secret, WorkloadGrantConfig, WorkloadIssuerConfig};
+use rtdb_auth::{AddressBlock, AuthConfig, GrantedAccess, ManagedWorkloadOidcConfig, Method, MethodRule, OidcConfig, PasswordHash, ScopedAudienceIssuerConfig, Secret, WorkloadGrantConfig, WorkloadIssuerConfig};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
 use rtdb_tx::transact::workload::Point;
 use rtdb_types::{Anomaly, Result, Timestamp};
@@ -59,7 +59,17 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
         "!ManagedWorkloadOidc" => {
             let create = workload_issuer(fields.require("create")?, "authn.create", false)?;
             let assignment = workload_issuer(fields.require("assignment")?, "authn.assignment", true)?;
-            AuthConfig::ManagedWorkloadOidc(Box::new(ManagedWorkloadOidcConfig::new(create, assignment)?))
+            let mut config = ManagedWorkloadOidcConfig::new(create, assignment)?;
+            if let Some(scope) = fields.take("scopedAudience") {
+                let mut scope = YamlFields::new(scope, "authn.scopedAudience")?;
+                let issuer = scope.required_string("issuerUrl")?.parse()
+                    .map_err(|_| invalid("issuerUrl must be an absolute URL"))?;
+                config = config.with_scoped_audience(ScopedAudienceIssuerConfig::new(
+                    issuer, scope.required_string("issuerCaCertificate")?, scope.required_string("clientIdPrefix")?,
+                )?)?;
+                scope.finish()?;
+            }
+            AuthConfig::ManagedWorkloadOidc(Box::new(config))
         }
         _ => return Err(invalid(format!("Unknown authentication configuration tag '{tag}'"))),
     };

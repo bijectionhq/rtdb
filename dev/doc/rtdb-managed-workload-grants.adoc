@@ -63,6 +63,34 @@ The authority point is on `main` and is configured by the operator.
 Only the assignment settings supply the ordered assignment peer profile.
 Grant renewal and selection of the combined configuration preserve the receipt namespace when the issuer, audience, subject, grant ID, database and incarnation are unchanged.
 
+=== Scoped audience access on the same Multi listener
+
+Add an optional `scopedAudience` block under the same `!ManagedWorkloadOidc` tag.
+
+[source,yaml]
+----
+  scopedAudience:
+    issuerUrl: https://audience-oidc.example.invalid/
+    issuerCaCertificate: !Env RTDB_AUDIENCE_OIDC_ISSUER_CA_PEM
+    clientIdPrefix: rtdb-audience-
+----
+
+Enroll a dedicated HTTPS issuer origin and OIDC server CA for this RTDB service.
+The audience prefix must be disjoint from both workload prefixes, and the discovery issuer and endpoints are checked against the selected origin.
+RTDB sends the existing Flight `Client` credential only to the selected provider.
+The audience issuer returns `sub` and the existing `rtdb_label_scope` object in UserInfo under a token with a positive lifetime.
+Issue the exact database name and UUID with the admitted read labels and an empty `write` set.
+Missing scopes, workload claims, mixed claims and write labels fail audience authentication.
+The verified read labels and incarnation determine the projected coordinates.
+The receipt namespace retains the existing issuer, subject, database and label inputs.
+For local Multi development, supply a literal loopback HTTPS origin for each enrolled issuer.
+
+With the Bijection scoped reader, mount the issuer's `client_id` and `client_secret` in its private `scoped_flight_credentials` directory as `<incarnation UUID>.json` and use the same private Multi Flight origin.
+Bijection's reader verifies the expected projected namespace for its commissioned public label.
+Private proof capture uses the explicit `protected_reads` field when the scoped custody capability is enabled.
+The checked Original custody owner provides independent authentication for resolving proofs and controlling release, disposal and drain.
+See link:rtdb-custody-release-handoff.md#scoped-v1-reads-and-exact-holds[scoped custody evidence] for the action boundary.
+
 === Single-provider and fixed qualification profiles
 
 Continue using a single `!OpenIdConnect` provider for the existing separate OIDC qualification and `!UserList` for fixed per-database qualification.

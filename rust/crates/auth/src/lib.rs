@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use http::{HttpRequest, HttpResponse, HttpTransport, NativeHttp};
-pub use managed_workload_oidc::{ManagedWorkloadOidcConfig, WorkloadIssuerConfig};
+pub use managed_workload_oidc::{ManagedWorkloadOidcConfig, ScopedAudienceIssuerConfig, WorkloadIssuerConfig};
 pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
 pub use visibility_scope::VerifiedLabelScope;

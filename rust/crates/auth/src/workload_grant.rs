@@ -17,13 +17,7 @@ pub struct WorkloadGrantConfig {
 
 impl WorkloadGrantConfig {
     pub fn new(audience: String, client_id_prefix: String) -> Result<Self> {
-        if !valid_identity(&audience)
-            || client_id_prefix.is_empty()
-            || client_id_prefix.len() > 128
-            || !client_id_prefix
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() && byte != b':')
-        {
+        if !valid_identity(&audience) || !valid_client_id_prefix(&client_id_prefix) {
             return Err(Anomaly::incorrect(
                 "rtdb.auth/workload-grant-config",
                 "Workload grants require a bounded audience and a nonempty client ID prefix",
@@ -59,6 +53,11 @@ impl WorkloadGrantConfig {
     pub fn client_id_prefix(&self) -> &str {
         &self.client_id_prefix
     }
+}
+
+pub(super) fn valid_client_id_prefix(prefix: &str) -> bool {
+    (1..=128).contains(&prefix.len())
+        && prefix.bytes().all(|byte| byte.is_ascii_graphic() && byte != b':')
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]

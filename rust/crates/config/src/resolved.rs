@@ -23,11 +23,21 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
             }
             authentication
         }
-        AuthConfig::ManagedWorkloadOidc(config) => json!({
-            "kind": "managed-workload-oidc",
-            "create": describe_workload_issuer(config.create(), "authn.create.issuerUrl", report),
-            "assignment": describe_workload_issuer(config.assignment(), "authn.assignment.issuerUrl", report),
-        }),
+        AuthConfig::ManagedWorkloadOidc(config) => {
+            let mut authentication = json!({
+                "kind": "managed-workload-oidc",
+                "create": describe_workload_issuer(config.create(), "authn.create.issuerUrl", report),
+                "assignment": describe_workload_issuer(config.assignment(), "authn.assignment.issuerUrl", report),
+            });
+            if let Some(scope) = config.scoped_audience() {
+                authentication["scoped_audience"] = json!({
+                    "issuer": endpoint(scope.issuer_url().as_str(), "authn.scopedAudience.issuerUrl", report),
+                    "issuer_ca_configured": true,
+                    "client_id_prefix": scope.client_id_prefix(),
+                });
+            }
+            authentication
+        }
     });
     for (name, remote) in &config.remotes {
         let path = format!("remotes.{name}");

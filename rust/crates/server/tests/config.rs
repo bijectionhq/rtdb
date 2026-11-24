@@ -22,6 +22,32 @@ authn: !ManagedWorkloadOidc
       validAtMicros: 0
 "#;
 
+const SCOPED_AUDIENCE_ISSUER: &str = r#"  scopedAudience:
+    issuerUrl: https://audience.example.invalid/
+    issuerCaCertificate: audience fixture CA
+    clientIdPrefix: audience-
+"#;
+
+#[test]
+fn managed_workload_oidc_enrolls_an_independent_scoped_audience_issuer() {
+    let yaml = format!("{MANAGED_WORKLOAD_OIDC}{SCOPED_AUDIENCE_ISSUER}");
+    let AuthConfig::ManagedWorkloadOidc(auth) = decode(&yaml).unwrap().auth else { panic!("expected managed workload OIDC"); };
+    let audience = auth.scoped_audience().unwrap();
+    assert_eq!(audience.issuer_url().as_str(), "https://audience.example.invalid/");
+    assert_eq!(audience.client_id_prefix(), "audience-");
+
+    for invalid in [
+        yaml.replace("clientIdPrefix: audience-", "clientIdPrefix: create-scope-"),
+        yaml.replace("clientIdPrefix: audience-", "clientIdPrefix: assignment"),
+        yaml.replace("clientIdPrefix: audience-", "clientIdPrefix: bad:scope"),
+        yaml.replace("https://audience.example.invalid/", "https://CREATE.example.invalid:443/scope"),
+        yaml.replace("https://audience.example.invalid/", "http://audience.example.invalid/"),
+        yaml.replace("    issuerCaCertificate: audience fixture CA\n", ""),
+    ] {
+        assert!(decode(&invalid).is_err());
+    }
+}
+
 #[test]
 fn managed_workload_oidc_has_disjoint_issuer_enrollments_and_one_authority_point() {
     let config = decode(MANAGED_WORKLOAD_OIDC).unwrap();

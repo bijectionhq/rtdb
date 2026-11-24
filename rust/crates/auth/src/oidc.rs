@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, HttpTransport, MethodRule, Principal, Scope, Secret, VerifiedLabelScope, VerifiedWorkloadGrant, WorkloadGrantConfig, forbidden, workload_grant};
+use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, HttpTransport, MethodRule, Principal, Scope, Secret, VerifiedLabelScope, VerifiedWorkloadGrant, WorkloadGrantConfig, forbidden, visibility_scope, workload_grant};
 
 #[derive(Clone, Debug)]
 pub struct OidcConfig {
@@ -29,10 +29,15 @@ pub(crate) struct Provider {
     device_endpoint: Option<Url>,
     service_client: Option<(String, Secret)>,
     pub rules: Vec<MethodRule>,
-    workload_grants: Option<WorkloadGrantConfig>,
+    enrollment: Option<Enrollment>,
     clock: Arc<dyn Clock>,
     http: Arc<dyn HttpTransport>,
     memory: Arc<MemoryBudget>,
+}
+
+enum Enrollment {
+    Workload(WorkloadGrantConfig),
+    ScopedAudience(String),
 }
 
 struct Token {
@@ -78,7 +83,7 @@ impl Credentials {
         let next = Token::parse(&response.body, self.provider.clock.now(), old_refresh, &self.provider.memory).map_err(|_| refresh_failed(Some(response.status)))?;
         let userinfo = self.provider.userinfo(&next).await.map_err(|_| refresh_failed(None))?;
         if userinfo.status != 200 || string(&userinfo.body, "sub").ok() != Some(subject)
-            || userinfo.body.get("rtdb_label_scope").is_some()
+            || userinfo.body.get(visibility_scope::CLAIM).is_some()
             || userinfo.body.get(workload_grant::CLAIM).is_some()
         {
             return Err(refresh_failed(Some(userinfo.status)));
@@ -91,22 +96,27 @@ impl Credentials {
 impl Provider {
     pub async fn open(config: OidcConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
         Self::discover(config.issuer_url, Some((config.client_id, config.client_secret)), config.rules,
-            config.workload_grants, memory, clock, http).await
+            config.workload_grants.map(Enrollment::Workload), memory, clock, http).await
     }
 
     pub(crate) async fn open_workload(issuer: Url, grants: WorkloadGrantConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
         Self::discover(issuer, None, vec![MethodRule::any(crate::Method::ClientCredentials)],
-            Some(grants), memory, clock, http).await
+            Some(Enrollment::Workload(grants)), memory, clock, http).await
+    }
+
+    pub(crate) async fn open_scoped_audience(issuer: Url, prefix: String, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
+        Self::discover(issuer, None, vec![MethodRule::any(crate::Method::ClientCredentials)],
+            Some(Enrollment::ScopedAudience(prefix)), memory, clock, http).await
     }
 
     async fn discover(issuer: Url, service_client: Option<(String, Secret)>, rules: Vec<MethodRule>,
-        workload_grants: Option<WorkloadGrantConfig>, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>,
+        enrollment: Option<Enrollment>, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>,
         http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
-        if let Some(grants) = &workload_grants {
+        if let Some(Enrollment::Workload(grants)) = &enrollment {
             grants.validate_rules(&rules)?;
         }
-        if workload_grants.is_some() && !workload_issuer_url(&issuer) {
-            return Err(discovery_failed("Workload grants require an HTTPS issuer"));
+        if enrollment.is_some() && !scoped_issuer_url(&issuer) {
+            return Err(discovery_failed("Scoped authentication requires an HTTPS issuer"));
         }
         let discovery_url = Url::parse(&format!("{}/.well-known/openid-configuration", issuer.as_str().trim_end_matches('/')))
             .map_err(|_| discovery_failed("Invalid OIDC discovery URL"))?;
@@ -120,18 +130,18 @@ impl Provider {
         let device_endpoint = response.body.get("device_authorization_endpoint").map(|_| endpoint("device_authorization_endpoint")).transpose()?;
         let token_endpoint = endpoint("token_endpoint")?;
         let userinfo_endpoint = endpoint("userinfo_endpoint")?;
-        if workload_grants.is_some() {
+        if enrollment.is_some() {
             if endpoint("issuer")? != issuer {
-                return Err(discovery_failed("The discovery issuer does not match the configured workload issuer"));
+                return Err(discovery_failed("The discovery issuer does not match the configured scoped issuer"));
             }
             for endpoint in [&token_endpoint, &userinfo_endpoint] {
                 if !https_endpoint(endpoint) || endpoint.origin() != issuer.origin() {
-                    return Err(discovery_failed("Workload grants require issuer-origin HTTPS token and UserInfo endpoints"));
+                    return Err(discovery_failed("Scoped authentication requires issuer-origin HTTPS token and UserInfo endpoints"));
                 }
             }
         }
         Ok(Arc::new(Self { issuer, token_endpoint, userinfo_endpoint, device_endpoint,
-            service_client, rules, workload_grants, clock, http, memory }))
+            service_client, rules, enrollment, clock, http, memory }))
     }
     fn base_fields(&self) -> BTreeMap<String, Secret> {
         self.service_client.as_ref().map_or_else(BTreeMap::new, |(id, secret)| {
@@ -146,13 +156,24 @@ impl Provider {
         self.http.request(HttpRequest::Get { url: self.userinfo_endpoint.clone(), bearer: Some(token.access.clone()) }).await
     }
     pub(crate) fn workload_config(&self, client_id: &str) -> Option<&WorkloadGrantConfig> {
-        self.workload_grants.as_ref().filter(|config| client_id.starts_with(config.client_id_prefix()))
+        self.workload_grants().filter(|config| client_id.starts_with(config.client_id_prefix()))
+    }
+
+    fn workload_grants(&self) -> Option<&WorkloadGrantConfig> {
+        match self.enrollment.as_ref() {
+            Some(Enrollment::Workload(config)) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn accepts_scoped_audience(&self, client_id: &str) -> bool {
+        matches!(self.enrollment.as_ref(), Some(Enrollment::ScopedAudience(prefix)) if client_id.starts_with(prefix.as_str()))
     }
     async fn principal(self: &Arc<Self>, token: Token, grant: RefreshGrant) -> Result<Arc<Principal>> {
         let response = self.userinfo(&token).await?;
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Failed to obtain user info from {}", self.userinfo_endpoint)).with_context("status", response.status.into())); }
         let user = string(&response.body, "sub")?;
-        let labels = response.body.get("rtdb_label_scope");
+        let labels = response.body.get(visibility_scope::CLAIM);
         let workload = match &grant {
             RefreshGrant::ClientCredentials { id, .. } => self.workload_config(id),
             RefreshGrant::Password => None,
@@ -165,9 +186,15 @@ impl Provider {
                 )?))
             }
             (Some(_), _, _) | (None, Some(_), _) => return Err(workload_grant::invalid_grant()),
-            (None, None, Some(claim)) => Some(Scope::Labels(VerifiedLabelScope::from_userinfo(
-                claim, self.issuer.as_str(), user, token.expires_at, self.clock.now(),
-            )?)),
+            (None, None, Some(claim)) => {
+                let scope = VerifiedLabelScope::from_userinfo(claim, self.issuer.as_str(), user, token.expires_at, self.clock.now())?;
+                if matches!(self.enrollment, Some(Enrollment::ScopedAudience(_))) && !scope.labels().write.is_empty() {
+                    return Err(visibility_scope::invalid_scope());
+                }
+                Some(Scope::Labels(scope))
+            }
+            (None, None, None) if matches!(self.enrollment, Some(Enrollment::ScopedAudience(_))) =>
+                return Err(visibility_scope::invalid_scope()),
             (None, None, None) => None,
         };
         let bytes = user.len().checked_add(std::mem::size_of::<Principal>())
@@ -182,7 +209,7 @@ impl Provider {
     }
     pub async fn password(self: &Arc<Self>, user: &str, password: &str) -> Result<Arc<Principal>> {
         if self.service_client.is_none() || self.workload_config(user).is_some()
-            || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some())
+            || self.workload_grants().is_some_and(|config| config.assignment().is_some())
         {
             return Err(workload_grant::invalid_grant());
         }
@@ -192,8 +219,9 @@ impl Provider {
     }
     pub async fn client_credentials(self: &Arc<Self>, id: &str, secret: &str) -> Result<Arc<Principal>> {
         let workload_started = self.workload_config(id).map(|_| self.clock.now());
-        if workload_started.is_none() && (self.service_client.is_none()
-            || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()))
+        let scoped_started = self.accepts_scoped_audience(id).then(|| self.clock.now());
+        if workload_started.is_none() && scoped_started.is_none() && (self.service_client.is_none()
+            || self.workload_grants().is_some_and(|config| config.assignment().is_some()))
         {
             return Err(workload_grant::invalid_grant());
         }
@@ -207,13 +235,13 @@ impl Provider {
             }
             started
         } else {
-            self.clock.now()
+            scoped_started.unwrap_or_else(|| self.clock.now())
         };
         let reservation = self.memory.reserve(id.len().checked_add(secret.len()).and_then(|bytes| bytes.checked_add(std::mem::size_of::<RefreshGrant>())).ok_or_else(|| invalid("Client credentials are too large"))?)?;
         self.principal(Token::parse(&response.body, token_time, None, &self.memory)?, RefreshGrant::ClientCredentials { id: id.into(), secret: Secret::new(secret), _reservation: reservation }).await
     }
     pub async fn device(self: &Arc<Self>) -> Result<DeviceAuthorization> {
-        if self.service_client.is_none() || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()) {
+        if self.service_client.is_none() || self.workload_grants().is_some_and(|config| config.assignment().is_some()) {
             return Err(workload_grant::invalid_grant());
         }
         let endpoint = self.device_endpoint.as_ref().ok_or_else(|| Anomaly::unsupported("xtdb.authn/device-auth-unsupported", "OIDC provider does not support device authorization flow - missing device_authorization_endpoint"))?;
@@ -266,7 +294,7 @@ fn expires_at(body: &Value, now: Timestamp) -> Result<Option<Timestamp>> {
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.auth/invalid-response", message) }
 fn discovery_failed(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.authn/oidc-discovery-failed", message) }
-pub(crate) fn workload_issuer_url(url: &Url) -> bool { https_endpoint(url) && url.query().is_none() }
+pub(crate) fn scoped_issuer_url(url: &Url) -> bool { https_endpoint(url) && url.query().is_none() }
 fn https_endpoint(url: &Url) -> bool {
     url.scheme() == "https" && url.host_str().is_some() && url.username().is_empty()
         && url.password().is_none() && url.fragment().is_none()

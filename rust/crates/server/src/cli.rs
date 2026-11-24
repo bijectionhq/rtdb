@@ -437,12 +437,13 @@ fn load_multi_dev_authn(path: &Path, memory: &std::sync::Arc<MemoryBudget>) -> R
                 && !oidc.rules.is_empty()
                 && oidc.rules.iter().all(|rule| rule.method == Method::ClientCredentials) => Ok(parsed),
         AuthConfig::ManagedWorkloadOidc(profile)
-            if !create_principals && [profile.create(), profile.assignment()].iter().all(|issuer| {
-                match issuer.issuer_url().host() {
-                    Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                    Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                    _ => false,
-                }
+            if !create_principals && [
+                Some(profile.create().issuer_url()), Some(profile.assignment().issuer_url()),
+                profile.scoped_audience().map(|scope| scope.issuer_url()),
+            ].into_iter().flatten().all(|issuer| match issuer.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
             }) => Ok(parsed),
         AuthConfig::UserList { users, rules, grants }
             if !users.is_empty() && !rules.is_empty()
