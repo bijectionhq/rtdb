@@ -30,10 +30,35 @@ An assigned follower and a restored attachment dependent on another custody auth
 ### Native reviewed placement backed by an Original assertion family
 
 The reviewed producer and the Original-vault bridge have independent admission.
-The bridge is a trusted in-process API, `NativeFamilyLanding::from_placed_original`.
-It requires the authenticated placed Original session, its exact directory writer, the existing assertion vault and a live native `MountedResponseRelease` on the same deployment.
-The stock Flight listeners have no cross-process bridge mount.
-The existing scoped successor grant and Original reader/controller checks still govern the retired Original Flight action.
+The planned steady-state Flight action is `rtdb.v1.OriginalFamilyLanding` and advertises `row-custody.original-family-landing` on the authenticated Original attachment after the native family authority is installed.
+The reviewed producer can continue to advertise `transact.custody-reviewed-placement` independently.
+The planned action and capability are currently gated.
+
+`NativeFamilyLanding::from_placed_original` is the compatibility mount for an existing placed Original.
+It binds the authenticated placed session, its exact directory writer, the existing assertion vault and a live native `MountedResponseRelease` on the same deployment.
+The existing scoped successor grant and distinct reader and controller credentials continue to govern that compatibility route.
+The native Original mount takes its authority from the installed v1 attachment, the current writer receipt and a positively bound family vault identity.
+It has no directory dependency.
+
+#### Native Original mount inputs
+
+- Provide a stable family vault namespace, stage ownership and assertion line identity bound to the exact native database incarnation and mounted Original writer.
+  Install the family provider under the existing authenticated custody owner and preserve that binding through restart and handoff.
+- Enroll the family member and capability durably, then confirm the exact original native occurrence against its keyed writing receipt.
+  Supply authenticated authorship and slot evidence for the original and winning rewrite, including the physical authoring branch when it differs from the review branch.
+- Reuse `MountedResponseRelease` for the current writer, exact reviewed source and acceptance evidence, live group and native response and checkpoint-copy drain.
+  The independent family reservation pins both stage identities before either can be sealed.
+  Acceptance recovery by key confirms the exact applied placement, branch drop and paired application witnesses before activating the family binding.
+- Supply a keyed, ordered Original family close with the exact elected writer, family, native group and family inventory.
+  Include enrolled and pending stages in the close inventory.
+  The family vault serializes closure with reservation, activation and admission.
+  The native group revocation provides the separate outer occurrence fence.
+- Install Original family release registration, promotion, cutoff and positive disposition under the generic custody surface.
+  Opening requires the exact active family binding, a live mounted occurrence and the promoted Original family hold.
+  Sending requires the existing fresh v1 native response admission for the exact part.
+  Settlement requires the Original family release and checkpoint-copy terminals and the native group release and checkpoint-copy drain for their exact fences.
+
+#### Reservation and acceptance
 
 1. Reserve the Original family member and the winning native occurrence through the bridge before sealing either stage.
    Use the destination and link stage UUIDs for the native placement and link IDs.
@@ -53,7 +78,6 @@ The existing scoped successor grant and Original reader/controller checks still 
 5. After both fences, record the exact native group drain, which requires positive response and checkpoint-copy closure.
    The Original stage settlement still requires positive Original release and checkpoint-copy closure.
    Existing Original fence inventory includes the capabilities of a reservation whose activation never completes.
-
 
 Protected exports remain subject to the managed checkpoint custody agreement.
 The existing hosted assertion-family route continues to own its current consumers.
