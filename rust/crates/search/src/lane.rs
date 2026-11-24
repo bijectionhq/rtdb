@@ -308,7 +308,7 @@ impl ArtefactBuilder for SearchBuilder {
                 match self.runtime.tree_file(&self.storage, &key, &locator, &columns, &identity, definition.version, true).await {
                     Ok(file) if file.verify().await.is_ok() => {
                         self.runtime.clear(&suspect);
-                        return record(crate::file::encode_tree_stats(&file.sections()?, &locator)?, locator.length);
+                        return record(crate::file::encode_tree_stats(&file.sections()?, locator.encode())?, locator.length);
                     }
                     Err(crate::runtime::FileError::Unavailable(error)) => return Err(error),
                     Err(crate::runtime::FileError::Missing) => {}
@@ -402,8 +402,8 @@ impl ArtefactBuilder for SearchBuilder {
             match format {
                 crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION | crate::file::LOGICAL_FORMAT_VERSION => {
                     let canonical = uuid_iids.is_some_and(|proof| proof.load(Ordering::Relaxed));
-                    let locator = crate::file::TreeLocator::read(&mut file, format)?.with_uuid_iid_evidence(canonical);
-                    crate::file::encode_tree_stats(&sections, &locator)
+                    let locator = crate::file::EncodedTreeLocator::read(&mut file, format, canonical)?;
+                    crate::file::encode_tree_stats(&sections, locator.text)
                 }
                 crate::file::FORMAT_VERSION => crate::file::encode_catalog_stats(&sections, Some(&crate::file::FooterLocator::read(&mut file)?)),
                 crate::file::TANTIVY_FORMAT_VERSION => Ok(crate::file::encode_tantivy_stats(&sections)),
