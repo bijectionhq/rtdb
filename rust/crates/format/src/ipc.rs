@@ -1319,13 +1319,18 @@ impl RowStreamEncoder {
 /// Encodes a standard Arrow stream, retaining the caller's alignment and end-marker convention.
 /// The caller reserves schema translation and encoding scratch, and retains the returned bytes' allocation charge.
 pub fn write_arrow_stream(schema: &Schema, pages: &[RecordBatch], options: IpcWriteOptions) -> Result<Vec<u8>> {
+    write_prefixed_arrow_stream(schema, pages, options, &[])
+}
+
+/// Encodes the IPC stream into the same allocation as its transport prefix.
+pub fn write_prefixed_arrow_stream(schema: &Schema, pages: &[RecordBatch], options: IpcWriteOptions, prefix: &[u8]) -> Result<Vec<u8>> {
     let decimal_schema = crate::ipc_decimal::DecimalSchema::new(schema)?;
     for page in pages { decimal_schema.validate_batch(page)?; }
-    let mut writer = StreamWriter::try_new_with_options(Vec::new(), &decimal_schema.wire, options).map_err(invalid)?;
+    let mut writer = StreamWriter::try_new_with_options(prefix.to_vec(), &decimal_schema.wire, options).map_err(invalid)?;
     for page in pages { writer.write(page).map_err(invalid)?; }
     writer.finish().map_err(invalid)?;
     let mut bytes = writer.into_inner().map_err(invalid)?;
-    patch_schema_frame(&mut bytes, &decimal_schema)?;
+    patch_schema_frame(&mut bytes[prefix.len()..], &decimal_schema)?;
     Ok(bytes)
 }
 
