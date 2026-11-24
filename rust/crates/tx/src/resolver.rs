@@ -27,6 +27,7 @@ mod prepared_landing;
 mod prepared_landing_basis;
 pub(crate) use prepared_landing::{PreparedLanding, is_landing as is_prepared_landing};
 mod constraint_receipt;
+mod resolution_candidate;
 mod control_order;
 mod schedule_order;
 mod retry;
@@ -549,14 +550,18 @@ impl TxResolver {
             outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
         }
-        let result = match outcome {
-            Ok(()) => TransactionResult::Committed { tx_key: key },
+        let candidate = resolution_candidate::resolve_candidate(tx, prepared_writes, outcome);
+        let (mut tx, prepared_writes, result) = match candidate {
+            Ok((original, writes)) => (original, writes, TransactionResult::Committed { tx_key: key }),
             Err(error) if error.is_caller_error() => {
                 if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
-                drop(tx);
-                tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+                let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
                 tx.decision = decision;
-                TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }
+                let result = TransactionResult::Aborted {
+                    tx_key: key,
+                    error: Some(crate::RetainedAnomaly::new(error, &context.memory)?),
+                };
+                (tx, None, result)
             }
             Err(error) => return Err(error),
         };
