@@ -15,6 +15,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration}
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
+use crate::actions::SelectionEncoder;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -2116,6 +2117,10 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], time: PointTime) -> Result<ActionResult, Status> {
+        self.held_owned_point(call, body, time, false, None).await
+    }
+
+    pub(crate) async fn held_owned_point(&self, call: &Call, body: &[u8], time: PointTime, compact: bool, selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -2124,12 +2129,12 @@ impl Service {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, id, valid, _identity) = point_request(call, request, time)?;
+        let (relation, id, valid, _identity) = selected_point_request(call, request, time, compact)?;
         if call.session.audience_source().is_some() {
             require_audience_point(&call.session, &relation, &id, held.audience_projection_work.is_none())?;
         }
         let fixed = matches!(time, PointTime::Required);
-        self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held))).await
+        self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held)), selection).await
     }
 
     pub(crate) async fn held_owned_absent_keys_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
@@ -2184,30 +2189,38 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_historical_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.held_owned_historical_point(call, body, None).await
+    }
+
+    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &[u8], selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned historical point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned historical point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = point_request(call, request, PointTime::Optional)?;
+        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Optional, selection.is_some())?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None).await?;
+        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, selection).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
     pub(crate) async fn held_owned_position_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.held_owned_position_point(call, body, None).await
+    }
+
+    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &[u8], selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned position point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let (mask, request) = split_position_mask(request)?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
+        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Required, selection.is_some())?;
         let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
         let cursor = held.snapshot.open_historical_position_point(&relation, &id, system, valid, mask).await.map_err(status)?;
-        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None).await?;
+        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, selection).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2229,7 +2242,7 @@ impl Service {
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Root cut point has no valid instant"))?;
         let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
-        let reply = self.finish_owned_point(call, system_time, valid, &id, cursor, None).await?;
+        let reply = self.finish_owned_point(call, system_time, valid, &id, cursor, None, None).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2286,7 +2299,7 @@ impl Service {
                 return Err(history_invalid());
             }
             last = interval.upper();
-            let reply = self.world_point_reply_with_extent(call, point, interval.lower(), None, Some(interval))?;
+            let reply = self.world_point_reply_with_extent(call, point, interval.lower(), None, Some(interval), None)?;
             bytes = wire::add(bytes, reply.encoded_len())?;
             if bytes > self.0.config.maximum_message_bytes {
                 return Err(Status::resource_exhausted("World version exceeds the Flight response limit"));
@@ -2327,7 +2340,7 @@ impl Service {
         let mut replies = Vec::with_capacity(2);
         for before in [true, false] {
             let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(call.memory(), group, valid, &id, cursor, None, Some(&columns), None, |_| Ok(None)).await?;
+            let reply = self.finish_owned_point_inner(call.memory(), group, valid, &id, cursor, None, Some(&columns), None, None, |_| Ok(None)).await?;
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -2336,6 +2349,12 @@ impl Service {
 
     pub(crate) async fn held_owned_valid_during_action(
         &self, call: &Call, body: &[u8], mode: ValidHistoryMode,
+    ) -> Result<ActionResult, Status> {
+        self.held_owned_valid_during(call, body, mode, false).await
+    }
+
+    pub(crate) async fn held_owned_valid_during(
+        &self, call: &Call, body: &[u8], mode: ValidHistoryMode, compact: bool,
     ) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
@@ -2353,19 +2372,30 @@ impl Service {
         } else {
             (None, request)
         };
-        let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = request_batch(call, arrow_bytes)?;
-        let batch = batch.batch();
-        if batch.num_columns() != 4 || batch.num_rows() != 1 {
-            return Err(invalid("Owned history requires one row with _id, a system cut and two valid endpoints"));
-        }
-        let (id, _identity) = point_identity(call, batch)?;
-        let from = history_request_endpoint(batch, "valid_from_micros")?;
-        let to = history_request_endpoint(batch, "valid_to_micros")?;
-        let valid = Interval::new(from, to).map_err(status)?;
-        if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
+        let (relation, request) = split_relation(request)?;
+        let (id, _identity, system, valid) = if compact {
+            let (system, request) = selection_time(request)?;
+            let (from, request) = selection_time(request)?;
+            let (to, request) = selection_time(request)?;
+            let (id, identity) = selection_identity(call, request)?;
+            let valid = Interval::new(from, to).map_err(status)?;
+            if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
+            (id, identity, system, valid)
+        } else {
+            let batch = request_batch(call, request)?;
+            let batch = batch.batch();
+            if batch.num_columns() != 4 || batch.num_rows() != 1 {
+                return Err(invalid("Owned history requires one row with _id, a system cut and two valid endpoints"));
+            }
+            let (id, identity) = point_identity(call, batch)?;
+            let from = history_request_endpoint(batch, "valid_from_micros")?;
+            let to = history_request_endpoint(batch, "valid_to_micros")?;
+            let valid = Interval::new(from, to).map_err(status)?;
+            if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
+            let system = history_request_endpoint(batch, "system_micros")?;
+            (id, identity, system, valid)
+        };
 
-        let system = history_request_endpoint(batch, "system_micros")?;
         let history = match mask {
             Some(mask) => held.snapshot.open_historical_position_valid_during(&relation, &id, valid, system, mask).await,
             None if matches!(mode, ValidHistoryMode::Region) =>
@@ -4012,13 +4042,17 @@ impl Service {
     }
 
     pub(crate) async fn held_world_point_at_action(&self, call: &Call, body: &[u8], parent: bool) -> Result<ActionResult, Status> {
+        self.held_world_point_at(call, body, parent, None).await
+    }
+
+    pub(crate) async fn held_world_point_at(&self, call: &Call, body: &[u8], parent: bool, selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
-        let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, selection.is_some())?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
         let point = if parent {
             held.snapshot.parent_point_at(&relation, &id, valid, system).await
@@ -4028,17 +4062,21 @@ impl Service {
         if point.present != system || point.witness.is_some() || point.until.is_some() {
             return Err(history_invalid());
         }
-        let response = self.world_point_reply(call, point, valid, None)?;
+        let response = self.world_point_reply_with_extent(call, point, valid, None, None, selection)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(response)
     }
 
     pub(crate) async fn held_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.held_world_point(call, body, None).await
+    }
+
+    pub(crate) async fn held_world_point(&self, call: &Call, body: &[u8], selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
-        let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, selection.is_some())?;
         let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
@@ -4052,7 +4090,7 @@ impl Service {
         let until = result.until;
         let absent = result.row.is_none() && !result.shadowed;
         let nonce = result.witness.take().map(|evidence| held.remember(call, evidence, absent)).transpose()?;
-        let reply = self.world_point_reply(call, result, valid_at, nonce)?;
+        let reply = self.world_point_reply_with_extent(call, result, valid_at, nonce, None, selection)?;
         if matches!(*mode, 2 | 3 | 4) {
             held.snapshot.check_parent_point(&relation, until).map_err(status)?;
         } else {
@@ -4192,12 +4230,13 @@ impl Service {
     }
 
     fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>) -> Result<ActionResult, Status> {
-        self.world_point_reply_with_extent(call, result, valid_at, nonce, None)
+        self.world_point_reply_with_extent(call, result, valid_at, nonce, None, None)
     }
 
     fn world_point_reply_with_extent(
         &self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>,
         extent: Option<rtdb_types::Interval>,
+        selection: Option<&mut SelectionEncoder>,
     ) -> Result<ActionResult, Status> {
         let mut metadata = std::collections::HashMap::from([
             ("rtdb.owned.world_shadowed".into(), u8::from(result.shadowed).to_string()),
@@ -4230,9 +4269,9 @@ impl Service {
             }
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
-            self.owned_point_reply_until(&schema, Some(&batch), result.present, valid_at, Some(revision), result.until)
+            self.owned_point_reply_in(self.memory(), &schema, Some(&batch), result.present, valid_at, Some(revision), result.until, selection)
         } else {
-            self.owned_point_reply(&Schema::empty().with_metadata(metadata), None, result.present, valid_at, None)
+            self.owned_point_reply_in(self.memory(), &Schema::empty().with_metadata(metadata), None, result.present, valid_at, None, None, selection)
         }
     }
 
@@ -4952,12 +4991,12 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
-        self.execute_owned_point(&snapshot, &relation, &id, None, false, None).await
+        self.execute_owned_point(&snapshot, &relation, &id, None, false, None, None).await
     }
 
     async fn execute_owned_point(
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
-        fixed: bool, origin: Option<(&Call, &OwnedReadResource)>,
+        fixed: bool, origin: Option<(&Call, &OwnedReadResource)>, selection: Option<&mut SelectionEncoder>,
     ) -> Result<ActionResult, Status> {
         let present = snapshot.system_time();
         let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
@@ -4988,24 +5027,25 @@ impl Service {
             && relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION
             && origin.is_some_and(|(call, _)| call.session.audience_source().is_none()))
             .then_some(snapshot);
-        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, witness).await?;
+        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, selection, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
-    async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
-        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, None, |_| Ok(None)).await
+    async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>, selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
+        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, None, selection, |_| Ok(None)).await
     }
 
     async fn finish_owned_point_inner(
         &self, memory: &Arc<MemoryBudget>, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
         lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
         attempt: Option<&OwnedReadSession>,
+        selection: Option<&mut SelectionEncoder>,
         witness: impl FnOnce(Option<Timestamp>) -> Result<Option<Uuid>, Status>,
     ) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
             let schema = with_point_witness(&Schema::empty(), witness(None)?);
-            return self.owned_point_reply_in(memory, &schema, None, present, valid, None, None);
+            return self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, selection);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -5054,7 +5094,7 @@ impl Service {
                 }
                 schema = schema.with_metadata(metadata);
             }
-            let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until)?;
+            let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until, selection)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
             }
@@ -5063,7 +5103,7 @@ impl Service {
             let schema = if path_columns.is_some() { wire::OwnedSchema::empty(memory)? }
                 else { wire::plan_schema(cursor.runtime_schema(), memory)? };
             let schema = with_point_witness(&schema, witness(None)?);
-            self.owned_point_reply_in(memory, &schema, None, present, valid, None, None)
+            self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, selection)
         }
     }
 
@@ -5072,12 +5112,13 @@ impl Service {
     }
 
     fn owned_point_reply_until(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>) -> Result<ActionResult, Status> {
-        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, until)
+        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, until, None)
     }
 
     fn owned_point_reply_in(
         &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
         present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
+        selection: Option<&mut SelectionEncoder>,
     ) -> Result<ActionResult, Status> {
         let _metadata = memory.reserve(wire::schema_bound(schema)?).map_err(status)?;
         let mut metadata = schema.metadata().clone();
@@ -5113,6 +5154,12 @@ impl Service {
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))
             .transpose().map_err(arrow)?;
+        let maximum = self.0.config.maximum_message_bytes.min(crate::config::AUDIENCE_REPLY_BYTES);
+        if let Some(selection) = selection
+            && let Some(reply) = selection.point(memory, &schema, batch.as_ref(), maximum)?
+        {
+            return Ok(reply);
+        }
         self.owned_stream_reply_in(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default())
     }
 
@@ -5147,6 +5194,30 @@ fn with_point_witness(schema: &Schema, nonce: Option<Uuid>) -> Schema {
 
 #[derive(Clone, Copy)]
 pub(crate) enum PointTime { Default, Optional, Required }
+
+fn selection_time(request: &[u8]) -> Result<(Timestamp, &[u8]), Status> {
+    let (time, rest) = request.split_first_chunk::<8>()
+        .ok_or_else(|| invalid("Truncated held selection time"))?;
+    Ok((Timestamp(i64::from_be_bytes(*time)), rest))
+}
+
+fn selection_identity(call: &Call, request: &[u8]) -> Result<(EntityId, Arc<MemoryReservation>), Status> {
+    let id = std::str::from_utf8(request).map_err(arrow)?;
+    let reservation = call.reserve(wire::add(4096, id.len())?)?;
+    Ok((EntityId::String(id.to_owned()), reservation))
+}
+
+fn selected_point_request(
+    call: &Call, body: &[u8], time: PointTime, compact: bool,
+) -> Result<(OwnedRelation, EntityId, Option<Timestamp>, Arc<MemoryReservation>), Status> {
+    if !compact {
+        return point_request(call, body, time);
+    }
+    let (relation, request) = split_relation(body)?;
+    let (valid, request) = selection_time(request)?;
+    let (id, reservation) = selection_identity(call, request)?;
+    Ok((relation, id, Some(valid), reservation))
+}
 
 fn point_request(
     call: &Call, body: &[u8], time: PointTime,

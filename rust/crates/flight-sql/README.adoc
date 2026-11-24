@@ -393,6 +393,24 @@ The first refusal terminates the stream with its scalar status, and dropping the
 Fresh replica sessions admit the same Root selectors as their scalar actions.
 Prepared audience sessions retain their scalar allowances.
 
+`rtdb.owned.ReadSelection.v1` uses the same count and length framing for up to 256 entries and a 2 MiB request.
+Point selectors 0 through 6 retain their action's binary cut prefix and relation name, followed by a signed big-endian valid instant and the UTF-8 identity to the end of the entry.
+Selector 8 carries the held timeline window as handle, length-prefixed relation, big-endian system time, lower and upper valid endpoints, and the UTF-8 identity.
+The owner acknowledges with `x-rtdb-owned-selection: v1` and uses the same per-entry order, authorization, decision coordinates and first-refusal behavior.
+Window replies use the scalar Arrow IPC stream.
+Compatible point replies begin with ASCII `P`, a one-byte schema change flag, and a big-endian u32 count of key/value metadata entries.
+Each metadata key and value is length-prefixed with a big-endian u32.
+A changed schema adds a length-prefixed Arrow IPC schema frame without schema metadata.
+The rest is one Arrow IPC record batch frame for a present point or empty for an absent point.
+Unchanged schemas reuse the last compatible schema in the action.
+Other point replies retain their scalar Arrow IPC envelope.
+
+`rtdb.owned.ReadAudiencePoints.v1` is available on reserved audience sessions and acknowledges with `x-rtdb-audience-points: v1`.
+It accepts two to four selector-zero entries carrying their complete `ReadHeldPoint.v2` request bodies within the reserved transport request bound.
+Each entry independently spends its original action and decode allowances, confirms its reserved route, and runs the scalar projection and delivery checks.
+Each result stays within the original reserved reply limit and uses the same compatible point framing.
+
+
 Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.
 Close success has zero Flight results.
 

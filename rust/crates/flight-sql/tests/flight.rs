@@ -2120,7 +2120,8 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
     running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     database.build_artefacts().await.unwrap();
 
-    let hold = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap()[0].body.slice(..16);
+    let opened = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap().remove(0).body;
+    let hold = opened.slice(..16);
     let point_prefix = [hold.as_ref(), relation].concat();
     let point = |id| request(&point_prefix, vec![
         ("_id", Arc::new(Int64Array::from(vec![id]))),
@@ -2148,6 +2149,22 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
     assert_eq!(stream.message().await.unwrap().unwrap().body, scalar_present);
     let failure = stream.message().await.unwrap_err();
     assert_eq!((failure.code(), failure.message()), (scalar_failure.code(), scalar_failure.message()));
+
+    let missing_key = Bytes::from([point_prefix.as_slice(), &opened[16..24], b"absent"].concat());
+    let selection = "rtdb.owned.ReadSelection.v1";
+    let input = client.request(Action {
+        r#type: selection.into(),
+        body: batch(&[(0, &missing_key), (0, &unknown), (0, &missing_key)]),
+    });
+    let reply = client.client.do_action(input).await.unwrap();
+    assert_eq!(reply.metadata().get("x-rtdb-owned-selection").unwrap(), "v1");
+    let mut stream = reply.into_inner();
+    assert!(!stream.message().await.unwrap().unwrap().body.is_empty());
+    let failure = stream.message().await.unwrap_err();
+    assert_eq!((failure.code(), failure.message()), (scalar_failure.code(), scalar_failure.message()));
+
+    let refused = client.action("rtdb.owned.ReadAudiencePoints.v1", batch(&[(0, &present), (0, &missing)])).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 
     let mut foreign = Client::connect(&running.server, Some("xtdb:secret")).await;
     let failure = foreign.action(points, batch(&[(0, &present), (0, &missing)])).await.unwrap_err();

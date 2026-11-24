@@ -8,7 +8,7 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
-pub(crate) use owned_batch::{IpcFrames, OWNED_IPC_HEADER};
+pub(crate) use owned_batch::{IpcFrames, OWNED_IPC_HEADER, SelectionEncoder};
 
 use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
@@ -16,6 +16,8 @@ fn fresh_replica_action(action: &str) -> bool {
     use crate::owned_actions::*;
     matches!(action, CLOSE_SESSION
         | owned_batch::READ_POINTS
+        | owned_batch::READ_SELECTION
+        | owned_batch::READ_AUDIENCE_POINTS
         | owned_batch::READ_RANGES
         | OWNED_SPATIAL_READINESS_V1
         | OBSERVE_HELD_HOSTED_V1
@@ -74,6 +76,14 @@ fn fresh_replica_action(action: &str) -> bool {
 }
 
 impl Service {
+    async fn confirm_audience_observation(&self, call: &Call) -> Result<(), Status> {
+        let source = call.session.audience_source().ok_or_else(unsupported)?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
+        Ok(())
+    }
+
     pub async fn action(&self, call: Call, action: Action, ipc_stream: bool) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
         use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_TABLE_PUBLICATION_SEQUENCE_V1, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V3};
@@ -91,7 +101,7 @@ impl Service {
             return self.scan_catalog_action(call, action.body).await;
         }
         if let Some(batch) = owned_batch::BatchKind::for_action(&action.r#type) {
-            if call.session.audience_source().is_some() {
+            if call.session.audience_source().is_some() != batch.audience() {
                 return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
             }
             if !self.0.config.owned_native_actions {
@@ -126,16 +136,14 @@ impl Service {
         }
         let work = Box::pin(async {
             let action_type = action.r#type.as_str();
-            if let Some(source) = call.session.audience_source() {
+            if call.session.audience_source().is_some() {
                 audience_work::decode_bytes(action.encoded_len())
                     .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
                     PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V5 | CONFIRM_APPLIED_HOSTED_V6 => {}
                     HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V3 => {
-                        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-                        let attachment = attachment.ok_or_else(unsupported)?;
-                        self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
+                        self.confirm_audience_observation(&call).await?;
                     }
                     // These actions only relinquish resources under the authenticated local session.
                     CLOSE_OWNED_READ_V1 | CLOSE_SESSION => {}
