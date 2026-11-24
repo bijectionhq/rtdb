@@ -13,6 +13,8 @@ use super::*;
 mod overlay_merge;
 #[path = "held_projection.rs"]
 mod projection;
+#[path = "held_shared_columns.rs"]
+mod shared_columns;
 
 use projection::WorldProjectionCustody;
 
@@ -334,6 +336,7 @@ enum ArchiveRead {
         at: Timestamp,
         after: Option<String>,
         fetch: usize,
+        prefix: Option<String>,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_query::OwnedIdentityCandidates>>,
@@ -1707,7 +1710,7 @@ impl HeldCheckpointWorld {
             let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
             self.require_overlay_coverage(relation, &witness).await?;
             self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
-            let parent = self.archive_identity_candidates(relation, valid, after, limit + 1, None).await?;
+            let parent = self.archive_identity_candidates(relation, valid, after, limit + 1, None, None).await?;
             for key in &parent.keys {
                 let id = EntityId::String(key.clone());
                 self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
@@ -1730,7 +1733,7 @@ impl HeldCheckpointWorld {
         let schema = self.historical_parent_schema(relation)?.clone();
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
-        let candidates = self.archive_identity_candidates(relation, valid, after, limit + 1, Some((system, schema))).await?;
+        let candidates = self.archive_identity_candidates(relation, valid, after, limit + 1, Some((system, schema)), None).await?;
         for key in &candidates.keys {
             let id = EntityId::String(key.clone());
             self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
@@ -1741,10 +1744,12 @@ impl HeldCheckpointWorld {
     async fn archive_identity_candidates(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, fetch: usize,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
+        prefix: Option<&str>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Identities {
             relation: relation.clone(), at: valid, after: after.map(str::to_owned), fetch, earlier,
+            prefix: prefix.map(str::to_owned),
             guard: self.open.snapshot.relation_release_guard([relation])?, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
@@ -1779,7 +1784,7 @@ impl HeldCheckpointWorld {
                 let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
                 (page.keys, page.reservations)
             } else {
-                self.archive_identity_candidates(relation, valid, after, FETCH, None).await?.into_parts()
+                self.archive_identity_candidates(relation, valid, after, FETCH, None, None).await?.into_parts()
             };
 
             let (candidates, through) = identity_candidates(&parent, &local.keys, FETCH);
@@ -3230,7 +3235,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     send_archive_answer(&plaintext, reply, response).await;
                                 }
-                                ArchiveRead::Identities { relation, at, after, fetch, earlier, guard, mut reply } => {
+                                ArchiveRead::Identities { relation, at, after, fetch, prefix, earlier, guard, mut reply } => {
                                     let read = async {
                                         require_relation_purge_history(&context, &owner)?;
                                         let scoped = Arc::clone(&context).with_owned_read_guard(guard);
@@ -3238,8 +3243,8 @@ pub(crate) async fn open_held_checkpoint_world(
                                             let schemas = [(relation.clone(), schema)];
                                             (exact_historical_parent_context(scoped, &owner, system, &schemas).await?, system)
                                         } else { (scoped, parent_time) };
-                                        rtdb_query::owned_identity_candidates(scoped, &owner, &relation, system,
-                                            at, after.as_deref(), fetch,
+                                        rtdb_query::owned_identity_candidates_in_prefix(scoped, &owner, &relation, system,
+                                            at, after.as_deref(), fetch, prefix.as_deref(),
                                         ).await
                                     };
                                     let response = tokio::select! {
