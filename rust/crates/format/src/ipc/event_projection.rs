@@ -220,7 +220,7 @@ mod tests {
         file.project_event_payload(&["body".into()]);
 
         let block = file.pages.block(0).unwrap();
-        let encoded = read_block(file.reader.as_mut(), block).unwrap();
+        let encoded = read_block(file.reader.as_mut(), block, true).unwrap();
         let (header, body) = super::super::block_message(block, &encoded).unwrap();
         let message = arrow_ipc::root_as_message(&encoded[header]).unwrap();
         let page = file.event_projection.as_ref().unwrap().decode(&file.pages.source_schema, message, &encoded.slice(body))
