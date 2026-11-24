@@ -100,6 +100,9 @@
 --
 -- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
 -- Their tries then become garbage like any superseded trie, and the deletion rules below collect them unchanged.
+-- Directory-managed logical search staging records its writer epoch and provider region before uploading.
+-- A replacement writer can order abandonment after the originating region drains.
+-- The installed search retirement still needs the immutable provider publication and its catalog grant.
 --
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.

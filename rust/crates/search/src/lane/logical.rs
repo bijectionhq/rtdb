@@ -222,7 +222,8 @@ impl SearchBuilder {
             publication: None, rebuild: (rebuild > 0).then_some(rebuild), source_rows: Some(source_rows),
             has_erases: has_erases.then_some(true), allocation: Some(allocation.to_vec()) };
         let intent = ObjectKey::new(run.pending_key(slug)?)?;
-        self.store.put(&intent, run.pending_bytes()?.into()).await?;
+        let staged = rtdb_format::search_manifest::StagedSearchRun { run: run.clone(), owner: self.store.search_staging_owner() };
+        self.store.put(&intent, staged.encode()?.into()).await?;
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
         let key = ObjectKey::new(run.object_key(slug)?)?;
         run.publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);

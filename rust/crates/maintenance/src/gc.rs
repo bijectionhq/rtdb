@@ -225,15 +225,16 @@ impl TrieCollector {
 
     async fn collect_pending_search(&self, entry: &TableEntry, catalog: &TrieCatalog, durable: Option<BlockIndex>,
         cancellation: &CancellationToken) -> Result<()> {
-        use rtdb_format::{log::proto::SearchRun, search_manifest::{MAX_PENDING_BYTES, pending_prefix}};
+        use rtdb_format::search_manifest::{MAX_PENDING_BYTES, StagedSearchRun, pending_prefix};
         let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
         let prefix = ObjectKey::new(pending_prefix(&entry.slug))?;
         let objects = self.store.list(Some(&prefix)).await?;
-        let now = (self.clock)();
         let known = catalog.search_runs(&entry.table).chain(catalog.retired_search_runs(&entry.table).filter_map(|item| item.run.as_ref()))
             .map(|run| ObjectKey::new(run.pending_key(&entry.slug)?).map_err(Anomaly::from)).collect::<Result<BTreeSet<_>>>()?;
-        let lease = self.config.reader_lease_micros()?;
-        let waiting = {
+        let coordinated = self.store.search_staging_owner().is_some();
+        let waiting = if coordinated { objects } else {
+            let lease = self.config.reader_lease_micros()?;
+            let now = (self.clock)();
             let mut observed = self.first_pending_search.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let seen: BTreeSet<_> = objects.iter().map(|object| &object.key).collect();
             observed.retain(|(table, key), _| table != &entry.table || (seen.contains(key) && !known.contains(key)));
@@ -258,7 +259,12 @@ impl TrieCollector {
                 Err(rtdb_storage::Error::MissingObject(_)) => continue,
                 Err(error) => return Err(error.into()),
             };
-            let Ok(mut run) = SearchRun::decode_pending(&bytes) else { continue; };
+            let Ok(StagedSearchRun { mut run, owner }) = StagedSearchRun::decode(&bytes) else { continue; };
+            if let Some(owner) = owner {
+                if !self.store.search_staging_drained(owner).await? { continue; }
+            } else if coordinated {
+                continue;
+            }
             if run.pending_key(&entry.slug)? != intent.key.as_str()
                 || durable.is_none_or(|boundary| run.blocks.last().is_none_or(|last| *last > boundary.0)) {
                 continue;
@@ -266,7 +272,11 @@ impl TrieCollector {
             let body = ObjectKey::new(run.object_key(&entry.slug)?)?;
             match self.store.head_fresh(&body).await {
                 Ok(object) if object.size == run.file_size() as u64 => {}
-                Ok(_) | Err(rtdb_storage::Error::MissingObject(_)) => continue,
+                Ok(_) => continue,
+                Err(rtdb_storage::Error::MissingObject(_)) => {
+                    if owner.is_some() { self.store.delete(&intent.key).await?; }
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             }
             run.publication = self.store.retirement_publication(&body).await?.map(Into::into);

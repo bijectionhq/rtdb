@@ -228,6 +228,11 @@ pub trait ObjectStore: Send + Sync {
         self.delete(key).await?;
         Ok(())
     }
+    /// The writer registration that owns a staged search run in this residence.
+    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> { None }
+    /// Checks that the staged writer was superseded and its provider work drained.
+    async fn search_staging_drained(&self, _owner: rtdb_format::search_manifest::SearchStagingOwner)
+        -> rtdb_types::Result<bool> { Ok(false) }
     /// Whether installed search-run retirement uses the exact publication grant.
     fn releases_exact_search_runs(&self) -> bool { false }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,

@@ -385,6 +385,12 @@ impl ObjectStore for EncryptingStore {
         self.inner.settle_classic_trie(key, version).await
     }
 
+    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> {
+        self.inner.search_staging_owner()
+    }
+    async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> rtdb_types::Result<bool> {
+        self.inner.search_staging_drained(owner).await
+    }
     fn releases_exact_search_runs(&self) -> bool { self.inner.releases_exact_search_runs() }
     async fn release_search_run(
         &self,

@@ -1303,6 +1303,13 @@ impl ObjectStore for GarbageStore {
         }
         Ok(allowed.into_iter().all(|allowed| allowed))
     }
+    fn search_staging_owner(&self) -> Option<rtdb_format::search_manifest::SearchStagingOwner> {
+        self.catalog_readers.as_ref()?.search_staging_owner()
+    }
+    async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> Result<bool> {
+        let Some(readers) = &self.catalog_readers else { return Ok(false); };
+        readers.search_staging_drained(owner).await
+    }
     fn releases_exact_search_runs(&self) -> bool { self.catalog_readers.is_some() }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {

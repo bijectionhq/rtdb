@@ -33,20 +33,6 @@ impl SearchRun {
         self.blocks.iter().copied().map(BlockIndex)
     }
 
-    pub fn pending_bytes(&self) -> Result<Vec<u8>> {
-        self.validate()?;
-        if self.allocation.is_none() || self.publication.is_some() {
-            return Err(invalid("Search upload intent must name a fresh allocation"));
-        }
-        Ok(self.encode_to_vec())
-    }
-
-    pub fn decode_pending(bytes: &[u8]) -> Result<Self> {
-        let run = Self::decode(bytes).map_err(invalid)?;
-        run.pending_bytes()?;
-        Ok(run)
-    }
-
     pub fn pending_key(&self, slug: &TableSlug) -> Result<String> {
         let name = self.object_key(slug)?;
         Ok(name.replace("/search-runs/", "/search-pending/"))
@@ -60,6 +46,66 @@ impl SearchRun {
 }
 
 pub const MAX_PENDING_BYTES: usize = 40 * 1024;
+
+const STAGE_PREFIX: &[u8] = b"RTDB-search-stage\0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchStagingOwner {
+    pub region: uuid::Uuid,
+    pub writer_epoch: u64,
+}
+
+pub struct StagedSearchRun {
+    pub run: SearchRun,
+    pub owner: Option<SearchStagingOwner>,
+}
+
+impl StagedSearchRun {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Self::validate(&self.run)?;
+        let mut bytes = STAGE_PREFIX.to_vec();
+        match self.owner {
+            Some(owner) if !owner.region.is_nil() && owner.writer_epoch > 0 => {
+                bytes.push(1);
+                bytes.extend_from_slice(owner.region.as_bytes());
+                bytes.extend_from_slice(&owner.writer_epoch.to_be_bytes());
+            }
+            Some(_) => return Err(invalid("Search upload intent has invalid writer custody")),
+            None => bytes.push(0),
+        }
+        self.run.encode(&mut bytes).map_err(invalid)?;
+        if bytes.len() > MAX_PENDING_BYTES { return Err(invalid("Search upload intent exceeds its size limit")); }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let malformed = || invalid("Search upload intent has invalid writer custody");
+        if bytes.len() > MAX_PENDING_BYTES { return Err(malformed()); }
+        let (kind, bytes) = bytes.strip_prefix(STAGE_PREFIX).and_then(|rest| rest.split_first()).ok_or_else(malformed)?;
+        let (owner, bytes) = match kind {
+            0 => (None, bytes),
+            1 => {
+                let (region, bytes) = bytes.split_first_chunk::<16>().ok_or_else(malformed)?;
+                let (epoch, bytes) = bytes.split_first_chunk::<8>().ok_or_else(malformed)?;
+                let (region, writer_epoch) = (uuid::Uuid::from_bytes(*region), u64::from_be_bytes(*epoch));
+                if region.is_nil() || writer_epoch == 0 { return Err(malformed()); }
+                (Some(SearchStagingOwner { region, writer_epoch }), bytes)
+            }
+            _ => return Err(malformed()),
+        };
+        let run = SearchRun::decode(bytes).map_err(invalid)?;
+        Self::validate(&run)?;
+        Ok(Self { run, owner })
+    }
+
+    fn validate(run: &SearchRun) -> Result<()> {
+        run.validate()?;
+        if run.allocation.is_none() || run.publication.is_some() {
+            return Err(invalid("Search upload intent must name a fresh allocation"));
+        }
+        Ok(())
+    }
+}
 
 pub fn pending_prefix(slug: &TableSlug) -> String { format!("{}/search-pending", slug.table_prefix()) }
 

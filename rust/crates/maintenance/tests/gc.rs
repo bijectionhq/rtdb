@@ -846,7 +846,8 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
         ..Default::default() };
     let marker = ObjectKey::new(pending.pending_key(&entry.slug).unwrap()).unwrap();
     let body = ObjectKey::new(pending.object_key(&entry.slug).unwrap()).unwrap();
-    store.put(&marker, pending.pending_bytes().unwrap().into()).await.unwrap();
+    let staged = rtdb_format::search_manifest::StagedSearchRun { run: pending, owner: None };
+    store.put(&marker, staged.encode().unwrap().into()).await.unwrap();
     let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), abandoned: AtomicBool::new(false) });
     let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: Arc::clone(&store), commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
