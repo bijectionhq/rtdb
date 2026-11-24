@@ -8,7 +8,7 @@ use rtdb_store::{
     ObjectKey, ObjectStore, Reachability, VerifiedManifest, WriterObjects, read_manifest,
 };
 use rtdb_tx::transact::{
-    Op, Receipt, Transact, TransactPipeline, TransactState, TransactionRecord,
+    Op, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
@@ -17,7 +17,7 @@ use rtdb_types::{
 use uuid::Uuid;
 
 use crate::{
-    journal::{Entry, Stream, journal_error, next},
+    journal::{Entry, JournalBatchAppender, Stream, journal_error, next},
     placement::preferred,
     replay::{ChangeHistory, Committed},
 };
@@ -27,7 +27,7 @@ mod pipeline;
 mod rotation;
 pub use pin::PinnedExport;
 pub use pipeline::WritePipeline;
-use pipeline::{Append, Planned, interrupted, receipt_for};
+use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;
 pub use rotation::{RotationReceipt, RotationTiming};
 
@@ -53,6 +53,8 @@ struct Lease {
 struct Writer {
     lease: Lease,
     pipeline: TransactPipeline,
+    acknowledged: Lsn,
+    recovering: bool,
     rotation: Option<ArmedRotation>,
     objects: WriterObjects,
     uploaded: BTreeSet<ObjectId>,
@@ -109,6 +111,11 @@ impl MultiDatabase {
         self.stream.create().await
     }
 
+    pub fn with_batch_appender(mut self, batch: Arc<dyn JournalBatchAppender>) -> Self {
+        self.stream.batch = Some(batch);
+        self
+    }
+
     pub fn incarnation(&self) -> [u8; 16] {
         *self.options.database.as_bytes()
     }
@@ -116,12 +123,13 @@ impl MultiDatabase {
     pub fn role(&self) -> Role {
         self.writer
             .as_ref()
-            .filter(|writer| self.before(writer.lease.until))
+            .filter(|writer| !writer.recovering && self.before(writer.lease.until))
             .map_or(Role::Follower, |writer| Role::Writer(writer.lease.epoch))
     }
 
     pub async fn tick(&mut self, live_nodes: &BTreeSet<IpAddr>) -> Result<Role> {
         let selected = preferred(self.options.database, live_nodes) == Some(self.options.node);
+        self.recover_writer().await?;
         if let Err(error) = self.refresh().await {
             if selected
                 && error.code == "rtdb/journal-unavailable"
@@ -197,6 +205,8 @@ impl MultiDatabase {
             self.writer = Some(Writer {
                 lease: attempt,
                 pipeline: self.new_pipeline()?,
+                acknowledged: self.state().head,
+                recovering: false,
                 rotation: None,
                 objects: WriterObjects::new(self.options.database, attempt.epoch.0),
                 uploaded: BTreeSet::new(),
@@ -205,13 +215,18 @@ impl MultiDatabase {
                 self.withdraw_writer();
                 return Err(error);
             }
-            self.append_control(
-                attempt,
-                Record::Lease {
-                    until: attempt.until,
-                },
-            )
-            .await?;
+            if let Err(error) = self
+                .append_control(
+                    attempt,
+                    Record::Lease {
+                        until: attempt.until,
+                    },
+                )
+                .await
+            {
+                self.withdraw_writer();
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -248,40 +263,93 @@ impl MultiDatabase {
     }
 
     pub async fn transact(&mut self, request: &Transact) -> Result<Receipt> {
+        self.transact_in(request, None).await
+    }
+
+    pub async fn transact_scoped(
+        &mut self,
+        request: &Transact,
+        scope: ScopedTransact<'_>,
+    ) -> Result<Receipt> {
+        self.transact_in(request, Some(scope)).await
+    }
+
+    async fn transact_in(
+        &mut self,
+        request: &Transact,
+        scope: Option<ScopedTransact<'_>>,
+    ) -> Result<Receipt> {
+        let result = self.transact_serial(request, scope).await;
+        if result.is_err() {
+            let _ = self.recover_writer().await;
+        }
+        self.project_receipt(result?, scope)
+    }
+
+    async fn transact_serial(
+        &mut self,
+        request: &Transact,
+        scope: Option<ScopedTransact<'_>>,
+    ) -> Result<Receipt> {
         self.refresh().await?;
         reject_erasure(request)?;
-        let write = match self.decide_one(request)? {
+        let write = match self.decide_one(request, scope)? {
             Planned::Answer(receipt) => return Ok(receipt),
             Planned::Append(write) => write,
         };
-        let authority = self.append_authority(write.entry.epoch)?;
-        let completed = authority.append(&write).await;
-        let receipts = self
-            .publish_staged(authority.lease, write, completed)
-            .await?;
-        if request.window.before.is_none() || !receipts.is_empty() {
-            return receipt_for(receipts, &request.key);
+        let lease = self.authority()?;
+        let original = write.at;
+        let (upper, receipts) = self.commit_one(lease, write).await?;
+        if request.window.before.is_none() {
+            return receipt_for(receipts, original, &request.key);
         }
-        let terminal = match self.decide_terminal(authority.lease) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                self.withdraw_writer();
-                return Err(interrupted(error));
-            }
-        };
-        let completed = authority.append(&terminal).await;
-        let receipts = self
-            .publish_staged(authority.lease, terminal, completed)
-            .await?;
-        receipt_for(receipts, &request.key)
+        let (terminal, _) = self
+            .decide_terminal(lease, original, upper)
+            .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
+        let position = terminal.at;
+        let (_, receipts) = self.commit_one(lease, terminal).await?;
+        receipt_for(receipts, position, &request.key)
     }
 
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
+        self.tx_status_in(key, None).await
+    }
+
+    pub async fn tx_status_scoped(
+        &mut self,
+        key: &[u8],
+        scope: ScopedTransact<'_>,
+    ) -> Result<Receipt> {
+        self.tx_status_in(key, Some(scope)).await
+    }
+
+    async fn tx_status_in(
+        &mut self,
+        key: &[u8],
+        scope: Option<ScopedTransact<'_>>,
+    ) -> Result<Receipt> {
         self.refresh().await?;
-        if let Some(writer) = &self.writer {
-            return writer.pipeline.tx_status(key);
+        let writer = self.writer.as_ref().filter(|writer| !writer.recovering);
+        let receipt = match (writer, scope) {
+            (Some(writer), Some(scope)) => writer.pipeline.tx_status_scoped(key, scope),
+            (Some(writer), None) => writer.pipeline.tx_status(key),
+            (None, Some(scope)) => self.state().transactions.tx_status_scoped(key, scope),
+            (None, None) => self.state().transactions.tx_status(key),
+        }?;
+        self.project_receipt(receipt, scope)
+    }
+
+    fn project_receipt(
+        &self,
+        receipt: Receipt,
+        scope: Option<ScopedTransact<'_>>,
+    ) -> Result<Receipt> {
+        match scope {
+            Some(scope) => self
+                .durable_transactions()
+                .project_receipt(receipt, scope.labels),
+            None => Ok(receipt),
         }
-        self.state().transactions.tx_status(key)
     }
 
     pub async fn fresh_index(&mut self) -> Result<&BranchIndex> {
@@ -554,13 +622,13 @@ impl MultiDatabase {
         generation: u64,
         record: Record,
     ) -> Result<()> {
-        let authority = self.append_authority(lease.epoch)?;
+        self.authority()?;
         let at = Lsn(self
             .writer
             .as_mut()
             .ok_or_else(no_writer)?
             .pipeline
-            .reserve());
+            .reserve()?);
         let write = Append {
             at,
             entry: Entry {
@@ -569,8 +637,7 @@ impl MultiDatabase {
                 record,
             },
         };
-        let completed = authority.append(&write).await;
-        self.publish_staged(lease, write, completed).await?;
+        self.commit_one(lease, write).await?;
         Ok(())
     }
 
@@ -589,7 +656,11 @@ impl MultiDatabase {
     }
 
     async fn refresh(&mut self) -> Result<()> {
-        if self.role() == Role::Follower {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| !self.before(writer.lease.until))
+        {
             self.withdraw_writer();
         }
         let end = self.stream.head().await?;
@@ -627,7 +698,7 @@ impl MultiDatabase {
     fn authority(&self) -> Result<Lease> {
         self.writer
             .as_ref()
-            .filter(|writer| self.before(writer.lease.until))
+            .filter(|writer| !writer.recovering && self.before(writer.lease.until))
             .map(|writer| writer.lease)
             .ok_or_else(no_writer)
     }

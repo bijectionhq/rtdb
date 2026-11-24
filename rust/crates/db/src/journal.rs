@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{Epoch, Journal, JournalError, Lsn, StreamId};
+use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, StreamId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -10,10 +10,22 @@ use uuid::Uuid;
 const ENVELOPE_VERSION: u8 = 1;
 const PAGE_SIZE: usize = 128;
 
+/// Commits a contiguous append group through its returned head.
+/// An error may leave a committed prefix of the group.
+pub trait JournalBatchAppender: Send + Sync {
+    fn append_batch(
+        &self,
+        stream: StreamId,
+        epoch: Epoch,
+        records: Vec<(Lsn, Bytes)>,
+    ) -> BoxFuture<'_, journal_contract::Result<Lsn>>;
+}
+
 #[derive(Clone)]
 pub(crate) struct Stream {
     pub(crate) database: Uuid,
     journal: Arc<dyn Journal>,
+    pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
     pub(crate) kms: Arc<dyn Kms>,
 }
 
@@ -34,6 +46,7 @@ impl Stream {
         Self {
             database,
             journal,
+            batch: None,
             kms,
         }
     }
@@ -122,6 +135,21 @@ impl Stream {
         payload: Bytes,
     ) -> journal_contract::Result<Lsn> {
         self.journal.append(self.id(), epoch, at, payload).await
+    }
+
+    pub(crate) async fn append_group(
+        &self,
+        epoch: Epoch,
+        mut records: Vec<(Lsn, Bytes)>,
+    ) -> journal_contract::Result<Lsn> {
+        if let Some(batch) = &self.batch {
+            return batch.append_batch(self.id(), epoch, records).await;
+        }
+        if records.len() != 1 {
+            return Err(JournalError::Unavailable);
+        }
+        let (at, payload) = records.pop().expect("one record");
+        self.append(epoch, at, payload).await
     }
 }
 

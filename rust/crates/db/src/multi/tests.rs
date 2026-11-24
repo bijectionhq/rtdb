@@ -8,10 +8,12 @@ use journal_contract::{BoxFuture, FileJournal, Identity, Limits, MemoryJournal, 
 use rtdb_crypt::LocalKms;
 use rtdb_logkeeper::simulation::{Fault, FaultJournal};
 use rtdb_store::{MemoryStore, read_file};
-use rtdb_tx::transact::{Cell, Guard, Outcome, Resolution, Row, Version, Window};
+use rtdb_tx::transact::{
+    Cell, Declaration, Guard, Outcome, Resolution, Row, Version, Visibility, Window,
+};
 use rtdb_types::{
     EntityId, StructFields, TableRef, Value,
-    rtdb_v1::{At, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, LabelScope, Layer, MAIN_BRANCH},
 };
 
 use super::*;
@@ -155,13 +157,15 @@ async fn multi_driver_replacement_refuses_a_timed_tx_after_its_reply_is_lost() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(Identity(1)))));
-    let mut writer = cluster.node(1, faults.clone());
+    let gate = Arc::new(GateJournal::new(faults.clone()));
+    let mut writer = cluster.node(1, gate.clone());
     let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
     writer.create().await.unwrap();
     writer.tick(&live(1)).await.unwrap();
 
     let mut timed = put(1, 1, "pending");
     timed.window.before = Some(Timestamp(90));
+    gate.block_seal.store(true, Ordering::SeqCst);
     faults.inject(Fault::DropAppendReply);
     assert_eq!(
         writer.transact(&timed).await.unwrap_err().code,
@@ -431,9 +435,23 @@ async fn multi_driver_late_upload_cannot_reenter_reachability() {
 struct GateJournal {
     inner: Arc<dyn Journal>,
     arm: AtomicBool,
+    block_seal: AtomicBool,
     block_trim: AtomicBool,
     entered: Notify,
     release: Notify,
+}
+
+impl GateJournal {
+    fn new(inner: Arc<dyn Journal>) -> Self {
+        Self {
+            inner,
+            arm: AtomicBool::new(false),
+            block_seal: AtomicBool::new(false),
+            block_trim: AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+        }
+    }
 }
 
 impl Journal for GateJournal {
@@ -442,7 +460,11 @@ impl Journal for GateJournal {
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
-        self.inner.seal(stream, epoch)
+        if self.block_seal.load(Ordering::SeqCst) {
+            Box::pin(async { Err(JournalError::Unavailable) })
+        } else {
+            self.inner.seal(stream, epoch)
+        }
     }
 
     fn append(
@@ -508,9 +530,16 @@ async fn multi_driver_withdraws_the_staged_suffix_when_fenced() {
     exercise_pipeline(PipelineOutcome::Fenced).await;
 }
 
+#[tokio::test]
+async fn multi_driver_recovers_a_committed_append_before_resuming_after_a_lost_reply() {
+    exercise_pipeline(PipelineOutcome::LostReply).await;
+}
+
+#[derive(Clone, Copy)]
 enum PipelineOutcome {
     Commit,
     Unavailable,
+    LostReply,
     Fenced,
 }
 
@@ -518,13 +547,7 @@ async fn exercise_pipeline(outcome: PipelineOutcome) {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(Identity(1)))));
-    let gate = Arc::new(GateJournal {
-        inner: faults.clone(),
-        arm: AtomicBool::new(false),
-        block_trim: AtomicBool::new(false),
-        entered: Notify::new(),
-        release: Notify::new(),
-    });
+    let gate = Arc::new(GateJournal::new(faults.clone()));
     let mut writer = cluster.node(1, gate.clone());
     writer.create().await.unwrap();
     writer.tick(&live(1)).await.unwrap();
@@ -583,6 +606,10 @@ async fn exercise_pipeline(outcome: PipelineOutcome) {
             faults.inject(Fault::Unavailable);
             Some(("rtdb/journal-unavailable", Lsn(1)))
         }
+        PipelineOutcome::LostReply => {
+            faults.inject(Fault::DropAppendReply);
+            Some(("rtdb/journal-unavailable", Lsn(2)))
+        }
         PipelineOutcome::Fenced => {
             cluster.at(116);
             let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
@@ -596,10 +623,29 @@ async fn exercise_pipeline(outcome: PipelineOutcome) {
     gate.release.notify_one();
     let (first, second) = tokio::join!(first, second);
     if let Some((error, head)) = expected_error {
-        assert_eq!(first.unwrap_err().code, error);
+        let first = first.unwrap_err();
+        assert_eq!(first.code, error);
+        assert_eq!(first.category, AnomalyCategory::Interrupted);
         assert_eq!(second.unwrap_err().code, "rtdb/speculative-write-withdrawn");
         assert_eq!(observer.head(stream).await.unwrap(), head);
-        assert_eq!(database.lock().await.role(), Role::Follower);
+        if matches!(outcome, PipelineOutcome::Fenced) {
+            assert_eq!(database.lock().await.role(), Role::Follower);
+        } else {
+            let next = pipeline.transact(put(3, 3, "resumed")).await.unwrap();
+            assert_eq!(next.basis.position(), head.0 + 1);
+            let mut database = database.lock().await;
+            assert_eq!(database.role(), Role::Writer(Epoch(1)));
+            if matches!(outcome, PipelineOutcome::LostReply) {
+                assert_eq!(
+                    database.tx_status(&[1; 16]).await.unwrap().basis.position(),
+                    2
+                );
+            }
+            assert_eq!(
+                database.tx_status(&[2; 16]).await.unwrap_err().code,
+                "rtdb/unknown-transaction"
+            );
+        }
     } else {
         assert_eq!(first.unwrap().basis.position(), 2);
         let second = second.unwrap();
@@ -607,6 +653,213 @@ async fn exercise_pipeline(outcome: PipelineOutcome) {
         assert_eq!(second.outcome, Outcome::Then);
         assert_eq!(observer.head(stream).await.unwrap(), Lsn(3));
     }
+}
+
+#[tokio::test]
+async fn multi_driver_admits_a_dependent_write_behind_a_timed_terminal_slot() {
+    exercise_timed_suffix(false).await;
+}
+
+#[tokio::test]
+async fn multi_driver_redecides_the_unsent_suffix_after_timed_refusal() {
+    exercise_timed_suffix(true).await;
+}
+
+async fn exercise_timed_suffix(refuse: bool) {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(Identity(1)))));
+    let mut writer = cluster.node(1, gate.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let preparing = Arc::new(Notify::new());
+    writer.clock = Arc::new({
+        let preparing = preparing.clone();
+        let time = cluster.time.clone();
+        move || {
+            preparing.notify_one();
+            Timestamp(time.load(Ordering::SeqCst))
+        }
+    });
+    let database = Arc::new(Mutex::new(writer));
+    let pipeline = WritePipeline::start(database.clone());
+    gate.arm.store(true, Ordering::SeqCst);
+    let mut timed = put(1, 1, "tentative");
+    timed.window.before = Some(Timestamp(25));
+    let first = pipeline.transact(timed);
+    tokio::pin!(first);
+    tokio::select! {
+        result = &mut first => panic!("timed write returned before durability: {result:?}"),
+        reached = tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()) => reached.unwrap(),
+    }
+    preparing.notified().await;
+    let mut later = put(2, 2, "later");
+    later.guards.push(Guard::Version {
+        branch: MAIN_BRANCH.into(),
+        table: table(),
+        id: EntityId::Integer(1),
+        valid_at: None,
+        expect: Version::Absent,
+    });
+    let dependent = pipeline.transact(later);
+    tokio::pin!(dependent);
+    tokio::select! {
+        result = &mut dependent => panic!("the dependent write passed the terminal slot: {result:?}"),
+        ready = tokio::time::timeout(Duration::from_secs(2), preparing.notified()) => ready.unwrap(),
+    }
+    assert_eq!(
+        database
+            .lock()
+            .await
+            .tx_status(&[2; 16])
+            .await
+            .unwrap_err()
+            .code,
+        "rtdb/transaction-pending"
+    );
+    assert_eq!(
+        journal
+            .handle(Identity(2))
+            .head(StreamId(DATABASE.as_u128()))
+            .await
+            .unwrap(),
+        Lsn(1)
+    );
+    if refuse {
+        cluster.at(30);
+    }
+    gate.release.notify_one();
+    let (first, dependent) = tokio::join!(first, dependent);
+    let first = first.unwrap();
+    let dependent = dependent.unwrap();
+    assert_eq!((first.basis.position(), dependent.basis.position()), (3, 4));
+    if refuse {
+        assert!(matches!(first.outcome, Outcome::Refused { .. }));
+        assert_eq!(dependent.outcome, Outcome::Then);
+    } else {
+        assert_eq!(first.outcome, Outcome::Then);
+        assert_eq!(dependent.outcome, Outcome::Otherwise { failed: vec![0] });
+    }
+}
+
+struct RecordingBatch {
+    journal: Arc<dyn Journal>,
+    groups: Mutex<Vec<Vec<Lsn>>>,
+}
+
+impl JournalBatchAppender for RecordingBatch {
+    fn append_batch(
+        &self,
+        stream: StreamId,
+        epoch: Epoch,
+        records: Vec<(Lsn, Bytes)>,
+    ) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        Box::pin(async move {
+            self.groups
+                .lock()
+                .await
+                .push(records.iter().map(|(at, _)| *at).collect());
+            let mut head = Lsn(0);
+            for (at, payload) in records {
+                head = self.journal.append(stream, epoch, at, payload).await?;
+            }
+            Ok(head)
+        })
+    }
+}
+
+#[tokio::test]
+async fn multi_driver_dispatches_the_decided_batch_in_one_journal_request() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let journal: Arc<dyn Journal> = Arc::new(journal.handle(Identity(1)));
+    let batch = Arc::new(RecordingBatch {
+        journal: journal.clone(),
+        groups: Mutex::new(Vec::new()),
+    });
+    let mut database = cluster.node(1, journal).with_batch_appender(batch.clone());
+    database.create().await.unwrap();
+    database.tick(&live(1)).await.unwrap();
+    let pipeline = WritePipeline::start(Arc::new(Mutex::new(database)));
+    let (first, second) = tokio::join!(
+        pipeline.transact(put(1, 1, "first")),
+        pipeline.transact(put(2, 2, "second")),
+    );
+    assert_eq!(
+        (
+            first.unwrap().basis.position(),
+            second.unwrap().basis.position()
+        ),
+        (2, 3)
+    );
+    assert_eq!(
+        *batch.groups.lock().await,
+        vec![vec![Lsn(1)], vec![Lsn(2), Lsn(3)]]
+    );
+}
+
+#[tokio::test]
+async fn multi_driver_routes_the_same_idempotency_key_in_two_receipt_namespaces() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut database = cluster.node(1, Arc::new(journal.handle(Identity(1))));
+    database.create().await.unwrap();
+    database.tick(&live(1)).await.unwrap();
+    let declaration = request(
+        1,
+        Op::Declare {
+            table: table(),
+            change: Declaration::Visibility(Visibility {
+                column: "label".into(),
+            }),
+        },
+    );
+    assert_eq!(
+        database.transact(&declaration).await.unwrap().outcome,
+        Outcome::Then
+    );
+    let labelled = |id, value| {
+        let mut request = put(2, id, value);
+        let Op::Put { rows, .. } = &mut request.ops[0] else {
+            unreachable!()
+        };
+        rows[0]
+            .cells
+            .insert("label".into(), Cell::Value(Value::Binary(vec![1])));
+        request
+    };
+    let scope = LabelScope {
+        read: BTreeSet::from([vec![1]]),
+        write: BTreeSet::from([vec![1]]),
+    };
+    let database = Arc::new(Mutex::new(database));
+    let pipeline = WritePipeline::start(database.clone());
+    let (left, right) = tokio::join!(
+        pipeline.transact_scoped(labelled(1, "left"), scope.clone(), [7; 32]),
+        pipeline.transact_scoped(labelled(2, "right"), scope.clone(), [8; 32]),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left.outcome, Outcome::Then);
+    assert_eq!(right.outcome, Outcome::Then);
+    assert_ne!(left.basis, right.basis);
+    let mut database = database.lock().await;
+    for (namespace, receipt) in [([7; 32], left), ([8; 32], right)] {
+        let authority = ScopedTransact {
+            receipt_namespace: namespace,
+            labels: &scope,
+        };
+        let status = database
+            .tx_status_scoped(&[2; 16], authority)
+            .await
+            .unwrap();
+        assert_eq!(status.basis, receipt.basis);
+        assert!(status.replayed);
+    }
+    assert_eq!(
+        database.tx_status(&[2; 16]).await.unwrap_err().code,
+        "rtdb/unknown-transaction"
+    );
 }
 
 struct FixedRotationTime(Lsn, Timestamp);
@@ -625,13 +878,7 @@ impl RotationTiming for FixedRotationTime {
 async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
-    let gate = Arc::new(GateJournal {
-        inner: Arc::new(journal.handle(Identity(1))),
-        arm: AtomicBool::new(false),
-        block_trim: AtomicBool::new(false),
-        entered: Notify::new(),
-        release: Notify::new(),
-    });
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(Identity(1)))));
     let timing = Arc::new(FixedRotationTime(Lsn(5), Timestamp(10)));
     let mut writer = cluster
         .node(1, gate.clone())

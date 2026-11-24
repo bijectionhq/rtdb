@@ -3,6 +3,7 @@ mod multi;
 mod placement;
 mod replay;
 
+pub use journal::JournalBatchAppender;
 pub use multi::{
     MultiDatabase, MultiOptions, PinnedExport, Role, RotationReceipt, RotationTiming, WritePipeline,
 };

@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
-use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT, Transact};
+use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, Layer},
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ServingDriver,
+    QuerySource, QueryView, ServingDriver, TransactSubmission,
 };
 
 pub struct MultiServing {
@@ -95,11 +95,11 @@ impl ServingDriver for MultiServing {
 
     async fn transact(
         &self,
-        request: Transact,
+        request: TransactSubmission,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         cancellation
-            .run_until_cancelled(self.writes.transact(request))
+            .run_until_cancelled(self.writes.transact(request.transaction))
             .await
             .ok_or_else(interrupted)?
     }
@@ -334,7 +334,7 @@ mod tests {
     };
     use rtdb_storage::cache::BufferPool;
     use rtdb_store::MemoryStore;
-    use rtdb_tx::transact::{Cell, Op, Outcome, Row, Window};
+    use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact, Window};
     use rtdb_types::{
         EntityId, StructFields, Value,
         rtdb_v1::{ClaimSealer, MAIN_BRANCH},
@@ -343,29 +343,34 @@ mod tests {
 
     use super::*;
 
-    fn write(key: u8, title: &str, before: Option<Timestamp>) -> Transact {
-        Transact {
-            key: vec![key; 16],
-            require: vec![],
-            window: Window {
-                not_before: None,
-                before,
-            },
-            guards: vec![],
-            ops: vec![Op::Put {
-                branch: MAIN_BRANCH.into(),
-                table: TableRef::new("public", "notes"),
-                rows: vec![Row {
-                    id: EntityId::Integer(1),
-                    valid: None,
-                    cells: StructFields::from([(
-                        "title".into(),
-                        Cell::Value(Value::Utf8(title.into())),
-                    )]),
+    fn write(key: u8, title: &str, before: Option<Timestamp>) -> TransactSubmission {
+        TransactSubmission {
+            transaction: Transact {
+                key: vec![key; 16],
+                require: vec![],
+                window: Window {
+                    not_before: None,
+                    before,
+                },
+                guards: vec![],
+                ops: vec![Op::Put {
+                    branch: MAIN_BRANCH.into(),
+                    table: TableRef::new("public", "notes"),
+                    rows: vec![Row {
+                        id: EntityId::Integer(1),
+                        valid: None,
+                        cells: StructFields::from([(
+                            "title".into(),
+                            Cell::Value(Value::Utf8(title.into())),
+                        )]),
+                    }],
+                    if_absent: false,
                 }],
-                if_absent: false,
-            }],
-            otherwise: vec![],
+                otherwise: vec![],
+            },
+            attempt: Uuid::from_u128(u128::from(key)),
+            submitted_at: Timestamp(10),
+            source: bytes::Bytes::new(),
         }
     }
 
