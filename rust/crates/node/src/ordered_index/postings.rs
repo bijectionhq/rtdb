@@ -465,6 +465,13 @@ fn select_array(
 }
 
 fn compact_slice(array: &dyn Array, start: usize, len: usize) -> Result<Option<ArrayRef>> {
+    let data = array.to_data();
+    // Arrow reports zero capacity for external owners, including a view into an entire source file.
+    if data.buffers().iter().any(|buffer| buffer.capacity() == 0)
+        || data.nulls().is_some_and(|nulls| nulls.buffer().capacity() == 0)
+    {
+        return Ok(None);
+    }
     let slice = array.slice(start, len);
     // IPC can carry the rest of a byte through a byte-aligned bitmap slice.
     let compact_bytes = match slice.data_type() {

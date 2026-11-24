@@ -299,7 +299,6 @@ impl Changes {
         Ok(root)
     }
 
-    /// Source buffers carry the admission for backing allocations hidden by their Arrow views.
     pub fn add_batch(
         &mut self,
         batch: &EventBatch,
@@ -529,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_projection_keeps_source_admission_and_reuses_complete_address_bytes() -> Result<()>
+    fn projection_releases_unknown_source_owners_and_reuses_complete_address_bytes() -> Result<()>
     {
         use arrow_array::StringArray;
         use rtdb_types::EntityId;
@@ -579,12 +578,11 @@ mod tests {
             unreachable!()
         };
         assert_eq!(value, "one");
-        assert_eq!(value.as_ptr(), source);
+        assert_ne!(value.as_ptr(), source);
         assert_eq!(first.view().key.as_ptr(), second.view().key.as_ptr());
-        assert!(source_memory.used_bytes() > 0);
+        assert_eq!(source_memory.used_bytes(), 0);
         assert!(projection_memory.used_bytes() > 0);
         drop(changes);
-        assert_eq!(source_memory.used_bytes(), 0);
         assert_eq!(projection_memory.used_bytes(), 0);
         Ok(())
     }
