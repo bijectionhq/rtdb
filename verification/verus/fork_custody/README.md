@@ -1,6 +1,6 @@
 # R8 · Fork reservation settlement
 
-The verified functions are the two decisions used by `Server::reconcile_domain_forks` before it sends the internal `FinishFork` action.
+The verified functions are the two decisions used by `Service::reconcile_domain_forks` before it sends the internal `FinishFork` action.
 The harness imports them from the shipped replay broker.
 
 | Verus law | Lean reference in [ForkCustody](../../multi/compose/ForkCustody.lean) | Production inputs |
