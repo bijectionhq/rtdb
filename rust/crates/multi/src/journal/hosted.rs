@@ -402,6 +402,7 @@ impl Placement {
         offered: Option<(WriterAdmission, RtdbCheckpoint)>,
         serving: &crate::deployment::CellStorage,
         memory: &Arc<MemoryBudget>,
+        releases: &TaskTracker,
     ) -> Result<Option<RtdbCheckpoint>> {
         let mut inspected = self.publication.lock().await;
         let custodian = self
@@ -496,10 +497,9 @@ impl Placement {
                         Arc::clone(&io),
                     )
                     .await?;
-                    let Some(candidate) = discovery::discover(
+                    let Some(candidate) = self.checkpoint_copy(published, releases, discovery::discover(
                         self, custodian, &provider, cut, &objects, (keys.as_ref(), &io), memory,
-                    )
-                    .await?
+                    )).await?
                     else {
                         *inspected = Some(cut);
                         return Ok(None);
@@ -507,46 +507,73 @@ impl Placement {
                     candidate
                 }
             };
-            if current.preparing.is_none() {
-                let source =
-                    storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
-                        .await?;
-                let references = provider
-                    .preflight(&reservation, origin, source.as_ref())
-                    .await?;
-                custodian
-                    .prepare_checkpoint(&current, origin.ordered(reservation)?, references)
-                    .await?;
-            }
-            let origin = provider.begin(&reservation, origin).await?;
-            let staged = match provider.prepared(reservation, origin).await? {
-                Some(prepared) => prepared,
-                None => {
-                    self.validate_checkpoint_boundary(
-                        custodian,
-                        published,
-                        reservation,
-                        origin,
-                        keys,
-                        serving,
-                        &io,
-                        memory,
-                    )
-                    .await?;
+            let staged = self.checkpoint_copy(origin.base, releases, async {
+                if current.preparing.is_none() {
                     let source =
                         storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
                             .await?;
-                    provider
-                        .prepare(&reservation, origin, source.as_ref())
-                        .await?
+                    let references = provider
+                        .preflight(&reservation, origin, source.as_ref())
+                        .await?;
+                    custodian
+                        .prepare_checkpoint(&current, origin.ordered(reservation)?, references)
+                        .await?;
                 }
-            };
+                let origin = provider.begin(&reservation, origin).await?;
+                match provider.prepared(reservation, origin).await? {
+                    Some(prepared) => Ok(prepared),
+                    None => {
+                        self.validate_checkpoint_boundary(
+                            custodian,
+                            published,
+                            reservation,
+                            origin,
+                            keys,
+                            serving,
+                            &io,
+                            memory,
+                        )
+                        .await?;
+                        let source =
+                            storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
+                                .await?;
+                        provider
+                            .prepare(&reservation, origin, source.as_ref())
+                            .await
+                    }
+                }
+            }).await?;
             let authority = custodian.route().await?;
             provider.publish(custodian, &authority, staged).await?;
             if requested.is_none_or(|(_, _, next)| staged.cut.next_lsn >= next) {
                 return Ok(Some(origin.checkpoint));
             }
         }
+    }
+
+    /// A copy uses the same durable checkpoint hold as serving reads.
+    /// Provider tasks also inherit the hold when cancellation drops their caller.
+    async fn checkpoint_copy<T>(
+        &self,
+        checkpoint: Checkpoint,
+        releases: &TaskTracker,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let route = self.worker.route().await?;
+        let request = self.worker.request(&route, Command::ProtectCheckpoint {
+            root: checkpoint.root,
+            from: checkpoint.cut.next_lsn,
+            through: checkpoint.cut.next_lsn,
+        })?;
+        let held = Held::acquire(&self.worker, request, releases).await?;
+        if held.scope().checkpoint != checkpoint {
+            return Err(invalid("The ordered copy hold selected a different checkpoint"));
+        }
+        let start = std::time::Instant::now();
+        let length = self.worker.read_lease(held.scope(), route.writer.epoch).await?;
+        let deadline = start.checked_add(std::time::Duration::from_millis(length))
+            .ok_or_else(|| invalid("The checkpoint copy lease overflows the custody clock"))?;
+        storage::with_read_lease(deadline, |_| IoRegion::retaining(held, work)).await
     }
 
     async fn validate_checkpoint_boundary(

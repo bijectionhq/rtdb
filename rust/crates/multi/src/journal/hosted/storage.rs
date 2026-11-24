@@ -580,6 +580,10 @@ where
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    async fn catalog_delivery_lease(&self) -> Result<Option<Arc<ReadLease>>> {
+        Ok(self.serving_deadline().await?.map(|deadline| Arc::new(ReadLease::until(deadline))))
+    }
+
     async fn open_log_snapshot(
         &self, authority: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<Arc<dyn ObjectStore>> {

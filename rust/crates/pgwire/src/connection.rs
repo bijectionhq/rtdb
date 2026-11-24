@@ -59,9 +59,19 @@ impl ConnectionDriver {
         });
         let outcome = loop {
             if self.draining.is_cancelled() && !protocol.extended() { break Ok(()); }
+            let expire = protocol.portal_deadline();
             let frame = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => break Ok(()),
+                _ = async {
+                    match expire {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    protocol.expire_portals(std::time::Instant::now());
+                    continue;
+                },
                 _ = self.draining.cancelled(), if !protocol.extended() => break Ok(()),
                 frame = receiver.recv() => match frame { Some(frame) => frame, None => break Ok(()) },
             };

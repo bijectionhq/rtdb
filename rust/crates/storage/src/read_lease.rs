@@ -37,6 +37,9 @@ impl ReadLease {
         }
     }
 
+    /// The provider's original monotonic cutoff, if this lease carries one.
+    pub fn provider_cutoff(&self) -> Option<Instant> { self.provider }
+
     /// The catalog's cutoff in the node's clock coordinates.
     pub fn deadline(&self) -> Option<i64> {
         self.catalog.as_ref().and_then(|catalog| catalog.deadline)

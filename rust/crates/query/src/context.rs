@@ -410,6 +410,11 @@ impl QueryContext {
         Ok(grant)
     }
 
+    /// An idle transport must release buffered results and their ordered catalog hold by this cutoff.
+    pub fn retention_deadline(&self) -> Option<std::time::Instant> {
+        self.catalog.read_lease().and_then(|lease| lease.provider_cutoff())
+    }
+
     pub fn check_cancelled(&self) -> Result<()> {
         if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { return Err(cancelled()); }
         if let Some(guard) = &self.catalog.owned_read_guard { guard()?; }

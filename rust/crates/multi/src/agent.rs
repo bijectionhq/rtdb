@@ -857,7 +857,7 @@ impl NodeAgent {
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
                 placement.publish_checkpoint(&self.keys, Some((admission, checkpoint)),
-                    &self.options.storage, self.node.memory()).await?.ok_or_else(||
+                    &self.options.storage, self.node.memory(), &self.ordered_releases).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
             return Ok(Response::Flushed { checkpoint });
@@ -1777,7 +1777,7 @@ impl NodeAgent {
             let _ = placement.dispose_withdrawn_workers().await;
             let _ = placement.retain_selected().await;
             let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),
-                &self.options.storage, self.node.memory());
+                &self.options.storage, self.node.memory(), &self.ordered_releases);
             if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
                 let _ = placement.retain_selected().await;
             }

@@ -112,6 +112,10 @@ fn read_only() -> Error { Error::Closed("An exact snapshot store is read-only".i
 
 #[async_trait]
 impl ObjectStore for SnapshotStore {
+    async fn catalog_delivery_lease(&self) -> Result<Option<Arc<ReadLease>>> {
+        Ok(Some(Arc::new(ReadLease::until(self.scope.serving().await?))))
+    }
+
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.scope.serving().await?;
         Ok(Some(Arc::clone(&self.files) as Arc<dyn Send + Sync>))

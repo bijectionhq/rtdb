@@ -533,7 +533,7 @@ impl Node {
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let database_lease = match cut {
-                CatalogReadCut::HostedApplied { .. } => None,
+                CatalogReadCut::HostedApplied { .. } => database.object_store().catalog_delivery_lease().await?,
                 CatalogReadCut::Current | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
             };
             if let Some(database_lease) = database_lease {
@@ -658,7 +658,11 @@ impl Node {
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
-        if !self.factory.options.replication.enabled || database.storage.object_store().defers_trie_releases() {
+        let objects = database.object_store();
+        if let Some(lease) = objects.catalog_delivery_lease().await? {
+            return Ok(Some(lease));
+        }
+        if !self.factory.options.replication.enabled || objects.defers_trie_releases() {
             return Ok(None);
         }
         database.read_lease(&self.factory.clock, &self.factory.options.garbage).await.map(Some)

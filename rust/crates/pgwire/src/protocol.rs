@@ -62,6 +62,15 @@ struct Portal {
     _bind_storage: Option<Arc<MemoryReservation>>,
 }
 
+impl Portal {
+    fn retention_deadline(&self) -> Option<std::time::Instant> {
+        match &self.state {
+            PortalState::Query(query) => query.cursor.context().retention_deadline(),
+            PortalState::Ready => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PreparationSettings<'a> { search_path: &'a str, timezone: &'a str }
 
@@ -103,6 +112,12 @@ impl ProtocolSession {
             reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None, replay_permit: None }
     }
     pub fn extended(&self) -> bool { self.extended }
+    pub fn portal_deadline(&self) -> Option<std::time::Instant> {
+        self.portals.values().filter_map(Portal::retention_deadline).min()
+    }
+    pub fn expire_portals(&mut self, now: std::time::Instant) {
+        self.portals.retain(|_, portal| portal.retention_deadline().is_none_or(|deadline| deadline > now));
+    }
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
     fn environment(&self) -> Result<SessionEnvironment> { SessionEnvironment::new(self.session.state().parameter_entries(), self.session.state().effective_timezone(), self.node.memory()) }
     fn token(&self) -> CancellationToken { self.session.state().cancellation().child_token() }

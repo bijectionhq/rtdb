@@ -177,6 +177,10 @@ pub trait ObjectStore: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/snapshot-custody",
             "The storage provider cannot open the journal's exact snapshot"))
     }
+    /// Bounds SQL execution and transport even if the answer uses only in-memory rows.
+    async fn catalog_delivery_lease(&self) -> rtdb_types::Result<Option<Arc<crate::ReadLease>>> {
+        Ok(None)
+    }
     /// Registers a captured catalog in a shared serving store.
     /// A missing cut represents an opaque capture. Standalone stores need no remote registration.
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {

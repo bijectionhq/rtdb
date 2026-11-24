@@ -167,6 +167,7 @@ impl Service {
         let slot = Arc::clone(&self.0.query_ticket_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained query tickets"))?;
         let deadline = tokio::time::Instant::now() + QUERY_TICKET_LIFETIME;
+        let deadline = context.retention_deadline().map_or(deadline, |cutoff| deadline.min(cutoff.into()));
         self.0.query_tickets.insert(id, Arc::new(QueryTicket {
             owner: call.session.owner(), connection, context, input, deadline, _slot: slot,
         }), QUERY_TICKET_LIFETIME, QUERY_TICKET_LIFETIME, false, 16).map_err(status)?;
