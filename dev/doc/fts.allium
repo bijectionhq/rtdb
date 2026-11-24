@@ -233,6 +233,9 @@ rule SearchJobRuns {
     -- A primary rewrite replaces the corresponding history locations while preserving the text revision's posting coverage.
     -- Replacement posting runs cover the exact union of the active receipts they supersede.
     -- A merge with both replay-backed and L0-backed inputs verifies the full union at a pinned boundary and publishes a source receipt that extends the replay-backed input's receipt.
+    -- The lane remembers failed merge proofs by table, definition identifier, definition version and both run digests.
+    -- Each logical maintenance pass reconciles the bounded memo with the active catalog and drops pairs with a retired input.
+    -- A remembered pair skips replay while its entry is retained, and eviction makes the pair eligible for replay again.
     -- The lane removes postings whose contributing events all precede an erase and retains postings with surviving later events.
     -- A scan uses logical negative evidence within the source extents covered by admitted runs at its pinned basis.
     -- A missing or corrupt run leaves its extent eligible for exact nomination from primary history.

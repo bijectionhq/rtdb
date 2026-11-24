@@ -55,7 +55,7 @@ pub struct SearchBuilder {
     columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
     history: Option<Arc<dyn rtdb_maintenance::TableHistorySource>>,
     scrubbed: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), [u8; 32]>>,
-    unmergeable: Mutex<std::collections::BTreeSet<[Vec<u8>; 2]>>,
+    unmergeable: Mutex<logical::UnmergeablePairs>,
 }
 
 impl SearchBuilder {
@@ -182,7 +182,13 @@ impl ArtefactBuilder for SearchBuilder {
     async fn maintain_independent(&self, snapshots: &dyn rtdb_maintenance::SnapshotSource, publisher: &dyn rtdb_maintenance::ArtefactPublisher,
         storage: (rtdb_types::StorageVersion, rtdb_types::StorageEpoch), cancellation: &CancellationToken) -> Result<()> {
         if self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION {
-            self.refresh_logical(snapshots, publisher, storage, cancellation).await?;
+            let before = snapshots.snapshot();
+            self.unmergeable.lock().retain_active(before.trie_catalog());
+            drop(before);
+            let result = self.refresh_logical(snapshots, publisher, storage, cancellation).await;
+            let after = snapshots.snapshot();
+            self.unmergeable.lock().retain_active(after.trie_catalog());
+            result?;
         }
         Ok(())
     }

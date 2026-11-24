@@ -1,11 +1,11 @@
-use std::{cell::RefCell, collections::BTreeMap, fs::File, io::{BufWriter, Read}, path::Path, sync::Arc};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs::File, io::{BufWriter, Read}, path::Path, sync::Arc};
 
 use arrow_array::Array;
 use rtdb_format::term_directory;
 use rtdb_format::log::proto::{SourceReceipt, TermDirectoryRoot};
 use rtdb_query::ObjectPageStore;
 use rtdb_format::{entity_history::forward_owner, keys::{TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded, SearchRun, SearchRunChange}};
-use rtdb_index::{PartitionValue, Snapshot};
+use rtdb_index::{PartitionValue, Snapshot, TrieCatalog};
 use rtdb_maintenance::{ArtefactDefinition, ArtefactPublisher, HistoryCoverage, HistoryRead, HistoryRow, SnapshotSource, input::download};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey};
 use rtdb_types::{AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, Interval, Result, StorageEpoch, StorageVersion, TableRef, Timestamp};
@@ -18,6 +18,31 @@ use super::forward::{ForwardFile, ForwardOutput};
 use crate::term_directory::{TermEdits, TermSummaries};
 
 type Erases = BTreeMap<Iid, SearchPosition>;
+type RunPair = [[u8; 32]; 2];
+
+const MAX_UNMERGEABLE_PAIRS: usize = 1024;
+
+#[derive(Default)]
+pub(super) struct UnmergeablePairs(BTreeSet<(RunPair, LogicalIndex)>);
+
+impl UnmergeablePairs {
+    fn contains(&self, index: &LogicalIndex, pair: RunPair) -> bool {
+        self.0.contains(&(pair, index.clone()))
+    }
+
+    fn insert(&mut self, index: &LogicalIndex, pair: RunPair) {
+        self.0.insert((pair, index.clone()));
+        if self.0.len() > MAX_UNMERGEABLE_PAIRS {
+            self.0.pop_last();
+        }
+    }
+
+    pub(super) fn retain_active(&mut self, catalog: &TrieCatalog) {
+        self.0.retain(|(pair, index)| pair.iter().all(|digest| {
+            catalog.active_search_run(&index.table, digest).is_some_and(|run| index.owns(run))
+        }));
+    }
+}
 
 struct PreparedLogicalRun {
     run: SearchRun,
@@ -82,6 +107,7 @@ pub(crate) fn run_identity(slug: &TableSlug, definition: &str, version: i64, blo
     if allocation.is_empty() { base } else { format!("{base}/{allocation:02x?}") }
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LogicalIndex {
     table: TableRef,
     id: String,
@@ -101,9 +127,12 @@ impl LogicalIndex {
         Self { table: definition.table.clone(), id: definition.id.trim_end_matches('w').to_owned(), version: definition.version }
     }
 
+    fn owns(&self, run: &SearchRun) -> bool {
+        run.definition_id() == self.id && run.definition_version() == self.version
+    }
+
     fn records<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a SearchRun> {
-        snapshot.trie_catalog().search_runs(&self.table)
-            .filter(|run| run.definition_id() == self.id && run.definition_version() == self.version).collect()
+        snapshot.trie_catalog().search_runs(&self.table).filter(|run| self.owns(run)).collect()
     }
 
     fn term_directory<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a TermDirectoryRoot> {
@@ -579,20 +608,21 @@ impl SearchBuilder {
                     && left.blocks.len() * 2 <= rtdb_format::search_manifest::MAX_RUN_BLOCKS
                     && left.file_size().saturating_add(right.file_size()) <= limit
                     && compatible_merge_inputs(left, right, self.history.is_some())
-                    && !self.unmergeable.lock().contains(&[left.digest().to_vec(), right.digest().to_vec()])
             });
             let mut adopted = false;
             for pair in candidates {
+                let [left, right] = pair.map(SearchRun::identity);
+                let digests = [left?, right?];
+                if self.unmergeable.lock().contains(index, digests) { continue; }
                 let hold = self.hold_logical_input(&snapshot).await?;
                 let merged = IoRegion::reading(hold, self.merge_logical(index, columns, &snapshot, pair, cancellation)).await;
                 let prepared = match merged {
                     Ok(Some(run)) => run,
-                    // Immutable inputs whose history cannot merge would fail the same way on every pass.
-                    Ok(None) => { self.unmergeable.lock().insert(pair.map(|run| run.digest().to_vec())); continue; }
+                    Ok(None) => { self.unmergeable.lock().insert(index, digests); continue; }
                     Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
                     Err(error) => return Err(error),
                 };
-                let inputs = pair.map(|run| run.digest().to_vec()).to_vec();
+                let inputs = digests.into_iter().map(|digest| digest.to_vec()).collect();
                 let identity = prepared.run.identity()?;
                 let change = self.directory_change(index, columns, &snapshot, prepared, inputs, cancellation).await?;
                 publish_change(publisher, storage, index, change).await?;
@@ -1079,7 +1109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mixed_pair_whose_history_cannot_extend_its_receipt_is_replayed_once() {
+    async fn unmergeable_mixed_pair_replays_once_while_active() {
         let events = ["repaired text", "sealed text"].map(|body| StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8(body.into()))])));
         let source = Arc::new(CountedReplay(TableReplay(events.iter().enumerate().map(|(block, operation)| {
             let fields = Some(StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]));
@@ -1102,6 +1132,89 @@ mod tests {
         }
         assert_eq!(index.records(&partition.value().snapshot()).len(), 2);
         assert_eq!(source.1.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(builder.unmergeable.lock().0.len(), 1);
+
+        use rtdb_maintenance::ArtefactBuilder;
+        builder.maintain_independent(&partition, &publisher, TEST_STORAGE, &CancellationToken::new()).await.unwrap();
+
+        assert!(index.records(&partition.value().snapshot()).is_empty());
+        assert!(builder.unmergeable.lock().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmergeable_pair_is_removed_when_either_input_retires() {
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let runs = [0, 1].map(|block| recorded_run(&index, block));
+        let pair = runs.each_ref().map(|run| run.identity().unwrap());
+        let inputs = runs.clone().map(|run| (index.table.clone(), run));
+
+        for (retired, surviving) in [(0, 1), (1, 0)] {
+            let partition = replay_partition(&inputs, 1);
+            let publisher = CatalogPublisher { partition: &partition, reject_once: parking_lot::Mutex::default() };
+            let mut memo = UnmergeablePairs::default();
+            memo.insert(&index, pair);
+            memo.retain_active(partition.value().trie_catalog());
+            assert!(memo.contains(&index, pair));
+
+            publish_change(&publisher, TEST_STORAGE, &index, SearchRunChange {
+                run: Some(runs[retired].clone()), retire_only: Some(true), ..Default::default()
+            }).await.unwrap();
+
+            let snapshot = partition.value().snapshot();
+            assert_eq!(index.records(&snapshot), [&runs[surviving]]);
+            memo.retain_active(snapshot.trie_catalog());
+            assert!(memo.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn unmergeable_pairs_belong_to_one_definition_generation() {
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let inputs = [0, 1].map(|block| (index.table.clone(), recorded_run(&index, block)));
+        let pair = inputs.each_ref().map(|(_, run)| run.identity().unwrap());
+        let partition = replay_partition(&inputs, 1);
+        let mut memo = UnmergeablePairs::default();
+        memo.insert(&index, pair);
+
+        let other_generations = [
+            LogicalIndex { table: TableRef::new("public", "other"), ..index.clone() },
+            LogicalIndex { id: "otherf16".into(), ..index.clone() },
+            LogicalIndex { version: 2, ..index.clone() },
+        ];
+        for other in &other_generations {
+            assert!(!memo.contains(other, pair));
+            memo.insert(other, pair);
+        }
+
+        memo.retain_active(partition.value().trie_catalog());
+        assert_eq!(memo.0.len(), 1);
+        assert!(memo.contains(&index, pair));
+    }
+
+    #[test]
+    fn unmergeable_pairs_are_bounded_across_generations() {
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let second_index = LogicalIndex { version: 2, ..index.clone() };
+        let pair = |value: usize| {
+            let mut right = [0; 32];
+            right[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            [[0; 32], right]
+        };
+        let mut memo = UnmergeablePairs::default();
+        for value in 1..=MAX_UNMERGEABLE_PAIRS {
+            memo.insert(&index, pair(value));
+            assert!(memo.0.len() <= MAX_UNMERGEABLE_PAIRS);
+        }
+
+        memo.insert(&second_index, pair(0));
+
+        assert_eq!(memo.0.len(), MAX_UNMERGEABLE_PAIRS);
+        assert!(memo.contains(&second_index, pair(0)));
+        assert!(!memo.contains(&index, pair(MAX_UNMERGEABLE_PAIRS)));
+        memo.insert(&index, pair(MAX_UNMERGEABLE_PAIRS));
+        assert_eq!(memo.0.len(), MAX_UNMERGEABLE_PAIRS);
+        assert!(memo.contains(&index, pair(1)));
+        assert!(memo.contains(&second_index, pair(0)));
     }
 
     #[derive(Default)]

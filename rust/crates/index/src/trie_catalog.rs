@@ -280,6 +280,9 @@ impl TrieCatalog {
     pub fn search_runs(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::SearchRun> {
         self.tables.get(table).into_iter().flat_map(|state| state.search.active())
     }
+    pub fn active_search_run(&self, table: &TableRef, digest: &[u8; 32]) -> Option<&log_pb::SearchRun> {
+        self.tables.get(table)?.search.active_run(digest)
+    }
     pub fn retired_search_runs(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::RetiredSearchRun> {
         self.tables.get(table).into_iter().flat_map(|state| state.search.retired())
     }

@@ -31,6 +31,8 @@ impl SearchManifest {
 
     pub fn active(&self) -> impl Iterator<Item = &SearchRun> { self.active.values() }
 
+    pub fn active_run(&self, digest: &[u8; 32]) -> Option<&SearchRun> { self.active.get(digest) }
+
     pub fn retired(&self) -> impl Iterator<Item = &RetiredSearchRun> { self.retired.values() }
 
     pub fn settled_at(&self, id: &[u8; 32]) -> Option<i64> {
