@@ -156,6 +156,7 @@ impl super::SharedLog for MemoryLog {
 
 #[async_trait]
 impl Log for MemoryLog {
+    fn shared(&self) -> Option<&dyn super::SharedLog> { Some(self) }
     fn maximum_append_bytes(&self) -> Option<usize> { Some(self.shared.maximum_message_bytes) }
     fn maximum_guarded_append_bytes(&self) -> Option<usize> { self.maximum_append_bytes() }
 

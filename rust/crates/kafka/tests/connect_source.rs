@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList, consumer::{BaseConsumer, Consumer}, message::Headers, mocking::MockCluster,
     producer::{FutureProducer, FutureRecord}};
 use rtdb_columnar::MemoryBudget;
-use rtdb_kafka::{KafkaClusterConfig, connect::{DateEnvironment, DateEnvironmentInput, DocsIndexer, PluginRegistry, ResumeToken, SourceConfig, SourceDriver, SourceOptions}};
+use rtdb_kafka::{KafkaClusterConfig, KafkaLog, KafkaLogOptions, connect::{DateEnvironment, DateEnvironmentInput, DocsIndexer, PluginRegistry, ResumeToken, SourceConfig, SourceDriver, SourceOptions}};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationConfig, ReplicationDriver, Role};
 use rtdb_storage::{MemoryStore, cache::BufferPool, log::MemoryLog};
-use rtdb_types::{SourcePosition, StorageEpoch, TableRef, Timestamp};
+use rtdb_types::{SourcePosition, StorageEpoch, TableRef, Timestamp, TxId};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -19,6 +19,11 @@ impl rtdb_replication::DatabaseEffects for Effects {
 }
 struct Authority;
 impl rtdb_tx::TransactionAuthorization for Authority { fn check_role_membership(&self, _: &str, _: Option<&str>) -> rtdb_types::Result<()> { Ok(()) } }
+
+struct IgnoreKafkaWarnings;
+impl rtdb_kafka::KafkaObserver for IgnoreKafkaWarnings {
+    fn warning(&self, _: rtdb_kafka::KafkaWarning) {}
+}
 
 const SCHEMA: &str = r#"{"type":"record","name":"Event","fields":[{"name":"name","type":"string"}]}"#;
 const GOOD_ID: u8 = 7;
@@ -56,6 +61,92 @@ fn avro(schema: u8, name: &str) -> Vec<u8> {
 
 async fn wait_for(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(20), async { while !predicate() { tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kafka_source_and_replica_preserve_transaction_order_across_follower_replay() {
+    let cluster = MockCluster::new(1).unwrap();
+    for topic in ["default-source", "default-replica"] {
+        cluster.create_topic(topic, 1, 1).unwrap();
+    }
+    let kafka = KafkaClusterConfig::new(cluster.bootstrap_servers());
+    let memory = MemoryBudget::new(1 << 30);
+    let stop_logs = CancellationToken::new();
+    let mut log_jobs = Vec::new();
+    let mut logs = Vec::new();
+    for read_only in [false, true] {
+        for topic in ["default-source", "default-replica"] {
+            let mut options = KafkaLogOptions::new(topic);
+            options.auto_create_topic = false;
+            options.read_only = read_only;
+            options.request_timeout = Duration::from_secs(5);
+            let opened = KafkaLog::open(&kafka, options, Arc::new(IgnoreKafkaWarnings), Arc::clone(&memory)).await.unwrap();
+            if let Some(driver) = opened.driver {
+                log_jobs.push(tokio::spawn(driver.run(stop_logs.clone())));
+            }
+            logs.push(opened.log);
+        }
+    }
+    let mut opened = Vec::new();
+    for (may_lead, logs) in [true, false].into_iter().zip(logs.chunks_exact(2)) {
+        let store = Arc::new(MemoryStore::default());
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
+        let logs = PartitionLogs::new(logs[0].clone(), logs[1].clone(), StorageEpoch(0), StorageEpoch(0),
+            rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+        let blocks = BlockStore::new(store, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
+        let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), rtdb_replication::BlockDiscovery::List).await.unwrap();
+        let partition = Arc::clone(&recovered.partition);
+        let progress = ProgressMonitor::new(recovered.progress.clone());
+        let resolve = Arc::new(rtdb_tx::ResolveContext { decision_clock: None, write_event_origins: false,
+            placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
+            storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority),
+            execution_observer: None, tracer: None });
+        let (handle, driver) = ReplicationDriver::new(ReplicationConfig {
+            may_lead, assertion_interval: Duration::from_secs(1), idle_heartbeat: false, ..Default::default()
+        },
+            logs, blocks, recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
+        opened.push((handle, driver, partition));
+    }
+    let (follower, follower_driver, follower_partition) = opened.pop().unwrap();
+    let (leader, leader_driver, leader_partition) = opened.pop().unwrap();
+    let leader_job = tokio::spawn(leader_driver.run());
+    let mut status = leader.watch_status();
+    let first_role = tokio::time::timeout(Duration::from_secs(20), status.wait_for(|status| {
+        status.role != Role::Following || status.promotion_failure.is_some()
+    })).await.expect("Kafka leader did not confirm its claim").unwrap().clone();
+    assert!(matches!(first_role.role, Role::Leading(_)), "{first_role:?}, fault: {:?}", leader.progress().fault());
+    let cancellation = CancellationToken::new();
+    let mut transactions = Vec::new();
+    for id in [17, 23] {
+        let tx = rtdb_tx::SourceTransaction::new(vec![rtdb_tx::TxOp::Sql {
+            sql: format!("INSERT INTO kafka_rows (_id) VALUES ({id})"), args: None,
+        }], Default::default(), &memory).unwrap();
+        let source = leader.submit_source_encoded(tx.encode().unwrap().into_bytes(), Timestamp(id)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), leader.await_tx(TxId(source.0), &cancellation))
+            .await.unwrap().unwrap().unwrap();
+        assert!(result.committed(), "{:?}", result.error());
+        transactions.push((source, result.tx_key()));
+    }
+    assert_eq!(transactions.iter().map(|(position, _)| position.0).collect::<Vec<_>>(), [0, 1]);
+    assert!(transactions[0].1.system_time < transactions[1].1.system_time);
+    let follower_job = tokio::spawn(follower_driver.run());
+    tokio::time::timeout(Duration::from_secs(10), follower.await_source(transactions[1].0, &cancellation)).await.unwrap().unwrap();
+    let table = TableRef::new("public", "kafka_rows");
+    for partition in [leader_partition, follower_partition] {
+        let view = partition.value();
+        assert_eq!(view.live().latest_completed_tx(), Some(transactions[1].1));
+        assert_eq!(view.live().tables().get(&table).unwrap().row_count(), 2);
+    }
+    assert_eq!(follower.status().role, Role::Following);
+    leader.shutdown();
+    follower.shutdown();
+    leader_job.await.unwrap().unwrap();
+    follower_job.await.unwrap().unwrap();
+    stop_logs.cancel();
+    for job in log_jobs {
+        job.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
