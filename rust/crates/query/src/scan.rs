@@ -587,7 +587,7 @@ impl ScanCursor {
             scan.predicates.retain(|predicate| metadata.is_none_or(|id| !predicate.referenced_columns().contains(&id)));
         }
         let fixed_iids = scan.iids.is_some();
-        let accelerate = accelerate && execution.context.catalog.owned_position_mask.is_none();
+        let accelerate = accelerate && !execution.context.catalog.uses_owned_event_cut();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.evaluator()); }
         let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
             match id_interval(&scan, execution.parameters.evaluator()) {
@@ -1112,7 +1112,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
 
     async fn score_resolved(&self, mut rows: Vec<crate::ResolvedSearchRow>, column: rtdb_plan::ColumnId, ascending_id: Option<rtdb_plan::ColumnId>,
         scorer: &rtdb_text::Scorer) -> Result<Option<crate::CandidateScores>> {
-        if self.scan.table.name.table.is_owned_event_data() || self.execution.context.catalog.owned_position_mask.is_some() {
+        if self.scan.table.name.table.is_owned_event_data() || self.execution.context.catalog.uses_owned_event_cut() {
             return Ok(None);
         }
         rows.retain(|row| self.within_pushdowns(row.version.iid));
@@ -1305,7 +1305,7 @@ impl PartitionScan {
         PruningOptions { bounds: self.bounds, projects_temporal_columns: self.scan.columns.iter().any(|field| matches!(field.name.as_str(), "_valid_from" | "_valid_to" | "_system_from" | "_system_to")),
             clamp_valid_time: self.scan.clamp_valid_time,
             bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning
-                || self.execution.context.catalog.owned_position_mask.is_some(),
+                || self.execution.context.catalog.uses_owned_event_cut(),
             iid }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
@@ -1682,6 +1682,7 @@ impl PartitionScan {
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let keyed = self.scan.table.name.table.is_owned_event_data();
         let position_mask = self.execution.context.catalog.owned_position_mask;
+        let transaction_cut = self.execution.context.catalog.owned_transaction_cut;
         let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
         // Every equal physical IID stays within one task. A key's events still
         // arrive in descending system time, independently of its neighbours.
@@ -1714,6 +1715,9 @@ impl PartitionScan {
             } else if let Some(iids) = &self.scan.iids {
                 if !iids.contains(&head.header.iid) { continue; }
             } else if self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns, head.header.iid, self.canonical_entity_iids)) {
+                continue;
+            }
+            if let Some(cut) = transaction_cut && !rtdb_temporal::event_applies_at_cut(&head.header, cut)? {
                 continue;
             }
             if position_mask.is_some_and(|(commit, from)| {
@@ -2303,6 +2307,34 @@ mod tests {
         ).await.unwrap().unwrap();
         let row = cursor.next_batch().await.unwrap().unwrap();
         assert_eq!(crate::owned_receipt_transaction(row.batch(), 0).unwrap(), TxId(4));
+    }
+
+    #[tokio::test]
+    async fn tied_root_publications_keep_the_original_marker_at_a_position_cut() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION).unwrap();
+        let id = EntityId::String("head".into());
+        let memory = MemoryBudget::new(1 << 24);
+        let original = TransactionKey { tx_id: TxId(4), system_time: Timestamp(100) };
+        let next = TransactionKey { tx_id: TxId(7), system_time: original.system_time };
+        for key in [original, next] {
+            let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            write.append(relation.table("alice"), StoredEvent {
+                position: None, origin: None, commit_position: 0, recency: None,
+                entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
+                system_from: key.system_time, valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
+            }).unwrap();
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let cancellation = CancellationToken::new();
+        let context = QueryContext::new(catalog, memory, original.system_time, "UTC", QueryOptions::default(), &cancellation).unwrap();
+        assert_eq!(crate::read_owned_root_publication(Arc::clone(&context), "alice").await.unwrap(), Some(next));
+        let context = context.with_owned_transaction_cut(original, &cancellation).unwrap();
+        assert_eq!(crate::read_owned_root_publication(context, "alice").await.unwrap(), Some(original));
     }
 
     #[tokio::test]

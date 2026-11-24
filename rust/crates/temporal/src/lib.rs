@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 mod event_step;
 mod ceiling_step;
 
+pub fn event_applies_at_cut(header: &EventHeader, through: rtdb_types::TxId) -> Result<bool> {
+    event_step::position_visible(header.position.map(|position| position.transaction.0), through.0, header.op == EventOp::Erase)
+        .ok_or_else(|| Anomaly::fault("rtdb.temporal/event-position",
+            "An exact publication read requires original event positions"))
+}
+
 #[allow(unexpected_cfgs)]
 #[cfg(kani)]
 mod proofs;

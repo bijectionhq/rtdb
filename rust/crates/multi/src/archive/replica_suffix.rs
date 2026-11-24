@@ -138,14 +138,14 @@ pub(crate) async fn find_held_publication(
                 envelope
             };
             let ReplicaBody::ResolvedTx(row) = envelope.message else { continue; };
-            if row.system_time_micros != Some(cut.basis().0) { continue; }
             let basis = TransactionKey {
                 tx_id: TxId(row.tx_id.ok_or_else(suffix_unavailable)?),
-                system_time: cut.basis(),
+                system_time: Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?),
             };
+            if !cut.matches_basis(basis) { continue; }
             let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
             if !row.committed.unwrap_or(false)
-                || !cut.matches_basis(basis) || row.db_op.is_some() || row.external_source_token.is_some()
+                || row.db_op.is_some() || row.external_source_token.is_some()
                 || source < 0
             {
                 return Err(suffix_unavailable());

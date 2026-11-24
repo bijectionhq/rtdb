@@ -1486,7 +1486,7 @@ impl OwnedReadSession {
             basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
-            publication: false,
+            publication: None,
             retained_world: None,
             renewal: false,
             until: self.fork_until,
@@ -1508,11 +1508,11 @@ impl OwnedReadSession {
         let mut cut = self.fork_cut(scope).await?;
         let head = cut.live.take().ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         let publication = rtdb_query::read_owned_root_publication(Arc::clone(&self.context), &self.owner)
-            .await?.filter(|publication| *publication <= head.system_time)
+            .await?.filter(|publication| publication.tx_id <= head.tx_id && publication.system_time <= head.system_time)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         self.check()?;
-        cut.basis = publication;
-        cut.publication = true;
+        cut.basis = publication.system_time;
+        cut.publication = Some(publication);
         Ok(cut)
     }
 
@@ -1523,7 +1523,13 @@ impl OwnedReadSession {
         if basis > cut.basis() {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        cut.basis = basis;
+        let context = self.context.with_owned_system_cut(basis, &self.context.cancellation)?;
+        let publication = rtdb_query::read_owned_root_publication(context, &self.owner).await?
+            .filter(|publication| publication.system_time == basis && publication.tx_id <= cut.issued_on.tx_id)
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        self.check()?;
+        cut.basis = publication.system_time;
+        cut.publication = Some(publication);
         Ok(cut)
     }
 
@@ -1564,7 +1570,7 @@ impl OwnedReadSession {
     ) -> Result<OwnedForkCut> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let mut cut = self.fork_cut(scope).await?;
-        if cut.live.is_none_or(|live| world.basis.system_time >= live.system_time || world.basis.tx_id >= live.tx_id)
+        if cut.live.is_none_or(|live| world.basis.system_time > live.system_time || world.basis.tx_id >= live.tx_id)
             || !world.ancestors.is_empty() || world.dropped
             || world.mode == rtdb_types::WorldClockMode::Proposal
             || world.parent_publication.is_none()
@@ -1595,7 +1601,7 @@ impl OwnedReadSession {
         &self, scope: rtdb_types::PlacedAttemptScope, predecessor: TransactionKey,
     ) -> Result<OwnedForkCut> {
         let mut cut = self.fork_cut(scope).await?;
-        if cut.live.is_none_or(|live| predecessor.system_time >= live.system_time || predecessor.tx_id >= live.tx_id) {
+        if cut.live.is_none_or(|live| predecessor.system_time > live.system_time || predecessor.tx_id >= live.tx_id) {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         cut.live = Some(predecessor);
@@ -2931,7 +2937,7 @@ pub struct OwnedForkCut {
     basis: Timestamp,
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
-    publication: bool,
+    publication: Option<TransactionKey>,
     retained_world: Option<RetainedWorldCut>,
     renewal: bool,
     until: Timestamp,
@@ -2950,7 +2956,8 @@ impl OwnedForkCut {
         self.root_point = point;
     }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
-    pub fn is_publication(&self) -> bool { self.publication }
+    pub fn is_publication(&self) -> bool { self.publication.is_some() }
+    pub fn positioned_basis(&self) -> Option<TransactionKey> { self.publication.or(self.live) }
     pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> {
         match self.retained_world {
             Some(RetainedWorldCut::Overlay(world, pin, clock)) => Some((world, pin, clock)),
@@ -2965,9 +2972,8 @@ impl OwnedForkCut {
     }
     pub fn is_renewal(&self) -> bool { self.renewal }
     pub fn matches_basis(&self, basis: TransactionKey) -> bool {
-        self.basis == basis.system_time && self.live.is_none_or(|live| live == basis)
-            && basis.tx_id <= self.issued_on.tx_id
-            && ((basis.tx_id == self.issued_on.tx_id) == (basis.system_time == self.issued_on.system_time))
+        self.basis == basis.system_time && self.positioned_basis().is_none_or(|original| original == basis)
+            && basis.tx_id <= self.issued_on.tx_id && basis.system_time <= self.issued_on.system_time
     }
     pub fn admits_overlay(&self, media: TransactionKey, system: Timestamp) -> bool {
         self.overlay().is_some() && self.basis == system && system <= media.system_time
@@ -3219,7 +3225,10 @@ impl NativeSession {
         };
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
         if requires_tip {
-            if fork.cut.root_point.map(|version| version.history) != record.parent_publication {
+            if fork.cut.root_point.map(|version| version.history) != record.parent_publication
+                || (fork.cut.is_publication() && fork.cut.root_point.is_none_or(|version|
+                    version.position.transaction != record.basis.tx_id))
+            {
                 return Err(rtdb_types::OwnedWorld::unavailable());
             }
             ops.push(TxOp::OwnedCheck {

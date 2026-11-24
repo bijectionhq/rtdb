@@ -36,3 +36,19 @@ pub(crate) fn recency_step(previous: i64, valid_from: i64, valid_to: i64, system
     let best = if previous > bound { previous } else { bound };
     (best, best >= valid_from)
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (if erase { Some(true) } else {
+        match original {
+            Some(position) => Some(position <= through),
+            None => None,
+        }
+    }),
+))]
+pub(crate) fn position_visible(original: Option<i64>, through: i64, erase: bool) -> Option<bool> {
+    if erase { return Some(true); }
+    match original {
+        Some(event) => Some(event <= through),
+        None => None,
+    }
+}

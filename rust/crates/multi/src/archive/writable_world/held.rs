@@ -2202,11 +2202,12 @@ async fn historical_parent_context(
     };
     // The pinned physical position is eligible only if it was itself an
     // application publication. A later checkpoint cannot stand in for it.
-    if selected > requested || (requested == parent && selected != parent) {
+    if selected.system_time > requested || (requested == parent && snapshot.tx_basis() != Some(selected)) {
         return Err(unavailable());
     }
-    require_parent_journal(&context, owner, &publication, selected).await?;
-    let capped = context.with_owned_system_cut(selected, &context.cancellation)?;
+    let capped = context.with_owned_transaction_cut(selected, &context.cancellation)?;
+    require_parent_journal(&context, owner, &publication, selected.system_time).await?;
+    let selected = selected.system_time;
     for (relation, expected) in schemas {
         require_parent_journal(&context, owner, relation, selected).await?;
         let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&capped), owner, relation).await?;

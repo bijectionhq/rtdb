@@ -15,7 +15,7 @@ use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
 use rtdb_storage::cache::HeldCatalogRead;
-use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, TransactionKey, TxId};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
@@ -37,6 +37,13 @@ impl SuffixCut<'_> {
         match self {
             Self::Tip(key) => key.system_time,
             Self::HeldPublication(cut, ..) => cut.basis(),
+        }
+    }
+
+    fn position(&self) -> Option<TxId> {
+        match self {
+            Self::Tip(key) => Some(key.tx_id),
+            Self::HeldPublication(cut, ..) => cut.positioned_basis().map(|basis| basis.tx_id),
         }
     }
 
@@ -935,7 +942,13 @@ impl NodeAgent {
                 && archived.log_epoch == record.log_epoch && archived.checkpoint.root_sha256.is_some()
             ).ok_or_else(unavailable)?;
             let checkpoint = archived.checkpoint;
-            if checkpoint.boundary < 0 || cutoff.time().0 <= checkpoint.system_time
+            let precedes = match cutoff.position() {
+                Some(position) => rtdb_types::SourcePosition::from_epoch_offset(
+                    StorageEpoch(record.log_epoch), checkpoint.source,
+                )?.0 < position.0,
+                None => checkpoint.system_time < cutoff.time().0,
+            };
+            if checkpoint.boundary < 0 || !precedes
                 || record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != record.incarnation)
                 || capture_replay_start(record, archived).is_err()
             {
@@ -979,7 +992,9 @@ impl NodeAgent {
             && applied.tx_key.is_some_and(|head| {
                 match &cutoff {
                     SuffixCut::Tip(basis) => head == *basis,
-                    SuffixCut::HeldPublication(..) => head.system_time >= cutoff.time(),
+                    SuffixCut::HeldPublication(..) => cutoff.position().map_or_else(
+                        || head.system_time >= cutoff.time(), |position| head.tx_id >= position,
+                    ),
                 }
             })
         ).ok_or_else(unavailable)?;

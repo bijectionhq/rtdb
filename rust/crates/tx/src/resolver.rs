@@ -1833,7 +1833,7 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected })
                         if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION && id == "head"
                             && checked_tip.is_none() => {
-                        checked_tip = Some((*valid_at, expected.map(|version| version.history)));
+                        checked_tip = Some((*valid_at, *expected));
                     }
                     Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
@@ -1926,7 +1926,7 @@ impl<'a> OpenTransaction<'a> {
                             || (with_root && !renewal && !sibling_fork && !held_publication
                                 && world.parent_publication == Some(world.basis.system_time))
                         {
-                            expected_tip = Some((world.basis.system_time, world.parent_publication));
+                            expected_tip = Some((world.basis, world.parent_publication));
                         }
                         forks += 1;
                     }
@@ -1938,8 +1938,16 @@ impl<'a> OpenTransaction<'a> {
                 Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected, .. })
                     if *checked == *relation && *observed == id && expected.is_none() == (sibling_fork || (proposal_hold && !proposal_shorten))
             )));
+            let tip_matches = match (expected_tip, checked_tip) {
+                (None, None) => true,
+                (Some((basis, publication)), Some((valid_at, observed))) => {
+                    valid_at == basis.system_time && observed.map(|point| point.history) == publication
+                        && observed.is_none_or(|point| point.position.transaction <= basis.tx_id)
+                }
+                _ => false,
+            };
             if (bounded_write && (!replacement_checked || !existing_control_write || control_writes > (5 + usize::from(proposal_hold))))
-                || forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
+                || forks != 1 || checks == 0 || !tip_matches || effects > 4096
                 || (publish_root && root_rows == 0)
                 || ((held_publication || root == OwnedForkRoot::Controls || proposal_publication) && control_writes == 0)
             {
@@ -2001,12 +2009,10 @@ impl<'a> OpenTransaction<'a> {
                 || record.basis.system_time != parent || deadline.is_none()
                 || operations.len().saturating_add(2) > 4096
                 || operations.iter().filter(|op| matches!(op, Operation::Public(TxOp::OwnedCheckWorldScope { .. }))).count() != 1
-                || (effect == ProposalLandingEffect::WithPoints && self.read_owned_revision(
+                || (effect == ProposalLandingEffect::WithPoints && rtdb_query::read_owned_root_publication(
+                    self.context.query_context(self.snapshot()?, self.decision_time(), &self.options.default_tz, self.trace_parent)?,
                     owner,
-                    &rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
-                    &rtdb_types::EntityId::String("head".into()),
-                    Interval::ALL,
-                ).await? != Some(parent))
+                ).await? != Some(record.basis))
             {
                 return Err(unavailable());
             }

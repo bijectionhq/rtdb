@@ -1,53 +1,104 @@
 {
   "summary": "Both production temporal resolvers share the checked admission of future events and history-wide ERASE.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 7,
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 9,
   "controls": {
     "admit_upper_endpoint": {
       "defect": "An ordinary event recorded at the system interval's exclusive upper edge is admitted.",
-      "mutate": [{
-        "file": "rust/crates/temporal/src/event_step.rs",
-        "find": "        Some(upper) => system_from < upper,\n        None",
-        "replace": "        Some(upper) => system_from <= upper,\n        None"
-      }],
-      "expect": [{
-        "file": "rust/crates/temporal/src/event_step.rs",
-        "function": "applies",
-        "category": "postcondition not satisfied"
-      }],
+      "mutate": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "find": "        Some(upper) => system_from < upper,\n        None",
+          "replace": "        Some(upper) => system_from <= upper,\n        None"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "function": "applies",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 6
     },
     "erase_as_ordinary_event": {
       "defect": "The implementation and its local contract both suppress erase outside the query's system range.",
-      "mutate": [{
-        "file": "rust/crates/temporal/src/event_step.rs",
-        "find": "out == (!already_erased && (erase || (match system_upper {",
-        "replace": "out == (!already_erased && ((match system_upper {"
-      }, {
-        "file": "rust/crates/temporal/src/event_step.rs",
-        "find": "    !already_erased && (erase || match system_upper {",
-        "replace": "    !already_erased && (match system_upper {"
-      }],
-      "expect": [{
-        "file": "verification/verus/temporal_admission/laws.rs",
-        "function": "an_erase_in_the_admitted_history_applies_beyond_the_query_time",
-        "category": "postcondition not satisfied"
-      }],
+      "mutate": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "find": "out == (!already_erased && (erase || (match system_upper {",
+          "replace": "out == (!already_erased && ((match system_upper {"
+        },
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "find": "    !already_erased && (erase || match system_upper {",
+          "replace": "    !already_erased && (match system_upper {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/temporal_admission/laws.rs",
+          "function": "an_erase_in_the_admitted_history_applies_beyond_the_query_time",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 6
     },
     "stop_recency_below_an_earlier_valid_end": {
       "defect": "A recency fold stops below the end of some preceding valid-time interval.",
-      "mutate": [{
-        "file": "rust/crates/temporal/src/event_step.rs",
-        "find": "(best, best >= valid_from)",
-        "replace": "(best, best <= valid_from)"
-      }],
-      "expect": [{
-        "file": "rust/crates/temporal/src/event_step.rs",
-        "function": "recency_step",
-        "category": "postcondition not satisfied"
-      }],
+      "mutate": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "find": "(best, best >= valid_from)",
+          "replace": "(best, best <= valid_from)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "function": "recency_step",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 6
+    },
+    "include_a_later_original_position": {
+      "mutate": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "find": "        Some(event) => Some(event <= through),",
+          "replace": "        Some(event) => Some(event <= through || event > through),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "function": "position_visible",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "exclude_erasure_from_position_cut": {
+      "mutate": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "find": "    if erase { return Some(true); }",
+          "replace": "    if erase { return Some(false); }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/temporal/src/event_step.rs",
+          "function": "position_visible",
+          "category": "postcondition not satisfied"
+        }
+      ]
     }
   }
 }

@@ -66,6 +66,7 @@ pub struct CatalogSnapshot {
     transaction_scoped: bool,
     owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
     pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
+    pub(crate) owned_transaction_cut: Option<rtdb_types::TxId>,
     owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
@@ -85,8 +86,12 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, resumed_storage_owner: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, resumed_storage_owner: None })
     }
+    pub(crate) fn uses_owned_event_cut(&self) -> bool {
+        self.owned_transaction_cut.is_some() || self.owned_position_mask.is_some()
+    }
+
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
         self.ordered_indexes = Some(inventory);

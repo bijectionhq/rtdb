@@ -76,7 +76,7 @@ fn select_held_archive(
             && require_capture_open(source, *capture).is_ok()
     };
     if let Some((&capture, _)) = source.checkpoint_captures.iter().find(|(capture, registered)|
-        available(capture, registered) && registered.checkpoint.system_time == cut.basis().0
+        available(capture, registered) && matches_fork_checkpoint(source, cut, registered.checkpoint)
     ) {
         return Ok(Some((capture, None)));
     }
@@ -97,6 +97,20 @@ fn select_held_archive(
     Ok(None)
 }
 
+fn checkpoint_source_tx(source: &DeploymentRecord, checkpoint: rtdb_directory::Checkpoint) -> Option<rtdb_types::TxId> {
+    rtdb_types::SourcePosition::from_epoch_offset(rtdb_types::StorageEpoch(source.log_epoch), checkpoint.source)
+        .ok().map(|position| rtdb_types::TxId(position.0))
+}
+
+fn matches_fork_checkpoint(
+    source: &DeploymentRecord, cut: &rtdb_node::OwnedForkCut, checkpoint: rtdb_directory::Checkpoint,
+) -> bool {
+    match cut.positioned_basis() {
+        Some(basis) => checkpoint_source_tx(source, checkpoint) == Some(basis.tx_id),
+        None => checkpoint.system_time == cut.basis().0,
+    }
+}
+
 async fn copy_published_fork_input(
     directory: Arc<dyn Directory>,
     storage: &CellStorage,
@@ -109,7 +123,7 @@ async fn copy_published_fork_input(
     until: Timestamp,
 ) -> Result<Uuid> {
     let checkpoint = source.checkpoint.filter(|checkpoint| {
-        checkpoint.root_sha256.is_some() && checkpoint.system_time == cut.basis().0
+        checkpoint.root_sha256.is_some() && matches_fork_checkpoint(source, cut, *checkpoint)
     }).ok_or_else(OwnedWorld::unavailable)?;
     if !cut.is_publication() || until <= now() || cut.until() <= now() {
         return Err(OwnedWorld::unavailable());
@@ -157,7 +171,11 @@ async fn copy_fork_suffix(
     let capture = source.checkpoint_captures.iter().filter(|(capture, base)| {
         base.archive == binding && base.media_bound && base.manifest_sha256.is_some()
             && base.checkpoint.root_sha256.is_some() && base.incarnation == source.incarnation
-            && base.log_epoch == source.log_epoch && base.checkpoint.system_time < cut.basis().0
+            && base.log_epoch == source.log_epoch
+            && (match cut.positioned_basis() {
+                Some(basis) => checkpoint_source_tx(source, base.checkpoint).is_some_and(|position| position < basis.tx_id),
+                None => base.checkpoint.system_time < cut.basis().0,
+            })
             && restore_binding.is_none_or(|binding| base.world_replay == Some(binding))
             && require_capture_open(source, **capture).is_ok()
             && crate::hosted_recovery::capture_replay_start(source, base).is_ok()
@@ -784,7 +802,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
             let storage = capture_source.ok_or_else(OwnedWorld::unavailable)?;
             let deadline = until.min(fork.deadline).min(fork.cut.until());
             let selected = if source.checkpoint.is_some_and(|checkpoint|
-                checkpoint.system_time == fork.cut.basis().0 && checkpoint.root_sha256.is_some()
+                matches_fork_checkpoint(&source, &fork.cut, checkpoint) && checkpoint.root_sha256.is_some()
             ) {
                 let capture = copy_published_fork_input(
                     Arc::clone(&directory), storage, archive, keys, hosted_task, deployment_id,
@@ -818,7 +836,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     ) {
         return Err(OwnedWorld::unavailable());
     }
-    let expected_basis = expected_basis.or(fork.cut.live());
+    let expected_basis = expected_basis.or(fork.cut.positioned_basis());
     let live = session.open_owned_read().await?;
     let predecessor = if let Some(pin) = fork.previous.filter(|_| renewal) {
         let world = fork.sibling.unwrap_or(fork.world);
@@ -847,7 +865,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     ).await?;
     live.check()?;
     let head = live.present();
-    if (basis.system_time >= head.system_time || basis.tx_id >= head.tx_id)
+    if (basis.system_time > head.system_time || basis.tx_id >= head.tx_id)
         && (!fork.cut.is_publication() || basis != head)
     {
         return Err(OwnedWorld::unavailable());
@@ -856,8 +874,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, suffix, basis };
 
     if !fork.cut.matches_basis(basis)
-        || parent_publication.is_some_and(|publication| publication > basis.system_time)
-        || (fork.cut.is_publication() && parent_publication != Some(basis.system_time))
+        || parent_publication.is_some_and(|publication| publication.tx_id > basis.tx_id)
+        || (fork.cut.is_publication() && parent_publication != Some(basis))
     {
         return Err(OwnedWorld::unavailable());
     }
@@ -867,7 +885,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
             (prior.schemas, prior.parent_publication, prior.fork_lineage)
         }
         Some(_) => return Err(OwnedWorld::unavailable()),
-        None => (schemas, parent_publication, Vec::new()),
+        None => (schemas, parent_publication.map(|publication| publication.system_time), Vec::new()),
     };
     let inherited = parent_publication.unwrap_or(basis.system_time);
     let mode = match fork.requested {
@@ -933,7 +951,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
                         || previous.schema_digest != retained.schema_digest
                         || previous.parent_publication != retained.parent_publication
                 } else {
-                    previous.basis.system_time >= retained.basis.system_time || previous.basis.tx_id >= retained.basis.tx_id
+                    previous.basis.system_time > retained.basis.system_time || previous.basis.tx_id >= retained.basis.tx_id
                 }
             {
                 return Err(OwnedWorld::unavailable());

@@ -1186,21 +1186,13 @@ pub async fn read_owned_world_with_revision(
     Ok(record)
 }
 
-pub async fn read_owned_root_publication(context: Arc<QueryContext>, owner: &str) -> Result<Option<Timestamp>> {
-    let memory = Arc::clone(&context.memory);
+pub async fn read_owned_root_publication(
+    context: Arc<QueryContext>, owner: &str,
+) -> Result<Option<TransactionKey>> {
     let relation = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
     let id = EntityId::String("head".into());
-    let valid = Interval::ALL;
-    let Some(mut cursor) = open_owned_point(context, owner, &relation, &id, Some(valid), Some(&["_id", "_system_from"])).await?
-    else { return Ok(None); };
-    let mut publication = None;
-    while let Some(batch) = cursor.next_batch().await? {
-        for row in 0..batch.batch().num_rows() {
-            let revision = owned_row_revision(batch.batch(), row, &id, &memory)?;
-            if publication.replace(revision).is_some() { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        }
-    }
-    Ok(publication)
+    Ok(read_owned_point_version(context, owner, &relation, &id, Interval::ALL).await?
+        .map(|point| TransactionKey { tx_id: point.position.transaction, system_time: point.history }))
 }
 
 pub async fn read_owned_parent_schemas(

@@ -103,6 +103,9 @@
 -- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
 -- A present point identifies the original transaction position and event ordinal.
+-- A Root publication selected for a fork retains the winning marker's position through archive choice, suffix replay and landing.
+-- An owned archive scan at that Root publication excludes transactions above its position even when their SQL history times tie.
+-- Applicable erasure continues to govern the selected historical winner.
 -- Equal SQL system times do not make two owned assertions interchangeable.
 -- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
 -- With no relation batches, the commit validates the deadline at its ordered position and changes no owned relation.

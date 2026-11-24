@@ -170,6 +170,28 @@ impl QueryContext {
         Ok(Arc::new(context))
     }
 
+    /// Narrows an owned archive read to the selected original publication.
+    pub fn with_owned_transaction_cut(
+        &self, through: TransactionKey, cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<Self>> {
+        let original = self.catalog.database(&self.catalog.default_database)?;
+        let [snapshot] = original.partitions.as_slice() else {
+            return Err(invalid("owned-transaction-cut", "An owned publication requires one captured partition"));
+        };
+        if through.tx_id.0 < 0
+            || snapshot.tx_basis().is_none_or(|basis| through.tx_id > basis.tx_id)
+            || self.catalog.owned_transaction_cut.is_some_and(|cut| through.tx_id > cut)
+        {
+            return Err(invalid("owned-transaction-cut", "The requested publication is above its captured cut"));
+        }
+        let mut context = self.with_owned_system_cut(through.system_time, cancellation)?;
+        let context_mut = Arc::make_mut(&mut context);
+        context_mut.catalog.owned_transaction_cut = Some(through.tx_id);
+        context_mut.catalog.fragmenter = None;
+        context_mut.accelerators = Default::default();
+        Ok(context)
+    }
+
     pub(crate) fn apply_settings(self: Arc<Self>, settings: &QuerySettings, parameters: rtdb_expr::Parameters<'_>) -> Result<Arc<Self>> {
         self.check_cancelled()?;
         let mut bytes = catalog_bound(&self.catalog)?;

@@ -1,4 +1,4 @@
-use crate::production::{applies, recency_step};
+use crate::production::{applies, position_visible, recency_step};
 use vstd::prelude::*;
 
 // LAW RTDB-TIME-01.
@@ -46,4 +46,14 @@ fn recency_cannot_prune_a_live_point(
     previous: i64, start: i64, end: i64, system_end: i64, valid_point: i64, system_point: i64,
 ) -> (i64, bool) {
     recency_step(previous, start, end, system_end)
+}
+
+#[verus_spec(out =>
+    requires selected < later,
+    ensures out == (Some(true), Some(false), Some(true)),
+)]
+fn exact_cut_excludes_a_later_position_and_applies_erasure(selected: i64, later: i64) -> (Option<bool>, Option<bool>, Option<bool>) {
+    (position_visible(Some(selected), selected, false),
+     position_visible(Some(later), selected, false),
+     position_visible(Some(later), selected, true))
 }
