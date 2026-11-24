@@ -380,6 +380,7 @@ pub struct DeliveryIo<W>(W);
 
 impl<W> DeliveryIo<W> {
     pub fn new(io: W) -> Self { Self(io) }
+    pub fn get_ref(&self) -> &W { &self.0 }
 }
 
 impl<W: AsyncRead + Unpin> AsyncRead for DeliveryIo<W> {

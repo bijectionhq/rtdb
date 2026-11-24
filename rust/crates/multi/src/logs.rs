@@ -116,6 +116,19 @@ impl PlacedReceiptCodec for DeploymentReceipts {
         let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
         self.cipher.open(SQL_SNAPSHOT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
     }
+
+    fn seal_range(&self, value: &[u8]) -> Result<String> {
+        Ok(URL_SAFE_NO_PAD.encode(self.cipher.seal("rtdb.multi/owned-range/v1", value)?))
+    }
+
+    fn open_range(&self, token: &str) -> Result<Vec<u8>> {
+        let invalid = || Anomaly::incorrect("rtdb.owned/durable-range", "Invalid placed range witness");
+        if token.len() > 2 * rtdb_node::MAX_DURABLE_RANGE_BYTES { return Err(invalid()); }
+        let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
+        let bytes = self.cipher.open("rtdb.multi/owned-range/v1", &sealed).map_err(|_| invalid())?;
+        if bytes.len() > rtdb_node::MAX_DURABLE_RANGE_BYTES { return Err(invalid()); }
+        Ok(bytes.to_vec())
+    }
 }
 
 /// The writers a node has opened, by deployment, for confirming leadership before a linearizable read.

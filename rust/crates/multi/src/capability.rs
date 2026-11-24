@@ -55,8 +55,8 @@ impl CellSecret {
         hmac::verify(&self.key, binding, proof).is_ok()
     }
 
-    pub(crate) fn flight_peer(&self, deployment: &str, epoch: u64, peer: IpAddr) -> String {
-        self.mint(&flight_peer_scope(deployment, epoch), &peer.to_string(), true, Duration::from_secs(60))
+    pub(crate) fn flight_peer(&self, deployment: &str, epoch: u64, fresh: bool, peer: IpAddr) -> String {
+        self.mint(&flight_peer_scope(deployment, epoch, fresh), &peer.to_string(), true, Duration::from_secs(60))
     }
 
     pub(crate) fn fresh_flight_peer(
@@ -114,8 +114,14 @@ impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
             return Ok((address, true));
         }
         let (deployment, epoch) = attachment_identity(attachment)?;
-        let scope = match epoch {
-            Some(epoch) => flight_peer_scope(&deployment, epoch),
+        let (peer, fresh) = match epoch {
+            Some(epoch) => {
+                let verify = |fresh| <Self as CapabilityVerifier>::verify(self, proof, &flight_peer_scope(&deployment, epoch, fresh));
+                match verify(true) {
+                    Ok(peer) => (peer, true),
+                    Err(_) => (verify(false)?, false),
+                }
+            }
             None => {
                 let storage = attachment_storage(attachment)?;
                 let Some(database_config::Log::OtherLog(log)) = &attachment.configuration().log else {
@@ -126,12 +132,12 @@ impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
                 if storage.compactor || storage.snapshot_block.is_some() || !log.require_read_index || log.deployment != deployment {
                     return Err(refused("The Flight SQL attachment has no active read index"));
                 }
-                fresh_flight_peer_scope(&deployment, log.epoch, log.log_epoch, &log.replica_stream, &storage.prefix)
+                let scope = fresh_flight_peer_scope(&deployment, log.epoch, log.log_epoch, &log.replica_stream, &storage.prefix);
+                (<Self as CapabilityVerifier>::verify(self, proof, &scope)?, true)
             }
         };
-        let peer = <Self as CapabilityVerifier>::verify(self, proof, &scope)?;
         let address = peer.principal.parse().map_err(|_| refused("The Flight SQL peer address is invalid"))?;
-        Ok((address, epoch.is_none()))
+        Ok((address, fresh))
     }
 }
 
@@ -159,7 +165,10 @@ pub(crate) fn attachment_storage(attachment: &rtdb_node::Database) -> Result<cra
     serde_json::from_slice(&config.value).map_err(|_| refused("The attachment has an invalid cell storage identity"))
 }
 
-fn flight_peer_scope(deployment: &str, epoch: u64) -> String { format!("~flight/peer/{deployment}/{epoch}") }
+fn flight_peer_scope(deployment: &str, epoch: u64, fresh: bool) -> String {
+    let role = if fresh { "fresh-holder" } else { "holder" };
+    format!("~flight/{role}/{deployment}/{epoch}")
+}
 
 fn ordered_reader_scope(
     placement: ordered_logkeeper::ordered::Placement, epoch: u64, enrollment: ordered_logkeeper::ordered::Enrollment,

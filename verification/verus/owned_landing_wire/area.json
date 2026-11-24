@@ -1,0 +1,79 @@
+{
+  "summary": "The production Flight decoder preserves hosted writer stamp and check intent, big-endian group lengths, the exact world fingerprint at the action cursor and the held row's revision metadata.",
+  "flags": ["--edition=2024", "--no-external-by-default"],
+  "min_verified_functions": 19,
+  "controls": {
+    "drop_writer_stamp": {
+      "defect": "Decode the installation comparison as a check for absence.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "find": "        ControlCommand::Check(expected)\n    } else if require_checks {\n        ControlCommand::Refuse\n    } else {\n        ControlCommand::Replace(expected)\n    }\n}",
+          "replace": "        ControlCommand::Check(None)\n    } else if require_checks {\n        ControlCommand::Refuse\n    } else {\n        ControlCommand::Replace(expected)\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "function": "hosted_control_command",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "reorder_group_length": {
+      "defect": "Swap the two bytes of the relation length or group count.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "find": "    ((bytes[0] as u16) << 8) | bytes[1] as u16",
+          "replace": "    ((bytes[1] as u16) << 8) | bytes[0] as u16"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "function": "group_u16",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "reorder_world_fingerprint": {
+      "defect": "Decode the world fingerprint in reverse byte order.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "find": "        fingerprint[i] = prefix[i];",
+          "replace": "        fingerprint[i] = prefix[31 - i];"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "function": "world_fingerprint",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "drop_held_revision": {
+      "defect": "Write a zero revision into held point metadata in place of the row's stamp.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "find": "        Some(at) => Some((REVISION, at)),",
+          "replace": "        Some(_) => Some((REVISION, 0)),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/owned_landing_wire.rs",
+          "function": "point_revision_metadata",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    }
+  }
+}

@@ -1499,14 +1499,14 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     body.extend(groups(&[("bj_fact_root_owner", &owner), ("bj_fact_root_program", &program), ("bj_relation_declarations", &declarations)]));
     let body = Bytes::from(body);
 
-    let refused = client.action("rtdb.owned.DecideHosted.v1", body.clone()).await.unwrap_err();
+    let refused = client.action("rtdb.owned.DecideHosted.v2", body.clone()).await.unwrap_err();
     assert!(refused.message().contains("lacks coverage"), "{refused}");
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 1);
     assert_eq!(integer(&client.query("SELECT count(*) FROM bj_relation_declarations").await[0], 0, 0), 1);
 
     relation.extend(declaration);
     client.action("rtdb.owned.DeclareSpatialPath.v1", relation.into()).await.unwrap();
-    client.action("rtdb.owned.DecideHosted.v1", body).await.unwrap();
+    client.action("rtdb.owned.DecideHosted.v2", body).await.unwrap();
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 2);
     let ordered = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner").await);
     assert_eq!(clock(&client.query("SELECT _system_from FROM bj_fact_root_program WHERE application_schema = 'new'").await), ordered);

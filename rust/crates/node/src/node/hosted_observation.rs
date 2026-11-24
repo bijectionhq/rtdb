@@ -7,7 +7,7 @@ use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, Timestamp, TransactionKey, Value};
 
 use crate::Database;
-use super::{AppliedCatalogAdmission, CatalogReadCut, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
+use super::{AppliedCatalogAdmission, CatalogReadCut, DurableRange, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
 use rtdb_query::QueryContext;
 
 /// One storage registration for a lower bound on the physical catalogs read by a prepared session.
@@ -246,6 +246,83 @@ async fn compare_controls(
         }
     }
     Ok(true)
+}
+
+impl NativeSession {
+    /// Validate an ordinary answer at a new, certified and protected journal cut.
+    pub async fn validate_durable_hosted_read(
+        &mut self,
+        scope: PlacedAttemptScope,
+        floor: &AppliedReadFloor,
+        until: Timestamp,
+        controls: &[HostedControlWrite],
+        points: &[AppliedOwnedPoint],
+        ranges: &[DurableRange],
+    ) -> Result<Option<AppliedReadConfirmation>> {
+        if self.placed_history()? != Some(scope) || controls.is_empty()
+            || controls.iter().any(|control| !control.is_check() || control.scope() != scope)
+            || points.iter().any(|point| point.relation.world().is_some() || point.relation.is_world_catalog())
+        {
+            return Err(unavailable());
+        }
+        let checks = ranges.iter().map(DurableRange::evidence);
+        let until = checks.clone().fold(until, |until, range| until.min(range.until));
+        if checks.clone().any(|range| range.scope != scope || !covers_transaction(floor.minimum(), range.basis)) {
+            return Err(unavailable());
+        }
+        let read = self.open_fresh_owned_read(floor.history(), Some(floor)).await?;
+        let observed = read.query_time()?;
+        if observed >= until || read.present.system_time >= until {
+            return Err(unavailable());
+        }
+        let guard = read.relation_release_guard_for(
+            checks.clone().map(|range| &range.relation).chain(points.iter().map(|point| &point.relation)),
+            true,
+        )?;
+        guard()?;
+        let database = read.context.catalog.database(&read.database)?;
+        let [captured] = database.partitions.as_slice() else { return Err(unavailable()); };
+        for range in checks {
+            let frontier = captured.relation_event_frontier(&range.relation.table(&read.owner))?;
+            if frontier == range.frontier { continue; }
+            let unchanged = match range.region.as_deref() {
+                Some(rtdb_types::OwnedRangeEvidence::FixedPath(evidence)) =>
+                    rtdb_query::verify_owned_fixed_range(
+                        &read.context, captured, &read.owner, &range.relation,
+                        range.basis.system_time, range.frontier, frontier, evidence,
+                    ).await?,
+                Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) =>
+                    rtdb_query::verify_owned_entity_region(
+                        &read.context, captured, &read.owner, &range.relation,
+                        range.basis.system_time, range.frontier, frontier, *anchor, region,
+                    ).await?,
+                None => false,
+            };
+            if !unchanged { return Ok(None); }
+        }
+        for point in points {
+            let at = if captured.contains_table(&point.relation.lifetime_table(&read.owner)) {
+                if point.valid_at > observed { return Err(unavailable()); }
+                observed
+            } else {
+                point.valid_at
+            };
+            let revision = rtdb_query::read_owned_point_revision(
+                Arc::clone(&read.context), &read.owner, &point.relation, &point.id, Interval::at(at)?,
+            ).await?;
+            if revision != point.expected { return Ok(None); }
+        }
+        for control in controls {
+            let point = rtdb_query::read_hosted_control_point(
+                Arc::clone(&read.context), control.table(), control.id(), false,
+            ).await?;
+            if point.row.map(|(_, revision)| revision) != control.expected() { return Ok(None); }
+        }
+        guard()?;
+        read.check()?;
+        if read.node.receiver_time().await? >= until { return Err(unavailable()); }
+        Ok(Some(AppliedReadConfirmation { covered: read.present, observed_at: observed }))
+    }
 }
 
 impl OwnedReadSession {

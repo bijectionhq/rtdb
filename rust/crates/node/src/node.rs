@@ -2,6 +2,8 @@ mod historical_owned_read;
 mod hosted_control;
 pub use hosted_control::RootCatalogRead;
 mod hosted_observation;
+mod durable_range;
+pub use durable_range::{DurableRange, MAX_DURABLE_RANGE_BYTES};
 pub use hosted_observation::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 use hosted_observation::PreparedAppliedCatalog;
 mod owned_changes;

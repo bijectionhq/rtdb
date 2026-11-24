@@ -1,5 +1,5 @@
 use rtdb_types::{
-    EntityId, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS, FixedRangeEvidence, FixedRangeKey,
+    EntityId, FIXED_RANGE_MAX_IDS, FixedRangeKey,
     FixedRangeRule, OwnedRelation,
 };
 
@@ -148,100 +148,5 @@ impl OpenTransaction<'_> {
             return Ok(Value::Null);
         };
         Ok(FixedRangeKey::from_cells(&value, id)?.to_value())
-    }
-
-    pub(super) async fn verify_fixed_range(
-        &self,
-        base: &Snapshot,
-        owner: &str,
-        relation: &OwnedRelation,
-        basis: Timestamp,
-        frontier: i64,
-        head_frontier: i64,
-        evidence: &FixedRangeEvidence,
-    ) -> Result<bool> {
-        let journal_frontier = base.relation_event_frontier(&relation.change_journal(owner)?)?;
-        let Some(head) = journal_frontier.checked_sub(1) else {
-            return Ok(false);
-        };
-        if evidence.revision < 0
-            || evidence.revision >= head
-            || head - evidence.revision > FIXED_RANGE_MAX_GROUPS
-        {
-            return Ok(false);
-        }
-        let context = self.context.query_context(
-            base.clone(),
-            self.tx_key().system_time,
-            &self.options.default_tz,
-            self.trace_parent,
-        )?;
-        let rule =
-            rtdb_query::read_owned_fixed_range_rule(Arc::clone(&context), owner, relation).await?;
-        if rule.as_ref() != Some(&evidence.rule) {
-            return Ok(false);
-        }
-        let anchor = rtdb_query::read_owned_change_entry(
-            Arc::clone(&context),
-            owner,
-            relation,
-            evidence.revision,
-        )
-        .await?;
-        if anchor.through_events != frontier
-            || (evidence.revision == 0 && (frontier != 0 || anchor.value != Value::Null))
-            || (evidence.revision != 0
-                && (anchor.system_time > basis
-                    || !matches!(anchor.value, Value::List(touches) if !touches.is_empty())))
-        {
-            return Ok(false);
-        }
-        let mut through = frontier;
-        let mut previous_time = basis;
-        let Some(head_time) = base.tx_basis().map(|key| key.system_time) else {
-            return Ok(false);
-        };
-        for revision in evidence.revision + 1..=head {
-            self.context.check_cancelled()?;
-            let entry = rtdb_query::read_owned_fixed_range_changes(
-                Arc::clone(&context),
-                owner,
-                relation,
-                revision,
-            )
-            .await?;
-            let Value::Struct(fields) = entry.value else {
-                return Ok(false);
-            };
-            let (Some(Value::I64(events)), Some(Value::List(sides))) =
-                (fields.get("event_count"), fields.get("sides"))
-            else {
-                return Ok(false);
-            };
-            if *events <= 0
-                || entry.system_time <= previous_time
-                || entry.system_time > head_time
-                || through.checked_add(*events) != Some(entry.through_events)
-                || sides.len() > FIXED_RANGE_MAX_IDS
-            {
-                return Ok(false);
-            }
-            for side in sides.iter() {
-                let Value::List(pair) = side.as_ref() else {
-                    return Ok(false);
-                };
-                if pair.len() != 2 {
-                    return Ok(false);
-                }
-                for key in pair.iter() {
-                    if *key != Value::Null && evidence.contains(&FixedRangeKey::from_value(key.as_ref())?) {
-                        return Ok(false);
-                    }
-                }
-            }
-            through = entry.through_events;
-            previous_time = entry.system_time;
-        }
-        Ok(through == head_frontier)
     }
 }

@@ -349,7 +349,7 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
         }
         if router.read_only && !prefer_holder
-            && let Ok(read) = route_ordered_reader(name, installed, options).await
+            && let Ok(read) = route_ordered_reader(name, installed, options, false).await
         {
             let server = connect_serving(&read.worker.pgwire, &read.worker.control, read.probe, options).await?;
             return Ok((server, Some(read.worker.control), read.epoch, installed.deployment.to_string()));
@@ -439,7 +439,7 @@ pub(crate) struct OrderedReaderRoute {
 }
 
 pub(crate) async fn route_ordered_reader(
-    name: &str, installed: &crate::journal::hosted::GatewayPlacement, options: &GatewayOptions,
+    name: &str, installed: &crate::journal::hosted::GatewayPlacement, options: &GatewayOptions, require_flight: bool,
 ) -> Result<OrderedReaderRoute> {
     let view = installed.journal.route().await?;
     let incumbent = view.writer.grant.map(|grant| grant.enrollment);
@@ -452,7 +452,7 @@ pub(crate) async fn route_ordered_reader(
         };
         let Ok((Response::OrderedRead { address, flight, proof }, probe)) =
             control::call_with_pgwire_probe(&worker.control, request, options.control_timeout, &key).await else { continue; };
-        if address == worker.pgwire && secret.verify_route(&control::ordered_read_binding(
+        if address == worker.pgwire && (!require_flight || flight.is_some()) && secret.verify_route(&control::ordered_read_binding(
             name, view.placement, worker.enrollment, view.writer.epoch, &address, flight.as_deref(),
         ), &proof) {
             return Ok(OrderedReaderRoute {

@@ -32,7 +32,6 @@ mod retry;
 mod retention;
 pub use retention::installed_receipt_time;
 mod fixed_range;
-mod owned_region;
 pub(crate) mod ordered_micros;
 mod replay_constraints;
 mod replay_worlds;
@@ -2212,13 +2211,18 @@ impl<'a> OpenTransaction<'a> {
                 }
                 let head = base.relation_event_frontier(&relation.table(owner))?;
                 if head != *frontier {
-                    let exact = match region.as_deref() {
-                        Some(rtdb_types::OwnedRangeEvidence::FixedPath(evidence)) =>
-                            self.verify_fixed_range(&base, owner, relation, basis.system_time, *frontier, head, evidence).await,
-                        Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) =>
-                            self.verify_owned_entity_region(&base, owner, relation, basis.system_time, *frontier, head, *anchor, region).await,
-                        None => Ok(false),
-                    }.unwrap_or(false);
+                    let exact = async {
+                        let Some(region) = region.as_deref() else { return Ok(false); };
+                        let context = self.context.query_context(
+                            base.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+                        )?;
+                        match region {
+                            rtdb_types::OwnedRangeEvidence::FixedPath(evidence) =>
+                                rtdb_query::verify_owned_fixed_range(&context, &base, owner, relation, basis.system_time, *frontier, head, evidence).await,
+                            rtdb_types::OwnedRangeEvidence::Entity { anchor, region } =>
+                                rtdb_query::verify_owned_entity_region(&context, &base, owner, relation, basis.system_time, *frontier, head, *anchor, region).await,
+                        }
+                    }.await.unwrap_or(false);
                     if !exact {
                         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range",
                             "The observed owned relation changed before ordering"));

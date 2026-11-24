@@ -50,6 +50,8 @@ pub trait PlacedReceiptCodec: Send + Sync {
     fn open(&self, token: &str) -> Result<Vec<u8>>;
     fn seal_snapshot(&self, value: &[u8]) -> Result<String>;
     fn open_snapshot(&self, token: &str) -> Result<Vec<u8>>;
+    fn seal_range(&self, value: &[u8]) -> Result<String> { self.seal(value) }
+    fn open_range(&self, token: &str) -> Result<Vec<u8>> { self.open(token) }
 }
 
 pub(crate) enum PlacedToken {

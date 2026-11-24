@@ -26,6 +26,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
 use uuid::Uuid;
 
+use crate::owned_landing_wire::{self, ControlCommand};
 use crate::{
     error::{arrow, invalid, status, unsupported},
     lease::Leased,
@@ -34,7 +35,9 @@ use crate::{
     upload, wire,
 };
 
-pub(crate) const DECIDE_HOSTED_V1: &str = "rtdb.owned.DecideHosted.v1";
+pub(crate) const SEAL_HOSTED_RANGES_V1: &str = "rtdb.owned.SealHostedRanges.v1";
+pub(crate) const VALIDATE_FRESH_HOSTED_V1: &str = "rtdb.owned.ValidateFreshHosted.v1";
+pub(crate) const DECIDE_HOSTED_V2: &str = "rtdb.owned.DecideHosted.v2";
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
@@ -190,7 +193,7 @@ fn ordered_group_count(body: &[u8]) -> Result<usize, Status> {
 
 fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<(OwnedRelation, &[u8])>, Status> {
     let (count, mut rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no group count"))?;
-    let count = usize::from(u16::from_be_bytes(*count));
+    let count = usize::from(owned_landing_wire::group_u16(count));
     let limit = if ordered { MAX_GROUPED_COMMIT_ROWS } else { MAX_COMMIT_GROUPS };
     if count > limit || (require_writes && count == 0) {
         return Err(invalid("Owned commit has an invalid relation group count"));
@@ -206,7 +209,7 @@ fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<
             return Err(invalid("Owned commit exceeds its distinct relation limit"));
         }
         let (length, framed) = framed.split_first_chunk::<4>().ok_or_else(|| invalid("Owned commit group has no Arrow length"))?;
-        let length = u32::from_be_bytes(*length) as usize;
+        let length = owned_landing_wire::group_u32(length) as usize;
         let (arrow, tail) = framed.split_at_checked(length).ok_or_else(|| invalid("Owned commit group Arrow stream is truncated"))?;
         if arrow.is_empty() {
             return Err(invalid("Owned commit group Arrow stream is empty"));
@@ -332,7 +335,6 @@ const OWNED_SEARCH_TOTAL: &str = "rtdb.owned.search_total";
 const OWNED_SEARCH_SCOPE: &str = "rtdb.owned.search_scope";
 const OWNED_SEARCH_WITNESSES: &str = "rtdb.owned.search_witnesses";
 const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
-const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
 const OWNED_ASSERTION_ORDINAL: &str = "rtdb.owned.assertion_ordinal";
 const OWNED_ASSERTION_LINE: &str = "rtdb.owned.assertion_line";
 const OWNED_ASSERTION_HELD_READING: &str = "rtdb.owned.assertion_held_reading_micros";
@@ -624,7 +626,7 @@ fn count_component(body: &[u8], maximum: usize) -> Result<(&[u8], &[u8]), Status
 
 fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     let (length, rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned action has no relation length"))?;
-    let length = usize::from(u16::from_be_bytes(*length));
+    let length = usize::from(owned_landing_wire::group_u16(length));
     let (name, arrow_bytes) = rest.split_at_checked(length).ok_or_else(|| invalid("Owned action relation is truncated"))?;
     if length > 96 { return Err(invalid("Owned action relation exceeds its length limit")); }
     let name = std::str::from_utf8(name).map_err(arrow)?;
@@ -1068,6 +1070,95 @@ impl Service {
         Ok((OwnedClockSlot { through, reading }, body))
     }
 
+    /// Seal only observations the original native hold actually issued.
+    pub(crate) async fn seal_hosted_ranges_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let (witnesses, rest, _witness_charge) = self.owned_witness_prefix(call, body, false)?;
+        if !rest.is_empty() { return Err(invalid("Unexpected input after the hosted range witnesses")); }
+        let mut bytes = Vec::new();
+        let mut charges = Vec::with_capacity(witnesses.len());
+        for (held, witness) in witnesses {
+            let cap = wire::add(4096, wire::mul(witness.retained_bytes(), 12)?)?
+                .min(3 * rtdb_node::MAX_DURABLE_RANGE_BYTES);
+            charges.push(call.reserve(cap)?);
+            let token = held.snapshot.seal_durable_range(&witness).map_err(status)?;
+            bytes.extend_from_slice(&u32::try_from(token.len()).map_err(arrow)?.to_be_bytes());
+            bytes.extend_from_slice(token.as_bytes());
+        }
+        let charge = call.reserve(bytes.len())?;
+        Ok(ActionResult { body: wire::retain(Bytes::from(bytes), charge) })
+    }
+
+    fn durable_hosted_ranges<'a>(&self, body: &'a [u8]) -> Result<(Vec<&'a str>, &'a [u8]), Status> {
+        let (length, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Hosted validation has no range count"))?;
+        let count = usize::from(u16::from_be_bytes(*length));
+        if count > MAX_RANGE_WITNESSES { return Err(invalid("Too many hosted range witnesses")); }
+        let mut witnesses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (length, rest) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing durable range length"))?;
+            let length = u32::from_be_bytes(*length) as usize;
+            if length == 0 || length > 2 * rtdb_node::MAX_DURABLE_RANGE_BYTES {
+                return Err(invalid("Invalid durable range length"));
+            }
+            let (token, rest) = rest.split_at_checked(length).ok_or_else(|| invalid("Truncated durable range"))?;
+            witnesses.push(std::str::from_utf8(token).map_err(|_| invalid("Invalid durable range encoding"))?);
+            body = rest;
+        }
+        Ok((witnesses, body))
+    }
+
+    async fn open_durable_hosted_ranges(&self, call: &Call, tokens: Vec<&str>) -> Result<Vec<rtdb_node::DurableRange>, Status> {
+        if tokens.is_empty() { return Ok(Vec::new()); }
+        let connection = self.connection(call, &call.database).await?;
+        let native = connection.borrow().await?;
+        require_idle(&native)?;
+        tokens.into_iter().map(|token| native.open_durable_range(token).map_err(status)).collect()
+    }
+
+    pub(crate) async fn validate_fresh_hosted_action(
+        &self, call: &Call, envelope: &Bytes,
+    ) -> Result<ActionResult, Status> {
+        let policy = self.hosted_control_policy(call)?;
+        if call.session.audience_source().is_some() { return Err(unsupported()); }
+        let (floor, body) = hosted_observation::applied_read_floor(envelope)?;
+        let (tokens, body) = self.durable_hosted_ranges(body)?;
+        let token_bytes = tokens.iter().map(|token| token.len()).sum();
+        let _witness_charge = call.reserve(wire::add(4096, wire::mul(token_bytes, 4)?)?)?;
+        let ranges = self.open_durable_hosted_ranges(call, tokens).await?;
+        let (until, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted validation has no deadline"))?;
+        let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted validation has no fact group length"))?;
+        let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Truncated hosted validation fact groups"))?;
+        let count = ordered_group_count(facts)?;
+        let _framing = call.reserve((count + MAX_COMMIT_GROUPS) * 512)?;
+        let facts = owned_groups(facts, false, true)?;
+        let controls = owned_groups(controls, true, false)?;
+        let fact_relations = facts.iter().map(|(relation, _)| relation).collect::<BTreeSet<_>>();
+        if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS {
+            return Err(invalid("Hosted validation exceeds its group limit"));
+        }
+        hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
+        let scope = self.hosted_control_scope(call).await?;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(ranges.len())
+            .ok_or_else(|| invalid("Hosted validation exceeds its condition limit"))?;
+        let (controls, _controls) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, true)?;
+        let mut operations = Vec::new();
+        let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut operations, &mut rows_left, CommitEffects::Facts)?;
+        let _points = call.reserve(wire::mul(operations.len(), std::mem::size_of::<rtdb_node::AppliedOwnedPoint>())?)?;
+        let points = operations.into_iter().map(|operation| match operation {
+            TxOp::OwnedCheck { relation, id, valid_at, expected } =>
+                Ok(rtdb_node::AppliedOwnedPoint { relation, id, valid_at, expected }),
+            _ => Err(invalid("Hosted validation supports only point and control checks")),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        let confirmation = native.validate_durable_hosted_read(
+            scope, &floor, Timestamp(i64::from_be_bytes(*until)), &controls, &points, &ranges,
+        ).await.map_err(status)?;
+        hosted_observation::confirmation_reply(call, confirmation)
+    }
+
     pub(crate) async fn decide_hosted_action(
         &self, call: &Call, envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
@@ -1112,7 +1203,10 @@ impl Service {
         } else {
             (Vec::new(), body, Vec::new())
         };
-        let (witnesses, body, _witness_charge) = self.owned_witness_prefix(call, body, true)?;
+        let (tokens, body) = self.durable_hosted_ranges(body)?;
+        let token_bytes = tokens.iter().map(|token| token.len()).sum();
+        let _witness_charge = call.reserve(wire::add(4096, wire::mul(token_bytes, 4)?)?)?;
+        let witnesses = self.open_durable_hosted_ranges(call, tokens).await?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted commit has no deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
         let (journal_before, body) = if recheck_at_staging {
@@ -1153,10 +1247,8 @@ impl Service {
         if recheck_at_staging && (replay || controls.iter().all(rtdb_tx::HostedControlWrite::is_check)) {
             return Err(invalid("A staging deadline requires a live hosted control replacement"));
         }
-        if replay {
-            for (held, _) in &witnesses {
-                held.snapshot.require_unscoped_root().map_err(status)?;
-            }
+        if replay && witnesses.iter().any(rtdb_node::DurableRange::requires_live_root) {
+            return Err(invalid("Scoped evidence requires live Root custody"));
         }
         if replay && (counted || !worlds.is_empty()) {
             return Err(invalid("Native replay admits an original effect batch"));
@@ -1164,6 +1256,7 @@ impl Service {
         let effects = CommitEffects::hosted(replay, counted || !worlds.is_empty(), &controls);
         let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
+        writes.extend(witnesses.into_iter().map(rtdb_node::DurableRange::operation));
         let _refusal = if let Some(refusal) = refusal {
             if replay {
                 return Err(invalid("A hosted constraint decision requires live Root custody"));
@@ -1195,7 +1288,7 @@ impl Service {
         if let Some(tick) = slot {
             self.wait_for_clock_slot(call, tick).await?;
         }
-        self.owned_write_reply_with_reads(call, writes, witnesses, worlds).await
+        self.owned_write_reply_with_reads(call, writes, Vec::new(), worlds).await
     }
 
     fn decode_hosted_control_groups(
@@ -1210,11 +1303,12 @@ impl Service {
             let batch = request_batch(call, arrow)?;
             let rows = batch.batch().num_rows();
             let schema = batch.batch().schema_ref();
+            let (id_column, expected_column, check_column) = owned_landing_wire::hosted_check_columns();
             let exact_type = |name, kind| schema.field_with_name(name).is_ok_and(|field| field.data_type() == &kind);
             let unique = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
             if rows == 0 || unique.len() != schema.fields().len() || schema.fields().len() > 131
-                || (schema.index_of("_check_only").is_ok() && !exact_type("_check_only", DataType::Boolean))
-                || !exact_type("_id", DataType::Utf8) || !exact_type("_expected_micros", DataType::Int64)
+                || (schema.index_of(check_column).is_ok() && !exact_type(check_column, DataType::Boolean))
+                || !exact_type(id_column, DataType::Utf8) || !exact_type(expected_column, DataType::Int64)
             {
                 return Err(invalid("Hosted controls require distinct fields, Utf8 IDs and explicit Int64 expectations"));
             }
@@ -1225,9 +1319,9 @@ impl Service {
             if !require_checks && HostedControlWrite::supports_arrow_catalog(&relation)
                 && schema.fields().iter().all(|field| field.metadata().is_empty())
             {
-                let expected = batch.batch().column_by_name("_expected_micros").and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                let expected = batch.batch().column_by_name(expected_column).and_then(|column| column.as_any().downcast_ref::<Int64Array>())
                     .ok_or_else(|| invalid("Hosted control expectation must be Int64 or null"))?;
-                let checks = batch.batch().column_by_name("_check_only").and_then(|column| column.as_any().downcast_ref::<BooleanArray>());
+                let checks = batch.batch().column_by_name(check_column).and_then(|column| column.as_any().downcast_ref::<BooleanArray>());
                 for row in 0..rows {
                     if checks.is_none_or(|checks| !checks.is_null(row) && !checks.value(row)) {
                         let positions = owned_payload_columns(batch.batch(), row, &["_expected_micros", "_check_only"])?;
@@ -3805,7 +3899,7 @@ impl Service {
         let (until, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no expiry"))?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("The retained child has no commit deadline"))?;
         let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("The retained child has no attempt identity"))?;
-        let (fingerprint, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("The retained child has no fingerprint"))?;
+        let (fingerprint, body) = owned_landing_wire::world_fingerprint(body).ok_or_else(|| invalid("The retained child has no fingerprint"))?;
         let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid retained child attempt"))?;
         if child == &[0; 16] || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
             return Err(invalid("Invalid retained child identity or attempt"));
@@ -3835,7 +3929,7 @@ impl Service {
             rtdb_node::OwnedWorldFork {
                 world: child, pin: child, previous: None, sibling: None, cut,
                 requested,
-                deadline, attempt: attempt.to_owned(), fingerprint: *fingerprint, controls, root: None,
+                deadline, attempt: attempt.to_owned(), fingerprint, controls, root: None,
             },
         ).await.map_err(status)?;
         if *registered.as_bytes() != child.0 { return Err(unsupported()); }
@@ -3898,7 +3992,7 @@ impl Service {
             _ => return Err(invalid("Invalid world fork clock mode")),
         };
         let (attempt, rest) = rest.split_first_chunk::<22>().ok_or_else(|| invalid("World fork has no attempt identity"))?;
-        let (fingerprint, groups) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("World fork has no fingerprint"))?;
+        let (fingerprint, groups) = owned_landing_wire::world_fingerprint(rest).ok_or_else(|| invalid("World fork has no fingerprint"))?;
         let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world fork attempt identity"))?;
         if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
             return Err(invalid("Invalid world fork attempt identity"));
@@ -4080,7 +4174,7 @@ impl Service {
                 previous: original.map(|world| world.parent_pin()),
                 sibling: previous.as_ref().filter(|_| sibling).map(|held| rtdb_types::Iid(*held.world.as_bytes())),
                 cut, requested, deadline,
-                attempt: attempt.into(), fingerprint: *fingerprint, controls, root: publish_root.then_some(root),
+                attempt: attempt.into(), fingerprint, controls, root: publish_root.then_some(root),
             },
         ).await.map_err(status)?;
         if registered.as_bytes() != world { return Err(unsupported()); }
@@ -4105,7 +4199,7 @@ impl Service {
         };
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world batch deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
-        let (fingerprint, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world batch fingerprint"))?;
+        let (fingerprint, body) = owned_landing_wire::world_fingerprint(body).ok_or_else(|| invalid("Missing world batch fingerprint"))?;
         let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing world batch count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
         if !(1..=8).contains(&count) { return Err(invalid("A world batch requires one to eight worlds")); }
@@ -4398,7 +4492,7 @@ impl Service {
         let observed = take_held_world_observations(&mut observations)?;
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            sections, root, observed, *fingerprint, controls, deadline,
+            sections, root, observed, fingerprint, controls, deadline,
         ).await.map_err(status)?;
         drop(observations);
         self.owned_tx_reply(&session, committed).await
@@ -4612,7 +4706,9 @@ impl Service {
         let mut metadata = schema.metadata().clone();
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
         metadata.insert(OWNED_VALID.into(), valid.0.to_string());
-        if let Some(revision) = revision { metadata.insert(OWNED_REVISION.into(), revision.0.to_string()); }
+        if let Some((key, at)) = owned_landing_wire::point_revision_metadata(revision.map(|time| time.0)) {
+            metadata.insert(key.into(), at.to_string());
+        }
         if let Some(until) = until { metadata.insert("rtdb.owned.until_micros".into(), until.0.to_string()); }
         if let Some(batch) = batch.filter(|batch| batch.column_by_name("_assertion_ordinal").is_some()) {
             if batch.num_rows() != 1 {
@@ -4796,21 +4892,21 @@ fn hosted_control_row(
     use rtdb_tx::HostedControlWrite;
 
     strip_owned_absence(&mut row)?;
-    let expected = match row.remove("_expected_micros") {
-        Some(Value::I64(time)) => Some(Timestamp(time)),
+    let (_, expected_column, check_column) = owned_landing_wire::hosted_check_columns();
+    let expected = match row.remove(expected_column) {
+        Some(Value::I64(time)) => Some(time),
         Some(Value::Null) => None,
         _ => return Err(invalid("Hosted control expectation must be Int64 or null")),
     };
-    let check_only = match row.remove("_check_only") {
+    let check_only = match row.remove(check_column) {
         Some(Value::Bool(check_only)) => check_only,
         None => false,
         _ => return Err(invalid("Hosted control check flag must be Boolean")),
     };
-    if require_checks && !check_only { return Err(invalid("Read validation permits only hosted control checks")); }
-    if check_only {
-        HostedControlWrite::check(relation.clone(), scope, expected, row)
-    } else {
-        HostedControlWrite::new(relation.clone(), scope, expected, row)
+    match owned_landing_wire::hosted_control_command(expected, check_only, require_checks) {
+        ControlCommand::Check(expected) => HostedControlWrite::check(relation.clone(), scope, expected.map(Timestamp), row),
+        ControlCommand::Replace(expected) => HostedControlWrite::new(relation.clone(), scope, expected.map(Timestamp), row),
+        ControlCommand::Refuse => return Err(invalid("Read validation permits only hosted control checks")),
     }.map_err(status)
 }
 
@@ -4822,7 +4918,7 @@ fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), 
     };
     for field in absent.iter() {
         let Value::Utf8(name) = field.as_ref() else { return Err(invalid("Owned _absent field must be text")); };
-        if name.starts_with('_') || !matches!(row.get(name.as_str()), Some(Value::Null | Value::Undefined)) {
+        if !owned_landing_wire::absence_payload_column(name.as_bytes()) || !matches!(row.get(name.as_str()), Some(Value::Null | Value::Undefined)) {
             return Err(invalid("Owned _absent may name only distinct null payload cells"));
         }
         row.remove(name.as_str());
