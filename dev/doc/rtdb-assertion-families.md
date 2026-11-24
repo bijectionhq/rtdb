@@ -351,11 +351,15 @@ Bijection's direct app landing resolves the approved branch at its original audi
 The Proposal owner and Root hold bind the deployment, serving incarnation, concrete label registration, installed grant catalog and exact table declaration.
 The current caller's Clear grant and the original approval invitation are checked independently.
 The private acceptance names that audience commitment and orders its current authority checks together with the selected world point and Root predecessor.
-The initial admitted case is one unindexed, acceptance-valid keyed creation on an unchanged Root publication.
-The exact key must retain the reviewed protected incarnation and have no Root winner.
-The original registered execution receipt authenticates the sealed review commitment and the guest rerun command, which is sealed under the source family.
+The admitted direct app cases are an acceptance-valid keyed creation and that creation followed by one registered rewrite of its original copy in the same Proposal.
+Both require an unchanged Root publication, the same complete key and protected incarnation, and no Root winner.
+For a pair, the reviewer authenticates both original receipt pairs and both exact ordered source cuts, including the retained creation and the winning rewrite.
+Each registered execution receipt authenticates its sealed review commitment and its guest rerun command, which is sealed under the same source family.
+Each receipt and observation consumes its place in the Proposal's original exact review budget.
 The replay ciphertext has a fresh derived stage at the authoring Proposal, with relation `bj_fact_root_admission` and a 64-byte lowercase hexadecimal receipt-and-position commitment as its slot.
-The original vault admits this slot only at a live Proposal and includes its capability in the ordinary family fence inventory.
+The original vault admits this command slot only at a live Proposal and includes its capability in the ordinary family fence inventory.
+Both guest commands rerun and match their registered effects. In the atomic Root publication the final image supplies the single visible copy and any indexed projection.
+The private receipt retains both compared decisions. The family reservation names the original member, and the sealed link names the actual winning world assertion and its order.
 The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
 The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
 
