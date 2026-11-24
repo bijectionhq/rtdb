@@ -242,7 +242,7 @@ impl Service {
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: Some(basis_wire(basis)),
-                    incarnation: Vec::new(),
+                    incarnation: basis.incarnation().to_vec(),
                 }
                 .encode_to_vec())
             }
@@ -320,7 +320,7 @@ impl Service {
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: Some(basis_wire(basis)),
-                    incarnation: Vec::new(),
+                    incarnation: basis.incarnation().to_vec(),
                 }
                 .encode_to_vec())
             }

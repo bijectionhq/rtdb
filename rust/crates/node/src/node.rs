@@ -1239,7 +1239,13 @@ impl Node {
             .transfer_managed_database(source, destination, transfer, cancellation).await?;
         let database = self.database_or_attach(destination.to_owned(), configuration)
             .await?.ok_or_else(closed)?;
-        self.catalog.with_current_attachment(&database, || Ok(basis))
+        self.catalog.with_current_attachment(&database, || {
+            if database.serving_driver().is_some_and(|driver| driver.incarnation() == basis.incarnation()) {
+                Ok(basis)
+            } else {
+                Err(Anomaly::fault("rtdb/deployment-incarnation", "The attachment differs from the restored deployment"))
+            }
+        })
     }
 
     /// Checks a held inherited carrier before the Original owner opens it for delivery.

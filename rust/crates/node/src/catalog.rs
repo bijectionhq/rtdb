@@ -108,7 +108,13 @@ impl DatabaseCatalog {
         self.with_current_attachment(original, || Ok(()))?;
         self.with_current_attachment(restored, || Ok(()))?;
         let cut = target.restore_checkpoint(export, cancellation).await?;
-        self.with_current_attachment(restored, || Ok(cut.basis))
+        self.with_current_attachment(restored, || {
+            if cut.basis.incarnation() == target.incarnation() {
+                Ok(cut.basis)
+            } else {
+                Err(Anomaly::fault("rtdb/deployment-incarnation", "The restored cut differs from the installed deployment"))
+            }
+        })
     }
 
     pub(crate) fn new(membership: Membership) -> Arc<Self> {

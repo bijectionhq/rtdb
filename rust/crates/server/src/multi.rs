@@ -1477,6 +1477,7 @@ mod tests {
                 .await
                 .unwrap();
                 let recovered = admin.restore(request).await.unwrap();
+                assert_eq!(recovered.incarnation.as_slice(), applied.incarnation().as_slice());
                 assert_eq!(
                     recovered.basis.unwrap().value.as_slice(),
                     &applied.to_bytes()

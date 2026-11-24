@@ -19,7 +19,7 @@ message CreateDeploymentRequest {
 message Deployment {
   string deployment = 1;
   rtdb.v1.Basis basis = 2;
-  // The attached database incarnation confirmed by CreateDeployment.
+  // The attached database incarnation confirmed by Create, Restore or Fork.
   bytes incarnation = 3;
 }
 message DeleteDeploymentRequest { string deployment = 1; }
