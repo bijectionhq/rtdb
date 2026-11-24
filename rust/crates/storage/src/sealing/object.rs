@@ -26,6 +26,7 @@ pub fn framed(key: &ObjectKey) -> bool {
     let key = key.as_str();
     (key.starts_with("tables/") && key.contains("/data/") && key.ends_with(".arrow"))
         || rtdb_format::entity_history::is_ranged_artefact(key)
+        || rtdb_format::keys::is_ranged_spatial_artefact(key)
         || rtdb_format::search_manifest::is_ranged_run(key)
         || rtdb_format::entity_directory::page_digest(key).is_some()
         || rtdb_format::term_directory::page_digest(key).is_some()
@@ -512,6 +513,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn ranged_spatial_postings_use_authenticated_frames() {
+        use rtdb_format::keys::{SPATIAL_ARTEFACT_KIND, TableSlug, spatial_posting_id};
+
+        let table = TableSlug::recorded("public$docs").unwrap();
+        let trie = "l00-rc-b00".parse().unwrap();
+        let key = |id: &str| ObjectKey::new(table.artefact_key(&trie, SPATIAL_ARTEFACT_KIND, id, 1).unwrap()).unwrap();
+        assert!(framed(&key(&spatial_posting_id("nearby"))));
+        assert!(!framed(&key("nearby~f2")));
+    }
 
     #[tokio::test]
     async fn arrow_byte_path_framed_file_matches_the_original_authenticated_object_bytes() {

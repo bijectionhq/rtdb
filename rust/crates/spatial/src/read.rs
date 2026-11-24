@@ -1,7 +1,8 @@
-use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, ops::Range, sync::Arc};
 
 use arrow_array::{Float64Array, RecordBatch, StructArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use bytes::Bytes;
 use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
     BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
@@ -234,11 +235,8 @@ async fn definition_ready(context: Arc<QueryContext>, definition: &definition::D
     let mut uncovered = Vec::new();
     for trie in snapshot.trie_entries(&definition.table) {
         context.check_cancelled()?;
-        let available = trie.artefact(&artefact.kind, &artefact.id, artefact.version).is_some_and(|record| {
-            record.file_size.and_then(|size| u64::try_from(size).ok())
-                .is_some_and(|size| (1..=postings::MAX_FILE_BYTES).contains(&size))
-                && record.stats.as_ref().is_some_and(|digest| digest.len() == 32)
-        });
+        let available = trie.artefact(&artefact.kind, &artefact.id, artefact.version)
+            .is_some_and(|record| postings::Root::from_record(record).is_ok());
         if available { continue; }
         if rtdb_maintenance::wants(&artefact, &trie.key, trie.data_file_size, snapshot.trie_catalog().file_size_target()) {
             return Ok(false);
@@ -671,6 +669,7 @@ pub(super) async fn visit_matches(
     let partition = (request.partition.len() == definition.partition.len())
         .then(|| Partition::of(request.partition.iter().map(|part| part.as_ref())));
     let mut candidates = Candidates::new(&context.memory)?;
+    let mut indexed_bytes = 0;
     let database = context
         .catalog
         .database(context.catalog.default_database())?;
@@ -684,51 +683,46 @@ pub(super) async fn visit_matches(
             .table_entry(&definition.table)
             .ok_or_else(postings::work_limit)?;
         if let Some(record) = trie.artefact(definition::KIND, &reference, definition.generation)
-            && let (Some(size), Some(digest)) = (
-                record
-                    .file_size
-                    .and_then(|size| u64::try_from(size).ok())
-                    .filter(|size| (1..=postings::MAX_FILE_BYTES).contains(size)),
-                record.stats.as_deref(),
-            )
+            && let Ok(root) = postings::Root::from_record(record)
         {
-            charge_bytes(&mut candidates.indexed_bytes, size, MAX_INDEXED_BYTES)?;
             let key = ObjectKey::new(table.slug.recorded_artefact_key(&trie.key, record)?)?;
-            let length = usize::try_from(size).map_err(|_| postings::work_limit())?;
-            match database
-                .storage
-                .get_exact_cached_or(&key, length, &context.memory)
-                .await
-            {
-                Ok(bytes) => {
-                    let check = || context.check_cancelled();
-                    check()?;
-                    let computed = bytes.sha256(|bytes| postings::sha256(bytes, &check))?;
-                    match postings::verify_digest(computed, digest).and_then(|()| postings::candidates(
-                        bytes,
-                        partition,
-                        &region.ranges,
-                        &context.memory,
-                        check,
-                        |iid| candidates.insert(iid),
-                    )) {
-                        Ok(()) => continue,
-                        Err(error) if error.code == "rtdb.spatial/postings" => { database.storage.evict(&key); }
-                        Err(error) => return Err(error),
+            let storage = &database.storage;
+            let result = async {
+                let size = root.range().end;
+                let whole = if storage.object_store().supports_scan_ranges(&key) {
+                    if storage.scan_length(&key).await.map_err(posting_read_error)? != size {
+                        return Err(postings::corrupt("Spatial posting object length differs from its catalog receipt"));
                     }
-                }
-                Err(error) => {
-                    let error = Anomaly::from(error);
-                    if matches!(
-                        error.category,
-                        AnomalyCategory::Forbidden | AnomalyCategory::Busy
-                    ) || error.code == "rtdb.storage/read-lease-expired"
-                    {
-                        return Err(error);
-                    }
-                }
+                    None
+                } else {
+                    charge_bytes(&mut indexed_bytes, size, MAX_INDEXED_BYTES)?;
+                    Some(storage.get_exact_cached_or(&key, size as usize, &context.memory).await.map_err(posting_read_error)?)
+                };
+                postings::candidates(
+                    root,
+                    partition,
+                    &region.ranges,
+                    &context.memory,
+                    || context.check_cancelled(),
+                    async |range: Range<u64>| {
+                        let lease = if let Some(whole) = &whole {
+                            whole.slice(range.start as usize..range.end as usize).map_err(posting_read_error)?
+                        } else {
+                            charge_bytes(&mut indexed_bytes, range.end - range.start, MAX_INDEXED_BYTES)?;
+                            storage.scan_range(&key, range, &context.memory).await.map_err(posting_read_error)?
+                        };
+                        Ok(Bytes::from_owner(lease))
+                    },
+                    |iid| candidates.insert(iid),
+                ).await
+            }.await;
+            match result {
+                Ok(()) => continue,
+                Err(error) if error.code == postings::CORRUPT => { storage.evict(&key); }
+                Err(error) => return Err(error),
             }
         }
+        context.check_cancelled()?;
         let size = u64::try_from(trie.data_file_size).map_err(|_| postings::work_limit())?;
         charge_bytes(&mut candidates.unindexed_bytes, size, MAX_UNINDEXED_BYTES)?;
         let rows = rtdb_query::visit_trie_iids(
@@ -865,7 +859,6 @@ struct Candidates {
     allowance: Arc<MemoryReservation>,
     unindexed_rows: usize,
     unindexed_bytes: u64,
-    indexed_bytes: u64,
 }
 
 impl Candidates {
@@ -875,7 +868,6 @@ impl Candidates {
             allowance: memory.reserve(0)?,
             unindexed_rows: 0,
             unindexed_bytes: 0,
-            indexed_bytes: 0,
         })
     }
 
@@ -924,6 +916,17 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
         .filter(|bytes| *bytes <= limit)
         .ok_or_else(postings::work_limit)?;
     Ok(())
+}
+
+fn posting_read_error(error: rtdb_storage::Error) -> Anomaly {
+    let error = Anomaly::from(error);
+    if matches!(error.category, AnomalyCategory::Forbidden | AnomalyCategory::Busy | AnomalyCategory::Interrupted)
+        || error.code == "rtdb.storage/read-lease-expired"
+    {
+        error
+    } else {
+        postings::corrupt(error)
+    }
 }
 
 #[cfg(test)]
