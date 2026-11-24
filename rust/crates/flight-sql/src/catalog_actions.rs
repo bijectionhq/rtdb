@@ -396,13 +396,14 @@ fn catalog_inserts(
         .map_err(status)?;
     let text = LogicalType::Scalar(ScalarType::Utf8);
     let integer = LogicalType::Scalar(ScalarType::I64);
+    let binary = LogicalType::Scalar(ScalarType::Binary);
     let types = [
         text.clone(),
         integer.clone(),
-        text.clone(),
+        binary.clone(),
         integer.clone(),
         text.clone(),
-        LogicalType::Scalar(ScalarType::Binary).maybe(),
+        binary.maybe(),
         integer.maybe(),
         text.clone(),
         LogicalType::list(text),
@@ -414,9 +415,9 @@ fn catalog_inserts(
         );
         let end = (start + INSERT_ROWS).min(batch.num_rows());
         let bytes = (start..end).try_fold(4096, |total, row| {
-            let strings = [
+            let fields = [
                 ids.value(row).len(),
-                wire::mul(keys.value(row).len(), 2)?,
+                keys.value(row).len(),
                 op_values.value(ops.keys().value(row) as usize).len(),
                 label_values.value(labels.keys().value(row) as usize).len(),
                 if values.is_null(row) {
@@ -425,7 +426,7 @@ fn catalog_inserts(
                     values.value(row).len()
                 },
             ];
-            let bytes = strings
+            let bytes = fields
                 .into_iter()
                 .try_fold(wire::add(total, 2048)?, wire::add)?;
             list_range(units, row).try_fold(bytes, |bytes, index| {
@@ -441,17 +442,13 @@ fn catalog_inserts(
             }
             let op = op_values.value(ops.keys().value(row) as usize);
             let label = label_values.value(labels.keys().value(row) as usize);
-            let mut key = String::with_capacity(keys.value(row).len() * 2);
-            for byte in keys.value(row) {
-                write!(key, "{byte:02x}").expect("String writes do not fail");
-            }
             let units = list_range(units, row)
                 .map(|i| Value::Utf8(unit_values.value(i).to_owned()))
                 .collect();
             args.extend([
                 Value::Utf8(ids.value(row).to_owned()),
                 Value::I64(worlds.value(row)),
-                Value::Utf8(key),
+                Value::Binary(keys.value(row).to_vec()),
                 Value::I64(ordinals.value(row)),
                 Value::Utf8(op.to_owned()),
                 if values.is_null(row) {
