@@ -160,7 +160,7 @@ impl<S> VisitMut for StatementTree<S> {
             Syntax::Erase(delete) => delete.visit(visitor)?,
             Syntax::Assert(value, _) | Syntax::Set { value, .. } => value.visit(visitor)?,
             Syntax::Records { records, .. } => records.visit(visitor)?,
-            Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => (),
+            Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => (),
         }
         for clause in &mut self.temporal { clause.extent.visit(visitor)?; }
         self.settings.visit(visitor)
@@ -223,7 +223,7 @@ impl<'input> ParsedStatement<'input> {
         match &self.tree.statement {
             Syntax::Standard(statement) => standard(statement),
             Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Records { .. } | Syntax::CreateTable { .. }
-            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } => true,
+            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } => true,
             _ => false,
         }
     }
@@ -231,7 +231,7 @@ impl<'input> ParsedStatement<'input> {
         match &self.tree.statement {
             Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. }) => StatementKind::Query,
             Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. }
-            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. }
+            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. }
             | Syntax::Erase(_) | Syntax::Assert(_, _)
             | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)) => StatementKind::Dml,
             _ => StatementKind::Session,
@@ -251,6 +251,8 @@ pub(crate) enum Syntax {
     DropSearchIndex { name: Identifier },
     CreateOrderedIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, if_not_exists: bool },
     DropOrderedIndex { name: Identifier },
+    CreateVectorIndex { name: Identifier, table: ast::ObjectName, column: Identifier, partition: Vec<Identifier>, dimensions: i64, method: String, recall: f64, if_not_exists: bool },
+    DropVectorIndex { name: Identifier },
     Set { name: Vec<Identifier>, value: ast::Expr, local: bool },
     Show(Vec<Identifier>),
 }
@@ -442,6 +444,11 @@ pub(super) fn parse_statement_syntax<'input>(
         }
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE TABLE", sql, parser.peek_token().span)); }
         Syntax::CreateTable { table, columns }
+    } else if word(tokens.first(), "CREATE") && word(tokens.get(1), "VECTOR") && word(tokens.get(2), "INDEX") {
+        create_vector_index(&dialect, &tokens[3..], sql, slice[0].span)?
+    } else if word(tokens.first(), "DROP") && word(tokens.get(1), "VECTOR") && word(tokens.get(2), "INDEX") {
+        if tokens.len() != 4 { return Err(sql_error("Expected one index name", sql, slice[0].span)); }
+        Syntax::DropVectorIndex { name: identifier_token(&tokens[3])? }
     } else if word(tokens.first(), "CREATE")
         && (word(tokens.get(1), "INDEX") || (word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX"))) {
         let search = word(tokens.get(1), "SEARCH");
@@ -588,6 +595,58 @@ pub(crate) fn expression(tokens: &[TokenWithSpan], source: &str, precedence: u8)
 
 pub(crate) fn word(token: Option<&TokenWithSpan>, expected: &str) -> bool {
     token.is_some_and(|token| matches!(&token.token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)))
+}
+
+/// `CREATE VECTOR INDEX [IF NOT EXISTS] name ON table (column) [PARTITION BY (column, ...)] WITH (dimensions = n, method = 'ivf', recall = r)`.
+fn create_vector_index(dialect: &SqlDialect, tokens: &[TokenWithSpan], sql: &str, at: Span) -> Result<Syntax> {
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens.to_vec());
+    let if_not_exists = word(tokens.first(), "IF") && word(tokens.get(1), "NOT") && word(tokens.get(2), "EXISTS");
+    if if_not_exists { for _ in 0..3 { parser.next_token(); } }
+    let name = identifier_token(&parser.next_token())?;
+    if !word(Some(&parser.next_token()), "ON") { return Err(sql_error("Expected ON after the index name", sql, at)); }
+    let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, at))?;
+    parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+    let column = identifier_token(&parser.next_token())?;
+    parser.expect_token(&Token::RParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+    let mut partition = Vec::new();
+    if word(Some(&parser.peek_token()), "PARTITION") {
+        parser.next_token();
+        if !word(Some(&parser.next_token()), "BY") { return Err(sql_error("Expected BY after PARTITION", sql, at)); }
+        parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+        loop {
+            partition.push(identifier_token(&parser.next_token())?);
+            if parser.consume_token(&Token::RParen) { break; }
+            parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+        }
+    }
+    let (mut dimensions, mut method, mut recall) = (None, None, None);
+    if !word(Some(&parser.next_token()), "WITH") { return Err(sql_error("A vector index requires WITH (dimensions, method, recall)", sql, at)); }
+    parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+    loop {
+        let option = parser.next_token();
+        parser.expect_token(&Token::Eq).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+        let value = parser.next_token();
+        let number = || match &value.token { Token::Number(text, _) => Some(text.clone()), _ => None };
+        if word(Some(&option), "DIMENSIONS") && dimensions.is_none() {
+            dimensions = Some(number().and_then(|text| text.parse::<i64>().ok()).filter(|dimensions| *dimensions > 0)
+                .ok_or_else(|| sql_error("Vector dimensions are a positive integer", sql, value.span))?);
+        } else if word(Some(&option), "METHOD") && method.is_none() {
+            let Token::SingleQuotedString(text) = &value.token else { return Err(sql_error("The approximate method is a string", sql, value.span)); };
+            method = Some(text.clone());
+        } else if word(Some(&option), "RECALL") && recall.is_none() {
+            recall = Some(number().and_then(|text| text.parse::<f64>().ok()).filter(|recall| recall.is_finite() && *recall > 0.0 && *recall <= 1.0)
+                .ok_or_else(|| sql_error("The recall target is a number in (0, 1]", sql, value.span))?);
+        } else {
+            return Err(sql_error("The vector index options are dimensions, method and recall, each once", sql, option.span));
+        }
+        if parser.consume_token(&Token::RParen) { break; }
+        parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+    }
+    if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after index definition", sql, parser.peek_token().span)); }
+    let (Some(dimensions), Some(method), Some(recall)) = (dimensions, method, recall) else {
+        return Err(sql_error("A vector index requires dimensions, method and recall", sql, at));
+    };
+    Ok(Syntax::CreateVectorIndex { name, table, column, partition, dimensions, method, recall, if_not_exists })
 }
 
 fn identifier_token(token: &TokenWithSpan) -> Result<Identifier> {

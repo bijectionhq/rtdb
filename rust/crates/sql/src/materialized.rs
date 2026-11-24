@@ -107,7 +107,7 @@ pub(crate) fn restore(syntax: &mut crate::parse::Syntax, temporal: &mut [crate::
         Syntax::Erase(delete) => visitor.apply(delete)?,
         Syntax::Assert(expression, _) | Syntax::Set { value: expression, .. } => visitor.apply(expression)?,
         Syntax::Records { records, .. } => visitor.apply(records)?,
-        Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => {},
+        Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => {},
     }
     visitor.apply_temporal(temporal)?;
     visitor.finish()

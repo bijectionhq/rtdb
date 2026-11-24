@@ -131,7 +131,12 @@ impl NodeServices {
         let search = default_search(format);
         Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
             decision_clock: None, compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
-            artefact_kinds: search.artefact_kinds.into_iter().chain([Arc::new(rtdb_spatial::SpatialArtefacts) as Arc<dyn rtdb_maintenance::ArtefactKind>]).collect(), scan_accelerators: search.scan_accelerators }
+            artefact_kinds: search.artefact_kinds.into_iter().chain([
+                Arc::new(rtdb_spatial::SpatialArtefacts) as Arc<dyn rtdb_maintenance::ArtefactKind>,
+                Arc::new(rtdb_vector::VectorArtefacts) as Arc<dyn rtdb_maintenance::ArtefactKind>,
+            ]).collect(),
+            scan_accelerators: search.scan_accelerators.into_iter()
+                .chain([Arc::new(rtdb_vector::VectorAccelerator::default()) as Arc<dyn rtdb_query::ScanAccelerator>]).collect() }
     }
 }
 

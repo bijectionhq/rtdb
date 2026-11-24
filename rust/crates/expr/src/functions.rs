@@ -47,6 +47,12 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         };
         return crate::vector::cosine_distance(left, right);
     }
+    if name == "approximate_nearest" {
+        let [column, _, _] = args else {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "approximate_nearest requires a column, a probe vector and a limit"));
+        };
+        return Ok(Value::Bool(!nullish(column)));
+    }
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
     if let Some(result) = crate::period::predicate(&name, args, context) { return result; }
     if let Some(result) = crate::search::call(&name, args, context) { return result; }

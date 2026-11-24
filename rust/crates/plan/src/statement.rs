@@ -22,6 +22,9 @@ pub enum Dml {
     DropSearchIndex { name: String },
     CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },
+    /// An approximate nearest-neighbour index over one vector column, partitioned by `partition` (vector.allium: VectorIndexDefinition).
+    CreateVectorIndex { name: String, table: QualifiedTable, column: String, partition: Vec<String>, dimensions: i64, method: String, recall: f64, if_not_exists: bool },
+    DropVectorIndex { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1438,6 +1438,40 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         self.verify_ranked_rows(rows, column, ascending_id, scorer).await
     }
 
+    async fn retain_visible(&self, mut iids: BTreeSet<Iid>) -> Result<Option<BTreeSet<Iid>>> {
+        iids.retain(|&iid| self.within_pushdowns(iid));
+        if iids.is_empty() { return Ok(Some(iids)); }
+        let mut scan = self.scan.clone();
+        let required: BTreeSet<_> = scan.predicates.iter().flat_map(Expr::referenced_columns).collect();
+        scan.columns.retain(|field| required.contains(&field.id));
+        scan.matches.retain(|evaluated| required.contains(&evaluated.id));
+        scan.top_k = None;
+        scan.ordered_top_k = None;
+        let iid_at = include_iid(&mut scan)?;
+        let schema = Schema::new(scan.columns.clone())?;
+        let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        scan.iids = Some(iids);
+        let mut cursor = Box::pin(ScanCursor::over_with_queries(scan, self.execution.clone(), self.pushdowns.clone(),
+            std::slice::from_ref(self.partition), self.storage, false, None, self.constants.search_queries)).await?;
+        let mut visible = BTreeSet::new();
+        while let Some(batch) = cursor.next_batch().await? {
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
+                return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
+            };
+            let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+            let mask = match &predicate {
+                Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
+                None => None,
+            };
+            for row in 0..batch.len {
+                if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
+                visible.insert(iids.get(row)?);
+            }
+        }
+        if let Some(counts) = cursor.scan_counts() { self.counts.lock().add(counts); }
+        Ok(Some(visible))
+    }
+
     async fn gather_ranked(&self, rows: Vec<crate::ResolvedSearchRow>) -> Result<BTreeMap<Iid, crate::SnapshotRow>> {
         if rows.is_empty() { return Ok(BTreeMap::new()); }
         let mut scan = self.scan.clone();

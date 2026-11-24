@@ -191,7 +191,7 @@ fn bind_parsed<T>(
     let forms = parsed.forms;
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
-    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
+    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
@@ -336,6 +336,17 @@ impl Context<'_> {
                 Ok(Statement::Dml(Dml::CreateOrderedIndex { name: name.normalized(), table: self.target(table)?, columns, if_not_exists: *if_not_exists }))
             }
             Syntax::DropOrderedIndex { name } => Ok(Statement::Dml(Dml::DropOrderedIndex { name: name.normalized() })),
+            Syntax::CreateVectorIndex { name, table, column, partition, dimensions, method, recall, if_not_exists } => {
+                let column = column.normalized();
+                let partition: Vec<_> = partition.iter().map(Identifier::normalized).collect();
+                if column.starts_with('_') || partition.iter().any(|name| name.starts_with('_')) { return Err(error("CREATE VECTOR INDEX cannot index internal columns")); }
+                if partition.iter().collect::<BTreeSet<_>>().len() != partition.len() || partition.contains(&column) {
+                    return Err(error("CREATE VECTOR INDEX requires distinct partition columns other than the vector column"));
+                }
+                Ok(Statement::Dml(Dml::CreateVectorIndex { name: name.normalized(), table: self.target(table)?, column, partition,
+                    dimensions: *dimensions, method: method.clone(), recall: *recall, if_not_exists: *if_not_exists }))
+            }
+            Syntax::DropVectorIndex { name } => Ok(Statement::Dml(Dml::DropVectorIndex { name: name.normalized() })),
             Syntax::Records { patch, table, records } => {
                 use crate::{StaticMutation, StaticMutationKind};
                 let StaticMutation { table, input, kind } = self.record_rows(*patch, table, records)?;

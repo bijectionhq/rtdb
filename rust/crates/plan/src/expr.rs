@@ -34,6 +34,12 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         }
         return Ok(LogicalType::Scalar(S::F64).maybe());
     }
+    if name == "approximate_nearest" {
+        if arguments.len() != 3 {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "approximate_nearest requires a column, a probe vector and a limit"));
+        }
+        return Ok(LogicalType::Scalar(S::Bool));
+    }
     if let Some(result) = crate::string::signature(&name, arguments) { return result; }
     if let Some(result) = crate::regex::signature(&name, arguments) { return result; }
     if let Some(result) = crate::session_info::signature(&name, arguments) { return result; }

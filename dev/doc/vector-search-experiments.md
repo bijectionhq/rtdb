@@ -250,6 +250,14 @@ Account for newly visible versions at valid-time boundaries and for the writes o
 An erase requires both immediate exclusion from results and eventual removal of the obsolete vector bytes under the index retirement protocol.
 Those are the publication and lifetime obligations to take from the existing ordered index and SlateDB's checkpoint design.
 
+The production route follows `vector.allium` and `rust/crates/vector`.
+A `CREATE VECTOR INDEX` definition carries the method and recall target, and its generation is the declaring transaction.
+The artefact lane publishes one byte-deterministic IVF generation per current trie, so the published frontier is the set of tries carrying one and compaction drops erased vectors from the next generation.
+Retired generations follow their trie or definition through the trie deletion grant.
+Partitions train separate clusters, so an equality filter on the partition columns prunes clusters before ranking.
+Probing is adaptive: the shortlist is verified against the scan's predicates and widened until it satisfies the limit, and a selective filter or an exhausted budget takes the exact route.
+HNSW is not admitted: its neighbour lists depend on insertion order and an erase repairs the graph in place, which the per-trie immutable generations rule out.
+
 Keep fixed-probe ANN in the benchmark while filtered recall and cold provider I/O remain below the evidence needed for a production planner.
 The present cold measurements count local range requests and bytes.
 The pack time excludes centroid training, and the churn timings leave full generation rebuilds outside the write path.

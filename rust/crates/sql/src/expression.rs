@@ -578,6 +578,7 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
         "array_upper" | "array_lower" | "array_length" | "mod" | "log" | "power" | "age"
         | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "match" | "search_corpus_fingerprint" | "cosine_distance" => 2..=2,
         "search_score" => 2..=5,
+        "approximate_nearest" => 3..=3,
         "round" => 1..=2,
         "least" | "greatest" | "str" | "format" | "concat" => 1..=usize::MAX,
         _ => return None,

@@ -4997,6 +4997,7 @@ dependencies = [
  "rtdb-trie",
  "rtdb-tx",
  "rtdb-types",
+ "rtdb-vector",
  "rtdb-xtql",
  "serde",
  "serde_json",
@@ -5537,6 +5538,30 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "rtdb-validation-json",
+]
+
+[[package]]
+name = "rtdb-vector"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "futures",
+ "rtdb-columnar",
+ "rtdb-format",
+ "rtdb-index",
+ "rtdb-maintenance",
+ "rtdb-plan",
+ "rtdb-query",
+ "rtdb-sql",
+ "rtdb-storage",
+ "rtdb-types",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

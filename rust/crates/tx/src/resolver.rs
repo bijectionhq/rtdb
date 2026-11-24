@@ -992,6 +992,39 @@ impl<'a> OpenTransaction<'a> {
                 }
                 return self.buffer.delete(TableRef::new("xt", "ordered_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
             }
+            Mutation::CreateVectorIndex { name, table, column, partition, dimensions, method, recall, if_not_exists } => {
+                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A vector index must cover a table in this database")); }
+                check_table(&table.table)?;
+                check_search_index_name(&name)?;
+                let method = method.to_ascii_lowercase();
+                if method != "ivf" { return Err(Anomaly::incorrect("rtdb.vector/method", format!("Unknown approximate method {method}; the supported method is ivf"))); }
+                if !(recall.is_finite() && recall > 0.0 && recall <= 1.0) || dimensions <= 0 {
+                    return Err(Anomaly::incorrect("rtdb.vector/definition", "A vector index needs positive dimensions and a recall target in (0, 1]"));
+                }
+                if self.index_exists("vector_indexes", &name).await? {
+                    if if_not_exists { return Ok(()); }
+                    return Err(Anomaly::incorrect("xtdb/index-already-exists", format!("Index {name} already exists")));
+                }
+                let document = StructFields::from([
+                    ("_id".into(), Value::Utf8(name)),
+                    ("schema_name".into(), Value::Utf8(table.table.schema)),
+                    ("table_name".into(), Value::Utf8(table.table.table)),
+                    ("column_name".into(), Value::Utf8(column)),
+                    ("partition_columns".into(), Value::list(partition.into_iter().map(Value::Utf8).collect())),
+                    ("dimensions".into(), Value::I64(dimensions)),
+                    ("method".into(), Value::Utf8(method)),
+                    ("recall".into(), Value::F64(recall)),
+                    ("version".into(), Value::I64(self.tx_key().tx_id.0)),
+                ]);
+                return self.buffer.put(TableRef::new("xt", "vector_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
+            Mutation::DropVectorIndex { name } => {
+                check_search_index_name(&name)?;
+                if !self.index_exists("vector_indexes", &name).await? {
+                    return Err(Anomaly::incorrect("xtdb/index-not-found", format!("Index {name} does not exist")));
+                }
+                return self.buffer.delete(TableRef::new("xt", "vector_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
             Mutation::GrantRole { user, role, revoke } => {
                 if self.context.database != "xtdb" { return Err(Anomaly::incorrect("xtdb/role-membership-non-primary", "Role membership can only be managed on the primary 'xtdb' database.").with_context("db", self.context.database.clone().into())); }
                 self.context.authorization.check_role_membership(&self.context.database, self.options.user.as_deref())?;

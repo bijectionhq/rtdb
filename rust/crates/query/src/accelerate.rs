@@ -132,6 +132,9 @@ pub trait CandidateVerifier: Send + Sync {
 
     /// Gathers the scan's output columns from verified versions after ranking.
     async fn gather_ranked(&self, _rows: Vec<ResolvedSearchRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
+
+    /// The IIDs whose visible version at the scan's cut satisfies every predicate of the scan, or `None` where this verifier cannot say.
+    async fn retain_visible(&self, _iids: BTreeSet<Iid>) -> Result<Option<BTreeSet<Iid>>> { Ok(None) }
 }
 
 #[derive(Clone)]

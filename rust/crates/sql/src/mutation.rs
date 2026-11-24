@@ -16,6 +16,8 @@ pub enum Mutation {
     DropSearchIndex { name: String },
     CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },
+    CreateVectorIndex { name: String, table: QualifiedTable, column: String, partition: Vec<String>, dimensions: i64, method: String, recall: f64, if_not_exists: bool },
+    DropVectorIndex { name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +143,9 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
         Dml::DropSearchIndex { name } => Mutation::DropSearchIndex { name },
         Dml::CreateOrderedIndex { name, table, columns, if_not_exists } => Mutation::CreateOrderedIndex { name, table, columns, if_not_exists },
         Dml::DropOrderedIndex { name } => Mutation::DropOrderedIndex { name },
+        Dml::CreateVectorIndex { name, table, column, partition, dimensions, method, recall, if_not_exists } =>
+            Mutation::CreateVectorIndex { name, table, column, partition, dimensions, method, recall, if_not_exists },
+        Dml::DropVectorIndex { name } => Mutation::DropVectorIndex { name },
     })
 }
 

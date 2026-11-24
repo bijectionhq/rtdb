@@ -13,7 +13,7 @@ impl Context<'_> {
                 for expression in records { self.admit_expression_literals(expression)?; }
             }
             S::Set { value, .. } | S::Assert(value, _) => self.admit_expression_literals(value)?,
-            S::CreateTable { .. } | S::CreateSearchIndex { .. } | S::DropSearchIndex { .. } | S::CreateOrderedIndex { .. } | S::DropOrderedIndex { .. } | S::GrantRole { .. } | S::Show(_) => (),
+            S::CreateTable { .. } | S::CreateSearchIndex { .. } | S::DropSearchIndex { .. } | S::CreateOrderedIndex { .. } | S::DropOrderedIndex { .. } | S::CreateVectorIndex { .. } | S::DropVectorIndex { .. } | S::GrantRole { .. } | S::Show(_) => (),
         }
         Ok(())
     }

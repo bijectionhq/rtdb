@@ -1201,6 +1201,10 @@ Claims use the shared claim format with the process's sealing authority.
 `RTDB_NEAREST(table, column, vector, limit)` returns the nearest vectors with `_distance` in ascending cosine-distance order.
 Both functions break ranking ties by internal row identity.
 `MATCH`, `SEARCH_SCORE` and `COSINE_DISTANCE` are also available as SQL expressions.
+`CREATE VECTOR INDEX name ON table (column) PARTITION BY (columns) WITH (dimensions = n, method = 'ivf', recall = r)` declares an approximate index; `DROP VECTOR INDEX name` retires it.
+A query opts into the approximate route by adding `APPROXIMATE_NEAREST(column, vector, limit)` to the predicates of `ORDER BY COSINE_DISTANCE(column, vector), _iid LIMIT limit`.
+The route probes the published generations, ranks the rows above their frontier exactly, and returns exact distances for candidates that may omit true neighbours.
+Without an index, or when the filter is selective, the same query ranks exactly.
 Use `FOR SYSTEM_TIME` or `FOR ALL SYSTEM_TIME` for transaction-time reads within the query cut.
 
 `Changes` requests a set of tables and reports open and closed system-time history intervals.
