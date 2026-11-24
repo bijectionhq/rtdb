@@ -218,8 +218,9 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>>;
     fn shared_column_census<'a>(
-        &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp, root_prefix: &'a str, world_prefix: &'a str,
-    ) -> BoxFuture<'a, Result<(WorldIdentityPage, OwnedWorldWitness)>>;
+        &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp,
+        root_prefix: rtdb_types::SharedColumnCarrierPrefix<'a>, world_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<(WorldIdentityPage, [OwnedWorldWitness; 2])>>;
     fn parent_identity_page_at<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
@@ -322,5 +323,6 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn read_parent_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
+        original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
 }

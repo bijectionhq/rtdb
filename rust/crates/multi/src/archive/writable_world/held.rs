@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use rtdb_flight_sql::FrozenWorldWinner;
-use rtdb_types::OwnedIdentityScan;
+use rtdb_types::{OwnedIdentityScan, SharedColumnCarrierPrefix};
 use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedPathColumns, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
 use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
@@ -337,7 +337,7 @@ enum ArchiveRead {
         at: Timestamp,
         after: OwnedIdentityScan<'static>,
         fetch: usize,
-        prefix: Option<String>,
+        protected: Option<(Vec<u8>, rtdb_types::OwnedSchema)>,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_query::OwnedIdentityCandidates>>,
@@ -994,7 +994,21 @@ impl HeldCheckpointWorld {
 
     pub async fn parent_point(
         &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool,
+        original_scope: Option<PlacedAttemptScope>,
     ) -> Result<WorldPoint> {
+        if relation.name() == rtdb_types::SHARED_COLUMN_CARRIERS {
+            let unavailable = OwnedWorld::unavailable;
+            if !matches!(id, EntityId::Binary(key) if SharedColumnCarrierPrefix::of_identity(key).is_some()) {
+                return Err(unavailable());
+            }
+            let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+            self.require_original_carrier_scope(&witness, original_scope).await?;
+            let schema = self.shared_root_schema(relation)?;
+            let fact = self.archive_point_checked(relation, id, valid_at, None, Some(schema)).await?;
+            self.check_parent_point(relation, None)?;
+            return Ok(WorldPoint { present: self.present(), fact, until: None, shadowed: false,
+                witness: observed.then_some(witness) });
+        }
         if self.ancestor().is_some() {
             let mut point = self.ancestor_point(relation, id, valid_at, observed).await?;
             // This route asks for the alias's inherited image.
@@ -1799,12 +1813,16 @@ impl HeldCheckpointWorld {
     async fn archive_identity_candidates(
         &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
-        prefix: Option<&str>,
+        prefix: Option<SharedColumnCarrierPrefix<'_>>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
+        let protected = match prefix {
+            Some(prefix) => Some((prefix.as_bytes().to_vec(), self.shared_root_schema(relation)?.clone())),
+            None => None,
+        };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Identities {
             relation: relation.clone(), at: valid, after: after.clone().into_owned(), fetch, earlier,
-            prefix: prefix.map(str::to_owned),
+            protected,
             guard: self.open.snapshot.relation_release_guard([relation])?, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
@@ -2340,7 +2358,8 @@ impl<'a> InheritedRelation<'a> {
         let mut reservations = Vec::new();
         for writer in self.writers() {
             let page = rtdb_query::owned_identity_candidates_in_prefix(
-                Arc::clone(&writer.overlay), self.owner, &writer.shadow, writer.overlay_basis, valid, after, limit + 1, prefix,
+                Arc::clone(&writer.overlay), self.owner, &writer.shadow, writer.overlay_basis, valid, after, limit + 1,
+                prefix.map(rtdb_columnar::EntityIdRef::String),
             ).await?;
             let (local, charges) = page.into_parts();
             keys.extend(local);
@@ -3320,16 +3339,23 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     send_archive_answer(&plaintext, reply, response).await;
                                 }
-                                ArchiveRead::Identities { relation, at, after, fetch, prefix, earlier, guard, mut reply } => {
+                                ArchiveRead::Identities { relation, at, after, fetch, protected, earlier, guard, mut reply } => {
                                     let read = async {
                                         require_relation_purge_history(&context, &owner)?;
                                         let scoped = Arc::clone(&context).with_owned_read_guard(guard);
+                                        let prefix = if let Some((prefix, schema)) = &protected {
+                                            let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&scoped), &owner, &relation).await?;
+                                            if !actual.is_some_and(|(actual, _)| &actual == schema) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                            Some(rtdb_columnar::EntityIdRef::Binary(prefix))
+                                        } else { None };
                                         let (scoped, system) = if let Some((system, schema)) = earlier {
                                             let schemas = [(relation.clone(), schema)];
                                             (exact_historical_parent_context(scoped, &owner, system, &schemas).await?, system)
                                         } else { (scoped, parent_time) };
                                         rtdb_query::owned_identity_candidates_in_prefix(scoped, &owner, &relation, system,
-                                            at, &after, fetch, prefix.as_deref(),
+                                            at, &after, fetch, prefix,
                                         ).await
                                     };
                                     let response = tokio::select! {

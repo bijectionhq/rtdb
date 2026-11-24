@@ -508,6 +508,12 @@ impl OwnedSchema {
         opaque.next().is_some_and(|field| field.name == name) && opaque.next().is_none()
     }
 
+    pub fn is_shared_column_carrier(&self) -> bool {
+        matches!(self.0.fields.as_slice(),
+            [Field { name, kind: Kind::OpaqueBinary {}, optional: false, nullable: false }] if name == "sealed_payload")
+            && self.0.validity == Validity::Explicit && self.0.lifetime_micros.is_none()
+    }
+
     pub fn path_column_type(&self, name: &str) -> Option<ScalarType> {
         match self.path_field(name)?.kind.path_logical()? {
             LogicalType::Scalar(ty) => Some(ty),

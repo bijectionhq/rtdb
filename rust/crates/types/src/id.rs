@@ -193,6 +193,8 @@ pub enum OwnedIdentityScan<'a> {
 impl<'a> OwnedIdentityScan<'a> {
     pub fn text(after: Option<&'a str>) -> Self { Self::Text(after.map(Cow::Borrowed)) }
 
+    pub fn binary(after: Option<&'a [u8]>) -> Self { Self::Binary(after.map(Cow::Borrowed)) }
+
     pub fn bound(&self) -> Option<crate::Value> {
         match self {
             Self::Text(after) => after.as_deref().map(|key| crate::Value::Utf8(key.to_owned())),
@@ -215,7 +217,7 @@ impl<'a> OwnedIdentityScan<'a> {
     pub fn seek(id: &'a EntityId) -> Result<Self> {
         match id {
             EntityId::String(text) => Ok(Self::text(Some(text))),
-            EntityId::Binary(bytes) => Ok(Self::Binary(Some(Cow::Borrowed(bytes)))),
+            EntityId::Binary(bytes) => Ok(Self::binary(Some(bytes))),
             _ => Err(Anomaly::incorrect("rtdb.owned/identity-page", "An identity page requires Utf8 or Binary keys")),
         }
     }
@@ -226,6 +228,34 @@ impl<'a> OwnedIdentityScan<'a> {
             Self::Binary(after) => OwnedIdentityScan::Binary(after.map(|key| Cow::Owned(key.into_owned()))),
             Self::Unbounded => OwnedIdentityScan::Unbounded,
         }
+    }
+}
+
+pub const SHARED_COLUMN_CARRIERS: &str = "fact_unit_shared_column_carriers";
+const SHARED_COLUMN_CARRIER_PREFIX_WIDTH: usize = 5 + 16 + 32 + 16 + 1 + 16 + 16 + 4;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SharedColumnCarrierPrefix<'a>(&'a [u8; SHARED_COLUMN_CARRIER_PREFIX_WIDTH]);
+
+impl<'a> SharedColumnCarrierPrefix<'a> {
+    pub const WIDTH: usize = SHARED_COLUMN_CARRIER_PREFIX_WIDTH;
+    pub const ID_WIDTH: usize = Self::WIDTH + 4096;
+
+    pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        let bytes = <&[u8; SHARED_COLUMN_CARRIER_PREFIX_WIDTH]>::try_from(bytes).ok()?;
+        bytes.starts_with(b"BFCP2").then_some(Self(bytes))
+    }
+
+    pub fn as_bytes(self) -> &'a [u8] { self.0 }
+
+    pub fn contains(self, id: &[u8]) -> bool {
+        id.len() == Self::ID_WIDTH && id.starts_with(self.0)
+    }
+
+    pub fn of_identity(id: &'a [u8]) -> Option<Self> {
+        let (prefix, payload) = id.split_at_checked(Self::WIDTH)?;
+        if payload.len() != Self::ID_WIDTH - Self::WIDTH { return None; }
+        Self::parse(prefix)
     }
 }
 

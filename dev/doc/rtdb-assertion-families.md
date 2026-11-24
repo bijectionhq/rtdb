@@ -362,19 +362,24 @@ Hybrid reads retain the combined text and vector dependencies under that same bo
 
 ### Shared column census
 
-Hosted protocol 224 advertises `rtdb.owned.ReadHeldWorldSharedColumnCensus.v1` through Flight `ListActions` to the installed writer.
-The request is the existing held world handle (16 bytes), signed big-endian valid instant (8 bytes), u16 byte length and lowercase hexadecimal Root BFCP2 prefix, then the ASCII world-column prefix.
+The installed writer discovers `rtdb.owned.ReadHeldWorldSharedColumnCensus.v2` through Flight `ListActions`.
+The request is the existing held world handle (16 bytes), signed big-endian valid instant (8 bytes), big-endian u16 byte length (106), raw Binary Root BFCP2 prefix, then the unchanged ASCII `world-column/<64 lowercase hex>/` prefix.
 The valid instant must be the held data clock.
-The response has one Arrow `_id` Utf8 column in strictly increasing ID order and the original world range witness.
-One completion covers the installed Root carrier prefix at the archived Root parent and the opaque shared column prefix in the selected overlay.
+The response has one dense Arrow identity union `_id` column, including on an empty census, and the existing `rtdb.owned.world_range_witness` metadata.
+Root rows use type ID 4 (Binary) in unsigned lexicographic order, followed by World rows using type ID 0 (Utf8) in strictly increasing text order.
+One completion covers the Binary `fact_unit_shared_column_carriers` prefix at the archived Root parent and the opaque text prefix in the selected `fact_unit_column_payloads` World overlay.
 When the pin has frozen ancestors, the overlay scan joins their exact retained carrier identities with the selected local overlay.
 Root selectors used for point reads sit outside the Root census and never count as overlay carriers.
 The response contains at most 512 identities.
-The witness binds the parent pin, original writer placement, Root purge frontier and selected overlay frontier, and the installer co-orders it with its exact carrier point and current Root unit condition.
+The nonce binds the parent pin, original writer placement, both source relations' purge frontiers and the selected text overlay's relation frontier.
+The installer co-orders that nonce with its exact carrier point and current Root unit condition.
 The scope is a writable world in the same placement.
 Every retained ancestor requires exact opaque schema and purge coverage.
 A restored destination cannot use a local census to substitute for an unavailable original source.
-The world carrier and Root point selector both use the scoped world-column key, with no fallback to an earlier key shape.
+Use parent mode `02` of the existing held World point action for Binary Root rows, including on nested holds.
+For batches use selector 4 of `rtdb.owned.ReadPoints.v1` with the same Arrow point body and Binary `_id`.
+The archived Root point requires the live original writer scope and applies the exact typed purge floor.
+World carriers and Root winner selectors continue to use the scoped Utf8 world-column key in `fact_unit_column_payloads`.
 
 ### Fence plan reply
 

@@ -312,6 +312,9 @@ impl OpenTransaction<'_> {
                 .get(&shadow.world)
                 .ok_or_else(OwnedWorld::unavailable)?;
             let root = shadow.relation;
+            if root.name() == rtdb_types::SHARED_COLUMN_CARRIERS {
+                return Err(OwnedWorld::unavailable());
+            }
             let relation = root.in_world(Iid(shadow.world.0))?;
             let schema = world
                 .schemas

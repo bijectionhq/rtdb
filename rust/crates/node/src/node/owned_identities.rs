@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_owned_entity_id};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedIdentityScan, OwnedRelation, Result, Timestamp};
+use rtdb_columnar::{EntityIdRef, MemoryReservation, estimate_read_value_bytes, read_owned_entity_id};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedIdentityScan, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
+    SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp};
 
 use super::{OwnedRangeWitness, OwnedReadSession};
 
 const MAX_PAGE_ROWS: usize = 128;
 const MAX_PAGE_BYTES: usize = 8 << 20;
 const PROTECTED_PAGE_ROWS: usize = 64;
-const CARRIER_PREFIX_BYTES: usize = 5 + 16 + 32 + 16 + 1 + 16 + 16 + 4;
-const CARRIER_IMAGE_BYTES: usize = 4096;
+const SEALED_SEARCH_UNIT_ROWS: &str = "fact_sealed_search_unit_rows";
 
 /// A bounded key page with progress through its last returned identity.
 pub struct OwnedIdentityPage {
@@ -49,26 +49,21 @@ impl OwnedReadSession {
     pub async fn protected_carrier_page(
         &self,
         relation: &OwnedRelation,
-        prefix: &str,
-        after: Option<&str>,
+        prefix: SharedColumnCarrierPrefix<'_>,
+        after: Option<&[u8]>,
         limit: usize,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>)> {
-        self.require_unscoped_root()?;
-        self.admit_read().await?;
-        if self.witness_scope != Some(scope)
-            || relation.name() != "fact_unit_column_payloads"
-            || !valid_carrier_prefix(prefix)
-            || !(1..=PROTECTED_PAGE_ROWS).contains(&limit)
-            || after.is_some_and(|id| !valid_carrier(id, prefix))
-        {
+        if !(1..=PROTECTED_PAGE_ROWS).contains(&limit) || after.is_some_and(|id| !prefix.contains(id)) {
             return Err(protected_page_unavailable());
         }
+        self.admit_shared_column_carriers(relation, scope).await?;
         let at = self.present.system_time;
         let page = self
-            .identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::text(after), limit, Some(prefix))
+            .identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::binary(after), limit,
+                Some(EntityIdRef::Binary(prefix.as_bytes())))
             .await?;
-        if page.keys.iter().any(|id| !matches!(id, EntityId::String(key) if valid_carrier(key, prefix))) {
+        if page.keys.iter().any(|key| !matches!(key, EntityId::Binary(id) if prefix.contains(id))) {
             return Err(protected_page_unavailable());
         }
         let witness = if page.more {
@@ -79,22 +74,50 @@ impl OwnedReadSession {
         Ok((page, witness))
     }
 
+    pub async fn sealed_search_unit_rows_page(
+        &self, relation: &OwnedRelation, prefix: &str, after: Option<&str>, limit: usize, scope: PlacedAttemptScope,
+    ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>, impl Fn() -> Result<()> + Send + Sync + use<>)> {
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || relation.name() != SEALED_SEARCH_UNIT_ROWS {
+            return Err(sealed_search_unit_unavailable());
+        }
+        if !(1..=PROTECTED_PAGE_ROWS).contains(&limit) || !sealed_search_unit_prefix(prefix)
+            || after.is_some_and(|id| !sealed_search_unit_row(prefix, id))
+        {
+            return Err(Anomaly::incorrect("rtdb.owned/sealed-search-unit", "Invalid sealed search unit prefix, continuation or limit"));
+        }
+        let context = self.relation_context(relation)?;
+        let expected = OwnedSchema::from_json(br#"{"fields":[]}"#)?;
+        if !rtdb_query::read_owned_relation_schema(context, &self.owner, relation).await?
+            .is_some_and(|(schema, _)| schema == expected)
+        {
+            return Err(sealed_search_unit_unavailable());
+        }
+        let original = self.original_inventory_provider_guard(scope).await?;
+        let at = self.present.system_time;
+        let page = self.identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::text(after), limit,
+            Some(EntityIdRef::String(prefix))).await?;
+        if page.keys.iter().any(|key| !matches!(key, EntityId::String(id) if sealed_search_unit_row(prefix, id))) {
+            return Err(sealed_search_unit_unavailable());
+        }
+        let witness = if page.more { None } else {
+            Some(self.relation_witness(relation)?.ok_or_else(sealed_search_unit_unavailable)?)
+        };
+        original()?;
+        Ok((page, witness, original))
+    }
+
     /// Compare resident derived coverage with the exact carrier events in
     /// this originating hold. Coverage is comparable only in one live
     /// database attachment and placed writer history.
     pub async fn protected_carrier_coverage(
         &self,
         relation: &OwnedRelation,
-        prefix: &str,
+        _prefix: SharedColumnCarrierPrefix<'_>,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<([u8; 72], OwnedRangeWitness)> {
-        self.require_unscoped_root()?;
-        self.admit_read().await?;
-        if self.witness_scope != Some(scope) || relation.name() != "fact_unit_column_payloads"
-            || !valid_carrier_prefix(prefix)
-        {
-            return Err(protected_page_unavailable());
-        }
+        self.admit_shared_column_carriers(relation, scope).await?;
         let witness = self.relation_witness(relation)?.ok_or_else(protected_page_unavailable)?;
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
@@ -109,6 +132,21 @@ impl OwnedReadSession {
         coverage[64..].copy_from_slice(&purge.to_be_bytes());
         self.check_relation(relation)?;
         Ok((coverage, witness))
+    }
+
+    async fn admit_shared_column_carriers(&self, relation: &OwnedRelation, scope: PlacedAttemptScope) -> Result<()> {
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || relation.name() != SHARED_COLUMN_CARRIERS {
+            return Err(protected_page_unavailable());
+        }
+        let context = self.relation_context(relation)?;
+        if !rtdb_query::read_owned_relation_schema(context, &self.owner, relation).await?
+            .is_some_and(|(schema, _)| schema.is_shared_column_carrier())
+        {
+            return Err(protected_page_unavailable());
+        }
+        Ok(())
     }
 
     /// Reads live local shadow keys, including tombstones, for one admitted world.
@@ -143,7 +181,7 @@ impl OwnedReadSession {
         let context = self.relation_context(relation)?;
         let relation = relation.in_world(admitted.id)?;
         let page = rtdb_query::owned_identity_candidates_in_prefix(
-            Arc::clone(&context), &self.owner, &relation, system, valid, after, fetch, prefix,
+            Arc::clone(&context), &self.owner, &relation, system, valid, after, fetch, prefix.map(EntityIdRef::String),
         ).await?;
         context.check_cancelled()?;
         Ok(page)
@@ -242,7 +280,7 @@ impl OwnedReadSession {
 
     async fn identity_page_in_prefix(
         &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
-        limit: usize, prefix: Option<&str>,
+        limit: usize, prefix: Option<EntityIdRef<'_>>,
     ) -> Result<OwnedIdentityPage> {
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
             return Err(Anomaly::incorrect(
@@ -258,12 +296,12 @@ impl OwnedReadSession {
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
         let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
-        let cursor = match (prefix, after) {
-            (Some(prefix), OwnedIdentityScan::Text(after)) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
-                Arc::clone(&context), &self.owner, relation, system, after.as_deref(), prefix, count as i64,
+        let cursor = match prefix {
+            Some(prefix) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
+                Arc::clone(&context), &self.owner, relation, system, after, prefix, count as i64,
             ).await?,
-            (Some(_), _) => return Err(invalid_page()),
-            (None, _) => rtdb_query::open_owned_identity_page(
+            Some(_) => return Err(invalid_page()),
+            None => rtdb_query::open_owned_identity_page(
                 Arc::clone(&context), &self.owner, relation, system, valid, after, count as i64,
             ).await?,
         };
@@ -296,9 +334,7 @@ impl OwnedReadSession {
                     charges.push(self.context.memory.reserve(bytes)?);
                     let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?.into_owned();
                     let previous = keys.last().or(bound.as_ref());
-                    if previous.is_some_and(|previous| previous >= &key)
-                        || prefix.is_some_and(|prefix| !matches!(&key, EntityId::String(key) if key.starts_with(prefix)))
-                    {
+                    if previous.is_some_and(|previous| previous >= &key) {
                         return Err(invalid_page());
                     }
                     if !at_head {
@@ -322,16 +358,28 @@ impl OwnedReadSession {
     }
 }
 
+fn sealed_search_unit_prefix(prefix: &str) -> bool {
+    prefix.strip_suffix('/').is_some_and(|alias|
+        alias.len() == 64 && alias.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+}
+
+fn sealed_search_unit_row(prefix: &str, id: &str) -> bool {
+    id.strip_prefix(prefix).and_then(|tail| tail.split_once('/')).is_some_and(|(relation, row)|
+        relation.starts_with("fact_") && relation.ends_with("_search") && relation.len() <= 96
+            && relation.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+            && !row.is_empty())
+}
+
+fn sealed_search_unit_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/sealed-search-unit",
+        "The Original sealed search unit inventory is unavailable")
+}
+
 fn invalid_page() -> Anomaly {
     Anomaly::fault(
         "rtdb.owned/identity-order",
         "The owned identity query returned invalid keys",
     )
-}
-
-fn lower_hex(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_protected_row_carrier(relation: &OwnedRelation, id: &EntityId) -> bool {
@@ -349,18 +397,6 @@ fn held_carrier_existence_has_only_the_row_payload_target() -> Result<()> {
     assert!(!is_protected_row_carrier(&payloads, &EntityId::String("column/opaque".to_owned())));
     assert!(!is_protected_row_carrier(&OwnedRelation::new("fact_unit_fences")?, &row));
     Ok(())
-}
-
-fn valid_carrier_prefix(prefix: &str) -> bool {
-    prefix.len() == 2 * CARRIER_PREFIX_BYTES
-        && prefix.starts_with("4246435032")
-        && lower_hex(prefix)
-}
-
-fn valid_carrier(id: &str, prefix: &str) -> bool {
-    id.len() == 2 * (CARRIER_PREFIX_BYTES + CARRIER_IMAGE_BYTES)
-        && id.starts_with(prefix)
-        && lower_hex(id)
 }
 
 fn protected_page_unavailable() -> Anomaly {
