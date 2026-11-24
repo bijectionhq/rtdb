@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, ListArray, NullArray, PrimitiveArray, UnionArray,
@@ -31,11 +30,10 @@ pub fn read_text_column<'a>(oid: u32, count: usize, mut cell: impl FnMut(usize) 
         701 => primitive::<Float64Type>(count, cell, float)?,
         1083 => primitive::<Time64NanosecondType>(count, cell, |text| Ok(rtdb_types::parse_iso_local_time(text)? as i64))?,
         11112 => primitive::<DurationMicrosecondType>(count, cell, crate::interval::duration_micros)?,
-        1007 => list(count, cell, false, visit_pg_array, PrimitiveBuilder::<Int32Type>::new(), append_primitive::<Int32Type>)?,
-        1016 => list(count, cell, false, visit_pg_array, PrimitiveBuilder::<Int64Type>::new(), append_primitive::<Int64Type>)?,
-        1009 => list(count, cell, false, visit_pg_array, StringBuilder::new(), |builder, text| {
-            builder.append_option(text.as_deref());
-            Ok(())
+        1007 => list(count, cell, false, PrimitiveBuilder::<Int32Type>::new(), append_integer_row::<Int32Type>)?,
+        1016 => list(count, cell, false, PrimitiveBuilder::<Int64Type>::new(), append_integer_row::<Int64Type>)?,
+        1009 => list(count, cell, false, StringBuilder::new(), |builder, text| {
+            visit_array(text, |item| { builder.append_option(item.as_deref()); Ok(()) })
         })?,
         1021 => float_array::<Float32Type>(count, cell, float32)?,
         1022 => float_array::<Float64Type>(count, cell, float)?,
@@ -49,10 +47,6 @@ pub fn read_text_column<'a>(oid: u32, count: usize, mut cell: impl FnMut(usize) 
     Ok(Some(result))
 }
 
-fn visit_pg_array<'a>(text: &'a str, append: &mut dyn FnMut(Option<Cow<'a, str>>) -> Result<()>) -> Result<()> {
-    visit_array(text, append)
-}
-
 fn float_array<'a, T: ArrowPrimitiveType>(
     count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>, parse: impl Fn(&str) -> Result<T::Native>,
 ) -> Result<ArrayRef> {
@@ -61,9 +55,11 @@ fn float_array<'a, T: ArrowPrimitiveType>(
         text.starts_with('[') || text.strip_prefix('{').is_some_and(|inner| inner.trim_start().starts_with('{'))
     };
     let build = |count, cell: &mut dyn FnMut(usize) -> Result<Option<&'a str>>| {
-        list(count, cell, true, visit_pg_array, PrimitiveBuilder::<T>::with_capacity(0), |builder, text| {
-            builder.append_option(text.as_deref().map(&parse).transpose()?);
-            Ok(())
+        list(count, cell, true, PrimitiveBuilder::<T>::with_capacity(0), |builder, text| {
+            visit_array(text, |item| {
+                builder.append_option(item.as_deref().map(&parse).transpose()?);
+                Ok(())
+            })
         })
     };
     let mut has_text = false;
@@ -126,20 +122,40 @@ fn primitive<'a, T: ArrowPrimitiveType>(
     Ok(Arc::new(builder.finish()))
 }
 
-fn append_primitive<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>, text: Option<Cow<'_, str>>) -> Result<()>
+fn append_integer_row<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>, text: &str) -> Result<()>
 where
     T::Native: std::str::FromStr,
     <T::Native as std::str::FromStr>::Err: std::fmt::Display,
 {
-    builder.append_option(text.as_deref().map(|text| text.parse().map_err(invalid)).transpose()?);
+    let start = builder.len();
+    let mut first = None;
+    let mut has_null = false;
+    visit_array(text, |item| {
+        if let Some(item) = item {
+            let value = item.parse().map_err(invalid)?;
+            first.get_or_insert(value);
+            builder.append_value(value);
+        } else {
+            has_null = true;
+            builder.append_null();
+        }
+        Ok(())
+    })?;
+    // Packed lists gather null slots from offset zero in each row's compact value buffer.
+    if let Some(first) = first.filter(|_| has_null) {
+        for index in start..builder.len() {
+            if builder.validity_slice().is_some_and(|bits| !arrow_buffer::bit_util::get_bit(bits, index)) {
+                builder.values_slice_mut()[index] = first;
+            }
+        }
+    }
     Ok(())
 }
 
 fn list<'a, B: ArrayBuilder>(
     count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
     keep_child_type: bool,
-    visit: impl Fn(&'a str, &mut dyn FnMut(Option<Cow<'a, str>>) -> Result<()>) -> Result<()>,
-    mut builder: B, mut append: impl FnMut(&mut B, Option<Cow<'a, str>>) -> Result<()>,
+    mut builder: B, mut append_row: impl FnMut(&mut B, &'a str) -> Result<()>,
 ) -> Result<ArrayRef> {
     let mut offsets = Vec::with_capacity(count + 1);
     let mut present = Vec::with_capacity(count);
@@ -147,7 +163,7 @@ fn list<'a, B: ArrayBuilder>(
     for row in 0..count {
         let text = cell(row)?;
         present.push(text.is_some());
-        if let Some(text) = text { visit(text, &mut |item| append(&mut builder, item))?; }
+        if let Some(text) = text { append_row(&mut builder, text)?; }
         offsets.push(i32::try_from(builder.len()).map_err(invalid)?);
     }
     let child = builder.finish();
@@ -253,11 +269,8 @@ pub fn read_vector_column<'a>(
     output: &mut BatchBuilder,
 ) -> Result<(Field, ArrayRef)> {
     if typmod == -1 {
-        let array = list(count, cell, true, |text, append| {
-            for component in vector_items(text)? { append(Some(Cow::Borrowed(component)))?; }
-            Ok(())
-        }, PrimitiveBuilder::<Float32Type>::with_capacity(0), |builder, text| {
-            builder.append_value(vector_component(text.as_deref().expect("pgvector component"))?);
+        let array = list(count, cell, true, PrimitiveBuilder::<Float32Type>::with_capacity(0), |builder, text| {
+            for component in vector_items(text)? { builder.append_value(vector_component(component)?); }
             Ok(())
         })?;
         return account_column(name, array, output);
@@ -445,7 +458,7 @@ mod tests {
             };
             assert_eq!(field, legacy_field, "OID {oid}");
             assert_eq!(actual.to_data(), legacy.to_data(), "OID {oid}");
-            assert!(ipc(field, actual) == ipc(legacy_field, legacy), "IPC differs for OID {oid}");
+            assert!(ipc(field, actual) == ipc(legacy_field, legacy), "IPC differs for OID {oid} and rows {rows:?}");
         }
     }
 
