@@ -156,22 +156,59 @@ pub(super) fn decode(
     max: usize,
     memory: &Arc<MemoryReservation>,
 ) -> Result<Vec<Reference>> {
+    decode_with_memory(batch, max, |keys, _| {
+        if keys.retained_bytes() > memory.bytes() {
+            return Err(invalid());
+        }
+        Ok(memory.clone())
+    })
+}
+
+pub(super) fn decode_page(
+    batch: RecordBatch,
+    max: usize,
+    backing: &Buffer,
+    opening: &mut MemoryReservation,
+) -> Result<Vec<Reference>> {
+    let mut references = decode_with_memory(batch, max, |keys, retains_batch| {
+        let bytes = keys.bytes_excluding(backing)?;
+        if bytes > opening.bytes() {
+            return Err(invalid());
+        }
+        let retained = if retains_batch {
+            bytes.saturating_add(ProjectedKeys::allocation_bytes())
+                .saturating_add(size_of::<FenceAddressBuffer>() + 2 * size_of::<usize>())
+        } else {
+            0
+        };
+        opening.split_off(retained)
+    })?;
+    for pointer in references.iter_mut().filter_map(|(_, pointer)| pointer.as_mut()) {
+        let pointer = Arc::get_mut(pointer).expect("newly decoded pointers are unpublished");
+        pointer._memory = Some(opening.split_off(pointer.owned_backing_bytes())?);
+    }
+    Ok(references)
+}
+
+fn decode_with_memory(
+    batch: RecordBatch,
+    max: usize,
+    reserve: impl FnOnce(&KeyBatch, bool) -> Result<Arc<MemoryReservation>>,
+) -> Result<Vec<Reference>> {
     let rows = batch.num_rows();
     if rows % 2 != 0 || rows / 2 > max {
         return Err(invalid());
     }
     let keys = KeyBatch::from_batch(batch, &fields())?;
-    if keys.retained_bytes() > memory.bytes() {
-        return Err(invalid());
-    }
     let columns = keys.batch().columns().to_vec();
+    let kinds = arrow::<UInt8Array>(columns[5].as_ref())?;
+    let memory = reserve(&keys, kinds.values().contains(&0))?;
     let keys = ProjectedKeys::new(keys, memory.clone());
     let revisions = arrow::<Int64Array>(columns[0].as_ref())?;
     let digests = arrow::<StringArray>(columns[1].as_ref())?;
     let generations = arrow::<Int64Array>(columns[2].as_ref())?;
     let sizes = arrow::<UInt64Array>(columns[3].as_ref())?;
     let counts = arrow::<UInt64Array>(columns[4].as_ref())?;
-    let kinds = arrow::<UInt8Array>(columns[5].as_ref())?;
     let levels = arrow::<UInt8Array>(columns[6].as_ref())?;
     let starts = arrow::<UInt64Array>(columns[7].as_ref())?;
     let iids = arrow::<FixedSizeBinaryArray>(columns[8].as_ref())?;
@@ -307,6 +344,7 @@ pub(super) fn decode(
                             measure,
                             first,
                             last,
+                            _memory: None,
                         })),
                     ))
                 }
@@ -372,6 +410,7 @@ mod tests {
             },
             first: fence(first.clone()),
             last: fence(last.clone()),
+            _memory: None,
         };
         let rows = Pointer {
             digest: "02".repeat(32),

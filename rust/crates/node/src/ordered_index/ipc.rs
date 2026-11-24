@@ -26,6 +26,10 @@ pub(super) fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
 }
 
 pub(super) fn decode(bytes: Bytes, max_rows: usize) -> Result<RecordBatch> {
+    decode_buffer(Buffer::from(bytes), max_rows)
+}
+
+pub(super) fn decode_buffer(bytes: Buffer, max_rows: usize) -> Result<RecordBatch> {
     let (schema, tail) = message(&bytes)?;
     if schema.header_type() != MessageHeader::Schema || schema.bodyLength() != 0 {
         return Err(invalid());
@@ -65,7 +69,7 @@ pub(super) fn decode(bytes: Bytes, max_rows: usize) -> Result<RecordBatch> {
         return Err(invalid());
     }
     let mut buffer = if bytes.as_ptr().align_offset(BUFFER_ALIGNMENT) == 0 {
-        Buffer::from(bytes)
+        bytes
     } else {
         Buffer::from_slice_ref(bytes.as_ref())
     };
