@@ -246,7 +246,9 @@ entity StagedTxTable {
     -- Puts from different struct layouts can share one Arrow batch while retaining the declarations of their original layouts.
     -- Staging preserves event assembly when a batch from different struct layouts is combined with other writes.
     -- Staging assembles row-backed document columns from borrowed cells.
-    -- A create-only insert checks each requested interval against the transaction snapshot before staging that document from its Arrow vector.
+    -- A create-only Arrow batch checks each requested interval against the transaction snapshot and the preceding intervals in that batch.
+    -- The check scans the distinct IIDs together and stages an admitted batch in input order.
+    -- A conflicting or invalid batch reports the first failure in document order.
     -- A governed Arrow event stages the full entity key and the assigned commit position with its document columns.
     -- A governed put stages its selected Arrow field layout with any acceptance-filled fields.
     -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.

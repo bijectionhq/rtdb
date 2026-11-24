@@ -2665,7 +2665,23 @@ impl SourceOperationReader<'_> {
             }
             "sql" => {
                 let sql = match value("query")? { Value::Utf8(sql) => sql, _ => return Err(invalid("SQL operation has no query")) };
-                let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(bytes.into(), memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
+                let arguments = body.fields().find("args").and_then(|(index, field)| {
+                    (field.data_type() == &DataType::Binary && field.metadata().is_empty())
+                        .then(|| body.column(index).as_any().downcast_ref::<arrow_array::BinaryArray>()).flatten()
+                }).filter(|array| array.is_valid(offset));
+                let args = if let Some(array) = arguments {
+                    let offsets = array.value_offsets();
+                    let start = offsets[offset] as usize;
+                    let length = offsets[offset + 1] as usize - start;
+                    let bytes = array.values().slice_with_length(start, length);
+                    Some(decode_arguments(bytes, memory)?)
+                } else {
+                    match value("args")? {
+                        Value::Null | Value::Undefined => None,
+                        Value::Binary(bytes) => Some(decode_arguments(Buffer::from_vec(bytes), memory)?),
+                        _ => return Err(invalid("SQL arguments are not IPC bytes")),
+                    }
+                };
                 TxOp::Sql { sql, args }
             }
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1"
@@ -2805,9 +2821,10 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
     crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory)
 }
 
-pub(crate) fn decode_arguments(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
+pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
+    let bytes = bytes.into();
     let _value_reservation = memory.reserve(crate::ipc::allocation_bound(&bytes)?)?;
-    let stream = rtdb_format::ipc::OwnedStream::read_buffer(Buffer::from(bytes), memory)?;
+    let stream = rtdb_format::ipc::OwnedStream::read_buffer(bytes, memory)?;
     let schema = Arc::clone(stream.schema());
     for (index, field) in schema.fields().iter().enumerate() {
         if !field.name().is_empty() && field.name() != &format!("${}", index + 1) && field.name() != &format!("?_{}", index) {
@@ -3218,6 +3235,7 @@ mod tests {
         ).unwrap();
 
         let replayed = roundtrip(&source);
+        assert_eq!(source.encode().unwrap().as_slice(), replayed.encode().unwrap().as_slice());
 
         let [Operation::Public(TxOp::Sql { args: Some(arguments), .. })] = replayed.operations.as_slice() else {
             panic!("Expected SQL arguments");

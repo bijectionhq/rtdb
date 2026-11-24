@@ -23,6 +23,18 @@ fn request(ops: Vec<TxOp>, context: &ResolveContext) -> SourceTransaction { Sour
 fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp::PutDocs { table: table(), documents: Documents::new(vec![document(value)], &context.memory).unwrap(), valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)) } }
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
+#[derive(Default)]
+struct QueryRuns(std::sync::atomic::AtomicUsize);
+impl rtdb_plan::Tracer for QueryRuns {
+    fn query_enabled(&self) -> bool { true }
+    fn transaction_enabled(&self) -> bool { false }
+    fn start(&self, _: Option<rtdb_plan::SpanContext>, name: &str, _: &[(&str, rtdb_plan::TraceValue<'_>)])
+        -> Option<Box<dyn rtdb_plan::TraceSpan>> {
+        if name == "xtdb.query" { self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        None
+    }
+}
+
 #[tokio::test]
 async fn a_static_insert_preserves_interleaved_assertion_order_for_one_identity() {
     use rtdb_format::envelope::SourceMessage;
@@ -429,6 +441,109 @@ async fn create_only_insert_checks_staged_intervals_and_replays_atomic_outcomes(
     let snapshot = follower.snapshot();
     let events = snapshot.segments(&table()).iter().flat_map(|segment| segment.batches()).map(|batch| batch.len()).sum::<usize>();
     assert_eq!(events, 2);
+}
+
+#[tokio::test]
+async fn arrow_replay_insert_batches_keep_replica_bytes_and_first_failure() {
+    use rtdb_format::{envelope::SourceMessage, ipc::write_stream};
+
+    let mut context = context();
+    let runs = Arc::new(QueryRuns::default());
+    context.tracer = Some(runs.clone());
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let timestamp = |value| Value::Timestamp {
+        value, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()),
+    };
+    let row = |id, from, to, bits: Option<u64>| StructFields::from([
+        ("_id".into(), Value::I64(id)),
+        ("_valid_from".into(), timestamp(from)),
+        ("_valid_to".into(), timestamp(to)),
+        ("reading".into(), bits.map(|bits| Value::F64(f64::from_bits(bits))).unwrap_or(Value::Null)),
+    ]);
+    let insert = |rows| TxOp::InsertDocs {
+        table: table(), documents: Documents::new(rows, &context.memory).unwrap(), valid_from: None, valid_to: None,
+    };
+    let replay = |operations| {
+        let bytes = request(operations, &context).encode().unwrap();
+        let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let existing = insert(vec![row(1, 20, 30, Some(0))]);
+    let rows = vec![row(1, 30, 40, Some(1 << 63)), row(2, 10, 45, Some(0x7ff8000000000123)), row(1, 10, 20, None)];
+    let replica_bytes = |resolved: &ResolvedTx| {
+        let batch = resolved.writes().tables()[&table()].batch().unwrap().arrow();
+        write_stream(batch.schema_ref(), std::slice::from_ref(batch)).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let mut reference = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let one_at_a_time = std::iter::once(existing.clone()).chain(rows.iter().cloned().map(|row| insert(vec![row]))).collect();
+    let expected = reference.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), replay(one_at_a_time), &context).await.unwrap();
+    runs.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    let grouped = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), replay(vec![existing, insert(rows)]), &context).await.unwrap();
+    assert!(grouped.result().committed(), "{:?}", grouped.result().error());
+    assert_eq!(runs.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(replica_bytes(&grouped), replica_bytes(&expected));
+
+    for (position, rows, code) in [
+        (1, vec![row(1, 25, 26, None), row(2, 60, 50, None)], "rtdb.tx/exists"),
+        (2, vec![row(2, 60, 50, None), row(1, 25, 26, None)], "xtdb.indexer/invalid-valid-times"),
+        (3, vec![row(3, 15, 16, None), row(1, 25, 26, None)], "rtdb.tx/exists"),
+    ] {
+        let result = resolver.resolve_source(state.snapshot(), SourcePosition(position), Timestamp(100 + position), replay(vec![insert(rows)]), &context).await.unwrap();
+        assert_eq!(result.result().error().unwrap().code, code);
+        assert!(!result.writes().tables().contains_key(&table()));
+    }
+}
+
+#[tokio::test]
+async fn arrow_replay_dynamic_insert_batches_independent_bindings_without_changing_replica_bytes() {
+    use rtdb_format::{envelope::SourceMessage, ipc::write_stream};
+
+    let mut context = context();
+    let runs = Arc::new(QueryRuns::default());
+    context.tracer = Some(runs.clone());
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let rows = vec![
+        vec![Value::I64(7), Value::F64(-0.0)],
+        vec![Value::I64(7), Value::F64(f64::from_bits(0x7ff8000000000123))],
+        vec![Value::I64(2), Value::F64(1.5)],
+    ];
+    let bound = |sql: &str, rows| TxOp::Sql {
+        sql: sql.into(), args: Some(SqlArguments::from_rows(rows, &context.memory).unwrap()),
+    };
+    let replay = |operations| {
+        let source = prepare_submission(operations, SubmitOptions::default(), "xtdb", &context.memory).unwrap();
+        let encoded = source.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        let replay = SourceTransaction::decode(&message, &context.memory).unwrap();
+        assert_eq!(encoded.as_slice(), replay.encode().unwrap().as_slice());
+        replay
+    };
+    let mut serial = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let mut grouped = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let insert = "INSERT INTO docs (_id, v) SELECT $1 + 0, CASE WHEN $1 < 0 THEN -$2 ELSE $2 END";
+    let expected = serial.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), replay(rows.iter().cloned().map(|row| bound(insert, vec![row])).collect()), &context).await.unwrap();
+    runs.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    let actual = grouped.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), replay(vec![bound(insert, rows)]), &context).await.unwrap();
+    assert!(actual.result().committed(), "{:?}", actual.result().error());
+    assert_eq!(runs.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let replica_bytes = |resolved: &ResolvedTx| {
+        let batch = resolved.writes().tables()[&table()].batch().unwrap().arrow();
+        write_stream(batch.schema_ref(), std::slice::from_ref(batch)).unwrap()
+    };
+    assert_eq!(replica_bytes(&actual), replica_bytes(&expected));
+
+    let invalid = "INSERT INTO docs (_id, v) SELECT $1, 100 / $1";
+    let args = vec![vec![Value::I64(2)], vec![Value::I64(0)], vec![Value::I64(1)]];
+    let result = grouped.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), replay(vec![bound(invalid, args)]), &context).await.unwrap();
+    let error = result.result().error().unwrap();
+    assert_eq!(error.context["arg-idx"], 1);
+    assert!(!result.writes().tables().contains_key(&table()));
+
+    let update = "UPDATE docs SET v = v + $1 WHERE _id = 2";
+    let args = vec![vec![Value::F64(3.0)], vec![Value::F64(10.0)]];
+    let result = grouped.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102), replay(vec![bound(update, args), sql("ASSERT (SELECT v FROM docs WHERE _id = 2) = 14.5")]), &context).await.unwrap();
+    assert!(result.result().committed(), "{:?}", result.result().error());
 }
 
 #[tokio::test]

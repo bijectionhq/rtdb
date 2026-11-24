@@ -31,6 +31,7 @@ mod control_order;
 mod schedule_order;
 mod retry;
 mod retention;
+mod sql_argument_table;
 pub use retention::installed_receipt_time;
 mod fixed_range;
 pub(crate) mod ordered_micros;
@@ -825,6 +826,12 @@ impl<'a> OpenTransaction<'a> {
     /// `planned` carries one operation's mutation from each argument row to the next, which reuses it while the
     /// transaction's catalog answers the planning's lookups the same.
     async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>) -> Result<()> {
+        let (mutation, context, syntax) = self.plan_sql_mutation(sql, arguments, planned)?;
+        self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(|error| error.with_context("sql", sql.into()))
+    }
+
+    fn plan_sql_mutation(&self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>)
+        -> Result<(rtdb_sql::Mutation, Arc<QueryContext>, Arc<MemoryReservation>)> {
         self.context.check_cancelled()?;
         // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
         let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
@@ -852,7 +859,7 @@ impl<'a> OpenTransaction<'a> {
                 mutation
             }
         };
-        self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
+        Ok((mutation, context, syntax))
     }
 
     /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
@@ -1123,27 +1130,13 @@ impl<'a> OpenTransaction<'a> {
         self.context.check_cancelled()?;
         match operation {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
-                Some(arguments) => {
-                    let mut planned = None;
-                    for row in arguments.indexed_bound_rows() {
-                        let (index, row) = row?;
-                        self.execute_sql_typed(sql, Some(row), &mut planned)
-                            .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
-                    }
-                    Ok(())
-                }
+                Some(arguments) => self.execute_sql_arguments(sql, arguments).await,
                 None => self.execute_sql(sql, None).await,
             },
             Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.clone().into_bytes(), &self.context.memory)?;
-                let mut planned = None;
-                for row in arguments.indexed_bound_rows() {
-                    let (index, row) = row?;
-                    self.execute_sql_typed(sql, Some(row), &mut planned)
-                        .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
-                }
-                Ok(())
+                self.execute_sql_arguments(sql, &arguments).await
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None, false).await,
             Operation::Public(TxOp::WriteArrowDocs { table, documents, write, valid_from, valid_to }) => match write {
@@ -3372,27 +3365,55 @@ impl<'a> OpenTransaction<'a> {
         Ok(key)
     }
 
-    async fn require_absent(&self, table: &TableRef, iid: Iid, valid: Interval) -> Result<()> {
+    async fn scan_insert_intervals(&self, table: &TableRef, iids: BTreeSet<Iid>, valid: Interval, names: &[&str]) -> Result<Option<QueryCursor>> {
         use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 
         let snapshot = self.snapshot()?;
-        if !snapshot.contains_table(table) { return Ok(()); }
+        if !snapshot.contains_table(table) { return Ok(None); }
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?
             .with_accelerators(Arc::from([]));
         let table = context.catalog.table(&QualifiedTable { database: self.context.database.clone(), table: table.clone() })?
             .ok_or_else(|| Anomaly::fault("rtdb.tx/insert-table", "Insert table disappeared from its ordered snapshot"))?;
-        let field = Field {
-            id: ColumnId(0), name: "_iid".into(), qualifier: None, qualified_only: false, unnamed: false,
-            data_type: table.scan_column_type("_iid"),
-        };
+        let columns = names.iter().copied().enumerate().map(|(index, name)| Field {
+            id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: table.scan_column_type(name),
+        }).collect();
         let scan = Relation::scan(Scan {
-            table, columns: vec![field],
+            table, columns,
             valid_time: TemporalFilter::FromTo { from: Expr::Literal(time_value(valid.lower())), to: Expr::Literal(time_value(valid.upper())) },
             system_time: TemporalFilter::Default, clamp_valid_time: false,
-            iids: Some([iid].into()), predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
+            iids: Some(iids), predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         })?;
         let query = PreparedQuery::new_in(Arc::new(scan), &context.memory)?;
-        require_empty_insert(query.execute_columns(context, Vec::new()).await?).await
+        query.execute_columns(context, Vec::new()).await.map(Some)
+    }
+
+    async fn insert_batch_is_absent(&self, table: &TableRef, headers: &[EventHeader]) -> Result<bool> {
+        let _scratch = self.context.memory.reserve(headers.len().checked_mul(96).ok_or_else(overflow)?)?;
+        let mut intervals = BTreeMap::<(Iid, Timestamp), Timestamp>::new();
+        let mut iids = BTreeSet::new();
+        let mut lower = Timestamp::MAX;
+        let mut upper = Timestamp::MIN;
+        for header in headers {
+            let valid = header.valid_time;
+            if insert_interval_overlaps(&intervals, header.iid, valid) { return Ok(false); }
+            intervals.insert((header.iid, valid.lower()), valid.upper());
+            iids.insert(header.iid);
+            lower = lower.min(valid.lower());
+            upper = upper.max(valid.upper());
+        }
+        let Some(mut cursor) = self.scan_insert_intervals(table, iids, Interval::new(lower, upper)?, &["_iid", "_valid_from", "_valid_to"]).await? else { return Ok(true); };
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            let iids = mutation_column(batch, "_iid")?;
+            let from = mutation_column(batch, "_valid_from")?;
+            let to = mutation_column(batch, "_valid_to")?;
+            for row in 0..batch.num_rows() {
+                let valid = Interval::new(from.time(row, Timestamp::MIN)?, to.time(row, Timestamp::MAX)?)?;
+                if insert_interval_overlaps(&intervals, iids.iid(row)?, valid) { return Ok(false); }
+            }
+        }
+        Ok(true)
     }
 
     fn put_owned_lifetime_floor(&mut self, owner: &str, relation: &OwnedRelation, floor: rtdb_types::OwnedLifetimeFloor) -> Result<()> {
@@ -3597,9 +3618,20 @@ impl<'a> OpenTransaction<'a> {
             .map(|(field, column)| (Arc::clone(field), Arc::clone(column))).unzip();
         let content = rtdb_columnar::build_struct_array(fields.into(), &columns, array.len(), None)?;
         if create_only {
+            if array.len() > 1
+                && let Ok(headers) = (0..array.len()).map(header).collect::<Result<Vec<_>>>()
+                && let Ok(true) = self.insert_batch_is_absent(table, &headers).await
+                && let Ok(batch) = rtdb_format::data::owned_put_batch(Arc::clone(&content), &headers, documents.source_bytes(), &memory)
+                && self.buffer.append_batch(table, batch).is_ok()
+            {
+                return Ok(());
+            }
+            // Replay in order when the group cannot commit, so a later conflict cannot mask an earlier failure.
             for row in 0..array.len() {
                 let event = header(row)?;
-                self.require_absent(table, event.iid, event.valid_time).await?;
+                if let Some(cursor) = self.scan_insert_intervals(table, [event.iid].into(), event.valid_time, &["_iid"]).await? {
+                    require_empty_insert(cursor).await?;
+                }
                 let batch = rtdb_format::data::owned_put_batch(content.slice(row, 1), &[event], documents.source_bytes(), &memory)?;
                 self.buffer.append_batch(table, batch)?;
             }
@@ -3756,6 +3788,11 @@ async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn insert_interval_overlaps(intervals: &BTreeMap<(Iid, Timestamp), Timestamp>, iid: Iid, valid: Interval) -> bool {
+    intervals.range((iid, Timestamp::MIN)..(iid, valid.upper())).next_back()
+        .is_some_and(|(_, end)| *end > valid.lower())
 }
 
 fn insert_exists() -> Anomaly {
