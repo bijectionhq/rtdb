@@ -61,6 +61,7 @@ The launcher atomically publishes a private protocol 3 receipt containing `datab
 The launcher requires `--parent-stdin` and drains on EOF or a termination signal.
 
 Use `--custody-provider-config FILE` to supply the existing Original provider projection for this name and incarnation.
+Server configuration can use `flightSql.custodyProviders[].owner` to select the authenticated Original principal for each native database. The principal needs write access to that database and its writer receipt still has to match the configured custody authority.
 The native listener authenticates the configured Original's caller and resolves release authority through the applied writer and provider evidence.
 The native launcher requires its own installed authority format.
 Classic installations require a separate migration that preserves their data and custody.

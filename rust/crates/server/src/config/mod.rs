@@ -234,8 +234,8 @@ fn flight(value: Yaml) -> Result<FlightSettings> {
         Ok::<_, Anomaly>(rtdb_flight_sql::HostedControlConfig { owner, relations })
     }).transpose()?;
     let custody_providers = custody_providers(&mut fields)?;
-    if !custody_providers.is_empty() && hosted_controls.is_none() {
-        return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "Custody provider routes require the hosted owner"));
+    if hosted_controls.is_none() && custody_providers.iter().any(|route| route.owner.is_none()) {
+        return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "Each custody provider route requires a configured owner"));
     }
     let config = FlightSettings { host: fields.string("host")?.unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
         transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,

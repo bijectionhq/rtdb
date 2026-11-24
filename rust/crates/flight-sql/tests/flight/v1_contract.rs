@@ -2234,10 +2234,8 @@ async fn configured_custody_query_mounts_only_for_the_credentialed_owner() {
         },
         writer: OriginalWriterPoint { table: TableRef::new("public", "installation"), id: EntityId::Integer(1), valid_at: Timestamp(0) },
         observations: observations.clone(),
-    }));
+    }).with_owner("xtdb".into()));
     let config = || FlightConfig {
-        owned_native_actions: true,
-        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig { owner: "xtdb".into(), relations: ["bj_installation".into()].into() }),
         custody_providers: [("xtdb".into(), provider.clone())].into(),
         ..Default::default()
     };

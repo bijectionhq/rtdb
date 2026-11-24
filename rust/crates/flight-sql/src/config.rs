@@ -149,8 +149,10 @@ impl Default for FlightConfig {
 }
 impl FlightConfig {
     pub(crate) fn validate(&self, standalone_custody_owner: Option<&str>) -> Result<()> {
+        let owns_unassigned_providers = self.hosted_controls.is_some() || standalone_custody_owner.is_some();
         if !self.custody_providers.is_empty()
-            && (self.hosted_controls.is_none() && standalone_custody_owner.is_none() || self.audience.is_some())
+            && (self.audience.is_some()
+                || !owns_unassigned_providers && self.custody_providers.values().any(|route| route.owner().is_none()))
         {
             return Err(Anomaly::incorrect("rtdb.flight-sql/custody-provider", "Custody providers require the installed owner on the original Flight listener"));
         }

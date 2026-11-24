@@ -315,6 +315,7 @@ pub async fn serve(launch: Launch, stop: CancellationToken) -> Result<()> {
         flight.custody_providers = parse_custody_provider_config(config)?;
         if flight.custody_providers.len() != 1
             || !flight.custody_providers[0].matches_installation(&target.name, target.id)
+            || flight.custody_providers[0].owner.as_deref().is_some_and(|owner| owner != "xtdb")
         {
             return Err(invalid(
                 "The custody provider must identify the original standalone installation",

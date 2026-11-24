@@ -25,6 +25,7 @@ const MAX_READ_PROOFS: usize = 8;
 
 pub struct CustodyProviderRoute {
     installation: CustodyProviderInstallation,
+    owner: Option<String>,
     mount: Mutex<Option<CustodyProviderMount>>,
 }
 impl fmt::Debug for CustodyProviderRoute {
@@ -37,8 +38,18 @@ impl CustodyProviderRoute {
     pub fn new(installation: CustodyProviderInstallation) -> Self {
         Self {
             installation,
+            owner: None,
             mount: Mutex::new(None),
         }
+    }
+
+    pub fn with_owner(mut self, owner: String) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    pub(crate) fn owner(&self) -> Option<&str> {
+        self.owner.as_deref().filter(|owner| !owner.is_empty())
     }
 
     async fn acquire(
@@ -186,7 +197,9 @@ fn read_proofs_commitment(proofs: &[Vec<u8>]) -> [u8; 32] {
 impl Service {
     pub(super) fn custody_route(&self, call: &Call) -> Result<&CustodyProviderRoute, Status> {
         let config = &self.0.config;
-        let owner = config.hosted_controls.as_ref().map(|policy| policy.owner.as_str())
+        let route = config.custody_providers.get(&call.database).map(Arc::as_ref);
+        let owner = route.and_then(CustodyProviderRoute::owner)
+            .or_else(|| config.hosted_controls.as_ref().map(|policy| policy.owner.as_str()))
             .or(self.0.standalone_custody_owner);
         let caller = &call.session.caller;
         if owner.is_none()
@@ -208,11 +221,7 @@ impl Service {
             .principal
             .authorize_database(&call.database, DatabaseAccess::Write)
             .map_err(error::anomaly)?;
-        config
-            .custody_providers
-            .get(&call.database)
-            .map(Arc::as_ref)
-            .ok_or_else(unavailable)
+        route.ok_or_else(unavailable)
     }
 
     pub(super) async fn custody_read_proof(

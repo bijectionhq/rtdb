@@ -245,8 +245,12 @@ impl ServerDriver {
         {
             let mut custody_providers = std::collections::BTreeMap::new();
             for provider in &settings.custody_providers {
-                let route = Arc::new(rtdb_flight_sql::CustodyProviderRoute::new(provider.installation(Arc::clone(node.memory()))?));
-                if custody_providers.insert(provider.database.clone(), route).is_some() {
+                let route = rtdb_flight_sql::CustodyProviderRoute::new(provider.installation(Arc::clone(node.memory()))?);
+                let route = match &provider.owner {
+                    Some(owner) => route.with_owner(owner.clone()),
+                    None => route,
+                };
+                if custody_providers.insert(provider.database.clone(), Arc::new(route)).is_some() {
                     return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "A database accepts one configured original custody provider"));
                 }
             }

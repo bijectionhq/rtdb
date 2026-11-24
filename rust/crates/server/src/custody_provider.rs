@@ -19,6 +19,7 @@ const MAX_RESPONSE: usize = 512 * 1024;
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub database: String,
+    pub(crate) owner: Option<String>,
     endpoint: Url,
     bearer: Secret,
     public_key: [u8; 32],
@@ -29,7 +30,8 @@ pub struct Settings {
 pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
     let mut fields = YamlFields::new(value, "flightSql.custodyProviders")?;
     let database = fields.required_string("database")?;
-    if database.is_empty() {
+    let owner = fields.string("owner")?;
+    if database.is_empty() || owner.as_deref().is_some_and(str::is_empty) {
         return Err(invalid());
     }
     let endpoint = Url::parse(&fields.required_string("endpoint")?).map_err(|_| invalid())?;
@@ -85,6 +87,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
     }
     Ok(Settings {
         database,
+        owner,
         endpoint,
         bearer: Secret::new(bearer),
         public_key,
