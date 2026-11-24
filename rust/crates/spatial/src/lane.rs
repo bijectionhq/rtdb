@@ -109,7 +109,7 @@ impl ArtefactBuilder for Builder {
         let bundle = output.clone();
         let memory = Arc::clone(&self.0.memory);
         let cancel = cancellation.clone();
-        let (size, digest) = tokio::task::spawn_blocking(move || {
+        let (size, root) = tokio::task::spawn_blocking(move || {
             let _geometry = memory.reserve(kernel::WORK_BYTES)?;
             let (mut reader, _metadata) = input::open_input(source, &memory)?;
             let mut postings = postings::Postings::new(&memory)?;
@@ -132,6 +132,7 @@ impl ArtefactBuilder for Builder {
                 }
             }
             let writer = std::fs::File::options()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(bundle)
@@ -153,7 +154,7 @@ impl ArtefactBuilder for Builder {
             kind: Some(definition::KIND.into()),
             definition_id: Some(job.definition.id.clone()),
             definition_version: Some(job.definition.version),
-            stats: Some(digest),
+            stats: Some(root),
             scope: None,
             file_size: Some(i64::try_from(size).map_err(fault)?),
             published_version,

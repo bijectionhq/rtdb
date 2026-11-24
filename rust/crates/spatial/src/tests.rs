@@ -17,17 +17,20 @@ fn point(longitude: f64, latitude: f64) -> Vec<u8> {
     [vec![0], geometry.wkb()].concat()
 }
 
-fn checked_candidates(
+async fn checked_candidates(
     bytes: Vec<u8>,
-    digest: &[u8],
+    stats: &[u8],
     partition: Option<Partition>,
     ranges: &[geometry::KeyRange],
     memory: &std::sync::Arc<MemoryBudget>,
     check: impl Fn() -> rtdb_types::Result<()>,
     insert: impl FnMut(Iid) -> rtdb_types::Result<()>,
 ) -> rtdb_types::Result<()> {
-    postings::verify_digest(postings::sha256(&bytes, &check)?, digest)?;
-    postings::candidates(bytes, partition, ranges, memory, check, insert)
+    let bytes = bytes::Bytes::from(bytes);
+    let root = postings::Root::decode(stats, bytes.len() as u64)?;
+    postings::candidates(root, partition, ranges, memory, check, async |range| {
+        Ok(bytes.slice(range.start as usize..range.end as usize))
+    }, insert).await
 }
 
 fn canonical_float(value: f64) -> Vec<u8> {
@@ -264,8 +267,8 @@ fn canonical_geometry_validates_the_complete_image_before_shape_admission() {
     }
 }
 
-#[test]
-fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitions() {
+#[tokio::test]
+async fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitions() {
     let cases = [(179.999, 0.0, -179.999, 0.0), (34.0, 90.0, -31.0, 90.0)];
     for (row_lon, row_lat, query_lon, query_lat) in cases {
         let mut work = GeometryWork::default();
@@ -288,7 +291,7 @@ fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_
         file.append(elsewhere, Iid([2; 16]), row.keys(&mut work).unwrap())
             .unwrap();
         let output = tempfile::NamedTempFile::new().unwrap();
-        let (length, digest) = file
+        let (length, stats) = file
             .write(
                 output.reopen().unwrap(),
                 &tokio_util::sync::CancellationToken::new(),
@@ -300,7 +303,7 @@ fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_
         let mut hits = Vec::new();
         checked_candidates(
             bytes.clone(),
-            &digest,
+            &stats,
             Some(selected),
             &cover,
             &memory,
@@ -309,13 +312,13 @@ fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_
                 hits.push(iid);
                 Ok(())
             },
-        )
+        ).await
         .unwrap();
         assert_eq!(hits, [wanted]);
         hits.clear();
         checked_candidates(
             bytes.clone(),
-            &digest,
+            &stats,
             None,
             &cover,
             &memory,
@@ -324,39 +327,39 @@ fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_
                 hits.push(iid);
                 Ok(())
             },
-        )
+        ).await
         .unwrap();
         hits.sort_unstable();
         assert_eq!(hits, [wanted, Iid([2; 16])]);
         let error = checked_candidates(
             bytes.clone(),
-            &digest,
+            &stats,
             None,
             &cover,
             &memory,
             || Err(postings::cancelled()),
             |_| panic!("cancelled posting traversal produced a candidate"),
-        )
+        ).await
         .unwrap_err();
         assert_eq!(error.code, "rtdb.spatial/cancelled");
-        bytes[0] ^= 1;
+        *bytes.last_mut().unwrap() ^= 1;
         assert!(
             checked_candidates(
                 bytes,
-                &digest,
+                &stats,
                 Some(selected),
                 &cover,
                 &memory,
                 || Ok(()),
                 |_| Ok(())
-            )
+            ).await
             .is_err()
         );
     }
 }
 
-#[test]
-fn spatial_arrow_postings_seek_across_page_boundaries() {
+#[tokio::test]
+async fn spatial_arrow_postings_seek_across_page_boundaries() {
     let memory = MemoryBudget::new(32 << 20);
     let partition = Partition::of([b"area".as_slice()]);
     let iid = Iid([9; 16]);
@@ -368,21 +371,21 @@ fn spatial_arrow_postings_seek_across_page_boundaries() {
             postings.append(partition, iid, vec![boundary, boundary - 1]).unwrap();
         }
         let file = tempfile::NamedTempFile::new().unwrap();
-        let (_, digest) = postings.write(
+        let (_, stats) = postings.write(
             file.reopen().unwrap(),
             &tokio_util::sync::CancellationToken::new(),
         ).unwrap();
-        (std::fs::read(file.path()).unwrap(), digest)
+        (std::fs::read(file.path()).unwrap(), stats)
     };
 
-    let (bytes, digest) = write((0..=boundary + 1).collect(), false);
-    let (reordered, reordered_digest) = write((0..=boundary + 1).rev().collect(), true);
+    let (bytes, stats) = write((0..=boundary + 1).collect(), false);
+    let (reordered, reordered_stats) = write((0..=boundary + 1).rev().collect(), true);
     assert_eq!(bytes, reordered);
-    assert_eq!(digest, reordered_digest);
+    assert_eq!(stats, reordered_stats);
     let mut selected = Vec::new();
     checked_candidates(
         bytes,
-        &digest,
+        &stats,
         Some(partition),
         &[geometry::KeyRange {
             start: boundary - 1,
@@ -394,7 +397,7 @@ fn spatial_arrow_postings_seek_across_page_boundaries() {
             selected.push(iid);
             Ok(())
         },
-    )
+    ).await
     .unwrap();
     assert_eq!(selected, [iid, iid]);
 }

@@ -27,12 +27,14 @@ pub fn rotation_evidence_mirrors_the_selected_fence(
 }
 
 pub fn rotation_evidence_names_the_clean_successor(
-    checkpoint: bool, reported: u64, successor: u64, retired: u64,
+    checkpoint: bool, original_request: bool, successor_owner: bool,
+    reported: u64, successor: u64, retired: u64,
 )
     requires successor as int == retired as int + 1,
 {
-    let covered = at_clean_checkpoint(checkpoint, reported, successor);
-    assert(covered ==> checkpoint && reported == successor && retired < reported);
+    let covered = at_clean_checkpoint(checkpoint, original_request, successor_owner, reported, successor);
+    assert(covered ==> checkpoint && original_request && successor_owner
+        && reported == successor && retired < reported);
 }
 
 pub fn a_fixed_reservation_fits_the_requested_deadline(requested: u64, reserved: u64) {

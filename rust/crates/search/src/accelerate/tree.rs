@@ -200,7 +200,7 @@ impl SearchAccelerator {
                 work.logical_roots += 1;
                 let scanned = async {
                     let tree = self.runtime.logical_file(request.storage, &table.slug, run, &definition.columns).await?;
-                    let mut rank = TreeRanked::open(tree, field, query, &scorer, request.bounds, TreeRankOrder::Score).await?;
+                    let mut rank = TreeRanked::open(tree, field, query, &scorer, request.bounds, TreeRankOrder::Score, request.memory).await?;
                     while rank.bound().is_some() {
                         if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
                         for candidate in rank.expand(request.iid_scope(), &mut examined).await? { results.insert(candidate.iid); }
@@ -458,7 +458,7 @@ impl RankSource for PartitionRankSource<'_> {
                 let table = request.snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
                 let opened = async {
                     let file = runtime.logical_file(request.storage, &table.slug, self.logical[index], &definition.columns).await?;
-                    TreeRanked::open(file, self.column_index, &self.matching, &self.ranking, request.bounds, self.order).await
+                    TreeRanked::open(file, self.column_index, &self.matching, &self.ranking, request.bounds, self.order, request.memory).await
                 }.await;
                 match opened {
                     Ok(rank) => {
@@ -487,7 +487,10 @@ impl RankSource for PartitionRankSource<'_> {
                         if let Some(bound) = rank.bound() { more.push(RankWork::new(bound, Task::ExpandLogical(index))); }
                     }
                     Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
-                    Err(error) => self.lost_run(index, &error, &mut more),
+                    Err(error) => {
+                        self.logical_ranks[index] = None;
+                        self.lost_run(index, &error, &mut more);
+                    }
                 }
             }
             Task::Open(index) => {
@@ -495,7 +498,7 @@ impl RankSource for PartitionRankSource<'_> {
                 let source = &self.sources[index];
                 let opened = async {
                     let file = source.open(runtime, request, definition).await?;
-                    TreeRanked::open(file, self.column_index, &self.matching, &self.ranking, request.bounds, self.order).await
+                    TreeRanked::open(file, self.column_index, &self.matching, &self.ranking, request.bounds, self.order, request.memory).await
                 }.await;
                 let rank = match opened {
                     Ok(rank) => rank,

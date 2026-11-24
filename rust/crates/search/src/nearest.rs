@@ -389,7 +389,7 @@ async fn approximate_partition(
         let Some(rtdb_vector::Round { candidates, complete }) = shortlist.round(cut, None).await? else { return Ok(false) };
         let mut settled = NearestWindow::new(&context.memory, query.k)?;
         if !candidates.is_empty() && let Some(cursor) = rtdb_query::open_owned_root_projection_of(
-            Arc::clone(context), owner, &partition.relation, valid, columns, candidates,
+            Arc::clone(context), owner, &partition.relation, valid, columns, candidates.into_iter().collect(),
         ).await? {
             rank_rows(context, cursor, partition, query, shadows, ordinal, &mut settled, None).await?;
         }

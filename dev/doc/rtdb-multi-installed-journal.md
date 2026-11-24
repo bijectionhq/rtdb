@@ -297,6 +297,7 @@ The broker waits for every signed cut, including roots with an empty local selec
 It projects the union of the other roots' selectors through authenticated fork maps.
 Staging checks the local selectors against the exact head being rewritten and removes the projected inherited origins.
 Every enrolled installed root must report a sealed successor bound to the same selection before any root requests rotation.
+Before committing erasure, RTDB checks that the signed clean-slot evidence covers a recovery hold for the same rotation request and the successor writer enrollment.
 A directory-only root needs an authenticated ordered handoff before it can participate.
 The handoff must fence the Directory writer and certify its exact recovery closure before selecting an installed route.
 Its original key inventories and admitted custody stay in the broker's domain until their original authorities confirm disposition.

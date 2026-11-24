@@ -67,8 +67,10 @@ impl VectorAccelerator {
         let budget = Budget { max_uncovered_bytes: self.max_uncovered_bytes, max_candidates: self.max_candidates };
         let Some(mut shortlist) = Shortlist::open(cut, &asked.definition, asked.probe, asked.limit, partition, scope, budget).await? else { return Ok(None) };
         loop {
-            let Some(Round { candidates, complete }) = shortlist.round(cut, scope).await? else { return Ok(None) };
-            let candidates = CandidateIids::from_set(candidates, request.memory)?;
+            let (candidates, complete) = {
+                let Some(Round { candidates, complete }) = shortlist.round(cut, scope).await? else { return Ok(None) };
+                (CandidateIids::from_sorted(&candidates, request.memory)?, complete)
+            };
             let Some(visible) = request.verifier.retain_visible(&candidates).await? else { return Ok(Some(candidates)) };
             if visible.len() >= asked.limit || complete { return Ok(Some(visible)); }
             // Too few candidates passed the filter: widen the probe and the shortlist until it is satisfied or the budget is spent.

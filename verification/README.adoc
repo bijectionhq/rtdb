@@ -164,6 +164,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The resolver uses these decisions for ordinary and prepared hosted publications.
   The surrounding resolver supplies observations and executes commands on its transaction candidate.
 * link:verus/installed_adapter/README.md[Installed adapter contract] checks the exact request identities against a named Lean reference and records Logkeeper's admission preconditions at RTDB's pin.
+* link:verus/ordered_recovery_cursor/area.json[Installed replay cursor] checks hold binding, preparation and delivery as a single cut transition.
+  A failed page open or record retention leaves the selected record eligible for retry, and snapshot references become available for admission only after successful delivery.
+  link:multi/lean/CheckpointReplay.lean[Checkpoint replay] relates any finite trace of exact deliveries and retries to the original checkpoint and journal prefix.
+  The provider must supply the original certified records, and the partition installer must apply their complete decoded effects.
 * link:verus/framing_decoders/area.json[Framing decoders] imports the Rust functions used for source and replica envelopes, replica retirement attempts, journal framing and Flight audience seats.
   On 2026-11-24, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 56 items, and all 27 mutations failed at their declared laws.
   A journal read requires a complete header and the whole declared body with its matching checksum, and a retained location requires exact consumption.

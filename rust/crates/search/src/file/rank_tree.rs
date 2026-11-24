@@ -1,16 +1,16 @@
-use std::{io::Write, ops::Range, sync::Arc};
+use std::{io::Write, mem::size_of, ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, Float64Array, Int64Array, LargeListArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     builder::FixedSizeBinaryBuilder, cast::AsArray, types::{Float64Type, Int64Type, UInt8Type, UInt32Type, UInt64Type},
 };
-use rtdb_types::Result;
+use rtdb_types::{MemoryBudget, MemoryReservation, Result};
 
 use super::{
     corrupt, fault,
     layout::{PageRef, Table, Writer, item_of, list, table},
     page_tree::{PageKind, TreeReader},
-    paged::{self, TermBlocks},
+    paged::PostingBlock,
 };
 
 const INLINE_WINDOWS: usize = 32;
@@ -96,44 +96,74 @@ pub(super) fn node_at(array: &StructArray, row: usize) -> Result<RankNode> {
     Ok(node)
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct WindowIds {
+pub(super) struct RankWindow {
+    pub window: u32,
+    pub block: usize,
+    pub frequency: u32,
+    pub length: u32,
+    pub unit_score: f64,
     pub minimum: Option<i64>,
     pub peak: Option<i64>,
 }
 
+pub(super) struct RankBlock {
+    pub posting: PostingBlock,
+    pub windows: Range<usize>,
+}
+
 pub(super) struct RankLeaf {
-    pub postings: TermBlocks,
-    pub ids: Vec<WindowIds>,
+    pub blocks: Vec<RankBlock>,
+    pub windows: Vec<RankWindow>,
+    _reservation: Option<Arc<MemoryReservation>>,
 }
 
 impl RankLeaf {
-    pub fn read(blocks: &LargeListArray, ids: &LargeListArray, row: usize) -> Result<Self> {
+    pub fn read(blocks: &LargeListArray, ids: &LargeListArray, row: usize, memory: Option<&Arc<MemoryBudget>>) -> Result<Self> {
         if row >= blocks.len() || row >= ids.len() { return Err(corrupt("Search rank page is incomplete")); }
-        let postings = TermBlocks::new(paged::blocks(blocks, row));
+        let blocks = blocks.value(row);
+        let blocks = blocks.as_struct();
+        let impacts = blocks.column(3).as_list::<i64>();
+        let offsets = impacts.value_offsets();
+        let base = offsets[0] as usize;
+        let range = base..offsets[blocks.len()] as usize;
+        let impacts = impacts.values().as_struct();
+        let uint = |column| impacts.column(column).as_primitive::<UInt32Type>().values();
+        let scores = impacts.column(5).as_primitive::<Float64Type>().values();
         let ids = ids.value(row);
         let ids = ids.as_struct();
-        let windows = ids.column(0).as_primitive::<UInt32Type>();
+        let window_ids = ids.column(0).as_primitive::<UInt32Type>();
         let minimum = ids.column(1).as_primitive::<Int64Type>();
         let peak = ids.column(2).as_primitive::<Int64Type>();
-        if postings.windows.is_empty()
-            || !postings.windows.iter().map(|&(window, _, _)| window).eq(windows.values().iter().copied())
-            || windows.values().windows(2).any(|pair| pair[0] >= pair[1])
-            || postings.windows.iter().any(|(_, _, impact)| !impact.max_unit_score.is_finite() || impact.max_unit_score <= 0.0) {
+        if range.is_empty() || &uint(0)[range.clone()] != window_ids.values().as_ref()
+            || window_ids.values().windows(2).any(|pair| pair[0] >= pair[1])
+            || scores[range.clone()].iter().any(|score| !score.is_finite() || *score <= 0.0) {
             return Err(corrupt("Search term impacts disagree with their ordering proof"));
         }
-        let ids = (0..ids.len()).map(|row| WindowIds {
-            minimum: minimum.is_valid(row).then(|| minimum.value(row)),
-            peak: peak.is_valid(row).then(|| peak.value(row)),
-        }).collect();
-        Ok(Self { postings, ids })
+        let bytes = 256usize.saturating_add(blocks.len().saturating_mul(size_of::<RankBlock>()))
+            .saturating_add(range.len().saturating_mul(size_of::<RankWindow>()));
+        let reservation = memory.map(|memory| memory.reserve(bytes)).transpose()?;
+        let mut block_descriptors = Vec::with_capacity(blocks.len());
+        let mut windows = Vec::with_capacity(range.len());
+        let frequencies = uint(1);
+        let lengths = uint(2);
+        for (block, offsets) in offsets.windows(2).enumerate() {
+            let start = windows.len();
+            for impact in offsets[0] as usize..offsets[1] as usize {
+                let row = impact - base;
+                windows.push(RankWindow { window: window_ids.value(row), block, frequency: frequencies[impact], length: lengths[impact],
+                    unit_score: scores[impact], minimum: minimum.is_valid(row).then(|| minimum.value(row)),
+                    peak: peak.is_valid(row).then(|| peak.value(row)) });
+            }
+            block_descriptors.push(RankBlock { posting: PostingBlock::at(blocks, block), windows: start..windows.len() });
+        }
+        Ok(Self { blocks: block_descriptors, windows, _reservation: reservation })
     }
 
     fn summary(&self, range: Range<usize>) -> RankNode {
-        self.postings.windows[range.clone()].iter().zip(&self.ids[range]).map(|(&(window, _, impact), ids)| RankNode {
-            first: window, last: window, height: 0, page: None,
-            frequency: impact.frequency, length: impact.length, unit_score: impact.max_unit_score,
-            minimum: ids.minimum, peak: ids.peak,
+        self.windows[range].iter().map(|window| RankNode {
+            first: window.window, last: window.window, height: 0, page: None,
+            frequency: window.frequency, length: window.length, unit_score: window.unit_score,
+            minimum: window.minimum, peak: window.peak,
         }).reduce(RankNode::combine).expect("a rank leaf contains a window")
     }
 }
@@ -178,22 +208,22 @@ fn slices(rows: &ArrayRef, range: Range<usize>, table: Table) -> Result<StructAr
 }
 
 pub(super) fn write_term(writer: &mut Writer<impl Write>, blocks: &LargeListArray, ids: &LargeListArray, row: usize) -> Result<RankNode> {
-    let decoded = RankLeaf::read(blocks, ids, row)?;
-    let window_count = decoded.postings.windows.len();
+    let decoded = RankLeaf::read(blocks, ids, row, None)?;
+    let window_count = decoded.windows.len();
     if window_count <= INLINE_WINDOWS { return Ok(decoded.summary(0..window_count)); }
     let blocks = blocks.value(row);
     let ids = ids.value(row);
     let mut level = Vec::new();
-    let mut remaining = decoded.postings.blocks.iter().enumerate().peekable();
+    let mut remaining = decoded.blocks.iter().enumerate().peekable();
     let mut first_window = 0;
     while let Some((first_block, block)) = remaining.next() {
-        let mut window_count = block.impacts.len();
+        let mut window_count = block.windows.len();
         let mut last_block = first_block;
         while let Some((_, next)) = remaining.peek() {
-            if window_count + next.impacts.len() > WINDOWS_PER_LEAF { break; }
+            if window_count + next.windows.len() > WINDOWS_PER_LEAF { break; }
             let (index, next) = remaining.next().expect("peeked rank block");
             last_block = index;
-            window_count += next.impacts.len();
+            window_count += next.windows.len();
         }
         let end_window = first_window + window_count;
         let node = decoded.summary(first_window..end_window);

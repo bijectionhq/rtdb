@@ -754,6 +754,8 @@ fn covers_clean_rotation(slots: &RotationSlots, receipt: Receipt) -> bool {
         && recovery.through == slots.checkpoint.cut
         && decision::at_clean_checkpoint(
             slots.checkpoint == recovery.checkpoint,
+            recovery.id == receipt.request,
+            recovery.owner == grant.enrollment,
             slots.key_generation,
             grant.key_generation,
         )

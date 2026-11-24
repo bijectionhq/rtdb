@@ -4169,51 +4169,86 @@ enum DocumentWrite<'a> { Insert, Put, Owned { relation: &'a rtdb_types::OwnedRel
 enum MutationKind { Put, Delete, Erase }
 
 fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
+    mutation_put_batches(batch, &[], system_time, memory)
+}
+
+fn scalar_mutation_put_field(field: &arrow_schema::Field) -> bool {
+    plain_scalar_field(field) && !matches!(field.data_type(), DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+}
+
+fn mutation_put_headers(batch: &RecordBatch, system_time: Timestamp) -> Result<impl Iterator<Item = Result<EventHeader>> + '_> {
+    let iid = mutation_column(batch, "_iid")?;
+    let from = mutation_column(batch, "_valid_from")?;
+    let to = mutation_column(batch, "_valid_to")?;
+    Ok((0..batch.num_rows()).map(move |row| {
+        Ok(EventHeader { position: None,
+            commit_position: 0,
+            iid: iid.iid(row)?, system_from: system_time,
+            valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
+        })
+    }))
+}
+
+fn mutation_put_batches(
+    batch: &RecordBatch, rest: &[OwnedBatch], system_time: Timestamp, memory: &Arc<MemoryBudget>,
+) -> Result<Option<OwnedBatch>> {
     let Some((index, _)) = batch.schema_ref().column_with_name("doc") else { return Ok(None); };
     let Some(content) = batch.column(index).as_struct_opt() else { return Ok(None); };
     if content.is_empty() || content.null_count() != 0 { return Ok(None); }
-    let scalar = content.fields().iter().all(|field| {
-        plain_scalar_field(field) && !matches!(field.data_type(), DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
-    });
+    let scalar = content.fields().iter().all(|field| scalar_mutation_put_field(field));
+    if !scalar && !rest.is_empty() { return Ok(None); }
     // A nullable field stores the scalar leg before null. When a later write adds a different type,
     // a null seen before the first scalar must still take its position in the transaction's union.
     if scalar && content.columns().iter().any(|array| array.is_null(0) && array.null_count() != array.len()) {
         return Ok(None);
     }
 
-    let iid = mutation_column(batch, "_iid")?;
-    let from = mutation_column(batch, "_valid_from")?;
-    let to = mutation_column(batch, "_valid_to")?;
+    let first_headers = mutation_put_headers(batch, system_time)?;
+    let rows = rest.iter().try_fold(batch.num_rows(), |rows, page| {
+        rows.checked_add(page.batch().num_rows()).ok_or_else(overflow)
+    })?;
     let bound = content.fields().iter().try_fold(4096usize, |bytes, field| {
         bytes.checked_add(field.size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
-    })?.checked_add(rtdb_index::IndexBatch::header_bytes(batch.num_rows())?).ok_or_else(overflow)?;
+    })?.checked_add(rtdb_index::IndexBatch::header_bytes(rows)?).ok_or_else(overflow)?;
     let _scratch = memory.reserve(bound)?;
-    let read_header = |row| -> Result<EventHeader> {
-        Ok(EventHeader { position: None,
-            commit_position: 0,
-            iid: iid.iid(row)?, system_from: system_time,
-            valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
-        })
-    };
-    let mut headers = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        // The row path orders header errors against admission of earlier documents.
-        let Ok(header) = read_header(row) else { return Ok(None); };
-        headers.push(header);
+    let mut headers = Vec::with_capacity(rows);
+    let header_pages = std::iter::once(Ok(first_headers)).chain(
+        rest.iter().map(|page| mutation_put_headers(page.batch(), system_time)),
+    );
+    for page in header_pages {
+        for header in page? {
+            // The row path orders header errors against admission of earlier documents.
+            let Ok(header) = header else { return Ok(None); };
+            headers.push(header);
+        }
     }
     if !scalar {
         let content = RecordBatch::from(content.clone());
         let Some(documents) = ArrowDocuments::from_canonical_ingest(&content, IngestMode::Mutation, memory)? else { return Ok(None); };
         return rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, None, memory).map(Some);
     }
-    let copy_bound = content.columns().iter().try_fold(
-        content.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?,
+    let documents = || {
+        std::iter::once(content).chain(rest.iter().map(move |page| page.batch().column(index).as_struct()))
+    };
+    let source_list_bytes = rest.len().checked_mul(2 * std::mem::size_of::<&dyn Array>()).ok_or_else(overflow)?;
+    let copy_bound = documents().flat_map(|document| document.columns()).try_fold(
+        rows.checked_mul(64).and_then(|bytes| bytes.checked_add(4096))
+            .and_then(|bytes| bytes.checked_add(source_list_bytes)).ok_or_else(overflow)?,
         |bytes, array| bytes.checked_add(array.get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow),
     )?;
     let _copy = memory.reserve(copy_bound)?;
-    let cells = (0..content.len()).map(|row| Some((0, row))).collect::<Vec<_>>();
-    let columns = content.columns().iter().map(|array| {
-        rtdb_columnar::copy_nullable_cells(&[array.as_ref()], &cells)
+    let mut cells = Vec::with_capacity(rows);
+    for (source, document) in documents().enumerate() {
+        cells.extend((0..document.len()).map(|row| Some((source, row))));
+    }
+    let mut sources = Vec::new();
+    let columns = content.columns().iter().enumerate().map(|(column, array)| {
+        if rest.is_empty() {
+            return rtdb_columnar::copy_nullable_cells(&[array.as_ref()], &cells);
+        }
+        sources.clear();
+        sources.extend(documents().map(|document| document.column(column).as_ref()));
+        rtdb_columnar::copy_nullable_cells(&sources, &cells)
     }).collect::<Result<Vec<_>>>()?;
     let schema = Arc::new(Schema::new(content.fields().clone()));
     let content = RecordBatch::try_new(schema, columns).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;

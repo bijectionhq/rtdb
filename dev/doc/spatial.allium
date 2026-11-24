@@ -14,7 +14,9 @@ entity SpatialPath {
 entity SpatialPostings {
     path: SpatialPath
     trie: String
-    digest: Bytes
+    directory_offset: Integer
+    directory_length: Integer
+    directory_digest: Bytes
 }
 
 -- An exact retry preserves the path generation.
@@ -39,16 +41,21 @@ entity SpatialPostings {
 -- The builder decodes the geometry and partition children of a put where the IPC layout allows projection.
 -- The builder appends covering keys to typed Arrow columns and sorts their row positions.
 -- A posting page whose sorted selection is contiguous reuses source Arrow slices.
--- The posting digest covers the exact bytes written to the file.
--- A held read decodes posting pages against the admitted immutable IPC allocation.
--- A posting read admits the recorded object length and provider scratch before reading its body.
--- Each cached immutable posting allocation retains the digest of its bytes for comparison with the held catalog.
+-- The completed posting object is published immutably before the catalog records its directory receipt.
+-- The receipt authenticates the directory and Arrow footer at the end of the posting object.
+-- Each directory entry binds an Arrow page's encoded bytes, row count, ordered partition and cell endpoints, and page-wide cell bounds.
+-- A held read authenticates the directory before using its fences to select page ranges.
+-- It authenticates each selected range and checks its page contents against the directory before visiting candidates.
+-- A posting read admits each selected range and provider scratch before fetching its bytes.
+-- A store with whole-object reads admits one recorded-length allocation and lends the directory and selected page slices from it.
 -- Admitted posting and trie provider reads retain the captured catalog until their I/O completes.
 -- Each shape contributes the keys of a bounded covering, and each point contributes a leaf with its reported accuracy class.
 -- A partition's digest is a candidate key, and the exact read also compares the partition bytes on the resolved row.
 -- The exact comparison uses the partition values borrowed from the held read request.
 -- A held read uses the path definition, source inventory, and live segments selected by the same snapshot.
+-- An unrestricted region's memory reservation covers its full key range and retained metadata.
 -- Exact refinement reuses the prepared region topology and its ordered metric segments across candidates.
+-- Exact refinement acquires temporary workspace when a resolved batch supplies an eligible geometry cell and releases it before pulling another batch.
 -- A prepared filter belongs to its authenticated held read and retains its request projection and range or ranked matches.
 -- A continuation sends the filter capability, complete typed identity, bound, and observation flag.
 -- A negotiated ordinary Flight reply emits spatial page IPC as complete messages under the original hold and release checks.
@@ -59,6 +66,8 @@ entity SpatialPostings {
 -- The live tail contributes candidate IIDs from its held event batches.
 -- One read budget covers all candidate sources and all refined rows.
 -- Any candidate set contains every IID whose visible row matches the requested partition and predicate.
+-- The held relation scan shares an admitted Arrow selection of the physical candidate IIDs.
+-- Candidate discovery releases its working storage once the scan selection is ready.
 -- A complete typed identity contributes at most one result at the chosen valid instant.
 -- Complete row history, including delete and erase events, determines visibility before exact geometry refinement.
 -- Only visible rows supply geometry to the read's exact predicate.

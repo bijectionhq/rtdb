@@ -3165,7 +3165,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=17e3d70e91745da54d62ff7db59d0b4c6ad2da27#17e3d70e91745da54d62ff7db59d0b4c6ad2da27"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=0edf9970dda269d9ffbf05fa95acd50d70c89dc0#0edf9970dda269d9ffbf05fa95acd50d70c89dc0"
 dependencies = [
  "bytes",
 ]
@@ -3339,7 +3339,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=17e3d70e91745da54d62ff7db59d0b4c6ad2da27#17e3d70e91745da54d62ff7db59d0b4c6ad2da27"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=0edf9970dda269d9ffbf05fa95acd50d70c89dc0#0edf9970dda269d9ffbf05fa95acd50d70c89dc0"
 dependencies = [
  "bytes",
  "crc32fast",

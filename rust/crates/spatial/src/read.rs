@@ -1,7 +1,8 @@
-use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, ops::Range, sync::Arc};
 
 use arrow_array::{Float64Array, RecordBatch, StructArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use bytes::Bytes;
 use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
     BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
@@ -9,7 +10,7 @@ use rtdb_columnar::{
 };
 use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
-use rtdb_query::QueryContext;
+use rtdb_query::{CandidateIids, QueryContext};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
 
@@ -234,11 +235,8 @@ async fn definition_ready(context: Arc<QueryContext>, definition: &definition::D
     let mut uncovered = Vec::new();
     for trie in snapshot.trie_entries(&definition.table) {
         context.check_cancelled()?;
-        let available = trie.artefact(&artefact.kind, &artefact.id, artefact.version).is_some_and(|record| {
-            record.file_size.and_then(|size| u64::try_from(size).ok())
-                .is_some_and(|size| (1..=postings::MAX_FILE_BYTES).contains(&size))
-                && record.stats.as_ref().is_some_and(|digest| digest.len() == 32)
-        });
+        let available = trie.artefact(&artefact.kind, &artefact.id, artefact.version)
+            .is_some_and(|record| postings::Root::from_record(record).is_ok());
         if available { continue; }
         if rtdb_maintenance::wants(&artefact, &trie.key, trie.data_file_size, snapshot.trie_catalog().file_size_target()) {
             return Ok(false);
@@ -315,57 +313,63 @@ impl RegionGeometry {
 
 impl PreparedRegion {
     pub fn new(region_bytes: &[u8], predicate: Predicate, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
-        let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-        let region = if matches!(predicate, Predicate::All) {
+        const METADATA_BYTES: usize = 512;
+        const FULL_RANGE: KeyRange = KeyRange { start: i64::MIN, end: i64::MAX };
+
+        if matches!(predicate, Predicate::All) {
             if !region_bytes.is_empty() {
                 return Err(kernel::invalid(
                     "An unrestricted spatial read takes no region",
                 ));
             }
-            None
+            let reservation = memory.reserve(METADATA_BYTES + std::mem::size_of::<KeyRange>())?;
+            return Ok(Self {
+                predicate,
+                location: None,
+                point_geometry: false,
+                ranges: vec![FULL_RANGE],
+                steps: 0,
+                _reservation: reservation,
+            });
+        }
+
+        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
+        let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
+        let region = Location::decode(region_bytes, &mut work)?;
+        predicate.validate_region(&region)?;
+        let point_geometry = region.is_point_geometry();
+        let (geometry, ranges) = if !region.geometry.is_empty() && predicate.cover_predicate().is_some() {
+            work.scoped(|work| {
+                let geometry = predicate.prepare_geometry(&region.geometry, work)?;
+                let ranges = predicate.cover(&geometry, work)?;
+                Ok::<_, Anomaly>((RegionGeometry::Prepared(geometry), ranges))
+            })?
         } else {
-            let region = Location::decode(region_bytes, &mut work)?;
-            predicate.validate_region(&region)?;
-            Some(region)
+            // An uncovered predicate only spends topology work when it reaches a candidate.
+            let geometry = if region.geometry.is_empty()
+                || matches!(predicate, Predicate::Classification(crate::Classification::Unknown))
+            {
+                RegionGeometry::Plain(region.geometry)
+            } else {
+                let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
+                match predicate.prepare_geometry(&region.geometry, &mut preparation) {
+                    Ok(geometry) => RegionGeometry::Prepared(geometry),
+                    Err(_) => RegionGeometry::Plain(region.geometry),
+                }
+            };
+            (geometry, None)
         };
-        let point_geometry = region.as_ref().is_some_and(Location::is_point_geometry);
-        let (region, ranges) = match region {
-            Some(region) if !region.geometry.is_empty() && predicate.cover_predicate().is_some() => {
-                work.scoped(|work| {
-                    let geometry = predicate.prepare_geometry(&region.geometry, work)?;
-                    let ranges = predicate.cover(&geometry, work)?;
-                    Ok::<_, Anomaly>((Some(RegionGeometry::Prepared(geometry)), ranges))
-                })?
-            }
-            Some(region) => {
-                // An uncovered predicate only spends topology work when it reaches a candidate.
-                let geometry = if region.geometry.is_empty()
-                    || matches!(predicate, Predicate::Classification(crate::Classification::Unknown))
-                {
-                    RegionGeometry::Plain(region.geometry)
-                } else {
-                    let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-                    match predicate.prepare_geometry(&region.geometry, &mut preparation) {
-                        Ok(geometry) => RegionGeometry::Prepared(geometry),
-                        Err(_) => RegionGeometry::Plain(region.geometry),
-                    }
-                };
-                (Some(geometry), None)
-            }
-            None => (None, None),
-        };
-        let ranges = ranges.unwrap_or_else(|| vec![KeyRange { start: i64::MIN, end: i64::MAX }]);
-        let bytes = region.as_ref().map_or(0, RegionGeometry::retained_bytes)
+        let ranges = ranges.unwrap_or_else(|| vec![FULL_RANGE]);
+        let bytes = geometry.retained_bytes()
             .checked_add(ranges.capacity() * std::mem::size_of::<KeyRange>())
-            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(postings::work_limit)?;
+            .and_then(|bytes| bytes.checked_add(METADATA_BYTES)).ok_or_else(postings::work_limit)?;
         let lease = Arc::get_mut(&mut reservation).expect("geometry construction owns the reservation");
         if bytes > lease.bytes() {
             lease.grow_to(bytes)?;
         } else {
             lease.shrink_to(bytes)?;
         }
-        Ok(Self { predicate, location: region, point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
+        Ok(Self { predicate, location: Some(geometry), point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
     }
 }
 
@@ -660,18 +664,12 @@ pub(super) async fn visit_matches(
         && request.partition.len() == definition.partition.len()
         && matches!(region.predicate, Predicate::Topology(geometry::predicates::TopologyPredicate::Intersects))
         && region.point_geometry;
-    let _geometry_memory = context.memory.reserve(kernel::WORK_BYTES)?;
     let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
     work.charge(region.steps).map_err(kernel::geometry_error)?;
     let partition = (request.partition.len() == definition.partition.len())
         .then(|| Partition::of(request.partition.iter().map(|part| part.as_ref())));
-    let mut candidates = Candidates {
-        ids: BTreeSet::new(),
-        allowance: context.memory.reserve(0)?,
-        unindexed_rows: 0,
-        unindexed_bytes: 0,
-        indexed_bytes: 0,
-    };
+    let mut candidates = Candidates::new(&context.memory)?;
+    let mut indexed_bytes = 0;
     let database = context
         .catalog
         .database(context.catalog.default_database())?;
@@ -685,61 +683,59 @@ pub(super) async fn visit_matches(
             .table_entry(&definition.table)
             .ok_or_else(postings::work_limit)?;
         if let Some(record) = trie.artefact(definition::KIND, &reference, definition.generation)
-            && let (Some(size), Some(digest)) = (
-                record
-                    .file_size
-                    .and_then(|size| u64::try_from(size).ok())
-                    .filter(|size| (1..=postings::MAX_FILE_BYTES).contains(size)),
-                record.stats.as_deref(),
-            )
+            && let Ok(root) = postings::Root::from_record(record)
         {
-            charge_bytes(&mut candidates.indexed_bytes, size, MAX_INDEXED_BYTES)?;
             let key = ObjectKey::new(table.slug.recorded_artefact_key(&trie.key, record)?)?;
-            let length = usize::try_from(size).map_err(|_| postings::work_limit())?;
-            match database
-                .storage
-                .get_exact_cached_or(&key, length, &context.memory)
-                .await
-            {
-                Ok(bytes) => {
-                    let check = || context.check_cancelled();
-                    check()?;
-                    let computed = bytes.sha256(|bytes| postings::sha256(bytes, &check))?;
-                    match postings::verify_digest(computed, digest).and_then(|()| postings::candidates(
-                        bytes,
-                        partition,
-                        &region.ranges,
-                        &context.memory,
-                        check,
-                        |iid| candidates.insert(iid),
-                    )) {
-                        Ok(()) => continue,
-                        Err(error) if error.code == "rtdb.spatial/postings" => { database.storage.evict(&key); }
-                        Err(error) => return Err(error),
+            let storage = &database.storage;
+            let result = async {
+                let size = root.range().end;
+                let whole = if storage.object_store().supports_scan_ranges(&key) {
+                    if storage.scan_length(&key).await.map_err(posting_read_error)? != size {
+                        return Err(postings::corrupt("Spatial posting object length differs from its catalog receipt"));
                     }
-                }
-                Err(error) => {
-                    let error = Anomaly::from(error);
-                    if matches!(
-                        error.category,
-                        AnomalyCategory::Forbidden | AnomalyCategory::Busy
-                    ) || error.code == "rtdb.storage/read-lease-expired"
-                    {
-                        return Err(error);
-                    }
-                }
+                    None
+                } else {
+                    charge_bytes(&mut indexed_bytes, size, MAX_INDEXED_BYTES)?;
+                    Some(storage.get_exact_cached_or(&key, size as usize, &context.memory).await.map_err(posting_read_error)?)
+                };
+                postings::candidates(
+                    root,
+                    partition,
+                    &region.ranges,
+                    &context.memory,
+                    || context.check_cancelled(),
+                    async |range: Range<u64>| {
+                        let lease = if let Some(whole) = &whole {
+                            whole.slice(range.start as usize..range.end as usize).map_err(posting_read_error)?
+                        } else {
+                            charge_bytes(&mut indexed_bytes, range.end - range.start, MAX_INDEXED_BYTES)?;
+                            storage.scan_range(&key, range, &context.memory).await.map_err(posting_read_error)?
+                        };
+                        Ok(Bytes::from_owner(lease))
+                    },
+                    |iid| candidates.insert(iid),
+                ).await
+            }.await;
+            match result {
+                Ok(()) => continue,
+                Err(error) if error.code == postings::CORRUPT => { storage.evict(&key); }
+                Err(error) => return Err(error),
             }
         }
+        context.check_cancelled()?;
         let size = u64::try_from(trie.data_file_size).map_err(|_| postings::work_limit())?;
         charge_bytes(&mut candidates.unindexed_bytes, size, MAX_UNINDEXED_BYTES)?;
-        rtdb_query::visit_trie_iids(
+        let rows = rtdb_query::visit_trie_iids(
             &context,
             Arc::clone(&database.storage),
             &table.slug,
             &trie.key,
-            |iid| candidates.insert_unindexed(iid),
+            MAX_UNINDEXED_ROWS - candidates.unindexed_rows,
+            |iid| candidates.insert(iid),
         )
-        .await?;
+        .await?
+        .ok_or_else(postings::work_limit)?;
+        candidates.unindexed_rows += rows;
     }
     for segment in snapshot.iter_segments(&definition.table) {
         for batch in segment.batches() {
@@ -749,14 +745,15 @@ pub(super) async fn visit_matches(
     let geometry = (region.location.is_some() || matches!(projection, Projection::Documents))
         .then_some(definition.geometry.as_str());
     let partition = definition.partition[..request.partition.len()].to_vec();
-    let cursor = rtdb_query::open_owned_spatial_scan(
+    let iids = candidates.finish()?;
+    let cursor = rtdb_query::open_owned_spatial_refinement(
         Arc::clone(&context),
         owner,
         relation,
         geometry,
         &partition,
         request.valid_at,
-        candidates.ids,
+        iids,
         projection,
         include_iid,
     )
@@ -777,6 +774,7 @@ pub(super) async fn visit_matches(
         } else {
             None
         };
+        let mut geometry_workspace = None;
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
             if !partition_matches(batch, row, partition_start, &request.partition)? {
@@ -799,6 +797,9 @@ pub(super) async fn visit_matches(
                 else {
                     continue;
                 };
+                if geometry_workspace.is_none() {
+                    geometry_workspace = Some(context.memory.reserve(kernel::WORK_BYTES)?);
+                }
                 work.scoped(|work| {
                     let Some(location) = Location::decode_stored(bytes, definition.encoding, work)? else {
                         return Ok(None);
@@ -858,10 +859,25 @@ struct Candidates {
     allowance: Arc<MemoryReservation>,
     unindexed_rows: usize,
     unindexed_bytes: u64,
-    indexed_bytes: u64,
 }
 
 impl Candidates {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self {
+            ids: BTreeSet::new(),
+            allowance: memory.reserve(0)?,
+            unindexed_rows: 0,
+            unindexed_bytes: 0,
+        })
+    }
+
+    fn finish(self) -> Result<CandidateIids> {
+        let Self { ids, allowance, .. } = self;
+        let iids = CandidateIids::from_set(ids, allowance.budget())?;
+        drop(allowance);
+        Ok(iids)
+    }
+
     fn insert(&mut self, iid: Iid) -> Result<()> {
         if self.ids.contains(&iid) {
             return Ok(());
@@ -902,6 +918,17 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
     Ok(())
 }
 
+fn posting_read_error(error: rtdb_storage::Error) -> Anomaly {
+    let error = Anomaly::from(error);
+    if matches!(error.category, AnomalyCategory::Forbidden | AnomalyCategory::Busy | AnomalyCategory::Interrupted)
+        || error.code == "rtdb.storage/read-lease-expired"
+    {
+        error
+    } else {
+        postings::corrupt(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +936,33 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use rtdb_columnar::{build_struct_array, entity_id_array, entity_id_type, read_value, to_field};
     use rtdb_types::{LogicalType, Value};
+
+    #[test]
+    fn spatial_candidate_handoff_releases_the_tree_allowance_at_the_cap() -> Result<()> {
+        let memory = MemoryBudget::new(8 << 20);
+        let mut candidates = Candidates::new(&memory)?;
+        let iid = |index: usize| Iid((index as u128).to_be_bytes());
+        for index in (0..MAX_CANDIDATES).rev() {
+            candidates.insert_unindexed(iid(index))?;
+        }
+        candidates.insert(iid(0))?;
+        assert_eq!(candidates.insert(iid(MAX_CANDIDATES)).unwrap_err().code, postings::work_limit().code);
+        assert_eq!(candidates.insert_unindexed(iid(0)).unwrap_err().code, postings::work_limit().code);
+        let tree_bytes = memory.used_bytes();
+
+        let retained = candidates.finish()?;
+        assert!(retained.iter().eq((0..MAX_CANDIDATES).map(iid)));
+        let arrow_bytes = memory.used_bytes();
+        assert!(arrow_bytes >= MAX_CANDIDATES * 16);
+        assert!(arrow_bytes < tree_bytes);
+        let shared = retained.clone();
+        drop(retained);
+        assert_eq!(shared.len(), MAX_CANDIDATES);
+        assert_eq!(memory.used_bytes(), arrow_bytes);
+        drop(shared);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[test]
     fn spatial_selection_orders_ties_by_the_typed_arrow_identity() -> Result<()> {

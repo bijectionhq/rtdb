@@ -1,11 +1,11 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet},
     io::Cursor,
     sync::Arc,
 };
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
 use rtdb_format::data::EventBatch;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::{
@@ -14,14 +14,14 @@ use rtdb_maintenance::{
 };
 use rtdb_replication::{PartitionLogs, RetainedTableReplay};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp, WorldShadow};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, Iid, Result, TableRef, Timestamp, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Definition, INDEX_ROOT, checkpoint, definitions, format_error,
+    Definition, DefinitionSet, INDEX_ROOT, checkpoint, definitions, format_error,
     projection::{Changes, EventOrder, KeyLayout, RevisionRoots},
     replay_coverage::{classify_replay_block, replay_complete},
-    tree::{Address, AddressRef, Root, Tree},
+    tree::{AddressRef, Root, Tree},
 };
 
 pub(crate) struct OrderedIndexMaintenance {
@@ -74,7 +74,9 @@ impl OrderedIndexMaintenance {
         let owned = super::owned_definitions(
             &self.database, snapshot, &self.storage, &self.memory, now.into(), cancellation,
         ).await?;
-        let active = definitions.iter().chain(&owned);
+        let active = definitions.as_deref().into_iter()
+            .chain(owned.as_ref())
+            .flat_map(DefinitionSet::iter);
         let directories = active.clone()
             .map(Definition::directory)
             .collect::<Result<BTreeSet<_>>>()?;
@@ -295,7 +297,8 @@ fn source_read_error(error: rtdb_storage::Error) -> Anomaly {
 #[derive(Default)]
 struct ErasureCuts {
     scope: u64,
-    by_address: BTreeMap<Address, EraseCut>,
+    by_key: BTreeMap<Box<[u8]>, EraseCut>,
+    by_iid: BTreeMap<Iid, EraseCut>,
 }
 
 type EraseCut = ((Timestamp, i128), Arc<MemoryReservation>);
@@ -309,16 +312,21 @@ impl ErasureCuts {
                 let header = batch.header(row)?;
                 self.scope = (block as u64 + 1).max(self.scope);
                 let key = batch.entity_key(row)?.unwrap_or_default();
-                let _scratch = memory.reserve(key.len().saturating_add(128))?;
-                if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(key)?; }
-                let address = AddressRef { iid: header.iid, key };
-                match self.by_address.entry(address.owned()) {
-                    Entry::Occupied(mut entry) => {
-                        let cut = &mut entry.get_mut().0;
-                        *cut = (*cut).max(header.precedence());
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert((header.precedence(), memory.reserve(key.len().saturating_add(128))?));
+                let existing = if key.is_empty() {
+                    self.by_iid.get_mut(&header.iid)
+                } else {
+                    EntityIdRef::from_handle_bytes(key)?;
+                    self.by_key.get_mut(key)
+                };
+                let precedence = header.precedence();
+                if let Some((cut, _)) = existing {
+                    *cut = (*cut).max(precedence);
+                } else {
+                    let cut = (precedence, memory.reserve(key.len().saturating_add(128))?);
+                    if key.is_empty() {
+                        self.by_iid.insert(header.iid, cut);
+                    } else {
+                        self.by_key.insert(Box::from(key), cut);
                     }
                 }
             }
@@ -326,8 +334,13 @@ impl ErasureCuts {
         })
     }
 
-    fn retains(&self, header: rtdb_types::EventHeader, address: AddressRef<'_>) -> bool {
-        self.by_address.get(&address.owned()).is_none_or(|(cut, _)| header.precedence() >= *cut)
+    fn retains(&self, header: EventHeader, address: AddressRef<'_>) -> bool {
+        let cut = if address.key.is_empty() {
+            self.by_iid.get(&address.iid)
+        } else {
+            self.by_key.get(address.key)
+        };
+        cut.is_none_or(|(precedence, _)| header.precedence() >= *precedence)
     }
 }
 
@@ -681,6 +694,59 @@ pub(super) fn cancelled() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_types::Interval;
+
+    #[test]
+    fn erasure_cuts_share_complete_keys_and_keep_keyless_iids_separate() -> Result<()> {
+        let key = b"\0order";
+        let plain = StoredEvent {
+            iid: Iid([4; 16]),
+            operation: StoredOperation::Erase,
+            system_from: Timestamp(20),
+            commit_position: 0,
+            entity_key: None,
+            valid_time: Interval::ALL,
+            origin: None,
+            position: None,
+            recency: None,
+        };
+        let keyed = StoredEvent {
+            system_from: Timestamp(10),
+            commit_position: 1,
+            entity_key: Some(Arc::from(&key[..])),
+            ..plain.clone()
+        };
+        let duplicate = StoredEvent {
+            iid: Iid([5; 16]),
+            commit_position: 2,
+            ..keyed.clone()
+        };
+        let memory = MemoryBudget::new(256 + key.len());
+        let cancellation = CancellationToken::new();
+        let mut cuts = ErasureCuts::default();
+        let mut record = |block, events: &[StoredEvent]| {
+            let batch = EventBatch::new(build_event_batch(events, None, None)?)?;
+            cuts.record(block, &batch, &memory, &cancellation)
+        };
+        record(4, std::slice::from_ref(&plain))?;
+        record(5, &[keyed.clone(), duplicate.clone(), keyed.clone()])?;
+
+        let retains = |header: EventHeader, key: &[u8]| {
+            cuts.retains(header, AddressRef { iid: header.iid, key })
+        };
+        assert!(!retains(keyed.header(), key));
+        assert!(retains(duplicate.header(), key));
+        assert!(retains(keyed.header(), b"\0other"));
+        assert!(retains(plain.header(), &[]));
+        assert!(!retains(keyed.header(), &[]));
+        assert!(retains(duplicate.header(), &[]));
+        assert_eq!(cuts.scope, 6);
+        assert_eq!(memory.used_bytes(), 256 + key.len());
+        drop(cuts);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn replay_projects_keys_and_keeps_the_original_event_headers() -> Result<()> {
@@ -714,9 +780,6 @@ mod tests {
 
     #[tokio::test]
     async fn erase_discovery_retains_the_decoded_pages_for_small_replays() -> Result<()> {
-        use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
-        use rtdb_types::{Iid, Interval};
-
         let memory = MemoryBudget::new(32 << 20);
         let storage = BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20);
         let event = StoredEvent { iid: Iid([4; 16]), operation: StoredOperation::Erase,
@@ -729,8 +792,7 @@ mod tests {
         storage.object_store().put(&source.object, bytes.into()).await?;
         let inputs = erase_cuts(&storage, &memory, &[source], &[], &CancellationToken::new()).await?;
         assert_eq!(inputs.cuts.scope, 5);
-        let address = AddressRef { iid: event.iid, key: &[] }.owned();
-        assert_eq!(inputs.cuts.by_address[&address].0, event.header().precedence());
+        assert_eq!(inputs.cuts.by_iid[&event.iid].0, event.header().precedence());
         let decoded = inputs.decoded.as_ref().expect("the selected replay fits the retention budget");
         assert_eq!(decoded[0].0, 1);
         assert_eq!(decoded[0].1[0].arrow(), &batch);

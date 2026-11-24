@@ -22,11 +22,9 @@ use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader,
 use crate::columnar::BatchCursor;
 use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, QueryContext, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
-struct DataFile {
+struct DataFileReader {
     storage: Arc<BufferPool>,
     key: ObjectKey,
-    /// The trie's metadata file, where an ordered scan finds the statistics of the leaves it comes to.
-    metadata: ObjectKey,
     opened: Option<OpenedLayout>,
 }
 
@@ -41,7 +39,11 @@ enum DataProjection<'a> {
     PutColumns(&'a [String]),
 }
 
-impl DataFile {
+impl DataFileReader {
+    fn new(storage: &Arc<BufferPool>, key: ObjectKey) -> Self {
+        Self { storage: Arc::clone(storage), key, opened: None }
+    }
+
     async fn open(&mut self, memory: &Arc<MemoryBudget>) -> Result<&OpenedLayout> {
         if self.opened.is_none() {
             let whole = if self.storage.object_store().supports_scan_ranges(&self.key) {
@@ -68,14 +70,23 @@ impl DataFile {
     }
 
     async fn decode_page_as(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.decode_funded_page(page, memory, projection, true).await
+    }
+
+    async fn decode_funded_page(
+        &mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>, include_builder_bound: bool,
+    ) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
         let mut bound = reader.page_bound(page, bytes.as_slice())?;
-        for field in reader.schema().fields() {
-            bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
-                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
+        // Arrow-only visitors can project a file whose full schema has no SQL builder layout.
+        if include_builder_bound {
+            for field in reader.schema().fields() {
+                bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
+                    .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
+            }
         }
         audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
@@ -87,11 +98,14 @@ impl DataFile {
         Ok((batch, charged))
     }
 
-    async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+    async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>, expected_metadata: Option<&[u8]>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let wire = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
+        if expected_metadata.is_some_and(|metadata| !wire.as_slice().starts_with(metadata)) {
+            return Err(invalid("page-metadata", "Arrow page header changed after row admission"));
+        }
         let reserve = |bound| {
             audience_work::decode_bytes(bound)?;
             memory.reserve(bound)
@@ -166,28 +180,44 @@ impl DataFile {
     }
 }
 
+/// Visits pages up to the row limit and returns the number of rows visited.
+/// `None` means the next page exceeded the limit after any earlier pages were visited.
 #[doc(hidden)]
 pub async fn visit_trie_iids(
     context: &crate::QueryContext, storage: Arc<BufferPool>, slug: &TableSlug, trie: &TrieKey,
-    mut visit: impl FnMut(Iid) -> Result<()>,
-) -> Result<()> {
+    limit: usize, mut visit: impl FnMut(Iid) -> Result<()>,
+) -> Result<Option<usize>> {
     context.check_cancelled()?;
-    let mut file = DataFile {
-        storage, key: ObjectKey::new(slug.data_key(trie))?,
-        metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
-    };
-    let pages = file.open(&context.memory).await?.layout.decoder.page_count();
+    let mut file = DataFileReader::new(&storage, ObjectKey::new(slug.data_key(trie))?);
+    let memory = &context.memory;
+    let pages = file.open(memory).await?.layout.decoder.page_count();
+    let mut rows = 0;
     for page in 0..pages {
         context.check_cancelled()?;
         if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
-            visit_iids(context, held.batch.view().iids()?, &mut visit)?;
+            let batch = held.batch.view();
+            if batch.len() > limit - rows { return Ok(None); }
+            visit_iids(context, batch.iids()?, &mut visit)?;
+            rows += batch.len();
         } else {
-            let (batch, _charged) = file.decode_spatial_page(page, &context.memory, PageProjection::Iid).await?;
-            let iids = batch.column_by_name("_iid").ok_or_else(|| invalid("page-iid", "Arrow page has no IID column"))?;
-            visit_iids(context, IidView::new(iids.as_ref())?, &mut visit)?;
+            let opened = file.opened.as_ref().expect("the data file is open");
+            let decoder = &opened.layout.decoder;
+            let metadata = file.read_range(opened.whole.as_ref(), decoder.page_metadata_range(page)?, memory).await?;
+            let page_rows = decoder.page_rows(page, metadata.as_slice())?;
+            if page_rows > limit - rows { return Ok(None); }
+
+            context.check_cancelled()?;
+            let (batch, _charged) = file.decode_spatial_page(page, memory, PageProjection::Iid, Some(metadata.as_slice())).await?;
+            let column = batch.column_by_name("_iid").ok_or_else(|| invalid("page-iid", "Arrow page has no IID field"))?;
+            let iids = IidView::new(column.as_ref())?;
+            if iids.len() != page_rows {
+                return Err(invalid("page-rows", "Arrow IID count differs from the admitted page row count"));
+            }
+            visit_iids(context, iids, &mut visit)?;
+            rows += page_rows;
         }
     }
-    Ok(())
+    Ok(Some(rows))
 }
 
 #[doc(hidden)]
@@ -195,14 +225,28 @@ pub async fn visit_trie_events(
     storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &tokio_util::sync::CancellationToken,
     slug: &TableSlug, trie: &TrieKey, put_columns: &[String], mut visit: impl FnMut(&EventBatch) -> Result<()>,
 ) -> Result<()> {
-    let mut file = DataFile {
-        storage: Arc::clone(storage), key: ObjectKey::new(slug.data_key(trie))?,
-        metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
-    };
+    let mut file = DataFileReader::new(storage, ObjectKey::new(slug.data_key(trie))?);
     let pages = file.open(memory).await?.layout.decoder.page_count();
     for page in 0..pages {
         if cancellation.is_cancelled() { return Err(point_cancelled()); }
         let (batch, _charge) = file.decode_page_as(page, memory, DataProjection::PutColumns(put_columns)).await?;
+        visit(&EventBatch::new(batch)?)?;
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub async fn visit_projected_data_events(
+    storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<MemoryBudget>, put_columns: &[String],
+    check_cancelled: impl Fn() -> Result<()>, mut visit: impl FnMut(&EventBatch) -> Result<()>,
+) -> Result<()> {
+    check_cancelled()?;
+    let mut file = DataFileReader::new(storage, key.clone());
+    let pages = file.open(memory).await?.layout.decoder.page_count();
+    for page in 0..pages {
+        check_cancelled()?;
+        let (batch, _charge) = file.decode_funded_page(page, memory, DataProjection::PutColumns(put_columns), false).await?;
+        check_cancelled()?;
         visit(&EventBatch::new(batch)?)?;
     }
     Ok(())
@@ -214,10 +258,7 @@ pub async fn trie_row_count_up_to(
     context: &crate::QueryContext, storage: Arc<BufferPool>, slug: &TableSlug, trie: &TrieKey, limit: usize,
 ) -> Result<Option<usize>> {
     context.check_cancelled()?;
-    let mut file = DataFile {
-        storage, key: ObjectKey::new(slug.data_key(trie))?,
-        metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
-    };
+    let mut file = DataFileReader::new(&storage, ObjectKey::new(slug.data_key(trie))?);
     let pages = file.open(&context.memory).await?.layout.decoder.page_count();
     let mut rows = 0usize;
     for page in 0..pages {
@@ -291,7 +332,7 @@ pub(crate) async fn primary_point_events(
             MetadataNode::RecencyBranch(children) => for (_, child) in children { pending.push((*child, path.clone())); },
         }
     }
-    let mut file = DataFile { storage: Arc::clone(request.storage), key: ObjectKey::new(slug.data_key(trie))?, metadata: metadata_key, opened: None };
+    let mut file = DataFileReader::new(request.storage, ObjectKey::new(slug.data_key(trie))?);
     let mut inspected = 0usize;
     for page in pages {
         if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
@@ -348,6 +389,12 @@ fn page_buffer(bytes: CacheLease) -> Buffer {
     // A cached page must release the rest of a whole object when the query is done reading it.
     if bytes.is_partial_allocation() { Buffer::from(bytes.as_slice().to_vec()) }
     else { Buffer::from(Bytes::from_owner(bytes)) }
+}
+
+struct DataFile {
+    reader: DataFileReader,
+    /// The trie's metadata file, where an ordered scan finds the statistics of the leaves it comes to.
+    metadata: ObjectKey,
 }
 
 #[derive(Default)]
@@ -803,7 +850,12 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true, None).await
+        let restricted_iids = context.catalog.owned_spatial_candidates(&scan.table.name);
+        if restricted_iids.is_some() && scan.iids.is_some() {
+            return Err(invalid("scan-iid-scope", "An owned spatial candidate scan already has a fixed IID scope"));
+        }
+        Self::over_with_queries(scan, execution, pushdowns, &database.partitions, &database.storage,
+            true, None, &SearchQueries::default(), restricted_iids).await
     }
     /// A scan of the given partitions of its database, which share `storage`.
     /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
@@ -1827,8 +1879,7 @@ impl ScanVerifier<'_> {
             if !self.partition.trie_catalog().trie(table, &trie).is_some_and(|entry| entry.state == TrieState::Live) {
                 return Err(invalid("search-row", "Resolved search row has no live source in this snapshot"));
             }
-            let mut file = DataFile { storage: Arc::clone(self.storage), key: ObjectKey::new(entry.slug.data_key(&trie))?,
-                metadata: ObjectKey::new(entry.slug.metadata_key(&trie))?, opened: None };
+            let mut file = DataFileReader::new(self.storage, ObjectKey::new(entry.slug.data_key(&trie))?);
             let mut loaded = Vec::with_capacity(pages.len());
             for page in pages {
                 let cached = (!memory.is_prepaid()).then(|| file.storage.view::<CachedPage>(&file.key, View::Page(page as usize))).flatten();
@@ -2077,7 +2128,10 @@ impl PartitionScan {
             let (metadata, _reservation) = read_metadata(&self.storage, &key, &self.execution.context.memory).await?;
             files.admit(file_count, &self.execution.context.memory)?;
             let file = files.entries.len();
-            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, metadata: key.clone(), opened: None });
+            files.entries.push(DataFile {
+                reader: DataFileReader::new(&self.storage, ObjectKey::new(slug.data_key(&trie.key))?),
+                metadata: key,
+            });
             let trie_recency = recency(trie.key.recency())?;
             let trie_key = Arc::new(trie.key.clone());
             let memory = &self.execution.context.memory;
@@ -2144,8 +2198,8 @@ impl PartitionScan {
         for index in pages {
             let page = &self.pages.entries[*index];
             let (Some(node), PageSource::File { file, .. }) = (page.unread, &page.source) else { continue };
-            let data = &self.files.entries[*file];
-            let read = match data.storage.view::<CachedMetadata>(&data.metadata, View::File) {
+            let file = &self.files.entries[*file];
+            let read = match file.reader.storage.view::<CachedMetadata>(&file.metadata, View::File) {
                 Some(cached) => {
                     audience_work::decode_bytes(cached.bound)?;
                     let _charge = self.execution.context.memory.reserve(cached.bound)?;
@@ -2170,7 +2224,10 @@ impl PartitionScan {
         let mut cached = false;
         let mut admitted: Option<(Arc<IndexBatch>, usize)> = None;
         let hit = match &page.source {
-            PageSource::File { file, page: page_index, .. } => self.files.entries[*file].storage.view::<CachedPage>(&self.files.entries[*file].key, View::Page(*page_index)),
+            PageSource::File { file, page: page_index, .. } => {
+                let data = &self.files.entries[*file].reader;
+                data.storage.view::<CachedPage>(&data.key, View::Page(*page_index))
+            }
             PageSource::Live { .. } => None,
         };
         let rows = match (&page.source, hit) {
@@ -2184,11 +2241,11 @@ impl PartitionScan {
                 ActiveRows::File(Arc::clone(&held.batch))
             }
             (PageSource::File { file, page: page_index, .. }, None) => {
-                let data = &mut self.files.entries[*file];
+                let data = &mut self.files.entries[*file].reader;
                 let context = &self.execution.context;
                 let (page, charged) = if context.spatial_refinement {
                     let selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
-                    data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected)).await?
+                    data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected), None).await?
                 } else {
                     data.decode_page(*page_index, &context.memory).await?
                 };
@@ -2230,7 +2287,7 @@ impl PartitionScan {
             previous = Some(header);
         }
         if let (Some((batch, bound)), PageSource::File { file, page: page_index, .. }) = (admitted, &page.source) {
-            let data = &self.files.entries[*file];
+            let data = &self.files.entries[*file].reader;
             data.storage.insert_view(&data.key, View::Page(*page_index), Arc::new(CachedPage { batch, bound }));
         }
         self.loaded.insert(index,LoadedPage { rows,_reservation: reservation,_charge: charge });
@@ -2517,7 +2574,7 @@ impl PartitionScan {
     fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
         let ScanMatch { query, files, live } = &self.matches[evaluated];
         let page_answers = match (files, source) {
-            (Some(answers), PageSource::File { file, page, .. }) => answers.file(&self.files.entries[*file].key).map(|matches| (matches, *page)),
+            (Some(answers), PageSource::File { file, page, .. }) => answers.file(&self.files.entries[*file].reader.key).map(|matches| (matches, *page)),
             _ => None,
         };
         resolved_match_column(&self.scan.matches[evaluated].column, query.as_deref(), rows, batches, &self.execution.context.memory, |_, row, query| {
@@ -2775,6 +2832,72 @@ mod tests {
     use rtdb_trie::TrieConfig;
     use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn owned_spatial_refinement_scans_only_retained_iids_and_preserves_empty_projection() -> Result<()> {
+        use crate::{CandidateIids, OwnedSpatialProjection, open_owned_spatial_refinement};
+        use rtdb_types::OwnedRelation;
+
+        let state = PartitionState::empty(TrieConfig::default())?;
+        let memory = MemoryBudget::new(1 << 24);
+        let relation = OwnedRelation::new("places")?;
+        let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+        let selected = EntityId::Uuid([0x40; 16]);
+        let excluded = EntityId::Uuid([0x80; 16]);
+        let expired = EntityId::Uuid([0; 16]);
+        let mut write = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
+        for (owner, id, location, valid_time) in [
+            ("alice", &selected, 1, Interval::ALL),
+            ("alice", &excluded, 2, Interval::ALL),
+            ("bob", &selected, 3, Interval::ALL),
+            ("alice", &expired, 4, Interval::new(Timestamp(0), Timestamp(50))?),
+        ] {
+            write.append(relation.table(owner), StoredEvent {
+                position: None, origin: None, commit_position: 0, recency: None,
+                entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
+                system_from: key.system_time, valid_time,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("_id".into(), id.as_value()), ("location".into(), Value::Binary(vec![location])),
+                ])),
+            })?;
+        }
+        state.apply(&write.stage()?)?;
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false)?;
+        let context = QueryContext::new(catalog, Arc::clone(&memory), key.system_time, "UTC",
+            QueryOptions::default(), &CancellationToken::new())?;
+        let projection = OwnedSpatialProjection::SelectedDocuments(&["location"]);
+        let open = |iids, projection| open_owned_spatial_refinement(
+            Arc::clone(&context), "alice", &relation, None, &[], key.system_time, iids, projection, true,
+        );
+        let empty = CandidateIids::from_sorted(&[], &memory)?;
+        assert!(open(empty.clone(), OwnedSpatialProjection::Identities).await?.is_none());
+        let empty = open(empty, projection).await?.unwrap();
+        let mut cursor = empty.cursor;
+        assert!(cursor.next_batch().await?.is_none());
+        let empty_schema = cursor.runtime_schema().clone();
+        assert_eq!(empty.document_columns.iter().map(|&index| empty_schema.fields()[index].name.as_str())
+            .collect::<Vec<_>>(), ["_id", "location", "_system_from"]);
+
+        for count in [1, 4096u128] {
+            let sorted = (0..(count - 1)).map(|index| Iid(index.to_be_bytes()))
+                .chain([selected.iid()]).collect::<Vec<_>>();
+            let iids = CandidateIids::from_sorted(&sorted, &memory)?;
+            let mut scan = open(iids, projection).await?.unwrap();
+            assert_eq!(scan.cursor.runtime_schema(), &empty_schema);
+            let page = scan.cursor.next_batch().await?.unwrap();
+            let batch = page.batch();
+            assert_eq!(batch.num_rows(), 1);
+            let physical_iids = IidView::new(batch.column_by_name("_iid").unwrap().as_ref())?;
+            assert_eq!(physical_iids.get(0)?, selected.iid());
+            let (index, field) = batch.schema_ref().column_with_name("location").unwrap();
+            assert_eq!(rtdb_columnar::binary_cell(field, batch.column(index).as_ref(), 0)?, Some(&[1][..]));
+            assert!(scan.cursor.next_batch().await?.is_none());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn fts_arrow_scan_keeps_shared_queries_and_candidate_vectors_between_accelerators() {
@@ -3590,13 +3713,71 @@ mod tests {
         let (_, execution, _) = descriptor_scan(snapshot, table, Arc::clone(&storage));
         let context = execution.context.as_ref();
         let mut iids = Vec::new();
-        visit_trie_iids(context, Arc::clone(&storage), &slug, &trie, |iid| {
+        let rows = visit_trie_iids(context, Arc::clone(&storage), &slug, &trie, 3, |iid| {
             iids.push(iid);
             Ok(())
         }).await.unwrap();
+        assert_eq!(rows, Some(3));
         assert_eq!(iids, events.iter().map(|event| event.iid).collect::<Vec<_>>());
         assert_eq!(trie_row_count_up_to(context, Arc::clone(&storage), &slug, &trie, 3).await.unwrap(), Some(3));
         assert_eq!(trie_row_count_up_to(context, storage, &slug, &trie, 2).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn spatial_iid_nomination_admits_wide_pages_and_refuses_over_limit_before_reading_body() {
+        let (state, table, mut events) = live_table();
+        let captured = state.value();
+        let snapshot = captured.snapshot();
+        let slug = snapshot.table_entry(&table).unwrap().slug.clone();
+        let trie = TrieKey::l0(captured.live().block_index()).unwrap();
+        let key = ObjectKey::new(slug.data_key(&trie)).unwrap();
+        for (index, event) in events.iter_mut().enumerate() {
+            let StoredOperation::Put(document) = &mut event.operation else { panic!("Expected a put") };
+            let payload = if index == 0 { "small".into() } else { "payload".repeat(64 << 10) };
+            document.insert("v".into(), Value::Utf8(payload));
+        }
+        let fields = StructFields::from([
+            ("_id".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("v".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ]);
+        let pages = [&events[..1], &events[1..]].map(|events| {
+            build_event_batch(events, Some(fields.clone()), Some(rtdb_types::RunEndWidth::I32)).unwrap()
+        });
+        let data = write_file(pages[0].schema_ref(), &pages).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        store.put(&key, data.into()).await.unwrap();
+        let storage = Arc::new(BufferPool::new(store.clone(), 128 << 20));
+        let (_, execution, _) = descriptor_scan(snapshot, table, Arc::clone(&storage));
+        let mut context = execution.context.as_ref().clone();
+        context.memory = MemoryBudget::new(256 << 10);
+        let mut iids = Vec::new();
+        let mut visit = |iid| { iids.push(iid); Ok(()) };
+
+        let small_pool = Arc::new(BufferPool::new(store, 128 << 10));
+        assert_eq!(visit_trie_iids(&context, Arc::clone(&small_pool), &slug, &trie, 2, &mut visit).await.unwrap(), None);
+        assert_eq!(visit_trie_iids(&context, small_pool, &slug, &trie, 3, &mut visit).await.unwrap_err().code,
+            "rtdb.storage/memory-limit");
+
+        assert_eq!(visit_trie_iids(&context, Arc::clone(&storage), &slug, &trie, 3, &mut visit).await.unwrap(), Some(3));
+        let mut file = DataFile {
+            storage: Arc::clone(&storage), key: key.clone(),
+            metadata: ObjectKey::new(slug.metadata_key(&trie)).unwrap(), opened: None,
+        };
+        let warmup = MemoryBudget::new(16 << 20);
+        for page in 0..2 {
+            let (batch, charged) = file.decode_page(page, &warmup).await.unwrap();
+            let bound = charged.bytes();
+            if page == 1 { assert!(bound > context.memory.limit_bytes()); }
+            let headers = storage.admit(IndexBatch::header_bytes(batch.num_rows()).unwrap()).unwrap();
+            let owned = OwnedBatch::with_reservation(batch, storage.admit(bound).unwrap()).unwrap();
+            let batch = IndexBatch::from_owned_with_headers(owned, headers).unwrap();
+            assert!(storage.insert_view(&key, View::Page(page), Arc::new(CachedPage { batch, bound })));
+        }
+
+        assert_eq!(visit_trie_iids(&context, Arc::clone(&storage), &slug, &trie, 2, &mut visit).await.unwrap(), None);
+        assert_eq!(visit_trie_iids(&context, storage, &slug, &trie, 3, &mut visit).await.unwrap(), Some(3));
+        assert_eq!(iids, [0, 0, 0, 1, 2, 0, 0, 1, 2].map(|index| events[index].iid));
+        assert_eq!(context.memory.used_bytes(), 0);
     }
 
     /// Persists one page per event; `misplaced` writes the second event's page in the first one's place too.

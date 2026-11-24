@@ -11,6 +11,52 @@
   ],
   "min_verified_functions": 32,
   "controls": {
+    "foreign_recovery_owner": {
+      "defect": "The clean checkpoint authorizes destruction with a different recovery enrollment.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (exact_checkpoint && original_request && successor_owner\n",
+          "replace": "ensures out == (exact_checkpoint && original_request\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    exact_checkpoint && original_request && successor_owner\n",
+          "replace": "    exact_checkpoint && original_request\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "rotation_evidence_names_the_clean_successor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "foreign_recovery_request": {
+      "defect": "The clean checkpoint authorizes destruction for a different recovery request.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (exact_checkpoint && original_request && successor_owner\n",
+          "replace": "ensures out == (exact_checkpoint && successor_owner\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    exact_checkpoint && original_request && successor_owner\n",
+          "replace": "    exact_checkpoint && successor_owner\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "rotation_evidence_names_the_clean_successor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
     "drop_a_slot": {
       "defect": "The selected read is allowed to stand in for the alternate slot.",
       "mutate": [
@@ -62,13 +108,13 @@
       "mutate": [
         {
           "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
-          "find": "    exact_checkpoint && generation == successor_generation && generation > 1\n",
-          "replace": "    exact_checkpoint && generation <= successor_generation && generation > 1\n"
+          "find": "        && generation == successor_generation && generation > 1\n",
+          "replace": "        && generation <= successor_generation && generation > 1\n"
         },
         {
           "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
-          "find": "ensures out == (exact_checkpoint && generation == successor_generation && generation > 1),",
-          "replace": "ensures out == (exact_checkpoint && generation <= successor_generation && generation > 1),"
+          "find": "        && generation == successor_generation && generation > 1),",
+          "replace": "        && generation <= successor_generation && generation > 1),"
         }
       ],
       "expect": [

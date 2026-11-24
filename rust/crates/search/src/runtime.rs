@@ -8,7 +8,7 @@ use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, LargeListArray,
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use parking_lot::Mutex;
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{PutText, PutTextColumn};
 use rtdb_index::Snapshot;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
@@ -32,9 +32,13 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
         if let Some((_, _, previous)) = self.entries.insert(key, (value, self.clock, weight)) { self.weight -= previous; }
         self.weight += weight;
         while self.weight > self.limit && self.entries.len() > 1 {
-            let Some(oldest) = self.entries.iter().min_by_key(|(_, (_, used, _))| *used).map(|(key, _)| key.clone()) else { break };
-            if let Some((_, _, weight)) = self.entries.remove(&oldest) { self.weight -= weight; }
+            self.evict_oldest();
         }
+    }
+    fn evict_oldest(&mut self) -> bool {
+        let Some(oldest) = self.entries.iter().min_by_key(|(_, (_, used, _))| *used).map(|(key, _)| key.clone()) else { return false; };
+        self.remove(&oldest);
+        true
     }
     fn remove(&mut self, key: &K) { if let Some((_, _, weight)) = self.entries.remove(key) { self.weight -= weight; } }
     fn clear(&mut self) { self.entries.clear(); self.weight = 0; }
@@ -511,6 +515,28 @@ type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
 type OpenedTreeKey = (usize, ObjectKey, crate::file::TreeLocation);
 type OpenedTree = (std::sync::Weak<BufferPool>, Arc<crate::file::TreeFile>);
 
+struct BuiltFiles {
+    cache: Bounded<(String, String), OpenedFile>,
+    residency: Arc<MemoryBudget>,
+}
+
+impl BuiltFiles {
+    fn new(bytes: usize) -> Self {
+        Self { cache: Bounded::new(bytes), residency: MemoryBudget::new(bytes) }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Option<Arc<MemoryReservation>> {
+        let room_for_other_files = self.cache.limit.checked_sub(bytes)?;
+        loop {
+            if let Ok(reservation) = self.residency.reserve(bytes) { return Some(reservation); }
+            let resident_outside_cache = self.residency.used_bytes().saturating_sub(self.cache.weight);
+            if resident_outside_cache > room_for_other_files || !self.cache.evict_oldest() {
+                return None;
+            }
+        }
+    }
+}
+
 /// A trie's search file as a scan reads it: the trie's data file, the identity the file's kept answers go by, the file, and which of its members the trie is.
 /// The tries of a partition group share one file, each its own member.
 pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile>, pub member: u32 }
@@ -528,7 +554,7 @@ pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<LivePostings>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
-    built: Mutex<Bounded<(String, String), OpenedFile>>,
+    built: Arc<Mutex<BuiltFiles>>,
     /// Builds in progress, which a second query for the same file awaits rather than repeats.
     building: Mutex<BTreeMap<(usize, String, String), Arc<tokio::sync::OnceCell<Arc<SearchFile>>>>>,
     mapped: Mutex<Bounded<(String, String), OpenedFile>>,
@@ -575,7 +601,7 @@ impl SearchRuntime {
             file_admission, legacy_residency, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
             logical_run_reads: Default::default(),
             definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
-            files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)),
+            files: Mutex::new(Bounded::new(file_bytes)), built: Arc::new(Mutex::new(BuiltFiles::new(file_bytes / 2))),
             mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(),
             match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), suspect_runs: Default::default(),
             suspect_term_directories: Default::default(),
@@ -853,45 +879,57 @@ impl SearchRuntime {
             return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids)?));
         }
         let set = Arc::new(trie.file.match_set(column, query)?);
-        if !trie.file.is_query_tree() {
+        if trie.file.cache_match_sets() {
             self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());
         }
         Ok(set)
     }
 
     /// A search file built on this node from the data file of a trie the lane has not indexed; a data file is immutable, so a kept one is never stale.
-    /// The build is charged to `memory` while it runs; the files kept are bounded apart from the recorded ones, so building never evicts those.
+    /// Retained pages use the built-file residency budget when admitted to the cache and `memory` otherwise.
     pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String],
         analyzer: rtdb_text::Analyzer, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
         let identity = format!("{data}#{columns:?}#{analyzer}");
         let share = storage.prepaid_metadata_budget().is_none();
         let cache_key = (database.to_string(), identity.clone());
         let build_key = (Arc::as_ptr(storage) as usize, database.to_string(), identity.clone());
-        if share && let Some((pool, file)) = self.built.lock().get(&cache_key) {
-            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file, member: 0 }); }
-        }
-        // A build that fails or whose query is cancelled leaves the cell empty, and the next caller builds.
-        let cell = if share { Arc::clone(self.building.lock().entry(build_key.clone()).or_default()) }
-            else { Arc::new(tokio::sync::OnceCell::new()) };
+        let cell = if share {
+            let mut building = self.building.lock();
+            if let Some((pool, file)) = self.built.lock().cache.get(&cache_key)
+                && pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) {
+                return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file, member: 0 });
+            }
+            Arc::clone(building.entry(build_key.clone()).or_default())
+        } else {
+            Arc::new(tokio::sync::OnceCell::new())
+        };
         let outcome = cell.get_or_try_init(|| async {
             let lease = storage.get(data).await?;
             let ceiling = crate::file::ceiling_of(trie.recency());
             let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
             let input_memory = Arc::clone(memory);
-            let (mut file, size) = tokio::task::spawn_blocking(move || {
+            let built = share.then(|| Arc::clone(&self.built));
+            let (file, weight) = tokio::task::spawn_blocking(move || {
                 let pages = crate::lane::search_pages_from_buffer(
                     arrow_buffer::Buffer::from(bytes::Bytes::from_owner(lease)), &indexed, analyzer, token, input_memory)?;
-                crate::file::build_query_pages(&indexed, pages, ceiling, indexing)
+                crate::file::build_query_pages(&indexed, pages, ceiling, indexing,
+                    |bytes| built.and_then(|built| built.lock().reserve(bytes)))
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
-            if !share { file = file.with_reservation(memory.reserve(size)?); }
             let file = Arc::new(file);
-            if share { self.built.lock().insert(cache_key.clone(), (Arc::downgrade(storage), Arc::clone(&file)), size); }
+            if let Some(weight) = weight {
+                self.built.lock().cache.insert(cache_key.clone(), (Arc::downgrade(storage), Arc::clone(&file)), weight);
+            }
             Ok::<_, rtdb_types::Anomaly>(file)
         }).await.cloned();
         if share {
             let mut building = self.building.lock();
-            if building.get(&build_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) { building.remove(&build_key); }
+            // A failed initializer leaves the cell empty for its existing waiters to retry.
+            if (outcome.is_ok() || Arc::strong_count(&cell) == 2)
+                && building.get(&build_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) {
+                building.remove(&build_key);
+            }
+            drop(cell);
         }
         Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file: outcome?, member: 0 })
     }
@@ -1213,7 +1251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queries_building_the_same_file_at_once_share_one_build() {
+    async fn query_built_files_coalesce_and_keep_residency_through_eviction() {
         use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
         let store = Arc::new(MemoryStore::default());
         let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
@@ -1230,8 +1268,43 @@ mod tests {
         let runtime = SearchRuntime::new(1 << 20);
         let trie: rtdb_format::keys::TrieKey = "l00-rc-b00".parse().unwrap();
         let (first, second) = tokio::join!(runtime.built("xtdb", &pool, &trie, &data, &columns, rtdb_text::Analyzer::Simple, &memory, &cancellation), runtime.built("xtdb", &pool, &trie, &data, &columns, rtdb_text::Analyzer::Simple, &memory, &cancellation));
-        assert!(Arc::ptr_eq(&first.unwrap().file, &second.unwrap().file));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(Arc::ptr_eq(&first.file, &second.file));
         assert!(runtime.building.lock().is_empty(), "a finished build leaves nothing in flight");
+        let retained = runtime.built.lock().residency.used_bytes();
+        assert!(retained > 0);
+        assert_eq!(runtime.built.lock().cache.weight, retained);
+        assert_eq!(memory.used_bytes(), 0);
+        let matches = runtime.match_set("xtdb", &second, "body", &rtdb_text::Query::parse("invoice")).unwrap();
+        assert!(runtime.match_sets.lock().entries.is_empty());
+        {
+            let mut built = runtime.built.lock();
+            let limit = built.residency.limit_bytes();
+            assert!(built.reserve(limit).is_none());
+            assert!(built.cache.entries.is_empty());
+        }
+        drop(first);
+        assert_eq!(runtime.built.lock().residency.used_bytes(), retained);
+        assert_eq!(second.file.holding("body", "invoice").unwrap().len(), 1);
+        drop(second);
+        assert_eq!(runtime.built.lock().residency.used_bytes(), retained);
+        assert_eq!(matches.value(0, 0).unwrap(), Some(true));
+        drop(matches);
+        assert_eq!(runtime.built.lock().residency.used_bytes(), 0);
+
+        let small = SearchRuntime::new(2);
+        let refused = MemoryBudget::new(1);
+        assert!(matches!(small.built("xtdb", &pool, &trie, &data, &columns, rtdb_text::Analyzer::Simple, &refused, &cancellation).await,
+            Err(error) if error.code == "rtdb/memory-budget-exceeded"));
+        assert_eq!(refused.used_bytes(), 0);
+        assert!(small.building.lock().is_empty());
+        let private = small.built("xtdb", &pool, &trie, &data, &columns, rtdb_text::Analyzer::Simple, &memory, &cancellation).await.unwrap();
+        assert!(small.built.lock().cache.entries.is_empty());
+        assert_eq!(small.built.lock().residency.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), retained);
+        drop(private);
+        assert_eq!(memory.used_bytes(), 0);
+
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let other = ObjectKey::new("tables/docs/data/l00-rc-b01.arrow").unwrap();

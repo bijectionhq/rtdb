@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, io::Write, ops::Range, sync::{Arc, LazyLock}};
 
 use arrow_array::{Array, FixedSizeBinaryArray, Int64Array, RecordBatch, UInt8Array, UInt32Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}, cast::AsArray, types::{Int64Type, UInt8Type, UInt32Type}};
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, bit_chunk_iterator::UnalignedBitChunk};
 use arrow_ipc::reader::{FileDecoder, read_footer_length};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -19,6 +19,7 @@ const ENTRY_BYTES: usize = 88;
 const ROWS_PER_RANGE: usize = 2048;
 const MAX_ROOT_BYTES: usize = 4 << 20;
 const MAX_RANGE_BYTES: usize = 16 << 20;
+const REVISION_WIDTH: i32 = 32;
 
 fn schema() -> &'static SchemaRef {
     static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(vec![
@@ -95,45 +96,100 @@ impl HistoryRange {
         Ok(HistoryPage(batch))
     }
 
-    pub fn read_forward(self, bytes: Buffer, columns: usize) -> Result<ForwardPage> {
-        self.read_batch(bytes, &forward_schema(columns)).map(ForwardPage)
+    pub fn read_forward(self, bytes: Buffer, columns: usize, column: usize, memory: &Arc<MemoryBudget>) -> Result<ForwardPage> {
+        let (footer, footer_length) = self.verified_footer(&bytes)?;
+        let column_count = columns.checked_add(2).ok_or_else(wrong_layout)?;
+        if column >= columns { return Err(unidentified_event()); }
+        let projection = [0, 1, 2 + column];
+        let stored = footer_schema(footer)?;
+        if stored.fields().map_or(0, |fields| fields.len()) != column_count {
+            return Err(wrong_layout());
+        }
+        let block = batch_block(footer)?;
+        let block_bytes = block_slice(&bytes, block)?;
+        let selected_bytes = if footer.dictionaries().is_none_or(|blocks| blocks.is_empty()) {
+            forward_projection_bytes(block, &block_bytes, column_count, self.rows as usize, &projection)?
+        } else {
+            None
+        };
+        let _layout = selected_bytes.map(|_| memory.reserve(footer_length.saturating_mul(16))).transpose()?;
+        let decode_bytes = selected_bytes.unwrap_or_else(|| bytes.len().saturating_mul(4));
+        let charge = memory.reserve(decode_bytes.saturating_add(4096))?;
+        let stored = Arc::new(arrow_ipc::convert::fb_to_schema(stored));
+        if !stored.metadata().is_empty()
+            || !stored.fields().iter().zip(forward_fields(columns)).all(|(field, expected)| field.as_ref() == &expected) {
+            return Err(wrong_layout());
+        }
+        let decoder = load_decoder(footer, stored, &bytes)?;
+        let batch = if selected_bytes.is_some() {
+            decode_batch(&decoder.with_projection(projection.to_vec()), block, &block_bytes)?
+        } else {
+            decode_batch(&decoder, block, &block_bytes)?.project(&projection).map_err(invalid)?
+        };
+        self.check_rows(&batch)?;
+        Ok(ForwardPage { batch, _charge: charge })
     }
 
     fn read_batch(self, bytes: Buffer, schema: &SchemaRef) -> Result<RecordBatch> {
-        verify(&bytes, self.length, self.digest)?;
+        let (footer, _) = self.verified_footer(&bytes)?;
+        let stored = Arc::new(arrow_ipc::convert::fb_to_schema(footer_schema(footer)?));
+        let decoder = load_decoder(footer, Arc::clone(&stored), &bytes)?;
+        if stored != *schema { return Err(wrong_layout()); }
+        let block = batch_block(footer)?;
+        let batch = decode_batch(&decoder, block, &block_slice(&bytes, block)?)?;
+        self.check_rows(&batch)?;
+        Ok(batch)
+    }
+
+    fn verified_footer(self, bytes: &[u8]) -> Result<(arrow_ipc::Footer<'_>, usize)> {
+        verify(bytes, self.length, self.digest)?;
         let footer_end = bytes.len().checked_sub(10).ok_or_else(|| invalid("Arrow file is shorter than its footer"))?;
         let footer_length = read_footer_length(bytes[footer_end..].try_into().expect("Arrow footer tail width")).map_err(invalid)?;
         let footer_start = footer_end.checked_sub(footer_length).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
         let footer = arrow_ipc::root_as_footer(&bytes[footer_start..footer_end])
             .map_err(|error| invalid(format!("Unable to get root as footer: {error:?}")))?;
-        let blocks = footer.recordBatches().ok_or_else(|| invalid("Unable to get record batches from IPC Footer"))?;
-        let stored = footer.schema().ok_or_else(|| invalid("Arrow footer has no schema"))?;
-        if !stored.endianness().equals_to_target_endianness() {
-            return Err(invalid("the endianness of the source system does not match the endianness of the target system."));
-        }
-        let stored = Arc::new(arrow_ipc::convert::fb_to_schema(stored));
-        let mut decoder = FileDecoder::new(Arc::clone(&stored), footer.version());
-        if let Some(dictionaries) = footer.dictionaries() {
-            for block in dictionaries {
-                decoder.read_dictionary(block, &block_slice(&bytes, block)?).map_err(invalid)?;
-            }
-        }
-        if stored != *schema || blocks.len() != 1 {
-            return Err(invalid("History range has the wrong Arrow layout"));
-        }
-        let block = blocks.get(0);
-        let batch = decoder.read_record_batch(block, &block_slice(&bytes, block)?).map_err(invalid)?
-            .ok_or_else(|| invalid("History range has no batch"))?;
+        Ok((footer, footer_length))
+    }
+
+    fn check_rows(self, batch: &RecordBatch) -> Result<()> {
         if batch.num_rows() != self.rows as usize || batch.column(0).null_count() != 0 {
             return Err(invalid("History range does not account for every row"));
         }
-        let iids = binary(&batch, 0);
+        let iids = binary(batch, 0);
         if iids.value(0) != self.first.0 || iids.value(self.rows as usize - 1) != self.last.0
             || (1..self.rows as usize).any(|row| iids.value(row - 1) > iids.value(row)) {
             return Err(invalid("History range has inconsistent IID fences"));
         }
-        Ok(batch)
+        Ok(())
     }
+}
+
+fn footer_schema<'a>(footer: arrow_ipc::Footer<'a>) -> Result<arrow_ipc::Schema<'a>> {
+    let stored = footer.schema().ok_or_else(|| invalid("Arrow footer has no schema"))?;
+    if !stored.endianness().equals_to_target_endianness() {
+        return Err(invalid("the endianness of the source system does not match the endianness of the target system."));
+    }
+    Ok(stored)
+}
+
+fn batch_block<'a>(footer: arrow_ipc::Footer<'a>) -> Result<&'a arrow_ipc::Block> {
+    let blocks = footer.recordBatches().ok_or_else(|| invalid("Unable to get record batches from IPC Footer"))?;
+    if blocks.len() != 1 { return Err(wrong_layout()); }
+    Ok(blocks.get(0))
+}
+
+fn load_decoder(footer: arrow_ipc::Footer<'_>, schema: SchemaRef, bytes: &Buffer) -> Result<FileDecoder> {
+    let mut decoder = FileDecoder::new(schema, footer.version());
+    if let Some(dictionaries) = footer.dictionaries() {
+        for block in dictionaries {
+            decoder.read_dictionary(block, &block_slice(bytes, block)?).map_err(invalid)?;
+        }
+    }
+    Ok(decoder)
+}
+
+fn decode_batch(decoder: &FileDecoder, block: &arrow_ipc::Block, bytes: &Buffer) -> Result<RecordBatch> {
+    decoder.read_record_batch(block, bytes).map_err(invalid)?.ok_or_else(|| invalid("History range has no batch"))
 }
 
 fn block_slice(bytes: &Buffer, block: &arrow_ipc::Block) -> Result<Buffer> {
@@ -149,31 +205,82 @@ fn block_slice(bytes: &Buffer, block: &arrow_ipc::Block) -> Result<Buffer> {
     Ok(bytes.slice_with_length(start, length))
 }
 
+fn forward_projection_bytes(block: &arrow_ipc::Block, bytes: &[u8], columns: usize, rows: usize,
+    projection: &[usize]) -> Result<Option<usize>> {
+    let metadata = usize::try_from(block.metaDataLength()).map_err(invalid)?;
+    let prefix = if bytes[..4] == [0xff; 4] { 8 } else { 4 };
+    let header = bytes.get(prefix..metadata).ok_or_else(wrong_layout)?;
+    let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
+    let Some(batch) = message.header_as_record_batch().filter(|batch| batch.compression().is_none()) else {
+        return Ok(None);
+    };
+    if batch.length() != rows as i64 { return Err(invalid("History range does not account for every row")); }
+    let body = &bytes[metadata..];
+    let buffer_count = columns.checked_mul(2).ok_or_else(wrong_layout)?;
+    let nodes = batch.nodes().filter(|nodes| nodes.len() == columns).ok_or_else(wrong_layout)?;
+    let buffers = batch.buffers().filter(|buffers| buffers.len() == buffer_count).ok_or_else(wrong_layout)?;
+    if message.bodyLength() != body.len() as i64 || batch.variadicBufferCounts().is_some_and(|counts| !counts.is_empty()) {
+        return Err(wrong_layout());
+    }
+
+    let mut selected = 0;
+    for (column, node) in nodes.iter().enumerate() {
+        let validity = forward_buffer(body, buffers.get(2 * column))?;
+        let values = forward_buffer(body, buffers.get(2 * column + 1))?;
+        let width = match column { 0 => 16, 1 => EventOrigin::WIDTH, _ => REVISION_WIDTH } as usize;
+        let nulls = usize::try_from(node.null_count()).map_err(invalid)?;
+        if node.length() != rows as i64 || values.len() < rows * width || nulls > rows
+            || (nulls != 0 && (validity.len() < rows.div_ceil(8)
+                || UnalignedBitChunk::new(validity, 0, rows).count_ones() != rows - nulls)) {
+            return Err(wrong_layout());
+        }
+        if projection.contains(&column) { selected += validity.len() + values.len(); }
+    }
+    Ok(Some(selected))
+}
+
+fn forward_buffer<'a>(body: &'a [u8], buffer: &arrow_ipc::Buffer) -> Result<&'a [u8]> {
+    let offset = usize::try_from(buffer.offset()).map_err(invalid)?;
+    let length = usize::try_from(buffer.length()).map_err(invalid)?;
+    let end = offset.checked_add(length).ok_or_else(wrong_layout)?;
+    body.get(offset..end).ok_or_else(wrong_layout)
+}
+
 fn forward_schema(columns: usize) -> SchemaRef {
-    Arc::new(Schema::new([
+    Arc::new(Schema::new(forward_fields(columns).collect::<Vec<_>>()))
+}
+
+fn forward_fields(columns: usize) -> impl Iterator<Item = Field> {
+    [
         Field::new("iid", DataType::FixedSizeBinary(16), false),
         Field::new("origin", DataType::FixedSizeBinary(EventOrigin::WIDTH), true),
-    ].into_iter().chain((0..columns).map(|index| Field::new(format!("revision_{index}"), DataType::FixedSizeBinary(32), true))).collect::<Vec<_>>()))
+    ].into_iter().chain((0..columns).map(|index| Field::new(format!("revision_{index}"), DataType::FixedSizeBinary(REVISION_WIDTH), true)))
 }
 
 fn binary(batch: &RecordBatch, column: usize) -> &FixedSizeBinaryArray {
     batch.column(column).as_any().downcast_ref::<FixedSizeBinaryArray>().expect("validated binary layout")
 }
 
-pub struct ForwardPage(RecordBatch);
+pub struct ForwardPage {
+    batch: RecordBatch,
+    _charge: Arc<MemoryReservation>,
+}
 
 impl ForwardPage {
-    pub fn revision(&self, row: usize, iid: Iid, origin: EventOrigin, column: usize) -> Result<Option<[u8; 32]>> {
-        if row >= self.0.num_rows() || column >= self.0.num_columns() - 2
-            || binary(&self.0, 0).value(row) != iid.0
-            || binary(&self.0, 1).is_null(row)
-            || binary(&self.0, 1).value(row) != origin.0 {
-            return Err(invalid("Forward witness does not identify the resolved event"));
+    pub fn revision(&self, row: usize, iid: Iid, origin: EventOrigin) -> Result<Option<[u8; 32]>> {
+        if row >= self.batch.num_rows() || binary(&self.batch, 0).value(row) != iid.0
+            || binary(&self.batch, 1).is_null(row)
+            || binary(&self.batch, 1).value(row) != origin.0 {
+            return Err(unidentified_event());
         }
-        let values = binary(&self.0, 2 + column);
+        let values = binary(&self.batch, 2);
         Ok(values.is_valid(row).then(|| values.value(row).try_into().expect("revision width")))
     }
 }
+
+fn wrong_layout() -> Anomaly { invalid("History range has the wrong Arrow layout") }
+
+fn unidentified_event() -> Anomaly { invalid("Forward witness does not identify the resolved event") }
 
 pub struct HistoryPage(RecordBatch);
 

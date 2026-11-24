@@ -1419,11 +1419,26 @@ pub fn write_prefixed_arrow_stream(schema: &Schema, pages: &[RecordBatch], optio
     Ok(bytes)
 }
 
+pub enum UncompressedBuffer<'bytes, 'spans> {
+    Slice(&'bytes [u8]),
+    Spans { length: usize, spans: &'spans mut dyn Iterator<Item = &'bytes [u8]> },
+}
+
+impl UncompressedBuffer<'_, '_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice(bytes) => bytes.len(),
+            Self::Spans { length, .. } => *length,
+        }
+    }
+}
+
 /// Writes one null-free, dictionary-free batch as a native Arrow V5 stream with 64-byte alignment.
-/// Supply node lengths in field traversal order and raw buffers in IPC order, including empty validity slots.
+/// Supply node lengths in field traversal order and logical buffers in IPC order, including empty validity slots.
+/// A logical buffer's spans must total its declared length and share one padding boundary.
 /// The sink can contain an incomplete stream on error and the caller owns flushing.
 pub fn write_uncompressed_stream_from_buffers(
-    mut output: impl Write, schema: &Schema, rows: usize, node_lengths: &[usize], buffers: &[&[u8]],
+    mut output: impl Write, schema: &Schema, rows: usize, node_lengths: &[usize], buffers: &mut [UncompressedBuffer<'_, '_>],
 ) -> std::result::Result<(), ArrowError> {
     const ALIGNMENT: usize = 64;
     const PADDING: [u8; ALIGNMENT] = [0; ALIGNMENT];
@@ -1434,8 +1449,10 @@ pub fn write_uncompressed_stream_from_buffers(
         .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
     let mut body_length = 0usize;
     let descriptors = buffers.iter().map(|buffer| {
-        let descriptor = arrow_ipc::Buffer::new(ipc_length(body_length)?, ipc_length(buffer.len())?);
-        body_length = body_length.checked_add(buffer.len().next_multiple_of(ALIGNMENT)).ok_or_else(length_error)?;
+        let length = buffer.len();
+        let descriptor = arrow_ipc::Buffer::new(ipc_length(body_length)?, ipc_length(length)?);
+        let padded_length = length.checked_next_multiple_of(ALIGNMENT).ok_or_else(length_error)?;
+        body_length = body_length.checked_add(padded_length).ok_or_else(length_error)?;
         Ok(descriptor)
     }).collect::<std::result::Result<Vec<_>, ArrowError>>()?;
 
@@ -1463,8 +1480,23 @@ pub fn write_uncompressed_stream_from_buffers(
     let batch_metadata = EncodedData { ipc_message: builder.finished_data().to_vec(), arrow_data: Vec::new() };
     write_message(&mut output, batch_metadata, &options)?;
     for buffer in buffers {
-        output.write_all(buffer)?;
-        output.write_all(&PADDING[..buffer.len().next_multiple_of(ALIGNMENT) - buffer.len()])?;
+        let length = buffer.len();
+        match buffer {
+            UncompressedBuffer::Slice(bytes) => output.write_all(bytes)?,
+            UncompressedBuffer::Spans { spans, .. } => {
+                let mut remaining = length;
+                for bytes in spans {
+                    remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("Arrow IPC buffer spans exceed the declared length".into())
+                    })?;
+                    output.write_all(bytes)?;
+                }
+                if remaining != 0 {
+                    return Err(ArrowError::InvalidArgumentError("Arrow IPC buffer spans fall short of the declared length".into()));
+                }
+            }
+        }
+        output.write_all(&PADDING[..length.next_multiple_of(ALIGNMENT) - length])?;
     }
     output.write_all(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0])?;
     Ok(())

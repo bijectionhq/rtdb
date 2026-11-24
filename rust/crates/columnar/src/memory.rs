@@ -199,21 +199,28 @@ impl OwnedBatch {
 
 /// Counts each buffer base address once, using the largest capacity reported for it.
 pub fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
-    allocation_size(batch, None)
+    allocation_size(std::slice::from_ref(batch), None)
 }
 
 /// Counts retained batch allocations apart from the backing charged by `buffer`'s owner.
 pub fn shared_allocation_size_excluding(batch: &RecordBatch, buffer: &Buffer) -> Result<usize> {
-    allocation_size(batch, Some(buffer.data_ptr().as_ptr() as usize))
+    allocation_size(std::slice::from_ref(batch), Some(buffer.data_ptr().as_ptr() as usize))
 }
 
-fn allocation_size(batch: &RecordBatch, excluded: Option<usize>) -> Result<usize> {
+/// Counts shared buffer capacity once across all retained batches.
+pub fn shared_batches_allocation_size(batches: &[RecordBatch]) -> Result<usize> {
+    allocation_size(batches, None)
+}
+
+fn allocation_size(batches: &[RecordBatch], excluded: Option<usize>) -> Result<usize> {
     let mut buffers = BTreeMap::new();
-    let mut descriptors = std::mem::size_of::<RecordBatch>();
-    for array in batch.columns() {
-        descriptors = descriptors.checked_add(array.get_array_memory_size().checked_sub(array.get_buffer_memory_size()).ok_or_else(allocation_overflow)?)
-            .ok_or_else(allocation_overflow)?;
-        collect_buffers(&array.to_data(), &mut buffers);
+    let mut descriptors = std::mem::size_of_val(batches);
+    for batch in batches {
+        for array in batch.columns() {
+            descriptors = descriptors.checked_add(array.get_array_memory_size().checked_sub(array.get_buffer_memory_size()).ok_or_else(allocation_overflow)?)
+                .ok_or_else(allocation_overflow)?;
+            collect_buffers(&array.to_data(), &mut buffers);
+        }
     }
     if let Some(base) = excluded { buffers.remove(&base); }
     buffers.values().try_fold(descriptors, |size, capacity| size.checked_add(*capacity).ok_or_else(allocation_overflow))

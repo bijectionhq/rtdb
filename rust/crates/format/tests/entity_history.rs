@@ -42,19 +42,38 @@ fn history_ranges_keep_mixed_event_identities_and_reject_unbound_bytes() {
 }
 
 #[test]
-fn forward_witness_requires_the_same_logical_event() {
+fn forward_witness_projects_one_revision_and_requires_the_same_logical_event() {
     let origin = EventOrigin::at([3; 16], 11, BlockIndex(8));
-    let iid = Iid([1; 16]);
-    let event = StoredEvent { position: None,
-        iid, system_from: Timestamp(40), valid_time: Interval::ALL, operation: StoredOperation::Delete,
-        recency: None, entity_key: None, commit_position: 0, origin: Some(origin),
-    };
-    let table = EventBatch::new(build_event_batch_with_recency(&[event], None, None, false).unwrap()).unwrap();
-    let mut writer = HistoryWriter::new(Vec::new(), [42; 32], &MemoryBudget::new(1 << 20)).unwrap();
-    writer.append_forward(0, &table, &["body".into()], |_| Ok(Some([25; 32]))).unwrap();
+    let events: Vec<_> = (0..128).map(|row| StoredEvent { position: None,
+        iid: Iid([row; 16]), system_from: Timestamp(40), valid_time: Interval::ALL, operation: StoredOperation::Delete,
+        recency: None, entity_key: None, commit_position: 0, origin: (row != 2).then_some(origin),
+    }).collect();
+    let table = EventBatch::new(build_event_batch_with_recency(&events, None, None, false).unwrap()).unwrap();
+    let columns = 128;
+    let field = 83;
+    let mut writer = HistoryWriter::new(Vec::new(), [42; 32], &MemoryBudget::new(4 << 20)).unwrap();
+    writer.append_forward_revisions(0, &table, columns, |row, _, column| {
+        Ok((row != 1 || column != field).then_some([column as u8; 32]))
+    }).unwrap();
     let (bytes, root) = writer.finish().unwrap();
     let range = ranges(&bytes[root.range().start as usize..], root, [42; 32], None).unwrap()[0];
-    let witness = range.read_forward(Buffer::from(&bytes[..range.range().end as usize]), 1).unwrap();
-    assert_eq!(witness.revision(0, iid, origin, 0).unwrap(), Some([25; 32]));
-    assert!(witness.revision(0, iid, EventOrigin::at([3; 16], 12, BlockIndex(8)), 0).is_err());
+    let raw = &bytes[..range.range().end as usize];
+    let memory = MemoryBudget::new(512 << 10);
+    assert!(raw.len() * 4 + 4096 > memory.limit_bytes());
+    let witness = range.read_forward(Buffer::from(raw), columns, field, &memory).unwrap();
+    assert!(memory.used_bytes() > 0);
+    assert_eq!(witness.revision(0, events[0].iid, origin).unwrap(), Some([83; 32]));
+    assert_eq!(witness.revision(1, events[1].iid, origin).unwrap(), None);
+    assert!(witness.revision(0, events[1].iid, origin).is_err());
+    assert!(witness.revision(0, events[0].iid, EventOrigin::at([3; 16], 12, BlockIndex(8))).is_err());
+    assert!(witness.revision(2, events[2].iid, origin).is_err());
+    drop(witness);
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(range.read_forward(Buffer::from(raw), columns - 1, field, &memory).is_err());
+    let mut wrong_fence = range;
+    wrong_fence.last = Iid([128; 16]);
+    assert!(wrong_fence.read_forward(Buffer::from(raw), columns, field, &memory).is_err());
+    let mut corrupt = raw.to_vec();
+    corrupt[0] ^= 1;
+    assert!(range.read_forward(Buffer::from(corrupt), columns, field, &memory).is_err());
 }

@@ -20,6 +20,26 @@ pub(super) struct Block {
     pub impacts: Vec<Impact>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PostingBlock {
+    pub page: usize,
+    pub slot: usize,
+    pub count: usize,
+}
+
+impl PostingBlock {
+    pub fn at(rows: &StructArray, row: usize) -> Self {
+        let value = |index| rows.column(index).as_primitive::<UInt32Type>().value(row) as usize;
+        Self { page: value(0), slot: value(1), count: value(2) }
+    }
+}
+
+impl Block {
+    fn posting(&self) -> PostingBlock {
+        PostingBlock { page: self.page, slot: self.slot, count: self.count }
+    }
+}
+
 pub(super) struct PostingPlan {
     terms: Vec<PlannedTerm>,
 }
@@ -259,14 +279,14 @@ mod tests {
 pub(super) fn blocks(directory: &LargeListArray, term: usize) -> Vec<Block> {
     let rows = directory.value(term);
     let rows = rows.as_struct();
-    let column = |index| rows.column(index).as_primitive::<UInt32Type>();
     let impacts = rows.column(3).as_list::<i64>();
     (0..rows.len()).map(|row| {
+        let PostingBlock { page, slot, count } = PostingBlock::at(rows, row);
         let impact = impacts.value(row);
         let impact = impact.as_struct();
         let impact_column = |index| impact.column(index).as_primitive::<UInt32Type>();
         Block {
-            page: column(0).value(row) as usize, slot: column(1).value(row) as usize, count: column(2).value(row) as usize,
+            page, slot, count,
             impacts: (0..impact.len()).map(|row| Impact {
                 window: impact_column(0).value(row), frequency: impact_column(1).value(row),
                 length: impact_column(2).value(row), same_frequency: impact.column(3).as_boolean().value(row),
@@ -289,10 +309,11 @@ impl Frequencies {
     }
 
     pub fn from_batch(batch: &arrow_array::RecordBatch, block: &Block, runs: u32) -> Result<Self> {
-        Self::checked_batch(batch, block, runs, false)
+        Self::checked_batch(batch, block.posting(), block.impacts.iter().map(|impact| impact.window), runs, false)
     }
 
-    pub fn checked_batch(batch: &arrow_array::RecordBatch, block: &Block, runs: u32, prior_check: bool) -> Result<Self> {
+    pub fn checked_batch(batch: &arrow_array::RecordBatch, block: PostingBlock, windows: impl Iterator<Item = u32>,
+        runs: u32, prior_check: bool) -> Result<Self> {
         let table = layout::table(batch, Table::Frequencies);
         if block.slot >= table.len() { return Err(corrupt("Search block has no frequency slot")); }
         let column = |index: usize| table.column(index).as_list::<i64>().value(block.slot).as_primitive::<UInt32Type>().clone();
@@ -305,7 +326,7 @@ impl Frequencies {
             return Err(corrupt("Search frequencies disagree with their directory"));
         }
         if !prior_check && !docs.values().chunk_by(|left, right| window_of(*left) == window_of(*right))
-            .map(|docs| window_of(docs[0])).eq(block.impacts.iter().map(|impact| impact.window)) {
+            .map(|docs| window_of(docs[0])).eq(windows) {
             return Err(corrupt("Search documents disagree with their scoring windows"));
         }
         Ok(Self { docs, counts })
@@ -326,14 +347,14 @@ impl Frequencies {
     }
 
     pub fn positions_from_batch(&self, batch: &arrow_array::RecordBatch, block: &Block) -> Result<LargeListArray> {
-        self.checked_positions(batch, block, false)
+        self.checked_positions(batch, block.slot, false)
     }
 
-    pub fn checked_positions(&self, batch: &arrow_array::RecordBatch, block: &Block, prior_check: bool) -> Result<LargeListArray> {
+    pub fn checked_positions(&self, batch: &arrow_array::RecordBatch, slot: usize, prior_check: bool) -> Result<LargeListArray> {
         let table = layout::table(batch, Table::Positions);
-        if block.slot >= table.len() { return Err(corrupt("Search block has no position slot")); }
+        if slot >= table.len() { return Err(corrupt("Search block has no position slot")); }
         let outer = table.column(0).as_list::<i64>();
-        let positions = outer.value(block.slot);
+        let positions = outer.value(slot);
         let positions = positions.as_list::<i64>();
         if !prior_check && (positions.len() != self.docs.len() || positions.null_count() != 0
             || !positions.value_offsets().windows(2).zip(self.counts.values()).all(|(range, &count)| range[1] - range[0] == i64::from(count))) {
