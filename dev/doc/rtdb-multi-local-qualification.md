@@ -136,6 +136,21 @@ Stop the backend with Ctrl-C, then use `kill -TERM "$rtdb_pid"` and `wait "$rtdb
 
 The Bijection transport cases `startup_catalog_checks_only_after_declaration_acceptance` and `original_receipt_survives_a_lost_or_incomplete_reply` cover the declaration and receipt edges separately under `native_store_runtime --lib rtdb::flight_v1`.
 
+## Protected Original custody profile
+
+Start a separate Multi process with the password-authenticated `xtdb` profile, its own data directory and the Bijection Original custody provider mounted.
+
+```bash
+"$RTDB" dev --multi --data "$data" --multi-tls-dir "$tls" \
+  --incarnation "$id" --custody-provider-config "$providers" --flight-sql-port 0
+```
+
+Use the Original provider YAML and bearer environment projection used by the standalone launcher. The private YAML file has a 64 KiB limit and must specify one provider for database `xtdb` and the exact launch incarnation. Its optional `owner` must be `xtdb`. For a locally issued provider certificate, put the PEM CA bundle in the provider entry's `caCertificate` field. RTDB uses that bundle for provider HTTPS and verifies the provider hostname or IP SAN. The Flight TLS inputs remain separate from provider HTTPS.
+
+For Bijection, set `BIJECTION_RTDB_ORIGINAL_CUSTODY_PROVIDER` to its private provider JSON and use the same provider endpoint, bearer, signing public key, exact authority and prepared writer claim. Use a live supervisor that can prove positive producer exit for the restart cases.
+
+Check startup rejects a provider configured for another incarnation or owner. Exercise missing placement and missing or mismatched response evidence over both HTTP versions. Exercise an admitted response racing a family fence, then recover the exact reservation through positive response closure while the supervisor retains the original producer exit.
+
 ## Separate OIDC Create and UserList profiles
 
 Start two processes with separate fresh data directories and bootstrap UUIDs.

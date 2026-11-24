@@ -5,7 +5,7 @@ use rtdb_format::database::proto::{LocalLog, LocalStorage, database_config::{Log
 use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
 
-use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings};
+use crate::config::{CustodyProviderSettings, NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings, parse_custody_provider_config};
 
 #[cfg(feature = "multi")]
 mod admin;
@@ -14,7 +14,7 @@ pub use admin::AdminOptions;
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME [--incarnation UUID]\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -37,6 +37,7 @@ pub struct MultiDevTls {
     directory: PathBuf,
     authn: Option<PathBuf>,
     journal_url: Option<String>,
+    custody_provider_config: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +213,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         let mut tls_directory = None;
         let mut authn = None;
         let mut journal_url = None;
+        let mut custody_provider_config = None;
         let mut incarnation = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -238,6 +240,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                         .ok_or_else(|| invalid("--multi-journal-url requires a Logkeeper TLS URL"))?;
                     journal_url = Some(url);
                 }
+                "--custody-provider-config" if custody_provider_config.is_none() => {
+                    let path = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
+                        .ok_or_else(|| invalid("--custody-provider-config requires a YAML file"))?;
+                    custody_provider_config = Some(PathBuf::from(path));
+                }
                 "--incarnation" if incarnation.is_none() => {
                     let raw = arguments.next().ok_or_else(|| invalid("--incarnation requires a UUID"))?;
                     incarnation = Some(uuid::Uuid::parse_str(&raw).ok()
@@ -255,13 +262,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             }
         }
         if options.multi && pgwire_requested { return Err(invalid("Multi development serves Flight SQL; use --flight-sql-port")); }
-        options.multi_tls = match (tls_directory, incarnation, authn, journal_url) {
-            (None, None, None, None) => None,
-            (Some(directory), Some(incarnation), authn, journal_url) if options.multi && data_requested && options.flight_sql_port >= 0 => {
-                Some(MultiDevTls { directory, incarnation, authn, journal_url })
+        options.multi_tls = match (tls_directory, incarnation, authn, journal_url, custody_provider_config) {
+            (None, None, None, None, None) => None,
+            (_, _, Some(_), _, Some(_)) => {
+                return Err(invalid("Development custody uses the loopback xtdb password profile"));
             }
-            (_, _, Some(_), _) | (_, _, _, Some(_)) => {
-                return Err(invalid("--multi-authn and --multi-journal-url require the complete Multi TLS development profile"));
+            (Some(directory), Some(incarnation), authn, journal_url, custody_provider_config)
+                if options.multi && data_requested && options.flight_sql_port >= 0 =>
+            {
+                Some(MultiDevTls { directory, incarnation, authn, journal_url, custody_provider_config })
+            }
+            (_, _, Some(_), _, _) | (_, _, _, Some(_), _) | (_, _, _, _, Some(_)) => {
+                return Err(invalid("Authentication, journal and custody options require the complete Multi TLS development profile"));
             }
             _ => return Err(invalid("--multi-tls-dir and --incarnation require --multi, explicit --data and an enabled Flight SQL listener")),
         };
@@ -391,7 +403,11 @@ impl DevOptions {
             };
         }
         config.server = Some(PgwireSettings { port: self.pgwire_port, ..Default::default() });
-        config.flight_sql = Some(FlightSettings { port: self.flight_sql_port, ..Default::default() });
+        let custody_providers = match &self.multi_tls {
+            Some(tls) => tls.custody_providers()?,
+            None => Vec::new(),
+        };
+        config.flight_sql = Some(FlightSettings { port: self.flight_sql_port, custody_providers, ..Default::default() });
         Ok(parsed.with_object_sort(self.object_sort))
     }
 }
@@ -460,6 +476,26 @@ impl MultiDevTls {
             return Err(invalid("Multi development password must contain 64 hexadecimal digits"));
         }
         Ok(Secret::new(std::str::from_utf8(&bytes).expect("validated ASCII")))
+    }
+
+    fn custody_providers(&self) -> Result<Vec<CustodyProviderSettings>> {
+        let Some(path) = &self.custody_provider_config else { return Ok(Vec::new()); };
+        let bytes = Zeroizing::new(read_private_multi_input(path, 64 * 1024)?);
+        let config = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid("Invalid development custody provider configuration"))?;
+        let mut providers = parse_custody_provider_config(config).map_err(|error| {
+            Anomaly::new(error.category, error.code, "Invalid development custody provider configuration")
+        })?;
+        let [provider] = providers.as_mut_slice() else {
+            return Err(invalid("Development custody requires one provider for the exact xtdb installation"));
+        };
+        if !provider.matches_installation("xtdb", self.incarnation)
+            || provider.owner.as_deref().is_some_and(|owner| owner != "xtdb")
+        {
+            return Err(invalid("Development custody requires the exact xtdb installation and owner"));
+        }
+        provider.owner = Some("xtdb".into());
+        Ok(providers)
     }
 
     fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>> {

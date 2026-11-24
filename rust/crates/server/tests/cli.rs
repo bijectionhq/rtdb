@@ -103,6 +103,56 @@ fn multi_development_tls_requires_an_exact_incarnation_and_explicit_local_data()
 }
 
 #[test]
+fn multi_tls_development_mounts_custody_only_for_the_exact_original() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut password = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    password.write_all(&[b'a'; 64]).unwrap();
+    password.persist(directory.path().join("password")).unwrap();
+    let provider = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let directory = directory.path().to_str().unwrap();
+    let provider = provider.path().to_str().unwrap();
+    let id = "01234567-89ab-4def-8000-000000000001";
+    let arguments = [
+        "dev", "--multi", "--data", "fresh", "--incarnation", id,
+        "--multi-tls-dir", directory, "--custody-provider-config", provider,
+    ];
+    let Command::Dev(options) = parse(&arguments) else { panic!("expected development TLS"); };
+    let config = format!(r#"custodyProviders:
+  - database: xtdb
+    endpoint: https://127.0.0.1:7777/observe
+    bearerToken: fixture-custody-token
+    incarnation: "{}"
+    installation: "{}"
+    sourceHistory: "{}"
+    registry: "{}"
+    originalWriter: "{}"
+    providerPublicKey: "{}"
+    writerTable: public.writer
+    writerId: authority
+    writerValidAtMicros: "0"
+"#, id.replace('-', ""), "01".repeat(16), "02".repeat(32), "03".repeat(32), "04".repeat(32), "05".repeat(32));
+    std::fs::write(provider, &config).unwrap();
+    let loaded = options.load_reserved().unwrap();
+    let providers = &loaded.configuration().flight_sql.as_ref().unwrap().custody_providers;
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].database, "xtdb");
+
+    for wrong in [
+        config.replace("database: xtdb", "database: other"),
+        config.replace(&id.replace('-', ""), &"06".repeat(16)),
+        config.replace("database: xtdb", "database: xtdb\n    owner: other"),
+        "custodyProviders: []".into(),
+    ] {
+        std::fs::write(provider, wrong).unwrap();
+        assert!(options.load_reserved().is_err());
+    }
+    let no_tls = ["dev", "--multi", "--data", "fresh", "--custody-provider-config", provider];
+    assert!(cli::parse(no_tls.map(str::to_owned), &|_| None).is_err());
+    let mixed_auth = arguments.into_iter().chain(["--multi-authn", provider]).map(str::to_owned);
+    assert!(cli::parse(mixed_auth, &|_| None).is_err());
+}
+
+#[test]
 fn multi_tls_development_authn_admits_oidc_or_user_list_only() {
     use rtdb_auth::{AuthConfig, GrantedAccess};
     let mut input = tempfile::NamedTempFile::new().unwrap();

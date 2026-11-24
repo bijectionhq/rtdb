@@ -21,6 +21,7 @@ pub struct Settings {
     pub database: String,
     pub(crate) owner: Option<String>,
     endpoint: Url,
+    ca_certificate: Option<String>,
     bearer: Secret,
     public_key: [u8; 32],
     authority: CustodyCarrierAuthority,
@@ -75,6 +76,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         original_writer: fixed_hex(&fields.required_string("originalWriter")?)?,
     };
     let public_key = fixed_hex(&fields.required_string("providerPublicKey")?)?;
+    let ca_certificate = fields.nullable_string("caCertificate")?;
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -89,6 +91,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         database,
         owner,
         endpoint,
+        ca_certificate,
         bearer: Secret::new(bearer),
         public_key,
         authority,
@@ -229,13 +232,22 @@ impl Settings {
         &self,
         memory: Arc<MemoryBudget>,
     ) -> Result<CustodyProviderInstallation> {
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .https_only(true)
             .no_proxy()
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| invalid())?;
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(pem) = &self.ca_certificate {
+            if pem.len() > 64 * 1024 {
+                return Err(invalid());
+            }
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|_| invalid())?;
+            if certs.is_empty() {
+                return Err(invalid());
+            }
+            client = client.tls_certs_only(certs);
+        }
+        let client = client.build().map_err(|_| invalid())?;
         let observations = Arc::new(Provider {
             client,
             memory,
