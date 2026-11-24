@@ -5,7 +5,7 @@
 //! The artefact record's stats carry the footer and the directory digest, so a reader opens the directory
 //! with one range read and checks every byte it uses.
 
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -13,17 +13,20 @@ use arrow_array::{
     Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
     builder::FixedSizeBinaryBuilder,
 };
-use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow_buffer::Buffer;
+use arrow_ipc::{Message, convert::fb_to_schema, reader::read_record_batch, root_as_message, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rtdb_types::{Anomaly, Iid, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{definition::FILE_VERSION, kmeans, rows::{IndexedRow, Partition}};
+use crate::{definition::FILE_VERSION, kmeans, rows::{IndexedRow, IndexedRows, Partition}};
 
 const MAGIC: &[u8; 8] = b"RTDBVEC1";
 const FOOTER_BYTES: usize = 32;
 const ALIGNMENT: u64 = 64;
+const CONTINUATION: [u8; 4] = [255; 4];
+const END: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
 
 fn unit_field(dimensions: usize) -> Result<DataType> {
     let width = i32::try_from(dimensions).map_err(|_| corrupt("Vector dimensions exceed the Arrow list width"))?;
@@ -90,10 +93,11 @@ pub(crate) struct Written { pub(crate) size: u64, pub(crate) locator: Locator }
 
 /// Writes the generation of `rows`, which this sorts so that the bytes depend only on the set of rows.
 /// Each partition trains its own clusters; a row belongs to exactly one cluster of its partition.
-pub(crate) fn write_generation(mut rows: Vec<IndexedRow>, dimensions: usize, output: &mut impl Write, cancellation: &CancellationToken) -> Result<Written> {
+pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, cancellation: &CancellationToken) -> Result<Written> {
+    let dimensions = rows.dimensions();
     let dimensions_u32 = u32::try_from(dimensions).map_err(|_| corrupt("Vector dimensions exceed the file format"))?;
-    rows.sort_by(|left, right| (left.partition, left.iid, left.system_from, left.valid_from, left.valid_to)
-        .cmp(&(right.partition, right.iid, right.system_from, right.valid_from, right.valid_to)));
+    rows.sort();
+    let ordered_rows = rows.rows();
     let block = block_schema(dimensions)?;
     let mut written = 0u64;
     let mut partitions = Vec::new();
@@ -103,21 +107,21 @@ pub(crate) fn write_generation(mut rows: Vec<IndexedRow>, dimensions: usize, out
     let mut counts = Vec::new();
     let mut digests = Vec::new();
     let mut start = 0;
-    while start < rows.len() {
-        let partition = rows[start].partition;
-        let end = start + rows[start..].iter().take_while(|row| row.partition == partition).count();
-        let members = &rows[start..end];
-        let units: Vec<&[f32]> = members.iter().map(|row| row.unit.as_slice()).collect();
-        let (trained, assignment) = kmeans::train(&units, dimensions, cancellation)?;
-        for (cluster, centroid) in trained.chunks_exact(dimensions).enumerate() {
-            let selected: Vec<&IndexedRow> = members.iter().zip(&assignment).filter(|(_, assigned)| **assigned as usize == cluster)
-                .map(|(row, _)| row).collect();
+    while start < ordered_rows.len() {
+        let partition = ordered_rows[start].partition;
+        let end = start + ordered_rows[start..].iter().take_while(|row| row.partition == partition).count();
+        let members = &ordered_rows[start..end];
+        let (trained, assignment) = kmeans::train(members.len(), dimensions, |index| rows.unit(&members[index]), cancellation)?;
+        let centroids_by_cluster = trained.chunks_exact(dimensions);
+        let mut selections = vec![Vec::new(); centroids_by_cluster.len()];
+        for (row, cluster) in members.iter().zip(assignment) { selections[cluster as usize].push(row); }
+        for (centroid, selected) in centroids_by_cluster.zip(selections) {
             if selected.is_empty() { continue; }
             if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
             let padding = ((ALIGNMENT - written % ALIGNMENT) % ALIGNMENT) as usize;
             output.write_all(&[0u8; ALIGNMENT as usize][..padding]).map_err(io)?;
             written += padding as u64;
-            let bytes = encode(&block, block_batch(&block, &selected, dimensions)?)?;
+            let bytes = encode(&block, block_batch(&block, &rows, &selected)?)?;
             output.write_all(&bytes).map_err(io)?;
             partitions.push(partition);
             centroids.extend_from_slice(centroid);
@@ -152,15 +156,19 @@ pub(crate) fn write_generation(mut rows: Vec<IndexedRow>, dimensions: usize, out
     Ok(Written { size: written, locator })
 }
 
-fn block_batch(schema: &SchemaRef, rows: &[&IndexedRow], dimensions: usize) -> Result<RecordBatch> {
-    let mut iids = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
-    for row in rows { iids.append_value(row.iid.0).map_err(arrow)?; }
+fn block_batch(schema: &SchemaRef, rows: &IndexedRows, selected: &[&IndexedRow]) -> Result<RecordBatch> {
+    let mut iids = FixedSizeBinaryBuilder::with_capacity(selected.len(), 16);
+    let mut units = Vec::with_capacity(selected.len() * rows.dimensions());
+    for row in selected {
+        iids.append_value(row.iid.0).map_err(arrow)?;
+        units.extend_from_slice(rows.unit(row));
+    }
     RecordBatch::try_new(Arc::clone(schema), vec![
         Arc::new(iids.finish()),
-        Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.valid_from))),
-        Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.valid_to))),
-        Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.system_from))),
-        Arc::new(unit_list(rows.iter().flat_map(|row| row.unit.iter().copied()).collect(), dimensions)?),
+        Arc::new(Int64Array::from_iter_values(selected.iter().map(|row| row.valid_from))),
+        Arc::new(Int64Array::from_iter_values(selected.iter().map(|row| row.valid_to))),
+        Arc::new(Int64Array::from_iter_values(selected.iter().map(|row| row.system_from))),
+        Arc::new(unit_list(units, rows.dimensions())?),
     ]).map_err(arrow)
 }
 
@@ -179,13 +187,52 @@ fn encode(schema: &SchemaRef, batch: RecordBatch) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn decode(bytes: &[u8], schema: &SchemaRef) -> Result<RecordBatch> {
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(arrow)?;
-    let batch = reader.next().ok_or_else(|| corrupt("A vector generation stream holds no batch"))?.map_err(arrow)?;
-    if reader.next().is_some() || batch.schema_ref().fields() != schema.fields() {
+fn message(bytes: &[u8]) -> Result<(Message<'_>, Range<usize>)> {
+    let prefix = if bytes.starts_with(&CONTINUATION) { 4 } else { 0 };
+    let invalid = || corrupt("Invalid Arrow IPC message in a vector generation");
+    let length = bytes.get(prefix..prefix + 4).ok_or_else(invalid)?;
+    let length = usize::try_from(i32::from_le_bytes(length.try_into().map_err(|_| invalid())?)).map_err(|_| invalid())?;
+    let start = prefix + 4;
+    let end = start.checked_add(length).ok_or_else(invalid)?;
+    let header = root_as_message(bytes.get(start..end).ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let body_length = usize::try_from(header.bodyLength()).map_err(|_| invalid())?;
+    let body_end = end.checked_add(body_length).filter(|end| *end <= bytes.len()).ok_or_else(invalid)?;
+    Ok((header, end..body_end))
+}
+
+fn decode(bytes: Buffer, schema: &SchemaRef, expected_rows: Option<usize>) -> Result<RecordBatch> {
+    let (header, body) = message(&bytes)?;
+    let stored = header.header_as_schema().filter(|_| body.is_empty()).ok_or_else(|| corrupt("A vector stream must begin with its schema"))?;
+    if !stored.endianness().equals_to_target_endianness()
+        || stored.fields().is_none_or(|fields| fields.len() != schema.fields().len())
+        || fb_to_schema(stored).fields() != schema.fields() {
+        return Err(corrupt("A vector generation stream has the wrong layout"));
+    }
+    let first_end = body.end;
+    let (header, body) = message(&bytes[first_end..])?;
+    let batch = header.header_as_record_batch().ok_or_else(|| corrupt("A vector generation stream holds no batch"))?;
+    let tail = &bytes[first_end + body.end..];
+    if !tail.is_empty() && tail != END && tail != [0; 4] {
         return Err(corrupt("A vector generation stream does not hold exactly one batch of its layout"));
     }
-    Ok(batch)
+    let rows = usize::try_from(batch.length()).map_err(|_| corrupt("Invalid vector generation row count"))?;
+    if rows > body.len() || expected_rows.is_some_and(|expected| rows != expected) {
+        return Err(corrupt("A vector generation stream does not hold its recorded rows"));
+    }
+    if batch.compression().is_some() || batch.variadicBufferCounts().is_some_and(|counts| !counts.is_empty())
+        || batch.nodes().is_none_or(|nodes| nodes.iter().any(|node| {
+            node.null_count() != 0 || usize::try_from(node.length()).map_or(true, |length| length > body.len())
+        }))
+        || batch.buffers().is_none_or(|buffers| buffers.iter().any(|buffer| {
+            buffer.offset() < 0 || buffer.length() < 0 || buffer.offset().checked_add(buffer.length())
+                .and_then(|end| usize::try_from(end).ok()).is_none_or(|end| end > body.len())
+        })) {
+        return Err(corrupt("Invalid Arrow IPC buffers in a vector generation"));
+    }
+    let data = bytes.slice_with_length(first_end + body.start, body.len());
+    // Arrow retains aligned slices of the input and copies misaligned primitive buffers.
+    read_record_batch(&data, batch, Arc::clone(schema), &Default::default(), None, &header.version())
+        .map_err(|error| corrupt(&error.to_string()))
 }
 
 /// One cluster as the directory names it.
@@ -202,10 +249,12 @@ pub(crate) struct Directory { pub(crate) dimensions: usize, pub(crate) clusters:
 
 impl Directory {
     /// Decodes directory bytes, checking them against the locator's digest.
-    pub(crate) fn read(bytes: &[u8], locator: &Locator) -> Result<Self> {
-        if <[u8; 32]>::from(Sha256::digest(bytes)) != locator.digest { return Err(corrupt("A vector generation directory does not match its digest")); }
+    pub(crate) fn read(bytes: Buffer, locator: &Locator) -> Result<Self> {
+        if bytes.len() as u64 != locator.directory.1 || <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) != locator.digest {
+            return Err(corrupt("A vector generation directory does not match its recorded length or digest"));
+        }
         let dimensions = locator.dimensions as usize;
-        let batch = decode(bytes, &directory_schema(dimensions)?)?;
+        let batch = decode(bytes, &directory_schema(dimensions)?, None)?;
         let column = |index: usize| batch.column(index).as_ref();
         let partitions = column(0).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| corrupt("partition"))?;
         let centroids = column(1).as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| corrupt("centroid"))?;
@@ -214,14 +263,16 @@ impl Directory {
         let counts = column(4).as_any().downcast_ref::<UInt32Array>().ok_or_else(|| corrupt("rows"))?;
         let digests = column(5).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| corrupt("digest"))?;
         let values = centroids.values().as_any().downcast_ref::<Float32Array>().ok_or_else(|| corrupt("centroid"))?.clone();
-        if values.len() != batch.num_rows() * dimensions { return Err(corrupt("centroid width")); }
+        if batch.num_rows().checked_mul(dimensions) != Some(values.len()) { return Err(corrupt("centroid width")); }
         let clusters = (0..batch.num_rows()).map(|row| {
-            let end = offsets.value(row).checked_add(lengths.value(row)).filter(|end| *end <= locator.directory.0)
-                .ok_or_else(|| corrupt("A cluster extends past the directory"))?;
+            let offset = offsets.value(row);
+            let end = offset.checked_add(lengths.value(row))
+                .filter(|end| offset.is_multiple_of(ALIGNMENT) && offset < *end && *end <= locator.directory.0)
+                .ok_or_else(|| corrupt("A cluster has an invalid range"))?;
             Ok(Cluster {
                 partition: Partition(partitions.value(row).try_into().map_err(|_| corrupt("partition"))?),
                 centroid: row * dimensions..(row + 1) * dimensions,
-                range: offsets.value(row)..end, rows: counts.value(row),
+                range: offset..end, rows: counts.value(row),
                 digest: digests.value(row).try_into().map_err(|_| corrupt("digest"))?,
             })
         }).collect::<Result<Vec<_>>>()?;
@@ -235,15 +286,17 @@ impl Directory {
 pub(crate) struct Block { iids: FixedSizeBinaryArray, valid_from: Int64Array, valid_to: Int64Array, system_from: Int64Array, units: Float32Array, dimensions: usize }
 
 impl Block {
-    pub(crate) fn read(bytes: &[u8], cluster: &Cluster, dimensions: usize) -> Result<Self> {
-        if <[u8; 32]>::from(Sha256::digest(bytes)) != cluster.digest { return Err(corrupt("A vector cluster does not match its digest")); }
-        let batch = decode(bytes, &block_schema(dimensions)?)?;
-        if batch.num_rows() != cluster.rows as usize { return Err(corrupt("A vector cluster does not hold its recorded rows")); }
+    pub(crate) fn read(bytes: Buffer, cluster: &Cluster, dimensions: usize) -> Result<Self> {
+        if cluster.range.end.checked_sub(cluster.range.start) != Some(bytes.len() as u64)
+            || <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) != cluster.digest {
+            return Err(corrupt("A vector cluster does not match its recorded length or digest"));
+        }
+        let batch = decode(bytes, &block_schema(dimensions)?, Some(cluster.rows as usize))?;
         let column = |index: usize| batch.column(index).as_ref();
         let integers = |index: usize| column(index).as_any().downcast_ref::<Int64Array>().cloned().ok_or_else(|| corrupt("temporal column"));
         let units = column(4).as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| corrupt("unit"))?
             .values().as_any().downcast_ref::<Float32Array>().ok_or_else(|| corrupt("unit"))?.clone();
-        if units.len() != batch.num_rows() * dimensions { return Err(corrupt("unit width")); }
+        if batch.num_rows().checked_mul(dimensions) != Some(units.len()) { return Err(corrupt("unit width")); }
         Ok(Self {
             iids: column(0).as_any().downcast_ref::<FixedSizeBinaryArray>().cloned().ok_or_else(|| corrupt("_iid"))?,
             valid_from: integers(1)?, valid_to: integers(2)?, system_from: integers(3)?, units, dimensions,
@@ -264,37 +317,105 @@ pub(crate) fn corrupt(detail: &str) -> Anomaly { Anomaly::fault("rtdb.vector/cor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, cache::BufferPool};
+    use rtdb_types::{EventHeader, EventOp, Interval, Timestamp};
 
-    fn rows(count: u64) -> Vec<IndexedRow> {
-        (0..count).map(|seed| {
+    fn rows(seeds: impl IntoIterator<Item = u64>) -> IndexedRows {
+        let mut rows = IndexedRows::new(2);
+        for seed in seeds {
             let mut iid = [0u8; 16];
             iid[..8].copy_from_slice(&seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
             let angle = seed as f64 * 0.37;
-            IndexedRow {
-                iid: Iid(iid), valid_from: 0, valid_to: i64::MAX, system_from: seed as i64,
-                partition: Partition::of([Some(std::borrow::Cow::Owned(rtdb_types::Value::I64((seed % 2) as i64)))]).unwrap(),
-                unit: vec![angle.cos() as f32, angle.sin() as f32],
-            }
-        }).collect()
+            let header = EventHeader { position: None, iid: Iid(iid), system_from: Timestamp(seed as i64), commit_position: 0,
+                valid_time: Interval::from_micros(0, i64::MAX).unwrap(), op: EventOp::Put };
+            let partition = Partition::of([Some(std::borrow::Cow::Owned(rtdb_types::Value::I64((seed % 2) as i64)))]).unwrap();
+            rows.push_unit(header, partition, &[angle.cos() as f32, angle.sin() as f32]);
+        }
+        rows
     }
 
     #[test]
     fn a_generation_is_a_function_of_its_rows() {
         let token = CancellationToken::new();
         let (mut first, mut second) = (Vec::new(), Vec::new());
-        let written = write_generation(rows(1_000), 2, &mut first, &token).unwrap();
-        let mut reversed = rows(1_000);
-        reversed.reverse();
-        write_generation(reversed, 2, &mut second, &token).unwrap();
+        let written = write_generation(rows(0..1_000), &mut first, &token).unwrap();
+        write_generation(rows((0..1_000).rev()), &mut second, &token).unwrap();
         assert_eq!(first, second);
         assert_eq!(written.size, first.len() as u64);
         let locator = Locator::decode(&written.locator.encode()).unwrap();
-        let directory = Directory::read(&first[locator.directory_range().start as usize..locator.directory_range().end as usize], &locator).unwrap();
+        let bytes = Buffer::from_slice_ref(&first);
+        let directory = Directory::read(bytes.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize), &locator).unwrap();
         let total: u32 = directory.clusters.iter().map(|cluster| cluster.rows).sum();
         assert_eq!(total, 1_000);
         for cluster in &directory.clusters {
-            let block = Block::read(&first[cluster.range.start as usize..cluster.range.end as usize], cluster, 2).unwrap();
+            let block = Block::read(bytes.slice_with_length(cluster.range.start as usize, (cluster.range.end - cluster.range.start) as usize), cluster, 2).unwrap();
             assert_eq!(block.len(), cluster.rows as usize);
+            for row in 0..block.len() {
+                let (_, _, seed) = block.extent(row);
+                let angle = seed as f64 * 0.37;
+                assert_eq!(block.unit(row), &[angle.cos() as f32, angle.sin() as f32]);
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn aligned_directory_and_cluster_columns_keep_their_range_charges() {
+        struct Aligned(Buffer);
+        impl AsRef<[u8]> for Aligned {
+            fn as_ref(&self) -> &[u8] { self.0.as_slice() }
+        }
+
+        let mut bytes = Vec::new();
+        let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
+        let memory = MemoryBudget::new(bytes.len());
+        let store = Arc::new(MemoryStore::default());
+        let key = ObjectKey::new("vector").unwrap();
+        store.put(&key, Bytes::from_owner(Aligned(Buffer::from_slice_ref(&bytes)))).await.unwrap();
+        let pool = BufferPool::new(store, 0);
+
+        let lease = pool.get_range_or(&key, locator.directory_range(), &memory).await.unwrap();
+        let directory_bytes = lease.as_slice().as_ptr_range();
+        let directory = Directory::read(Buffer::from(Bytes::from_owner(lease)), &locator).unwrap();
+        let cluster = &directory.clusters[0];
+        assert!(directory_bytes.contains(&directory.centroid(cluster).as_ptr().cast::<u8>()));
+        assert_eq!(memory.used_bytes(), locator.directory.1 as usize);
+
+        let lease = pool.get_range_or(&key, cluster.range.clone(), &memory).await.unwrap();
+        let cluster_bytes = lease.as_slice().as_ptr_range();
+        let cluster_len = lease.as_slice().len();
+        let block = Block::read(Buffer::from(Bytes::from_owner(lease)), cluster, 2).unwrap();
+        assert!(cluster_bytes.contains(&block.unit(0).as_ptr().cast::<u8>()));
+        assert_eq!(memory.used_bytes(), locator.directory.1 as usize + cluster_len);
+        drop(directory);
+        assert_eq!(memory.used_bytes(), cluster_len);
+        drop(block);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn misaligned_cluster_values_still_decode_and_bad_records_decline() {
+        let mut bytes = Vec::new();
+        let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
+        let aligned = Buffer::from_slice_ref(&bytes);
+        let directory = Directory::read(aligned.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize), &locator).unwrap();
+        let cluster = &directory.clusters[0];
+        let mut shifted = vec![0];
+        shifted.extend_from_slice(&bytes[cluster.range.start as usize..cluster.range.end as usize]);
+        let range = Buffer::from_slice_ref(&shifted).slice(1);
+        let block = Block::read(range.clone(), cluster, 2).unwrap();
+        assert_eq!(block.len(), cluster.rows as usize);
+        assert!(!range.as_ptr_range().contains(&block.unit(0).as_ptr().cast::<u8>()));
+
+        let bad_rows = Cluster { rows: cluster.rows + 1, range: cluster.range.clone(), centroid: cluster.centroid.clone(), ..*cluster };
+        let bad_digest = Cluster { digest: [0; 32], range: cluster.range.clone(), centroid: cluster.centroid.clone(), ..*cluster };
+        let bad_length = Cluster { range: cluster.range.start..cluster.range.end + 1, centroid: cluster.centroid.clone(), ..*cluster };
+        for record in [&bad_rows, &bad_digest, &bad_length] {
+            let error = Block::read(range.clone(), record, 2).err().unwrap();
+            assert!(crate::shortlist::declined(&error));
+        }
+        let error = Block::read(range, cluster, 3).err().unwrap();
+        assert!(crate::shortlist::declined(&error));
     }
 }
