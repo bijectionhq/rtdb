@@ -1,18 +1,19 @@
 use std::{fmt::Write, sync::Arc, time::Duration};
 
 use arrow_array::{
-    Array, BinaryArray, DictionaryArray, Int32Array, Int64Array, ListArray, RecordBatch,
+    Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, Int64Array, ListArray, RecordBatch,
     StringArray, types::Int32Type,
 };
 use arrow_buffer::Buffer;
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Schema};
 use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, to_field};
 use rtdb_format::ipc::OwnedStream;
 use rtdb_tx::{SqlArguments, TxOp};
-use rtdb_types::{LogicalType, ScalarType, TableRef, Value};
+use rtdb_types::{LogicalType, ScalarType, TableRef};
 use tonic::{Response, Status};
 
 use crate::{
@@ -127,7 +128,7 @@ impl Service {
             let [batch] = stream.pages() else {
                 return Err(invalid("Expected one catalog write batch"));
             };
-            Some(catalog_inserts(batch.batch(), call.memory())?)
+            Some(catalog_inserts(batch, call.memory())?)
         };
         let mut operations = request
             .before
@@ -314,9 +315,10 @@ impl Service {
 }
 
 fn catalog_inserts(
-    batch: &RecordBatch,
+    owner: &OwnedBatch,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(Vec<TxOp>, Arc<MemoryReservation>), Status> {
+    let batch = owner.batch();
     if !batch
         .schema()
         .fields()
@@ -388,7 +390,7 @@ fn catalog_inserts(
     }
 
     let sql_bytes = wire::add(
-        wire::mul(batch.num_rows(), 256)?,
+        wire::mul(batch.num_rows(), 4096)?,
         wire::mul(stamp_values.len(), 128)?,
     )?;
     let sql_charge = memory
@@ -408,61 +410,39 @@ fn catalog_inserts(
         text.clone(),
         LogicalType::list(text),
     ];
+    let unit_type = to_field("units", &types[8]).map_err(status)?;
+    let DataType::List(unit_field) = unit_type.data_type() else {
+        return Err(invalid("Invalid catalog unit type"));
+    };
+    let units = ListArray::try_new(
+        Arc::clone(unit_field),
+        units.offsets().clone(),
+        Arc::clone(units.values()),
+        None,
+    )
+    .map_err(arrow)?;
     let mut operations = Vec::new();
     for start in (0..batch.num_rows()).step_by(INSERT_ROWS) {
         let mut sql = String::from(
             "INSERT INTO bj_kernel_writes (_id, world, key, idx, op, value, number, label, units, _valid_from) VALUES ",
         );
         let end = (start + INSERT_ROWS).min(batch.num_rows());
-        let bytes = (start..end).try_fold(4096, |total, row| {
-            let fields = [
-                ids.value(row).len(),
-                keys.value(row).len(),
-                op_values.value(ops.keys().value(row) as usize).len(),
-                label_values.value(labels.keys().value(row) as usize).len(),
-                if values.is_null(row) {
-                    0
-                } else {
-                    values.value(row).len()
-                },
-            ];
-            let bytes = fields
-                .into_iter()
-                .try_fold(wire::add(total, 2048)?, wire::add)?;
-            list_range(units, row).try_fold(bytes, |bytes, index| {
-                wire::add(bytes, wire::add(unit_values.value(index).len(), 128)?)
-            })
-        })?;
-        let _args = memory.reserve(bytes).map_err(status)?;
-        let mut args = Vec::with_capacity((end - start) * types.len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity((end - start) * types.len());
         for row in start..end {
-            let first = args.len() + 1;
+            let first = columns.len() + 1;
             if row != start {
                 sql.push_str(", ");
             }
-            let op = op_values.value(ops.keys().value(row) as usize);
-            let label = label_values.value(labels.keys().value(row) as usize);
-            let units = list_range(units, row)
-                .map(|i| Value::Utf8(unit_values.value(i).to_owned()))
-                .collect();
-            args.extend([
-                Value::Utf8(ids.value(row).to_owned()),
-                Value::I64(worlds.value(row)),
-                Value::Binary(keys.value(row).to_vec()),
-                Value::I64(ordinals.value(row)),
-                Value::Utf8(op.to_owned()),
-                if values.is_null(row) {
-                    Value::Null
-                } else {
-                    Value::Binary(values.value(row).to_vec())
-                },
-                if numbers.is_null(row) {
-                    Value::Null
-                } else {
-                    Value::I64(numbers.value(row))
-                },
-                Value::Utf8(label.to_owned()),
-                Value::list(units),
+            columns.extend([
+                Arc::new(ids.slice(row, 1)) as ArrayRef,
+                Arc::new(worlds.slice(row, 1)),
+                Arc::new(keys.slice(row, 1)),
+                Arc::new(ordinals.slice(row, 1)),
+                Arc::new(op_values.slice(ops.keys().value(row) as usize, 1)),
+                Arc::new(values.slice(row, 1)),
+                Arc::new(numbers.slice(row, 1)),
+                Arc::new(label_values.slice(labels.keys().value(row) as usize, 1)),
+                Arc::new(units.slice(row, 1)),
             ]);
 
             write!(
@@ -506,8 +486,19 @@ fn catalog_inserts(
             )
             .expect("String writes do not fail");
         }
-        let types = (start..end).flat_map(|_| types.iter().cloned()).collect();
-        let args = SqlArguments::new(types, vec![args], memory).map_err(status)?;
+        let fields = types
+            .iter()
+            .cycle()
+            .take(columns.len())
+            .enumerate()
+            .map(|(index, ty)| to_field(format!("?_{index}"), ty).map_err(status))
+            .collect::<Result<Vec<_>, _>>()?;
+        let arguments = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(arrow)?;
+        let args = SqlArguments::from_arrow_with_canonical_source(
+            owner.with_retained_buffers(arguments),
+            memory,
+        )
+        .map_err(status)?;
         operations.push(TxOp::Sql {
             sql,
             args: Some(args),
@@ -527,4 +518,71 @@ fn column<T: 'static>(batch: &RecordBatch, index: usize) -> Result<&T, Status> {
         .as_any()
         .downcast_ref::<T>()
         .ok_or_else(|| invalid(format!("Invalid catalog column type at {index}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::builder::StringDictionaryBuilder;
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+    use rtdb_tx::prepare_submission;
+    use rtdb_types::Value;
+
+    #[test]
+    fn catalog_arrow_bindings_preserve_order_and_the_sql_source() {
+        let memory = MemoryBudget::new(32 << 20);
+        let dictionary = |entries: [&str; 2]| {
+            let mut values = StringDictionaryBuilder::<Int32Type>::new();
+            for entry in entries {
+                values.append(entry).unwrap();
+            }
+            Arc::new(values.finish()) as ArrayRef
+        };
+        let columns = [
+            ("_id", Arc::new(StringArray::from(vec!["z", "a"])) as ArrayRef),
+            ("world", Arc::new(Int64Array::from(vec![1, 2]))),
+            ("key", Arc::new(BinaryArray::from_vec(vec![&[0xff], &[0]]))),
+            ("idx", Arc::new(Int64Array::from(vec![3, 4]))),
+            ("op", dictionary(["put", "del"])),
+            ("value", Arc::new(BinaryArray::from_opt_vec(vec![Some(&[0; 8][..]), None]))),
+            ("number", Arc::new(Int64Array::from(vec![None, Some(5)]))),
+            ("label", dictionary(["owner", "reader"])),
+            ("units", Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                OffsetBuffer::new(vec![0, 2, 2].into()),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                None,
+            ))),
+            ("stamp_offsets", Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([
+                Some(vec![Some(1)]),
+                Some(vec![]),
+            ]))),
+        ];
+        let batch = OwnedBatch::new(RecordBatch::try_from_iter(columns).unwrap(), &memory).unwrap();
+        let (writes, _charge) = catalog_inserts(&batch, &memory).unwrap();
+        let [TxOp::Sql { sql, args: Some(args) }] = writes.as_slice() else {
+            panic!("expected one catalog write");
+        };
+        assert!(args.single_arrow_page().is_some());
+        assert!(sql.contains("OVERLAY($6 PLACING EPOCH_NANOS_BE(CURRENT_TIMESTAMP) FROM 1 FOR 8)"));
+        assert!(sql.contains("($10, $11, $12, $13, $14, $15, $16, $17, $18,"));
+        let expected = vec![
+            Value::Utf8("z".into()), Value::I64(1), Value::Binary(vec![0xff]), Value::I64(3),
+            Value::Utf8("put".into()), Value::Binary(vec![0; 8]), Value::Null,
+            Value::Utf8("owner".into()),
+            Value::list(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]),
+            Value::Utf8("a".into()), Value::I64(2), Value::Binary(vec![0]), Value::I64(4),
+            Value::Utf8("del".into()), Value::Null, Value::I64(5),
+            Value::Utf8("reader".into()), Value::list(vec![]),
+        ];
+        assert_eq!(&*args.rows().next().unwrap().unwrap(), expected.as_slice());
+        let row = SqlArguments::new(args.types().to_vec(), vec![expected], &memory).unwrap();
+        let source = |operations| {
+            prepare_submission(operations, Default::default(), "xtdb", &memory)
+                .unwrap().encode().unwrap()
+        };
+        let row = source(vec![TxOp::Sql { sql: sql.clone(), args: Some(row) }]);
+        assert_eq!(source(writes).as_slice(), row.as_slice());
+    }
 }
