@@ -229,6 +229,9 @@ surface StatelessDatabase {
         -- The reviewed reservation records its transaction key and basis and commits the source evidence alongside the destination and link identities.
         -- The accepting arm checks the retained reservation receipt and the current writer, source and group inventory, then places the protected main rows and drops the reviewed branch together.
         -- Exact placement and branch catalogue readback at the accepted basis pairs the retained activation with its keyed transaction receipt after branch drop.
+        -- An installed Original bridge distinguishes the canonical landing request commitment from the acceptance body commitment bound after sealing.
+        -- Original activation requires the exact native reservation and accepted receipts and both body witnesses written at the accepting basis.
+        -- The native fold recovers the opaque carrier and link from the accepted placement after the source branch drops.
         -- Revocation masks the matching occurrences through all retained ancestor views and drains their existing release holds before native key destruction.
         -- Scoped readers receive custody evidence as an opaque read handle.
 

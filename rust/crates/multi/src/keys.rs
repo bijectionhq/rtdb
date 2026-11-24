@@ -28,6 +28,7 @@ mod unit;
 pub use rtdb_storage::sealing::{UnitOperation, UnitOutput};
 pub use unit::{UnitScope, UnitSlot};
 pub(crate) use unit::UnitLedger;
+pub use assertion::family::NativeFamilyLanding;
 pub(crate) use assertion::family::{assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment};
 pub use assertion::family::{AssertionFamilies, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation, WorldRowSlot, CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
 pub use assertion::family::{ManagedFamilyTransfer, ManagedFamilyTransferSource};

@@ -587,6 +587,10 @@ contract LogService {
         -- A retired family release rechecks its current grant and marker through plaintext handoff.
         -- The private Root landing link binds the enrolled member and the reviewed source winner.
         -- The release owner authenticates the prepared switch receipt and recovers an interrupted activation from the original ordered position.
+        -- A native bridge durably enrolls both Original stages with the native review, keyed order and paired witness locations.
+        -- A native bridge keeps the inner carrier closed until the Original vault records activation of the exact applied native placement.
+        -- A native-backed family hold rechecks both current authorities before release.
+        -- The Original deadline waits for positive native release and checkpoint-copy drain as well as the Original drains.
         -- The private deadline journal requires the exact stage inventory and all enrolled release drains before retiring the family capabilities.
         -- Signed terminal settlement preserves independent denials by original position and drops private family membership.
         -- A protected checkpoint transfer binds an exact source pin and cut to one prepared destination and the full original contributor inventory.

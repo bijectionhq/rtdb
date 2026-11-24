@@ -386,6 +386,15 @@ impl BranchIndex {
         Ok((original.commitment(group), occurrence))
     }
 
+    pub fn custody_occurrence_payload(
+        &self, selected: Basis, group: CustodyGroupId, commitment: [u8; 32],
+    ) -> Result<&super::CustodyPayload> {
+        let (_, occurrence) = self.custody_read_occurrence(selected, group, commitment)?;
+        self.local_custody_event(group, occurrence)
+            .and_then(|event| event.image.as_ref()?.custody_payload.as_ref())
+            .ok_or_else(placement_conflict)
+    }
+
     fn local_custody_event(&self, group: CustodyGroupId, occurrence: &CustodyOccurrence) -> Option<&BranchEvent> {
         let target = &occurrence.target;
         let events = self.branches.get(&target.branch)?.tables.get(&target.table)?.events.get(&target.id)?;

@@ -2,8 +2,8 @@ use rtdb_types::{RootLandingBinding, RootLandingTarget};
 
 use super::*;
 
-const ROOT_PAYLOAD_CODEC: u32 = u32::from_be_bytes(*b"RLP1");
-const ROOT_LINK_CODEC: u32 = u32::from_be_bytes(*b"RLL1");
+pub(super) const ROOT_PAYLOAD_CODEC: u32 = u32::from_be_bytes(*b"RLP1");
+pub(super) const ROOT_LINK_CODEC: u32 = u32::from_be_bytes(*b"RLL1");
 
 impl AssertionFamilies<'_> {
     pub async fn seal_root_landing_payload(
@@ -154,6 +154,7 @@ impl AssertionFamilies<'_> {
         self.require_position_open(binding.position).await?;
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_root_landing(stage, binding)?;
+        self.require_native_landing_live(&record, binding.assertion).await?;
         Ok(record)
     }
 }
@@ -173,7 +174,7 @@ impl Family {
 
 fn reserved(record: &Family, reservation: LandingReservation) -> Result<&Landing> {
     record.require_live()?;
-    record.landings.iter().find(|entry| entry.reservation == reservation).ok_or_else(conflict)
+    record.landings.iter().find(|entry| entry.native.is_none() && entry.reservation == reservation).ok_or_else(conflict)
 }
 
 fn require_binding(prior: &AcceptedLanding, position: Position, digest: [u8; 32]) -> Result<()> {
@@ -187,7 +188,7 @@ fn matches_digest(expected: [u8; 32], input: &[u8]) -> bool {
     expected.as_slice() == digest(&SHA256, input).as_ref()
 }
 
-fn root_binding_digest(binding: RootLandingBinding) -> [u8; 32] {
+pub(super) fn root_binding_digest(binding: RootLandingBinding) -> [u8; 32] {
     let mut hash = Context::new(&SHA256);
     hash.update(b"rtdb.multi/root-landing-binding/v1\0");
     hash.update(&binding.to_bytes());
@@ -196,7 +197,7 @@ fn root_binding_digest(binding: RootLandingBinding) -> [u8; 32] {
     commitment
 }
 
-fn root_authoring(
+pub(super) fn root_authoring(
     family: Uuid, assertion_id: AssertionId, target: RootLandingTarget, codec: u32,
 ) -> AssertionAuthoring {
     let mut hash = Context::new(&SHA256);
@@ -208,7 +209,7 @@ fn root_authoring(
     AssertionAuthoring { assertion_id, scope_commitment, codec }
 }
 
-fn link_prefix(reservation: LandingReservation, payload_digest: [u8; 32]) -> Vec<u8> {
+pub(super) fn link_prefix(reservation: LandingReservation, payload_digest: [u8; 32]) -> Vec<u8> {
     let mut body = Vec::with_capacity(128);
     body.extend_from_slice(&reservation.source.to_bytes());
     body.extend_from_slice(&reservation.review_commitment);

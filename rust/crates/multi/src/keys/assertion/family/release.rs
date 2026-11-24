@@ -283,12 +283,27 @@ pub(super) struct ReleaseHold {
     attempt: [u8; 32],
     binding: [u8; 32],
     phase: ReleasePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_assertion_id")]
+    native_member: Option<AssertionId>,
+}
+
+mod optional_assertion_id {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(value: &Option<AssertionId>, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        value.map(|assertion| assertion.to_bytes()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<AssertionId>, D::Error> {
+        Option::<[u8; 32]>::deserialize(deserializer).map(|value| value.map(AssertionId::from_bytes))
+    }
 }
 
 impl<'a> AssertionFamilies<'a> {
     pub fn with_release_authority<'b>(self, authority: &'b dyn FamilyReleaseAuthority) -> AssertionFamilies<'b> where 'a: 'b {
         AssertionFamilies {
             journal: self.journal, region: self.region, original: self.original, release_authority: Some(authority),
+            native_landing: self.native_landing,
         }
     }
 
@@ -324,8 +339,12 @@ impl<'a> AssertionFamilies<'a> {
                 return self.check_family_release(registration, false).await;
             }
             if family.release_holds.len() >= MAX_HOLDS { return Err(too_large()); }
+            let native_member = family.landings.iter().find(|landing| landing.native.is_some()
+                && landing.reservation.destination == input.member().assertion)
+                .map(|landing| landing.reservation.destination);
             family.release_holds.push(ReleaseHold {
                 attempt: registration.attempt, binding: registration.binding, phase: ReleasePhase::Private,
+                native_member,
             });
             if self.write(registration.family(), Some(&etag), &family).await? {
                 return self.check_family_release(registration, false).await;
@@ -338,7 +357,8 @@ impl<'a> AssertionFamilies<'a> {
         if let FamilyReleaseInput::RootLanding { binding, .. } = input {
             self.require_position_open(binding.position).await?;
         }
-        input.require_enrolled(family)
+        input.require_enrolled(family)?;
+        self.require_native_landing_live(family, input.member().assertion).await
     }
 
     pub async fn promote_family_release(&self, registration: FamilyReleaseRegistration) -> Result<()> {
@@ -367,14 +387,14 @@ impl<'a> AssertionFamilies<'a> {
     async fn check_family_release(&self, registration: FamilyReleaseRegistration, promoted: bool) -> Result<()> {
         self.require_release_observation(registration, FamilyReleaseObservation::Live).await?;
         let (family, _) = self.read_live_release(registration).await?;
-        if !family.release_holds.iter().any(|hold| hold.attempt == registration.attempt
+        let hold = family.release_holds.iter().find(|hold| hold.attempt == registration.attempt
             && hold.binding == registration.binding && if promoted {
                 hold.phase == ReleasePhase::Promoted
             } else {
                 hold.phase.terminal_byte().is_none()
-            })
-        {
-            return Err(conflict());
+            }).ok_or_else(conflict)?;
+        if let Some(member) = hold.native_member {
+            self.require_native_landing_live(&family, member).await?;
         }
         check_expiry(registration.expires_at_ms)
     }
@@ -434,6 +454,7 @@ impl<'a> AssertionFamilies<'a> {
                     if family.release_holds.len() >= MAX_HOLDS { return Err(too_large()); }
                     family.release_holds.push(ReleaseHold {
                         attempt: registration.attempt, binding: registration.binding, phase: terminal,
+                        native_member: None,
                     });
                     true
                 }
@@ -502,7 +523,7 @@ impl<'a> AssertionFamilies<'a> {
         if family.fenced != Some(expected.order) || family.fence_inventory(expected.order).vault_inventory() != expected.inventory {
             return Err(conflict());
         }
-        Ok(family.release_holds.is_empty() && self.checkpoint_transfers_drained(&family).await?)
+        Ok(family.release_holds.is_empty() && family.native_landings_drained() && self.checkpoint_transfers_drained(&family).await?)
     }
 
     fn require_release_owner(&self, owner: CarrierJournalIdentity) -> Result<()> {

@@ -27,10 +27,33 @@ An assigned follower and a restored attachment dependent on another custody auth
    Compare reserve and activation keys, source and review commitments, destination occurrence, validity, ordinal and digests, and the source drop basis.
    The existing custody group fence and release drain include the new placement and surviving inherited copies.
 
-The placed Original assertion vault is a separate authority.
-An application that uses those stages still needs a durable mapping of the native reviewed source and accepted `Then` receipt and placement to the exact vault member, destination and link stages, application receipt, and accepted binding.
-The provider must authenticate that mapping without an owned branch registration, deny plaintext while activation is pending, and recover the same activation after branch drop.
-Its family fence, positive release terminals, checkpoint-copy drain and stage destruction must settle alongside the separately verified native group fence and drain.
+### Native reviewed placement backed by an Original assertion family
+
+The reviewed producer and the Original-vault bridge have independent admission.
+The bridge is a trusted in-process API, `NativeFamilyLanding::from_placed_original`.
+It requires the authenticated placed Original session, its exact directory writer, the existing assertion vault and a live native `MountedResponseRelease` on the same deployment.
+The stock Flight listeners have no cross-process bridge mount.
+The existing scoped successor grant and Original reader/controller checks still govern the retired Original Flight action.
+
+1. Reserve the Original family member and the winning native occurrence through the bridge before sealing either stage.
+   Use the destination and link stage UUIDs for the native placement and link IDs.
+   The reservation pins the review and its physical occurrence commitments, both native request keys, the target, the canonical application request digest and the exact receipt and proof cell locators.
+   Supply the same Original and winning carrier bytes observed by the native review.
+2. Seal the destination payload and link.
+   Bind the SHA-256 of the byte-identical application receipt and proof cells with `bind_acceptance_body` before submitting the native reservation.
+   The application body may contain the sealed link.
+   `RootLandingTarget.receipt` commits the canonical landing request, while the bound body digest commits the eventual acceptance record.
+3. Order the native reservation and landing with the paired receipt and proof writes.
+   Call `activate` with the original acceptance key, including after a lost reply or branch drop.
+   The bridge confirms both keyed `Then` receipts, both cells written at the accepting Basis, the exact Root placement and source drop.
+   It recovers the opaque carrier and link from that exact occurrence, authenticates the frames and retains the same Root binding in the Original vault.
+4. Pending stages grant no plaintext.
+   Reuse the existing Original family registration and release manager with the same native mount on an activated binding.
+   Original release admission and the final live hold check require both authorities.
+5. After both fences, record the exact native group drain, which requires positive response and checkpoint-copy closure.
+   The Original stage settlement still requires positive Original release and checkpoint-copy closure.
+   Existing Original fence inventory includes the capabilities of a reservation whose activation never completes.
+
 
 Protected exports remain subject to the managed checkpoint custody agreement.
 The existing hosted assertion-family route continues to own its current consumers.

@@ -2,6 +2,8 @@
 
 mod release;
 mod root_landing;
+mod native_landing;
+pub use native_landing::NativeFamilyLanding;
 mod managed;
 mod transfer;
 
@@ -249,6 +251,8 @@ impl FamilyFence {
 struct Landing {
     reservation: LandingReservation,
     accepted: Option<AcceptedLanding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native: Option<native_landing::NativeLanding>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -431,6 +435,7 @@ pub struct AssertionFamilies<'a> {
     region: Arc<IoRegion>,
     original: Option<OriginalFenceRead<'a>>,
     release_authority: Option<&'a dyn FamilyReleaseAuthority>,
+    native_landing: Option<&'a rtdb_node::serving::custody_release::MountedResponseRelease<'a>>,
 }
 
 struct OriginalFenceRead<'a> {
@@ -441,7 +446,7 @@ struct OriginalFenceRead<'a> {
 
 impl<'a> AssertionFamilies<'a> {
     pub(in crate::keys) fn new(journal: &'a dyn AssertionVaultJournal, region: Arc<IoRegion>) -> Self {
-        Self { journal, region, original: None, release_authority: None }
+        Self { journal, region, original: None, release_authority: None, native_landing: None }
     }
 
     pub fn with_original_reader(
@@ -517,7 +522,7 @@ impl<'a> AssertionFamilies<'a> {
             if let Some(prior) = record.landings.iter().find(|entry| {
                 entry.reservation.destination == reservation.destination
             }) {
-                return if prior.reservation == reservation { Ok(((), false)) } else { Err(conflict()) };
+                return if prior.native.is_none() && prior.reservation == reservation { Ok(((), false)) } else { Err(conflict()) };
             }
             if record.original.assertion == reservation.destination
                 || record.stage_used(reservation.capability)
@@ -525,7 +530,7 @@ impl<'a> AssertionFamilies<'a> {
             {
                 return Err(conflict());
             }
-            record.landings.push(Landing { reservation, accepted: None });
+            record.landings.push(Landing { reservation, accepted: None, native: None });
             Ok(((), true))
         }).await
     }
@@ -544,7 +549,7 @@ impl<'a> AssertionFamilies<'a> {
             {
                 return Err(conflict());
             }
-            let index = record.landings.iter().position(|landing| landing.reservation == reservation)
+            let index = record.landings.iter().position(|landing| landing.native.is_none() && landing.reservation == reservation)
                 .ok_or_else(conflict)?;
             let mut placement_digest = [0; 32];
             placement_digest.copy_from_slice(digest(&SHA256, &placement.to_bytes()).as_ref());
@@ -683,7 +688,7 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn require_reserved(&self, family: Uuid, reservation: LandingReservation) -> Result<()> {
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
-        if record.landings.iter().any(|landing| landing.reservation == reservation) { Ok(()) } else { Err(conflict()) }
+        if record.landings.iter().any(|landing| landing.native.is_none() && landing.reservation == reservation) { Ok(()) } else { Err(conflict()) }
     }
 
     pub async fn plan_fence(&self, family: Uuid, selected: Position, order: Uuid) -> Result<FamilyFence> {
@@ -813,7 +818,9 @@ impl<'a> AssertionFamilies<'a> {
                 return Ok(());
             }
             let record = decode_family(&bytes)?;
-            if !record.release_holds.is_empty() || !self.checkpoint_transfers_drained(&record).await? { return Err(conflict()); }
+            if !record.release_holds.is_empty() || !record.native_landings_drained() || !self.checkpoint_transfers_drained(&record).await? {
+                return Err(conflict());
+            }
             let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);
             deadline.require_settled_family(&fence, custody_key).await?;
             for position in fence.positions {
