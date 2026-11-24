@@ -142,20 +142,17 @@ impl SelectedColumn {
         union(name, legs, memory)
     }
 
-    pub(crate) fn fragment_slice(&self, rows: Range<usize>) -> Option<ArrowVector> {
+    pub(crate) fn fragment_source(&self, rows: Range<usize>) -> Option<(ArrowVector, Range<usize>)> {
         let cells = self.cells.get(rows)?;
         let &(source, start) = cells.first()?;
         let (array, field, logical, _) = self.sources.get(source)?.as_ref()?;
         let end = start.checked_add(cells.len())?;
-        let whole = start == 0 && end == array.len();
         if end > array.len()
-            || (!whole && nested_layout(array.data_type()))
             || cells.iter().zip(start..end).any(|(&(seen, row), expected)| seen != source || row != expected)
         {
             return None;
         }
-        let array = if whole { Arc::clone(array) } else { array.slice(start, cells.len()) };
-        Some((array, Arc::clone(field), logical.clone()))
+        Some(((Arc::clone(array), Arc::clone(field), logical.clone()), start..end))
     }
 
     pub(crate) fn fragment_vector(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>)
@@ -1482,7 +1479,8 @@ fn contiguous_fragment_selection_preserves_its_funded_source() {
     let selected = SelectedColumn::new(vec![Some((Arc::new(array), field, None, Some(grant)))],
         Arc::new(vec![(0, 1), (0, 2), (0, 3), (0, 0)]));
     let original = memory.used_bytes();
-    let (borrowed, _, _) = selected.fragment_slice(0..3).unwrap();
+    let ((source, _, _), rows) = selected.fragment_source(0..3).unwrap();
+    let borrowed = source.slice(rows.start, rows.len());
     let (gathered, charge) = selected.fragment_vector(0..3, &memory).unwrap();
     let borrowed = borrowed.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
     assert_eq!(borrowed.values().as_ptr(), pointer);
@@ -1490,7 +1488,7 @@ fn contiguous_fragment_selection_preserves_its_funded_source() {
     assert_eq!(gathered.0.as_ref(), borrowed as &dyn Array);
     drop((gathered, charge));
     assert_eq!(memory.used_bytes(), original);
-    assert!(selected.fragment_slice(1..4).is_none());
+    assert!(selected.fragment_source(1..4).is_none());
 }
 
 #[test]

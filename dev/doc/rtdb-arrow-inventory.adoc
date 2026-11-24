@@ -114,7 +114,9 @@ See link:../../rust/crates/query/src/cursor.rs[results], link:../../rust/crates/
 
 * SQL and XTQL parsing, planning, catalog lookup, transaction dispatch, hashes and selected addresses use Rust control representations.
 * The source and replica log envelopes transport Arrow payloads with transaction and durability metadata.
-* Delegated fragments lend a compatible contiguous Arrow selection to the IPC writer under its existing source owner.
+* Delegated fragments lend compatible contiguous Arrow selections, including sliced nested columns, to the IPC writer under their existing source owners.
+  Nested slices rebase offsets and admit the selected child spans for each frame.
+  Mixed positions and incompatible nested layouts use a bounded gather.
 * SQL survivor replay reads compatible event files from their funded input buffers.
 * Owned fact commits borrow UTF-8 operation values directly from Int8 Arrow dictionaries, including import page validation.
 * PostgreSQL protocols and explicit row APIs retain their public representations.
