@@ -44,8 +44,7 @@ gradle.projectsEvaluated {
         task.classpath = test.classpath + root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
         task.jvmArgumentProviders.addAll(test.jvmArgumentProviders)
         task.environment(test.environment)
-        task.environment("XTDB_REE_IIDS", "false")
-        task.environment("XTDB_WITHIN_FILE_RECENCY_BRANCHING", "false")
+        task.environment("XTDB_COMPACTOR_221_OPT_IN", "false")
         def workspace = root.providers.gradleProperty("rtdb.mixedIidWorkspace")
         task.doFirst { task.workingDir(root.file(workspace.get())) }
         task.mainClass.set("clojure.main")
