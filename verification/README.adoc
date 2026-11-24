@@ -416,10 +416,15 @@ Copy it into `rust/crates/azure/tests/` in an isolated checkout of that revision
 The fixture speaks Azure's HTTP protocol on loopback and exercises the real Azure and remote-storage adapters.
 A passing diagnostic observes the defect described in the ledger.
 
-=== Bijection consumer contract
+=== RTDB v1 consumer conformance
 
-The versioned link:contracts/rtdb-consumer-v1.json[RTDB consumer contract] exports named landing wire, held-order, prepared-switch and archive decision guarantees.
-The accompanying link:contracts/rtdb-consumer-v1.proofs.json[proof mapping] identifies each checked owner and distinguishes abstract model facts from shipped decisions.
-The contract version and digest remain stable across compatible RTDB revisions, and each publication of proof evidence identifies the exact checked Git commit.
-Use a new contract version for a changed guarantee.
-Run `verification/check_consumer_contract.py` with the pinned Verus and Lean executables to check each named export and the declared Verus controls in disposable source copies.
+The link:../rust/proto/rtdb.v1.proto[public protobuf schema] and the link:../rust/crates/flight-sql/tests/flight/v1_contract.rs[executable Flight cases] define the RTDB wire contract.
+The suite starts an RTDB node, sends independent Flight requests and decodes Arrow rows, protobuf trailers and error details.
+Run `verification/rtdb-v1-conformance` in the guarded local environment.
+The RTDB Flight integration CI job includes these cases.
+
+For a running instance in consumer CI, set `RTDB_CONFORMANCE_ENDPOINT` to the Flight endpoint and run the same suite with the `rtdb_v1_remote_consumer` filter and `-- --ignored`.
+`RTDB_CONFORMANCE_DATABASE` and `RTDB_CONFORMANCE_AUTHORIZATION` set the optional database and authentication headers.
+The remote case exercises discovery, SQL rows and the captured basis without writing fixtures to the target database.
+
+Run `verification/check_consumer_names.sh` to check the tracked first-party tree for consumer-specific identifiers.

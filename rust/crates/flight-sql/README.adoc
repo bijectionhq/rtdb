@@ -1162,3 +1162,49 @@ The reply is one big-endian signed 64-bit event count from the installed and liv
 An initial call returns the current count for a subsequent relation read.
 A call with a previous count waits until it differs or until 20 seconds elapse, at which point it returns the previous count.
 A changed count signals the client to read its relation at a fresh basis using its existing cursor.
+
+== RTDB v1 Flight service
+
+The public protobuf descriptors are in link:../../proto/rtdb.v1.proto[rtdb.v1] and link:../../proto/rtdb.admin.v1.proto[rtdb.admin.v1].
+Select the database with `x-xtdb-database` and discover the route's features and limits via `DoAction` with type `rtdb.v1.Capabilities`.
+Action bodies and replies are serialized protobuf messages.
+For `Query` and `Changes`, put the request in a `google.protobuf.Any` and use its serialized bytes as a `DoGet` ticket.
+Flight sends the Arrow IPC schema and batches first, then one metadata-only `FlightData` carrying the corresponding protobuf trailer.
+A failed call carries a protobuf `Error` in the `rtdb-error-bin` status detail.
+
+`Query` accepts a read-only SQL statement and an optional Arrow IPC stream containing one positional parameter row.
+Use a deterministic total `ORDER BY` for queries whose results span pages and repeat the request with the returned continuation and the desired page limit.
+The request's basis and query clock are fixed across its pages.
+Tracking returns an authenticated claim covering the database at the reported basis.
+The current implementation accepts `main` with the merged layer.
+Query and Changes tokens are valid for the lifetime of the serving attachment and process.
+
+`RTDB_SEARCH(table, column, query)` returns matching rows with `_score` in descending score order.
+`RTDB_NEAREST(table, column, vector, limit)` returns the nearest vectors with `_distance` in ascending cosine-distance order.
+Both functions break ranking ties by internal row identity.
+`MATCH`, `SEARCH_SCORE` and `COSINE_DISTANCE` are also available as SQL expressions.
+Use `FOR SYSTEM_TIME` or `FOR ALL SYSTEM_TIME` for transaction-time reads within the query cut.
+
+`Changes` requests a set of tables and reports open and closed system-time history intervals.
+Each output row carries a table, a system time, the interval boundary direction, and selected Arrow IPC key or row images.
+The limit counts whole system-time groups.
+Ascending requests advance `after` to `through`, and descending requests move `until` down to `through` while retaining the original `after`.
+A cursor below the retained checkpoint floor returns `rtdb/cursor-expired`.
+
+Default mode serves the same wire operations on local or shared logs.
+The route advertises `query.linearizable` when it can establish a fresh barrier.
+Branch selectors, timed writes and administrative actions require their corresponding feature implementations.
+
+[cols="1,3"]
+|===
+| Error category | Caller action
+| `incorrect` | Correct the request before retrying.
+| `unsupported` | Consult `Capabilities` for the named feature.
+| `not-found` | Re-plan from a fresh query or resolve the missing resource.
+| `forbidden` | Obtain the required access before retrying.
+| `conflict` | Re-read the relevant state before deciding whether to retry.
+| `busy` | Wait for the returned `retry_after_millis` before retrying.
+| `unavailable` | Retry a write with the same transaction key.
+| `interrupted` | Check `TxStatus` for the outcome of an interrupted write.
+| `fault` | Report the server fault with its stable error code.
+|===

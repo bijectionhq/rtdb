@@ -1,0 +1,51 @@
+-- allium: 3
+-- The consumer boundary for a database served by the default or Multi driver.
+
+external entity ConsumerClient {
+    -- A caller with credentials for the selected database.
+}
+
+external entity WireDatabase {
+    -- The database incarnation selected when the call is admitted.
+}
+
+actor WireConsumer {
+    identified_by: ConsumerClient
+}
+
+surface StatelessDatabase {
+    facing consumer: WireConsumer
+    context database: WireDatabase
+
+    @guarantee CapabilityDiscovery
+        -- A caller learns which operations and optional features the selected route can serve.
+        -- An unavailable optional feature returns its name for comparison with Capabilities.
+
+    @guarantee CapturedRead
+        -- Each successful query reports the basis of the database cut used for its rows.
+        -- A basis orders cuts within the selected database incarnation.
+        -- Exactly selects its named cut.
+        -- AtLeast returns a cut at or beyond its requested basis.
+        -- AsOf applies a system-time ceiling to the selected cut.
+        -- Where advertised, Linearizable establishes a fresh barrier within the call.
+
+    @guarantee QueryContinuation
+        -- A continuation reopens the same read basis and interpretation for the same ordered query and parameters.
+        -- A successful final page has no continuation.
+        -- The caller may redeem a continuation in a new Flight session.
+
+    @guarantee RankedReads
+        -- Text search returns matching rows ordered by descending relevance score.
+        -- Vector nearest-neighbour reads return at most their requested limit ordered by ascending cosine distance.
+        -- Ranking resolves rows at the query's selected cut.
+
+    @guarantee QueryClaim
+        -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
+        -- The region may cover the entire database.
+
+    @guarantee ChangesCoverage
+        -- Changes reports its covered interval even when there are no changes for the selected tables.
+        -- A returned page carries whole system-time groups.
+        -- An expired starting cut returns the cursor-expired code.
+        -- A waiting call returns after a relevant change, complete coverage of its requested interval or expiry of its wait.
+}

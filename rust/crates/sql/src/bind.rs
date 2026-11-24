@@ -20,6 +20,21 @@ enum TablePurpose { Query, Mutation, Erase }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ListTableKind { Series, Unnest }
 
+#[derive(Clone, Copy)]
+enum RankedTable { Search, Nearest }
+
+impl RankedTable {
+    fn from_name(name: &ast::ObjectName) -> Option<Self> {
+        let [part] = name.0.as_slice() else { return None; };
+        let ident = part.as_ident().filter(|ident| ident.quote_style.is_none())?;
+        match ident.value.to_ascii_lowercase().as_str() {
+            "rtdb_search" => Some(Self::Search),
+            "rtdb_nearest" => Some(Self::Nearest),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FormAllocation<'a> { Tracked(&'a Arc<MemoryBudget>), Untracked }
 impl<'a> FormAllocation<'a> {
@@ -1041,7 +1056,12 @@ impl Context<'_> {
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, with_ordinality, json_path, index_hints } => {
                 if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(grammar_rejected("A table sample or dialect-specific table modifier")); }
-                if args.is_some() { return Err(grammar_rejected("Table arguments")); }
+                if let Some(args) = args {
+                    if let Some(ranked) = RankedTable::from_name(name) && args.settings.is_none() {
+                        return self.ranked_table(ranked, &args.args, alias.as_ref(), *with_ordinality, purpose);
+                    }
+                    return Err(grammar_rejected("Table arguments"));
+                }
                 if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
                 if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
                     let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
@@ -1129,6 +1149,19 @@ impl Context<'_> {
             }
             ast::TableFactor::ExpressionDerived { expr, alias, with_ordinality } => {
                 if purpose != TablePurpose::Query { return Err(error("Mutation target must be a base table")); }
+                if let ast::Expr::Function(function) = expr
+                    && let Some(ranked) = RankedTable::from_name(&function.name)
+                {
+                    if let ast::FunctionArguments::List(args) = &function.args
+                        && args.duplicate_treatment.is_none() && args.clauses.is_empty()
+                        && matches!(function.parameters, ast::FunctionArguments::None)
+                        && function.filter.is_none() && function.over.is_none()
+                        && function.null_treatment.is_none() && function.within_group.is_empty()
+                    {
+                        return self.ranked_table(ranked, &args.args, alias.as_ref(), *with_ordinality, purpose);
+                    }
+                    return Err(grammar_rejected("Ranked table function modifiers"));
+                }
                 let expression = self.lateral_scope(lateral_start, |context| context.expr(expr, &Schema::default(), &BTreeMap::new()))?;
                 let series = alias.is_some() && matches!(expr, ast::Expr::Function(function)
                     if function.name.0.last().and_then(ast::ObjectNamePart::as_ident)
@@ -1151,6 +1184,57 @@ impl Context<'_> {
             }
             _ => Err(grammar_rejected(format!("Table source {table}"))),
         }
+    }
+
+    fn ranked_table(&mut self, ranked: RankedTable, args: &[ast::FunctionArg], alias: Option<&ast::TableAlias>, with_ordinality: bool, purpose: TablePurpose) -> Result<Arc<Relation>> {
+        if purpose != TablePurpose::Query || with_ordinality {
+            return Err(grammar_rejected("Ranked table function modifiers"));
+        }
+        let expressions = args.iter().map(|arg| match arg {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(expr),
+            _ => Err(grammar_rejected("Ranked table function argument")),
+        }).collect::<Result<Vec<_>>>()?;
+        let (table, column, probe, fetch, rank_name, function, descending) = match (ranked, expressions.as_slice()) {
+            (RankedTable::Search, [table, column, probe]) => (table, column, probe, None, "_score", "search_score", true),
+            (RankedTable::Nearest, [table, column, probe, limit]) => (table, column, probe, Some(*limit), "_distance", "cosine_distance", false),
+            _ => return Err(error("RTDB_SEARCH requires a table, column and query. RTDB_NEAREST also requires a limit")),
+        };
+        let parts = match table {
+            ast::Expr::Identifier(part) => vec![part.clone()],
+            ast::Expr::CompoundIdentifier(parts) => parts.clone(),
+            _ => return Err(error("A ranked table function requires a source table name")),
+        };
+        let ast::Expr::Identifier(column) = column else { return Err(error("A ranked table function requires a column name")); };
+        let table = ast::TableFactor::Table {
+            name: ast::ObjectName(parts.into_iter().map(ast::ObjectNamePart::Identifier).collect()),
+            alias: None, args: None, with_hints: vec![], version: None, with_ordinality: false,
+            partitions: vec![], json_path: None, sample: None, index_hints: vec![],
+        };
+        let input = self.table_for(&table, TablePurpose::Query, 0)?;
+        let field = |name: &str| input.schema().fields().iter().find(|field| field.name == name);
+        let source = field(&identifier(column).normalized()).ok_or_else(|| error("Ranked column does not exist"))?;
+        let tie = field("_iid").ok_or_else(|| error("A ranked table function requires a base table"))?.expression();
+        if field(rank_name).is_some() { return Err(error(format!("Ranked table output already has a column named {rank_name}"))); }
+        let probe = self.expr(probe, &Schema::default(), &BTreeMap::new())?;
+        let fetch = fetch.map(|value| self.expr(value, &Schema::default(), &BTreeMap::new())).transpose()?;
+        let arguments = vec![source.expression(), probe];
+        let rank = crate::expression::call(function.into(), arguments.clone())?;
+        let mut rank_field = self.binder.field(rank_name, None, rank.data_type())?;
+        rank_field.qualifier = source.qualifier.clone();
+        let rank_column = rank_field.expression();
+        let input = if matches!(ranked, RankedTable::Search) {
+            Arc::new(input.filter(crate::expression::call("match".into(), arguments)?)?)
+        } else { input };
+        let input = Arc::new(input.extend(vec![NamedExpr { field: rank_field, expr: rank }])?);
+        let input = if matches!(ranked, RankedTable::Nearest) {
+            Arc::new(input.filter(Expr::Unary { op: UnaryOp::IsNotNull, expr: Box::new(rank_column.clone()) })?)
+        } else { input };
+        let sorted = Arc::new(input.sort(vec![
+            SortExpr { expr: rank_column, descending, nulls_first: false },
+            SortExpr { expr: tie, descending: false, nulls_first: false },
+        ])?);
+        let output = if let Some(fetch) = fetch { Arc::new(sorted.limit(None, Some(fetch))?) } else { sorted };
+        alias.map_or(Ok(output.clone()), |alias| self.alias(output, alias))
     }
 
     pub(crate) fn admit_table_temporal_literals(&mut self, name: &ast::ObjectName) -> Result<()> {

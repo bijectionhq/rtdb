@@ -159,6 +159,8 @@ impl PreparedSql {
     /// Execution-time rebinding does not append warnings to this immutable preparation.
     pub fn notices(&self) -> &[SqlNotice] { &self.0.notices }
     pub fn ordered_index_command_tag(&self) -> Option<&'static str> { self.0.ordered_index_command_tag }
+    /// Whether SQL supplies its own read settings for the statement.
+    pub fn selects_read_settings(&self) -> bool { self.0.snapshot_selector != Default::default() }
     pub fn is_dml(&self) -> bool { matches!(&self.0.result, PreparedResult::Dml) }
     pub fn prepared_schema(&self) -> Option<&Schema> { match &self.0.result { PreparedResult::Query { schema, .. } => Some(schema), PreparedResult::Dml => None } }
     pub fn postgres_types(&self) -> Option<&[PgType]> { match &self.0.result { PreparedResult::Query { pg_types, .. } => Some(pg_types), PreparedResult::Dml => None } }

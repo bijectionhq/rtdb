@@ -4652,6 +4652,8 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "prost",
+ "prost-build",
+ "protoc-bin-vendored",
  "rtdb-auth",
  "rtdb-columnar",
  "rtdb-expr",

@@ -26,6 +26,7 @@ pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send 
 pub(crate) struct Service(pub Arc<Inner>);
 pub(crate) struct Inner {
     pub node: Node,
+    pub(crate) v1: crate::v1::State,
     pub config: FlightConfig,
     pub cancellation: CancellationToken,
     pub sessions: Registry<String, Session>,
@@ -173,7 +174,7 @@ impl Service {
                 transport,
             })
         } else { None };
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
@@ -548,7 +549,7 @@ impl FlightService for Service {
         let catalog_actions = [crate::catalog_actions::PUBLISH_CATALOG, crate::catalog_actions::WATCH_RELATION, crate::catalog_actions::SCAN_CATALOG];
         let catalog_enabled = self.0.config.owned_native_actions
             && !call.session.fresh_replica && call.session.audience_source().is_none();
-        result_stream(call, actions.into_iter().chain(catalog_actions.into_iter().filter(|_| catalog_enabled))
+        result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS).chain(catalog_actions.into_iter().filter(|_| catalog_enabled))
             .map(|name| Ok(flight::ActionType { r#type: name.into(), description: name.into() })).collect())
     }
     async fn get_flight_info(&self, request: Request<flight::FlightDescriptor>) -> Result<Response<flight::FlightInfo>, Status> {
@@ -580,6 +581,11 @@ impl FlightService for Service {
         let result = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?; call.response(result)
     }
     async fn do_get(&self, request: Request<flight::Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
+        let ticket = &request.get_ref().ticket;
+        if let Some(command) = crate::v1::ticket(ticket) {
+            let call = self.call(&request, request.get_ref().encoded_len()).await.map_err(crate::v1::error::map_status)?;
+            return self.v1_get(call, command).await;
+        }
         let call = self.call(&request, request.get_ref().encoded_len()).await?;
         let command = command(&request.into_inner().ticket).map_err(|error| call.error(error))?;
         match command {
@@ -593,6 +599,10 @@ impl FlightService for Service {
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
+        if crate::v1::is_action(&request.get_ref().r#type) {
+            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await.map_err(crate::v1::error::map_status)?;
+            return self.v1_action(call, request.into_inner());
+        }
         let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)
             .is_some_and(|encoding| encoding == "stream-v1");

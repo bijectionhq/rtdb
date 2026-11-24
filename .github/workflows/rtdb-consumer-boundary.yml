@@ -1,0 +1,15 @@
+name: RTDB consumer boundary
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  consumer-names:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: verification/check_consumer_names.sh

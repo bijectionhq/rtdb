@@ -64,6 +64,14 @@ impl Database {
     pub fn serves_audience_storage(&self, source: uuid::Uuid) -> bool {
         self.audience_storage.as_ref().is_some_and(|storage| storage.source == source)
     }
+    /// Identifies the database attachment that issued a wire token.
+    /// A new attachment receives a new identity.
+    pub fn wire_incarnation(&self) -> uuid::Uuid { self.protected_equality_epoch }
+    /// Reports whether the attachment supports establishing a fresh read barrier.
+    pub fn wire_linearizable_reads(&self) -> bool {
+        self.has_replica_read_index() || (!self.read_only && !self.external_source()
+            && !matches!(self.configuration.log, Some(database_config::Log::OtherLog(_))))
+    }
     pub fn name(&self) -> &str { &self.name }
     pub fn configuration(&self) -> &DatabaseConfig { &self.configuration }
     /// The immutable receipt authority of this live writer attachment.

@@ -27,3 +27,17 @@ pub use owned_world::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, Prep
 
 /// Private Flight gateway request marker and response cutoff.
 pub const GATEWAY_ANSWER_DEADLINE_HEADER: &str = "x-rtdb-answer-deadline";
+
+mod v1;
+
+/// Generated `rtdb.v1` and `rtdb.admin.v1` Flight envelopes.
+pub mod rtdb {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/rtdb.v1.rs"));
+    }
+    pub mod admin {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/rtdb.admin.v1.rs"));
+        }
+    }
+}

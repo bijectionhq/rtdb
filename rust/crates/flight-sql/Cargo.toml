@@ -41,6 +41,10 @@ async-stream = "=0.3.6"
 hmac = "=0.12.1"
 zeroize = "=1.9.1"
 
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true
 rtdb-maintenance.workspace = true

@@ -127,6 +127,7 @@ impl NodeServices {
 #[derive(Clone, Copy)]
 enum CatalogReadCut<'a> {
     Current,
+    Single,
     Reserved(TransactionKey),
     HostedApplied {
         minimum: TransactionKey,
@@ -501,6 +502,45 @@ impl Node {
         self.query_context_in_placement(database, basis, identity, None, CatalogReadCut::Current, cancellation).await
     }
 
+    /// Captures one database with the node's clock and time zone.
+    /// `linearizable` establishes a fresh read barrier before capture.
+    /// An attachment change during the read invalidates the capture.
+    pub async fn wire_query_context(
+        &self, database: &str, identity: &dyn SessionIdentity, linearizable: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<QueryContext>> {
+        let mut basis = QueryBasis {
+            snapshot: TimeBasis::default(), replica_capture: None, resume_token: None,
+            has_await_floor: false, snapshot_time: None, current_time: self.query_instant(),
+            timezone: self.factory.options.default_timezone.clone(),
+        };
+        let local = self.catalog.database(database)?;
+        let placement = Arc::downgrade(&local);
+        if linearizable {
+            self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+            if local.has_replica_read_index() {
+                let capture = local.capture_replica_snapshot(cancellation).await?;
+                basis.replica_capture = Some(crate::session::ReplicaQueryCapture {
+                    attachment: placement.clone(), snapshot: Arc::new(capture),
+                });
+            } else {
+                self.await_durable_source(database, identity, false, Some(&placement), cancellation).await?;
+            }
+        }
+        self.query_context_in_placement(database, &basis, identity, Some(&placement), CatalogReadCut::Single, cancellation).await
+    }
+
+    /// After admission, waits up to `timeout` for applied system time to reach or exceed `time`.
+    /// The caller captures its read context separately.
+    pub async fn wire_await_time(&self, database: &str, identity: &dyn SessionIdentity, time: Timestamp, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
+        self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        self.ensure_indexing()?;
+        let database = self.catalog.database(database)?;
+        tokio::time::timeout(timeout, database.progress().await_system_time(time, cancellation))
+            .await.map_err(|_| timeout_error())??;
+        Ok(())
+    }
+
     async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cut: CatalogReadCut<'_>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
@@ -518,7 +558,7 @@ impl Node {
                 if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
                 Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, admission))
             }
-            CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
+            CatalogReadCut::Current | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => {
                 if replica_capture.is_none() && let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
                 None
             }
@@ -539,13 +579,13 @@ impl Node {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let database_lease = match cut {
                 CatalogReadCut::HostedApplied { .. } => database.object_store().catalog_delivery_lease().await?,
-                CatalogReadCut::Current | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
+                CatalogReadCut::Current | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
             };
             if let Some(database_lease) = database_lease {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let snapshot = match cut {
-                CatalogReadCut::Current => crate::read_selection::query_snapshot(
+                CatalogReadCut::Current | CatalogReadCut::Single => crate::read_selection::query_snapshot(
                     replica_capture.map(|capture| (*capture.snapshot).clone()),
                     || database.partition.snapshot(),
                 ),
@@ -621,8 +661,11 @@ impl Node {
             timezone: basis.timezone.clone(),
         });
         let basis = applied_basis.as_ref().unwrap_or(basis);
-        let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
+        let mut catalog = CatalogSnapshot::new(database, snapshots, false)?
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory));
+        if !matches!(cut, CatalogReadCut::Single) {
+            catalog = catalog.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
+        }
         let archive_history = self.read_fence.as_ref().is_some_and(|fence| fence.archive_history(database));
         if archive_history { catalog = catalog.with_archive_history(); }
         if !audience && !archive_history { catalog = catalog.with_fragmenter(self.scan_fragmenter.clone(), fragment_residence); }

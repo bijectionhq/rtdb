@@ -111,11 +111,16 @@ impl Running {
     async fn start_with_options(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions) -> Self {
         Self::start_with_fence(password, config, placements, tracer, options, None).await
     }
-    async fn start_with_fence(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>) -> Self {
+    async fn start_with_fence(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>) -> Self {
+        Self::start_with_resources(password, config, placements, tracer, options, read_fence, None).await
+    }
+    async fn start_with_resources(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<Arc<dyn rtdb_node::ResourceFactory>>) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
         let mut services = NodeServices { clock: node_clock, tracer, read_fence, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
-        if config.hosted_controls.is_some() {
+        if let Some(resources) = resources {
+            services.resources = resources;
+        } else if config.hosted_controls.is_some() {
             services.resources = Arc::new(HostedFixtureResources(rtdb_node::NativeResources::default()));
         }
         options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
@@ -2460,3 +2465,6 @@ async fn catalog_actions_are_absent_when_owner_actions_are_disabled() {
     }
     running.stop().await;
 }
+
+#[path = "flight/v1_contract.rs"]
+mod v1_contract;

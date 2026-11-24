@@ -1,0 +1,234 @@
+syntax = "proto3";
+package rtdb.v1;
+
+import "google/protobuf/empty.proto";
+
+// Query and Changes use DoGet with google.protobuf.Any tickets.
+// Each reply sends Arrow Flight schema and batch data, followed by a metadata-only FlightData carrying its protobuf trailer.
+// The remaining verbs use DoAction with the rtdb.v1.<verb> type and the serialized protobuf request and result bodies.
+service Rtdb {
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc Query(QueryRequest) returns (stream QueryFrame);
+  rpc Transact(TransactRequest) returns (Receipt);
+  rpc TxStatus(TxStatusRequest) returns (Receipt);
+  rpc Changes(ChangesRequest) returns (stream ChangesFrame);
+}
+
+// Opaque cut ordered within the database incarnation that issued it.
+message Basis { bytes value = 1; }
+// Opaque authenticated read evidence scoped to the branch and basis that issued it.
+message Claim { bytes value = 1; }
+message At {
+  oneof selection {
+    google.protobuf.Empty latest = 1;
+    Basis at_least = 2;
+    Basis exactly = 3;
+    google.protobuf.Empty linearizable = 4;
+    sint64 as_of_micros = 5;
+  }
+}
+enum Layer { LAYER_MERGED = 0; LAYER_LOCAL = 1; }
+message Source {
+  string branch = 1;
+  // Omission selects Latest.
+  At at = 2;
+  Layer layer = 3;
+}
+message Limits {
+  uint32 max_page_rows = 1;
+  uint32 max_change_groups = 2;
+  uint64 max_wait_millis = 3;
+  uint32 min_key_bytes = 4;
+  uint32 max_key_bytes = 5;
+}
+message CapabilitiesRequest {}
+message CapabilitiesResponse {
+  string api = 1;
+  repeated string features = 2;
+  Limits limits = 3;
+  sint64 server_time_micros = 4;
+}
+message Page {
+  uint32 limit = 1;
+  // Resume with the same Source, SQL, parameters and track flag.
+  bytes after = 2;
+}
+message QueryRequest {
+  Source source = 1;
+  // Read-only SQL. Source supplies the statement-wide read settings.
+  string sql = 2;
+  // An Arrow IPC stream with exactly one batch containing one positional parameter row.
+  optional bytes params_ipc = 3;
+  bool track = 4;
+  Page page = 5;
+}
+message QueryTrailer {
+  Basis basis = 1;
+  sint64 system_time_micros = 2;
+  Claim claim = 3;
+  optional bytes next = 4;
+}
+message QueryFrame {
+  oneof frame {
+    bytes arrow_ipc = 1;
+    QueryTrailer trailer = 2;
+  }
+}
+message Window { optional sint64 not_before_micros = 1; optional sint64 before_micros = 2; }
+message TransactRequest {
+  bytes key = 1;
+  repeated string require = 2;
+  Window window = 3;
+  repeated Guard guards = 4;
+  repeated Op ops = 5;
+  repeated Op otherwise = 6;
+}
+message TxStatusRequest { bytes key = 1; }
+message Guard {
+  oneof guard {
+    Claim unchanged = 1;
+    Version version = 2;
+    CountAtMost count_at_most = 3;
+  }
+}
+message Version {
+  string branch = 1;
+  string table = 2;
+  Cell id = 3;
+  optional sint64 valid_at_micros = 4;
+  oneof expect {
+    google.protobuf.Empty absent = 5;
+    google.protobuf.Empty present = 6;
+    Basis written = 7;
+  }
+}
+enum When { WHEN_BEFORE = 0; WHEN_AFTER = 1; }
+message CountAtMost {
+  string branch = 1;
+  string table = 2;
+  string index = 3;
+  Cell lower = 4;
+  Cell upper = 5;
+  optional sint64 valid_at_micros = 6;
+  uint64 n = 7;
+  When when = 8;
+}
+message Cell {
+  oneof value {
+    // An Arrow IPC stream with exactly one scalar cell, including typed null.
+    bytes arrow_ipc = 1;
+    google.protobuf.Empty tx_time = 2;
+    google.protobuf.Empty tx_basis = 3;
+  }
+}
+message Interval { optional sint64 from_micros = 1; optional sint64 to_micros = 2; }
+message Row { map<string, Cell> cells = 1; }
+message Put { string branch = 1; string table = 2; repeated Row rows = 3; bool if_absent = 4; }
+message Delete { string branch = 1; string table = 2; repeated Cell ids = 3; Interval valid = 4; }
+message Erase { optional string branch = 1; string table = 2; repeated Cell ids = 3; }
+message Schema { bytes arrow_schema_ipc = 1; }
+enum IndexKind {
+  INDEX_KIND_UNSPECIFIED = 0;
+  INDEX_KIND_ORDERED = 1;
+  INDEX_KIND_SEARCH = 2;
+  INDEX_KIND_SPATIAL = 3;
+  INDEX_KIND_VECTOR = 4;
+}
+message Index { string name = 1; IndexKind kind = 2; repeated string columns = 3; }
+message Ttl { optional uint64 duration_micros = 1; }
+message Constraint { string name = 1; string expression = 2; }
+message Declare {
+  string table = 1;
+  oneof change {
+    Schema schema = 2;
+    Index index = 3;
+    Ttl ttl = 4;
+    Constraint constraint = 5;
+    google.protobuf.Empty drop = 6;
+  }
+}
+message BranchBasis { string branch = 1; Basis basis = 2; }
+message Fork { string child = 1; BranchBasis from = 2; bool writable = 3; optional sint64 expires_at_micros = 4; }
+message Renew { string branch = 1; sint64 expires_at_micros = 2; }
+message Merge { string from = 1; string into = 2; }
+message DropBranch { string branch = 1; }
+message Op {
+  oneof op {
+    Put put = 1;
+    Delete delete = 2;
+    Erase erase = 3;
+    Declare declare = 4;
+    Fork fork = 5;
+    Renew renew = 6;
+    Merge merge = 7;
+    DropBranch drop_branch = 8;
+  }
+}
+message Otherwise { repeated uint32 failed = 1; }
+message Erasure { sint64 unreadable_by_micros = 1; }
+message Receipt {
+  bytes key = 1;
+  Basis basis = 2;
+  sint64 system_time_micros = 3;
+  oneof outcome {
+    google.protobuf.Empty then = 4;
+    Otherwise otherwise = 5;
+    Error refused = 6;
+  }
+  bool replayed = 7;
+  Erasure erasure = 8;
+}
+enum Order { ORDER_ASCENDING = 0; ORDER_DESCENDING = 1; }
+enum Images {
+  IMAGES_NONE = 0;
+  IMAGES_KEYS = 1;
+  IMAGES_BEFORE = 2;
+  IMAGES_AFTER = 3;
+  IMAGES_BOTH = 4;
+}
+message ChangesRequest {
+  string branch = 1;
+  repeated string tables = 2;
+  // Exclusive lower bound. Omission selects the beginning of history.
+  Basis after = 3;
+  // Inclusive upper bound. Omission selects the available head.
+  Basis until = 4;
+  Order order = 5;
+  Images images = 6;
+  // Maximum number of whole system-time groups.
+  uint32 limit = 7;
+  optional uint64 wait_millis = 8;
+}
+message ChangesTrailer {
+  // For ascending pages this is the next exclusive lower bound.
+  // For descending pages this is the next inclusive upper bound.
+  Basis through = 1;
+  // The requested interval is covered, up to the captured head when until is absent.
+  bool complete = 2;
+}
+message ChangesFrame {
+  oneof frame {
+    bytes arrow_ipc = 1;
+    ChangesTrailer trailer = 2;
+  }
+}
+enum AnomalyCategory {
+  ANOMALY_CATEGORY_UNSPECIFIED = 0;
+  ANOMALY_CATEGORY_INCORRECT = 1;
+  ANOMALY_CATEGORY_UNSUPPORTED = 2;
+  ANOMALY_CATEGORY_NOT_FOUND = 3;
+  ANOMALY_CATEGORY_FORBIDDEN = 4;
+  ANOMALY_CATEGORY_CONFLICT = 5;
+  ANOMALY_CATEGORY_BUSY = 6;
+  ANOMALY_CATEGORY_UNAVAILABLE = 7;
+  ANOMALY_CATEGORY_INTERRUPTED = 8;
+  ANOMALY_CATEGORY_FAULT = 9;
+}
+// Serialized in the rtdb-error-bin status metadata.
+message Error {
+  AnomalyCategory category = 1;
+  string code = 2;
+  string message = 3;
+  optional string feature = 4;
+  optional uint64 retry_after_millis = 5;
+}

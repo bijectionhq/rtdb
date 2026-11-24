@@ -18,6 +18,7 @@
 -- Directory rules apply to directory deployments, and installed-journal obligations have their own authority invariants.
 --
 -- Status: target design, ahead of the implementation.
+-- dev/doc/rtdb-v1.allium defines the stateless consumer surface shared with default mode.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
