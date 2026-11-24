@@ -9,8 +9,8 @@ use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, sealing::PUBLICATION
 use rtdb_types::{Anomaly, Result, ServingPublication};
 
 use crate::{
-    keys::{KeyService, UnitScope},
-    packing::{PackIndex, held_back, is_pack_key, read_index},
+    keys::KeyService,
+    packing::{held_back, is_pack_key, read_index},
     reference::{physical_objects, stores},
 };
 
@@ -32,61 +32,6 @@ impl<'a> PublicationCensus<'a> {
         io: &'a Arc<IoRegion>,
     ) -> Self {
         Self { keys, peers, io }
-    }
-
-    pub(super) async fn withdraw_last(
-        &self,
-        bucket: &dyn ObjectStore,
-        owner: &DeploymentRecord,
-        target: &ObjectKey,
-        name: &str,
-        pack: Option<&PackIndex>,
-    ) -> Result<()> {
-        let Some(namespace) = owner.storage_namespaces else {
-            return Ok(());
-        };
-        if self.keys.namespace_id().await? != namespace.keys {
-            return Err(changed());
-        }
-        let sealing = super::directory_publications(self.keys, owner, Arc::clone(self.io))?;
-        let members: Vec<_> = match pack {
-            Some(pack) => pack
-                .entries
-                .iter()
-                .map(|(name, entry)| (name.as_str(), entry.offset, entry.length))
-                .collect(),
-            None => vec![(name, 0, bucket.head_fresh(target).await?.size)],
-        };
-        for (name, offset, length) in members {
-            let logical = ObjectKey::new(name)?;
-            if !sealing.applies(&logical) {
-                continue;
-            }
-            if length < HEADER_BYTES {
-                return Err(changed());
-            }
-            let end = offset.checked_add(HEADER_BYTES).ok_or_else(changed)?;
-            let header = bucket.observe_range(target, offset..end).await?.value;
-            let origin = match sealing.header(&logical, header).await {
-                Ok((_, origin)) => origin,
-                Err(Error::ErasedUnderView) => continue,
-                Err(error) => return Err(error.into()),
-            };
-
-            if !self
-                .has_another_copy(bucket, owner, target, &logical, origin, pack.is_some())
-                .await?
-            {
-                let slot = UnitScope::directory_publication_slot(
-                    &owner.org,
-                    &owner.lineage,
-                    origin,
-                    &logical,
-                );
-                self.keys.withdraw_unit_key(slot, self.io).await?;
-            }
-        }
-        Ok(())
     }
 
     pub(super) async fn pack_plan(

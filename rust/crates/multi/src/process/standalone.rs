@@ -243,7 +243,6 @@ pub async fn serve_standalone(
             storage,
             Some(keys),
             None,
-            Duration::from_secs(3600),
             Duration::from_secs(10),
             cancellation.clone(),
         ));

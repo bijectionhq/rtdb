@@ -304,7 +304,7 @@ impl ReferencingStore {
     }
 }
 
-async fn require_publication(bucket: &dyn ObjectStore, key: &ObjectKey, expected: &PhysicalObjectPublication)
+pub(crate) async fn require_publication(bucket: &dyn ObjectStore, key: &ObjectKey, expected: &PhysicalObjectPublication)
     -> rtdb_storage::Result<()> {
     match bucket.retirement_publication(key).await? {
         Some(observed) if observed == *expected => Ok(()),

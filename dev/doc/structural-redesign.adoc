@@ -192,7 +192,8 @@ Classic local search staging binds the upload to a durable filesystem writer wit
 Governed worlds share the selected root and frozen ancestor inventory between admission and retirement. Each retained capture binds its manifest and each suffix also binds its original transaction key.
 Classic remote catalog holds under the original key vault can settle an abandoned reader when the same locked filesystem proves the attachment has ended. Missing witnesses keep the remote hold.
 Allocated Classic S3 search runs with exact version evidence use the same catalog and physical settlement grant as compacted primaries.
-Hosted maintenance accepts only exact physical grants and no longer withdraws inherited references from path-only grace records. Those references retain custody until there is an exact ordered withdrawal.
+Hosted maintenance can withdraw an inherited loose edge when the fork already has a byte-identical copy with a fresh immutable provider witness. The lineage remains pinned while it checks both publications and withdraws the exact manifest edge. The replacement copy needs its own deletion grant. Other path-only references stay in custody.
+Directory-managed local maintenance no longer uses raw-path grace. Path-only releases stay retained without an exact grant. Covered local packs still use the archived replay closure and the local lineage reservation.
 Unsealed and foreign-vault remote holds stay in custody without a verifiable drain witness. Renewal across other entry points, full recovery-root integration, remote Classic staging, legacy search seal retirement, and uncoordinated timers remain open.
 
 |5

@@ -153,7 +153,7 @@ async fn exercise_replay_pack_retirement(storage: CellStorage, archive: CellStor
         }
         let stop = tokio_util::sync::CancellationToken::new();
         let launch = || tokio::spawn(rtdb_multi::store::run_reaper(
-            cell.directory.clone(), storage.clone(), Some(keys.clone()), Some(owner.clone()), Duration::ZERO,
+            cell.directory.clone(), storage.clone(), Some(keys.clone()), Some(owner.clone()),
             Duration::from_millis(20), stop.clone(),
         ));
         let mut reaper = launch();
@@ -749,7 +749,7 @@ async fn ordered_index_erasure_retires_the_old_hosted_provider_generation() {
         let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
             cell.directory.clone(), storage.clone(), Some(Arc::new(cell.keys())),
             None,
-            Duration::from_secs(3600), Duration::from_millis(20), stop.clone(),
+            Duration::from_millis(20), stop.clone(),
         ));
         let observed = loop {
             let current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
