@@ -529,7 +529,7 @@ impl<R: Read> ArrowStream<R> {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some((metadata, body)) = read_message(&mut self.reader)? {
             let body = if body.is_empty() { Buffer::default() } else { Buffer::from(body) };
-            if let Some(batch) = decode_stream_batch(Cow::Owned(metadata), &body, &self.schema, &mut self.dictionaries, self.projection.as_deref())? { return Ok(Some(batch)); }
+            if let Some(batch) = decode_stream_batch(Cow::Owned(metadata), align_ipc_body(body), &self.schema, &mut self.dictionaries, self.projection.as_deref())? { return Ok(Some(batch)); }
         }
         Ok(None)
     }
@@ -635,13 +635,8 @@ impl OwnedStream {
         let mut pages = Vec::new();
         for message in messages {
             let (header, body) = message?;
-            // Arrow IPC creates dense union offsets before aligning ArrayData buffers.
-            let body = if dense_unions && body.as_ptr().align_offset(std::mem::align_of::<i32>()) != 0 {
-                Buffer::from_slice_ref(body.as_slice())
-            } else {
-                body
-            };
-            if let Some(batch) = decode_stream_batch(Cow::Borrowed(header), &body, &schema, &mut dictionaries, None)? {
+            let body = if dense_unions { align_ipc_body(body) } else { body };
+            if let Some(batch) = decode_stream_batch(Cow::Borrowed(header), body, &schema, &mut dictionaries, None)? {
                 pages.push(OwnedBatch::with_reservation(batch, Arc::clone(&reservation))?);
             }
         }
@@ -666,25 +661,34 @@ fn contains_dense_union(ty: &DataType) -> bool {
     }
 }
 
+/// Ensures dense union offsets can be read before Arrow aligns the decoded arrays.
+pub fn align_ipc_body(body: Buffer) -> Buffer {
+    if body.as_ptr().align_offset(std::mem::align_of::<i32>()) == 0 {
+        body
+    } else {
+        Buffer::from_slice_ref(body.as_slice())
+    }
+}
+
 fn decode_stream_batch(
-    mut metadata: Cow<'_, [u8]>, body: &Buffer, schema: &SchemaRef,
+    mut metadata: Cow<'_, [u8]>, body: Buffer, schema: &SchemaRef,
     dictionaries: &mut HashMap<i64, ArrayRef>, projection: Option<&[usize]>,
 ) -> Result<Option<RecordBatch>> {
     let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
-    validate_lz4_lengths(&message, body)?;
+    validate_lz4_lengths(&message, &body)?;
     let data = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
     if let Some(data) = data {
         let nodes = data.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
         if nodes.iter().any(|node| node.null_count() < 0) {
-            nulls::normalize(metadata.to_mut(), body, schema)?;
+            nulls::normalize(metadata.to_mut(), &body, schema)?;
         }
     }
     let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
     if let Some(batch) = message.header_as_record_batch() {
-        return arrow_ipc::reader::read_record_batch(body, batch, Arc::clone(schema), dictionaries, projection, &message.version()).map(Some).map_err(invalid);
+        return arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(schema), dictionaries, projection, &message.version()).map(Some).map_err(invalid);
     }
     let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Unexpected Arrow stream message"))?;
-    arrow_ipc::reader::read_dictionary(body, dictionary, schema, dictionaries, &message.version()).map_err(invalid)?;
+    arrow_ipc::reader::read_dictionary(&body, dictionary, schema, dictionaries, &message.version()).map_err(invalid)?;
     Ok(None)
 }
 
@@ -1235,4 +1239,29 @@ fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {
     assert!(rtdb_columnar::shared_allocation_size(&decoded).unwrap() < bytes.len());
     drop((reader, bytes));
     assert_eq!(decoded, batch);
+}
+
+#[test]
+fn owned_ipc_decodes_dense_unions_from_an_unaligned_envelope() {
+    use arrow_array::{Int64Array, StringArray, UnionArray};
+    use arrow_schema::{DataType, Field, UnionFields};
+
+    let fields = UnionFields::try_new([0, 1], [
+        Field::new("i64", DataType::Int64, false),
+        Field::new("utf8", DataType::Utf8, false),
+    ]).unwrap();
+    let union = UnionArray::try_new(fields, vec![0, 1, 0].into(), Some(vec![0, 0, 1].into()), vec![
+        Arc::new(Int64Array::from(vec![7, -4])), Arc::new(StringArray::from(vec!["hello"])),
+    ]).unwrap();
+    let page = RecordBatch::try_from_iter([("value", Arc::new(union) as ArrayRef)]).unwrap();
+    let mut envelope = vec![0];
+    write_stream_to(page.schema_ref(), [&page], &mut envelope).unwrap();
+    let bytes = Buffer::from_slice_ref(&envelope).slice(1);
+    let mut position = 0;
+    stream_message(&bytes, &mut position).unwrap().unwrap();
+    let (_, body) = stream_message(&bytes, &mut position).unwrap().unwrap();
+    assert_ne!(bytes[body].as_ptr().align_offset(std::mem::align_of::<i32>()), 0);
+
+    let stream = OwnedStream::read_buffer(bytes, &MemoryBudget::new(1 << 20)).unwrap();
+    assert_eq!(stream.pages()[0].batch(), &page);
 }

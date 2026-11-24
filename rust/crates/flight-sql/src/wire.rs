@@ -82,7 +82,8 @@ impl Decoder {
             arrow_ipc::MessageHeader::DictionaryBatch => {
                 let schema = self.schema.as_ref().ok_or_else(|| invalid("Dictionary arrived before schema"))?;
                 let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Invalid dictionary message"))?;
-                arrow_ipc::reader::read_dictionary(&Buffer::from(data.data_body), dictionary, schema, &mut self.dictionaries, &message.version()).map_err(arrow)?;
+                let body = rtdb_format::ipc::align_ipc_body(Buffer::from(data.data_body));
+                arrow_ipc::reader::read_dictionary(&body, dictionary, schema, &mut self.dictionaries, &message.version()).map_err(arrow)?;
                 self.permanent.push(charge); Ok(None)
             }
             arrow_ipc::MessageHeader::RecordBatch => {
@@ -90,8 +91,9 @@ impl Decoder {
                 let batch = message.header_as_record_batch().ok_or_else(|| arrow(arrow_schema::ArrowError::ParseError(
                     "Unable to convert flight data header to a record batch".to_owned(),
                 )))?;
+                let body = rtdb_format::ipc::align_ipc_body(Buffer::from(data.data_body));
                 let batch = arrow_ipc::reader::read_record_batch(
-                    &Buffer::from(data.data_body), batch, schema, &self.dictionaries, None, &message.version(),
+                    &body, batch, schema, &self.dictionaries, None, &message.version(),
                 ).map_err(arrow)?;
                 let retained = self.memory.reserve(rtdb_columnar::shared_allocation_size(&batch).map_err(status)?).map_err(status)?;
                 let owned = OwnedBatch::with_reservation(batch, retained).map_err(status)?;

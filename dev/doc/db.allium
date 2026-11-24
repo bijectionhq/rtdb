@@ -416,6 +416,7 @@ variant TxMessage : SourceMessage {
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
     -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
     -- Source intake retains legacy transaction bytes and protobuf byte fields from the delivered record through operation decoding.
+    -- A message body that lands at an unaligned address in its transport uses aligned storage during Arrow decoding.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
     -- Pgwire SQL arguments are admitted as an Arrow row with canonical source fields and buffers.
     -- Pgwire integer-array Bind preserves source IPC bytes beneath null components.
