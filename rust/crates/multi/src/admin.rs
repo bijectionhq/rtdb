@@ -575,11 +575,11 @@ pub async fn fork_block_into(directory: &Arc<dyn Directory>, storage: &CellStora
 
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
 /// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
-pub async fn fork_at_time(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    fork_time_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, system_time, grace, maximum_message_bytes).await
+pub async fn fork_at_time(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, broker: Option<&crate::replay_broker::Client>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    fork_time_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, broker, system_time, grace, maximum_message_bytes).await
 }
 
-pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, broker: Option<&crate::replay_broker::Client>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let source = fork_source(directory.as_ref(), parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
@@ -598,7 +598,7 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
                 }
                 Ok(Some(crate::hosted_recovery::replay_start(current, checkpoint.boundary)?))
             },
-            |current, _, io| async move {
+            |current, region, io| async move {
                 let bucket = storage.bucket(Arc::clone(&io)).await?;
                 let scope = format!("{}/{}", source.storage_prefix(), crate::archive::checkpoint_storage_root()?);
                 let store = crate::store::open_deployment_store(bucket, &scope, crate::packing::PackDiscovery::From(checkpoint.block), crate::store::wall_clock()).await?;
@@ -612,7 +612,14 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
                     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
                     let through = reader.read_index(current.epoch).await?.through();
                     let reader = crate::logs::SealedLog::new(reader, keys, &current.key_id(), &current.replica_seal_scope(), io).await?;
-                    crate::logs::transactions_until(&reader, &store, &catalog, checkpoint.boundary, through, system_time).await
+                    let history = crate::replay_broker::History::of(&current)?;
+                    let memory = rtdb_columnar::MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes);
+                    crate::logs::transactions_until(&reader, &catalog, checkpoint.boundary, through, system_time,
+                        async |position, frame| {
+                            let broker = broker.ok_or_else(|| fork_unavailable(parent))?;
+                            broker.read(history, region, position, frame, &memory).await
+                        },
+                    ).await
                 }).await.map_err(|_| fork_unavailable(parent))?
             },
         ).await?;

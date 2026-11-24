@@ -269,6 +269,10 @@ pub struct NodeAgent {
 }
 
 impl NodeAgent {
+    pub(crate) fn replay_broker(&self) -> Option<&crate::replay_broker::Client> {
+        self.options.replay_broker.as_ref()
+    }
+
     pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, ordered: Arc<crate::journal::hosted::Routes>, ordered_releases: tokio_util::task::TaskTracker, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
         Arc::new(Self { directory, keys, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, ordered, ordered_releases, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
@@ -938,7 +942,7 @@ impl NodeAgent {
             let _charge = self.node.memory().reserve(32 << 20)?;
             let SuffixCut::HeldPublication(cut, keys, base, region, io) = &cutoff else { return Err(unavailable()); };
             let (basis, replica, source) = crate::archive::find_held_publication(
-                &stream, &proof, &record, &self.options.storage, *keys, cut,
+                &stream, &proof, &record, self.replay_broker(), *keys, cut,
                 base, *region, Arc::clone(io), self.node.memory(),
             ).await?;
             if source <= checkpoint.source || source > source_through || replica > replica_through {

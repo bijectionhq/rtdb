@@ -139,7 +139,6 @@ async fn copy_published_fork_input(
 
 async fn copy_fork_suffix(
     directory: Arc<dyn Directory>,
-    storage: &CellStorage,
     archive: &CellStorage,
     keys: &dyn KeyService,
     hosted_task: Option<&HostedTask>,
@@ -189,7 +188,7 @@ async fn copy_fork_suffix(
             ).await
         },
     ).await?;
-    replica_suffix::capture(directory, storage, archive, keys, hosted_task, deployment, suffix, pin, memory).await?;
+    replica_suffix::capture(directory, archive, keys, agent.replay_broker(), hosted_task, deployment, suffix, pin, memory).await?;
     Ok((capture, Some(suffix)))
 }
 
@@ -239,7 +238,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
             (ancestor.capture, ancestor.suffix)
         } else {
             let (capture, suffix) = copy_fork_suffix(
-                Arc::clone(&directory), storage, archive, keys, hosted_task, agent, deployment,
+                Arc::clone(&directory), archive, keys, hosted_task, agent, deployment,
                 &source, &cut, cut.until(), None, resources.memory,
             ).await?;
             (capture, suffix.ok_or_else(unavailable)?)
@@ -392,7 +391,7 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
         capture
     } else {
         copy_fork_suffix(
-            Arc::clone(&directory), storage, archive, keys, hosted_task, agent, deployment,
+            Arc::clone(&directory), archive, keys, hosted_task, agent, deployment,
             &source, &cut, cut.until(), Some(binding), resources.memory,
         ).await?
     };
@@ -787,7 +786,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
                 (capture, None)
             } else {
                 copy_fork_suffix(
-                    Arc::clone(&directory), storage, archive, keys, hosted_task,
+                    Arc::clone(&directory), archive, keys, hosted_task,
                     agent.ok_or_else(OwnedWorld::unavailable)?, deployment_id, &source, &fork.cut, deadline, None, resources.memory,
                 ).await?
             };

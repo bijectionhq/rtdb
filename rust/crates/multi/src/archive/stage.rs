@@ -24,8 +24,8 @@ use crate::{
     keys::KeyService,
     reference::{PrefixedStore, key},
     store::{
-        CheckpointReplayPublication, ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
-        track_checkpoint_replay_publication, track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
+        ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
+        track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
     },
 };
 
@@ -321,7 +321,6 @@ fn staged(
 pub(crate) enum RegionPublication {
     Stage(Arc<dyn Directory>, Uuid),
     CheckpointTransfer(Arc<dyn Directory>, Uuid),
-    CheckpointReplay(Arc<dyn Directory>, CheckpointReplayPublication),
     Capture(Arc<dyn Directory>),
 }
 
@@ -368,9 +367,6 @@ where
             }
             Some(RegionPublication::CheckpointTransfer(owner, operation)) => {
                 track_checkpoint_transfer_publications(&mut io, owner, deployment.to_owned(), region, operation);
-            }
-            Some(RegionPublication::CheckpointReplay(owner, replay)) => {
-                track_checkpoint_replay_publication(&mut io, owner, deployment.to_owned(), region, replay);
             }
             Some(RegionPublication::Capture(owner)) => {
                 track_publications(&mut io, owner, deployment.to_owned(), region, None);

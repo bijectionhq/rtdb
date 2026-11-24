@@ -22,7 +22,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
-       rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE --config FILE [--ecs-cluster ARN]\n\
+       rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE [--transfer-token-file FILE] --config FILE [--ecs-cluster ARN]\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
        rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker UUID --serial N\n\
@@ -345,7 +345,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 133 } else { 15 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 134 } else { 16 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
         };
@@ -398,7 +398,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let tls = rtdb_server::tls::load(&tls, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
             let service = rtdb_multi::replay_broker::Service::new(
                 directory(arguments.required("directory")?).await?, storage, &serving, key_store,
-                std::path::Path::new(arguments.required("token-file")?), hosted_task(&arguments)?,
+                std::path::Path::new(arguments.required("token-file")?),
+                arguments.optional("transfer-token-file").map(std::path::Path::new), hosted_task(&arguments)?,
             )?;
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:0")?)
                 .await.map_err(io)?;
@@ -729,6 +730,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
+                    replay_broker_client(&arguments, "")?,
                     task.clone(),
                     control,
                 )?;
@@ -810,7 +812,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
-                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, rtdb_types::Timestamp(time.timestamp_micros()),
+                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, replay_broker_client(&arguments, "")?.as_ref(), rtdb_types::Timestamp(time.timestamp_micros()),
                         Duration::from_secs(arguments.number("grace", 3600u64)?), 4 << 20).await?
                 }
                 (at_block, _) => match at_block {
@@ -1114,12 +1116,14 @@ fn replay_broker_client(arguments: &Arguments, prefix: &str) -> Result<Option<rt
     let server_name = format!("{prefix}replay-broker-name");
     let ca = format!("{prefix}replay-broker-ca");
     let token = format!("{prefix}replay-broker-token-file");
-    if [&endpoint, &server_name, &ca, &token].iter().all(|flag| !arguments.present(flag)) {
+    let transfer_token = format!("{prefix}replay-broker-transfer-token-file");
+    if [&endpoint, &server_name, &ca, &token, &transfer_token].iter().all(|flag| !arguments.present(flag)) {
         return Ok(None);
     }
     rtdb_multi::replay_broker::Client::from_files(
         arguments.required(&endpoint)?, arguments.required(&server_name)?,
         std::path::Path::new(arguments.required(&ca)?), std::path::Path::new(arguments.required(&token)?),
+        arguments.optional(&transfer_token).map(std::path::Path::new),
     ).map(Some)
 }
 

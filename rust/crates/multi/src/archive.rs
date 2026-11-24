@@ -2164,7 +2164,7 @@ pub(crate) async fn stage_checkpoint_transfer(
 /// stage under the original source installation's recovery authority.
 pub(crate) async fn issue_checkpoint_transfer(
     directory: Arc<dyn Directory>, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
-    selector: StageSelector, hosted_task: Option<rtdb_directory::HostedTask>,
+    selector: StageSelector, broker: Option<&crate::replay_broker::Client>, hosted_task: Option<rtdb_directory::HostedTask>,
 ) -> Result<rtdb_directory::CheckpointTransferTerminal> {
     let (source, capture, org) = selector.source.as_ref()
         .ok_or_else(|| inconsistent("Terminal transfer requires authenticated source authority"))?;
@@ -2206,13 +2206,14 @@ pub(crate) async fn issue_checkpoint_transfer(
     let fence = directory.fence_checkpoint_transfer(&rtdb_directory::CheckpointTransferSelection {
         stage, source_version, destination_version,
     }).await?;
-    seal_checkpoint_transfer(directory.as_ref(), storage, archive, keys, hosted_task.as_ref(), &fence).await
+    seal_checkpoint_transfer(directory.as_ref(), storage, archive, keys, broker, hosted_task.as_ref(), &fence).await
 }
 
 /// Complete an already ordered source transfer fence. The result is a
 /// retained source receipt, and does not activate or release either residence.
 pub(crate) async fn seal_checkpoint_transfer(
     directory: &dyn Directory, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
+    broker: Option<&crate::replay_broker::Client>,
     hosted_task: Option<&rtdb_directory::HostedTask>,
     fence: &rtdb_directory::CheckpointTransferFence,
 ) -> Result<rtdb_directory::CheckpointTransferTerminal> {
@@ -2261,7 +2262,7 @@ pub(crate) async fn seal_checkpoint_transfer(
                     manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None, require_replay: false,
                 },
                 CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-                Some(read_world::TerminalReplay { storage, source_region, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+                Some(read_world::TerminalReplay { broker, source_region, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
                 |context, basis, terminal| async move {
                     let terminal = terminal.ok_or_else(|| inconsistent("Terminal replay produced no source census"))?;
                     Ok((basis, terminal, archive_lifetime_floors_digest(context, basis).await?))

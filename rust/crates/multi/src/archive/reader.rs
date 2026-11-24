@@ -37,7 +37,7 @@ use crate::{
     logs::frozen_checkpoint,
     process::standalone::{gateway_tls, read_bounded, write_private},
     reference::{PrefixedStore, key},
-    store::{CELL_STORAGE_TYPE, EncryptingStore, ROOT_MARKER},
+    store::{CELL_STORAGE_TYPE, ROOT_MARKER},
 };
 
 mod owned_inventory;
@@ -372,7 +372,7 @@ async fn open_inventory(
         .into_iter()
         .map(|object| object.key)
         .collect::<BTreeSet<_>>();
-    if !expected.is_subset(&observed) {
+    if expected != observed {
         return Err(inconsistent(
             "The staged storage root differs from its accepted inventory",
         ));
@@ -388,13 +388,6 @@ async fn open_inventory(
         Some(material) => crate::keys::tracked_deployment_archive_key(keys, media_id, material)?,
     };
     let plaintext = Arc::new(CapturedObjects { files, objects, cipher });
-    let extras = observed.difference(&expected).cloned().collect::<BTreeSet<_>>();
-    if !extras.is_empty() {
-        let material = material.as_ref()
-            .ok_or_else(|| inconsistent("The primary stage contains unclaimed objects"))?;
-        let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(Arc::clone(&bucket), root)), material)?;
-        Box::pin(owned_inventory::verify_seeded_payloads(bucket.as_ref(), &serving, plaintext.as_ref(), keys, record, stage, extras, region)).await?;
-    }
     let point = CapturePoint {
         operation: stage.intent.capture,
         deployment: stage.intent.source,

@@ -546,20 +546,6 @@ pub(crate) fn track_checkpoint_transfer_publications(
     ));
 }
 
-pub(crate) struct CheckpointReplayPublication {
-    pub bootstrap_sha256: [u8; 32],
-    pub object: ObjectKey,
-}
-
-pub(crate) fn track_checkpoint_replay_publication(
-    io: &mut Arc<IoRegion>, directory: Arc<dyn Directory>, deployment: String, region: Uuid,
-    replay: CheckpointReplayPublication,
-) {
-    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointReplay(replay) },
-    ));
-}
-
 pub(crate) fn track_hosted_fork_publications(io: &mut Arc<IoRegion>, directory: Arc<dyn Directory>, deployment: String, region: Uuid) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
         DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::HostedFork },
@@ -571,7 +557,6 @@ enum PublicationOwner {
     Transfer,
     CheckpointStage(Uuid),
     CheckpointTransfer(Uuid),
-    CheckpointReplay(CheckpointReplayPublication),
     HostedFork,
 }
 
@@ -604,17 +589,6 @@ impl PublicationJournal for DirectoryPublications {
                         intent.operation == *operation && intent.destination.to_string() == record.id
                             && record.checkpoint_stage.as_deref() == Some(&fence.destination)
                             && crate::archive::admits_checkpoint_transfer_object(record, &fence.destination, key.as_str())
-                    }),
-                PublicationOwner::CheckpointReplay(replay) => record.lifecycle == Lifecycle::Restoring
-                    && &replay.object == key
-                    && record.checkpoint_transfer_replica.as_deref().is_some_and(|replica| {
-                        let bootstrap = &replica.bootstrap;
-                        let fence = &bootstrap.terminal.fence;
-                        bootstrap.ciphertext_sha256 == replay.bootstrap_sha256
-                            && fence.destination.intent.destination.to_string() == record.id
-                            && record.checkpoint_transfer_fence.as_deref() == Some(fence)
-                            && record.checkpoint_stage.as_deref() == Some(&fence.destination)
-                            && record.checkpoint_transfer_bootstrap.as_deref() == Some(bootstrap)
                     }),
                 PublicationOwner::HostedFork => record.lifecycle == Lifecycle::Restoring
                     && record.hosted_fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),

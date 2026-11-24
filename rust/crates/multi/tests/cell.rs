@@ -4320,13 +4320,13 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     let then = rtdb_types::Timestamp(chrono::DateTime::parse_from_str(&written, "%Y-%m-%d %H:%M:%S%.f%:z").unwrap().timestamp_micros());
     for id in 5..7 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
 
-    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
+    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", None, rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
         "a time before the checkpoint is a past block's");
-    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", then, Duration::from_secs(3600), 4 << 20).await.unwrap();
+    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", None, then, Duration::from_secs(3600), 4 << 20).await.unwrap();
     admin::fork_time_into(
         &cell.directory, &cell.storage(), &cell.keys(), "shop",
         admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None },
-        then, Duration::from_secs(3600), 4 << 20,
+        None, then, Duration::from_secs(3600), 4 << 20,
     ).await.unwrap();
     let external = connect_eventually(&cell, "shop-external-then").await;
     assert_eq!(values(&external, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"]);

@@ -71,7 +71,14 @@ struct Request {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     Read { ticket: Uuid, position: i64, reference: String },
-    Publish { epoch: u64, object: String, length: usize },
+    Publish { route: PublishRoute, object: String, length: usize },
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PublishRoute {
+    Writer { epoch: u64 },
+    Transfer { operation: Uuid, bootstrap: [u8; 32], position: i64 },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -95,6 +102,7 @@ struct Remote {
     server_name: ServerName<'static>,
     tls: Arc<ClientConfig>,
     token: Arc<str>,
+    transfer_token: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -107,7 +115,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    pub fn from_files(endpoint: &str, server_name: &str, ca: &Path, token: &Path) -> Result<Self> {
+    pub fn from_files(endpoint: &str, server_name: &str, ca: &Path, token: &Path, transfer_token: Option<&Path>) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         for certificate in CertificateDer::pem_file_iter(ca).map_err(transport)? {
             roots.add(certificate.map_err(transport)?).map_err(transport)?;
@@ -123,13 +131,14 @@ impl Client {
             server_name: ServerName::try_from(server_name.to_owned()).map_err(transport)?,
             tls: Arc::new(tls),
             token: Arc::from(Token::read(token)?),
+            transfer_token: transfer_token.map(Token::read).transpose()?.map(Arc::from),
         }))))
     }
 
     pub(crate) fn standalone(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>, tasks: TaskTracker,
     ) -> Result<Self> {
-        let service = Service::open(directory, storage, serving, keys, None, None)?;
+        let service = Service::open(directory, storage, serving, keys, None, None, None)?;
         Ok(Self(Arc::new(ClientRoute::Standalone { service, tasks })))
     }
 
@@ -160,6 +169,24 @@ impl Client {
     pub(crate) async fn publish(
         &self, history: History, epoch: u64, object: &ObjectKey, bytes: Bytes,
     ) -> Result<Option<PhysicalObjectVersion>> {
+        self.publish_with(history, PublishRoute::Writer { epoch }, object, bytes).await
+    }
+
+    pub(crate) async fn seed(
+        &self, target: &DeploymentRecord, replica: &rtdb_directory::CheckpointTransferReplica,
+        position: i64, object: &ObjectKey, bytes: Bytes,
+    ) -> Result<Option<PhysicalObjectVersion>> {
+        let route = PublishRoute::Transfer {
+            operation: replica.bootstrap.terminal.fence.destination.intent.operation,
+            bootstrap: replica.bootstrap.ciphertext_sha256,
+            position,
+        };
+        self.publish_with(History::of(target)?, route, object, bytes).await
+    }
+
+    async fn publish_with(
+        &self, history: History, route: PublishRoute, object: &ObjectKey, bytes: Bytes,
+    ) -> Result<Option<PhysicalObjectVersion>> {
         check_length(bytes.len())?;
         let ClientRoute::Remote(remote) = self.0.as_ref() else {
             let ClientRoute::Standalone { service, tasks } = self.0.as_ref() else { unreachable!(); };
@@ -167,10 +194,10 @@ impl Client {
             let name = object.clone();
             let charge = service.memory.reserve(bytes.len())?;
             return tasks.spawn(async move {
-                service.publish_body(history, epoch, &name, bytes, charge).await
+                service.publish_body(history, route, &name, bytes, charge).await
             }).await.map_err(transport)?;
         };
-        let action = Action::Publish { epoch, object: object.to_string(), length: bytes.len() };
+        let action = Action::Publish { route, object: object.to_string(), length: bytes.len() };
         let mut socket = remote.connect(history, action).await?;
         socket_work(async {
             socket.write_all(&bytes).await.map_err(transport)?;
@@ -185,11 +212,16 @@ impl Client {
 
 impl Remote {
     async fn connect(&self, history: History, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let token = match &action {
+            Action::Publish { route: PublishRoute::Transfer { .. }, .. } =>
+                self.transfer_token.as_ref().ok_or_else(refused)?,
+            _ => &self.token,
+        };
         socket_work(async {
             let stream = TcpStream::connect(self.endpoint.as_ref()).await.map_err(transport)?;
             let mut stream = TlsConnector::from(Arc::clone(&self.tls))
                 .connect(self.server_name.clone(), stream).await.map_err(transport)?;
-            send_header(&mut stream, &Request { token: self.token.to_string(), history, action }).await?;
+            send_header(&mut stream, &Request { token: token.to_string(), history, action }).await?;
             Ok(stream)
         }).await
     }
@@ -201,6 +233,7 @@ pub struct Service {
     namespace: [u8; 32],
     keys: Arc<dyn KeyService>,
     token: Option<Token>,
+    transfer_token: Option<Token>,
     custody: ReplayCustody,
     memory: Arc<MemoryBudget>,
 }
@@ -208,14 +241,19 @@ pub struct Service {
 impl Service {
     pub fn new(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
-        token: &Path, task: Option<rtdb_directory::HostedTask>,
+        token: &Path, transfer_token: Option<&Path>, task: Option<rtdb_directory::HostedTask>,
     ) -> Result<Arc<Self>> {
-        Self::open(directory, storage, serving, keys, Some(Token::new(&Token::read(token)?)?), task)
+        let ordinary = Token::read(token)?;
+        let transfer = transfer_token.map(Token::read).transpose()?;
+        if transfer.as_ref() == Some(&ordinary) {
+            return Err(Anomaly::incorrect("rtdb.multi/replay-broker-credential", "Recovery transfer requires its own replay broker credential"));
+        }
+        Self::open(directory, storage, serving, keys, Some(Token::new(&ordinary)?), transfer.as_deref().map(Token::new).transpose()?, task)
     }
 
     fn open(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
-        token: Option<Token>, task: Option<rtdb_directory::HostedTask>,
+        token: Option<Token>, transfer_token: Option<Token>, task: Option<rtdb_directory::HostedTask>,
     ) -> Result<Arc<Self>> {
         let shares_media = match (&storage, serving) {
             (CellStorage::S3 { config: payload }, CellStorage::S3 { config: serving }) => payload.bucket == serving.bucket,
@@ -233,7 +271,7 @@ impl Service {
             (_, owner) => ReplayCustody::Hosted { owner },
         };
         Ok(Arc::new(Self {
-            directory, storage, namespace, keys, custody, token,
+            directory, storage, namespace, keys, custody, token, transfer_token,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
         }))
     }
@@ -272,7 +310,11 @@ impl Service {
 
     async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<TcpStream>) -> Result<()> {
         let request: Request = socket_work(receive_header(socket)).await?;
-        if !self.token.as_ref().is_some_and(|token| token.accepts(&request.token)) { return Err(refused()); }
+        let verifier = match &request.action {
+            Action::Publish { route: PublishRoute::Transfer { .. }, .. } => &self.transfer_token,
+            _ => &self.token,
+        };
+        if !verifier.as_ref().is_some_and(|token| token.accepts(&request.token)) { return Err(refused()); }
         let history = request.history;
         match request.action {
             Action::Read { ticket, position, reference } => {
@@ -280,11 +322,11 @@ impl Service {
                 self.read_for_ticket(history, ticket, position, &frame, &self.memory, Some(socket)).await?;
                 Ok(())
             }
-            Action::Publish { epoch, object, length } => {
+            Action::Publish { route, object, length } => {
                 let key = ObjectKey::new(object)?;
-                self.writer(history, epoch).await?;
+                require_publication(history, route, &self.current(history).await?, &key)?;
                 let (body, charge) = socket_work(receive_body(socket, length, &self.memory)).await?;
-                let version = self.publish_body(history, epoch, &key, body, charge).await?;
+                let version = self.publish_body(history, route, &key, body, charge).await?;
                 socket_work(send_header(socket, &Response::Publication { version })).await
             }
         }
@@ -340,7 +382,7 @@ impl Service {
     }
 
     async fn publish_body(
-        &self, history: History, epoch: u64, key: &ObjectKey, body: Bytes, charge: Arc<rtdb_types::MemoryReservation>,
+        &self, history: History, route: PublishRoute, key: &ObjectKey, body: Bytes, charge: Arc<rtdb_types::MemoryReservation>,
     ) -> Result<Option<PhysicalObjectVersion>> {
         check_publish_key(key)?;
         let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
@@ -353,11 +395,11 @@ impl Service {
         let version = crate::archive::stage::with_region(
             self.directory.as_ref(), self.keys.as_ref(), &deployment, &self.storage, task, None, None,
             |record| {
-                require_writer(history, epoch, record)?;
+                require_publication(history, route, record, key)?;
                 Ok(None)
             },
             |record, _, io| async move {
-                self.writer(history, epoch).await?;
+                require_publication(history, route, &self.current(history).await?, key)?;
                 let files = self.open_store(&record, io).await?;
                 let published = IoRegion::retaining(charge, files.put_with_publication(key, body)).await?;
                 let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
@@ -367,19 +409,13 @@ impl Service {
                 Ok(version)
             },
         ).await?;
-        self.writer(history, epoch).await?;
+        require_publication(history, route, &self.current(history).await?, key)?;
         Ok(version)
     }
 
     async fn current(&self, history: History) -> Result<DeploymentRecord> {
         self.directory.deployment(&history.deployment.to_string()).await?
             .filter(|record| history.matches(record)).ok_or_else(refused)
-    }
-
-    async fn writer(&self, history: History, epoch: u64) -> Result<DeploymentRecord> {
-        let record = self.current(history).await?;
-        require_writer(history, epoch, &record)?;
-        Ok(record)
     }
 
     async fn admit_read(
@@ -389,7 +425,7 @@ impl Service {
         for _ in 0..CAS_ATTEMPTS {
             let mut record = self.current(history).await?;
             if matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Deleted)
-                || !record.storage_regions.get(&ticket).is_some_and(|hold| hold.requires_replica_offset(position))
+                || !record.storage_regions.get(&ticket).is_some_and(|hold| admits_position(hold, position))
             {
                 return Err(refused());
             }
@@ -441,7 +477,7 @@ impl Service {
         let residence = residence(record);
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
         let files = Arc::new(PrefixedStore::new(bucket, &residence));
-        let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, record.log_epoch), io);
+        let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, payload_log_epoch(record)), io);
         Ok(EncryptingStore::with_units(files, Arc::new(ledger)))
     }
 
@@ -463,8 +499,47 @@ impl Service {
     }
 }
 
-fn residence(record: &DeploymentRecord) -> String {
-    format!("replay-bodies/{}/{}", record.storage_prefix(), record.log_epoch)
+pub(crate) fn residence(record: &DeploymentRecord) -> String {
+    format!("replay-bodies/{}/{}", record.storage_prefix(), payload_log_epoch(record))
+}
+
+pub(crate) fn admits_position(hold: &StorageRegion, position: i64) -> bool {
+    match hold {
+        StorageRegion::ReplicaReplay { first_required, through, .. } =>
+            *first_required >= 0 && (*first_required..=*through).contains(&position),
+        region => region.first_required_replica().is_some_and(|first| (0..=position).contains(&first)),
+    }
+}
+
+fn payload_log_epoch(record: &DeploymentRecord) -> i32 {
+    record.checkpoint_stage.as_ref().filter(|stage| stage.transfer_only)
+        .map_or(record.log_epoch, |stage| stage.source_log_epoch)
+}
+
+fn require_publication(
+    history: History, route: PublishRoute, record: &DeploymentRecord, key: &ObjectKey,
+) -> Result<()> {
+    if !history.matches(record) { return Err(refused()); }
+    match route {
+        PublishRoute::Writer { epoch } => require_writer(history, epoch, record),
+        PublishRoute::Transfer { operation, bootstrap, position } => {
+            let replica = record.checkpoint_transfer_replica.as_deref().ok_or_else(refused)?;
+            let receipt = &replica.bootstrap;
+            let terminal = &receipt.terminal;
+            let stage = &terminal.fence.destination;
+            if record.lifecycle != Lifecycle::Restoring || record.holder.is_some()
+                || record.checkpoint_stage.as_deref() != Some(stage)
+                || record.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
+                || record.checkpoint_transfer_bootstrap.as_deref() != Some(receipt)
+                || stage.intent.operation != operation || receipt.ciphertext_sha256 != bootstrap
+                || position <= stage.checkpoint.boundary || position > terminal.replica_through
+                || !crate::archive::admits_seeded_transfer_payload(record, stage, key.as_str())
+            {
+                return Err(refused());
+            }
+            Ok(())
+        }
+    }
 }
 
 fn require_writer(history: History, epoch: u64, record: &DeploymentRecord) -> Result<()> {

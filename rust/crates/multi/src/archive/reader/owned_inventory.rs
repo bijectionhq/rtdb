@@ -63,6 +63,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
     storage: &CellStorage,
     keys: &dyn KeyService,
     selector: StageSelector,
+    broker: Option<&crate::replay_broker::Client>,
     hosted_task: Option<HostedTask>,
 ) -> Result<CheckpointTransferBootstrap> {
     use crate::{
@@ -144,7 +145,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                             let _pages = memory.reserve(32 << 20)?;
                             let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                             let source_cipher = replica_suffix::TerminalReplicaCipher::open(&source, keys, Arc::clone(&source_io)).await?;
-                            let payloads = replica_suffix::ServingPayloads::new(&source, source_region, &certificate, storage, keys, source_io, memory)?;
+                            let payloads = replica_suffix::ServingPayloads::new(&source, source_region, &certificate, broker, memory)?;
                             while let Some(mut entries) = segments.next().await? {
                                 let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
                                 let through = entries.last().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
@@ -156,9 +157,9 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                                 for entry in entries {
                                     let Some(envelope) = replay.admit(&entry, fence, recovered)? else { continue; };
                                     if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                        let (resolved, payload) = payloads.resolve_verified(entry.lsn, &envelope).await?;
+                                        let (resolved, payload) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
                                         replay.apply(resolved, recovered, memory)?;
-                                        artifact.put_payload(entry.lsn, &payload.bytes, chain).await?;
+                                        artifact.put_payload(entry.lsn, payload.as_ref(), chain).await?;
                                     } else {
                                         replay.apply(envelope, recovered, memory)?;
                                     }
@@ -215,6 +216,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     storage: &CellStorage,
     keys: &dyn KeyService,
     selector: StageSelector,
+    broker: Option<&crate::replay_broker::Client>,
     hosted_task: Option<HostedTask>,
 ) -> Result<rtdb_directory::CheckpointTransferReplica> {
     use crate::{
@@ -227,7 +229,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     use rtdb_storage::log::LogOffset;
 
     let bootstrap = verify_checkpoint_transfer_target(
-        Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
+        Arc::clone(&directory), storage, keys, selector, broker, hosted_task.clone(),
     ).await?;
     let terminal = &bootstrap.terminal;
     let stage = &terminal.fence.destination;
@@ -248,7 +250,6 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     };
     let ordered = &bootstrap;
     let task = hosted_task.as_ref();
-    let directory = &directory;
     Box::pin(with_region(
         owner, keys, &target_id, storage, task, None, None, admit_target,
         |target, _, region| async move {
@@ -262,7 +263,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             let files = PrefixedStore::new(Arc::clone(&bucket), root);
             let marker = files.observe_fresh_exact(&key(ROOT_MARKER)?, target.id.len()).await?;
             if marker.value.as_ref() != target.id.as_bytes() {
-                return Err(inconsistent("The replica payload store has another target owner"));
+                return Err(inconsistent("The staged checkpoint has another target owner"));
             }
             let media = keys.existing_key(&target.key_id()).await?
                 .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
@@ -335,9 +336,9 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                     if let Some(control) = replica_suffix::transfer_control(resolved, stage.checkpoint)? {
                         entry.payload = control;
                     } else if let Some(payload) = offloaded.as_ref() {
-                        let proxy = target_payload_proxy(&envelope, resolved, &payload.body.bytes)?;
-                        publish_target_payload(directory, storage, keys, task, &target, &reserved, &payload.path, &payload.body.bytes).await?;
-                        entry.payload = proxy;
+                        let broker = broker.ok_or_else(|| unavailable("Detached replay transfer requires its installed broker"))?;
+                        let publication = broker.seed(&target, &reserved, entry.lsn, &payload.path, payload.body.bytes.clone()).await?;
+                        entry.payload = target_payload_proxy(&envelope, resolved, &payload.body.bytes, publication)?;
                     }
                 }
                 next += entries.len() as i64;
@@ -378,97 +379,19 @@ async fn observe_transfer_payload(
     Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
 }
 
-pub(super) async fn verify_seeded_payloads(
-    bucket: &dyn ObjectStore, serving: &dyn ObjectStore, staged: &dyn ObjectStore,
-    keys: &dyn KeyService, record: &rtdb_directory::DeploymentRecord, stage: &rtdb_directory::CheckpointStage,
-    mut extras: std::collections::BTreeSet<ObjectKey>, region: Arc<IoRegion>,
-) -> Result<()> {
-    use crate::archive::{admits_seeded_transfer_payload, replica_suffix, verify_cut};
-    use crate::reference::key;
-
-    if extras.iter().any(|path| !admits_seeded_transfer_payload(record, stage, path.as_str())) {
-        return Err(inconsistent("The staged storage root differs from its accepted inventory"));
-    }
-    let bootstrap = record.checkpoint_transfer_bootstrap.as_deref()
-        .ok_or_else(|| inconsistent("The staged payloads need an ordered bootstrap"))?;
-    let terminal = &bootstrap.terminal;
-    let artifact = ReplicaArtifact::open_transfer(bucket, keys, record, terminal, region).await?;
-    let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
-    let expected = artifact.read_ordered_transfer(bootstrap.ciphertext_sha256).await?;
-    let root_key = key(&block_key(BlockIndex(stage.checkpoint.block))?)?;
-    let root = PayloadBytes::read(staged, &root_key, &memory).await?;
-    let catalog = BlockCatalog::decode(&root.bytes)?;
-    verify_cut(&catalog, stage.checkpoint, StorageEpoch(stage.source_log_epoch))?;
-    let mut fence = TermFence::from_catalog(&catalog)?;
-    let mut writer = None;
-    let mut next = transfer_first(stage)?;
-    let mut chain = artifact.chain();
-    while next <= terminal.replica_through {
-        let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
-        let entries = artifact.read_segment(next, terminal.replica_through, &mut chain).await?;
-        for entry in &entries {
-            let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, terminal.fence.source_writer_epoch)? else { continue; };
-            let Some(payload) = observe_transfer_payload(&artifact, entry.lsn, &envelope, &mut chain, &memory).await? else { continue; };
-            if replica_suffix::transfer_control(&payload.resolved, stage.checkpoint)?.is_none() && extras.remove(&payload.path)
-                && serving.get_fresh_exact(&payload.path, payload.body.bytes.len()).await? != payload.body.bytes
-            {
-                return Err(inconsistent("A staged replica payload differs from its ordered bootstrap"));
-            }
-        }
-        next += entries.len() as i64;
-    }
-    super::super::replica_artifact::require_chain(chain, expected)?;
-    if !extras.is_empty() { return Err(inconsistent("The staged storage root contains an unordered replica payload")); }
-    Ok(())
-}
-
-fn target_payload_proxy(original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8]) -> Result<bytes::Bytes> {
+fn target_payload_proxy(
+    original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8],
+    publication: Option<rtdb_types::PhysicalObjectVersion>,
+) -> Result<bytes::Bytes> {
     let rtdb_format::envelope::ReplicaBody::OversizedMessage(reference) = &original.message else {
         return Err(inconsistent("The target payload has no certified reference"));
     };
     let id = reference.payload_id.clone().ok_or_else(|| inconsistent("The target payload has no object identity"))?;
-    let proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
+    let mut proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
+    if let Some(publication) = publication {
+        proxy.bind_offload_publication(publication)?;
+    }
     Ok(proxy.encode().into())
-}
-
-async fn publish_target_payload(
-    directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, task: Option<&HostedTask>,
-    target: &rtdb_directory::DeploymentRecord, reserved: &rtdb_directory::CheckpointTransferReplica,
-    path: &ObjectKey, bytes: &bytes::Bytes,
-) -> Result<()> {
-    use crate::{
-        archive::{checkpoint_storage_root, admits_seeded_transfer_payload, stage::{RegionPublication, with_region}},
-        reference::{PrefixedStore, key}, store::{CheckpointReplayPublication, EncryptingStore},
-    };
-    let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
-    let publication = RegionPublication::CheckpointReplay(Arc::clone(directory), CheckpointReplayPublication {
-        bootstrap_sha256: reserved.bootstrap.ciphertext_sha256,
-        object: key(&format!("{root}/{path}"))?,
-    });
-    let stage = &reserved.bootstrap.terminal.fence.destination;
-    Box::pin(with_region(
-        directory.as_ref(), keys, &target.id, storage, task, None, Some(publication),
-        |current| {
-            if current.lifecycle != Lifecycle::Restoring || current.holder.is_some()
-                || current.checkpoint_transfer_replica.as_deref() != Some(reserved)
-                || !admits_seeded_transfer_payload(current, stage, path.as_str())
-            {
-                return Err(inconsistent("The target no longer owns this detached replay payload"));
-            }
-            Ok(None)
-        },
-        |current, _, io| async move {
-            let bucket = storage.bucket(io).await?;
-            let media = keys.existing_key(&current.key_id()).await?
-                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
-            let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(bucket, root)), &media)?;
-            serving.put_with_publication(path, bytes.clone()).await?;
-            if serving.get_fresh_exact(path, bytes.len()).await? != *bytes {
-                return Err(inconsistent("The target offloaded replica payload differs from its ordered artifact"));
-            }
-            Ok(())
-        },
-    )).await
 }
 
 fn transfer_first(stage: &rtdb_directory::CheckpointStage) -> Result<i64> {
@@ -483,6 +406,7 @@ pub(crate) async fn activate_checkpoint_transfer_target(
     storage: &CellStorage,
     keys: &dyn KeyService,
     selector: StageSelector,
+    broker: Option<&crate::replay_broker::Client>,
     hosted_task: Option<HostedTask>,
 ) -> Result<rtdb_directory::CheckpointTransferActivation> {
     use crate::{
@@ -508,7 +432,7 @@ pub(crate) async fn activate_checkpoint_transfer_target(
         return Ok(accepted.clone());
     }
     let replica = seed_checkpoint_transfer_target(
-        Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
+        Arc::clone(&directory), storage, keys, selector, broker, hosted_task.clone(),
     ).await?;
     let terminal = &replica.bootstrap.terminal;
     let stage = &terminal.fence.destination;

@@ -4,7 +4,7 @@
 //! The source log is the holder's in-process intake: only the holder submits, the holder alone resolves, and a resolved transaction is durable once its replica record commits, so a transaction costs one quorum append.
 //! A submission the holder had not yet resolved when it stopped was never acknowledged, and its client retries it.
 
-use std::sync::Arc;
+use std::{ops::AsyncFn, sync::Arc};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
@@ -439,7 +439,8 @@ fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
 
 /// Materializes admitted transactions up to the requested time in the confirmed replica prefix.
 pub(crate) async fn transactions_until(
-    replica: &dyn Log, store: &dyn ObjectStore, catalog: &BlockCatalog, boundary: i64, through: LogOffset, system_time: Timestamp,
+    replica: &dyn Log, catalog: &BlockCatalog, boundary: i64, through: LogOffset, system_time: Timestamp,
+    read_payload: impl AsyncFn(i64, &[u8]) -> Result<rtdb_storage::log::ReplicaPayload>,
 ) -> Result<Vec<ReplicaEnvelope>> {
     let mut kept = Vec::new();
     let mut fence = TermFence::from_catalog(catalog)?;
@@ -456,12 +457,9 @@ pub(crate) async fn transactions_until(
             let frame = ReplicaFrame::decode(&record.payload)?;
             if fence.admit(frame.term, frame.term_sequence)?.verdict != Verdict::Apply { continue; }
             let envelope = frame.into_envelope().ok_or_else(gap)?;
-            let envelope = if let Some(key) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? {
-                let key = ObjectKey::new(key)?;
-                IoRegion::retaining(Arc::new(record), async {
-                    let bytes = store.get_fresh(&key).await?;
-                    Ok::<_, Anomaly>(envelope.unwrap_payload(&bytes)?)
-                }).await?
+            let envelope = if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) {
+                let body = read_payload(record.metadata.offset.0, &record.payload).await?;
+                envelope.unwrap_payload(body.as_ref())?
             } else { envelope };
             if let ReplicaBody::ResolvedTx(tx) = envelope.message {
                 tx.checked_acceptance_stage()?;
@@ -781,14 +779,20 @@ mod tests {
         journal.enqueue(reference.encode().into(), Timestamp(10)).await.unwrap().durable().await.unwrap();
         store.put(&path, bytes).await.unwrap();
 
-        let tail = transactions_until(&journal, &store, &catalog, -1, LogOffset(1), Timestamp(10)).await.unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let read = async |position, frame: &[u8]| {
+            assert_eq!(position, 1);
+            let reference = rtdb_storage::log::ReplicaPayloadReference::from_frame(frame, CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap();
+            Ok::<_, Anomaly>(reference.read_at(&store, &memory).await?)
+        };
+        let tail = transactions_until(&journal, &catalog, -1, LogOffset(1), Timestamp(10), &read).await.unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].message, transaction.message);
 
         store.delete(&path).await.unwrap();
         store.put(&path, Bytes::from_static(b"replacement")).await.unwrap();
-        let error = transactions_until(&journal, &store, &catalog, -1, LogOffset(1), Timestamp(10)).await.unwrap_err();
-        assert_eq!(error.code, "rtdb.format/oversized-payload-mismatch");
+        let error = transactions_until(&journal, &catalog, -1, LogOffset(1), Timestamp(10), &read).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/immutable-object-conflict");
     }
 
     #[tokio::test]
@@ -797,7 +801,6 @@ mod tests {
         use rtdb_types::Term;
 
         let journal = MemoryLog::new(1024);
-        let store = rtdb_storage::MemoryStore::default();
         let catalog = BlockCatalog::from_proto(rtdb_format::block::proto::Block {
             block_index: Some(0), term_id: Some(2), boundary_term_seq: Some(0), ..Default::default()
         }).unwrap();
@@ -808,7 +811,7 @@ mod tests {
             }),
         };
 
-        let copy = transactions_until(&journal, &store, &catalog, -1, LogOffset(0), Timestamp(10));
+        let copy = transactions_until(&journal, &catalog, -1, LogOffset(0), Timestamp(10), async |_, _| unreachable!());
         tokio::pin!(copy);
         assert!(futures::poll!(copy.as_mut()).is_pending());
         journal.enqueue(transaction.encode().into(), Timestamp(10)).await.unwrap().durable().await.unwrap();
