@@ -205,6 +205,35 @@ pub fn replay_artefact_file(
     Ok(Some(slug.recorded_artefact_key(trie, record)?))
 }
 
+const DECLARED_COLUMNS: &str = "io.rtdb.sql.declared-columns.v1";
+
+pub fn schema_with_declarations(
+    schema: Schema, declarations: &rtdb_types::StructFields<rtdb_types::LogicalType>,
+) -> Result<Schema> {
+    if schema.metadata().contains_key(DECLARED_COLUMNS) {
+        return Err(invalid("The SQL declaration metadata is reserved"));
+    }
+    if declarations.is_empty() { return Ok(schema); }
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(DECLARED_COLUMNS.into(), serde_json::to_string(declarations).map_err(invalid)?);
+    Ok(schema.with_metadata(metadata))
+}
+
+pub fn schema_declarations(
+    schema: &Schema,
+) -> Result<rtdb_types::StructFields<rtdb_types::LogicalType>> {
+    schema.metadata().get(DECLARED_COLUMNS)
+        .map(|declarations| serde_json::from_str(declarations).map_err(invalid))
+        .transpose().map(Option::unwrap_or_default)
+}
+
+pub fn without_schema_declarations(schema: &Schema) -> Option<Schema> {
+    if !schema.metadata().contains_key(DECLARED_COLUMNS) { return None; }
+    let mut metadata = schema.metadata().clone();
+    metadata.remove(DECLARED_COLUMNS);
+    Some(schema.clone().with_metadata(metadata))
+}
+
 impl TableBlock {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let wire = pb::TableBlock::decode(bytes).map_err(invalid)?;
@@ -224,14 +253,31 @@ impl TableBlock {
     /// `types` supplies the Arrow schema's field types in their first-seen leg order, as the reference's block schema keeps them;
     /// the column metadata orders union legs by name. A column absent from `types` takes its metadata's type.
     pub fn from_parts(columns: BTreeMap<String, cpb::ColumnMeta>, types: &rtdb_types::StructFields<rtdb_types::LogicalType>, row_count: i64, partitions: Vec<pb::Partition>) -> Result<Self> {
+        Self::with_declarations(columns, types, &Default::default(), row_count, partitions)
+    }
+
+    pub fn with_declarations(
+        columns: BTreeMap<String, cpb::ColumnMeta>,
+        types: &rtdb_types::StructFields<rtdb_types::LogicalType>,
+        declarations: &rtdb_types::StructFields<rtdb_types::LogicalType>,
+        row_count: i64,
+        partitions: Vec<pb::Partition>,
+    ) -> Result<Self> {
         if row_count < 0 { return Err(invalid("Table row count is negative")); }
         let schema = Schema::new(columns.iter().map(|(name, column)| {
             let ty = match types.get(name) { Some(ty) => ty.clone(), None => crate::columns::logical_type(column)? };
             rtdb_columnar::to_field(name, &ty)
         }).collect::<Result<Vec<_>>>()?);
-        let arrow_schema = crate::ipc::write_schema_message(&schema)?;
+        let arrow_schema = crate::ipc::write_schema_message(&schema_with_declarations(schema, declarations)?)?;
         let column_name_to_hll = columns.iter().filter_map(|(name, column)| column.hll.as_ref().map(|hll| (name.clone(), hll.clone()))).collect();
         Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns, ..Default::default() }), charge: None })
+    }
+
+    pub fn declared_columns(&self) -> Result<rtdb_types::StructFields<rtdb_types::LogicalType>> {
+        match self.wire.arrow_schema.as_deref() {
+            Some(schema) if !schema.is_empty() => schema_declarations(&crate::ipc::read_schema_message(schema)?),
+            _ => Ok(Default::default()),
+        }
     }
 
     pub fn encoded_len(&self) -> usize { self.wire.encoded_len() }

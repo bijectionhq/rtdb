@@ -19,6 +19,7 @@
 --   A derived posting page can serve a related snapshot when its covered rows lie in both snapshots' shared prefix.
 --   One coroutine writes a transient, and it is never published mid-flight.
 --   Columnar puts retain their Arrow values alongside resolved IIDs and valid-time intervals until the events are encoded.
+--   A committed SQL declaration retains its original column types through replica replay and checkpoints separately from the types inferred from row events.
 --   A positioned owned append returns the ordinal it stored in the event header for use by the resolver's change journal.
 --   Rebuilding an unpositioned archive event leaves the original ordinal inventory available to positioned effects.
 --   A copied world effect consumes its explicit original ordinal independently of the Root effect sequence.

@@ -46,6 +46,9 @@ Local expiry alone is insufficient if a persisted wrapping remains recoverable.
 The deadline applies after commit, and preparation and provider reconciliation may take longer than 120 seconds.
 This keeps the surviving root readable through deadline expiry, including when a provider stops answering during cleanup.
 
+Committed SQL declarations retain their own schema through replay and checkpointing.
+The survivor schema joins those explicit declarations with types inferred from the surviving row events.
+
 Search artefacts do not supply ambient statistics.
 Two-argument scores therefore depend only on the resolved row and query.
 Corpus-relative queries derive their statistics from the applicable admitted rows or receive them explicitly.

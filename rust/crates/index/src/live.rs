@@ -242,6 +242,7 @@ pub struct LiveTable {
     row_count: u32,
     lineage: LiveRowLineage,
     column_types: StructFields<LogicalType>,
+    declared_columns: StructFields<LogicalType>,
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
@@ -260,12 +261,13 @@ impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), declared_columns: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn row_count(&self) -> u32 { self.row_count }
     pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
+    pub fn declared_columns(&self) -> &StructFields<LogicalType> { &self.declared_columns }
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
@@ -394,6 +396,7 @@ impl LiveTable {
         if self.last_system_time.is_some_and(|previous| previous > system_time) { return Err(invalid("Live table system time moved backwards")); }
         let mut next = self.clone();
         next.column_types = merge_column_types(&next.column_types, &write.column_types);
+        crate::catalog::add_declarations(&mut next.declared_columns, &write.declared_columns);
         if let Some(batch) = &write.batch {
             if batch.view().has_entity_keys() != self.table.is_owned_event_data() {
                 return Err(invalid("The table write has the wrong physical entity-key layout"));
@@ -488,7 +491,7 @@ impl LiveTable {
                 hlls.insert(name, combined);
             }
         }
-        Ok(TableMeta { column_types: self.column_types.clone(), row_count: i64::from(self.row_count), hlls })
+        Ok(TableMeta { column_types: self.column_types.clone(), declared_columns: self.declared_columns.clone(), row_count: i64::from(self.row_count), hlls })
     }
 }
 
@@ -545,12 +548,22 @@ impl BlockPages<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct TableWrite { column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>> }
+pub struct TableWrite {
+    column_types: StructFields<LogicalType>,
+    declared_columns: StructFields<LogicalType>,
+    batch: Option<Arc<IndexBatch>>,
+}
 impl TableWrite {
     pub fn new(column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
         let column_types = match &batch { Some(batch) => declare_column_types(batch.put_types(), &column_types), None => column_types };
-        Self { column_types, batch }
+        Self { column_types, declared_columns: StructFields::new(), batch }
     }
+    pub fn with_declarations(mut self, declared_columns: StructFields<LogicalType>) -> Self {
+        self.column_types = declare_column_types(&self.column_types, &declared_columns);
+        self.declared_columns = declared_columns;
+        self
+    }
+    pub fn declared_columns(&self) -> &StructFields<LogicalType> { &self.declared_columns }
     pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
     pub fn batch(&self) -> Option<&Arc<IndexBatch>> { self.batch.as_ref() }
     pub fn row_count(&self) -> usize { self.batch.as_ref().map_or(0, |batch| batch.len()) }
@@ -692,6 +705,7 @@ impl LiveIndex {
 #[derive(Default)]
 struct PendingTable {
     declared: StructFields<LogicalType>,
+    sql_declarations: StructFields<LogicalType>,
     events: Vec<StoredEvent>,
     batches: Vec<(usize, Arc<IndexBatch>)>,
     reservations: Vec<Arc<MemoryReservation>>,
@@ -851,6 +865,21 @@ impl TransactionBuffer {
         }
         Ok(())
     }
+    pub fn record_sql_declaration(
+        &mut self, table: &TableRef, fields: &[(String, LogicalType)],
+    ) -> Result<()> {
+        self.declare_document_types(table, fields.iter().map(|(name, ty)| (name, ty)))?;
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("SQL declaration requires an open table write"))?;
+        for (name, ty) in fields {
+            let old = pending.sql_declarations.get(name);
+            let reservation = self.budget.reserve(document_type_bytes(name, ty, old)?)?;
+            let merged = old.map_or_else(|| ty.clone(), |old| old.join(ty));
+            pending.sql_declarations.insert(name.clone(), merged);
+            pending.reservations.push(reservation);
+        }
+        Ok(())
+    }
+
     pub fn put(&mut self, table: TableRef, document: StructFields<Value>, valid_time: Interval) -> Result<()> {
         let id = document.get("_id").ok_or_else(|| invalid("Put document has no _id"))?.entity_id()?;
         self.append(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
@@ -1073,7 +1102,8 @@ impl TransactionBuffer {
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
             let batch = Some(pending.copy_since(WritePosition::default(), &self.budget)?);
-            Ok((table.clone(), TableWrite::new(pending.declared.clone(), batch)))
+            Ok((table.clone(), TableWrite::new(pending.declared.clone(), batch)
+                .with_declarations(pending.sql_declarations.clone())))
         }).collect::<Result<_>>()?;
         StagedWrite::new(self.tx_key, self.base.tx_basis(), self.base.block_index(), tables)
     }

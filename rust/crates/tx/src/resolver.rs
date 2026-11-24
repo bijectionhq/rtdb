@@ -186,7 +186,18 @@ impl ResolvedTx {
         let mut bound = 65_536usize.checked_add(db_op_bytes(self.db_op.as_ref())?).ok_or_else(overflow)?;
         for (table, write) in self.writes.tables() {
             let batch = write.batch().ok_or_else(|| Anomaly::fault("rtdb.tx/missing-table-batch", "Resolved table declaration has no Arrow batch"))?;
-            let bytes = crate::ipc::encode(batch.arrow().schema().as_ref(), [batch.arrow()], memory)?;
+            let declaration_page;
+            let page = if write.declared_columns().is_empty() {
+                batch.arrow()
+            } else {
+                let schema = rtdb_format::catalog::schema_with_declarations(
+                    batch.arrow().schema_ref().as_ref().clone(), write.declared_columns(),
+                )?;
+                declaration_page = batch.arrow().clone().with_schema(Arc::new(schema))
+                    .map_err(|error| Anomaly::incorrect("rtdb.tx/declaration-schema", error.to_string()))?;
+                &declaration_page
+            };
+            let bytes = crate::ipc::encode(page.schema_ref(), [page], memory)?;
             let name = format!("{}/{}", table.schema, table.table);
             bound = bound.checked_add(name.capacity()).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
             let (bytes, reservation) = bytes.into_parts();
@@ -919,7 +930,7 @@ impl<'a> OpenTransaction<'a> {
             Mutation::CreateTable { table, columns } => {
                 let table = table.table;
                 self.declare_table(table.clone(), columns.iter().map(|(name, _)| name.clone()))?;
-                return self.buffer.declare_document_types(&table, columns.iter().map(|(name, ty)| (name, ty)));
+                return self.buffer.record_sql_declaration(&table, &columns);
             },
             Mutation::CreateSearchIndex { name, table, columns, history, if_not_exists } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }

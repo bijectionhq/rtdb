@@ -210,6 +210,15 @@ impl Snapshot {
         self.iter_segments(table).all(|segment| segment.has_canonical_entity_iids())
     }
 
+    pub fn declared_columns(&self, table: &TableRef) -> StructFields<LogicalType> {
+        let mut declarations = self.table_catalog.metadata(table)
+            .map_or_else(StructFields::new, |metadata| metadata.declared_columns.clone());
+        if let Some(live) = self.durable.tables().get(table) {
+            crate::catalog::add_declarations(&mut declarations, live.declared_columns());
+        }
+        declarations
+    }
+
     pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> { self.column_types_for(table, self.column_names(table)) }
     pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> StructFields<LogicalType> {
         let sources: Vec<_> = self.durable.tables().get(table).into_iter().chain(self.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();

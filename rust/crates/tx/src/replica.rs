@@ -105,7 +105,22 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
         }
         let pages = crate::ipc::decode(bytes, memory)?;
         if pages.len() != 1 { return Err(invalid("Resolved transaction table must contain exactly one record batch")); }
-        let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
+        let page = pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?;
+        let schema = page.batch().schema_ref();
+        let declarations = rtdb_format::catalog::schema_declarations(schema)?;
+        if !declarations.is_empty() && message.committed != Some(true) {
+            return Err(invalid("An uncommitted transaction cannot declare columns"));
+        }
+        let page = match rtdb_format::catalog::without_schema_declarations(schema) {
+            Some(schema) => {
+                let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.batch().num_rows()));
+                let rows = arrow_array::RecordBatch::try_new_with_options(Arc::new(schema), page.batch().columns().to_vec(), &options)
+                    .map_err(|error| invalid(error.to_string()))?;
+                rtdb_columnar::OwnedBatch::with_reservation(rows, Arc::clone(page.reservation()))?
+            }
+            None => page,
+        };
+        let batch = IndexBatch::from_owned(page)?;
         let owned_data = table.is_owned_event_data();
         if !batch.is_empty() && batch.view().has_entity_keys() != owned_data {
             return Err(invalid("Resolved transaction has the wrong entity-key layout"));
@@ -120,7 +135,7 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
                 }
             }
         }
-        tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
+        tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)).with_declarations(declarations));
     }
     if held {
         return Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: None });
@@ -410,6 +425,45 @@ mod tests {
     use rtdb_format::data::StoredEvent;
     use rtdb_index::{PartitionState, TransactionBuffer};
     use rtdb_types::{EntityId, Iid, OwnedRelation};
+
+    #[test]
+    fn replica_and_checkpoint_preserve_only_explicit_declarations_as_provenance() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let state = PartitionState::empty(Default::default())?;
+        let table = TableRef::new("public", "orders");
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
+        transaction.declare_table(table.clone(), ["declared".to_owned()])?;
+        transaction.record_sql_declaration(&table, &[("declared".into(), rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Utf8))])?;
+        transaction.put(table.clone(), StructFields::from([
+            ("_id".into(), Value::Utf8("one".into())),
+            ("row_only".into(), Value::I64(7)),
+        ]), Interval::ALL)?;
+        let staged = transaction.stage()?;
+        let write = &staged.tables()[&table];
+        let batch = write.batch().unwrap().arrow();
+        let schema = rtdb_format::catalog::schema_with_declarations(batch.schema_ref().as_ref().clone(), write.declared_columns())?;
+        let batch = batch.clone().with_schema(Arc::new(schema)).unwrap();
+        let bytes = crate::ipc::encode(batch.schema_ref(), [&batch], &memory)?;
+        let mut frame = ResolvedTx {
+            tx_id: Some(key.tx_id.0),
+            src_msg_id: Some(key.tx_id.0),
+            system_time_micros: Some(key.system_time.0),
+            committed: Some(true),
+            ..Default::default()
+        };
+        frame.table_data.insert(table.schema_and_table(), bytes.as_slice().to_vec());
+        let replayed = decode_replica(&frame, None, staged.block_index(), &memory)?;
+        state.apply(&replayed.writes)?;
+        let snapshot = state.snapshot();
+        assert!(snapshot.column_types(&table).contains_key("row_only"));
+        assert_eq!(&snapshot.declared_columns(&table), write.declared_columns());
+        let prepared = state.prepare_block()?;
+        let blocks = prepared.table_blocks(&BTreeMap::new(), key.system_time)?;
+        let reopened = rtdb_format::catalog::TableBlock::decode(&blocks[&table].encode())?;
+        assert_eq!(&reopened.declared_columns()?, write.declared_columns());
+        Ok(())
+    }
 
     #[test]
     fn held_projection_preserves_the_exact_business_batch() -> Result<()> {

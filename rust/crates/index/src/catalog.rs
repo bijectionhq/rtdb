@@ -28,16 +28,26 @@ pub fn declare_column_types(rows: &StructFields<LogicalType>, declared: &StructF
     types
 }
 
+pub(crate) fn add_declarations(
+    into: &mut StructFields<LogicalType>, declarations: &StructFields<LogicalType>,
+) {
+    for (name, ty) in declarations {
+        let merged = into.get(name).map_or_else(|| ty.clone(), |old| old.join(ty));
+        into.insert(name.clone(), merged);
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableMeta {
     pub column_types: StructFields<LogicalType>,
+    pub declared_columns: StructFields<LogicalType>,
     pub row_count: i64,
     pub hlls: BTreeMap<String, Vec<u8>>,
 }
 
 impl TableMeta {
     pub fn from_block(block: &TableBlock) -> Result<Self> {
-        Ok(Self { column_types: block.column_types()?, row_count: block.row_count(),
+        Ok(Self { column_types: block.column_types()?, declared_columns: block.declared_columns()?, row_count: block.row_count(),
             hlls: block.column_hlls().into_iter().map(|(name, bytes)| (name, bytes.to_vec())).collect() })
     }
     pub fn fold(&self, delta: &Self) -> Result<Self> {
@@ -48,12 +58,14 @@ impl TableMeta {
                 Some(previous) => rtdb_format::hll::combine(previous, bytes)?, None => bytes.clone(),
             });
         }
-        Ok(Self { column_types: merge_column_types(&self.column_types, &delta.column_types),
+        let mut declared_columns = self.declared_columns.clone();
+        add_declarations(&mut declared_columns, &delta.declared_columns);
+        Ok(Self { column_types: merge_column_types(&self.column_types, &delta.column_types), declared_columns,
             row_count: self.row_count.checked_add(delta.row_count).ok_or_else(|| invalid("Table row count overflow"))?, hlls })
     }
     pub fn to_block(&self, partitions: Vec<block_pb::Partition>) -> Result<TableBlock> {
         let columns = self.column_types.iter().map(|(name, ty)| Ok((name.clone(), column_from_type(ty, self.hlls.get(name).cloned())?))).collect::<Result<_>>()?;
-        TableBlock::from_parts(columns, &self.column_types, self.row_count, partitions)
+        TableBlock::with_declarations(columns, &self.column_types, &self.declared_columns, self.row_count, partitions)
     }
     pub fn contributed_type(&self, name: &str) -> LogicalType {
         self.column_types.get(name).cloned().unwrap_or_else(|| absent_type(&self.column_types))
@@ -126,7 +138,10 @@ impl TableCatalog {
     }
     pub fn with_seeded_table(&self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut next = self.with_entries_for([table.clone()])?;
-        next.tables.entry(table).or_insert_with(|| TableMeta { column_types: columns.into_iter().map(|name| (name, LogicalType::Nothing)).collect(), ..TableMeta::default() });
+        next.tables.entry(table).or_insert_with(|| {
+            let declared_columns: StructFields<_> = columns.into_iter().map(|name| (name, LogicalType::Nothing)).collect();
+            TableMeta { column_types: declared_columns.clone(), declared_columns, ..TableMeta::default() }
+        });
         Ok(next)
     }
     pub fn with_system_tables(&self) -> Result<Self> {
