@@ -1014,7 +1014,6 @@ async fn multi_driver_releases_a_fork_pin_after_independent_destination_publicat
         cluster.store.clone(),
         cluster.kms.clone(),
         Arc::new(|| Timestamp(10)),
-        Arc::new(ClaimSealer::new(*destination_id.as_bytes(), [29; 32])),
     )
     .unwrap();
     child.create().await.unwrap();

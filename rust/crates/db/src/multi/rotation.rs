@@ -132,9 +132,10 @@ impl MultiDatabase {
                     .committed_at(self.options.database, Lsn(plan.rotation_lsn()))
                     .await?;
                 self.require_authority(lease)?;
+                let this = &mut *self;
                 let retirement = plan
-                    .finish_rotation(kms.as_ref(), committed.0, |through| async {
-                        self.trim(lease, Lsn(through)).await
+                    .finish_rotation(kms.as_ref(), committed.0, move |through| async move {
+                        this.trim(lease, Lsn(through)).await
                     })
                     .await?;
                 let armed = ArmedRotation {
