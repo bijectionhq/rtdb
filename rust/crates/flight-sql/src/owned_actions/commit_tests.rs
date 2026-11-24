@@ -13,6 +13,22 @@ fn grouped(deadline: i64, groups: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn hosted_refusal_carries_the_public_clock_version_group() {
+    let attempt = ("fact_attempts", &b"attempt"[..]);
+    let head = ("fact_publications", &b"head"[..]);
+    let clock = (rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION, &b"clock"[..]);
+    let ordinary = grouped(0, &[attempt, head]);
+    let public = grouped(0, &[attempt, head, clock]);
+    let foreign = grouped(0, &[attempt, head, ("items", b"data")]);
+
+    assert_eq!(hosted_refusal_fact_groups(&ordinary[8..]).unwrap().len(), 2);
+    let parsed = hosted_refusal_fact_groups(&public[8..]).unwrap();
+    assert_eq!(parsed[2].0.name(), clock.0);
+    assert_eq!(parsed[2].1, clock.1);
+    assert!(hosted_refusal_fact_groups(&foreign[8..]).is_err());
+}
+
+#[test]
 fn grouped_commit_frames_each_ipc_stream_in_mutation_order() {
     let body = grouped(-4, &[("items", b"first"), ("orders", b"second")]);
     let request = CommitRequest::parse(&body, CommitFormat::Grouped).unwrap();

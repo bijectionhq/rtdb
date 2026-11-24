@@ -273,6 +273,7 @@
 -- The protected membership projection reads no carrier body.
 -- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
 -- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.
+-- A public clock continuation refusal carries its public version marker through Flight and orders it with the original continuation fate.
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
 -- A replacement outside every current Root capacity predicate does not increase a covered count.
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.

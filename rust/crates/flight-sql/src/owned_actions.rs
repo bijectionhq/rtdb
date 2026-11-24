@@ -212,6 +212,15 @@ fn owned_count_conditions<'a>(call: &Call, body: &'a [u8], world: Option<rtdb_ty
     Ok((conditions, body, charges))
 }
 
+fn hosted_refusal_fact_groups(body: &[u8]) -> Result<Vec<(OwnedRelation, &[u8])>, Status> {
+    let groups = owned_groups(body, false, true)?;
+    match groups.as_slice() {
+        [_, _] => Ok(groups),
+        [_, _, (relation, _)] if relation.name() == rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION => Ok(groups),
+        _ => Err(invalid("A hosted refusal requires its original attempt and publication groups")),
+    }
+}
+
 fn ordered_group_count(body: &[u8]) -> Result<usize, Status> {
     let (count, _) = body.split_first_chunk::<2>()
         .ok_or_else(|| invalid("Ordered owned commit has no group count"))?;
@@ -1501,9 +1510,9 @@ impl Service {
                 .ok_or_else(|| invalid("Missing refusal fact stream length"))?;
             let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*len) as usize)
                 .ok_or_else(|| invalid("Truncated refusal fact stream"))?;
-            let facts = owned_groups(facts, false, true)?;
+            let facts = hosted_refusal_fact_groups(facts)?;
             let controls = owned_groups(controls, true, false)?;
-            if facts.len() != 2 || controls.is_empty() {
+            if controls.is_empty() {
                 return Err(invalid("A hosted refusal requires its original receipt groups"));
             }
             hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
