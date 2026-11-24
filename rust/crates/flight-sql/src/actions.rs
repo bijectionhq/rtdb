@@ -373,7 +373,7 @@ impl Service {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action_type == crate::owned_actions::DECIDE_WORLD_CUT_V2).await?)])
                 }
-                crate::owned_actions::DECIDE_HELD_WORLDS_V2 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2 => {
+                crate::owned_actions::DECIDE_HELD_WORLDS_V3 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2 => {
                     Ok(vec![Ok(self.decide_held_worlds_action(&call, &action.body,
                         action_type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2).await?)])
                 }

@@ -414,6 +414,13 @@ impl TableRef {
         Some(Self::new(OWNED_SCHEMA_V1, format!("{owner}-{}", relation.name())))
     }
 
+    /// Identifies purge metadata with the same owner and Root relation as the erased row.
+    pub fn owned_purge_relation(&self) -> Option<(&str, bool)> {
+        let name = self.owned_storage_name()?;
+        name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).map(|relation| (relation, true))
+            .or_else(|| name.strip_prefix(OWNED_PURGE_PREFIX).map(|relation| (relation, false)))
+    }
+
     pub fn is_owned_change_journal(&self) -> bool {
         self.owned_storage_name().is_some_and(|name| name.starts_with(OWNED_CHANGE_PREFIX))
     }

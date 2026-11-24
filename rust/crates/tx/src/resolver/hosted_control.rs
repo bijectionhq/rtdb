@@ -16,54 +16,60 @@ fn funded_booking_missing() -> Anomaly {
         "The ordered mutation seat differs from the original funded booking")
 }
 
-fn family_retirement(operation: &Operation, digest: Option<&[u8; 32]>) -> Result<Option<Option<Iid>>> {
-    let relation = match operation.owned_relation() {
-        Some(relation) if relation.root_relation().as_ref().unwrap_or(relation).name() == "fact_unit_fences" => relation,
-        _ => return Ok(None),
+fn invalid_family_fence() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/assertion-family-fence-marker", "Invalid ordered family fence marker")
+}
+
+fn family_retirement(operation: &Operation) -> Result<Option<(Option<Iid>, EntityId, [u8; 32])>> {
+    use crate::hosted_control::OwnedDocumentRow;
+
+    let Some(write) = crate::hosted_control::owned_document_write(operation) else { return Ok(None); };
+    let world = write.relation.world();
+    if write.relation.root_relation().as_ref().unwrap_or(write.relation).name() != "fact_unit_fences" {
+        return Ok(None);
+    }
+    let inventory = |phase: Option<&[u8]>, inventory: Option<&[u8]>| {
+        if phase != Some(b"BFU1\x01".as_slice()) { return None; }
+        inventory.and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
     };
-    let inventory_matches = |inventory: &[u8]| inventory.len() == 32
-        && digest.is_none_or(|digest| inventory == digest.as_slice());
-    let values_match = |rows: &crate::Documents| rows.rows().iter().filter(|row| {
-        matches!(row.get("unit_phase"), Some(Value::Binary(phase)) if phase == b"BFU1\x01")
-            && matches!(row.get("assertion_vault_inventory"), Some(Value::Binary(inventory)) if inventory_matches(inventory))
-    }).count();
-    let arrow_matches = |rows: &crate::ArrowDocuments| {
-        let mut matches = 0;
-        for row in 0..rows.row_count() {
-            let cell = |name: &str| {
-                if rows.legacy_owned_presence().is_some() {
-                    return rows.legacy_owned_cell(name, row);
-                }
-                let array = rows.array();
-                Ok(array.fields().iter().zip(array.columns())
-                    .find(|(field, _)| field.name() == name)
-                    .map(|(field, array)| rtdb_columnar::ArrowCell { field, array: array.as_ref(), row }))
-            };
-            if cell("unit_phase")?.and_then(|cell| cell.binary()) == Some(b"BFU1\x01".as_slice())
-                && cell("assertion_vault_inventory")?.and_then(|cell| cell.binary()).is_some_and(inventory_matches)
+    let mut retirement = None;
+    for row in write.documents.rows() {
+        let digest = match row {
+            OwnedDocumentRow::Values(values) => {
+                let binary = |name| match values.get(name) {
+                    Some(Value::Binary(bytes)) => Some(bytes.as_slice()),
+                    _ => None,
+                };
+                inventory(binary("unit_phase"), binary("assertion_vault_inventory"))
+            }
+            OwnedDocumentRow::Arrow(page, index) => {
+                let cell = |name| {
+                    if page.legacy_owned_presence().is_some() {
+                        return page.legacy_owned_cell(name, index);
+                    }
+                    let array = page.array();
+                    Ok(array.fields().iter().zip(array.columns())
+                        .find(|(field, _)| field.name() == name)
+                        .map(|(field, array)| ArrowCell { field, array: array.as_ref(), row: index }))
+                };
+                inventory(cell("unit_phase")?.and_then(ArrowCell::binary),
+                    cell("assertion_vault_inventory")?.and_then(ArrowCell::binary))
+            }
+        };
+        if let Some(digest) = digest {
+            if world.is_some() && (write.from, write.to) != (Some(Timestamp::MIN), Some(Timestamp::MAX))
+                || retirement.replace((world, row.id()?, digest)).is_some()
             {
-                matches += 1;
+                return Err(invalid_family_fence());
             }
         }
-        Ok::<_, Anomaly>(matches)
-    };
-    let count = match operation {
-        Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. })
-        | Operation::OwnedWriteIids { documents, .. } => values_match(documents),
-        Operation::Public(TxOp::OwnedArrowDocs { documents, .. })
-        | Operation::OwnedArrowIids { documents, .. } => arrow_matches(documents)?,
-        _ => 0,
-    };
-    match count {
-        0 => Ok(None),
-        1 => Ok(Some(relation.world())),
-        _ => Err(Anomaly::incorrect("rtdb.owned/assertion-family-fence-marker", "A family fence requires one digest-bound retirement")),
     }
+    Ok(retirement)
 }
 
 impl OpenTransaction<'_> {
     pub(super) async fn claim_assertion_family_fences(
-        &self, operations: &[Operation], replay: bool,
+        &mut self, owner: &str, operations: &[Operation], replay: bool,
     ) -> Result<()> {
         use rtdb_types::AssertionFamilyFenceMarker;
 
@@ -72,11 +78,11 @@ impl OpenTransaction<'_> {
                 Some(control),
             _ => None,
         });
-        let invalid = || Anomaly::incorrect("rtdb.owned/assertion-family-fence-marker", "Invalid ordered family fence marker");
+        let invalid = invalid_family_fence;
         let Some(control) = controls.next() else {
             if !replay {
                 for operation in operations {
-                    if family_retirement(operation, None)?.is_some() { return Err(invalid()); }
+                    if family_retirement(operation)?.is_some() { return Err(invalid()); }
                 }
             }
             return Ok(());
@@ -86,12 +92,26 @@ impl OpenTransaction<'_> {
         if replay || controls.next().is_some() { return Err(invalid()); }
         let archive = self.context.world_constraints.as_ref().ok_or_else(invalid)?;
         let mut root_erases = BTreeSet::new();
+        let mut root_relations = BTreeSet::new();
+        let mut search_markers = BTreeSet::new();
         for operation in operations {
-            if let Operation::Public(TxOp::OwnedErase { relation, id }) = operation
-                && (!relation.is_root_data() || !relation.name().ends_with("_search") || !root_erases.insert((relation, id)))
-            {
-                return Err(invalid());
+            if let Operation::Public(TxOp::OwnedErase { relation, id }) = operation {
+                if !crate::hosted_control::family_root_erase(relation) || !root_erases.insert((relation, id)) {
+                    return Err(invalid());
+                }
+                root_relations.insert(relation.name());
             }
+            if let Some(write) = crate::hosted_control::owned_document_write(operation)
+                && write.relation.name() == "fact_sealed_search_erasures"
+            {
+                if !crate::hosted_control::family_search_erase_marker(&write) { return Err(invalid()); }
+                for row in write.documents.rows() {
+                    if !search_markers.insert(row.string_id().ok_or_else(invalid)?) { return Err(invalid()); }
+                }
+            }
+        }
+        if root_relations != search_markers {
+            return Err(invalid());
         }
         let EntityId::String(id) = control.id() else { return Err(invalid()); };
         let family = AssertionFamilyFenceMarker::family_id(id).map_err(|_| invalid())?;
@@ -103,15 +123,86 @@ impl OpenTransaction<'_> {
         let marker = AssertionFamilyFenceMarker::decode(body).map_err(|_| invalid())?;
         let mut retirement = None;
         for operation in operations {
-            if let Some(line) = family_retirement(operation, Some(&marker.inventory))? {
-                if retirement.replace(line).is_some() { return Err(invalid()); }
+            if let Some((world, id, digest)) = family_retirement(operation)?
+                && (digest != marker.inventory || retirement.replace((world, id)).is_some())
+            {
+                return Err(invalid());
             }
         }
-        let retirement_world = retirement.ok_or_else(invalid)?;
+        let (retirement_world, retirement_id) = retirement.ok_or_else(invalid)?;
+        let rows = match retirement_world {
+            Some(world) => Some(self.assertion_fence_world_winner(
+                owner, operations, world, &retirement_id, marker.winner,
+            ).await?),
+            None => None,
+        };
+        let winner = match (&rows, retirement_world, &retirement_id) {
+            (Some(rows), Some(world), EntityId::String(key)) => {
+                let carrier = ArrowCell::named(rows.batch(), "sealed_payload", 0)
+                    .and_then(ArrowCell::binary).ok_or_else(invalid)?;
+                Some(super::AssertionFenceWorldWinner { world, key, carrier })
+            }
+            (None, None, _) => None,
+            _ => return Err(invalid()),
+        };
         archive.claim_assertion_family_fence(super::AssertionFenceClaim {
             database: &self.context.database, attempt, durable_predecessor: self.buffer.base_snapshot().tx_basis(),
-            family, marker, retirement_world, root_erases: &root_erases,
-        }).await
+            family, marker, winner, root_erases: &root_erases,
+        }).await?;
+        self.family_fence_admitted = true;
+        Ok(())
+    }
+
+    async fn assertion_fence_world_winner(
+        &self, owner: &str, operations: &[Operation], world: Iid, id: &EntityId, winner: rtdb_types::Position,
+    ) -> Result<OwnedBatch> {
+        use rtdb_types::WorldClockMode;
+
+        let invalid = invalid_family_fence;
+        let (record, _) = self.owned_worlds.get(&world).ok_or_else(invalid)?;
+        let relation = OwnedRelation::new("fact_unit_column_payloads")?.in_world(world)?;
+        if winner.line_generation != world.0 || record.dropped
+            || !operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::OwnedCheckWorldPurge { relation: checked, pin, .. })
+                    if checked == &relation && *pin == record.pin))
+            || !operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::OwnedPublishWorld { world: published, drop_world: false, .. })
+                    if *published == world))
+        {
+            return Err(invalid());
+        }
+        let reading = match record.mode {
+            WorldClockMode::Held { .. } => self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()),
+            WorldClockMode::Proposal => self.terms_time,
+            WorldClockMode::Retained => return Err(invalid()),
+        };
+        let context = self.context.query_context(
+            self.buffer.base_snapshot().clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+        )?;
+        let mut cursor = rtdb_query::open_owned_assertion_point(
+            context, owner, &relation, id, Some(Interval::at(reading)?), false,
+        ).await?.ok_or_else(invalid)?;
+        let mut winner_row = None;
+        while let Some(rows) = cursor.next_batch().await? {
+            match rows.batch().num_rows() {
+                0 => continue,
+                1 if winner_row.is_none() => winner_row = Some(rows),
+                _ => return Err(invalid()),
+            }
+        }
+        let rows = winner_row.ok_or_else(invalid)?;
+        let row = rows.batch();
+        let history = rtdb_query::owned_row_revision(row, 0, id, &self.context.memory)?;
+        let position = rtdb_query::owned_row_event_position(row, 0)?;
+        let ordinal = rtdb_query::owned_row_assertion_ordinal(row, 0)?.ok_or_else(invalid)?;
+        if u64::try_from(history.0).ok() != Some(winner.publication) || u64::from(ordinal.get()) != winner.ordinal.get()
+            || !operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::OwnedCheck { relation: checked, id: selected, expected: Some(expected), .. })
+                    if checked == &relation && selected == id && expected.history == history && expected.position == position))
+        {
+            return Err(invalid());
+        }
+        Ok(rows)
     }
 
     pub(super) async fn check_hosted_controls(

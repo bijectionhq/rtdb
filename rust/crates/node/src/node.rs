@@ -3776,7 +3776,11 @@ impl NativeSession {
         {
             return Err(unavailable());
         }
-        if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
+        if proposal_overlay && (sections.len() != 1
+            || root.publication.as_ref().is_some_and(|root| {
+                !family_fence || !root.writes.iter().all(rtdb_tx::proposal_family_root_write)
+                    || !root.writes.iter().any(|op| matches!(op, TxOp::OwnedErase { .. }))
+            })
             || match &sections[0].1.effect {
                 OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls, true),
                 OwnedWorldEffect::SettleProposal => !rtdb_tx::proposal_overlay_controls(&controls, false),

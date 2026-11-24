@@ -556,7 +556,9 @@ contract LogService {
         -- Ordinary and archive releases resolve pending claims against current original custody.
         -- A landing enrolls its destination and separate private link stages in a live family before provisioning either capability.
         -- A fenced family denies activation and current admission for every enrolled occurrence.
-        -- Either the Proposal original or an active landed occurrence can close the same family.
+        -- Either a bound world original or an active landed occurrence can close the same family.
+        -- A world retirement authenticates the current local carrier position and slot as well as the registered member.
+        -- A controlled Proposal retirement with Root derivatives co-orders the registered receipt, retirement digest, marker and exact Root erasures.
         -- The first family fence fixes the live positions and includes both capabilities of every pending landing in its destruction inventory.
         -- Family custody supplies a current admission check for installed publication and release owners.
         -- A family-sealed Root carrier opens only at the exact activated position and envelope under the live family.

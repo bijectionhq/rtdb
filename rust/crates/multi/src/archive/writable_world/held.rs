@@ -37,19 +37,23 @@ impl rtdb_node::WorldConstraintArchive for WorldArchive {
         if claim.attempt.scope() != expected || installed.writer_pool().is_none() {
             return Err(unavailable());
         }
-        let selected_line = claim.retirement_world.map_or_else(
+        let winner_line = claim.winner.as_ref().map_or_else(
             || crate::keys::assertion_root_line(deployment, installed.log_epoch),
-            |world| world.0,
+            |winner| winner.world.0,
         );
-        if claim.marker.selected.line_generation != selected_line {
+        if claim.marker.winner.line_generation != winner_line {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Conflict,
-                "rtdb.owned/assertion-family-fence-marker", "The retirement and selected assertion belong to different lines"));
+                "rtdb.owned/assertion-family-fence-marker", "The retirement and physical winner belong to different lines"));
         }
         let client_family = Uuid::from_bytes(claim.family);
         let family = crate::keys::family_vault_address(deployment, client_family);
         let region = rtdb_storage::IoRegion::new();
         let families = self.keys.assertion_families(region).ok_or_else(unavailable)?;
-        families.claim_fence(family, client_family, claim.marker, claim.attempt, claim.durable_predecessor, claim.root_erases).await
+        let winner = match claim.winner {
+            Some(winner) => Some((winner, self.keys.assertion_keys().ok_or_else(unavailable)?)),
+            None => None,
+        };
+        families.claim_fence(family, client_family, claim.marker, claim.attempt, claim.durable_predecessor, claim.root_erases, winner).await
     }
 
     async fn check(&self, check: rtdb_node::ArchivedWorldConstraints<'_>) -> Result<()> {

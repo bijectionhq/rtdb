@@ -886,7 +886,7 @@ The predecessor archive pin is eligible for retirement only after the order acce
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 
-`rtdb.owned.DecideHeldWorlds.v2` orders one to eight world publications with optional Root facts and checks.
+`rtdb.owned.DecideHeldWorlds.v3` orders one to eight world publications with optional Root facts and checks.
 The first byte signals an offered clock slot, final count conditions and a refusal alternative in its three low bits.
 The optional slot handle precedes a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
 Each world supplies the 16-byte world ID and original held handle, a u16 witness count and its 16-byte nonces, and a 22-byte attempt ID.
@@ -913,6 +913,11 @@ RTDB fills these from the selected source reading before checking archived and l
 The fact payload retains the authored expression for landing.
 Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
 The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
+Root kind 8 is a nonterminal controlled Proposal retirement with a separate Root publication. It uses kind 2's independent Root attempt and retains kind 5's observations and registered receipt controls.
+Its Root groups contain only the exact family inventory's search erases and their relation erasure markers.
+The same order writes the checked version 2 family marker and the digest-bearing world retirement.
+A controlled Proposal retirement without Root selectors uses kind 5 with the family marker.
+Hosted clients discover the version 3 decision and `rtdb.owned.ResolveFamilyMember.v1` through authenticated Flight ListActions.
 `rtdb.owned.SwitchPreparedProposal.v2` uses the same frame with Root kind 6 and an offered clock.
 It accepts one reviewed Proposal under the original live Root and Proposal holds.
 The submitting node evaluates its complete footprint and materializes immutable table batches against the exact installed predecessor.
@@ -1134,7 +1139,7 @@ The reply contains the signed big-endian microsecond reading and the original 40
 An accepted receipt retains that observation alongside the actual receiver observation and the offered through-position.
 A successor authenticates continuation of the same clock domain with nondecreasing epoch, sequence, and time.
 The reading is a signed big-endian microsecond count.
-`rtdb.owned.DecideHosted.v4` and `rtdb.owned.DecideHeldWorlds.v2` can use that reading with the original handle.
+`rtdb.owned.DecideHosted.v4` and `rtdb.owned.DecideHeldWorlds.v3` can use that reading with the original handle.
 The placement and session must still own the hold.
 The source append must reach the offered reading. The receiver's sampled clock must be in the half-open second starting there.
 A committed receipt keeps the exact reading and original held position alongside the unrounded receiver observation.

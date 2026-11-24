@@ -79,12 +79,13 @@ pub const ASSERTION_FAMILY_FENCES: &str = "bj_fact_assertion_family_fences";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssertionFamilyFenceMarker {
     pub selected: Position,
+    pub winner: Position,
     pub order: uuid::Uuid,
     pub inventory: [u8; 32],
 }
 
 impl AssertionFamilyFenceMarker {
-    pub const WIDTH: usize = 1 + Position::WIDTH + 16 + 32;
+    pub const WIDTH: usize = 1 + 2 * Position::WIDTH + 16 + 32;
 
     pub fn family_id(text: &str) -> Result<[u8; 16], AssertionWireError> {
         let id = uuid::Uuid::parse_str(text).map_err(|_| AssertionWireError)?;
@@ -96,20 +97,26 @@ impl AssertionFamilyFenceMarker {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, AssertionWireError> {
         let bytes: &[u8; Self::WIDTH] = bytes.try_into().map_err(|_| AssertionWireError)?;
-        let order = uuid::Uuid::from_bytes(field(bytes, 1 + Position::WIDTH));
-        let inventory = field(bytes, 1 + Position::WIDTH + 16);
-        if bytes[0] != 1 || order.is_nil() || inventory == [0; 32] {
+        let order = uuid::Uuid::from_bytes(field(bytes, 1 + 2 * Position::WIDTH));
+        let inventory = field(bytes, 1 + 2 * Position::WIDTH + 16);
+        if bytes[0] != 2 || order.is_nil() || inventory == [0; 32] {
             return Err(AssertionWireError);
         }
-        Ok(Self { selected: Position::from_bytes(field(bytes, 1))?, order, inventory })
+        Ok(Self {
+            selected: Position::from_bytes(field(bytes, 1))?,
+            winner: Position::from_bytes(field(bytes, 1 + Position::WIDTH))?,
+            order,
+            inventory,
+        })
     }
 
     pub fn to_bytes(self) -> [u8; Self::WIDTH] {
         let mut bytes = [0; Self::WIDTH];
-        bytes[0] = 1;
+        bytes[0] = 2;
         bytes[1..33].copy_from_slice(&self.selected.to_bytes());
-        bytes[33..49].copy_from_slice(self.order.as_bytes());
-        bytes[49..].copy_from_slice(&self.inventory);
+        bytes[33..65].copy_from_slice(&self.winner.to_bytes());
+        bytes[65..81].copy_from_slice(self.order.as_bytes());
+        bytes[81..].copy_from_slice(&self.inventory);
         bytes
     }
 }

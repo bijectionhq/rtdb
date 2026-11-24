@@ -43,7 +43,7 @@ use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
 mod world_constraints;
-pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, WorldConstraintArchive};
+pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, WorldConstraintArchive};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
@@ -732,6 +732,7 @@ pub struct OpenTransaction<'a> {
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
+    family_fence_admitted: bool,
     placed_attempt: Option<PlacedAttempt>,
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
@@ -739,7 +740,7 @@ pub struct OpenTransaction<'a> {
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, family_fence_admitted: false, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -2434,7 +2435,6 @@ impl<'a> OpenTransaction<'a> {
         }
         let archive_replay = replay.is_some();
         self.check_hosted_controls(operations, source_scope, replay).await?;
-        self.claim_assertion_family_fences(operations, archive_replay).await?;
         let signed_root_count = has_clock_slot && proposal_land.is_some_and(|landing| {
             landing.effect != crate::hosted_control::ProposalLandingEffect::Close
         });
@@ -2550,7 +2550,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
             }
         }
-        Ok(())
+        self.claim_assertion_family_fences(owner, operations, archive_replay).await
     }
 
     async fn read_owned_revision(&self, owner: &str, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: Interval) -> Result<Option<Timestamp>> {
@@ -2798,22 +2798,26 @@ impl<'a> OpenTransaction<'a> {
             }
             rtdb_types::OwnedChangeKind::Expired(original)
         } else { kind };
-        let search = OwnedRelation::search_catalog(owner);
-        if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
-            while let Some(batch) = rows.next_batch().await? {
-                let batch = batch.batch();
-                for row in 0..batch.num_rows() {
-                    let read = |name| {
-                        let (slot, field) = batch.schema_ref().column_with_name(name).ok_or_else(purge_path_uncovered)?;
-                        let array = batch.column(slot).as_ref();
-                        let bound = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
-                        let _charge = self.context.memory.reserve(bound.saturating_add(4096))?;
-                        rtdb_columnar::read_value(field, array, row)
-                    };
-                    let (Value::Utf8(schema), Value::Utf8(name)) = (read("schema_name")?, read("table_name")?) else {
-                        return Err(purge_path_uncovered());
-                    };
-                    if table.schema == schema && table.table == name { return Err(purge_path_uncovered()); }
+        // The original vault verified every selector. The same source writes the
+        // held search revocation marker and the relation's purge frontier.
+        if !(self.family_fence_admitted && crate::hosted_control::family_root_erase(relation)) {
+            let search = OwnedRelation::search_catalog(owner);
+            if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
+                while let Some(batch) = rows.next_batch().await? {
+                    let batch = batch.batch();
+                    for row in 0..batch.num_rows() {
+                        let read = |name| {
+                            let (slot, field) = batch.schema_ref().column_with_name(name).ok_or_else(purge_path_uncovered)?;
+                            let array = batch.column(slot).as_ref();
+                            let bound = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
+                            let _charge = self.context.memory.reserve(bound.saturating_add(4096))?;
+                            rtdb_columnar::read_value(field, array, row)
+                        };
+                        let (Value::Utf8(schema), Value::Utf8(name)) = (read("schema_name")?, read("table_name")?) else {
+                            return Err(purge_path_uncovered());
+                        };
+                        if table.schema == schema && table.table == name { return Err(purge_path_uncovered()); }
+                    }
                 }
             }
         }

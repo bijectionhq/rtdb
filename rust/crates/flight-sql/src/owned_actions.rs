@@ -337,7 +337,7 @@ pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V5: &str = "rtdb.owned.PublishHeldWorldRetention.v5";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const DECIDE_WORLD_CUT_V2: &str = "rtdb.owned.DecideWorldCut.v2";
-pub(crate) const DECIDE_HELD_WORLDS_V2: &str = "rtdb.owned.DecideHeldWorlds.v2";
+pub(crate) const DECIDE_HELD_WORLDS_V3: &str = "rtdb.owned.DecideHeldWorlds.v3";
 pub(crate) const SWITCH_PREPARED_PROPOSAL_V2: &str = "rtdb.owned.SwitchPreparedProposal.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
@@ -5436,9 +5436,10 @@ impl Service {
         if !observations.is_empty() && *root_kind >= 3 {
             return Err(invalid("Independent observers require an ordinary world batch"));
         }
+        let proposal_family_retirement = *root_kind == 8 && !prepared_proposal;
         let (root_read, body) = match *root_kind {
             0 => (None, body),
-            1 | 2 | 3 | 4 | 5 | 6 | 7 => {
+            kind if (1..=7).contains(&kind) || proposal_family_retirement => {
                 let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
                 let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
                 held.snapshot.require_unscoped_root().map_err(status)?;
@@ -5447,7 +5448,7 @@ impl Service {
             _ => return Err(invalid("Invalid Root section kind")),
         };
         let delete_root = *root_kind == 4;
-        let proposal_overlay = *root_kind == 5;
+        let proposal_overlay = *root_kind == 5 || proposal_family_retirement;
         let proposal_land = *root_kind == 6;
         if !prepared_landing::admits(proposal_land, prepared_proposal, slot.is_some()) {
             return Err(invalid("A prepared Proposal switch requires its landing and offered clock"));
@@ -5464,7 +5465,7 @@ impl Service {
             }
             rows_left = rows_left.checked_sub(1).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
             (Some(sections[0].attempt.as_str()), body)
-        } else if *root_kind == 2 {
+        } else if *root_kind == 2 || proposal_family_retirement {
             let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("Missing Root attempt identity"))?;
             let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid Root attempt identity"))?;
             if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) || !attempts.insert(attempt) {
@@ -5490,6 +5491,9 @@ impl Service {
             match &operation {
                 TxOp::OwnedCheck { relation, .. } if relation.world().is_none() && !relation.is_world_catalog() =>
                     root.checks.push(operation),
+                _ if proposal_family_retirement && rtdb_tx::proposal_family_root_write(&operation) =>
+                    root_writes.push(operation),
+                _ if proposal_family_retirement => return Err(invalid("Operation is outside the Proposal family retirement")),
                 _ if root_attempt.is_some() && (rtdb_tx::is_root_partition_frontier(&operation) || rtdb_tx::is_public_root_version_marker(&operation)) =>
                     root_writes.push(operation),
                 _ if proposal_land && rtdb_tx::is_proposal_landing_frontier(&operation) =>
@@ -5517,7 +5521,7 @@ impl Service {
         root.clock_slot = slot;
         root.proposal_land = proposal_land;
         root.proposal_close = proposal_close;
-        if (proposal_overlay && !proposal_eligible) || (terminal_proposal && !proposal_overlay) {
+        if (proposal_overlay && !proposal_eligible) || (terminal_proposal && (!proposal_overlay || proposal_family_retirement)) {
             return Err(invalid("Registered settlement requires one witnessed Proposal overlay"));
         }
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
@@ -5548,6 +5552,11 @@ impl Service {
         let (mut controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left,
             !family_fence && !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
         rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
+        if proposal_family_retirement && !controls.iter().any(rtdb_tx::HostedControlWrite::is_assertion_family_marker)
+            || prepared_proposal && controls.iter().any(rtdb_tx::HostedControlWrite::is_assertion_family_marker)
+        {
+            return Err(invalid("The decision has no matching family retirement marker"));
+        }
         let _refusal_charge = if !refusal.is_empty() {
             hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
             let (refusal, charge) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;

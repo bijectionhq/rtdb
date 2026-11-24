@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::keys::{
     AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, KeyService, LandingLink,
-    LandingReservation, WorldRowSlot, assertion_root_line, family_vault_address, world_row_scope,
+    LandingReservation, WorldRowSlot, assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment,
 };
 
 struct Scope {
@@ -106,7 +106,8 @@ impl Scope {
     fn enrolled_row(&self, row: &WorldRowAuthoring) -> Result<EnrolledWorldRow> {
         Ok(EnrolledWorldRow {
             world: row.world, assertion: row.assertion, capability: self.stage(row.stage)?,
-            scope_commitment: world_row_scope(row_slot(row), &row.disclosure), codec: row.codec,
+            scope_commitment: world_row_scope(row_slot(row), &row.disclosure),
+            slot_commitment: world_row_slot_commitment(row_slot(row)), codec: row.codec,
         })
     }
 

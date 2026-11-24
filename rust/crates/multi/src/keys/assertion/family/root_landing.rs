@@ -195,6 +195,7 @@ mod tests {
             assertion: original.assertion,
             capability: original.capability,
             scope_commitment: [8; 32],
+            slot_commitment: [9; 32],
             codec: 1,
         }).await?;
         families.register(family, original).await?;
