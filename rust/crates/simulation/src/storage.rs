@@ -1,6 +1,6 @@
 //! A deterministic simulation of a cell's storage lifecycle: deployments writing through their real store stacks, releasing, forking (now and at a past block), being reaped, deleted and moved between cells.
 //!
-//! Driven for real, against `rtdb_storage::MemoryStore` buckets: `store::open_deployment_store` (prefixed, referencing when forked, packing, garbage), `reference::fork`, `reference::written_at_ms`, `store::reaper_pass`, `reference::simulate_erase_deployment` and `reference::materialize`.
+//! Driven for real, against `rtdb_storage::MemoryStore` buckets: `store::open_deployment_store` (prefixed, referencing when forked, packing, garbage), `reference::simulate_fork`, `reference::written_at_ms`, `store::reaper_pass`, `reference::simulate_erase_deployment` and `reference::simulate_materialize`.
 //! Modelled: what each deployment should read, and the admin sequences around the real calls (a fork flushes its parent first; a fork at a past block is refused once the block is as old as the reaper's grace; a move fences the holder, losing what it held back).
 //! Time is a simulated clock, which the stores stamp releases and packs from through the real `store::stamps`, so a run is a pure function of its seed.
 
