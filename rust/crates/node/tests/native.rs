@@ -1821,13 +1821,14 @@ async fn bitemporal_sql_matches_ordered_history_through_flush_compaction_and_res
         let mut settings = options();
         settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
         settings.query.bypass_temporal_pruning = bypass;
-        let runtime = services();
+        let clock = Arc::new(ReplayTestClock(AtomicI64::new(events[0].system)));
+        let runtime = NodeServices { clock: clock.clone(), ..services() };
         let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         let database = node.catalog().database("xtdb").unwrap();
         for (index, event) in events.iter().enumerate() {
-            let options = AutonomousTxOptions { system_time: Some(Timestamp(event.system)), ..Default::default() };
-            let outcome = session.state_mut().execute_tx(vec![event.operation(&node)], options).await.unwrap();
+            clock.0.store(event.system, Ordering::SeqCst);
+            let outcome = session.state_mut().execute_tx(vec![event.operation(&node)], AutonomousTxOptions::default()).await.unwrap();
             assert!(outcome.committed(), "{:?}", outcome.error());
             assert_eq!(outcome.tx_key().system_time, Timestamp(event.system));
             let prefix = &events[..=index];
@@ -2986,7 +2987,6 @@ async fn catalog_transactions_advance_system_time_and_replay_in_order() {
         settings.membership = Membership::Durable {
             primary: local_database(directory.path()), skipped: BTreeSet::from(["secondary".into()]),
         };
-        // A client time may not lead the log, so the head passes the log clock only when that clock steps back.
         struct SteppedClock(AtomicI64);
         impl Clock for SteppedClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
         let first_time = Timestamp(1_000_000_000);
@@ -3000,9 +3000,7 @@ async fn catalog_transactions_advance_system_time_and_replay_in_order() {
         let (node, driver) = running(settings.clone(), boot()).await;
         let token = CancellationToken::new();
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
-        let put = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions {
-            system_time: Some(first_time), ..Default::default()
-        }).await.unwrap();
+        let put = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap();
         assert!(put.committed());
         assert_eq!(put.tx_key().system_time, first_time);
         clock.0.store(1_000_000, Ordering::Relaxed);
@@ -4635,34 +4633,6 @@ async fn a_private_replay_marker_covers_out_of_order_samples_and_survives_restar
         drop(session);
         stop(&reopened, driver).await;
     }).await.unwrap();
-}
-
-#[tokio::test]
-async fn a_keyed_transaction_rejected_before_its_duplicate_guard_keeps_its_error() {
-    let (node, driver) = running(options(), services()).await;
-    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
-    let metadata = rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
-        ("idempotency_key".into(), Value::Utf8("order-1".into())),
-    ])), node.memory()).unwrap();
-    let original = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions {
-        user_metadata: Some(metadata.clone()),
-        ..AutonomousTxOptions::default()
-    }).await.unwrap();
-    assert!(original.committed());
-    let retry = session.state_mut().submit_tx(vec![put(&node, 2, 20)], AutonomousTxOptions {
-        system_time: Some(original.tx_key().system_time),
-        user_metadata: Some(metadata),
-        ..AutonomousTxOptions::default()
-    }).await.unwrap();
-    let cancellation = CancellationToken::new();
-    let result = node.await_transaction("xtdb", retry.tx_id, &Authority, &cancellation).await.unwrap();
-    assert_eq!(result.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
-    assert!(session.state_mut().execute_tx(vec![put(&node, 3, 30)], AutonomousTxOptions::default()).await.unwrap().committed());
-    let delayed = node.await_transaction("xtdb", retry.tx_id, &Authority, &cancellation).await.unwrap();
-    assert_eq!(delayed.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
-    assert_eq!(delayed.tx_key(), result.tx_key());
-    drop(session);
-    stop(&node, driver).await;
 }
 
 #[tokio::test]

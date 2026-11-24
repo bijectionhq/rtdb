@@ -170,7 +170,7 @@ fn decode_operations(bytes: Option<&[u8]>, memory: &Arc<MemoryBudget>) -> Result
 fn source_message(message: Option<&SourceMessage>) -> Result<(&'static str, String)> {
     Ok(match message {
         Some(SourceMessage::LegacyTransaction(_)) => ("legacy-tx", edn::map([("type", ":legacy-tx".into())])),
-        Some(SourceMessage::Protobuf(SourceBody::Tx(tx))) => ("tx", edn::map([("type", ":tx".into()), ("default-tz", edn::quoted(tx.default_tz.as_deref().unwrap_or("UTC"))), ("user", tx.user.as_deref().map_or("nil".into(), edn::quoted)), ("system-time", tx.system_time_micros.map_or("nil".into(), edn::instant))])),
+        Some(SourceMessage::Protobuf(SourceBody::Tx(tx))) => ("tx", edn::map([("type", ":tx".into()), ("default-tz", edn::quoted(tx.default_tz.as_deref().unwrap_or("UTC"))), ("user", tx.user.as_deref().map_or("nil".into(), edn::quoted))])),
         Some(SourceMessage::Protobuf(SourceBody::FlushBlock(block))) => ("flush-block", edn::map([("type", ":flush-block".into()), ("expected-block-idx", block.expected_block_idx.unwrap_or_default().to_string())])),
         Some(SourceMessage::Protobuf(SourceBody::TriesAdded(tries))) => ("tries-added", tries_message(tries, false)),
         Some(SourceMessage::Protobuf(SourceBody::AttachDatabase(attach))) => ("attach-database", edn::map([("type", ":attach-database".into()), ("db-name", edn::quoted(attach.db_name.as_deref().unwrap_or_default())), ("config", edn::quoted(&format!("{:?}", attach.config)))])),

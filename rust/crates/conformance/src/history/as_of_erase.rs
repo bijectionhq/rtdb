@@ -83,18 +83,18 @@ async fn observe_node(node: &Node, clock: &FixtureClock, fixture: &Fixture, put_
     let mut session = node.session("xtdb", Arc::new(Identity))?;
     let put = TxOp::PutDocs { table: table.clone(), documents: Documents::new(documents, node.memory())?,
         valid_from: None, valid_to: None };
-    let put = session.state_mut().execute_tx(vec![put], AutonomousTxOptions { system_time: Some(put_time), ..Default::default() }).await?;
+    let put = session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await?;
     if !put.committed() || put.tx_key().system_time != put_time {
-        return Err("erase fixture put did not commit at its requested system time".into());
+        return Err("erase fixture put did not commit at its fixture clock reading".into());
     }
     flush(node).await?;
     let put_block = require_layout(node, &mut session, &table, put.tx_key(), false).await?;
 
     clock.0.store(erase_time.0, Ordering::SeqCst);
     let erase = TxOp::EraseDocs { table: table.clone(), ids: EntityIds::new(vec![erased], node.memory())? };
-    let erase = session.state_mut().execute_tx(vec![erase], AutonomousTxOptions { system_time: Some(erase_time), ..Default::default() }).await?;
+    let erase = session.state_mut().execute_tx(vec![erase], AutonomousTxOptions::default()).await?;
     if !erase.committed() || erase.tx_key().system_time != erase_time {
-        return Err("erase fixture erase did not commit at its requested system time".into());
+        return Err("erase fixture erase did not commit at its fixture clock reading".into());
     }
     if require_layout(node, &mut session, &table, erase.tx_key(), true).await? != put_block {
         return Err("erase fixture moved to a later block before its live queries".into());

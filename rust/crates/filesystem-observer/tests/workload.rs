@@ -17,7 +17,7 @@ fn production_parser_separates_literal_management_words_from_actual_management()
 
 #[test]
 fn begin_and_fixed_generated_controls_have_explicit_policy_roles() {
-    assert!(proof("begin","BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2100-01-03T00:00:00.000001+00:00')").is_ok());
+    assert!(proof("begin","BEGIN READ WRITE WITH (METADATA = 1)").is_ok());
     assert!(proof("begin","BEGIN; ATTACH DATABASE escape").is_err());
     assert!(proof("read","SET AWAIT_TOKEN = 'value'").is_err());
     assert!(proof("generated","SET AWAIT_TOKEN = 'value''; ATTACH DATABASE escape'").is_ok());

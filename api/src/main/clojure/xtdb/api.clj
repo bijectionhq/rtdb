@@ -164,13 +164,14 @@
    (into [] (plan-q node query opts))))
 
 (defn- begin-rw-sql [{:keys [system-time default-tz async? metadata]}]
+  (when (some? system-time)
+    (throw (err/incorrect :xtdb/invalid-tx-option "System time is assigned by the store")))
   (let [kvs (->> [["TIMEZONE = ?" (some-> default-tz str)]
-                  ["SYSTEM_TIME = ?" system-time]
                   ["METADATA = ?" metadata]]
                  (into [] (filter (comp some? second))))]
-    (into [(format "BEGIN READ WRITE WITH (%s, ASYNC = %s)"
-                   (str/join ", " (map first kvs))
-                   (boolean async?))]
+    (into [(str "BEGIN READ WRITE WITH ("
+                (str/join ", " (cons (str "ASYNC = " (boolean async?)) (map first kvs)))
+                ")")]
           (map second)
           kvs)))
 
@@ -285,10 +286,6 @@
        - a table in another database is unreachable;
          referring to one reports that the table was not found
 
-   - :system-time
-     overrides system-time for the transaction,
-     mustn't be earlier than any previous system-time
-
    - :default-tz
      overrides the default time zone for the transaction,
      should be an instance of java.time.ZoneId
@@ -344,10 +341,6 @@
          so `INSERT INTO other_db.foo` writes to schema `other_db` here
        - a table in another database is unreachable;
          referring to one reports that the table was not found
-
-   - :system-time
-     overrides system-time for the transaction,
-     mustn't be earlier than any previous system-time
 
    - :default-tz
      overrides the default time zone for the transaction,

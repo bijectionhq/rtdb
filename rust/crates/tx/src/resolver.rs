@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bounded_retry::is_bounded_receipts_table;
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
-use crate::system_time::{SourceTime, TimeRejection};
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
@@ -339,7 +338,7 @@ impl TxResolver {
                 count += usize::from(is_slot);
                 !is_slot
             });
-            if count != 1 || request.options.system_time.is_some() || request.guard.is_some()
+            if count != 1 || request.guard.is_some()
                 || request.idempotency_key().is_some() || attempt.is_none()
                 || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
                 || !request.operations.iter().any(|operation| matches!(operation,
@@ -361,18 +360,9 @@ impl TxResolver {
             crate::system_time::clock_slot_time(slot, self.resolved_head, log_time, observed)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"))
         }).transpose();
-        let clock_request = match request.options.system_time {
-            None => SourceTime::Automatic,
-            Some(requested) if has_owned_operations => SourceTime::ExactOwnedPublication(requested.0),
-            Some(requested) => SourceTime::ExactSystem {
-                requested: requested.0,
-                require_current_append: request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time),
-            },
-        };
-        let selected_time = clock_request.select(self.previous_system_time(), log_time.0, default_time.0);
         let key = TransactionKey {
             tx_id: TxId(position.0),
-            system_time: Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
+            system_time: default_time,
         };
         let slot_reading = slot_time.as_ref().ok().copied().flatten();
         let terms_time = slot_reading.unwrap_or(key.system_time);
@@ -381,7 +371,7 @@ impl TxResolver {
         ));
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
-        let placement = if selected_time.is_ok() && slot_time.is_ok() {
+        let placement = if slot_time.is_ok() {
             request.place_owned_periods(acceptance_relative, placed_periods)
                 .and_then(|()| request.place_proposal_keys(terms_time, placed_periods))
         } else {
@@ -431,27 +421,11 @@ impl TxResolver {
             && !request.operations.iter().all(Operation::is_owned)
         {
             Err(Anomaly::incorrect("rtdb.owned/mixed-transaction", "Owned and ordinary writes require separate transactions"))
-        } else if let Err(rejection) = selected_time {
-            let (requested, error) = match rejection {
-                TimeRejection::BehindHistory(requested) => (requested,
-                    Anomaly::incorrect("invalid-system-time", "specified system-time precedes the current history")
-                        .with_context("latest-completed-tx", tx_key_context(self.resolved_head.expect("a nonadvancing time has a predecessor"))?)),
-                TimeRejection::RepeatedOwnedPublication(requested) => (requested,
-                    Anomaly::incorrect("invalid-system-time", "An owned publication requires a distinct history coordinate")
-                        .with_context("latest-completed-tx", tx_key_context(self.resolved_head.expect("an existing coordinate has a predecessor"))?)),
-                TimeRejection::AheadOfAppend(requested) => (requested,
-                    Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
-                        .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?)),
-                TimeRejection::BehindAppend(requested) => (requested,
-                    Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
-                        .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?)),
-            };
-            Err(error.with_context("tx-key", tx_key_context(TransactionKey { tx_id: key.tx_id, system_time: Timestamp(requested) })?))
         } else if staging_deadline.is_some() && (attempt.is_none() || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
             || request.guard.is_some() || request.idempotency_key().is_some()) {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
         } else if let Some(generation) = request.prepared_landing.take() {
-            if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
+            if request.guard.is_some() || request.options.user_metadata.is_some() {
                 return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
             }
             if primary.iter().any(|operation| matches!(operation,

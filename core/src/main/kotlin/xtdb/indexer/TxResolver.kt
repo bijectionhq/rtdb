@@ -14,7 +14,6 @@ import xtdb.api.TransactionResult.Aborted
 import xtdb.api.TransactionResult.Committed
 import xtdb.api.error.Anomaly
 import xtdb.api.error.Fault
-import xtdb.api.error.Incorrect
 import xtdb.api.log.DbOp
 import xtdb.api.log.SourceMessage
 import xtdb.api.tx.ExternalSourceToken
@@ -40,7 +39,6 @@ import java.nio.channels.Channels
 import java.time.Instant
 import java.time.InstantSource
 import java.time.ZoneId
-import java.time.ZonedDateTime
 
 private val SKIPPED_EXN: Throwable = Fault("Transaction was skipped", "xtdb/skipped-tx")
 
@@ -193,7 +191,6 @@ internal class TxResolver(
         msgId: MessageId,
         msgTimestamp: Instant,
         txOps: VectorReader?,
-        systemTime: Instant?,
         defaultTz: ZoneId?,
         user: String?,
         userMetadata: Any?,
@@ -206,31 +203,10 @@ internal class TxResolver(
 
         // If lc-tx's systemTime >= msgTimestamp, bump past it by 1µs; otherwise use msgTimestamp.
         // (`+1000ns` is `+1µs`.)
-        val defaultSystemTime: Instant = lcTx?.systemTime?.let { lcSysTime ->
+        val effectiveSystemTime: Instant = lcTx?.systemTime?.let { lcSysTime ->
             if (lcSysTime >= msgTimestamp) lcSysTime.plusNanos(1_000) else null
         } ?: msgTimestamp
 
-        // Equal is rejected as well as older — a read basis names a tx by its system-time, so two txs
-        // sharing one leaves it ambiguous (#6086).
-        // The aborted tx-key uses the *default* (smoothed) systemTime, not the rejected one,
-        // so the tx-key still satisfies the monotonicity invariant.
-        if (systemTime != null && lcTx != null && systemTime <= lcTx.systemTime) {
-            val err = Incorrect(
-                "specified system-time must be later than current tx",
-                "invalid-system-time",
-                mapOf(
-                    "tx-key" to TransactionKey(msgId, systemTime),
-                    "latest-completed-tx" to lcTx,
-                ),
-            )
-            LOG.warn { "specified system-time '$systemTime' not later than current tx '$lcTx'" }
-
-            return@withSpan stageStandaloneTx(
-                msgId, TransactionKey(msgId, defaultSystemTime), err, userMetadataMap, countError = true
-            )
-        }
-
-        val effectiveSystemTime = systemTime ?: defaultSystemTime
         val txKey = TransactionKey(msgId, effectiveSystemTime)
 
         if (txOps == null)
@@ -273,7 +249,7 @@ internal class TxResolver(
 
         bufferPool.putObjectSync("skipped-txs/${msgId.asLexDec}".asPath, ByteBuffer.wrap(payload))
 
-        return indexSourceLogTx(msgId, msgTimestamp, null, null, null, null, null)
+        return indexSourceLogTx(msgId, msgTimestamp, null, null, null, null)
     }
 
     fun indexTx(msgId: MessageId, msgTimestamp: Instant, msg: SourceMessage.Tx): ResolvedTx {
@@ -289,7 +265,7 @@ internal class TxResolver(
                     indexSourceLogTx(
                         msgId, msgTimestamp,
                         rel["tx-ops"],
-                        msg.systemTime, msg.defaultTz, msg.user, userMetadata
+                        msg.defaultTz, msg.user, userMetadata
                     )
                 }
             }
@@ -304,7 +280,6 @@ internal class TxResolver(
                 Relation(allocator, loader.schema).use { rel ->
                     loader.loadNextPage(rel)
 
-                    val systemTime = (rel["system-time"].getObject(0) as ZonedDateTime?)?.toInstant()
                     val defaultTz = (rel["default-tz"].getObject(0) as String?).let { ZoneId.of(it) }
                     val userMetadata = rel.vectorForOrNull("user-metadata")?.getObject(0)
                     val user = rel.vectorForOrNull("user")?.getObject(0) as String?
@@ -312,7 +287,7 @@ internal class TxResolver(
                     indexSourceLogTx(
                         msgId, msgTimestamp,
                         rel["tx-ops"].listElements,
-                        systemTime, defaultTz, user, userMetadata
+                        defaultTz, user, userMetadata
                     )
                 }
             }

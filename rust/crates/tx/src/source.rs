@@ -249,7 +249,7 @@ impl SourceTransaction {
         let (pages, mut options, guard, legacy, abort_on_legacy_resolver) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
-                let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, system_time: tx.system_time_micros.map(Timestamp), user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
+                let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
                 let guard = match (&tx.idempotency_guard, &tx.replay_submission, &tx.bounded_retry) {
                     (Some(guard), None, None) => {
                         let submitted_at = Timestamp(guard.submitted_at_micros.ok_or_else(|| invalid("Idempotency guard has no submission timestamp"))?);
@@ -305,7 +305,9 @@ impl SourceTransaction {
                 })?;
             parsed_fields.grow_to(bound)?;
             options.default_tz = match cell(first.batch(), "default-tz", 0)? { Value::Utf8(value) => value, _ => return Err(invalid("Legacy transaction has no timezone")) };
-            options.system_time = optional_timestamp(cell(first.batch(), "system-time", 0)?)?;
+            if !matches!(optional_cell(first.batch(), "system-time", 0)?, Value::Null | Value::Undefined) {
+                return Err(invalid("The source transaction cannot supply system time"));
+            }
             options.user = optional_string(optional_cell(first.batch(), "user", 0)?)?;
             let metadata = optional_cell(first.batch(), "user-metadata", 0)?;
             if !matches!(metadata, Value::Null | Value::Undefined) { options.user_metadata = Some(UserMetadata::new(metadata, memory)?); }
@@ -345,7 +347,6 @@ impl SourceTransaction {
         let batch = self.operation_batch(None, SourcePurpose::Receipt)?;
         field(crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?.as_slice());
         field(self.options.default_tz.as_bytes());
-        field(&self.options.system_time.map_or([0; 9], |time| { let mut bytes = [1; 9]; bytes[1..].copy_from_slice(&time.0.to_be_bytes()); bytes }));
         if let Some(Value::Struct(fields)) = self.options.user_metadata.as_ref().map(UserMetadata::value) {
             let mut rest = fields.clone();
             rest.remove("idempotency_key");
@@ -403,7 +404,7 @@ impl SourceTransaction {
         let (tx_ops, _tx_ops_reservation) = bytes.into_parts();
         let (user_metadata, _user_metadata_reservation) = metadata.map(RetainedBytes::into_parts).unzip();
         let tx = rtdb_format::generated::xtdb::log::proto::Tx {
-            tx_ops: Some(tx_ops), system_time_micros: self.options.system_time.map(|time| time.0),
+            tx_ops: Some(tx_ops),
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
             user_metadata, external_source_token: None,
             idempotency_guard,

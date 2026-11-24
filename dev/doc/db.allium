@@ -464,7 +464,6 @@ variant TxMessage : SourceMessage {
     -- An existing marker can resolve the duplicate before operation execution.
     -- Execution of the assertion aborts the transaction before any user operation.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
-    system_time: Timestamp?
     default_tz: ZoneId               -- always present
     user: String?
     user_metadata: Bytes?
@@ -985,7 +984,6 @@ rule ClientSubmitsTransaction {
 
     ensures:
         let msg = TxMessage.created(
-            system_time: opts.system_time,
             default_tz: opts.default_tz,
             user: opts.user,
             user_metadata: opts.user_metadata
@@ -1027,8 +1025,7 @@ rule LeaderProcessesTx {
     ensures:
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
-        -- A transaction with rtdb_ordered_system_time enabled in user metadata aborts before evaluating mutations if its requested system time precedes the source message timestamp.
-        -- The refused transaction uses the normally assigned system time, so it still advances the resolved head.
+        -- The resolver assigns SQL history time from the source append observation and its preceding history coordinate.
         -- A version-one bounded application retry carries an exclusive cutoff and a nonce in a dedicated source field.
         -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
         -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.

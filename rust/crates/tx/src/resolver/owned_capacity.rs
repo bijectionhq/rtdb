@@ -398,14 +398,6 @@ impl OpenTransaction<'_> {
         {
             return Err(unavailable());
         }
-        if self.options.system_time.is_some() && !self.options.user_metadata.as_ref()
-            .is_some_and(UserMetadata::requires_ordered_system_time)
-        {
-            return Err(Anomaly::incorrect(
-                "rtdb.owned/ordered-system-time",
-                "Hosted capacity publication requires the ordered system clock",
-            ));
-        }
         let context = self.context.query_context(
             self.buffer.base_snapshot(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
         )?;

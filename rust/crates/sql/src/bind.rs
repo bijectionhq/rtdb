@@ -505,7 +505,7 @@ impl Context<'_> {
                         _ => return Err(grammar_rejected("A transaction isolation level other than the four standard levels")),
                     }
                 }
-                Statement::Begin { access_mode, system_time: None }
+                Statement::Begin { access_mode }
             }
             ast::Statement::Commit { chain, .. } if !chain => Statement::Commit,
             ast::Statement::Rollback { chain, savepoint, .. } if !chain && savepoint.is_none() => Statement::Rollback,

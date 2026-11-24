@@ -201,7 +201,7 @@ mod owner_tests {
         assert_eq!(options.clock_time, Some(rtdb_plan::ControlValue::TimestampLiteral("2020-01-01T00:00:00Z".into())));
 
         for (source, first_error) in [
-            ("BEGIN READ WRITE, METADATA first_unknown(), SYSTEM_TIME second_unknown()", "second_unknown"),
+            ("BEGIN READ WRITE, TIMEZONE first_unknown(), METADATA second_unknown()", "first_unknown"),
             ("BEGIN READ ONLY, CLOCK_TIME TIMESTAMP 'bad', TIME ZONE first_unknown()", "first_unknown"),
         ] {
             let parsed = parse_control_syntax_in(source, &budget).unwrap().unwrap();

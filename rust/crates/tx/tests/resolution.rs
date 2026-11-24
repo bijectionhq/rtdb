@@ -81,26 +81,6 @@ async fn ordinary_sql_orders_at_a_tied_history_coordinate_after_a_regression() {
 }
 
 #[tokio::test]
-async fn explicit_system_time_may_tie_and_never_leads_its_original_append() {
-    let context = context();
-    let state = PartitionState::empty(Default::default()).unwrap();
-    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![], &context), &context).await.unwrap();
-    state.apply(first.writes()).unwrap();
-    resolver.take_head().unwrap();
-    for (position, appended, committed) in [(1, 100, true), (2, 99, false)] {
-        let options = SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() };
-        let request = SourceTransaction::new(vec![], options, &context.memory).unwrap();
-        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), request, &context).await.unwrap();
-        assert_eq!(resolved.result().committed(), committed);
-        assert_eq!(resolved.result().tx_key().system_time, Timestamp(100));
-        if !committed { assert_eq!(resolved.result().error().unwrap().code, "rtdb/future-system-time"); }
-        state.apply(resolved.writes()).unwrap();
-        resolver.take_head().unwrap();
-    }
-}
-
-#[tokio::test]
 async fn sql_source_replay_keeps_unreached_parameter_cells_in_arrow() {
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -335,41 +315,14 @@ impl rtdb_plan::ExecutionObserver for Metrics {
 }
 
 #[tokio::test]
-async fn ingestion_metrics_count_abort_and_invalid_time_but_exclude_skipped_transaction() {
+async fn ingestion_metrics_count_aborts_but_exclude_skipped_transactions() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let metrics = Arc::new(Metrics::default()); let mut context = context(); context.execution_observer = Some(metrics.clone());
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("ASSERT FALSE")], &context), &context).await.unwrap();
     resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).await.unwrap();
-    let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() }, &context.memory).unwrap();
-    resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request, &context).await.unwrap();
+    resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request(vec![sql("ASSERT FALSE")], &context), &context).await.unwrap();
     assert_eq!(metrics.0.load(std::sync::atomic::Ordering::Relaxed), 2);
-}
-
-#[tokio::test]
-async fn guarded_system_time_cannot_precede_the_source_log() {
-    let state = PartitionState::empty(Default::default()).unwrap();
-    let context = context();
-    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let metadata = UserMetadata::new(
-        Value::Struct(StructFields::from([("rtdb_ordered_system_time".into(), Value::Bool(true))])),
-        &context.memory,
-    ).unwrap();
-    let guarded = |time| SourceTransaction::new(
-        vec![put(&context, 9, 0, i64::MAX)],
-        SubmitOptions { system_time: Some(Timestamp(time)), user_metadata: Some(metadata.clone()), ..Default::default() },
-        &context.memory,
-    ).unwrap();
-
-    let aborted = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), guarded(99), &context).await.unwrap();
-    assert_eq!(aborted.result().error().unwrap().code, "rtdb/ordered-system-time");
-    assert_eq!(aborted.result().tx_key().system_time, Timestamp(100));
-    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")]);
-
-    let committed = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), guarded(101), &context).await.unwrap();
-    assert!(committed.result().committed());
-    assert_eq!(committed.result().tx_key().system_time, Timestamp(101));
-    assert_eq!(committed.writes().tables()[&table()].batch().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -641,10 +594,9 @@ async fn indexer_cleans_up_aborted_transactions_2489_and_advances_the_clock() {
     assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
     let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(50), request(vec![], &context), &context).await.unwrap();
     assert_eq!(next.result().tx_key().system_time, Timestamp(101));
-    let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(101)), ..Default::default() }, &context.memory).unwrap();
-    let invalid = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(50), request, &context).await.unwrap();
-    assert_eq!(invalid.result().error().unwrap().code, "invalid-system-time");
-    assert_eq!(invalid.result().tx_key().system_time, Timestamp(102));
+    let following = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(50), request(vec![], &context), &context).await.unwrap();
+    assert!(following.result().committed());
+    assert_eq!(following.result().tx_key().system_time, Timestamp(102));
 }
 
 #[tokio::test]
@@ -790,41 +742,21 @@ async fn resolved_series_dml_uses_the_resolving_nodes_endpoint_policy() {
 }
 
 #[tokio::test]
-async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_clock() {
-    let state = PartitionState::empty(Default::default()).unwrap();
-    let context = context();
-    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let at = |time| SourceTransaction::new(vec![put(&context, 3, 0, i64::MAX)], SubmitOptions { system_time: Some(Timestamp(time)), ..Default::default() }, &context.memory).unwrap();
-
-    for (position, requested) in [(0, 101), (1, i64::MAX)] {
-        let refused = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(100), at(requested), &context).await.unwrap();
-        assert_eq!(refused.result().error().unwrap().code, "rtdb/future-system-time");
-        assert!(refused.result().tx_key().system_time.0 <= 101, "a refused time never becomes the head");
-        assert_eq!(refused.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
-    }
-    let at_log = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(200), at(200), &context).await.unwrap();
-    assert!(at_log.result().committed());
-    assert_eq!(at_log.result().tx_key().system_time, Timestamp(200));
-    let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(3), Timestamp(300), request(vec![], &context), &context).await.unwrap();
-    assert_eq!(next.result().tx_key().system_time, Timestamp(300), "automatic time follows the log once no client time leads it");
-}
-
-#[tokio::test]
-async fn explicit_owned_time_keeps_its_append_bound_and_does_not_manufacture_a_successor() {
+async fn owned_time_advances_while_replica_receipts_preserve_the_original_append() {
     use rtdb_format::envelope::{ReplicaBody, SourceMessage};
     use rtdb_types::{OwnedRelation, TxId};
 
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let owned = |revision, value| {
+    let owned = |value| {
         let source = SourceTransaction::new(
             vec![TxOp::OwnedReplaceDocs {
                 relation: OwnedRelation::new("clocks").unwrap(),
                 documents: Documents::new(vec![document(value)], &context.memory).unwrap(),
                 valid_from: Some(Timestamp(0)), valid_to: None,
             }],
-            SubmitOptions { user: Some("owner".into()), system_time: Some(Timestamp(revision)), ..Default::default() },
+            SubmitOptions { user: Some("owner".into()), ..Default::default() },
             &context.memory,
         ).unwrap();
         let encoded = source.encode().unwrap();
@@ -833,12 +765,11 @@ async fn explicit_owned_time_keeps_its_append_bound_and_does_not_manufacture_a_s
     let results = TableRef::new("xt", "txs");
     for (position, sample) in [(0, 100), (1, 100), (2, 99)] {
         let snapshot = state.snapshot();
-        let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(position), Timestamp(sample), owned(sample, position), &context).await.unwrap();
-        assert_eq!(resolved.result().committed(), position == 0);
-        if position != 0 { assert_eq!(resolved.result().error().unwrap().code, "invalid-system-time"); }
+        let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(position), Timestamp(sample), owned(position), &context).await.unwrap();
+        assert!(resolved.result().committed(), "{:?}", resolved.result());
         let key = resolved.result().tx_key();
         assert_eq!(key.tx_id, TxId(position));
-        if position == 0 { assert_eq!(key.system_time, Timestamp(sample)); }
+        assert_eq!(key.system_time, Timestamp(100 + position));
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("resolved transaction"); };
         let replay = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
@@ -847,8 +778,6 @@ async fn explicit_owned_time_keeps_its_append_bound_and_does_not_manufacture_a_s
         assert!(matches!(row["source_log_time"], Value::Timestamp { value, .. } if value == sample));
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
     }
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(99, 3), &context).await.unwrap();
-    assert_eq!(refused.result().error().unwrap().code, "rtdb/future-system-time");
 }
 
 #[tokio::test]

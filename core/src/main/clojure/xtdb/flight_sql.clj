@@ -115,14 +115,15 @@
       (str/join ", " (cons "SET TRANSACTION READ ONLY" opts)))))
 
 (defn- set-tx-rw-sql [{:keys [system-time default-tz metadata async?]}]
+  (when (some? system-time)
+    (throw (err/incorrect :xtdb/invalid-tx-option "System time is assigned by the store")))
   (when metadata
     (throw (err/unsupported :xtdb.flight-sql/metadata-unsupported
                             "`:metadata` is not supported over FlightSQL: SET TRANSACTION can't be parameterised, and a metadata map has no faithful SQL-literal rendering"
                             {:metadata metadata})))
 
   (str/join ", " (cond-> ["SET TRANSACTION READ WRITE" (str "ASYNC = " (boolean async?))]
-                   default-tz (conj (str "TIMEZONE = " (str-literal default-tz)))
-                   system-time (conj (str "SYSTEM_TIME = " (ts-literal system-time default-tz))))))
+                   default-tz (conj (str "TIMEZONE = " (str-literal default-tz))))))
 
 ;; -- tx ops --
 

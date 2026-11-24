@@ -77,8 +77,8 @@ fn put(memory: &Arc<MemoryBudget>, table: &str, rows: &[([u8; 16], &str)]) -> Re
     })
 }
 
-fn encode_source(memory: &Arc<MemoryBudget>, operations: Vec<TxOp>, time: Timestamp, replay_iids: Option<&[[u8; 16]]>) -> Result<bytes::Bytes, Error> {
-    let transaction = SourceTransaction::new(operations, SubmitOptions { system_time: Some(time), ..Default::default() }, memory)?;
+fn encode_source(memory: &Arc<MemoryBudget>, operations: Vec<TxOp>, replay_iids: Option<&[[u8; 16]]>) -> Result<bytes::Bytes, Error> {
+    let transaction = SourceTransaction::new(operations, SubmitOptions::default(), memory)?;
     let encoded = transaction.encode()?;
     let mut message = SourceMessage::decode(encoded.as_slice())?.ok_or("Expected a source transaction")?;
     if let Some(iids) = replay_iids {
@@ -94,8 +94,8 @@ async fn seed_source_log(directory: &Path) -> Result<SourcePosition, Error> {
         put(&memory, REPLAY, &[(TARGET, "original"), (TARGET, "survivor"), (OTHER, "unmatched")])?,
         put(&memory, CANONICAL, &[(TARGET, "canonical"), (OTHER, "unmatched")])?,
         put(&memory, KEYS, &[(REPLACED, "key")])?,
-    ], FIRST_TIME, Some(&[REPLACED, SURVIVOR, OTHER]))?;
-    let second = encode_source(&memory, vec![put(&memory, REPLAY, &[(REPLACED, "replacement")])?], SECOND_TIME, None)?;
+    ], Some(&[REPLACED, SURVIVOR, OTHER]))?;
+    let second = encode_source(&memory, vec![put(&memory, REPLAY, &[(REPLACED, "replacement")])?], None)?;
     let (log, driver) = LocalLog::open(directory.join("log/LOG"), LocalLogOptions {
         maximum_message_bytes: 1 << 20,
         queue_capacity: 2,

@@ -28,7 +28,7 @@ pub enum Dml {
 pub enum Statement {
     Query(Arc<Relation>),
     Dml(Dml),
-    Begin { access_mode: Option<AccessMode>, system_time: Option<Expr> },
+    Begin { access_mode: Option<AccessMode> },
     Commit,
     Rollback,
     Set { name: Vec<Identifier>, value: Expr, local: bool },

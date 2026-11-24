@@ -895,8 +895,7 @@ readOnlyTxOption
     ;
 
 readWriteTxOption
-    : 'SYSTEM_TIME' '='? txOptionValue # SystemTimeTxOption
-    | ASYNC '='? (async=literal | DEFAULT) # AsyncTxOption
+    : ASYNC '='? (async=literal | DEFAULT) # AsyncTxOption
     | METADATA '='? txOptionValue # MetadataTxOption
     ;
 

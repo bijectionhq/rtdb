@@ -43,7 +43,7 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" | "application_name" | "rtdb_ordered_system_time"
+        "snapshot_token" | "timezone" | "transaction_isolation" | "application_name"
         | "rtdb_bounded_retry" | "rtdb_source_barrier" | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
         "rtdb_hosted_source_barrier" => vec![(name.as_str(), text), ("tx_id", integer), ("system_time", instant.maybe())],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
@@ -329,7 +329,7 @@ impl NativeSession {
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "application_name" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.application_name().into())]]),
-            "rtdb_ordered_system_time" | "rtdb_bounded_retry" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
+            "rtdb_bounded_retry" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
             "rtdb_hosted_source_owner" => {
                 let Some(SourceInspection::Owner(history)) = source else {
                     return Err(Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source confirmation has no history"));
@@ -400,7 +400,6 @@ pub async fn transaction_settings(options: &TransactionOptions, parameters: &[Va
             clock_time: clock_update(options.clock_time.as_ref(), &eval).await?, await_token: update(options.await_token.as_ref(), &eval, token).await?,
         })),
         Some(ControlAccessOptions::ReadWrite(options)) => Some(AccessSettings::ReadWrite(ReadWriteSettings {
-            system_time: update(options.system_time.as_ref(), &eval, instant).await?,
             user_metadata: update(options.metadata.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), value => UserMetadata::new(value, memory).map(Some) }).await?,
             asynchronous: update(options.asynchronous.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), Value::Bool(value) => Ok(Some(value)), _ => Err(invalid("ASYNC requires a boolean")) }).await?,
         })),

@@ -50,7 +50,6 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
     let mut options = fields(request.remove("options").unwrap_or_else(|| Value::Struct(StructFields::new())))?;
     let timezone = optional_string(options.remove("default_timezone"))?;
     let database = optional_string(options.remove("database"))?;
-    let system_time = optional_time(options.remove("system_time"), timezone.as_deref().unwrap_or("UTC"))?;
     let user_metadata = options.remove("metadata").filter(|value| !matches!(value, Value::Null)).map(|value| UserMetadata::new(value, memory)).transpose()?;
     if !options.is_empty() { return Err(crate::invalid("Unknown transaction option")); }
     let operations = list(request.remove("operations").ok_or_else(|| crate::invalid("operations is required"))?)?;
@@ -58,7 +57,7 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
     if !request.is_empty() { return Err(crate::invalid("Unknown transaction request field")); }
     session.region.run(async {
         let mut state = session.state.lock();
-        let options = AutonomousTxOptions { database, default_timezone: timezone, system_time, user_metadata };
+        let options = AutonomousTxOptions { database, default_timezone: timezone, user_metadata };
         token.run_until_cancelled(async {
             let mut values = StructFields::new();
             if asynchronous {

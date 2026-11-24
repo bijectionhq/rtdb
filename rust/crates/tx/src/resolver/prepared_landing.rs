@@ -59,7 +59,7 @@ impl SourceTransaction {
             return Ok(());
         }
         if self.guard.is_some() || self.options.user_metadata.is_some()
-            || self.options.system_time.is_some() || self.prepared_landing.is_some()
+            || self.prepared_landing.is_some()
         {
             return Err(invalid());
         }

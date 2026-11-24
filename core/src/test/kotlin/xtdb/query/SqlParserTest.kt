@@ -68,10 +68,9 @@ class SqlParserTest {
         assertNull(roMode.clockTime)
         assertEquals("'UTC'", ro.timeZone.text)
 
-        val rw = setTx("SET TRANSACTION READ WRITE, ASYNC = TRUE, SYSTEM_TIME = DEFAULT").accessMode as TxOptions.ReadWrite
+        val rw = setTx("SET TRANSACTION READ WRITE, ASYNC = TRUE, METADATA = DEFAULT").accessMode as TxOptions.ReadWrite
         assertEquals("TRUE", rw.async.text)
-        assertEquals(TxOptionValue.Default, rw.systemTime)
-        assertNull(rw.userMetadata)
+        assertEquals(TxOptionValue.Default, rw.userMetadata)
     }
 
     @Test
@@ -95,6 +94,7 @@ class SqlParserTest {
             "SET TRANSACTION SNAPSHOT_TOKEN = 'tok'",
             "SET TRANSACTION READ WRITE, SNAPSHOT_TOKEN = 'tok'",
             "SET TRANSACTION READ ONLY, SYSTEM_TIME = TIMESTAMP '2020-01-01Z'",
+            "SET TRANSACTION READ WRITE, SYSTEM_TIME = DEFAULT",
             "SET TRANSACTION READ ONLY, READ WRITE",
             "SET TRANSACTION READ ONLY SNAPSHOT_TOKEN = 'tok'",
             "SET TRANSACTION READ ONLY WITH (SNAPSHOT_TOKEN = 'tok')",
@@ -106,8 +106,8 @@ class SqlParserTest {
 
     @Test
     fun `BEGIN takes the list of modes, and its WITH form`() {
-        val list = (one("START TRANSACTION READ WRITE, SYSTEM_TIME = TIMESTAMP '2020-01-01Z'") as Begin).txOptions
-        assertTrue((list.accessMode as TxOptions.ReadWrite).systemTime is TxOptionValue.Expr)
+        val list = (one("START TRANSACTION READ WRITE, METADATA = 42") as Begin).txOptions
+        assertTrue((list.accessMode as TxOptions.ReadWrite).userMetadata is TxOptionValue.Expr)
 
         val with = (one("BEGIN READ ONLY WITH (SNAPSHOT_TOKEN = 'tok', TIMEZONE = 'UTC')") as Begin).txOptions
         assertEquals("'tok'", (with.accessMode as TxOptions.ReadOnly).snapshotToken.text)

@@ -131,14 +131,13 @@ private class ParsedStatementVisitor : SqlBaseVisitor<ParsedStatement>() {
     }
 
     private fun TxOptions.ReadWrite.with(opt: Sql.ReadWriteTxOptionContext) = when (opt) {
-        is Sql.SystemTimeTxOptionContext -> copy(systemTime = opt.txOptionValue().value())
         is Sql.AsyncTxOptionContext -> copy(async = opt.async?.let { TxOptionValue.Expr(it) } ?: TxOptionValue.Default)
         is Sql.MetadataTxOptionContext -> copy(userMetadata = opt.txOptionValue().value())
         else -> error("unknown read-write option: ${opt.javaClass}")
     }
 
     private val noReadOnlyOptions = TxOptions.ReadOnly(null, null, null, null)
-    private val noReadWriteOptions = TxOptions.ReadWrite(null, null, null)
+    private val noReadWriteOptions = TxOptions.ReadWrite(null, null)
 
     private fun List<Sql.CommonTxModeContext>.timeZone() =
         filterIsInstance<Sql.TxTzModeContext>().lastOrNull()?.txTzOption()?.value()

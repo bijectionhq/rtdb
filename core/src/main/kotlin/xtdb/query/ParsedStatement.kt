@@ -46,7 +46,7 @@ sealed interface ParsedStatement {
         ) : AccessModeOptions
 
         data class ReadWrite(
-            val systemTime: TxOptionValue?, val userMetadata: TxOptionValue?, val async: TxOptionValue?,
+            val userMetadata: TxOptionValue?, val async: TxOptionValue?,
         ) : AccessModeOptions
     }
 

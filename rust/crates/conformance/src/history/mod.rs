@@ -83,8 +83,8 @@ async fn submit(node: &Node, clock: &FixtureClock, transaction: &Transaction) ->
         Operation::Erase { id } => TxOp::EraseDocs { table, ids: EntityIds::new(vec![EntityId::String(id.clone())], node.memory())? },
     };
     let mut session = node.session("xtdb", Arc::new(Identity))?;
-    let result = session.state_mut().execute_tx(vec![operation], AutonomousTxOptions { system_time: Some(time), ..Default::default() }).await?;
-    if !result.committed() || result.tx_key().system_time != time { return Err(format!("history transaction did not commit at its requested system time: {result:?}").into()); }
+    let result = session.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await?;
+    if !result.committed() || result.tx_key().system_time != time { return Err(format!("history transaction did not commit at its fixture clock reading: {result:?}").into()); }
     Ok(json!({"tx_id":result.tx_key().tx_id.0,"system_time_micros":time.0,"committed":true}))
 }
 
@@ -317,12 +317,9 @@ mod join_iid_tests {
             })
         }).collect::<Result<Vec<_>, Error>>()?;
         let mut session = node.session("xtdb", Arc::new(Identity))?;
-        let result = session.state_mut().execute_tx(ops, AutonomousTxOptions {
-            system_time: Some(system_time),
-            ..Default::default()
-        }).await?;
+        let result = session.state_mut().execute_tx(ops, AutonomousTxOptions::default()).await?;
         if !result.committed() || result.tx_key().system_time != system_time {
-            return Err(format!("Join fixture did not commit at its requested system time: {result:?}").into());
+            return Err(format!("Join fixture did not commit at its fixture clock reading: {result:?}").into());
         }
         Ok(result.tx_key())
     }

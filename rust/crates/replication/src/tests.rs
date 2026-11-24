@@ -274,7 +274,7 @@ async fn skipped_malformed_arrow_keeps_diagnostics_and_orders_the_original_attem
     use rtdb_format::envelope::{SourceBody, SourceMessage};
 
     let diagnostic = proto::Tx {
-        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100),
+        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()),
         user: Some("alice".into()), ..Default::default()
     };
     let message = SourceMessage::Protobuf(SourceBody::Tx(proto::Tx {

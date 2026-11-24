@@ -39,9 +39,7 @@ async fn open(directory: &Path, clock: Arc<FixtureClock>) -> Result<RunningNode,
 async fn submit(node: &Node, clock: &FixtureClock, time: Timestamp, operations: Vec<TxOp>) -> Result<TransactionKey, Error> {
     clock.0.store(time.0, Ordering::SeqCst);
     let mut session = node.session("xtdb", Arc::new(Identity))?;
-    let transaction = session.state_mut().execute_tx(operations, AutonomousTxOptions {
-        system_time: Some(time), ..Default::default()
-    }).await?;
+    let transaction = session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await?;
     if !transaction.committed() || transaction.tx_key().system_time != time {
         return Err(format!("Mixed IID transaction did not commit at {time:?}: {transaction:?}").into());
     }

@@ -444,10 +444,8 @@ value CommitOpts {
     -- Write-side options, grammar-scoped to READ WRITE (readWriteTxOption in the SQL
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
-    --   system_time   — the system-time to record the transaction at.
-    --                   It must be at least the preceding system time and at most the authenticated source-log append observation for the original record.
-    --                   A later explicit time aborts with rtdb/future-system-time.
-    --                   Automatic history time is the maximum of the preceding value and the append observation, or the append observation at genesis.
+    -- Automatic history time is the maximum of the preceding value and the append observation,
+    -- or the append observation at genesis. Owned publications require a distinct history coordinate.
     --   user_metadata — per-transaction metadata.
     --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
     --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.
@@ -477,7 +475,6 @@ value CommitOpts {
     --   async         — true: commit submits without awaiting; false: execute-and-await.
     --                    The begin-time default; a COMMIT SYNC / COMMIT ASYNC (see CommitMode)
     --                    overrides it for that one commit.
-    system_time: Timestamp?
     user_metadata: Bytes?
     async: Boolean
 }
@@ -498,7 +495,6 @@ value ReadOnlySettings {
 
 value ReadWriteSettings {
     -- The read-write options a READ WRITE statement names; each one it doesn't name is null.
-    system_time: OptionSetting?
     user_metadata: OptionSetting?
     async: OptionSetting?
 }
@@ -688,8 +684,7 @@ rule BeginOpensTransaction {
                 session_default_tz: connection.default_tz,
                 buffer: buffer,
                 commit_opts: CommitOpts(
-                    system_time: null,
-                    user_metadata: null,
+                user_metadata: null,
                     async: false
                 )
             )
@@ -789,7 +784,7 @@ rule SetTransactionReadOnly {
 
 rule SetTransactionReadWrite {
     -- READ WRITE makes the phase Writing with an empty buffer: a Writing tx carries no read basis, as writes don't read.
-    -- A Writing tx keeps the commit-opts this statement doesn't name; any other phase starts with the defaults (no system-time, no metadata, synchronous).
+    -- A Writing tx keeps the commit-opts this statement doesn't name; any other phase starts with the defaults (no metadata, synchronous).
     -- ASYNC = DEFAULT makes the commit synchronous.
     when: SetTransaction(frontend, connection, access_mode, read_only_opts, commit_opts, tz_override)
     requires: connection.tx != null
@@ -804,9 +799,6 @@ rule SetTransactionReadWrite {
         connection.tx.mode = Writing
         connection.tx.buffer = buffer
         connection.tx.commit_opts = CommitOpts(
-            system_time:
-                if commit_opts?.system_time != null: commit_opts.system_time.value
-                else: prior?.system_time,
             user_metadata:
                 if commit_opts?.user_metadata != null: commit_opts.user_metadata.value
                 else: prior?.user_metadata,
@@ -921,7 +913,7 @@ rule FirstQueryPinsReadBasis {
 
 rule FirstStatementResolvesWriting {
     -- First statement in a Pending(Unspecified) tx is DML → Writing with an empty buffer and
-    -- default commit-opts (synchronous, no system-time override); no read basis was pinned.
+    -- default commit-opts (synchronous); no read basis was pinned.
     -- The DML op itself is then buffered by BufferDml.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: connection.tx != null
@@ -934,7 +926,6 @@ rule FirstStatementResolvesWriting {
         connection.tx.mode = Writing
         connection.tx.buffer = buffer
         connection.tx.commit_opts = CommitOpts(
-            system_time: null,
             user_metadata: null,
             async: false
         )
@@ -1036,7 +1027,6 @@ rule ManualLazyOpenDml {
             session_default_tz: connection.default_tz,
             buffer: buffer,
             commit_opts: CommitOpts(
-                system_time: null,
                 user_metadata: null,
                 async: false
             )
@@ -1224,7 +1214,6 @@ rule CommitWriting {
         let opts = {
             user: connection.user,
             default_tz: connection.tx.tx_default_tz,
-            system_time: connection.tx.commit_opts.system_time,
             user_metadata: connection.tx.commit_opts.user_metadata
         }
 
@@ -1630,7 +1619,7 @@ surface ConnectionLifecycle {
 
 ---- Open Questions
 
-open question "AutoCommitDml stamps opts with user and default_tz only (no system_time). Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"
+open question "AutoCommitDml stamps opts with user and default_tz only. Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"
 
 open question "Should pgwire cancellation require the BackendKeyData secret as well as the connection identifier?"
     -- The pinned frontend sends a zero secret and routes CancelRequest by connection identifier alone.

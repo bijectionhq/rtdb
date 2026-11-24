@@ -1,4 +1,4 @@
-use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, admits_historical_time, advances, automatic_time, historical_time};
 use vstd::prelude::*;
 
 verus! {
@@ -56,33 +56,6 @@ pub fn a_stalled_clock_advances_one_tick(previous: i64, candidate: i64)
 pub fn the_maximum_cannot_be_advanced(candidate: i64) {
     let assigned = automatic_time(Some(i64::MAX), candidate);
     assert(assigned.is_none());
-}
-
-// LAW TIME-SYSTEM-EXPLICIT-REFUSAL.
-pub fn nonadvancing_explicit_times_are_refused(previous: i64, candidate: i64)
-    requires candidate <= previous,
-{
-    let admissible = advances(Some(previous), candidate);
-    assert(!admissible);
-}
-
-// LAW TIME-SYSTEM-BOUNDED-BY-LOG.
-pub fn an_admitted_client_time_never_leads_the_log(previous: Option<i64>, candidate: i64, log_time: i64) {
-    let admitted = admits_client_time(previous, candidate, log_time);
-    if admitted {
-        assert(candidate <= log_time);
-    }
-}
-
-// LAW TIME-SYSTEM-NO-EXHAUSTION.
-pub fn an_admitted_client_time_leaves_a_following_chronon(previous: Option<i64>, candidate: i64, log_time: i64, next_log: i64)
-    requires log_time < i64::MAX,
-{
-    let admitted = admits_client_time(previous, candidate, log_time);
-    if admitted {
-        let next = automatic_time(Some(candidate), next_log);
-        assert(next.is_some());
-    }
 }
 
 pub fn a_proposal_slot_checks_the_observation_independently_of_append() {

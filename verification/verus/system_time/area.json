@@ -1,5 +1,5 @@
 {
-  "summary": "Ordinary SQL admits tied history time within the original append bound. Owned publications that still address rows by strict system time retain their separate successor rule.",
+  "summary": "The resolver assigns ordinary SQL history time from the original append and preceding coordinate. Owned publications use a strict successor.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,10 +7,10 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 28,
+  "min_verified_functions": 24,
   "controls": {
     "substitute_the_ordered_funded_booking": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -27,7 +27,7 @@
       ]
     },
     "retime_the_terminal_funded_receipt": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -44,22 +44,22 @@
       ]
     },
     "substitute_the_receiver_clock_domain": {
-      "min_verified_functions": 35,
-    "mutate": [
-      {
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "    same_domain && earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time\n",
-        "replace": "    earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time\n"
-      }
-    ],
-    "expect": [
-      {
-        "file": "rust/crates/tx/src/system_time.rs",
-        "function": "accepts_clock_lineage",
-        "category": "postcondition not satisfied"
-      }
-    ]
-  },
+      "min_verified_functions": 31,
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    same_domain && earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time\n",
+          "replace": "    earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "accepts_clock_lineage",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
     "reuse_the_previous_tick": {
       "mutate": [
         {
@@ -159,68 +159,12 @@
           "file": "verification/verus/system_time/laws.rs",
           "function": "the_maximum_cannot_be_advanced",
           "category": "assertion failed"
-        },
-        {
-          "file": "verification/verus/system_time/laws.rs",
-          "function": "nonadvancing_explicit_times_are_refused",
-          "category": "assertion failed"
-        },
-        {
-          "file": "rust/crates/tx/src/system_time.rs",
-          "function": "admits_client_time",
-          "category": "postcondition not satisfied"
         }
       ],
       "min_verified_functions": 6
     },
-    "admit_a_future_time": {
-      "defect": "A client may name a system time later than the log's append time.",
-      "mutate": [
-        {
-          "file": "rust/crates/tx/src/system_time.rs",
-          "find": "    advances(previous, candidate) && candidate <= log_time\n",
-          "replace": "    advances(previous, candidate)\n"
-        }
-      ],
-      "expect": [
-        {
-          "file": "rust/crates/tx/src/system_time.rs",
-          "function": "admits_client_time",
-          "category": "postcondition not satisfied"
-        }
-      ],
-      "min_verified_functions": 10
-    },
-    "admit_a_future_time_with_weakened_contract": {
-      "defect": "Both the runtime and its contract admit a client time ahead of the log.",
-      "mutate": [
-        {
-          "file": "rust/crates/tx/src/system_time.rs",
-          "find": "    advances(previous, candidate) && candidate <= log_time\n",
-          "replace": "    advances(previous, candidate)\n"
-        },
-        {
-          "file": "rust/crates/tx/src/system_time.rs",
-          "find": "    } && candidate <= log_time),\n",
-          "replace": "    }),\n"
-        }
-      ],
-      "expect": [
-        {
-          "file": "verification/verus/system_time/laws.rs",
-          "function": "an_admitted_client_time_never_leads_the_log",
-          "category": "assertion failed"
-        },
-        {
-          "file": "verification/verus/system_time/laws.rs",
-          "function": "an_admitted_client_time_leaves_a_following_chronon",
-          "category": "assertion failed"
-        }
-      ],
-      "min_verified_functions": 9
-    },
     "sql_rejects_a_tie": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -237,7 +181,7 @@
       ]
     },
     "sql_accepts_a_client_time_after_append": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -254,7 +198,7 @@
       ]
     },
     "substitute_append_for_the_receiver_observation": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -271,7 +215,7 @@
       ]
     },
     "include_the_receiver_window_end": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -288,7 +232,7 @@
       ]
     },
     "let_a_prepared_clock_lead_append": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -305,7 +249,7 @@
       ]
     },
     "include_the_exclusive_owned_deadline": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -322,20 +266,24 @@
       ]
     },
     "retime_relative_terms_at_source_append": {
-      "min_verified_functions": 35,
-      "mutate": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "find": "    match (slot, observed) {\n        (Some(reading), _) | (None, Some(reading)) => reading,\n        (None, None) => appended,\n    }",
-        "replace": "    match slot {\n        Some(reading) => reading,\n        None => appended,\n    }"
-      }],
-      "expect": [{
-        "file": "rust/crates/tx/src/system_time.rs",
-        "function": "acceptance_relative_time",
-        "category": "postcondition not satisfied"
-      }]
+      "min_verified_functions": 31,
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "    match (slot, observed) {\n        (Some(reading), _) | (None, Some(reading)) => reading,\n        (None, None) => appended,\n    }",
+          "replace": "    match slot {\n        Some(reading) => reading,\n        None => appended,\n    }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "acceptance_relative_time",
+          "category": "postcondition not satisfied"
+        }
+      ]
     },
     "collapse_equal_history_times": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -352,7 +300,7 @@
       ]
     },
     "omit_grid_alignment": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -369,7 +317,7 @@
       ]
     },
     "substitute_whole_root_progress_for_the_prepared_floor": {
-      "min_verified_functions": 35,
+      "min_verified_functions": 31,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",

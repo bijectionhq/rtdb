@@ -7,7 +7,7 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Owner decisions
 
-* A client-supplied system time may equal or follow the preceding system time and cannot lead the authenticated source-log append observation for the original request (tolerance zero).
+* The resolver assigns system time from the authenticated source-log append observation and the preceding history coordinate. Owned publications use distinct history coordinates.
 * An await token establishes a causal lower bound.
   A system-time cap filters the chosen prefix, and a fresh admission can include later corrections below that cap.
   An issued exact snapshot token identifies the same applied cut on every successful re-admission under current authorization, retention and custody.

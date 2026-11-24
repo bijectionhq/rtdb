@@ -982,13 +982,6 @@ impl UserMetadata {
     pub fn value(&self) -> &Value { &self.value }
 
     pub(crate) fn erasure_unit(&self) -> Result<Option<MetadataErasureUnit>> { MetadataErasureUnit::parse(self.value()) }
-
-    pub(crate) fn requires_ordered_system_time(&self) -> bool {
-        matches!(
-            self.value(),
-            Value::Struct(fields) if fields.get("rtdb_ordered_system_time") == Some(&Value::Bool(true))
-        )
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1407,12 +1400,11 @@ impl TxOp {
 #[derive(Clone, Debug)]
 pub struct SubmitOptions {
     pub default_tz: String,
-    pub system_time: Option<Timestamp>,
     pub user: Option<String>,
     pub user_metadata: Option<UserMetadata>,
 }
 impl Default for SubmitOptions {
-    fn default() -> Self { Self { default_tz: "UTC".into(), system_time: None, user: None, user_metadata: None } }
+    fn default() -> Self { Self { default_tz: "UTC".into(), user: None, user_metadata: None } }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
