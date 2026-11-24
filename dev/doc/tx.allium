@@ -283,6 +283,7 @@
 -- A later retraction removes a point or span and a later append establishes membership again.
 -- For a reviewed landing prefix the receiver admits exclusions only for later sample assertions carried by the candidate.
 -- Fixed-label protected count guards use the complete carrier identity population with ordered row or unit fences and row expiry metadata.
+-- The shared-unit guard counts the installed Root relation's complete Binary carriers under the raw BFCP2 prefix at final ordered membership.
 -- The protected membership projection reads no carrier body.
 -- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
 -- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rtdb_columnar::ArrowCell;
 use rtdb_plan::Catalog;
 use rtdb_query::{HostedControlPoint, QueryCursor};
 use rtdb_tx::HostedControlWrite;
@@ -18,6 +19,7 @@ use super::{
 mod retired_original;
 pub use retired_original::{RetiredOriginalFamilyRead, RetiredOriginalFamilySource};
 
+const INSTALLATION: &str = "bj_installation";
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const ARCHIVE_FENCE: &str = "archive-source-fence.v1";
 
@@ -72,6 +74,57 @@ impl RootCatalogRead {
 }
 
 impl OwnedReadSession {
+    pub(super) async fn original_inventory_provider_guard(
+        &self, scope: PlacedAttemptScope,
+    ) -> Result<impl Fn() -> Result<()> + Send + Sync + use<>> {
+        let unavailable = hosted_source_unavailable;
+        if self.witness_scope != Some(scope) { return Err(unavailable()); }
+        let catalog = self.context.catalog.database(&self.database)?;
+        let [held] = catalog.partitions.as_slice() else { return Err(unavailable()); };
+        let installation = TableRef::new("public", INSTALLATION);
+        let restore = TableRef::new("public", RESTORE);
+        let expected = [held.relation_event_frontier(&installation)?, held.relation_event_frontier(&restore)?];
+        let point = read_carrier_point(&self.context, INSTALLATION, "authority").await?;
+        let (row, revision) = point.row.ok_or_else(unavailable)?;
+        let row = row.batch();
+        let field = |name| ArrowCell::named(row, name, 0);
+        if revision.0 <= 0
+            || field("kind").and_then(ArrowCell::utf8) != Some("hosted")
+            || !field("incarnation").and_then(ArrowCell::binary).is_some_and(|id| id.len() == 16 && id.iter().any(|&byte| byte != 0))
+            || !field("writer").and_then(ArrowCell::utf8).is_some_and(|id|
+                id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+        {
+            return Err(unavailable());
+        }
+        for marker in ["restore", "released", ARCHIVE_FENCE] {
+            if rtdb_query::read_hosted_control_point(
+                Arc::clone(&self.context), restore.clone(), &EntityId::String(marker.into()), false,
+            ).await?.row.is_some() {
+                return Err(unavailable());
+            }
+        }
+        let receipt = self.node.await_durable_source(&self.database, self.identity.as_ref(), true,
+            Some(&self.attachment), &self.cancellation).await?.ok_or_else(unavailable)?;
+        let applied = receipt.applied.filter(|applied| covers_transaction(*applied, self.present))
+            .ok_or_else(unavailable)?;
+        let node = self.node.clone();
+        let database = self.database.clone();
+        let attachment = self.attachment.clone();
+        let guard = move || {
+            let attached = node.attached_database(&database, Some(&attachment))?;
+            let current = attached.snapshot();
+            if attached.placed_writer_scope() != Some(scope)
+                || !current.tx_basis().is_some_and(|tip| covers_transaction(tip, applied))
+                || [current.relation_event_frontier(&installation)?, current.relation_event_frontier(&restore)?] != expected
+            {
+                return Err(unavailable());
+            }
+            Ok(())
+        };
+        guard()?;
+        Ok(guard)
+    }
+
     pub async fn open_root_catalog(&self, read: RootCatalogRead) -> Result<QueryCursor> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
@@ -164,7 +217,7 @@ impl CurrentAssertionFamilyRead {
     pub async fn carrier_journal_installation(&self) -> Result<HostedControlPoint> {
         let restored = self.carrier_point("bj_rtdb_restore_hold", "restore").await?;
         if restored.row.is_some() { return Err(hosted_source_unavailable()); }
-        self.carrier_point("bj_installation", "authority").await
+        self.carrier_point(INSTALLATION, "authority").await
     }
 
     pub async fn carrier_journal_registration(&self, key: &str) -> Result<HostedControlPoint> {

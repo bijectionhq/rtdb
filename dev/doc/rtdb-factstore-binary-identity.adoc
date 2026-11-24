@@ -25,7 +25,8 @@ In those regional bound components a zero-length handle still denotes an unbound
 Provision the Binary fact relations against a clear physical cut.
 An existing Utf8 key and a Binary key occupy separate identities.
 The Binary scan profile requires a Binary identity column at the selected cut.
-Bijection should keep the existing Utf8 path names, control and catalog IDs, publication heads, attempt IDs and protected carrier IDs.
+Bijection should keep the existing Utf8 path names, control and catalog IDs, publication heads, attempt IDs and protected row and World-slot IDs.
+Root protected shared-column carriers have a separate Binary contract below.
 Public pgwire accepts the existing text, keyword, signed integer and UUID entity identities.
 
 == Request and response mapping
@@ -67,6 +68,56 @@ The raw address payload is 1 to 4096 bytes.
 Send the original signed i64 valid instant and the existing absence byte or presence byte with the original signed i64 revision and 16-byte event position.
 Keep flag `00` for no point and flag `01` with a raw Utf8 key for publication markers and other text points.
 The floor, deadline, following hosted control groups and confirmation reply keep their existing framing.
+
+== Protected shared-column carriers
+
+Provision `fact_unit_shared_column_carriers` in the installed Root schema with explicit validity, no lifetime, and one required non-null `opaque_binary` field named `sealed_payload`.
+Write complete Arrow Binary IDs to this relation and keep Root winner selector IDs, ordinary protected-row carrier IDs and World carrier slots in `fact_unit_column_payloads` as Utf8.
+The shared-column carrier prefix is 106 bytes: ASCII `BFCP2`, history (16), unit alias (32), tablet (16), payload part (1), field (16), column (16) and generation (4, big endian).
+The full 4202-byte ID appends the complete 4096-byte opaque image.
+Arrow and compact point operands use the raw ID, and components that require the complete typed handle prepend byte `04`.
+Treat the bytes as a scoped opaque identity throughout the client and archive, including when checking original membership, ciphertext context and erasure.
+
+Use `rtdb.owned.ReadHeldProtectedCarrierCoverage.v2` and `rtdb.owned.ReadHeldProtectedCarrierPage.v2` with the existing Root hold handle, length-prefixed relation name and one-row Arrow request.
+Send a non-null Binary `prefix` to both, and a nullable Binary `after` and Int64 `limit` (1 to 64) to the page.
+Use a Binary null on the first page and the full last Binary `_id` as the exclusive bound on the next page.
+Page replies carry a Binary `_id` column even when empty, with the existing more flag and a range witness on completion.
+Coverage returns the existing Base64-encoded 72-byte stamp and nonce, with data and purge frontiers from the new relation.
+The stamp contains the original placement scope (40 bytes), attached database equality epoch (16 bytes), and the signed big-endian data and purge frontiers (8 bytes each).
+The final-count operand on the existing `protected_membership` condition is byte `02`, the raw 106-byte prefix, and the existing 64 ASCII lowercase hex bytes of the unit fence ID.
+The existing row-membership operand starts with byte `00`.
+
+World census and pinned parent point details are in xref:rtdb-assertion-families.md[Assertion families].
+Bijection must provision the split relations before opening new-format holds and update the carrier, locator, winner body, retained ciphertext binding and replay or retirement records together.
+Restore must validate the exact original scope and use the original event positions and full typed handle when replaying puts, residues and admitted purges.
+Switch only from an empty shared-carrier population or a paired cutover that accounts for every provider and retained cut before serving v2.
+The v2 receiver has no hex carrier reader.
+
+The shared-carrier retirement caller submits its current carrier check, erase and create-only receipt through `DecideHosted.v4` with its installed writer checks.
+The live admission verifies the complete Binary carrier and ciphertext, its original ordered membership and the later unit fence against the same predecessor before applying the erase and receipt together.
+Original replay still uses its archive admission.
+
+== Sealed search unit inventory
+
+The installed hosted writer discovers `rtdb.owned.ReadHeldSealedSearchUnitRows.v1` through Flight `ListActions`.
+Use the original unscoped Root hold for that authenticated session and placed writer epoch.
+RTDB confirms the live provider and the held `bj_installation` authority, rejects the Original source fence and destination restore markers, and checks the provider frontiers again before release.
+The installed relation is `fact_sealed_search_unit_rows` with the v1 owned declaration `{"fields":[]}`, explicit validity, and no lifetime.
+Its physical rows have only the text identity `<unit alias>/<derived search relation>/<opaque row ID>`.
+
+The request is the 16-byte held Root handle, the relation name with its existing big-endian u16 byte length, and one Arrow record with Utf8 `prefix`, nullable Utf8 `after` and non-null Int64 `limit` (1 to 64).
+Send exactly the 64 lowercase ASCII hexadecimal characters of the Original 32-byte unit alias followed by `/` as `prefix`.
+Send a typed Utf8 null for the first `after` and the full last returned inventory ID as the exclusive bound on each next page.
+The reply has one Utf8 `_id` column in strictly increasing text order, including a Utf8 schema on an empty page.
+The reply's present and valid coordinates both equal the held Root system time.
+The existing `rtdb.owned.identity_more` metadata is `1` while another page is available and `0` on completion.
+An `rtdb.owned.range_witness` nonce appears only on completion, including an empty terminal page, and binds the original hold and the inventory relation's full event frontier.
+
+In Bijection, point `READ_HELD_SEARCH_UNIT_ROWS` at the new action and use it from `HeldRead::sealed_search_unit_page`.
+In `FactSnapshot::sealed_unit_rows`, preserve the exact suffix after the first relation delimiter and require the terminal range witness from the same hold.
+Carry that witness with the inventory evidence into the originating hosted decision using the existing range witness path.
+The ordered writer compares every derived erase and per-relation revocation marker with that unit’s inventory at the original predecessor.
+The same decision orders or checks the unit fence and publishes the registered receipt.
 
 == Unique window replies
 
