@@ -763,7 +763,7 @@ mod tests {
             ])),
         };
         let batch = build_event_batch(std::slice::from_ref(&event), None, None)?;
-        let bytes = rtdb_format::ipc::write_file(batch.schema_ref(), &[batch])?;
+        let bytes = rtdb_format::ipc::write_file(batch.schema_ref(), std::slice::from_ref(&batch))?;
         let source = SourceFile { block: 4, object: ObjectKey::new("test/order-index/projected")?, size: bytes.len(), rows: Some(1) };
         storage.object_store().put(&source.object, bytes.into()).await?;
 
