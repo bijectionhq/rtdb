@@ -477,3 +477,33 @@ fn row_visibility_scopes_otherwise_effects_and_receipts() {
     assert_eq!(recovered.tx_status_scoped(&guarded.key, authority).unwrap().basis, basis(2));
     assert_eq!(recovered.tx_status_scoped(&guarded.key, other).unwrap().basis, basis(3));
 }
+
+#[test]
+fn row_visibility_scoped_claims_check_hidden_effects_without_returning_them() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL)]));
+    let scope = LabelScope { read: BTreeSet::from([vec![1]]), ..LabelScope::default() };
+    let caller = ScopedTransact { labels: &scope, receipt_namespace: [2; 32] };
+    let evidence = ClaimScope { branch: MAIN_BRANCH.into(), basis: basis(1), layer: Layer::Merged };
+    let claim = claims().seal_scoped(&evidence, &scope).unwrap();
+    let mut validation = request(3, vec![]);
+    validation.guards.push(Guard::Unchanged(claim));
+    let validate = |state: &TransactState, request: &Transact, authority| {
+        let Resolution::Answer(receipt) = state.resolve_scoped(request, 3, Timestamp(30), DEFAULT, &claims(), authority).unwrap()
+            else { panic!("expected validation receipt"); };
+        state.project_receipt(receipt, authority.labels).unwrap()
+    };
+    let first = validate(&state, &validation, caller);
+    assert_eq!(first.outcome, Outcome::Then);
+    commit(&mut state, 2, &request(2, vec![labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL)]));
+    let second = validate(&state, &validation, caller);
+    assert_eq!(second.outcome, Outcome::Otherwise { failed: vec![0] });
+    assert_eq!(first.basis, second.basis);
+    assert_eq!(first.system_time, second.system_time);
+
+    let foreign = LabelScope::default();
+    let wrong = validate(&state, &validation, ScopedTransact { labels: &foreign, ..caller });
+    assert!(matches!(wrong.outcome, Outcome::Refused { error } if error.code == "rtdb/invalid-claim"));
+    validation.guards[0] = Guard::Unchanged(claims().seal(&evidence).unwrap());
+    assert!(matches!(validate(&state, &validation, caller).outcome, Outcome::Refused { error } if error.code == "rtdb/invalid-claim"));
+}

@@ -114,6 +114,14 @@ impl ClaimSealer {
     }
 
     pub fn seal(&self, scope: &ClaimScope) -> Result<Claim> {
+        self.seal_for(scope, CLAIM_DOMAIN)
+    }
+
+    pub fn seal_scoped(&self, scope: &ClaimScope, labels: &LabelScope) -> Result<Claim> {
+        self.seal_for(scope, &labels.main_read_incarnation(self.incarnation))
+    }
+
+    fn seal_for(&self, scope: &ClaimScope, domain: &[u8]) -> Result<Claim> {
         if scope.basis.incarnation() != self.incarnation || !valid_branch_name(&scope.branch) {
             return Err(invalid_claim());
         }
@@ -124,7 +132,7 @@ impl ClaimSealer {
         payload.push(match scope.layer { Layer::Merged => 0, Layer::Local => 1 });
         payload.extend_from_slice(scope.branch.as_bytes());
         self.key.seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(nonce), aead::Aad::from(CLAIM_DOMAIN), &mut payload,
+            aead::Nonce::assume_unique_for_key(nonce), aead::Aad::from(domain), &mut payload,
         ).map_err(|_| Anomaly::fault("rtdb/claim-seal", "Could not seal query claim"))?;
         let mut bytes = nonce.to_vec();
         bytes.extend(payload);
@@ -132,13 +140,21 @@ impl ClaimSealer {
     }
 
     pub fn open(&self, claim: &Claim) -> Result<ClaimScope> {
+        self.open_for(claim, CLAIM_DOMAIN)
+    }
+
+    pub fn open_scoped(&self, claim: &Claim, labels: &LabelScope) -> Result<ClaimScope> {
+        self.open_for(claim, &labels.main_read_incarnation(self.incarnation))
+    }
+
+    fn open_for(&self, claim: &Claim, domain: &[u8]) -> Result<ClaimScope> {
         if claim.0.len() > MAX_CLAIM_BYTES {
             return Err(invalid_claim());
         }
         let (nonce, payload) = claim.0.split_first_chunk::<NONCE_BYTES>().ok_or_else(invalid_claim)?;
         let mut payload = payload.to_vec();
         let plaintext = self.key.open_in_place(
-            aead::Nonce::assume_unique_for_key(*nonce), aead::Aad::from(CLAIM_DOMAIN), &mut payload,
+            aead::Nonce::assume_unique_for_key(*nonce), aead::Aad::from(domain), &mut payload,
         ).map_err(|_| invalid_claim())?;
         let (basis, rest) = plaintext.split_first_chunk::<{ Basis::WIDTH }>().ok_or_else(invalid_claim)?;
         let basis = Basis::from_bytes(basis)?;

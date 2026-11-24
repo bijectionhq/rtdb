@@ -11,12 +11,17 @@ impl Candidate<'_> {
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
                     for row in rows {
-                        let valid = effective_valid(row.valid, cut.system_time)?;
                         if let Some(visibility) = &definition.visibility
                             && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
                         {
                             return Err(invalid_label());
                         }
+                        if definition.visibility.is_some() && (row.valid.is_none()
+                            || row.cells.values().any(|cell| !matches!(cell, Cell::Value(_))))
+                        {
+                            return Err(labelled_time_error());
+                        }
+                        let valid = effective_valid(row.valid, cut.system_time)?;
                         let mut cells = row.cells.iter().map(|(name, value)| (name.clone(), value.resolve(cut)))
                             .collect::<StructFields<_>>();
                         if cells.contains_key("_id") {
@@ -35,6 +40,9 @@ impl Candidate<'_> {
                 Op::Delete { branch, table, ids, valid } => {
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
+                    if definition.visibility.is_some() && valid.is_none() {
+                        return Err(labelled_time_error());
+                    }
                     let valid = effective_valid(*valid, cut.system_time)?;
                     for id in ids {
                         self.authorize_write(branch, table, id, valid, &definition, None)?;
@@ -249,6 +257,7 @@ impl Candidate<'_> {
                 definition.indexes.insert(index.name.clone(), index.clone());
             }
             Declaration::Ttl(ttl) => {
+                if definition.visibility.is_some() && ttl.is_some() { return Err(labelled_time_error()); }
                 if let Some(ttl) = ttl { expiry(cut.system_time, *ttl)?; }
                 definition.ttl_micros = *ttl;
             }
@@ -272,6 +281,7 @@ impl Candidate<'_> {
             },
             Declaration::Visibility(visibility) => {
                 validate_column(&visibility.column)?;
+                if definition.ttl_micros.is_some() { return Err(labelled_time_error()); }
                 if definition.visibility.as_ref() != Some(visibility) {
                     if definition.visibility.is_some() || self.index.has_row_history(table) {
                         return Err(conflict("rtdb/visibility-declaration", "Declare a stable visibility column before writing the table"));
@@ -398,4 +408,8 @@ fn invalid_label() -> Anomaly {
 
 fn write_scope_error() -> Anomaly {
     Anomaly::new(AnomalyCategory::Forbidden, "rtdb/write-scope", "The row operation is outside the write scope")
+}
+
+fn labelled_time_error() -> Anomaly {
+    Anomaly::unsupported("rtdb/labelled-time", "Labelled rows require explicit valid time and literal cells")
 }

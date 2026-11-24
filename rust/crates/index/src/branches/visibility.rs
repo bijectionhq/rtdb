@@ -46,6 +46,13 @@ impl VisibleHistory {
             )
         })
     }
+
+    pub fn projected_cut(&self, source: Basis) -> Result<BranchCut> {
+        let (&basis, _) = self.source_bases.iter().rev().find(|(_, original)| {
+            original.incarnation() == source.incarnation() && **original <= source
+        }).ok_or_else(|| Anomaly::incorrect("rtdb/foreign-basis", "The basis belongs to another database incarnation"))?;
+        self.index.exact(basis)
+    }
 }
 
 impl BranchIndex {

@@ -271,7 +271,26 @@ impl TransactState {
         &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
         authority: ScopedTransact<'_>,
     ) -> Result<Resolution> {
-        self.resolve_with_scope(request, position, now, features, claims, Some(authority))
+        let mut request = request.clone();
+        if request.guards.iter().any(|guard| matches!(guard, Guard::Version { expect: Version::Written(_), .. })) {
+            let history = self.index.project_main_visibility(authority.labels)?;
+            for guard in &mut request.guards {
+                if let Guard::Version { branch, expect: Version::Written(basis), .. } = guard {
+                    if branch != MAIN_BRANCH {
+                        return Err(Anomaly::unsupported("rtdb/scoped-branch", "Scoped written versions require the main branch"));
+                    }
+                    *basis = history.source_basis(*basis)?;
+                }
+            }
+        }
+        self.resolve_with_scope(&request, position, now, features, claims, Some(authority))
+    }
+
+    pub fn project_receipt(&self, mut receipt: Receipt, scope: &LabelScope) -> Result<Receipt> {
+        let cut = self.index.project_main_visibility(scope)?.projected_cut(receipt.basis)?;
+        receipt.basis = cut.basis;
+        receipt.system_time = cut.system_time;
+        Ok(receipt)
     }
 
     fn resolve_with_scope(
@@ -361,13 +380,13 @@ impl TransactState {
 
         let mut failed = Vec::new();
         for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| !guard.after()) {
-            if !guard.evaluate(&base, time, claims)? { failed.push(i); }
+            if !guard.evaluate(&base, time, claims, scope)? { failed.push(i); }
         }
         if failed.is_empty() {
             let mut then = Candidate::new(base.clone(), scope);
             then.execute(&request.ops)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
-                if !guard.evaluate(&then.index, time, claims)? { failed.push(i); }
+                if !guard.evaluate(&then.index, time, claims, scope)? { failed.push(i); }
             }
             if failed.is_empty() {
                 if !request.ops.is_empty() { then.check_constraints()?; }
@@ -480,11 +499,14 @@ impl Guard {
         matches!(self, Self::CountAtMost { when: When::After, .. })
     }
 
-    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &ClaimSealer) -> Result<bool> {
+    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &ClaimSealer, scope: Option<&LabelScope>) -> Result<bool> {
         let view = |branch| index.view(branch, At::Latest, Layer::Merged, time);
         match self {
             Self::Unchanged(claim) => {
-                let ClaimScope { branch, basis, layer } = claims.open(claim)?;
+                let ClaimScope { branch, basis, layer } = match scope {
+                    Some(scope) => claims.open_scoped(claim, scope)?,
+                    None => claims.open(claim)?,
+                };
                 index.is_unchanged(&branch, basis, layer, time)
             }
             Self::Version { branch, table, id, valid_at, expect } => {

@@ -1758,6 +1758,8 @@ surface ConnectionLifecycle {
 -- A scoped credential writes through Transact and requires a visibility declaration on each addressed table.
 -- An unrestricted credential declares visibility before the table has retained row history.
 -- Every put to a declared table contains a literal label in the declared column.
+-- Labelled writes supply their valid-time bounds and literal cells so that stored rows carry only application-selected time coordinates.
+-- A labelled table can express expiry in those valid-time bounds.
 -- SingleLabelPerTx checks the distinct labels affected by the selected effects across declared tables whenever those effects address a table with that policy.
 -- The otherwise arm has the same write checks as the then arm and starts from the original state.
 -- Before and After guards evaluate the full original state or the full candidate, respectively.
