@@ -421,8 +421,14 @@ impl LiveTable {
             if batch.view().has_entity_keys() != self.table.is_owned_event_data() {
                 return Err(invalid("The table write has the wrong physical entity-key layout"));
             }
-            if !batch.has_system_time(system_time) { return Err(invalid("Imported event system time differs from its transaction")); }
-            if batch.view().has_entity_keys() && !batch.is_empty() {
+            if write.adopted_history {
+                if self.row_count != 0 || !self.chunks.is_empty() {
+                    return Err(invalid("An adopted history must start a virgin live table"));
+                }
+            } else if !batch.has_system_time(system_time) {
+                return Err(invalid("Imported event system time differs from its transaction"));
+            }
+            if !write.adopted_history && batch.view().has_entity_keys() && !batch.is_empty() {
                 let mut previous = if self.last_system_time == Some(system_time) && self.row_count > 0 {
                     let header = self.header(self.row_count - 1)?;
                     (header.system_from == system_time
@@ -764,17 +770,24 @@ pub struct TableWrite {
     column_types: StructFields<LogicalType>,
     declared_columns: StructFields<LogicalType>,
     batch: Option<Arc<IndexBatch>>,
+    adopted_history: bool,
 }
 impl TableWrite {
     pub fn new(column_types: StructFields<LogicalType>, batch: Option<Arc<IndexBatch>>) -> Self {
         let column_types = match &batch { Some(batch) => declare_column_types(batch.put_types(), &column_types), None => column_types };
-        Self { column_types, declared_columns: StructFields::new(), batch }
+        Self { column_types, declared_columns: StructFields::new(), batch, adopted_history: false }
     }
     pub fn with_declarations(mut self, declared_columns: StructFields<LogicalType>) -> Self {
         self.column_types = declare_column_types(&self.column_types, &declared_columns);
         self.declared_columns = declared_columns;
         self
     }
+    #[doc(hidden)]
+    pub fn as_adopted_history(mut self) -> Self {
+        self.adopted_history = true;
+        self
+    }
+    pub fn is_adopted_history(&self) -> bool { self.adopted_history }
     pub fn declared_columns(&self) -> &StructFields<LogicalType> { &self.declared_columns }
     pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
     pub fn batch(&self) -> Option<&Arc<IndexBatch>> { self.batch.as_ref() }
@@ -794,9 +807,38 @@ impl StagedWrite {
         if predecessor.is_some_and(|previous| previous.tx_id >= tx_key.tx_id || previous.system_time > tx_key.system_time) {
             return Err(invalid("Transaction key does not advance its predecessor"));
         }
+        let mut adopted = BTreeMap::<&str, (bool, bool)>::new();
+        let mut positions = std::collections::BTreeSet::new();
         for (table, write) in &tables {
+            if write.adopted_history {
+                let relation = table.owned_effect_relation_name()
+                    .filter(|name| rtdb_types::OwnedRelation::new(*name).is_ok_and(|relation| relation.is_root_data()))
+                    .ok_or_else(|| invalid("An adopted history must be a Root data or journal table"))?;
+                let roles = adopted.entry(relation).or_default();
+                let role = if table.is_owned_change_journal() { &mut roles.1 } else { &mut roles.0 };
+                if std::mem::replace(role, true) {
+                    return Err(invalid("An adoption repeats a history role"));
+                }
+                let batch = write.batch().filter(|batch| !batch.is_empty())
+                    .ok_or_else(|| invalid("An adopted history must have events"))?;
+                let mut previous = None;
+                for header in batch.headers.0.iter() {
+                    let position = header.position.ok_or_else(|| invalid("An adopted event has no original position"))?;
+                    if predecessor.is_none_or(|basis| position.transaction > basis.tx_id || header.system_from > basis.system_time)
+                        || header.system_from >= tx_key.system_time
+                        || position.transaction.0 < 0
+                        || previous.is_some_and(|prior: EventPosition| position <= prior)
+                        || !positions.insert(position)
+                        || !matches!(header.op, EventOp::Put | EventOp::Delete)
+                        || (table.is_owned_change_journal() && (header.op != EventOp::Put || header.valid_time != Interval::ALL))
+                    {
+                        return Err(invalid("An adopted event is outside the original ordered history"));
+                    }
+                    previous = Some(position);
+                }
+            }
             if let Some(batch) = write.batch() {
-                if !batch.has_system_time(tx_key.system_time) {
+                if !write.adopted_history && !batch.has_system_time(tx_key.system_time) {
                     return Err(invalid("Staged event has another transaction's system time"));
                 }
                 if batch.view().has_commit_positions() && !table.is_owned_event_data() && !table.is_owned_world_topology()
@@ -805,6 +847,9 @@ impl StagedWrite {
                     return Err(invalid("A commit position requires an owned fact or world topology"));
                 }
             }
+        }
+        if !adopted.is_empty() && (adopted.len() != 1 || adopted.values().next() != Some(&(true, true))) {
+            return Err(invalid("An adoption requires one data and journal pair"));
         }
         Ok(Self { tx_key, predecessor, block_index, tables, segments: OnceLock::new() })
     }
@@ -867,7 +912,7 @@ impl StagedWrite {
         let mut first = 0u64;
         for table in self.tables.values_mut() {
             let Some(batch) = &table.batch else { continue; };
-            if batch.is_empty() { continue; }
+            if batch.is_empty() || table.adopted_history { continue; }
             let last = first.checked_add(batch.len() as u64).ok_or_else(|| invalid("Event ordinal overflow"))?;
             if !batch.view().has_origin_column() {
                 let origins = (first..last).map(|ordinal| Some(rtdb_types::EventOrigin::at(commit, ordinal, block)));
@@ -951,6 +996,7 @@ impl LiveIndex {
 struct PendingTable {
     declared: StructFields<LogicalType>,
     sql_declarations: StructFields<LogicalType>,
+    adopted_history: Option<Arc<IndexBatch>>,
     events: Vec<StoredEvent>,
     batches: Vec<PendingBatch>,
     reservations: Vec<Arc<MemoryReservation>>,
@@ -1409,10 +1455,25 @@ impl TransactionBuffer {
 
     /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
     pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
+    #[doc(hidden)]
+    pub fn adopt_owned_history(&mut self, table: TableRef, batch: Arc<IndexBatch>) -> Result<()> {
+        if self.base.contains_table(&table) || self.tables.contains_key(&table) {
+            return Err(invalid("An adopted history requires a virgin destination"));
+        }
+        let pending = PendingTable { adopted_history: Some(batch), ..PendingTable::default() };
+        self.tables.insert(table, pending);
+        Ok(())
+    }
     pub fn has_pending_table(&self, table: &TableRef) -> bool { self.tables.contains_key(table) }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
         for (table, pending) in &self.tables {
+            if let Some(batch) = &pending.adopted_history {
+                let segment = Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())
+                    .append(&TableWrite::new(StructFields::new(), Some(Arc::clone(batch))).as_adopted_history(), self.tx_key.system_time)?);
+                segments.insert(table.clone(), (segment, WritePosition::default(), StructFields::new()));
+                continue;
+            }
             let (segment, done, declared) = match segments.get(table) {
                 Some((segment, done, declared)) => (Arc::clone(segment), *done, Some(declared)),
                 None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), WritePosition::default(), None),
@@ -1434,6 +1495,12 @@ impl TransactionBuffer {
     }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
+            if let Some(batch) = &pending.adopted_history {
+                if !pending.events.is_empty() || !pending.batches.is_empty() || !pending.sql_declarations.is_empty() {
+                    return Err(invalid("An adopted history cannot share its table with fresh writes"));
+                }
+                return Ok((table.clone(), TableWrite::new(StructFields::new(), Some(Arc::clone(batch))).as_adopted_history()));
+            }
             let batch = Some(pending.copy_since(WritePosition::default(), &self.budget)?);
             Ok((table.clone(), TableWrite::new(pending.declared.clone(), batch)
                 .with_declarations(pending.sql_declarations.clone())))

@@ -11,6 +11,8 @@ use crate::{RetainedAnomaly, TransactionResult};
 
 pub(crate) mod worlds;
 
+pub(crate) const ADOPTED_HISTORY_METADATA: &str = "rtdb:adopted-history";
+
 const MAX_RETIRED_OUTCOMES: usize = 128;
 
 pub struct ReplayedTransaction {
@@ -107,11 +109,24 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
         if pages.len() != 1 { return Err(invalid("Resolved transaction table must contain exactly one record batch")); }
         let page = pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?;
         let schema = page.batch().schema_ref();
+        let adopted = match schema.metadata().get(ADOPTED_HISTORY_METADATA).map(String::as_str) {
+            None => false,
+            Some("1") if result.committed() && message.db_op.is_none() && (held || placed.is_some()) => true,
+            Some(_) => return Err(invalid("An adopted history requires a committed placed decision")),
+        };
         let declarations = rtdb_format::catalog::schema_declarations(schema)?;
         if !declarations.is_empty() && message.committed != Some(true) {
             return Err(invalid("An uncommitted transaction cannot declare columns"));
         }
-        let page = match rtdb_format::catalog::without_schema_declarations(schema) {
+        let mut clean_schema = rtdb_format::catalog::without_schema_declarations(schema);
+        if adopted {
+            if !declarations.is_empty() { return Err(invalid("An adopted history cannot declare columns")); }
+            let clean = clean_schema.unwrap_or_else(|| schema.as_ref().clone());
+            let mut metadata = clean.metadata().clone();
+            metadata.remove(ADOPTED_HISTORY_METADATA);
+            clean_schema = Some(clean.with_metadata(metadata));
+        }
+        let page = match clean_schema {
             Some(schema) => {
                 let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.batch().num_rows()));
                 let rows = arrow_array::RecordBatch::try_new_with_options(Arc::new(schema), page.batch().columns().to_vec(), &options)
@@ -135,8 +150,10 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
                 }
             }
         }
-        tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)).with_declarations(declarations));
+        let write = TableWrite::new(StructFields::new(), Some(batch)).with_declarations(declarations);
+        tables.insert(table, if adopted { write.as_adopted_history() } else { write });
     }
+    check_adoption_publication(&tables, key, memory)?;
     if held {
         return Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: None });
     }
@@ -224,6 +241,60 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
         return Err(invalid("Placed world inventory has no owned effects"));
     }
     Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: placed.map(|(attempt, _)| attempt) })
+}
+
+fn check_adoption_publication(tables: &BTreeMap<TableRef, TableWrite>, key: TransactionKey, memory: &Arc<MemoryBudget>) -> Result<()> {
+    let Some((table, _)) = tables.iter().find(|(table, write)| write.is_adopted_history() && table.is_owned_event_data())
+    else { return Ok(()); };
+    let invalid = || invalid("Adopted history has no atomic Root publication and retirement");
+    let (owner, destination) = table.table.split_once('-').ok_or_else(invalid)?;
+    let role = |suffix| TableRef::new(&table.schema, format!("{owner}-{suffix}"));
+    let adoption = tables.get(&role(".adopted-relations")).and_then(TableWrite::batch).ok_or_else(invalid)?;
+    let attempts = tables.get(&role(rtdb_types::OWNED_ATTEMPT_RELATION)).and_then(TableWrite::batch).ok_or_else(invalid)?;
+    let publications = tables.get(&role(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)).and_then(TableWrite::batch).ok_or_else(invalid)?;
+    let retirement = tables.get(&role(".retired-relations")).and_then(TableWrite::batch).ok_or_else(invalid)?;
+    let bytes = [adoption, publications, retirement].into_iter().try_fold(0usize, |bytes, batch| {
+        bytes.checked_add(batch.arrow().get_array_memory_size()).ok_or_else(invalid)
+    })?;
+    if bytes > 256 * 1024 || attempts.is_empty()
+        || adoption.len() != 1 || !adoption.view().header(0).is_ok_and(|header| header.system_from == key.system_time)
+        || [TableRef::new("public", "bj_fact_root_owner"), TableRef::new("public", "bj_relation_declarations")]
+            .iter().any(|table| tables.get(table).is_none_or(|write| write.row_count() == 0))
+    {
+        return Err(invalid());
+    }
+    let _scratch = memory.reserve(bytes * 8 + 4096)?;
+    let StoredOperation::Put(row) = adoption.view().read_event(0)?.operation else { return Err(invalid()); };
+    let Some(Value::Utf8(source)) = row.get("predecessor") else { return Err(invalid()); };
+    if source == destination || !rtdb_types::OwnedRelation::new(source.as_str()).is_ok_and(|relation| relation.is_root_data())
+        || !matches!(row.get("_id"), Some(Value::Utf8(id)) if id == destination)
+        || row.get("activation_tx") != Some(&Value::I64(key.tx_id.0))
+        || row.get("activation_micros") != Some(&Value::I64(key.system_time.0))
+        || tables.contains_key(&role(source))
+        || tables.contains_key(&role(&format!(".changes-{source}")))
+    {
+        return Err(invalid());
+    }
+    let head = format!("fact_partition_head:{destination}");
+    let mut heads = 0;
+    for index in 0..publications.len() {
+        if let StoredOperation::Put(row) = publications.view().read_event(index)?.operation
+            && matches!(row.get("_id"), Some(Value::Utf8(id)) if id == &head)
+            && publications.header(index)?.valid_time == Interval::ALL
+        {
+            heads += 1;
+        }
+    }
+    if heads != 1 { return Err(invalid()); }
+    for index in 0..retirement.len() {
+        if let StoredOperation::Put(row) = retirement.view().read_event(index)?.operation
+            && matches!(row.get("_id"), Some(Value::Utf8(id)) if id == source)
+            && rtdb_types::OwnedRetirement::decode(&row).is_ok_and(|(_, retired)| retired.retired_at == key.system_time)
+        {
+            return Ok(());
+        }
+    }
+    Err(invalid())
 }
 
 fn verify_archive_replay(

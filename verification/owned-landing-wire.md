@@ -53,3 +53,52 @@ The ordered resolver's comparison, marker write, and selection of the held recor
 
 RTDB's decoder laws are in [owned_landing_wire](verus/owned_landing_wire/laws.rs).
 Bijection checks the encoder and hash input selection in its `factstore_landing` Verus area.
+
+## Populated clear relation adoption
+
+The private hosted Root decision accepts one fact group named by the predecessor layout.
+Its single Arrow row has four non-null columns: Utf8 `_id` equal to the predecessor, Utf8 `_op` equal to `adopt-relation`, Utf8 `destination` equal to the staged layout, and signed Int64 `retain_micros` using the owned retirement bound.
+The existing placed writer proof, create-only attempt marker, expected Root catalog and declaration controls, and held conditions travel in the same decision.
+
+Use the same Bijection Root hold for all four reads.
+For each endpoint call `HeldRead::read_point` on `fact_publications` with `point_key(fact_partition_head(relation), None)` at held present.
+Turn the source's `Point::stamp` into its existing point check with both the SQL history microseconds and the 16-byte event position.
+Turn the destination result into an absence check at that same present.
+For each endpoint call the existing `ordered_population` on that hold with the installed empty-key population order from its layout.
+Submit the returned full-span witness as `Evidence::IndexReplacementPopulation` through the durable range witness stream.
+RTDB requires exactly one range witness per endpoint, the same witnessed transaction key and placed scope for both, a live witness deadline, and an exact match to each durable data frontier.
+The source must have an original partition head and positioned history.
+The staged destination must have a zero data frontier and a virgin data, journal and purge inventory.
+The receiver compares the two witness frontiers to the durable predecessor, then derives the data and journal event counts for that same predecessor.
+The population returned by a held count describes winners at its valid instant.
+The receiver's data inventory includes every original put and delete and its journal inventory includes the coverage floor, so neither inventory is a caller-supplied field.
+
+Carry the adoption group in the existing Bijection deployment attempt fingerprint.
+The create-only marker and the placed outcome are installed with the successor and predecessor retirement.
+Recover an ambiguous submission through the original placed outcome, or recover the matching fingerprint from the original Bijection attempt marker as other hosted releases do.
+A repeated decision never copies the history a second time because its checked predecessor and virgin destination have already moved.
+A different fingerprint under the same marker cannot recover that marker as its own outcome.
+A fresh Flight submission has its own placed receipt and is subject to the same predecessor comparisons.
+
+The production resolver still uses the [hosted decision checks](verus/owned_flight_decision/area.json) for installed authority, predecessor stamp equality and primary publication.
+Adoption uses the same `revision_matches` decision for its held population frontiers.
+The [read-back identity area](verus/readback_identity/area.json) covers the existing journal body confirmation used to install the ordered transaction.
+The [change group area](verus/owned_change_group/area.json) covers the checked journal sequence used by the successor feed.
+Relocation's complete file census, canonical-to-compound cell correspondence, and the composition through replica replay and erasure are additional source obligations.
+
+### Clear cell correspondence
+
+The current execution seam is `OwnedSchema::clear_compound_successor` and the returned `CompoundAdoption::convert`.
+RTDB executes it over each original clear cell read from its own bounded history census.
+It implements the concrete subset of Bijection's canonical grammar for tags 2, 3, 4, 5, 7, 8, 9, 10, 12 and 13.
+Those tags carry null, Boolean, signed Int64, Float64 with preserved signed zero and canonical NaN, Date32, UTC microsecond Instant, Utf8 and Binary with canonical NUL escapes, recursively admitted lists, and closed records with sorted keys.
+The conversion also implements Bijection's `v2_value`, `value_` and `is_present_` layouts and selects union legs by their admitted canonical value tag.
+An explicit top-level canonical null stays in the declared Binary leg, and a missing field stays absent.
+Unsupported scalar carriers, Decimal, references, clock or revision terms, open records, and values outside the installed compound shape refuse adoption.
+
+The receiver's obligation is to establish exact correspondence against the source bytes it opened itself.
+It must also establish one-to-one coverage at the original event coordinates, so a candidate digest or successful Arrow shape check alone cannot authorize replacement.
+The value mapping can be supplied by the shared native_columnar owner once its concrete promotion is available in a receiver-linkable component with a bounded canonical input, exact installed compound declaration, explicit presence and null semantics, and a funded Arrow output.
+RTDB can execute that same mapping over its checked inventory and build the ordered baseline.
+If the caller supplies promoted Arrow instead, RTDB still needs a receiver-executed equivalence check for every positioned cell against its original canonical bytes before staging the candidate.
+The current local subset and its source cases provide no correspondence evidence for the refused shapes.

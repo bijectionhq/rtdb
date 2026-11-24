@@ -1,3 +1,6 @@
+mod compound_adoption;
+pub use compound_adoption::CompoundAdoption;
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -603,6 +606,47 @@ impl OwnedSchema {
 
     fn path_field(&self, name: &str) -> Option<&Field> {
         self.0.fields.iter().find(|field| field.name == name)
+    }
+
+    #[doc(hidden)]
+    pub fn clear_compound_successor<'a>(
+        &self, successor: &'a Self, orders: &[(&str, &str)],
+    ) -> Result<(&'a str, CompoundAdoption<'a>)> {
+        let refused = || invalid("Adoption requires exactly one clear canonical field and its bounded compound successor");
+        if !self.is_v2() || !successor.is_v2() || !self.has_acceptance_validity()
+            || self.0.validity != successor.0.validity || self.lifetime_micros().is_some()
+            || successor.lifetime_micros().is_some() || self.0.fields.len() != successor.0.fields.len()
+            || self.has_world_assertion_journal() || successor.has_world_assertion_journal()
+            || self.0.fields.iter().any(|field| field.kind.is_opaque() || matches!(field.kind, Kind::Label {}))
+        {
+            return Err(refused());
+        }
+        let mut changed = None;
+        let order = |field: &Field| matches!(field.kind, Kind::Binary {}) && !field.optional && !field.nullable;
+        for (old, new) in orders {
+            if !self.path_field(old).is_some_and(order) || !successor.path_field(new).is_some_and(order)
+                || (old != new && (self.path_field(new).is_some() || successor.path_field(old).is_some()))
+            {
+                return Err(refused());
+            }
+        }
+        for next in &successor.0.fields {
+            if orders.iter().any(|(_, new)| *new == next.name.as_str()) { continue; }
+            let previous = self.path_field(&next.name).ok_or_else(refused)?;
+            if previous == next { continue; }
+            let Kind::Union { legs } = &next.kind else { return Err(refused()); };
+            let [Kind::Binary {}, Kind::Struct { fields }] = legs.as_slice() else { return Err(refused()); };
+            let [value] = fields.as_slice() else { return Err(refused()); };
+            if changed.is_some() || !matches!(previous.kind, Kind::Binary {} | Kind::CanonicalBinary {})
+                || previous.optional != next.optional || previous.nullable != next.nullable
+                || value.name != "v2_value" || value.optional || !value.nullable
+                || !compound_adoption::is_compound(&value.kind)
+            {
+                return Err(refused());
+            }
+            changed = Some((next.name.as_str(), CompoundAdoption(&value.kind)));
+        }
+        changed.ok_or_else(refused)
     }
 
     pub fn validate_types(&self, types: &StructFields<LogicalType>) -> Result<()> {

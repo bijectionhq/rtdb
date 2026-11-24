@@ -795,8 +795,14 @@ impl OwnedReadSession {
         &self, relation: &OwnedRelation, cut: TransactionKey,
     ) -> Result<()> {
         self.check_relation(relation)?;
-        let database = self.retained_root_context().catalog.database(&self.database)?;
+        let root = self.retained_root_context();
+        let database = root.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        if let Some((_, activation)) = rtdb_query::read_owned_adoption(Arc::clone(root), &self.owner, relation).await?
+            && !activation.at_or_before(cut)
+        {
+            return Err(historical_owned_read::below_floor(activation.system_time));
+        }
         if let Some(covered) = self.covered_journal(snapshot, relation, self.present.system_time).await?
             && covered.floor.through_events != 0
             && !covered.floor.publication.at_or_before(cut)
@@ -819,11 +825,16 @@ impl OwnedReadSession {
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
         };
+        let activation = rtdb_query::read_owned_adoption(Arc::clone(self.retained_root_context()), &self.owner, relation)
+            .await?.map(|(_, activation)| activation.system_time);
+        if let Some(floor) = activation.filter(|floor| at < *floor) {
+            return Err(historical_owned_read::below_floor(floor));
+        }
         let Some(covered) = self.covered_journal(snapshot, relation, self.present.system_time).await? else {
             self.check_relation(relation)?;
             return Ok(None);
         };
-        let floor = (covered.floor.through_events != 0).then_some(covered.floor.publication.system_time);
+        let floor = (covered.floor.through_events != 0).then_some(covered.floor.publication.system_time).max(activation);
         if let Some(floor) = floor.filter(|floor| at < *floor) {
             return Err(historical_owned_read::below_floor(floor));
         }

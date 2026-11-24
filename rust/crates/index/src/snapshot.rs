@@ -285,6 +285,17 @@ impl Snapshot {
         next.system_time_cap = Some(tx_key.system_time);
         Ok(next)
     }
+    pub(crate) fn require_virgin_adoption(&self, write: &StagedWrite) -> Result<()> {
+        for (table, effect) in write.tables() {
+            if effect.is_adopted_history()
+                && (self.contains_table(table) || self.trie_catalog.iter_tries(table).next().is_some())
+            {
+                return Err(Anomaly::incorrect("rtdb.index/adoption-destination", "Adopted history requires a virgin destination"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn with_staged(&self, staged: &[Arc<StagedWrite>]) -> Result<Self> {
         let mut next = self.clone();
         if !staged.is_empty() { next.memos = Default::default(); }
@@ -292,6 +303,7 @@ impl Snapshot {
             if write.predecessor() != next.basis || write.block_index() != self.block_index() {
                 return Err(Anomaly::incorrect("rtdb.index/overlay-order", "Staged overlay does not follow the snapshot basis and block"));
             }
+            next.require_virgin_adoption(write)?;
             for (table, segment) in write.staged_segments()? {
                 next.layered.entry(table.clone()).or_default().push(Arc::clone(segment));
             }
