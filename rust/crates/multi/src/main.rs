@@ -339,6 +339,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::BuildInfo,
             standalone_protocol: u32,
             hosted_protocol: u32,
+            held_root_catalog: bool,
             pgwire_arrow_copy_out: bool,
             placed_receipt_retirement: bool,
         }
@@ -348,6 +349,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 146 } else { 17 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
+            held_root_catalog: true,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;

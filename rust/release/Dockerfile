@@ -72,6 +72,7 @@ COPY --from=multi-build /source/rust/target/release/rtdb-multi /usr/local/bin/rt
 COPY --chmod=0555 rust/release/multi-entrypoint.sh /usr/local/bin/rtdb-multi-entrypoint
 USER rtdb
 ENTRYPOINT ["/usr/local/bin/rtdb-multi-entrypoint"]
+LABEL io.rtdb.held-root-catalog=true
 
 FROM runtime-environment AS runtime
 COPY --from=build /source/rust/target/release/rtdb /usr/local/bin/rtdb

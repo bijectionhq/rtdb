@@ -1,12 +1,13 @@
 use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_array::TimestampMicrosecondArray;
+use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
 use rtdb_storage::cache::{BufferPool, HeldCatalogRead};
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, Timestamp, TransactionKey, Value};
 
 use crate::Database;
-use super::{AppliedCatalogAdmission, CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, prepare_query, read_value};
+use super::{AppliedCatalogAdmission, CatalogReadCut, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
 use rtdb_query::QueryContext;
 
 /// One storage registration for a lower bound on the physical catalogs read by a prepared session.
@@ -139,8 +140,10 @@ impl AppliedReadFloor {
                 let batch = batch.batch();
                 if batch.num_rows() == 0 { continue; }
                 if seen || batch.num_rows() != 1 { return Err(unavailable()); }
-                let value = read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?;
-                if !matches!(value, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == expected.system_time.0) {
+                let time = selected_cell(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?
+                    .and_then(|(_, column, row)| column.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                        .map(|column| column.value(row)));
+                if time != Some(expected.system_time.0) {
                     return Err(unavailable());
                 }
                 seen = true;
@@ -148,6 +151,54 @@ impl AppliedReadFloor {
             if !seen { return Err(unavailable()); }
         }
         Ok(())
+    }
+}
+
+impl NativeSession {
+    pub async fn confirm_hosted_source_prefix(
+        &self,
+        history: uuid::Uuid,
+        floor: Option<&AppliedReadFloor>,
+    ) -> Result<Option<TransactionKey>> {
+        if history.is_nil() || floor.is_some_and(|floor| floor.history() != history)
+            || self.service.audience_storage.is_some() || self.placed_history()?.is_none()
+        {
+            return Err(hosted_source_unavailable());
+        }
+        let database = self.state.database();
+        let cancellation = self.state.cancellation();
+        let receipt = self.service.await_durable_source(database, true, cancellation).await?
+            .ok_or_else(hosted_source_unavailable)?;
+        if uuid::Uuid::parse_str(&receipt.history).ok() != Some(history) {
+            return Err(hosted_source_unavailable());
+        }
+        let Some(sampled) = receipt.applied else {
+            return if floor.is_none() { Ok(None) } else { Err(hosted_source_unavailable()) };
+        };
+        if floor.is_some_and(|floor| !covers_transaction(sampled, floor.minimum())) {
+            return Err(hosted_source_unavailable());
+        }
+        let basis = QueryBasis {
+            snapshot: TimeBasis::default(),
+            replica_capture: None,
+            resume_token: None,
+            has_await_floor: false,
+            snapshot_time: Some(sampled.system_time),
+            current_time: sampled.system_time.into(),
+            timezone: self.state.session_timezone().to_owned(),
+        };
+        let context = self.service.query_context(database, &basis, cancellation).await?;
+        let captured = context.catalog.database(database)?;
+        let [partition] = captured.partitions.as_slice() else {
+            return Err(hosted_source_unavailable());
+        };
+        let head = partition.tx_basis().filter(|head| covers_transaction(*head, sampled))
+            .ok_or_else(hosted_source_unavailable)?;
+        let sampled_floor = AppliedReadFloor::new(history, vec![sampled])?;
+        floor.unwrap_or(&sampled_floor).require_transactions(&context, head, Some(sampled)).await?;
+        context.check_cancelled()?;
+        self.service.database()?;
+        Ok(Some(sampled))
     }
 }
 

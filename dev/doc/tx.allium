@@ -288,6 +288,9 @@
 -- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
 -- SHOW rtdb_hosted_source_barrier is the hosted variant and returns the confirmed deployment identity.
 -- It requires a current holder with linearizable reads, a recovered directory checkpoint, and a fresh quorum confirmation.
+-- The ordinary hosted Flight source confirmation uses the same barrier before checking the original positions at one admitted catalog cut.
+-- The authenticated placed control owner supplies the deployment identity and up to four exact transaction ID and system-time pairs.
+-- The Flight reply carries the sampled applied position as Arrow columns only when the cut proves every supplied position.
 --
 -- == Boundaries ==
 --

@@ -27,6 +27,9 @@ entity SpatialPostings {
 -- An ordered Root catalog publication can require the exact staged path definition and check its coverage at the ordered cut.
 -- A spatial index addition orders its readiness conditions with the Root catalog, publication markers, and deploy-hook writes.
 -- A compatible placed Root catalog write retains its Arrow payload and exact field presence through ordered validation and staging.
+-- An ordinary held Root catalog reads the installed authority and the active declarations on one authenticated cut and returns their Arrow columns.
+-- The declaration inventory has a fixed Root world predicate and a bounded row count.
+-- In a placed deployment the installed control owner and relation allowlist gate the catalog projection.
 -- The readiness check includes any events staged by the catalog publication.
 -- A failed readiness condition prevents publication of the revised catalog.
 -- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.

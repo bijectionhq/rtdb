@@ -1,5 +1,6 @@
 mod historical_owned_read;
 mod hosted_control;
+pub use hosted_control::RootCatalogRead;
 mod hosted_observation;
 pub use hosted_observation::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 use hosted_observation::PreparedAppliedCatalog;

@@ -35,6 +35,7 @@ pub use rtdb_tx::{ArchivedWorldConstraints, HostedControlWrite, WorldConstraintA
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
 pub use node::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
+pub use node::RootCatalogRead;
 pub use node::SearchFileFormat;
 #[cfg(feature = "search")]
 pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
