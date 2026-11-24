@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{Epoch, Journal, JournalError, Lsn, Page, StreamId};
+use journal_contract::{Epoch, Journal, JournalError, Lsn, StreamId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -10,10 +10,17 @@ use uuid::Uuid;
 const ENVELOPE_VERSION: u8 = 1;
 const PAGE_SIZE: usize = 128;
 
+#[derive(Clone)]
 pub(crate) struct Stream {
     pub(crate) database: Uuid,
     journal: Arc<dyn Journal>,
     pub(crate) kms: Arc<dyn Kms>,
+}
+
+pub(crate) struct CommittedPage {
+    pub(crate) floor: Lsn,
+    pub(crate) records: Vec<(Lsn, Bytes)>,
+    pub(crate) head: Lsn,
 }
 
 pub(crate) struct Entry {
@@ -53,10 +60,16 @@ impl Stream {
         self.journal.seal(self.id(), epoch).await
     }
 
-    pub(crate) async fn read(&self, from: Lsn) -> journal_contract::Result<Page> {
-        self.journal
+    pub(crate) async fn read(&self, from: Lsn) -> journal_contract::Result<CommittedPage> {
+        let page = self
+            .journal
             .read(self.id(), from, PAGE_SIZE, Duration::ZERO)
-            .await
+            .await?;
+        Ok(CommittedPage {
+            floor: page.floor,
+            records: page.records,
+            head: page.end,
+        })
     }
 
     pub(crate) async fn trim(&self, epoch: Epoch, through: Lsn) -> journal_contract::Result<()> {

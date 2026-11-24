@@ -2,21 +2,36 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use journal_contract::{Epoch, JournalError, Lsn};
 use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record};
-use rtdb_index::branches::BranchCut;
+use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex};
 use rtdb_store::{ObjectStore, Reachability, VerifiedManifest, read_manifest};
 use rtdb_tx::transact::{Receipt, TransactState, TransactionRecord};
 use rtdb_types::{Anomaly, Result, Timestamp, rtdb_v1::Basis};
 
 use crate::journal::{Entry, Stream, journal_error, next};
 
+pub struct AppliedEffects {
+    pub cut: BranchCut,
+    pub previous: BranchCut,
+    pub effects: Vec<BranchEffect>,
+}
+
+pub struct ChangeHistory<'a> {
+    pub index: &'a BranchIndex,
+    pub floor: Lsn,
+    pub head: Lsn,
+    pub groups: &'a [AppliedEffects],
+    pub now: Timestamp,
+}
+
 pub(crate) struct Committed {
     pub(crate) transactions: TransactState,
     pub(crate) floor: Lsn,
-    pub(crate) end: Lsn,
+    pub(crate) head: Lsn,
     pub(crate) epoch: Epoch,
     pub(crate) generation: u64,
     pub(crate) lease: Option<(Epoch, i64)>,
     pub(crate) records: Vec<Record>,
+    pub(crate) effects: Vec<AppliedEffects>,
 }
 
 impl Committed {
@@ -24,11 +39,12 @@ impl Committed {
         Self {
             transactions: TransactState::new(*stream.database.as_bytes()),
             floor,
-            end: Lsn(floor.0 - 1),
+            head: Lsn(floor.0 - 1),
             epoch: Epoch(0),
             generation: 1,
             lease: None,
             records: Vec::new(),
+            effects: Vec::new(),
         }
     }
 
@@ -38,7 +54,7 @@ impl Committed {
         end: Lsn,
         mut previous: Option<Self>,
     ) -> Result<Self> {
-        let mut from = next(previous.as_ref().map_or(Lsn(0), |state| state.end))?;
+        let mut from = next(previous.as_ref().map_or(Lsn(0), |state| state.head))?;
         loop {
             let page = match stream.read(from).await {
                 Ok(page) => page,
@@ -49,7 +65,7 @@ impl Committed {
                 }
                 Err(error) => return Err(journal_error(error)),
             };
-            if page.floor == Lsn(0) || page.end < Lsn(page.floor.0 - 1) {
+            if page.floor == Lsn(0) || page.head < Lsn(page.floor.0 - 1) {
                 return Err(invalid("The journal page has invalid bounds"));
             }
             if previous
@@ -81,10 +97,10 @@ impl Committed {
                 }
                 state.apply(lsn, entry)?;
             }
-            if state.end == end {
+            if state.head == end {
                 return Ok(state);
             }
-            let following = next(state.end)?;
+            let following = next(state.head)?;
             if following <= from {
                 return Err(journal_error(JournalError::Unavailable));
             }
@@ -94,20 +110,35 @@ impl Committed {
     }
 
     pub(crate) fn apply(&mut self, lsn: Lsn, entry: Entry) -> Result<Option<Receipt>> {
-        if lsn != next(self.end)? || entry.epoch < self.epoch {
+        if lsn != next(self.head)? || entry.epoch < self.epoch {
             return Err(invalid("The journal records are out of order"));
         }
         let mut receipt = None;
+        let mut effects = None;
+        let previous = self.transactions.index().head();
         let generation = match &entry.record {
             Record::Tx { payload, .. } => {
                 let record = TransactionRecord::decode(payload)?;
-                if !matches!(record, TransactionRecord::Tx(_)) {
+                let TransactionRecord::Tx(transaction) = &record else {
                     return Err(invalid("A Tx envelope must contain a resolved transaction"));
-                }
+                };
+                effects = Some(transaction.effects().to_vec());
                 receipt = self.transactions.apply(lsn.0, record)?;
                 self.generation
             }
             Record::Settle { tx_lsn } => {
+                let offset = tx_lsn
+                    .checked_sub(self.floor.0)
+                    .and_then(|offset| usize::try_from(offset).ok());
+                let Some(Record::Tx { payload, .. }) =
+                    offset.and_then(|offset| self.records.get(offset))
+                else {
+                    return Err(invalid("Settle has no retained transaction"));
+                };
+                let TransactionRecord::Tx(transaction) = TransactionRecord::decode(payload)? else {
+                    return Err(invalid("Settle does not refer to a resolved transaction"));
+                };
+                effects = Some(transaction.effects().to_vec());
                 receipt = self
                     .transactions
                     .apply(lsn.0, TransactionRecord::Settle { tx_lsn: *tx_lsn })?;
@@ -130,7 +161,8 @@ impl Committed {
                 self.generation
             }
             Record::Checkpoint(checkpoint) => {
-                if checkpoint.through != self.end.0 || checkpoint.key_generation != entry.generation
+                if checkpoint.through != self.head.0
+                    || checkpoint.key_generation != entry.generation
                 {
                     return Err(invalid(
                         "The checkpoint does not cover the preceding position",
@@ -138,7 +170,15 @@ impl Committed {
                 }
                 checkpoint.key_generation
             }
-            Record::KeyRotate { generation, .. } => *generation,
+            Record::KeyRotate { generation, at } => {
+                if *at != self.head.0
+                    || !matches!(self.records.last(), Some(Record::Checkpoint(checkpoint))
+                    if checkpoint.key_generation == *generation)
+                {
+                    return Err(invalid("Key rotation must follow its clean checkpoint"));
+                }
+                *generation
+            }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
         };
         if generation != entry.generation {
@@ -148,8 +188,20 @@ impl Committed {
         }
         self.generation = generation;
         self.epoch = entry.epoch;
-        self.end = lsn;
+        self.head = lsn;
         self.records.push(entry.record);
+        if let (Some(receipt), Some(effects)) = (&receipt, effects)
+            && !effects.is_empty()
+        {
+            self.effects.push(AppliedEffects {
+                cut: BranchCut {
+                    basis: receipt.basis,
+                    system_time: receipt.system_time,
+                },
+                previous,
+                effects,
+            });
+        }
         Ok(receipt)
     }
 

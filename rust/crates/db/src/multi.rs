@@ -10,14 +10,20 @@ use rtdb_store::{
 use rtdb_tx::transact::{
     LINEARIZABLE, Op, Receipt, Resolution, TIMED_TRANSACT, Transact, TransactionRecord,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::ClaimSealer};
+use rtdb_types::{
+    Anomaly, AnomalyCategory, Result, Timestamp,
+    rtdb_v1::{Basis, Claim, ClaimScope, ClaimSealer, Layer},
+};
 use uuid::Uuid;
 
 use crate::{
     journal::{Entry, Stream, journal_error, next},
     placement::preferred,
-    replay::Committed,
+    replay::{ChangeHistory, Committed},
 };
+
+mod pipeline;
+pub use pipeline::WritePipeline;
 
 pub struct MultiOptions {
     pub database: Uuid,
@@ -91,6 +97,10 @@ impl MultiDatabase {
 
     pub async fn create(&self) -> Result<()> {
         self.stream.create().await
+    }
+
+    pub fn incarnation(&self) -> [u8; 16] {
+        *self.options.database.as_bytes()
     }
 
     pub fn role(&self) -> Role {
@@ -226,18 +236,8 @@ impl MultiDatabase {
         if let Some(lease) = authority {
             self.refuse_pending(lease).await?;
         }
-        if request
-            .ops
-            .iter()
-            .chain(&request.otherwise)
-            .any(|op| matches!(op, Op::Erase { .. }))
-        {
-            return Err(Anomaly::unsupported(
-                "rtdb/erasure-required",
-                "Submit erasure through the key rotation path",
-            ));
-        }
-        let position = next(self.state().end)?;
+        reject_erasure(request)?;
+        let position = next(self.state().head)?;
         let now = (self.clock)();
         let features = [LINEARIZABLE, TIMED_TRANSACT];
         let prepared = match self.state().transactions.resolve(
@@ -273,6 +273,32 @@ impl MultiDatabase {
     pub async fn fresh_index(&mut self) -> Result<&BranchIndex> {
         self.refresh().await?;
         Ok(self.state().transactions.index())
+    }
+
+    pub async fn fresh_view(&mut self) -> Result<(BranchIndex, u64)> {
+        self.refresh().await?;
+        let state = self.state();
+        Ok((state.transactions.index().clone(), state.generation))
+    }
+
+    pub fn seal_claim(&self, branch: String, basis: Basis, layer: Layer) -> Result<Claim> {
+        self.claims.seal(&ClaimScope {
+            branch,
+            basis,
+            layer,
+        })
+    }
+
+    pub async fn fresh_history(&mut self) -> Result<ChangeHistory<'_>> {
+        self.refresh().await?;
+        let state = self.state();
+        Ok(ChangeHistory {
+            index: state.transactions.index(),
+            floor: state.floor,
+            head: state.head,
+            groups: &state.effects,
+            now: (self.clock)(),
+        })
     }
 
     pub async fn check_generation(&self, generation: u64) -> Result<()> {
@@ -322,7 +348,7 @@ impl MultiDatabase {
             pins: closure.pins().cloned().collect(),
             payload: self.state().checkpoint_payload(lease.until)?,
         };
-        let through = self.state().end;
+        let through = self.state().head;
         let generation = self.state().generation;
         let writer = self.writer.as_mut().ok_or_else(no_writer)?;
         let image = writer
@@ -455,7 +481,7 @@ impl MultiDatabase {
     }
 
     async fn append(&mut self, lease: Lease, record: Record) -> Result<Option<Receipt>> {
-        let at = next(self.state().end)?;
+        let at = next(self.state().head)?;
         let entry = Entry {
             epoch: lease.epoch,
             generation: self.state().generation,
@@ -588,6 +614,21 @@ fn no_writer() -> Anomaly {
         "rtdb/no-writer",
         "This node has no active writer lease",
     )
+}
+
+fn reject_erasure(request: &Transact) -> Result<()> {
+    if request
+        .ops
+        .iter()
+        .chain(&request.otherwise)
+        .any(|op| matches!(op, Op::Erase { .. }))
+    {
+        return Err(Anomaly::unsupported(
+            "rtdb/erasure-required",
+            "Erasure requires a qualified key rotation path",
+        ));
+    }
+    Ok(())
 }
 
 fn missing_receipt() -> Anomaly {

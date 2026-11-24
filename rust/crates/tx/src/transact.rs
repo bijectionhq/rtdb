@@ -125,6 +125,7 @@ pub struct PreparedAppend {
 impl PreparedAppend {
     pub fn position(&self) -> u64 { self.position }
     pub fn record(&self) -> &TransactionRecord { &self.record }
+    pub fn into_record(self) -> TransactionRecord { self.record }
 
     /// Call only after the original append durably acknowledges under this writer.
     pub fn after_original_ack(&self, clock_upper: Timestamp, terminal_position: u64) -> Option<TransactionRecord> {
@@ -166,7 +167,7 @@ impl TransactionRecord {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResolvedTransact {
     fingerprint: [u8; 32],
     receipt: Receipt,
@@ -174,18 +175,24 @@ pub struct ResolvedTransact {
     before: Option<Timestamp>,
 }
 
+impl ResolvedTransact {
+    pub fn effects(&self) -> &[BranchEffect] { &self.effects }
+}
+
+#[derive(Clone)]
 struct Pending {
     position: u64,
     tx: ResolvedTransact,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredReceipt {
     receipt: Receipt,
     fingerprint: [u8; 32],
 }
 
 /// State folded from a single stream. A caller resolves at its fresh committed prefix.
+#[derive(Clone)]
 pub struct TransactState {
     index: BranchIndex,
     receipts: BTreeMap<Vec<u8>, StoredReceipt>,

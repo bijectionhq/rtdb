@@ -848,10 +848,18 @@ contract FencedStreamWriter {
         -- Recovery appends Refuse for a pending timed transaction before admitting writes.
         -- A pending transaction has no visible effects.
 
+    @invariant SpeculativeWriteSuffix
+        -- The writer resolves ordinary requests in order against a private overlay of its durable prefix and staged writes.
+        -- An ordinary transaction has one journal append.
+        -- A reply that depends on staged writes follows their durable acknowledgements.
+        -- A rejected append withdraws the dependent unacknowledged suffix.
+        -- Reads and status lookups use the committed fold.
+
     @invariant CheckpointRecovery
         -- A writer trims through the position immediately before a committed checkpoint record.
         -- A checkpoint image carries the applied transaction cut, active pins and the publishing writer's lease.
         -- A follower starts from the retained checkpoint and applies its committed suffix in position order.
+
 }
 
 contract EpochScopedStorage {
