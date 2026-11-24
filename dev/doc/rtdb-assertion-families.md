@@ -219,6 +219,37 @@ Original-authority marker reads use a current source barrier for both ordinary a
 A pending claim with no ordered marker leaves already-enrolled stages open under that current admission.
 The vault finalizes the first ordered marker and can replace an aborted claim only once the original source's durable history covers the failed attempt.
 
+### Original family response release holds
+
+The original family vault serializes exact response-part holds with the pending claim and fence finalization.
+An installed carrier-journal adapter must authenticate the linked original writer, installation, registry and full response part at a current source barrier.
+Its source installation and transport cell history are separate coordinates.
+This vault slice admits a carrier journal only on the original placed history.
+An unavailable, restored or separately placed registry refuses until its exact original adapter is available.
+
+Each hold binds the exact member and input, the transport part and its immutable cutoff.
+Only the authenticated live registration can stage or promote, and current marker admission applies before and after a hold mutation and at final release.
+Private cancellation consumes the exact attempt before a promotion can win.
+A promoted hold closes only after positive durable disposal from the original carrier journal.
+The original vault retains a terminal record before acknowledging disposal or removing a hold from the family roster.
+A deadline refuses further release but supplies no disposal evidence.
+A drain checks the current original marker and the exact inventory before declaring all family holds terminal.
+Hosted protocol 221 advertises `rtdb.owned.FamilyResponseRelease.v1` to the installed writer.
+It reuses the current original placement, hosted `bj_installation` incarnation and writer, and the canonical `bj_external_key_recovery` table.
+Recovery requires the same linked original writer and leaves the registry row in place until the vault acknowledges terminal custody.
+The action refuses mounted, restored or cross-source placements.
+
+The request starts with one operation byte.
+Prepare (0) carries family UUID (16), response part (72), the original epoch-millisecond cutoff (u64 big-endian), and input.
+It returns provider origin (32), attempt (32), and the nonsecret recovery address (188).
+Stage (1) carries origin, attempt, response part, address, and the same input.
+Promote (2), check (3), cancel (4), and dispose (5) carry only origin, attempt, part, and address. Each returns byte 1.
+The part orders cell history, Usher, Conductor and response UUIDs followed by the positive u64 ordinal.
+Input kind 0 is the exact member occurrence. Kind 1 adds the world's ordered winning position and the complete world-row authoring prefix.
+The RTDB adapter derives the registry commitment from the original placed history, the installed incarnation, and the registry table name.
+It authenticates the exact row creator against the current original `bj_installation` writer and checks the original registry address at the same barrier.
+Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
+
 ### Fence plan reply
 
 Protocol 217 retires the former immediate fence action.
@@ -252,6 +283,9 @@ The offered clock is an acceptance premise.
 RTDB assigns the ordered position when it resolves the prepared generation.
 The pre-publication link therefore names the destination by the receipt digest and review slot, and the post-publication binding adds the exact accepted position selected by that slot.
 The receipt binds the approved source slot, destination carrier and validity, disclosure commitment, and the exact payload and link envelopes.
+The prepared switch includes an absent family marker check for each family in the protected Root carriers.
+The original ordered resolver compares that exact set with the carriers being placed.
+A fence that orders first therefore invalidates the applied switch even when the destination was reserved earlier.
 The release owner authenticates the applied receipt and its proof, the installed carrier and original ordered position, and uses the same evidence when recovering an interrupted activation.
 A constraint refusal, a stale prepared generation or a missing receipt grants no activation.
 A reservation and sealed frames alone grant no release.

@@ -1825,7 +1825,7 @@ pub(crate) fn family_root_erase(relation: &OwnedRelation) -> bool {
 }
 
 pub(crate) fn family_search_erase_marker(write: &ProposalOverlayWrite<'_>) -> bool {
-    write.relation.name() == "fact_sealed_search_erasures" && !write.create_only
+    write.relation.is_root_data() && write.relation.name() == "fact_sealed_search_erasures" && !write.create_only
         && write.from == Some(Timestamp::MIN) && write.to.is_none_or(|to| to == Timestamp::MAX)
         && write.documents.row_count() > 0 && write.documents.has_exact_presence()
         && write.documents.rows().all(|row| row.only_id() && row.string_id().is_some())
@@ -2392,6 +2392,37 @@ pub(crate) fn hosted_proposal_land(
         )
     });
     if protected && (public_version || !frontiers.is_empty()) {
+        return None;
+    }
+    let mut landing_families = std::collections::BTreeSet::new();
+    for op in operations {
+        let Some(write) = owned_document_write(op) else { continue; };
+        if write.relation.is_root_data() && write.relation.name() == "fact_unit_column_payloads" {
+            if !protected { return None; }
+            for row in write.documents.rows() {
+                let carrier = row.binary("sealed_payload", || Anomaly::incorrect(
+                    "rtdb.owned/proposal-landing", "Invalid protected landing carrier",
+                )).ok()??;
+                let (family, _) = carrier.strip_prefix(b"BJRL1")?.split_first_chunk::<16>()?;
+                if *family == [0; 16] { return None; }
+                landing_families.insert(*family);
+            }
+        }
+    }
+    if protected != !landing_families.is_empty() {
+        return None;
+    }
+    let mut checked_families = std::collections::BTreeSet::new();
+    for control in &controls {
+        if control.name() == rtdb_types::ASSERTION_FAMILY_FENCES {
+            let EntityId::String(id) = control.id() else { return None; };
+            let family = rtdb_types::AssertionFamilyFenceMarker::family_id(id).ok()?;
+            if !control.is_check() || control.expected().is_some() || !checked_families.insert(family) {
+                return None;
+            }
+        }
+    }
+    if checked_families != landing_families {
         return None;
     }
     let all_fixed_periods = writes.values().all(|key| key.extents[0].is_some());

@@ -590,6 +590,7 @@ impl FlightService for Service {
         let hosted_world_actions = [
             crate::owned_actions::DECIDE_HELD_WORLDS_V3,
             crate::owned_family::RESOLVE_FAMILY_MEMBER_V1,
+            crate::owned_family::FAMILY_RESPONSE_RELEASE_V1,
         ];
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS)
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
