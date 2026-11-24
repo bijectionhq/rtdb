@@ -331,7 +331,7 @@ impl Service {
     }
 }
 
-async fn check_custody(call: &Call, database: &Database, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
+pub(super) async fn check_custody(call: &Call, database: &Database, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
     if groups.is_empty() { return Ok(()); }
     let driver = database.serving_driver().ok_or_else(|| error::unsupported("row-custody"))?;
     driver.check_custody_delivery(groups, &call.cancellation).await.map_err(error::anomaly)

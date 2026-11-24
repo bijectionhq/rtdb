@@ -2,11 +2,14 @@ use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
-use rtdb_index::{Snapshot, branches::BranchCut};
+use rtdb_index::{
+    Snapshot,
+    branches::{BranchCut, RowImage},
+};
 use rtdb_tx::transact::{CustodyGroupId, Receipt};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority, TransactSubmission};
 use rtdb_types::{
-    EntityId, Interval, Result, StructFields, TableRef, Timestamp, Value,
+    EntityId, Interval, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, Branch, Claim, Layer},
 };
 use tokio_util::sync::CancellationToken;
@@ -60,6 +63,7 @@ pub struct ChangePage {
     pub groups: Vec<ChangeGroup>,
     pub through: Basis,
     pub complete: bool,
+    pub custody_groups: BTreeSet<CustodyGroupId>,
 }
 
 pub struct ChangeGroup {
@@ -79,8 +83,8 @@ pub struct ChangeRow {
     pub id: EntityId,
     pub valid: Option<Interval>,
     pub kind: ChangeKind,
-    pub before: Option<StructFields<Value>>,
-    pub after: Option<StructFields<Value>>,
+    pub before: Option<RowImage>,
+    pub after: Option<RowImage>,
 }
 
 /// An admitted database attachment. Each mode establishes its own barriers and publishes only applied state.

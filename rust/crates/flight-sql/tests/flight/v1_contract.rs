@@ -1114,6 +1114,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             }],
             through: cut.basis,
             complete: true,
+            custody_groups: Default::default(),
         })
     }
 }

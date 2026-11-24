@@ -78,9 +78,9 @@ impl ServingScope {
                 valid: Some(row.valid),
                 kind: if row.after.is_some() { ChangeKind::Opened } else { ChangeKind::Closed },
                 before: row.before.as_ref().filter(|_| matches!(request.images, ChangeImages::Before | ChangeImages::Both))
-                    .map(|image| image.cells.clone()),
+                    .map(|image| image.as_ref().clone()),
                 after: row.after.as_ref().filter(|_| matches!(request.images, ChangeImages::After | ChangeImages::Both))
-                    .map(|image| image.cells.clone()),
+                    .map(|image| image.as_ref().clone()),
             }).collect::<Vec<_>>();
             if rows.is_empty() { continue; }
             if groups.len() == request.limit {
@@ -99,6 +99,7 @@ impl ServingScope {
             groups,
             through: Basis::new(head.incarnation(), through),
             complete: !more && until.is_none_or(|until| until <= head.position()),
+            custody_groups: BTreeSet::new(),
         })
     }
 }
@@ -119,6 +120,7 @@ mod tests {
     use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchTable, RowImage, Visibility};
 
     use super::*;
+    use rtdb_types::{StructFields, Value};
 
     #[test]
     fn scoped_change_page_hides_unrelated_raw_progress_and_private_images() {

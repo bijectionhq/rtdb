@@ -23,7 +23,7 @@ const FRAME_HEADER_BYTES: usize = 65;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches",
-    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "tx-status", "sql.history",
+    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "row-visibility", "tx-status", "sql.history",
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, "branches",

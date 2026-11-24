@@ -7,7 +7,7 @@ use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, Op};
 use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
-use super::TransactSubmission;
+use super::{ChangePage, TransactSubmission};
 
 pub(crate) async fn prepare(submission: &mut TransactSubmission, vault: &CustodyVault) -> Result<()> {
     let fingerprint = submission.transaction.logical_sha256()?;
@@ -54,9 +54,9 @@ pub(crate) async fn snapshot(
         for id in view.ids(table) {
             for event in view.history(table, id) {
                 let Some(image) = event.image.as_ref() else { continue };
-                let Some(payload) = &image.custody_payload else { continue };
-                let group = image.custody_group.ok_or_else(missing_group)?;
+                let Some(group) = image.custody_group else { continue };
                 groups.insert(group);
+                let Some(payload) = &image.custody_payload else { continue };
                 if let std::collections::btree_map::Entry::Vacant(entry) = opened.entry((group, payload.binding)) {
                     entry.insert(open(vault, group, payload).await?);
                 }
@@ -85,6 +85,24 @@ pub(crate) async fn check_delivery(index: &BranchIndex, vault: &CustodyVault, gr
         vault.check_readable(group).await?;
     }
     Ok(())
+}
+
+pub(crate) async fn open_changes(index: &BranchIndex, vault: &CustodyVault, mut page: ChangePage) -> Result<ChangePage> {
+    for row in page.groups.iter_mut().flat_map(|group| &mut group.rows) {
+        for image in [&mut row.before, &mut row.after] {
+            let Some(group) = image.as_ref().and_then(|image| image.custody_group) else { continue };
+            if !index.custody_group_live(group)? {
+                *image = None;
+                continue;
+            }
+            page.custody_groups.insert(group);
+            let image = image.as_mut().expect("a custody group belongs to an image");
+            if let Some(payload) = image.custody_payload.take() {
+                image.cells.extend(open(vault, group, &payload).await?);
+            }
+        }
+    }
+    Ok(page)
 }
 
 pub(crate) async fn reconcile_revocations(index: &BranchIndex, vault: &CustodyVault, now: Timestamp) -> Result<()> {
@@ -124,6 +142,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::serving::{ChangeGroup, ChangeKind, ChangeRow};
 
     #[tokio::test]
     async fn protected_cells_are_sealed_before_append_and_revocation_blocks_delivery() {
@@ -168,12 +187,36 @@ mod tests {
         assert_eq!(private.get("private"), Some(&Value::Utf8("protected-string".into())));
         let (_, groups) = snapshot(&view, &MemoryBudget::new(1 << 22), &vault).await.unwrap();
         check_delivery(state.index(), &vault, &groups).await.unwrap();
+        let page = || ChangePage {
+            groups: vec![ChangeGroup {
+                cut: row.cut,
+                rows: vec![ChangeRow {
+                    table: table.clone(),
+                    id: row.id.clone(),
+                    valid: Some(row.valid),
+                    kind: ChangeKind::Opened,
+                    before: None,
+                    after: Some(image.as_ref().clone()),
+                }],
+            }],
+            through: row.cut.basis,
+            complete: true,
+            custody_groups: BTreeSet::new(),
+        };
+        let opened_changes = open_changes(state.index(), &vault, page()).await.unwrap();
+        let after = opened_changes.groups[0].rows[0].after.as_ref().unwrap();
+        assert_eq!(after.cells.get("private"), private.get("private"));
+        assert_eq!(opened_changes.custody_groups, groups);
+        let pending_changes = page();
 
         let revoke = request(2, vec![Op::RevokeCustodyGroup { group }]);
         let Resolution::Append(append) = state.resolve(&revoke.transaction, 2, Timestamp(11), &[ROW_CUSTODY], &claims).unwrap()
             else { panic!("a revocation must append"); };
         state.apply(2, append.into_record()).unwrap();
         assert_eq!(check_delivery(state.index(), &vault, &groups).await.unwrap_err(), rtdb_crypt::erased_under_view());
+        let redacted = open_changes(state.index(), &vault, pending_changes).await.unwrap();
+        assert!(redacted.groups[0].rows[0].after.is_none());
+        assert!(redacted.custody_groups.is_empty());
         let checkpoint = state.encode_checkpoint().unwrap();
         let reopened = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
         reconcile_revocations(reopened.index(), &vault, Timestamp(11)).await.unwrap();

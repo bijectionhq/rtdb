@@ -21,6 +21,16 @@ pub(crate) struct DefaultServing {
     pub(crate) writable: bool,
 }
 
+impl DefaultServing {
+    async fn open_change_page(&self, view: &NativeServingView, page: ChangePage) -> Result<ChangePage> {
+        if !view.index.has_custody_groups() {
+            return Ok(page);
+        }
+        let vault = self.tokens.authority().await?.custody_vault();
+        super::custody::open_changes(&view.index, &vault, page).await
+    }
+}
+
 #[async_trait]
 impl ServingDriver for DefaultServing {
     fn incarnation(&self) -> [u8; 16] { self.handle.authority().incarnation }
@@ -146,11 +156,11 @@ impl ServingDriver for DefaultServing {
             let snapshot = self.handle.view(At::Latest, cancellation).await?;
             let page = scope.changes(&snapshot.index, &request)?;
             if !page.groups.is_empty() || request.until.is_some() && page.complete || tokio::time::Instant::now() >= deadline {
-                return Ok(page);
+                return self.open_change_page(&snapshot, page).await;
             }
             match tokio::time::timeout_at(deadline, self.handle.after(snapshot.index.head().basis, cancellation)).await {
                 Ok(result) => result?,
-                Err(_) => return Ok(page),
+                Err(_) => return self.open_change_page(&snapshot, page).await,
             }
         }
     }
@@ -166,11 +176,11 @@ impl ServingDriver for DefaultServing {
                 || request.until.is_some_and(|until| until <= head)
                 || tokio::time::Instant::now() >= deadline
             {
-                return Ok(page);
+                return self.open_change_page(&view, page).await;
             }
             match tokio::time::timeout_at(deadline, self.handle.after(head, cancellation)).await {
                 Ok(result) => result?,
-                Err(_) => return Ok(page),
+                Err(_) => return self.open_change_page(&view, page).await,
             }
         }
     }
@@ -220,7 +230,7 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
         }
         Ok(ChangeGroup { cut: *cut, rows })
     }).collect::<Result<_>>()?;
-    Ok(ChangePage { groups, through, complete: !more && request.until.is_none_or(|until| until <= head) })
+    Ok(ChangePage { groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new() })
 }
 
 fn append_images(
@@ -248,11 +258,11 @@ fn append_images(
         let previous = before.and_then(|view| view.row(&write.table, &write.id, from)).and_then(|event| event.image_at(from));
         let current = after.and_then(|view| view.row(&write.table, &write.id, from)).and_then(|event| event.image_at(from));
         if let Some(previous) = previous {
-            let image = matches!(images, ChangeImages::Before | ChangeImages::Both).then(|| previous.cells.clone());
+            let image = matches!(images, ChangeImages::Before | ChangeImages::Both).then(|| previous.clone());
             output.push(make_row(valid, ChangeKind::Closed, image, None));
         }
         if let Some(current) = current {
-            let image = matches!(images, ChangeImages::After | ChangeImages::Both).then(|| current.cells.clone());
+            let image = matches!(images, ChangeImages::After | ChangeImages::Both).then(|| current.clone());
             output.push(make_row(valid, ChangeKind::Opened, None, image));
         } else if previous.is_none() {
             output.push(make_row(valid, ChangeKind::Closed, None, None));

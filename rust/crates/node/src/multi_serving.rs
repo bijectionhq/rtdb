@@ -220,18 +220,19 @@ impl ServingDriver for MultiServing {
             .run_until_cancelled(async {
                 let start = Instant::now();
                 loop {
-                    let page = {
-                        let mut database = self.database.lock().await;
-                        let history = database.fresh_history().await?;
-                        changes_page(&history, &request, self.incarnation)?
-                    };
+                    let mut database = self.database.lock().await;
+                    let history = database.fresh_history().await?;
+                    let page = changes_page(&history, &request, self.incarnation)?;
                     let remaining = request.wait.saturating_sub(start.elapsed());
-                    if !page.groups.is_empty()
-                        || request.until.is_some() && page.complete
-                        || remaining.is_zero()
-                    {
-                        return Ok(page);
+                    if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
+                        let index = history.index.has_custody_groups().then(|| history.index.clone());
+                        drop(database);
+                        return match index {
+                            Some(index) => crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await,
+                            None => Ok(page),
+                        };
                     }
+                    drop(database);
                     tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
                 }
             })
@@ -343,6 +344,7 @@ fn changes_page(
         groups: page,
         through: Basis::new(incarnation, through),
         complete: !has_more && until.is_none_or(|until| until <= history.head.0),
+        custody_groups: BTreeSet::new(),
     })
 }
 
@@ -385,12 +387,12 @@ fn change_rows(
                 before
                     .and_then(|view| view.row(table, &event.id, from))
                     .and_then(|event| event.image_at(from))
-                    .map(|image| image.cells.clone())
+                    .cloned()
             } else {
                 None
             };
             let after = if matches!(images, ChangeImages::After | ChangeImages::Both) {
-                event.image_at(from).map(|image| image.cells.clone())
+                event.image_at(from).cloned()
             } else {
                 None
             };
@@ -577,11 +579,11 @@ mod tests {
         assert_eq!(page.groups.len(), 1);
         let row = &page.groups[0].rows[0];
         assert_eq!(
-            row.before.as_ref().unwrap()["title"],
+            row.before.as_ref().unwrap().cells["title"],
             Value::Utf8("one".into())
         );
         assert_eq!(
-            row.after.as_ref().unwrap()["title"],
+            row.after.as_ref().unwrap().cells["title"],
             Value::Utf8("two".into())
         );
 

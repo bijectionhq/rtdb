@@ -29,6 +29,7 @@ use crate::{
 
 use super::{
     MAX_CHANGE_GROUPS, MAX_WAIT, error, head, proto,
+    query::check_custody,
     tokens::{self, cursor_expired},
     trailer,
 };
@@ -453,6 +454,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
             service.check_attachment(&call, &database)?;
+            check_custody(&call, &database, &page.custody_groups).await?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
             yield wire::schema_data(&schema, &memory).map_err(error::map_status)?;
             for group in page.groups.into_iter().filter(|_| !progress_only) {
@@ -462,9 +464,9 @@ impl Service {
                     let id = row.id.as_value();
                     let key = (images != ChangeImages::None).then(|| write_values([("_id", &id)], &memory)).transpose()?;
                     let before = if erased || !matches!(images, ChangeImages::Before | ChangeImages::Both) { None }
-                        else { row.before.as_ref().map(|cells| write_change_image(cells, &id, row.valid, &memory)).transpose()? };
+                        else { row.before.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
                     let after = if erased || !matches!(images, ChangeImages::After | ChangeImages::Both) { None }
-                        else { row.after.as_ref().map(|cells| write_change_image(cells, &id, row.valid, &memory)).transpose()? };
+                        else { row.after.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
                     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
                         Arc::new(StringArray::from(vec![format!("{}.{}", row.table.schema, row.table.table)])),
                         Arc::new(TimestampMicrosecondArray::from(vec![group.cut.system_time.0]).with_timezone("UTC")),
@@ -475,12 +477,14 @@ impl Service {
                         Arc::new(BooleanArray::from(vec![erased])),
                     ]).map_err(|error| error::map_status(Status::internal(error.to_string())))?;
                     for frame in encoder.batch(&batch, &memory).map_err(error::map_status)? {
+                        check_custody(&call, &database, &page.custody_groups).await?;
                         call.handoff(context.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
                         yield frame;
                     }
                 }
             }
             service.check_attachment(&call, &database)?;
+            check_custody(&call, &database, &page.custody_groups).await?;
             call.handoff(context.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
             yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete });
         });
