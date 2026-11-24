@@ -16,13 +16,13 @@ pub(super) struct LandingBasis {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(admitted => ensures
-    admitted == (prepared == installed && prepared_position == assigned_position),
+    admitted == (prepared == installed && prepared_key == assigned_key),
 ))]
 pub(super) fn generation_matches(
     prepared: LandingBasis,
     installed: LandingBasis,
-    prepared_position: i64,
-    assigned_position: i64,
+    prepared_key: (i64, i64),
+    assigned_key: (i64, i64),
 ) -> bool {
     prepared.predecessor_id == installed.predecessor_id
         && prepared.predecessor_time == installed.predecessor_time
@@ -31,5 +31,6 @@ pub(super) fn generation_matches(
         && prepared.storage_epoch == installed.storage_epoch
         && prepared.replica_epoch == installed.replica_epoch
         && prepared.replica_through == installed.replica_through
-        && prepared_position == assigned_position
+        && prepared_key.0 == assigned_key.0
+        && prepared_key.1 == assigned_key.1
 }

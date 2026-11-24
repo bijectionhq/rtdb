@@ -159,7 +159,12 @@ impl PreparedLanding {
         let installed = landing_basis(
             base.tx_basis().ok_or_else(stale)?, base.block_index(), base.catalog_cut().ok_or_else(stale)?,
         );
-        if !generation_matches(prepared, installed, self.writes.tx_key().tx_id.0, assigned.tx_id.0) {
+        let staged_key = self.writes.tx_key();
+        if !generation_matches(
+            prepared, installed,
+            (staged_key.tx_id.0, staged_key.system_time.0),
+            (assigned.tx_id.0, assigned.system_time.0),
+        ) {
             return Err(stale());
         }
         Ok((self.writes, self.refused))
