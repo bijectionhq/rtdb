@@ -318,14 +318,12 @@ impl ErasureJournal for ErasureCoordinator<'_> {
     }
 
     async fn reopen(&self, prepared: PreparedErasure) -> Result<()> {
-        if self.provider.open(prepared.checkpoint).await?.authority
-            != CheckpointAuthority::Erasure(binding(prepared.erasure, prepared.rotation))
-        {
-            return Err(invalid(
-                "The provider checkpoint belongs to a different erasure attempt",
-            ));
-        }
-        Ok(())
+        self.provider
+            .reopen_survivor(
+                prepared.checkpoint,
+                binding(prepared.erasure, prepared.rotation),
+            )
+            .await
     }
 
     async fn execute(&self, request: &Request) -> Result<Decision> {

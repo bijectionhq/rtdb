@@ -501,11 +501,23 @@ impl CheckpointCustody {
         let root = ObjectKey::new(block_key(rtdb_types::BlockIndex(checkpoint.block))?)?;
         let catalog = BlockCatalog::decode(&store.get(&root).await?)?;
         crate::archive::verify_cut(&catalog, checkpoint, self.epoch)?;
-        // Enumerating the actual root again ensures every referenced member
-        // can be opened by this exact manifest before the journal can use it.
+        // Check that the selected catalog's closure is present in this manifest.
         let _ = crate::archive::recovery_manifest_sha256(store.as_ref(), checkpoint, self.epoch)
             .await?;
         Ok(OpenedCheckpoint { checkpoint, store, authority: manifest.authority })
+    }
+
+    pub(crate) async fn reopen_survivor(&self, chosen: Checkpoint, binding: ErasureBinding) -> Result<()> {
+        let opened = self.open(chosen).await?;
+        if opened.authority != CheckpointAuthority::Erasure(binding) {
+            return Err(invalid("The provider checkpoint belongs to a different erasure attempt"));
+        }
+        for member in opened.store.list(None).await? {
+            let length = usize::try_from(member.size)
+                .map_err(|_| invalid("A clean checkpoint member exceeds addressable length"))?;
+            opened.store.observe_fresh_exact(&member.key, length).await?;
+        }
+        Ok(())
     }
 
     async fn read_manifest(
