@@ -215,6 +215,7 @@ message SearchRunChange {
     reserved 5 to 9;
     TermDirectoryRoot term_directory = 10;
     bytes replaces_directory = 11;
+    int64 prune_settled_at = 12;
 }
 
 message TermDirectoryRoot {
@@ -229,6 +230,7 @@ message RetiredSearchRun {
     int64 superseded_at = 2;
   bool abandoned = 3;
   bool released = 4;
+    int64 settled_at_replica_msg_id = 5;
 }
 
 message ArtefactsAdded {

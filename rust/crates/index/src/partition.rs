@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, TableRef, Timestamp, TransactionKey, TxId};
 
 use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
@@ -168,6 +168,15 @@ impl TrieCollection {
                 self.readers[reader].search_runs(table).any(|run| run.identity().is_ok_and(|key| key == id))
             });
             (!protected).then_some(run)
+        })
+    }
+
+    pub fn eligible_search_tombstones(&self, table: &TableRef) -> impl Iterator<Item = &rtdb_format::log::proto::RetiredSearchRun> {
+        self.current.trie_catalog().retired_search_runs(table).filter(move |retired| {
+            if !retired.abandoned() || !retired.released() { return false; }
+            let Some(settled_at) = retired.settled_at_replica_msg_id else { return true; };
+            let Some(id) = retired.run.as_ref().and_then(|run| run.identity().ok()) else { return false; };
+            self.readers.iter().all(|reader| reader.search_tombstone_settled_at(table, &id) == Some(settled_at))
         })
     }
 
@@ -372,8 +381,13 @@ impl PartitionState {
         *value = Arc::new(next);
     }
     pub fn remove_artefacts(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>) {
+        self.remove_artefacts_at(table, entries, None);
+    }
+
+    pub fn remove_artefacts_at(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>,
+        position: Option<ReplicaPosition>) {
         let mut value = self.value.write();
-        let trie_catalog = value.trie_catalog.without_artefacts(table, entries);
+        let trie_catalog = value.trie_catalog.without_artefacts_at(table, entries, position);
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(trie_catalog);
         *value = Arc::new(next);

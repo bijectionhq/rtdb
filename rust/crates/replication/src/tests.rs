@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError::Empty;
 use tokio_util::sync::CancellationToken;
 
-use super::{Applied, TailPoll, accept_artefacts, cached_objects, read_replay_head, source_decode_bound, start_poll};
+use super::{Applied, TailPoll, accept_artefacts, admit_search_intents, cached_objects, read_replay_head, source_decode_bound, start_poll};
 use crate::*;
 use crate::logs::replica_decode_bound;
 
@@ -2707,6 +2707,54 @@ fn search_adoption_requires_a_provider_version_or_terminal_publication_when_the_
     }), ..address }), false, true));
     assert!(accepts(None, false, false));
     assert!(accepts(None, true, true));
+}
+
+#[tokio::test]
+async fn an_abandoned_search_allocation_cannot_be_adopted_after_tombstone_pruning() {
+    use rtdb_format::{keys::TrieKey, search_manifest::StagedSearchRun};
+    use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
+    use rtdb_storage::ObjectKey;
+
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let slug = tables.entry(&table).unwrap().slug.clone();
+    let anchor = TrieKey::l0(BlockIndex(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table.clone(),
+        [CatalogTrie::notification(anchor.clone(), 1, None).unwrap()], Timestamp(1)).unwrap();
+    let state = PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap());
+    let run = proto::SearchRun { definition_id: Some("bodyf16".into()), definition_version: Some(1), blocks: vec![0],
+        digest: Some(vec![1; 32]), locator: Some(vec![1]), file_size: Some(1), source_rows: Some(1),
+        allocation: Some(vec![2; 16]), ..Default::default() };
+    let marker = ObjectKey::new(run.pending_key(&slug).unwrap()).unwrap();
+    let store = MemoryStore::default();
+    let staged = StagedSearchRun { run: run.clone(), owner: None };
+    store.put(&marker, staged.encode().unwrap().into()).await.unwrap();
+    let change = proto::SearchRunChange { run: Some(run.clone()), ..Default::default() };
+    let request = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0),
+        table_name: Some(table.schema_and_table()), entries: vec![proto::ArtefactEntry {
+            trie_key: Some(anchor.to_string()), record: Some(change.to_artefact().unwrap()),
+        }], ..Default::default() };
+    let mut before = request.clone();
+    let snapshot = state.snapshot();
+    accept_artefacts(&mut before, &snapshot, CURRENT_STORAGE_VERSION.0, 0, false);
+    admit_search_intents(&mut before, &snapshot, &store).await;
+    assert_eq!(before.entries, request.entries);
+
+    let removal = proto::SearchRunChange { run: Some(run), retire_only: Some(true), ..Default::default() };
+    let abandon = proto::SearchRunChange { abandon: Some(true), ..removal.clone() }.to_artefact().unwrap();
+    state.add_artefacts_at(&table, vec![(anchor.clone(), abandon)], Timestamp(2));
+    store.delete(&marker).await.unwrap();
+    state.remove_artefacts_at(&table, vec![(anchor.clone(), removal.to_artefact().unwrap())], Some(ReplicaPosition(2)));
+    let prune = proto::SearchRunChange { prune_settled_at: Some(2), ..removal }.to_artefact().unwrap();
+    state.remove_artefacts_at(&table, vec![(anchor, prune)], Some(ReplicaPosition(4)));
+
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.trie_catalog().retired_search_runs(&table).count(), 0);
+    let mut delayed = request;
+    accept_artefacts(&mut delayed, &snapshot, CURRENT_STORAGE_VERSION.0, 0, false);
+    assert_eq!(delayed.entries.len(), 1);
+    admit_search_intents(&mut delayed, &snapshot, &store).await;
+    assert!(delayed.entries.is_empty());
 }
 
 #[test]

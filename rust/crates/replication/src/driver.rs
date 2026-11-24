@@ -1318,7 +1318,7 @@ impl ReplicationDriver {
                         if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
                             let entries = artefact_entries(&message.entries);
                             let slug = self.partition.value().table_catalog().entry(&table).map(|entry| entry.slug.clone());
-                            self.partition.remove_artefacts(&table, entries.clone());
+                            self.partition.remove_artefacts_at(&table, entries.clone(), Some(record.metadata.position));
                             // The lane deletes the objects from the store next; this node's cached copies are its own to drop.
                             let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| {
                                 if record.kind() == rtdb_format::entity_directory::RECORD_KIND { return None; }
@@ -1582,8 +1582,10 @@ impl ReplicationDriver {
                 None
             }
             Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(mut message))) => {
+                let store = self.resolve.storage.object_store();
                 let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0,
-                    self.resolve.storage.object_store().requires_search_publication());
+                    store.requires_search_publication());
+                admit_search_intents(&mut message, &durable, store.as_ref()).await;
                 message.source_msg_id = Some(position.0);
                 leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsAdded(message)), block, None, &self.resolve.memory)?;
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1962,6 +1964,26 @@ fn search_publication_is_valid(record: &proto::ArtefactRecord) -> bool {
                 valid_object_version(publication.version().as_bytes())
             }
     })
+}
+
+async fn admit_search_intents(message: &mut proto::ArtefactsAdded, durable: &Snapshot, store: &dyn rtdb_storage::ObjectStore) {
+    let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return; };
+    for entry in std::mem::take(&mut message.entries) {
+        if let Some(record) = &entry.record && record.kind() == rtdb_format::search_manifest::RECORD_KIND {
+            let Ok(change) = proto::SearchRunChange::from_artefact(record) else { continue; };
+            let Some(run) = change.run.as_ref() else { continue; };
+            if !change.retire_only() && run.allocation.is_some()
+                && !durable.trie_catalog().search_runs(&table).any(|active| active == run)
+            {
+                let Some(table_entry) = durable.table_entry(&table) else { continue; };
+                let Ok(intent) = run.pending_key(&table_entry.slug).and_then(|key| Ok(rtdb_storage::ObjectKey::new(key)?))
+                    else { continue; };
+                // An earlier source admission is ordered before pruning. A later one needs the intent again.
+                if store.head_fresh(&intent).await.is_err() { continue; }
+            }
+        }
+        message.entries.push(entry);
+    }
 }
 
 /// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.

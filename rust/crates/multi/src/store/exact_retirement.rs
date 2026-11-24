@@ -987,19 +987,26 @@ const ARCHIVE_SOURCE_HELD: &str = "rtdb.multi/archive-source-held";
 
 pub(crate) async fn permits_search_release(directory: &dyn Directory, bucket: &dyn ObjectStore, owner: &DeploymentRecord,
     store: &str, key: &ObjectKey, publication: Option<&PublishedObjectVersion>) -> Result<bool> {
-    Ok(permits_search_releases(directory, bucket, owner, store, &[(key, publication)]).await?[0])
+    Ok(permits_search_releases(directory, bucket, owner, store, &[(key, publication)], None).await?[0])
 }
 
 /// Evaluates every release against one reading of the lineage, the deployments and their fork bases.
 pub(crate) async fn permits_search_releases(directory: &dyn Directory, bucket: &dyn ObjectStore, owner: &DeploymentRecord,
-    store: &str, items: &[(&ObjectKey, Option<&PublishedObjectVersion>)]) -> Result<Vec<bool>> {
+    store: &str, items: &[(&ObjectKey, Option<&PublishedObjectVersion>)], minimum_checkpoint: Option<rtdb_types::BlockIndex>) -> Result<Vec<bool>> {
     let lineage = directory.lineage_state(&owner.lineage).await?;
     if lineage.open_generation().is_none() || lineage.preparations().next().is_some() { return Ok(vec![false; items.len()]); }
     let deployments = directory.deployments().await?;
     let mut bases = Vec::new();
     for record in deployments.iter().filter(|record| record.lineage == owner.lineage && record.lifecycle != Lifecycle::Deleted) {
         for referrer in stores(bucket, &record.storage_prefix()).await? {
-            bases.push(Base::load(bucket, &referrer).await?);
+            let base = Base::load(bucket, &referrer).await?;
+            if minimum_checkpoint.is_some_and(|minimum| base.objects.iter().any(|(path, source)| {
+                source == store && checkpoint_metadata_block(path).or_else(|| crate::packing::pack_block(path))
+                    .is_some_and(|block| block < minimum.0)
+            })) {
+                return Ok(vec![false; items.len()]);
+            }
+            bases.push(base);
         }
     }
     let mut permits = Vec::with_capacity(items.len());

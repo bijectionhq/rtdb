@@ -178,6 +178,9 @@ impl SearchRunChange {
             || decoded.replaces.iter().collect::<BTreeSet<_>>().len() != decoded.replaces.len()
             || (decoded.retire_only() && !decoded.replaces.is_empty())
             || (decoded.abandon() && (!decoded.retire_only() || run.allocation.is_none()))
+            || decoded.prune_settled_at.is_some_and(|position| position < 0 || !decoded.retire_only()
+                || decoded.abandon() || run.allocation.is_none() || decoded.term_directory.is_some()
+                || decoded.replaces_directory.is_some())
         {
             return Err(invalid("Search publication has inconsistent receipts"));
         }

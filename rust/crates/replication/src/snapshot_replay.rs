@@ -250,7 +250,7 @@ impl RecoveredPartition {
                     if same_storage(message.storage_version, message.storage_epoch, cut)
                         && let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())
                     {
-                        self.partition.remove_artefacts(&table, artefact_entries(&message.entries));
+                        self.partition.remove_artefacts_at(&table, artefact_entries(&message.entries), Some(position));
                     }
                     self.advance_snapshot_source(message.source_msg_id, slot.is_some())?;
                 }

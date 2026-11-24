@@ -898,7 +898,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
             let entries = message.entries.into_iter().map(|entry| {
                 (entry.trie_key.unwrap().parse::<TrieKey>().unwrap(), entry.record.unwrap())
             }).collect();
-            self.state.remove_artefacts(&self.table, entries);
+            self.state.remove_artefacts_at(&self.table, entries, Some(ReplicaPosition(2)));
             Ok(SourcePosition(2))
         }
     }
@@ -949,8 +949,48 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     collector.collect_as_of(Timestamp(101), &stop).await.unwrap();
     assert!(store.head(&body).await.is_err());
     assert!(store.head(&marker).await.is_err());
+    let settlement = || state.snapshot().trie_catalog().retired_search_runs(&table).next()
+        .map(|retired| (retired.released(), retired.settled_at_replica_msg_id));
+    assert_eq!(settlement(), Some((true, Some(2))));
+
+    let at = Timestamp(102);
+    let old = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
+    let old_block = BlockCatalog::from_proto(pb::Block {
+        boundary_replica_msg_id: Some(2), ..block(0).as_proto().clone()
+    }).unwrap();
+    store.put(&old, old_block.encode().into()).await.unwrap();
+    let prepared = state.prepare_block().unwrap();
+    let checkpoint = BlockCatalog::from_proto(pb::Block {
+        block_index: Some(1), boundary_replica_msg_id: Some(3),
+        latest_completed_tx: old_block.as_proto().latest_completed_tx,
+        tables: prepared.table_catalog().unwrap().entries().map(|entry| entry.to_proto()).collect(),
+        ..Default::default()
+    }).unwrap();
+    let table_blocks = prepared.table_blocks(&BTreeMap::new(), at).unwrap();
+    assert_eq!(table_blocks[&table].as_proto().retired_search_runs[0].settled_at_replica_msg_id, Some(2));
+    store.put(&ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap(), checkpoint.encode().into()).await.unwrap();
+    state.adopt_block(prepared, checkpoint, &table_blocks, &BTreeMap::new(), at).unwrap();
+    state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(3), ..cut }).unwrap();
+
+    collector.collect_as_of(at, &stop).await.unwrap();
+    assert_eq!(settlement(), Some((true, Some(2))));
+    store.delete(&old).await.unwrap();
+
+    let held_catalog = store.retain_catalog(Some(cut)).await.unwrap().unwrap();
+    collector.collect_as_of(at, &stop).await.unwrap();
+    assert_eq!(settlement(), Some((true, Some(2))));
+    drop(held_catalog);
+
+    let startup = store.hold_recovery_open().await.unwrap();
+    collector.collect_as_of(at, &stop).await.unwrap();
+    assert_eq!(settlement(), Some((true, Some(2))));
+    drop(startup);
+
+    collector.collect_as_of(at, &stop).await.unwrap();
+    assert_eq!(settlement(), None);
+    assert!(state.prepare_block().unwrap().table_blocks(&BTreeMap::new(), at).unwrap()[&table]
+        .as_proto().retired_search_runs.is_empty());
     assert!(observer.0.lock().unwrap().is_empty());
-    assert!(state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().released());
 }
 
 struct DirectoryPublisher(Arc<PartitionState>);

@@ -284,6 +284,10 @@ impl TrieCatalog {
         self.tables.get(table).into_iter().flat_map(|state| state.search.retired())
     }
 
+    pub(crate) fn search_tombstone_settled_at(&self, table: &TableRef, id: &[u8; 32]) -> Option<i64> {
+        self.tables.get(table)?.search.settled_at(id)
+    }
+
     pub fn with_search_manifest(&self, table: &TableRef, block: TableBlock) -> TableBlock {
         block.with_search_runs(self.search_runs(table).cloned().collect(), self.retired_search_runs(table).cloned().collect())
     }
@@ -326,7 +330,7 @@ impl TrieCatalog {
     pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
         let Ok(change) = log_pb::SearchRunChange::from_artefact(record) else { return false; };
         let Some(run) = &change.run else { return false; };
-        self.accepts_search_source(table, &change)
+        change.prune_settled_at.is_none() && self.accepts_search_source(table, &change)
             && (change.abandon() || run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some())))
     }
 
@@ -437,6 +441,11 @@ impl TrieCatalog {
     }
     /// A record matches an entry on kind, definition id and definition version alone.
     pub fn without_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        self.without_artefacts_at(table, entries, None)
+    }
+
+    pub(crate) fn without_artefacts_at(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>,
+        position: Option<rtdb_types::ReplicaPosition>) -> Self {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
@@ -448,9 +457,9 @@ impl TrieCatalog {
                     continue;
                 }
                 if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
-                    if let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) && change.retire_only()
-                        && let Some(run) = change.run {
-                        std::sync::Arc::make_mut(&mut state.search).forget(&run);
+                    if key.level() == 0 && let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) && change.retire_only()
+                        && let Some(run) = change.run && run.blocks.first() == Some(&key.block_index().0) {
+                        std::sync::Arc::make_mut(&mut state.search).forget(&run, change.prune_settled_at, position);
                     }
                     continue;
                 }

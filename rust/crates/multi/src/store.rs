@@ -19,7 +19,7 @@ use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Li
 use rtdb_format::{keys::StorageRoot, trie_retirement::InstalledRetirement};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, ObjectReadAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
-use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, Result};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
@@ -1695,6 +1695,11 @@ impl ObjectStore for GarbageStore {
         let Some((bucket, cut)) = self.release_inventory.as_deref().zip(cut) else { return Ok(false); };
         readers.permits_search_release(bucket, cut, key, publication).await
     }
+    async fn permits_search_tombstone_prune(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        checkpoint: BlockIndex, cut: CatalogCut) -> Result<bool> {
+        let Some((readers, bucket)) = self.catalog_readers.as_ref().zip(self.release_inventory.as_deref()) else { return Ok(false); };
+        readers.permits_search_tombstone_prune(bucket, cut, checkpoint, key, publication).await
+    }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
@@ -1836,12 +1841,32 @@ fn recovery_covers_release(owner: &DeploymentRecord, release: &GarbageRecord) ->
     })) {
         return false;
     }
+    recovery_covers_floor(owner, floor)
+}
+
+fn recovery_covers_floor(owner: &DeploymentRecord, floor: &CatalogAdmissionFloor) -> bool {
+    let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
     through >= 0 && owner.log_epoch == floor.cut.replica_epoch.0 && owner.recovery_manifest_sha256.is_some()
         && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary >= through)
         && owner.storage_regions.values().all(|region| match region.first_required_replica() {
             Some(first) => first > through,
             None => region.checkpoint_metadata_from().is_none(),
         })
+}
+
+pub(super) fn recovery_covers_search_checkpoint(owner: &DeploymentRecord, floor: &CatalogAdmissionFloor, checkpoint: BlockIndex) -> bool {
+    owner.checkpoint.is_some_and(|published| published.block >= checkpoint.0)
+        && owner.checkpoint_captures.iter().all(|(operation, capture)| {
+            let boundary = rtdb_types::ReplicaPosition::from_epoch_offset(rtdb_types::StorageEpoch(capture.log_epoch), capture.checkpoint.boundary);
+            crate::archive::require_capture_open(owner, *operation).is_err() || (capture.checkpoint.boundary >= 0
+                && boundary.is_ok_and(|boundary| boundary >= floor.cut.through))
+        })
+        && owner.storage_regions.values().all(|region| {
+            region.checkpoint_metadata_from().is_none_or(|block| block >= checkpoint.0)
+                && !matches!(region, StorageRegion::ReferenceRead { .. }
+                    | StorageRegion::Local { archive: Some(_), .. } | StorageRegion::Remote { archive: Some(_), .. })
+        })
+        && recovery_covers_floor(owner, floor)
 }
 
 async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration,
@@ -2334,7 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_release_waits_for_fork_preparation_archive_hold_and_declared_reference() {
-        use rtdb_directory::{ArchiveSourceHold, ForkPreparation, MemoryDirectory, StorageNamespaces};
+        use rtdb_directory::{ArchiveSourceHold, Checkpoint, CheckpointCapture, CheckpointCaptureRetirement, ForkPreparation, MemoryDirectory, StorageNamespaces};
         use rtdb_format::{keys::CURRENT_STORAGE_VERSION, log::proto::PublishedObjectVersion};
         use rtdb_storage::MemoryStore;
         use rtdb_types::{PhysicalObjectPublication, ReplicaPosition, S3ObjectNamespace, StorageEpoch, TerminalObjectPublication};
@@ -2356,7 +2381,7 @@ mod tests {
             directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, owner, Some(record.epoch),
         ));
         let store = EncryptingStore::new(store, &[7; 32]).unwrap();
-        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(1) };
         let body = key(&format!("tables/public$docs/search-runs/{}.f16.arrow", "a".repeat(64)));
         let physical = key(&format!("{scope}/{body}"));
         let namespace = S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None };
@@ -2365,10 +2390,27 @@ mod tests {
         }));
         store.put(&body, Bytes::from_static(b"body")).await.unwrap();
         assert!(store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        let checkpoint = BlockIndex(2);
+        let may_prune = || store.permits_search_tombstone_prune(&body, Some(&publication), checkpoint, cut);
+        assert!(!may_prune().await.unwrap());
+        let replay = Uuid::new_v4();
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.checkpoint = Some(Checkpoint { block: checkpoint.0, boundary: 2, source: 0, system_time: 0, root_sha256: Some([1; 32]) });
+            record.recovery_manifest_sha256 = Some([2; 32]);
+            record.storage_regions.insert(replay, StorageRegion::ReplicaReplay { first_required: 0, through: 0, custody: ReplayCustody::Local });
+            Ok(())
+        }).await.unwrap();
+        assert!(!may_prune().await.unwrap());
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.storage_regions.remove(&replay);
+            Ok(())
+        }).await.unwrap();
+        assert!(may_prune().await.unwrap());
 
         let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
         directory.change_lineage(&record.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
         assert!(!store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert!(!may_prune().await.unwrap());
 
         let archive = Uuid::new_v4();
         crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
@@ -2381,6 +2423,7 @@ mod tests {
         }).await.unwrap();
         directory.change_lineage(&record.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
         assert!(!store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert!(!may_prune().await.unwrap());
         let versioned = |version: &str| PublishedObjectVersion::from(PhysicalObjectVersion {
             namespace: namespace.clone(), key: physical.to_string(), version: version.into(),
         });
@@ -2389,21 +2432,48 @@ mod tests {
 
         crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
             record.storage_regions.remove(&archive);
+            record.checkpoint_captures.insert(archive, CheckpointCapture {
+                archive: "archive".into(), key_namespace: None, incarnation: record.incarnation, log_epoch: record.log_epoch,
+                checkpoint: Checkpoint { block: 0, boundary: 0, ..record.checkpoint.unwrap() },
+                automatic_fork: false, world_replay: None, media_bound: true,
+                manifest_sha256: Some("manifest".into()), remote_disposal: None,
+            });
             Ok(())
         }).await.unwrap();
         assert!(store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert!(!may_prune().await.unwrap());
+        let later_archive = Uuid::new_v4();
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.checkpoint_capture_retirements.insert(archive, CheckpointCaptureRetirement {
+                archive: "archive".into(), manifest_sha256: Some("manifest".into()),
+                authorized_at_ms: 0, key_withdrawn_at_ms: None, observed_empty_at_ms: None,
+                operation_revoked_at_ms: None, scheduled_revocation_at_ms: None,
+            });
+            let mut later = record.checkpoint_captures[&archive].clone();
+            later.checkpoint = Checkpoint { block: 1, boundary: 1, ..later.checkpoint };
+            record.checkpoint_captures.insert(later_archive, later);
+            Ok(())
+        }).await.unwrap();
+        assert!(may_prune().await.unwrap());
 
         let mut child = DeploymentRecord::new("child", "acme", vec![], 0);
         child.lineage.clone_from(&record.lineage);
         let child = directory.create_deployment(child).await.unwrap();
         let child_store = format!("{}/{root}", child.storage_prefix());
-        let base = crate::reference::Base { objects: BTreeMap::from([(body.to_string(), scope)]), ..Default::default() };
+        let old_checkpoint = crate::packing::block_pack(&rtdb_format::keys::block_key(BlockIndex(1)).unwrap());
+        let base = crate::reference::Base { objects: BTreeMap::from([
+            (body.to_string(), scope.clone()), (old_checkpoint.clone(), scope),
+        ]), ..Default::default() };
         base.initialize(bucket.as_ref(), &child_store).await.unwrap();
         assert!(!store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
         assert_eq!(store.get(&body).await.unwrap(), Bytes::from_static(b"body"));
 
         base.forget(bucket.as_ref(), &child_store, &BTreeSet::from([body.to_string()])).await.unwrap();
         assert!(store.permits_search_release(&body, Some(&publication), Some(cut)).await.unwrap());
+        assert!(!may_prune().await.unwrap());
+        let base = crate::reference::Base::load(bucket.as_ref(), &child_store).await.unwrap();
+        base.forget(bucket.as_ref(), &child_store, &BTreeSet::from([old_checkpoint])).await.unwrap();
+        assert!(may_prune().await.unwrap());
         assert!(store.release_search_run(&body, Some(&publication), Some(cut)).await.unwrap());
         assert!(store.list(Some(&body)).await.unwrap().is_empty());
         assert!(bucket.head(&physical).await.is_ok());

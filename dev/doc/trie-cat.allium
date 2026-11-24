@@ -509,6 +509,8 @@ rule FollowerRefreshes {
 ------------------------------------------------------------
 
 rule AddArtefact {
+    -- A source request to adopt a new logical search allocation requires the allocation's staging intent.
+    -- Replica replay applies the previously admitted publication in order.
     -- A logical-search publication can install term-directory evidence together with its change to a definition generation's active runs.
     -- The directory update compares the held root and the identities of the active runs before changing either.
     -- A legacy change to the active runs invalidates the directory for that generation.
@@ -543,6 +545,9 @@ rule AddArtefact {
 }
 
 rule RemoveArtefact {
+    -- Releasing an abandoned logical search allocation records its first settlement position and retains its exact run receipt.
+    -- A later ordered prune removes the tombstone whose run receipt and settlement position match the request.
+    -- The per-table checkpoint preserves the settlement position together with the tombstone until that prune applies.
     -- Removes an artefact's record from its trie's entry, on applying an artefacts-removed record (db.allium: LeaderAppliesOwnArtefactsRemoved, HandleReplicaMessage).
     -- A record matches on kind, definition id and definition version; with none matching, or no such trie, nothing changes.
     when: RemoveArtefact(table, trie_key, record)

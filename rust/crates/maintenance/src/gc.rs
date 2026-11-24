@@ -10,8 +10,8 @@ use rtdb_format::{
 };
 use rtdb_index::{PartitionState, TrieCatalog};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
-use tokio::sync::Semaphore;
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, TableRef, Timestamp};
+use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 use crate::{ArtefactPublisher, CycleWorker, SnapshotSource, TableRetirements, TrieDeletionPublisher};
 use crate::retirement_intent::{self, FileRelease, PendingRetirement};
@@ -172,10 +172,12 @@ impl TrieCollector {
             self.observer.table_failed(None, &error);
         }
         let Some(as_of) = as_of else { return Ok(()); };
+        let oldest_checkpoint = OnceCell::new();
         let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();
         let tasks = stream::iter(tables).map(|entry| {
             let release = release.clone();
             let collection = Arc::clone(&collection);
+            let oldest_checkpoint = &oldest_checkpoint;
             async move {
                 let mut eligible = collection.eligible(&entry.table, as_of);
                 let receipt_l0 = self.store.releases_receipt_l0() && entry.table.stores_expiring_transaction_metadata();
@@ -199,6 +201,7 @@ impl TrieCollector {
                     self.collect_search_seals(&entry, &seals, cut, collection.current().trie_catalog(), cancellation).await?;
                     self.collect_pending_search(&entry, collection.current().trie_catalog(), collection.current().table_catalog().block_index(), cancellation).await?;
                     self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await?;
+                    self.prune_search_tombstones(&entry, &collection, cut, oldest_checkpoint, cancellation).await?;
                     self.collect_entity_directory_pages(&entry, &collection, cut, cancellation).await?;
                     self.collect_term_directory_pages(&entry, &collection, cut, cancellation).await
                 }).await;
@@ -441,6 +444,62 @@ impl TrieCollector {
             if !self.store.release_search_run(&key, run.publication.as_ref(), cut).await? { continue; }
             let trie_key = TrieKey::l0(rtdb_types::BlockIndex(run.blocks[0]))?.to_string();
             let record = SearchRunChange { run: Some(run.clone()), retire_only: Some(true), ..Default::default() }.to_artefact()?;
+            entries.push(ArtefactEntry { trie_key: Some(trie_key), record: Some(record) });
+            if entries.len() >= self.config.chunk_size { break; }
+        }
+        if !entries.is_empty() {
+            publisher.remove(ArtefactsRemoved { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
+                table_name: Some(entry.table.schema_and_table()), entries, source_msg_id: None }).await?;
+        }
+        Ok(())
+    }
+
+    async fn oldest_search_checkpoint(&self, latest: BlockIndex, cut: CatalogCut) -> Result<Option<(BlockIndex, CatalogCut)>> {
+        IoRegion::reading_recovery(self.store.as_ref(), async {
+            let directory = ObjectKey::new("blocks")?;
+            let oldest = self.store.list(Some(&directory)).await?.into_iter().filter_map(|object| {
+                let block = block_index_from_key(object.key.as_str()).ok()?;
+                (block <= latest).then_some((block, object.key))
+            }).min_by_key(|(block, _)| *block);
+            let Some((oldest, key)) = oldest else { return Ok(None); };
+            let bytes = match self.store.get_fresh(&key).await {
+                Ok(bytes) => bytes,
+                Err(rtdb_storage::Error::MissingObject(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let catalog = BlockCatalog::decode(&bytes)?;
+            let Some(through) = catalog.boundary_replica_position() else { return Ok(None); };
+            Ok((catalog.block_index() == oldest && through.0 >= 0 && through.epoch() == cut.replica_epoch && through <= cut.through)
+                .then_some((oldest, CatalogCut { through, ..cut })))
+        }).await
+    }
+
+    async fn prune_search_tombstones(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection, cut: Option<CatalogCut>,
+        oldest_checkpoint: &OnceCell<Option<(BlockIndex, CatalogCut)>>, cancellation: &CancellationToken) -> Result<()> {
+        let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
+        let Some((cut, latest)) = cut.zip(collection.current().table_catalog().block_index()) else { return Ok(()); };
+        let mut entries = Vec::new();
+        for retired in collection.eligible_search_tombstones(&entry.table) {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let Some(run) = retired.run.as_ref().filter(|run| run.allocation.is_some()) else { continue; };
+            if let Some(settled_at) = retired.settled_at_replica_msg_id {
+                let Some((block, checkpoint)) = *oldest_checkpoint.get_or_try_init(|| self.oldest_search_checkpoint(latest, cut)).await?
+                    else { continue; };
+                if checkpoint.through.0 <= settled_at { continue; }
+                let first_in_journal = ReplicaPosition::from_epoch_offset(checkpoint.replica_epoch, 0)?;
+                let floor = CatalogCut { through: ReplicaPosition(settled_at + 1).max(first_in_journal), ..checkpoint };
+                let key = ObjectKey::new(run.object_key(&entry.slug)?)?;
+                if !self.store.permits_search_tombstone_prune(&key, run.publication.as_ref(), block, floor).await? { continue; }
+            }
+            let intent = ObjectKey::new(run.pending_key(&entry.slug)?)?;
+            match self.store.head_fresh(&intent).await {
+                Err(rtdb_storage::Error::MissingObject(_)) => (),
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let trie_key = TrieKey::l0(BlockIndex(run.blocks[0]))?.to_string();
+            let record = SearchRunChange { run: Some(run.clone()), retire_only: Some(true),
+                prune_settled_at: retired.settled_at_replica_msg_id, ..Default::default() }.to_artefact()?;
             entries.push(ArtefactEntry { trie_key: Some(trie_key), record: Some(record) });
             if entries.len() >= self.config.chunk_size { break; }
         }

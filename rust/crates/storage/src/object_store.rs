@@ -270,6 +270,15 @@ pub trait ObjectStore: Send + Sync {
     /// Checks storage-side dependencies before attempting to release a retired search run.
     async fn permits_search_release(&self, _key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> { Ok(true) }
+    async fn permits_search_tombstone_prune(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        _checkpoint: rtdb_types::BlockIndex, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        if self.defers_trie_releases() {
+            let Some(local) = self.local_maintenance_store() else { return Ok(false); };
+            let Some(_recovery) = local.try_lock_recovery_deletion().await? else { return Ok(false); };
+            if !self.advance_catalog_floor(cut).await? { return Ok(false); }
+        }
+        self.permits_search_release(key, publication, Some(cut)).await
+    }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() {

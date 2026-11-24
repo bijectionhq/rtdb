@@ -515,6 +515,11 @@ impl ObjectStore for EncryptingStore {
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
         self.inner.permits_search_release(key, publication, cut).await
     }
+    async fn permits_search_tombstone_prune(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        checkpoint: rtdb_types::BlockIndex, cut: rtdb_types::CatalogCut) -> Result<bool> {
+        crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(),
+            self.inner.permits_search_tombstone_prune(key, publication, checkpoint, cut)).await
+    }
     async fn release_search_run(
         &self,
         key: &ObjectKey,

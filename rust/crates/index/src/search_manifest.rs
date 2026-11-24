@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_format::{log::proto::{RetiredSearchRun, SearchRun, SearchRunChange, TermDirectoryRoot}, term_directory};
-use rtdb_types::{Anomaly, Result, Timestamp};
+use rtdb_types::{Anomaly, ReplicaPosition, Result, Timestamp};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchManifest {
@@ -32,6 +32,11 @@ impl SearchManifest {
     pub fn active(&self) -> impl Iterator<Item = &SearchRun> { self.active.values() }
 
     pub fn retired(&self) -> impl Iterator<Item = &RetiredSearchRun> { self.retired.values() }
+
+    pub fn settled_at(&self, id: &[u8; 32]) -> Option<i64> {
+        let retired = self.retired.get(id).filter(|retired| retired.abandoned() && retired.released())?;
+        retired.settled_at_replica_msg_id
+    }
 
     pub fn term_directory(&self, id: &str, version: i64) -> Option<&TermDirectoryRoot> {
         self.term_directories.get(&(id.to_owned(), version))
@@ -68,11 +73,20 @@ impl SearchManifest {
         root.runs() == count && change.replaces_directory() == term_directory::publication_basis(current, self.generation(key)).as_slice()
     }
 
-    pub fn forget(&mut self, run: &SearchRun) {
-        if let Ok(id) = run.identity() && let Some(retired) = self.retired.get_mut(&id)
-            && retired.run.as_ref() == Some(run) {
-            if retired.abandoned() { retired.released = Some(true); }
-            else { self.retired.remove(&id); }
+    pub fn forget(&mut self, run: &SearchRun, prune_settled_at: Option<i64>, position: Option<ReplicaPosition>) {
+        let Ok(id) = run.identity() else { return; };
+        let Some(retired) = self.retired.get_mut(&id).filter(|retired| retired.run.as_ref() == Some(run)) else { return; };
+        if let Some(expected) = prune_settled_at {
+            if retired.abandoned() && retired.released() && retired.settled_at_replica_msg_id == Some(expected) {
+                self.retired.remove(&id);
+            }
+        } else if retired.abandoned() {
+            retired.released = Some(true);
+            if retired.settled_at_replica_msg_id.is_none() {
+                retired.settled_at_replica_msg_id = position.map(|position| position.0);
+            }
+        } else {
+            self.retired.remove(&id);
         }
     }
 
@@ -93,6 +107,7 @@ impl SearchManifest {
     }
 
     pub fn publish(&mut self, change: SearchRunChange, as_of: Timestamp) -> bool {
+        if change.prune_settled_at.is_some() { return false; }
         let Some(run) = change.run.as_ref() else { return false; };
         if run.validate().is_err() { return false; }
         let Ok(id) = run.identity() else { return false; };
@@ -206,7 +221,7 @@ mod tests {
         assert_eq!(retired.len(), 2);
         assert!(retired.iter().all(|receipt| receipt.superseded_at() == 42));
         let mut recovered = SearchManifest::load(&[merged], &retired).unwrap();
-        recovered.forget(&a);
+        recovered.forget(&a, None, None);
         assert_eq!(recovered.retired().count(), 1);
     }
 
@@ -286,11 +301,24 @@ mod tests {
         let mut manifest = SearchManifest::default();
         assert!(manifest.publish(abandon.clone(), Timestamp(42)));
         assert!(!manifest.publish(change.clone(), Timestamp(43)));
-        manifest.forget(&orphan);
+        manifest.forget(&orphan, None, Some(ReplicaPosition(5)));
+        manifest.forget(&orphan, None, Some(ReplicaPosition(6)));
         let retired = manifest.retired().cloned().collect::<Vec<_>>();
         assert!(retired[0].released());
+        assert_eq!(retired[0].settled_at_replica_msg_id, Some(5));
         let mut reopened = SearchManifest::load(&[], &retired).unwrap();
         assert!(!reopened.publish(change.clone(), Timestamp(44)));
+        reopened.forget(&orphan, Some(6), Some(ReplicaPosition(7)));
+        assert_eq!(reopened.retired().count(), 1);
+        reopened.forget(&orphan, Some(5), Some(ReplicaPosition(8)));
+        assert_eq!(reopened.retired().count(), 0);
+
+        let legacy = RetiredSearchRun { settled_at_replica_msg_id: None, ..retired[0].clone() };
+        let mut reopened = SearchManifest::load(&[], &[legacy]).unwrap();
+        reopened.forget(&orphan, Some(5), Some(ReplicaPosition(8)));
+        assert_eq!(reopened.retired().count(), 1);
+        reopened.forget(&orphan, None, Some(ReplicaPosition(9)));
+        assert_eq!(reopened.retired().next().unwrap().settled_at_replica_msg_id, Some(9));
 
         let mut published = SearchManifest::default();
         assert!(published.publish(change, Timestamp(41)));

@@ -449,7 +449,12 @@ rule DeleteAndCommitChunkRule {
     -- A fresh provider absence observed after drain settles an intent with no uploaded body.
     -- Ordered abandonment succeeds while the allocation is unadopted and fences later adoption at the same identity.
     -- A hosted release of an installed retirement requires the catalog admission floor and proof of the provider version or terminal publication.
-    -- Checkpoint recovery retains the abandonment after physical release.
+    -- The ordered release records the replica position at which the abandoned allocation settled.
+    -- A checkpoint preserves the released abandonment until collection orders its removal.
+    -- Collection requires the oldest recoverable checkpoint boundary to follow settlement, and a fresh observation that the drained writer's staging intent is absent.
+    -- Open catalog captures and local recovery admissions can retain an older view.
+    -- Hosted collection checks the catalog admission floor, authenticated recovery coverage, and fork and archive holds before pruning.
+    -- A released abandonment from an older checkpoint format gains a settlement position through a repeated ordered release once its staging intent is absent.
     -- Replay checkpoint copies and archives include every authenticated page reached by the recorded term directory roots.
     -- A serving receipt over a complete semantic entity directory omits the covered obsolete L0 pairs, logical posting runs, and term directory pages.
     -- The lane rebuilds the search files from the entity directory and the surviving primary payloads.

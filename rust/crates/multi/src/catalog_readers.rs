@@ -7,7 +7,7 @@ use rtdb_directory::{Cas, CatalogAdmissionFloor, CatalogReader, DeploymentRecord
 use rtdb_format::keys::StorageRoot;
 use rtdb_format::log::proto::PublishedObjectVersion;
 use rtdb_storage::{ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, StorageEpoch};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
@@ -136,26 +136,42 @@ impl CatalogReaders {
         }))
     }
 
-    pub async fn permits_search_release(&self, bucket: &dyn ObjectStore, cut: CatalogCut, key: &ObjectKey,
-        publication: Option<&PublishedObjectVersion>) -> Result<bool> {
+    async fn search_release_owner(&self, cut: CatalogCut) -> Result<DeploymentRecord> {
         if !self.matches_cut(cut)? { return Err(closed()); }
         let Some(record) = self.directory.deployment(&self.deployment).await? else { return Err(closed()); };
         if !self.residence_is_open(&record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none() {
             return Err(closed());
         }
+        Ok(record)
+    }
+
+    pub async fn permits_search_release(&self, bucket: &dyn ObjectStore, cut: CatalogCut, key: &ObjectKey,
+        publication: Option<&PublishedObjectVersion>) -> Result<bool> {
+        let record = self.search_release_owner(cut).await?;
         let store = format!("{}/{}", self.residence, self.storage_root);
         crate::store::exact_retirement::permits_search_release(self.directory.as_ref(), bucket, &record, &store, key, publication).await
     }
 
     pub async fn permits_search_releases(&self, bucket: &dyn ObjectStore, cut: CatalogCut,
         items: &[(&ObjectKey, Option<&PublishedObjectVersion>)]) -> Result<Vec<bool>> {
-        if !self.matches_cut(cut)? { return Err(closed()); }
-        let Some(record) = self.directory.deployment(&self.deployment).await? else { return Err(closed()); };
-        if !self.residence_is_open(&record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none() {
-            return Err(closed());
+        let record = self.search_release_owner(cut).await?;
+        let store = format!("{}/{}", self.residence, self.storage_root);
+        crate::store::exact_retirement::permits_search_releases(self.directory.as_ref(), bucket, &record, &store, items, None).await
+    }
+
+    pub async fn permits_search_tombstone_prune(&self, bucket: &dyn ObjectStore, cut: CatalogCut, checkpoint: BlockIndex,
+        key: &ObjectKey, publication: Option<&PublishedObjectVersion>) -> Result<bool> {
+        let (floor, allowed) = self.close_admission(cut, &[None]).await?;
+        if !allowed[0] { return Ok(false); }
+        let owner = self.search_release_owner(cut).await?;
+        if owner.catalog_readers.values().any(|reader| reader.storage_root == self.storage_root && reader.replica_epoch != cut.replica_epoch.0)
+            || !crate::store::recovery_covers_search_checkpoint(&owner, &floor, checkpoint)
+        {
+            return Ok(false);
         }
         let store = format!("{}/{}", self.residence, self.storage_root);
-        crate::store::exact_retirement::permits_search_releases(self.directory.as_ref(), bucket, &record, &store, items).await
+        Ok(crate::store::exact_retirement::permits_search_releases(self.directory.as_ref(), bucket, &owner, &store,
+            &[(key, publication)], Some(checkpoint)).await?[0])
     }
 
     pub async fn advance(&self, installed: CatalogCut) -> Result<bool> {
