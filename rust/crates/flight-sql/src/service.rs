@@ -497,16 +497,17 @@ pub(crate) async fn action_result_stream(
     handoff_action_results(call, values, plaintext).await
 }
 
-pub(crate) async fn handoff_action_results<I>(
+pub(crate) async fn handoff_action_results<T, I>(
     call: Call, values: I, plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
-) -> Result<Response<Output<flight::Result>>, Status>
+) -> Result<Response<Output<T>>, Status>
 where
-    I: IntoIterator<Item = Result<flight::Result, Status>>,
+    T: Send + 'static,
+    I: IntoIterator<Item = Result<T, Status>>,
     I::IntoIter: Send + 'static,
 {
     let first = call.cancellation.run_until_cancelled(plaintext.grant()).await.ok_or_else(cancelled)?.map_err(status)?;
     let (headers, cutoff) = call.delivery_headers(&first, false)?;
-    let stream: Output<flight::Result> = Box::pin(futures::stream::unfold(
+    let stream: Output<T> = Box::pin(futures::stream::unfold(
         (call, values.into_iter(), plaintext, Some(first), false),
         move |(call, mut values, plaintext, mut first, stopped)| async move {
             if stopped { return None; }
@@ -541,14 +542,28 @@ impl FlightService for Service {
     }
     async fn list_flights(&self, request: Request<flight::Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }
     async fn poll_flight_info(&self, request: Request<flight::FlightDescriptor>) -> Result<Response<flight::PollInfo>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }
-    async fn do_exchange(&self, request: Request<Streaming<flight::FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> { let call = self.call(&request, 0).await?; Err(call.error(unsupported())) }
+    async fn do_exchange(&self, request: Request<Streaming<flight::FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
+        use crate::owned_actions::{DECIDE_HOSTED_STREAM_V1, HOSTED_UPLOAD_HEADER};
+        let call = self.call(&request, 0).await?;
+        let headers = request.metadata().get_all(HOSTED_UPLOAD_HEADER);
+        let mut versions = headers.iter();
+        if !versions.next().is_some_and(|version| version == DECIDE_HOSTED_STREAM_V1)
+            || versions.next().is_some() || !self.supports_hosted_upload(&call)
+        {
+            return Err(call.error(unsupported()));
+        }
+        self.hosted_upload(call, request.into_inner()).await
+    }
     async fn list_actions(&self, request: Request<flight::Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
         let call = self.call(&request, 0).await?;
         let actions = ["BeginSavepoint", "BeginTransaction", "CreatePreparedStatement", "ClosePreparedStatement", "CreatePreparedSubstraitPlan", "CancelQuery", "EndSavepoint", "EndTransaction"];
         let catalog_actions = [crate::catalog_actions::PUBLISH_CATALOG, crate::catalog_actions::WATCH_RELATION, crate::catalog_actions::SCAN_CATALOG];
         let catalog_enabled = self.0.config.owned_native_actions
             && !call.session.fresh_replica && call.session.audience_source().is_none();
+        let hosted_upload = self.supports_hosted_upload(&call)
+            .then_some(crate::owned_actions::DECIDE_HOSTED_STREAM_V1);
         result_stream(call, actions.into_iter().chain(catalog_actions.into_iter().filter(|_| catalog_enabled))
+            .chain(hosted_upload)
             .map(|name| Ok(flight::ActionType { r#type: name.into(), description: name.into() })).collect())
     }
     async fn get_flight_info(&self, request: Request<flight::FlightDescriptor>) -> Result<Response<flight::FlightInfo>, Status> {

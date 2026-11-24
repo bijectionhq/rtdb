@@ -240,6 +240,18 @@ Usher terminates Flight SQL and routes by basis:
 
 This replaces Bijection's separate Flight SQL gateway.
 
+#### Hosted write uploads
+
+An installed placed writer can discover `rtdb.owned.DecideHostedStream.v1` through Flight `ListActions` and offer it in the `x-rtdb-owned-write` header on `DoExchange`.
+Each `FlightData.data_body` carries one section or one complete Arrow IPC message.
+The upload starts with the existing hosted decision prefix through the deadline and any journal cutoff, then the primary control groups and the packed fact schedule.
+Each scheduled stream carries its relation and IPC byte length followed by its Arrow messages and IPC end marker.
+An empty Flight frame seals the upload, and the owner requires clean end of input immediately after that seal.
+The upload is limited to 16,384 frames and the existing 64 MiB message limit less 1,024 bytes, including the four-byte fact length accounted for in the unary carrier.
+The owner allows 30 seconds to receive the complete upload.
+The ordered decision uses the same installed writer proof, custody checks, effect ordinals, refusal alternative and commit receipt as the packed unary action.
+An interrupted upload releases its request buffers, and a lost reply to a complete upload uses the original attempt recovery.
+
 #### Audience action work
 
 Each audience Flight action allows 256 object-store requests, 32 MiB of requested bodies, 4 MiB of provider metadata envelopes, 65,536 scan items and 64 MiB of decoding.

@@ -1,4 +1,5 @@
 mod hosted_control;
+mod hosted_upload;
 mod prepared_landing;
 mod hosted_observation;
 mod import_page;
@@ -6,6 +7,7 @@ mod packed_groups;
 mod unique;
 
 pub(crate) use hosted_control::{READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1, READ_HELD_HOSTED_CONTROL_V3, READ_HELD_ROOT_CATALOG_V1};
+pub(crate) use hosted_upload::{DECIDE_HOSTED_STREAM_V1, HOSTED_UPLOAD_HEADER};
 pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V6, CONFIRM_HOSTED_SOURCE_V1, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V3};
 pub(crate) use import_page::DECIDE_HOSTED_IMPORT_PAGE_V1;
 pub(crate) use packed_groups::DECIDE_HOSTED_PACKED_V1;
@@ -49,6 +51,14 @@ pub(crate) enum HostedDecisionWire {
     Original,
     ImportPage,
     Packed,
+}
+
+enum HostedDecisionInput<'a> {
+    Inline(HostedDecisionWire),
+    Streamed {
+        packed: packed_groups::PackedGroups<'static>,
+        controls: &'a [u8],
+    },
 }
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
@@ -1277,6 +1287,12 @@ impl Service {
     pub(crate) async fn decide_hosted_action(
         &self, call: &Call, envelope: &Bytes, wire: HostedDecisionWire,
     ) -> Result<ActionResult, Status> {
+        self.decide_hosted(call, envelope, HostedDecisionInput::Inline(wire)).await
+    }
+
+    async fn decide_hosted(
+        &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>,
+    ) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
         let (authority, body) = Self::installed_authority(envelope)?;
         let ([flags], body) = body.split_first_chunk::<1>()
@@ -1284,7 +1300,7 @@ impl Service {
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
             return Err(invalid("Invalid hosted decision flags"));
         }
-        if matches!(wire, HostedDecisionWire::ImportPage) && *flags != 0 {
+        if matches!(input, HostedDecisionInput::Inline(HostedDecisionWire::ImportPage)) && *flags != 0 {
             return Err(invalid("A hosted import page requires an ordinary Root decision"));
         }
         let counted = *flags & 1 != 0;
@@ -1324,13 +1340,13 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, wire).await
+        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
-        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, format: HostedDecisionWire,
+        funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, input: HostedDecisionInput<'_>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1352,21 +1368,32 @@ impl Service {
             let cutoff = rtdb_types::TimedJournalCutoff::new(before, *certificate).map_err(status)?;
             (Some(cutoff), body)
         } else { (None, body) };
-        let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
-        let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
-            .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
         let mut page = None;
         let mut packed = None;
-        let facts = match format {
-            HostedDecisionWire::Original => facts,
-            HostedDecisionWire::ImportPage => {
-                let (import, inline) = import_page::ImportPage::split(call, facts)?;
-                page = Some(import);
-                inline
+        let (facts, controls): (&[u8], &[u8]) = match input {
+            HostedDecisionInput::Inline(format) => {
+                let (length, body) = body.split_first_chunk::<4>()
+                    .ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
+                let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+                    .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
+                let facts = match format {
+                    HostedDecisionWire::Original => facts,
+                    HostedDecisionWire::ImportPage => {
+                        let (import, inline) = import_page::ImportPage::split(call, facts)?;
+                        page = Some(import);
+                        inline
+                    }
+                    HostedDecisionWire::Packed => {
+                        packed = Some(packed_groups::PackedGroups::parse(call, facts)?);
+                        &[0, 0]
+                    }
+                };
+                (facts, controls)
             }
-            HostedDecisionWire::Packed => {
-                packed = Some(packed_groups::PackedGroups::parse(call, facts)?);
-                &[0, 0]
+            HostedDecisionInput::Streamed { packed: groups, controls } => {
+                if !body.is_empty() { return Err(invalid("Hosted decision prefix has trailing bytes")); }
+                packed = Some(groups);
+                (&[0, 0], controls)
             }
         };
         let fact_groups = ordered_group_count(facts)?;

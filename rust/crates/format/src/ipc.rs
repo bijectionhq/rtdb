@@ -437,15 +437,47 @@ impl OwnedStream {
 
     pub fn read_buffer(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = memory.reserve(stream_bound(&bytes, true, arrow_descriptors)?)?;
+        let bytes = &bytes;
         let mut position = 0;
-        let (header, body) = stream_message(&bytes, &mut position)?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
+        Self::decode_messages(std::iter::from_fn(|| {
+            stream_message(bytes, &mut position).transpose().map(|message| {
+                message.map(|(header, body)| (header, bytes.slice_with_length(body.start, body.len())))
+            })
+        }), reservation)
+    }
+
+    /// Like a complete IPC stream, with each message held in a separate buffer.
+    pub fn read_frames(frames: &[Buffer], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let (end, frames) = frames.split_last().ok_or_else(|| invalid("Arrow stream has no end marker"))?;
+        if end.as_slice() != [255, 255, 255, 255, 0, 0, 0, 0] {
+            return Err(invalid("Arrow stream has no end marker"));
+        }
+        let messages = || frames.iter().map(|frame| {
+            let mut position = 0;
+            let (header, body) = stream_message(frame, &mut position)?
+                .ok_or_else(|| invalid("Arrow stream ended before its last frame"))?;
+            if position != frame.len() { return Err(invalid("Arrow stream frame contains trailing bytes")); }
+            Ok((header, frame.slice_with_length(body.start, body.len())))
+        });
+        let bound = messages().try_fold(8192, |bound, message| {
+            let (header, body) = message?;
+            allocation_add(bound, framed_message_bound(header, &body, header.len(), arrow_descriptors)?)
+        })?;
+        Self::decode_messages(messages(), memory.reserve(bound)?)
+    }
+
+    fn decode_messages<'a>(
+        mut messages: impl Iterator<Item = Result<(&'a [u8], Buffer)>>,
+        reservation: Arc<MemoryReservation>,
+    ) -> Result<Self> {
+        let (header, body) = messages.next().transpose()?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
         if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
         let schema = decoded_schema::adapt(&Arc::new(read_schema_header(header)?))?;
         let dense_unions = schema.fields().iter().any(|field| contains_dense_union(field.data_type()));
         let mut dictionaries = HashMap::new();
         let mut pages = Vec::new();
-        while let Some((header, body)) = stream_message(&bytes, &mut position)? {
-            let body = bytes.slice_with_length(body.start, body.len());
+        for message in messages {
+            let (header, body) = message?;
             // Arrow IPC creates dense union offsets before aligning ArrayData buffers.
             let body = if dense_unions && body.as_ptr().align_offset(std::mem::align_of::<i32>()) != 0 {
                 Buffer::from_slice_ref(body.as_slice())

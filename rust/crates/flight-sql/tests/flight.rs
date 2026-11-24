@@ -5,7 +5,7 @@ use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use rtdb_auth::{AuthConfig, Authenticator, HttpRequest, HttpResponse, HttpTransport, Secret};
 use rtdb_columnar::MemoryBudget;
@@ -1221,8 +1221,15 @@ fn owned_spatial_flight_pages_share_the_original_cut() {
     }).unwrap().join().unwrap();
 }
 
-#[tokio::test]
-async fn owned_import_page_preserves_hosted_effect_positions() {
+#[test]
+fn owned_import_page_preserves_hosted_effect_positions() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(check_hosted_effect_positions());
+    }).unwrap().join().unwrap();
+}
+
+async fn check_hosted_effect_positions() {
     use arrow_array::{ArrayRef, BooleanArray, TimestampMicrosecondArray};
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
@@ -1244,6 +1251,44 @@ async fn owned_import_page_preserves_hosted_effect_positions() {
             ("_id", Arc::new(StringArray::from(ids.to_vec())) as ArrayRef),
             ("_op", Arc::new(StringArray::from(vec!["create"; ids.len()]))),
         ])
+    }
+
+    fn exchange_frames(body: Bytes, prefix_len: usize) -> Vec<arrow_flight::FlightData> {
+        let frame = |data_body| arrow_flight::FlightData { data_body, ..Default::default() };
+        let size = u32::from_be_bytes(body[prefix_len..][..4].try_into().unwrap()) as usize;
+        let end = prefix_len + 4 + size;
+        let mut packed = body.slice(prefix_len + 4..end);
+        let runs = u16::from_be_bytes(packed[..2].try_into().unwrap()) as usize;
+        let stream_count = u16::from_be_bytes(packed[2..4].try_into().unwrap()) as usize;
+        let mut frames = vec![frame(body.slice(..prefix_len)), frame(body.slice(end..)), frame(packed.split_to(4 + runs * 2))];
+        for _ in 0..stream_count {
+            let relation_len = u16::from_be_bytes(packed[..2].try_into().unwrap()) as usize;
+            let header = packed.split_to(2 + relation_len + 4);
+            let stream_len = u32::from_be_bytes(header[2 + relation_len..].try_into().unwrap()) as usize;
+            frames.push(frame(header));
+            let mut ipc = packed.split_to(stream_len);
+            while !ipc.is_empty() {
+                assert_eq!(&ipc[..4], &[255; 4]);
+                let len = u32::from_le_bytes(ipc[4..8].try_into().unwrap()) as usize;
+                let metadata_end = len + 8;
+                let body_len = if len == 0 { 0 } else {
+                    arrow_ipc::root_as_message(&ipc[8..metadata_end]).unwrap().bodyLength() as usize
+                };
+                frames.push(frame(ipc.split_to(metadata_end + body_len)));
+            }
+        }
+        assert!(packed.is_empty());
+        frames.push(arrow_flight::FlightData::default());
+        frames
+    }
+
+    const UPLOAD: &str = "rtdb.owned.DecideHostedStream.v1";
+    async fn exchange(client: &mut Client, version: &'static str, frames: Vec<arrow_flight::FlightData>)
+        -> std::result::Result<Vec<arrow_flight::FlightData>, Status>
+    {
+        let mut request = client.request(futures::stream::iter(frames));
+        request.metadata_mut().insert("x-rtdb-owned-write", version.parse().unwrap());
+        client.client.do_exchange(request).await?.into_inner().try_collect().await
     }
 
     async fn ordinal(client: &mut Client, relation: &str, id: &str) -> u64 {
@@ -1323,22 +1368,94 @@ async fn owned_import_page_preserves_hosted_effect_positions() {
     ]).unwrap();
     let documents = [batch("a"), batch("b")];
     let document_stream = write_arrow_stream(documents[0].schema_ref(), &documents, IpcWriteOptions::default()).unwrap();
-    let ordinary_packed = |schedule: [u16; 3]| {
+    let ordinary_packed = |schedule: [u16; 3], documents_relation: &str, index_relation: &str| {
         let mut facts = [3u16, 2].into_iter().chain(schedule).flat_map(u16::to_be_bytes).collect::<Vec<_>>();
-        group(&mut facts, "packed_documents", &document_stream);
-        group(&mut facts, "packed_index", &creates(&["posting"]));
+        group(&mut facts, documents_relation, &document_stream);
+        group(&mut facts, index_relation, &creates(&["posting"]));
         facts
     };
     control_revision = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
     let action = "rtdb.owned.DecideHostedPacked.v1";
-    let error = client.action(action, request(ordinary_packed([0, 1, 1]), control_revision, 4)).await.unwrap_err();
+    let error = client.action(action, request(ordinary_packed([0, 1, 1], "packed_documents", "packed_index"), control_revision, 4)).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    client.action(action, request(ordinary_packed([0, 1, 0]), control_revision, 4)).await.unwrap();
+    client.action(action, request(ordinary_packed([0, 1, 0], "packed_documents", "packed_index"), control_revision, 4)).await.unwrap();
     for (suffix, id) in [("documents", "a"), ("index", "posting"), ("documents", "b")] {
         let original = ordinal(&mut client, &format!("old_{suffix}"), id).await;
         assert_eq!(ordinal(&mut client, &format!("packed_{suffix}"), id).await, original);
     }
     assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner WHERE _id = 'root'").await[0], 0, 0), 4);
+
+    let list = client.request(arrow_flight::Empty {});
+    let advertised: Vec<_> = client.client.list_actions(list).await.unwrap().into_inner().try_collect().await.unwrap();
+    assert!(advertised.iter().any(|action| action.r#type == UPLOAD));
+    control_revision = clock(&client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await);
+    let frames = |schedule| exchange_frames(
+        request(ordinary_packed(schedule, "streamed_documents", "streamed_index"), control_revision, 5),
+        rtdb_tx::HostedAuthority::WIDTH + 11,
+    );
+    let full = frames([0, 1, 0]);
+    assert_eq!(exchange(&mut client, "rtdb.owned.DecideHostedStream.v2", full.clone()).await.unwrap_err().code(), tonic::Code::Unimplemented);
+    assert_eq!(exchange(&mut client, UPLOAD, frames([0, 1, 1])).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    let mut truncated = full.clone();
+    truncated.pop();
+    assert_eq!(exchange(&mut client, UPLOAD, truncated.clone()).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    let mut trailing = full.clone();
+    trailing.push(arrow_flight::FlightData::default());
+    assert_eq!(exchange(&mut client, UPLOAD, trailing).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    let (entered_pending, pending) = tokio::sync::oneshot::channel();
+    let stalled = futures::stream::iter(truncated).chain(futures::stream::once(async move {
+        let _ = entered_pending.send(());
+        std::future::pending::<arrow_flight::FlightData>().await
+    }));
+    let mut interrupted = client.request(stalled);
+    interrupted.metadata_mut().insert("x-rtdb-owned-write", UPLOAD.parse().unwrap());
+    let mut upload_client = client.client.clone();
+    let task = tokio::spawn(async move { upload_client.do_exchange(interrupted).await });
+    tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap().unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    let mut stale = full.clone();
+    let mut prefix = stale[0].data_body.to_vec();
+    prefix[24] = 0x22;
+    stale[0].data_body = prefix.into();
+    let error = exchange(&mut client, UPLOAD, stale).await.unwrap_err();
+    assert!(error.message().contains("authority changed before ordering"), "{error}");
+
+    let original_controls = &full[1].data_body[2..];
+    let length_at = 2 + "bj_installation".len();
+    let size = u32::from_be_bytes(original_controls[length_at..length_at + 4].try_into().unwrap()) as usize;
+    let owner_group = &original_controls[length_at + 4 + size..];
+    let mut alternative = Vec::new();
+    let mut facts = 2u16.to_be_bytes().to_vec();
+    group(&mut facts, "streamed_documents", &creates(&["refusal"]));
+    group(&mut facts, "streamed_index", &creates(&["refusal"]));
+    alternative.extend_from_slice(&(facts.len() as u32).to_be_bytes());
+    alternative.extend_from_slice(&facts);
+    alternative.extend_from_slice(&1u16.to_be_bytes());
+    alternative.extend_from_slice(owner_group);
+    let mut body = request(ordinary_packed([0, 1, 0], "streamed_documents", "streamed_index"), control_revision, 5).to_vec();
+    let flags = rtdb_tx::HostedAuthority::WIDTH;
+    body[flags] = 4;
+    body.splice(flags + 1..flags + 1, (alternative.len() as u32).to_be_bytes().into_iter().chain(alternative.iter().copied()));
+    let invalid_alternative = exchange_frames(body.clone().into(), flags + 15 + alternative.len());
+    let unary = client.action(action, body.into()).await.unwrap_err();
+    let streamed = exchange(&mut client, UPLOAD, invalid_alternative).await.unwrap_err();
+    assert!(unary.message().contains("must settle the exact original registered dispatch"), "{unary}");
+    assert_eq!(streamed.code(), unary.code());
+    assert_eq!(streamed.message(), unary.message());
+    assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner WHERE _id = 'root'").await[0], 0, 0), 4);
+
+    let receipt = exchange(&mut client, UPLOAD, full).await.unwrap();
+    assert_eq!(receipt.len(), 1);
+    assert_eq!(StreamReader::try_new(receipt[0].data_body.as_ref(), None).unwrap().next().unwrap().unwrap().num_rows(), 1);
+    for (suffix, id) in [("documents", "a"), ("index", "posting"), ("documents", "b")] {
+        let original = ordinal(&mut client, &format!("old_{suffix}"), id).await;
+        assert_eq!(ordinal(&mut client, &format!("streamed_{suffix}"), id).await, original);
+    }
+    assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner WHERE _id = 'root'").await[0], 0, 0), 5);
+
     running.stop().await;
 }
 
