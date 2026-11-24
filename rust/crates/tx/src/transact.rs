@@ -6,7 +6,7 @@ use rtdb_index::branches::{
 };
 pub use rtdb_index::branches::{
     CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation, CustodyResponseAdmission,
-    CustodyPlacementId, CustodyTarget, GroupedCount, IndexDefinition, Visibility,
+    CustodyPlacementId, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition, Visibility,
     RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind,
 };
 use rtdb_types::{
@@ -14,6 +14,7 @@ use rtdb_types::{
     Term, TimeUnit, Timestamp, Value,
     rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, valid_branch_name},
 };
+pub use rtdb_types::rtdb_v1::{ValidTime, ValidTimeBound};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::{RawValue, to_raw_value};
 use sha2::{Digest, Sha256};
@@ -196,49 +197,6 @@ pub struct Row {
     pub custody_payload: Option<CustodyPayload>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ValidTime {
-    Literal(Interval),
-    Relative { from: ValidTimeBound, to: ValidTimeBound },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ValidTimeBound {
-    Instant(Timestamp),
-    TransactionMicros(i64),
-}
-
-impl ValidTime {
-    pub fn new(from: ValidTimeBound, to: ValidTimeBound) -> Result<Self> {
-        match (from, to) {
-            (ValidTimeBound::Instant(from), ValidTimeBound::Instant(to)) => {
-                Ok(Self::Literal(Interval::new(from, to)?))
-            }
-            (from, to) => Ok(Self::Relative { from, to }),
-        }
-    }
-
-    pub fn resolve(self, time: Timestamp) -> Result<Interval> {
-        let bound = |bound| match bound {
-            ValidTimeBound::Instant(at) => Ok(at),
-            ValidTimeBound::TransactionMicros(offset) => time.0.checked_add(offset).map(Timestamp).ok_or_else(|| {
-                Anomaly::incorrect("rtdb/invalid-valid-time", "The transaction-relative valid time is out of range")
-            }),
-        };
-        match self {
-            Self::Literal(interval) => Ok(interval),
-            Self::Relative { from, to } => Interval::new(bound(from)?, bound(to)?),
-        }
-    }
-
-    fn is_literal(self) -> bool { matches!(self, Self::Literal(_)) }
-}
-
-impl From<Interval> for ValidTime {
-    fn from(interval: Interval) -> Self { Self::Literal(interval) }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Op {
     Put { branch: Branch, table: TableRef, rows: Vec<Row>, if_absent: bool },
@@ -273,6 +231,8 @@ fn native_custody_key(custody: &NativeCheckpointCustody, installed: bool) -> Vec
 pub struct CustodyPlacement {
     pub placement_id: CustodyPlacementId,
     pub reservation: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<DerivedCustodyReservation>,
     pub carrier_column: String,
     pub link_column: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1037,7 +997,16 @@ impl TransactState {
                effects: Vec<BranchEffect>) -> Result<Receipt> {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
-        for effect in effects { candidate.apply(effect)?; }
+        for effect in effects {
+            if let BranchEffect::ActivateCustodyOccurrence { occurrence, .. }
+                | BranchEffect::ActivateDerivedCustodyOccurrence { occurrence, .. } = &effect
+                && (receipt_namespace.is_some()
+                    || !occurrence.receipt_key.is_empty() && occurrence.receipt_key != receipt.key)
+            {
+                return Err(invalid_record());
+            }
+            candidate.apply(effect)?;
+        }
         self.index = candidate;
         let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None });
         debug_assert!(previous.is_none());

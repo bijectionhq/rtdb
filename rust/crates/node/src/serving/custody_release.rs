@@ -600,6 +600,7 @@ mod tests {
                             placement: CustodyPlacement {
                                 placement_id: [4; 16],
                                 reservation: None,
+                                derived: None,
                                 carrier_column: "carrier".into(),
                                 link_column: None,
                                 commitments: Some(CustodyPlacementCommitments {

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ring::{aead, digest, rand::{SecureRandom, SystemRandom}};
 use serde::{Deserialize, Serialize};
 
-use crate::{Anomaly, Iid, Result, TableRef, Timestamp};
+use crate::{Anomaly, Iid, Interval, Result, TableRef, Timestamp};
 
 pub type Branch = String;
 pub const MAIN_BRANCH: &str = "main";
@@ -12,6 +12,49 @@ pub const WRITTEN_BASIS_COLUMN: &str = "_rtdb_written_basis";
 pub const QUERY_WRITTEN_BASIS: &str = "query.written-basis";
 pub const CLEAR_RANK_INPUT: &str = "query.clear-rank-input";
 pub const RANKED_INDEX_DECLARATIONS: &str = "declare.ranked-index";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ValidTime {
+    Literal(Interval),
+    Relative { from: ValidTimeBound, to: ValidTimeBound },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidTimeBound {
+    Instant(Timestamp),
+    TransactionMicros(i64),
+}
+
+impl ValidTime {
+    pub fn new(from: ValidTimeBound, to: ValidTimeBound) -> Result<Self> {
+        match (from, to) {
+            (ValidTimeBound::Instant(from), ValidTimeBound::Instant(to)) => {
+                Ok(Self::Literal(Interval::new(from, to)?))
+            }
+            (from, to) => Ok(Self::Relative { from, to }),
+        }
+    }
+
+    pub fn resolve(self, time: Timestamp) -> Result<Interval> {
+        let bound = |bound| match bound {
+            ValidTimeBound::Instant(at) => Ok(at),
+            ValidTimeBound::TransactionMicros(offset) => time.0.checked_add(offset).map(Timestamp).ok_or_else(|| {
+                Anomaly::incorrect("rtdb/invalid-valid-time", "The transaction-relative valid time is out of range")
+            }),
+        };
+        match self {
+            Self::Literal(interval) => Ok(interval),
+            Self::Relative { from, to } => Interval::new(bound(from)?, bound(to)?),
+        }
+    }
+
+    pub fn is_literal(self) -> bool { matches!(self, Self::Literal(_)) }
+}
+
+impl From<Interval> for ValidTime {
+    fn from(interval: Interval) -> Self { Self::Literal(interval) }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelScope {

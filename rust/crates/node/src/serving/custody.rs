@@ -27,7 +27,8 @@ pub(crate) async fn prepare(request: &mut Transact, vault: &CustodyVault) -> Res
                 Op::Put { rows, .. } => rows.as_mut_slice(),
                 Op::PlaceCustodyRow { row, placement, .. } => {
                     let expected = 1 + usize::from(placement.link_column.is_some());
-                    if placement.reservation.is_some() != placement.link_column.is_some()
+                    if placement.reservation.is_some() && placement.derived.is_some()
+                        || (placement.reservation.is_some() || placement.derived.is_some()) != placement.link_column.is_some()
                         || row.protected_columns.len() != expected
                         || placement.link_column.as_ref() == Some(&placement.carrier_column)
                     {
@@ -208,7 +209,7 @@ mod tests {
                 custody_group: Some(group), protected_columns: vec!["carrier".into()], custody_payload: None,
             },
             placement: CustodyPlacement {
-                placement_id: group, reservation: None, carrier_column: "carrier".into(), link_column: None, commitments: None,
+                placement_id: group, reservation: None, derived: None, carrier_column: "carrier".into(), link_column: None, commitments: None,
             },
         };
         let mut state = TransactState::new(incarnation);
@@ -253,7 +254,7 @@ mod tests {
                     protected_columns: vec!["carrier".into(), "link".into()],
                 },
                 placement: CustodyPlacement {
-                    placement_id: [6; 16], reservation: Some([7; 32]), carrier_column: "carrier".into(),
+                    placement_id: [6; 16], reservation: Some([7; 32]), derived: None, carrier_column: "carrier".into(),
                     link_column: Some("link".into()), commitments: None,
                 },
             }],

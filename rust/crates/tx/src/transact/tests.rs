@@ -769,6 +769,132 @@ fn row_visibility_scoped_claims_check_hidden_effects_without_returning_them() {
 }
 
 #[test]
+fn derived_custody_placement_uses_the_earlier_original_in_the_accepting_arm() {
+    let group = [8; 16];
+    let original_id = [9; 16];
+    let derived_id = [10; 16];
+    let inline = DerivedCustodyReservation {
+        original_placement_id: original_id, link: [11; 16], review_sha256: [12; 32],
+        carrier_sha256: [13; 32], link_sha256: [14; 32],
+    };
+    let original = custody_carrier(group, 1, original_id);
+    let mut derived = custody_carrier(group, 2, derived_id);
+    let Op::PlaceCustodyRow { row, placement, .. } = &mut derived else { unreachable!() };
+    row.protected_columns.push("link".into());
+    placement.link_column = Some("link".into());
+    placement.commitments = Some(CustodyPlacementCommitments {
+        carrier_sha256: inline.carrier_sha256, link_sha256: Some(inline.link_sha256),
+    });
+    placement.derived = Some(inline);
+
+    let mut state = TransactState::new(INCARNATION);
+    let create = Op::CreateCustodyGroup { group };
+    for (at, ops) in [
+        (1, vec![create.clone(), derived.clone(), original.clone()]),
+        (2, vec![create.clone(), original.clone(), derived.clone(), derived.clone()]),
+    ] {
+        let receipt = commit_custody(&mut state, at, &request(at as u8, ops));
+        assert!(matches!(receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+        assert!(state.index().custody_inventory(group).is_none());
+    }
+    let publish = request(3, vec![create, put(MAIN_BRANCH, 99, "before"), original, derived.clone()]);
+    let receipt = commit_custody(&mut state, 3, &publish);
+    assert_eq!(receipt.outcome, Outcome::Then);
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, receipt.system_time).unwrap();
+    let entries = view.custody_placements().collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    let original = entries.iter().find(|entry| entry.placement_id == original_id).unwrap();
+    let derived_entry = entries.iter().find(|entry| entry.placement_id == derived_id).unwrap();
+    let occurrence = derived_entry.occurrence.unwrap();
+    assert_eq!(original.occurrence.unwrap().ordinal, 2);
+    assert_eq!((derived_entry.enrolled, occurrence.written, occurrence.ordinal), (receipt.basis, receipt.basis, 3));
+    assert_eq!(occurrence.receipt_key, receipt.key);
+    assert_eq!(occurrence.reservation, derived_entry.reservation);
+    assert!(occurrence.reservation.is_some());
+    let (origin, read) = state.index().custody_read_occurrence(receipt.basis, group, occurrence.commitment(group)).unwrap();
+    assert_eq!(origin, original.occurrence.unwrap().commitment(group));
+    assert_eq!(read, occurrence);
+    let replay = state.tx_status(&publish.key).unwrap();
+    assert_eq!(replay, Receipt { replayed: true, ..receipt });
+
+    let Op::PlaceCustodyRow { placement, .. } = &mut derived else { unreachable!() };
+    placement.placement_id = [15; 16];
+    placement.derived.as_mut().unwrap().link = [16; 16];
+    let late = commit_custody(&mut state, 4, &request(4, vec![derived]));
+    assert!(matches!(late.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+}
+
+#[test]
+fn moved_custody_placement_compares_relative_validity_at_its_own_ordered_clock() {
+    let group = [8; 16];
+    let mut state = TransactState::new(INCARNATION);
+    let root = custody_carrier(group, 1, [9; 16]);
+    assert_eq!(commit_custody(&mut state, 1, &request(1, vec![Op::CreateCustodyGroup { group }, root])).outcome, Outcome::Then);
+    let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(10)).unwrap();
+    let original = view.custody_placements().next().unwrap().occurrence.unwrap().commitment(group);
+    let valid = ValidTime::new(ValidTimeBound::TransactionMicros(0), ValidTimeBound::Instant(Timestamp::MAX)).unwrap();
+    let reservation = CustodyReservation {
+        original, source: original, destination: [10; 16], link: [11; 16],
+        target: CustodyTarget { branch: "copy".into(), table: table(), id: EntityId::Integer(2), valid },
+        review_sha256: [12; 32], carrier_sha256: [13; 32], link_sha256: [14; 32],
+    };
+    let digest = reservation.commitment(INCARNATION, group);
+    let reserve = Op::ReserveCustodyPlacement { group, reservation: reservation.clone() };
+    let mut moved = custody_carrier(group, 2, reservation.destination);
+    let Op::PlaceCustodyRow { branch, row, placement, .. } = &mut moved else { unreachable!() };
+    *branch = "copy".into();
+    row.valid = Some(valid);
+    row.protected_columns.push("link".into());
+    placement.reservation = Some(digest);
+    placement.link_column = Some("link".into());
+    placement.commitments = Some(CustodyPlacementCommitments {
+        carrier_sha256: reservation.carrier_sha256, link_sha256: Some(reservation.link_sha256),
+    });
+    assert_eq!(commit_custody(&mut state, 2, &request(2, vec![fork("copy", 1)])).outcome, Outcome::Then);
+    let early = commit_custody(&mut state, 3, &request(3, vec![reserve.clone(), moved.clone()]));
+    assert!(matches!(early.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+    assert_eq!(commit_custody(&mut state, 4, &request(4, vec![reserve])).outcome, Outcome::Then);
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    let mut stale = moved.clone();
+    let Op::PlaceCustodyRow { row, .. } = &mut stale else { unreachable!() };
+    row.valid = Some(valid.resolve(Timestamp(40)).unwrap().into());
+    let refused = commit_custody(&mut state, 5, &request(5, vec![stale]));
+    assert!(matches!(refused.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+    let applied = commit_custody(&mut state, 6, &request(6, vec![moved]));
+    assert_eq!(applied.outcome, Outcome::Then);
+    let view = state.index().view("copy", At::Latest, Layer::Local, applied.system_time).unwrap();
+    let enrolled = view.custody_placements().find(|entry| entry.placement_id == reservation.destination).unwrap();
+    let occurrence = enrolled.occurrence.unwrap();
+    assert_eq!(enrolled.enrolled, basis(4));
+    assert_eq!(occurrence.target.valid.lower(), applied.system_time);
+    assert_eq!(occurrence.target.valid.upper(), Timestamp::MAX);
+    assert_eq!(occurrence.receipt_key, applied.key);
+}
+
+fn custody_carrier(group: CustodyGroupId, id: i64, placement_id: CustodyPlacementId) -> Op {
+    Op::PlaceCustodyRow {
+        branch: MAIN_BRANCH.into(), table: table(),
+        row: Row {
+            id: EntityId::Integer(id), valid: Some(Interval::ALL.into()), cells: StructFields::new(),
+            custody_group: Some(group), protected_columns: vec!["carrier".into()],
+            custody_payload: Some(CustodyPayload { binding: [3; 32], envelope: placement_id.to_vec() }),
+        },
+        placement: CustodyPlacement {
+            placement_id, reservation: None, derived: None, carrier_column: "carrier".into(), link_column: None,
+            commitments: Some(CustodyPlacementCommitments { carrier_sha256: [7; 32], link_sha256: None }),
+        },
+    }
+}
+
+fn commit_custody(state: &mut TransactState, at: u64, request: &Transact) -> Receipt {
+    let prepared = plan(state, request, at, at as i64 * 10, &[ROW_CUSTODY]);
+    apply(state, at, prepared.record()).unwrap()
+}
+
+#[test]
 fn custody_reservation_activation_and_release_share_the_revocation_order() {
     use std::num::NonZeroU64;
     use rtdb_index::branches::{CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
@@ -789,7 +915,7 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
                 protected_columns: if link_sha256.is_some() { vec!["carrier".into(), "link".into()] } else { vec!["carrier".into()] },
             },
             placement: CustodyPlacement {
-                placement_id: stage, reservation, carrier_column: "carrier".into(), link_column: link_sha256.map(|_| "link".into()),
+                placement_id: stage, reservation, derived: None, carrier_column: "carrier".into(), link_column: link_sha256.map(|_| "link".into()),
                 commitments: Some(CustodyPlacementCommitments { carrier_sha256, link_sha256 }),
             },
         }
@@ -806,7 +932,7 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
     let plan_before_reserving = state.index().custody_inventory(group).unwrap().sha256;
     let reservation = CustodyReservation {
         original, source: original, destination: [12; 16], link: [13; 16],
-        target: CustodyTarget { branch: "copy".into(), table: table(), id: EntityId::Integer(1), valid },
+        target: CustodyTarget { branch: "copy".into(), table: table(), id: EntityId::Integer(1), valid: valid.into() },
         review_sha256: [15; 32], carrier_sha256: [16; 32], link_sha256: [17; 32],
     };
     let reserved = reservation.commitment(INCARNATION, group);
@@ -917,7 +1043,7 @@ fn custody_admission_orders_the_whole_part_and_preserves_its_drain_after_restart
             row: Row { id: EntityId::Integer(at as i64), valid: Some(Interval::ALL.into()), cells: StructFields::new(),
                 custody_group: Some(group), custody_payload: Some(CustodyPayload { binding: [13; 32], envelope: vec![at as u8] }),
                 protected_columns: vec!["carrier".into()] },
-            placement: CustodyPlacement { placement_id, reservation: None, carrier_column: "carrier".into(),
+            placement: CustodyPlacement { placement_id, reservation: None, derived: None, carrier_column: "carrier".into(),
                 link_column: None, commitments: Some(CustodyPlacementCommitments { carrier_sha256: [14; 32], link_sha256: None }) },
         };
         let carrier = write(&mut state, at, &request(at as u8, vec![Op::CreateCustodyGroup { group }, placement]));

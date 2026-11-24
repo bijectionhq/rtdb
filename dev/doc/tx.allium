@@ -1798,6 +1798,8 @@ surface ConnectionLifecycle {
 -- Resolved custody placement effects use the same transaction order and replay boundary as the protected row.
 -- The resolved occurrence names the physical authoring branch, target row, valid interval, written basis and within-transaction ordinal.
 -- Copy activation binds the exact reservation, carrier and link and consumes its destination identity.
+-- An inline derived reservation resolves the earlier original occurrence from the same accepting arm and activates with its own protected row.
+-- A prior ordered reservation binds the authored validity rule and compares its resolved interval at the activating write's receipt clock.
 -- A reserved destination and its link remain in the revocation inventory until the group's permanent denial.
 -- The latest revoked inventory keeps the first revocation basis and its digest.
 -- Authenticated release phase effects use the same order as revocation and hold their own receipt namespace.

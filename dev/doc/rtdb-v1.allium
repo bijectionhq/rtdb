@@ -150,7 +150,9 @@ surface StatelessDatabase {
 
     @guarantee ProtectedPlacement
         -- A route that serves row custody orders original placement, reservation, activation and revocation in the same database fold.
-        -- A reservation binds the exact original and reviewed source occurrences to fresh destination and link identities, a valid target interval and the reviewed carrier and link bytes.
+        -- A reservation binds the exact original and reviewed source occurrences to fresh destination and link identities, a target validity rule and the reviewed carrier and link bytes.
+        -- A derived write can reserve and activate its destination together after the original occurrence orders earlier in the same transaction arm.
+        -- A separately reserved placement activates at a later basis and resolves relative target validity at the accepting placement clock.
         -- Only the ordered write at the reserved target can activate the destination, and its basis, within-transaction ordinal and encrypted envelope become part of the occurrence commitment.
         -- A same-database branch inherits the original occurrence through its fork basis.
         -- The inventory includes inactive reservations and active occurrences, so a new reservation or activation invalidates an earlier revocation plan.

@@ -38,9 +38,14 @@ impl Candidate<'_> {
                         reservation: placement.reservation,
                         link_sha256: commitments.link_sha256,
                     };
-                    self.index.check_custody_occurrence(group, &occurrence)?;
                     self.write(branch, table, row.id.clone(), valid, Some(image))?;
-                    self.push(BranchEffect::ActivateCustodyOccurrence { group, occurrence })?;
+                    let activation = match &placement.derived {
+                        Some(reservation) => BranchEffect::ActivateDerivedCustodyOccurrence {
+                            group, occurrence, reservation: reservation.clone(),
+                        },
+                        None => BranchEffect::ActivateCustodyOccurrence { group, occurrence },
+                    };
+                    self.push(activation)?;
                 }
                 Op::Delete { branch, table, ids, valid } => {
                     self.require_write_branch(branch)?;

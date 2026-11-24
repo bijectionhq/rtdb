@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_tx::transact::{
     self as tx, Cell, CountRange, Declaration, GroupedCount, Guard, IndexDefinition, Op, Row, Transact, Version,
-    CustodyPlacement, CustodyReservation, CustodyTarget, ValidTime, ValidTimeBound, When, Window,
+    CustodyPlacement, CustodyReservation, CustodyTarget, DerivedCustodyReservation, ValidTime, ValidTimeBound, When, Window,
     RankedIndexDefinition, RankedIndexKind,
 };
 use rtdb_types::{
@@ -182,9 +182,6 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
             WireOp::ReserveCustodyPlacement(reserve) => {
                 let target = reserve.target.ok_or_else(|| error::incorrect("Missing custody placement target"))?;
                 let valid = target.valid.ok_or_else(|| error::incorrect("Missing custody placement interval"))?;
-                let ValidTime::Literal(valid) = interval(valid)? else {
-                    return Err(error::incorrect("The custody placement target requires literal valid time"));
-                };
                 Op::ReserveCustodyPlacement {
                     group: custody_identity(&reserve.group)?,
                     reservation: CustodyReservation {
@@ -194,7 +191,7 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
                         link: custody_identity(&reserve.link)?,
                         target: CustodyTarget {
                             branch: branch(target.branch)?, table: table(&target.table)?,
-                            id: entity(target.id, memory)?, valid,
+                            id: entity(target.id, memory)?, valid: interval(valid)?,
                         },
                         review_sha256: commitment(&reserve.review_sha256)?,
                         carrier_sha256: commitment(&reserve.carrier_sha256)?,
@@ -202,18 +199,32 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
                     },
                 }
             }
-            WireOp::PlaceCustodyRow(place) => Op::PlaceCustodyRow {
-                branch: branch(place.branch)?,
-                table: table(&place.table)?,
-                row: decode_row(place.row.ok_or_else(|| error::incorrect("Missing custody row"))?, memory)?,
-                placement: CustodyPlacement {
-                    placement_id: custody_identity(&place.placement_id)?,
-                    reservation: place.reservation_sha256.as_deref().map(commitment).transpose()?,
-                    carrier_column: place.carrier_column,
-                    link_column: place.link_column,
-                    commitments: None,
-                },
-            },
+            WireOp::PlaceCustodyRow(place) => {
+                if place.reservation_sha256.is_some() && place.derived_reservation.is_some() {
+                    return Err(error::incorrect("Custody placement takes one reservation"));
+                }
+                Op::PlaceCustodyRow {
+                    branch: branch(place.branch)?,
+                    table: table(&place.table)?,
+                    row: decode_row(place.row.ok_or_else(|| error::incorrect("Missing custody row"))?, memory)?,
+                    placement: CustodyPlacement {
+                        placement_id: custody_identity(&place.placement_id)?,
+                        reservation: place.reservation_sha256.as_deref().map(commitment).transpose()?,
+                        derived: place.derived_reservation.map(|derived| -> Result<_, Status> {
+                            Ok(DerivedCustodyReservation {
+                                original_placement_id: custody_identity(&derived.original_placement_id)?,
+                                link: custody_identity(&derived.link)?,
+                                review_sha256: commitment(&derived.review_sha256)?,
+                                carrier_sha256: commitment(&derived.carrier_sha256)?,
+                                link_sha256: commitment(&derived.link_sha256)?,
+                            })
+                        }).transpose()?,
+                        carrier_column: place.carrier_column,
+                        link_column: place.link_column,
+                        commitments: None,
+                    },
+                }
+            }
         },
     )
 }

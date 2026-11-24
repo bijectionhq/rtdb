@@ -18,7 +18,7 @@ mod custody_release;
 mod custody_transfer;
 mod visibility;
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
-pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyTarget};
+pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyTarget, DerivedCustodyReservation};
 pub use custody_release::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart};
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
@@ -185,6 +185,7 @@ pub enum BranchEffect {
     RevokeCustodyGroup { group: CustodyGroupId },
     ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
     ActivateCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence },
+    ActivateDerivedCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence, reservation: DerivedCustodyReservation },
     CustodyRelease(CustodyRelease),
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
 }
@@ -730,7 +731,10 @@ impl BranchIndex {
             BranchEffect::CreateCustodyGroup { group } => self.create_custody_group(group)?,
             BranchEffect::RevokeCustodyGroup { group } => self.revoke_custody_group(group)?,
             BranchEffect::ReserveCustodyPlacement { group, reservation } => self.reserve_custody_placement(group, reservation)?,
-            BranchEffect::ActivateCustodyOccurrence { group, occurrence } => self.activate_custody_occurrence(group, occurrence)?,
+            BranchEffect::ActivateCustodyOccurrence { group, occurrence } => self.activate_custody_occurrence(group, occurrence, None)?,
+            BranchEffect::ActivateDerivedCustodyOccurrence { group, occurrence, reservation } => {
+                self.activate_custody_occurrence(group, occurrence, Some(reservation))?;
+            }
             BranchEffect::CustodyRelease(release) => self.apply_custody_release(release)?,
             BranchEffect::NativeCustodyTransfer { custody, destination } => self.apply_native_custody_transfer(custody, destination)?,
         }

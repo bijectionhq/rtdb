@@ -254,7 +254,7 @@ message CustodyPlacementTarget {
   string branch = 1;
   string table = 2;
   Cell id = 3;
-  // An explicit literal interval.
+  // Relative bounds are evaluated at the accepting PlaceCustodyRow clock.
   Interval valid = 4;
 }
 message ReserveCustodyPlacement {
@@ -273,11 +273,20 @@ message PlaceCustodyRow {
   string table = 2;
   Row row = 3;
   bytes placement_id = 4;
-  // Absent for the original occurrence.
+  // A prior ordered reservation. Mutually exclusive with derived_reservation.
   optional bytes reservation_sha256 = 5;
   string carrier_column = 6;
   // Required for a reserved placement. Both named columns are protected binary cells.
   optional string link_column = 7;
+  DerivedCustodyReservation derived_reservation = 8;
+}
+message DerivedCustodyReservation {
+  // The original placement ID in the same group, ordered earlier in this arm.
+  bytes original_placement_id = 1;
+  bytes link = 2;
+  bytes review_sha256 = 3;
+  bytes carrier_sha256 = 4;
+  bytes link_sha256 = 5;
 }
 message Op {
   oneof op {
