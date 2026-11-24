@@ -107,7 +107,7 @@ The source must be a member position (the original or an accepted landing), both
 The destination assertion must differ from the original's.
 An exact retry succeeds; a different reservation for the same destination is refused.
 
-### `rtdb.owned.ActivateFamilyLanding.v1`
+### `rtdb.owned.ActivateFamilyLanding.v2` (placed form)
 
 Request: family `uuid`, `placement`, `reservation`.
 
@@ -116,7 +116,7 @@ The placement must name the reservation's destination assertion and destination 
 The vault records the placement digest; an exact retry succeeds and a different placement is refused.
 This action serializes against the fence and does not itself verify publication evidence.
 
-### `rtdb.owned.SealFamilyLandingLink.v1`
+### `rtdb.owned.SealFamilyLandingLink.v2` (placed form)
 
 Request: family `uuid`, `reservation`, `placement`, destination scope (32), intent (32, nonzero), review slot (u64).
 
@@ -189,6 +189,53 @@ Request: family `uuid`.
 
 Persists a denial for every member position and replaces the family with a permanent denial, after the fixed assertion deadline has a signed settlement for the family's order.
 The fixed assertion profile is not installed on hosted cells, so this action is refused with `rtdb.owned/assertion-profile-uninstalled`.
+
+## Bijection Root landing
+
+A Bijection Root carrier contains the existing unit-sealed payload inside an assertion envelope sealed by the RTDB broker under the reservation's fresh destination stage.
+The Root unit fence and the original family fence both govern release.
+The landing authority verifies equivalent effective disclosure, including access to the Proposal and world, before probing or opening the source.
+The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
+The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
+
+The offered clock is an acceptance premise.
+RTDB assigns the ordered position when it resolves the prepared generation.
+The pre-publication link therefore names the destination by the receipt digest and review slot, and the post-publication binding adds the exact accepted position selected by that slot.
+The receipt binds the approved source slot, destination carrier and validity, disclosure commitment, and the exact payload and link envelopes.
+The release owner authenticates the applied receipt and its proof, the installed carrier and original ordered position, and uses the same evidence when recovering an interrupted activation.
+A constraint refusal, a stale prepared generation or a missing receipt grants no activation.
+A reservation and sealed frames alone grant no release.
+
+Every Root release path checks the exact activated binding against the current family before opening the outer envelope, including exact history, journal/replay, and derivative backfill.
+An original reader lease and final release check still apply after opening.
+An unavailable original vault or unproven binding fails closed.
+A fenced winner continues to shadow older assertions.
+A dependent restore must keep the outer envelope and resolve current custody through the original authority, or refuse release.
+It cannot convert the payload to a receiver-only envelope.
+Root erasure selects the authenticated landed occurrence and closes the same family as erasure of the Proposal original.
+Root derivative registration and the ordered erase inventory remain part of the existing R6/R7 contract.
+
+Hosted protocol 216 introduces the Root landing form.
+The reservation request is unchanged.
+All other fields below use the encodings above.
+
+| Name | Bytes | Layout |
+| --- | --- | --- |
+| `root-target` | 104 | Receipt digest (32), review slot (u64), carrier address and valid extent commitment (32), effective disclosure commitment (32). |
+| `root-binding` | 248 | `position`, `assertion`, destination stage UUID, `root-target`, SHA-256 of the destination envelope (32), SHA-256 of the link envelope (32). |
+
+The receipt, address and extent, disclosure, and envelope commitments must be nonzero.
+The client authenticates the address, extent and disclosure commitments from the installed Root carrier and its publication.
+The vault binds Root payload seal/open to the target, family and destination identity in a Root-specific authoring domain.
+The reservation names the original or another admitted family member position.
+The seal request separately supplies the actual ordered position of the reviewed winning source, which can be a later rewrite of that member.
+The link seals both source coordinates and the destination envelope digest.
+Its authoring scope binds the private family identity and the Root target.
+
+* `rtdb.owned.SealFamilyLandingPayload.v1` takes family, reservation, `root-target`, then the unit-sealed carrier bytes. It returns the destination assertion envelope.
+* `rtdb.owned.OpenFamilyLandingPayload.v1` takes family, destination `stage`, `root-binding`, then the destination envelope. It verifies the active binding and exact envelope digest and returns the inner carrier. Opening requires the current family both before and after the broker unwrap.
+* `rtdb.owned.SealFamilyLandingLink.v2` takes a binding-kind byte. Kind 0 is followed by the placed request fields above. Kind 1 is followed by family, reservation, `root-target`, the reviewed source `position`, then the destination envelope digest. It returns the separately sealed link envelope.
+* `rtdb.owned.ActivateFamilyLanding.v2` takes a binding-kind byte. Kind 0 is followed by the placed request fields above. Kind 1 is followed by family, `root-binding`, reservation, then the link envelope. The vault authenticates the exact link before first activation, and accepts an exact activation retry independently of link retirement.
 
 ## Fence semantics across dependent forks
 

@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use arrow_flight::Result as ActionResult;
 use bytes::{Bytes, BytesMut};
-use rtdb_types::{AssertionId, PlacementBinding, Position};
+use rtdb_types::{AssertionId, PlacementBinding, Position, RootLandingBinding, RootLandingTarget};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -16,8 +16,10 @@ pub(crate) const ENROLL_ASSERTION_FAMILY_V1: &str = "rtdb.owned.EnrollAssertionF
 pub(crate) const ENROLL_FAMILY_WORLD_ROW_V1: &str = "rtdb.owned.EnrollFamilyWorldRow.v1";
 pub(crate) const REGISTER_ASSERTION_FAMILY_V1: &str = "rtdb.owned.RegisterAssertionFamily.v1";
 pub(crate) const RESERVE_FAMILY_LANDING_V1: &str = "rtdb.owned.ReserveFamilyLanding.v1";
-pub(crate) const ACTIVATE_FAMILY_LANDING_V1: &str = "rtdb.owned.ActivateFamilyLanding.v1";
-pub(crate) const SEAL_FAMILY_LANDING_LINK_V1: &str = "rtdb.owned.SealFamilyLandingLink.v1";
+pub(crate) const ACTIVATE_FAMILY_LANDING_V2: &str = "rtdb.owned.ActivateFamilyLanding.v2";
+pub(crate) const SEAL_FAMILY_LANDING_LINK_V2: &str = "rtdb.owned.SealFamilyLandingLink.v2";
+pub(crate) const SEAL_FAMILY_LANDING_PAYLOAD_V1: &str = "rtdb.owned.SealFamilyLandingPayload.v1";
+pub(crate) const OPEN_FAMILY_LANDING_PAYLOAD_V1: &str = "rtdb.owned.OpenFamilyLandingPayload.v1";
 pub(crate) const REQUIRE_LIVE_FAMILY_OCCURRENCE_V1: &str = "rtdb.owned.RequireLiveFamilyOccurrence.v1";
 pub(crate) const REQUIRE_FAMILY_POSITION_OPEN_V1: &str = "rtdb.owned.RequireFamilyPositionOpen.v1";
 pub(crate) const REGISTER_FAMILY_DERIVED_V1: &str = "rtdb.owned.RegisterFamilyDerived.v1";
@@ -28,8 +30,9 @@ pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionF
 
 pub(crate) fn is_family_action(action: &str) -> bool {
     matches!(action, ASSERTION_FAMILY_SCOPE_V1 | ENROLL_ASSERTION_FAMILY_V1 | ENROLL_FAMILY_WORLD_ROW_V1
-        | REGISTER_ASSERTION_FAMILY_V1 | RESERVE_FAMILY_LANDING_V1 | ACTIVATE_FAMILY_LANDING_V1
-        | SEAL_FAMILY_LANDING_LINK_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
+        | REGISTER_ASSERTION_FAMILY_V1 | RESERVE_FAMILY_LANDING_V1 | ACTIVATE_FAMILY_LANDING_V2
+        | SEAL_FAMILY_LANDING_LINK_V2 | SEAL_FAMILY_LANDING_PAYLOAD_V1 | OPEN_FAMILY_LANDING_PAYLOAD_V1
+        | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
         | FENCE_ASSERTION_FAMILY_V1 | SETTLE_ASSERTION_FAMILY_V1)
 }
@@ -39,6 +42,8 @@ const MAX_RELATION_BYTES: usize = 255;
 const MAX_KEY_BYTES: usize = 512;
 /// The ordered log's message limit bounds a sealed row body.
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ROOT_CARRIER_BYTES: usize = MAX_ROW_BYTES - 128;
+const MAX_ROOT_LINK_BYTES: usize = 512;
 
 /// An `AssertionStage` on the wire: deployment, incarnation and one-use slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -97,6 +102,19 @@ pub enum FamilyRequest {
     SealLandingLink {
         family: Uuid, reservation: FamilyReservationWire, placement: PlacementBinding,
         destination_scope: [u8; 32], intent: [u8; 32], review_slot: u64,
+    },
+    ActivateRootLanding {
+        family: Uuid, binding: RootLandingBinding, reservation: FamilyReservationWire, link: Bytes,
+    },
+    SealRootLandingLink {
+        family: Uuid, reservation: FamilyReservationWire, target: RootLandingTarget,
+        reviewed_source: Position, payload_digest: [u8; 32],
+    },
+    SealRootLandingPayload {
+        family: Uuid, reservation: FamilyReservationWire, target: RootLandingTarget, carrier: Bytes,
+    },
+    OpenRootLandingPayload {
+        family: Uuid, stage: FamilyStage, binding: RootLandingBinding, envelope: Bytes,
     },
     RequireLiveOccurrence { family: Uuid, occurrence: FamilyOccurrenceWire },
     RequirePositionOpen(Position),
@@ -230,6 +248,25 @@ impl<'a> Frame<'a> {
         })
     }
 
+    fn root_target(&mut self) -> Result<RootLandingTarget, Status> {
+        RootLandingTarget::from_bytes(self.take("Root landing target")?)
+            .map_err(|_| invalid("Invalid Root landing target"))
+    }
+
+    fn root_binding(&mut self) -> Result<RootLandingBinding, Status> {
+        RootLandingBinding::from_bytes(self.take("Root landing binding")?)
+            .map_err(|_| invalid("Invalid Root landing binding"))
+    }
+
+    fn tail(&mut self, body: &Bytes, max: usize) -> Result<Bytes, Status> {
+        if self.0.is_empty() || self.0.len() > max {
+            return Err(invalid("Invalid assertion family body length"));
+        }
+        let rest = body.slice(body.len() - self.0.len()..);
+        self.0 = &[];
+        Ok(rest)
+    }
+
     fn finish(self) -> Result<(), Status> {
         if self.0.is_empty() { Ok(()) } else { Err(invalid("Unexpected input after the assertion family request")) }
     }
@@ -245,18 +282,45 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
         },
         REGISTER_ASSERTION_FAMILY_V1 => FamilyRequest::Register { family: frame.uuid("family")?, original: frame.occurrence()? },
         RESERVE_FAMILY_LANDING_V1 => FamilyRequest::ReserveLanding { family: frame.uuid("family")?, reservation: frame.reservation()? },
-        ACTIVATE_FAMILY_LANDING_V1 => FamilyRequest::ActivateLanding {
-            family: frame.uuid("family")?, placement: frame.placement()?, reservation: frame.reservation()?,
+        ACTIVATE_FAMILY_LANDING_V2 => match frame.u8("landing binding kind")? {
+            0 => FamilyRequest::ActivateLanding {
+                family: frame.uuid("family")?, placement: frame.placement()?, reservation: frame.reservation()?,
+            },
+            1 => FamilyRequest::ActivateRootLanding {
+                family: frame.uuid("family")?, binding: frame.root_binding()?,
+                reservation: frame.reservation()?, link: frame.tail(body, MAX_ROOT_LINK_BYTES)?,
+            },
+            _ => return Err(invalid("Invalid landing binding kind")),
         },
-        SEAL_FAMILY_LANDING_LINK_V1 => {
-            let family = frame.uuid("family")?;
-            let reservation = frame.reservation()?;
-            let placement = frame.placement()?;
-            let destination_scope = frame.take("destination scope")?;
-            let intent = frame.take::<32>("intent")?;
-            if intent == [0; 32] { return Err(invalid("Assertion landing intent is zero")); }
-            FamilyRequest::SealLandingLink { family, reservation, placement, destination_scope, intent, review_slot: frame.u64("review slot")? }
-        }
+        SEAL_FAMILY_LANDING_LINK_V2 => match frame.u8("landing binding kind")? {
+            0 => {
+                let family = frame.uuid("family")?;
+                let reservation = frame.reservation()?;
+                let placement = frame.placement()?;
+                let destination_scope = frame.take("destination scope")?;
+                let intent = frame.take::<32>("intent")?;
+                if intent == [0; 32] { return Err(invalid("Assertion landing intent is zero")); }
+                FamilyRequest::SealLandingLink { family, reservation, placement, destination_scope, intent, review_slot: frame.u64("review slot")? }
+            }
+            1 => {
+                let family = frame.uuid("family")?;
+                let reservation = frame.reservation()?;
+                let target = frame.root_target()?;
+                let reviewed_source = frame.position()?;
+                let payload_digest = frame.take::<32>("destination envelope digest")?;
+                if payload_digest == [0; 32] { return Err(invalid("Invalid destination envelope digest")); }
+                FamilyRequest::SealRootLandingLink { family, reservation, target, reviewed_source, payload_digest }
+            }
+            _ => return Err(invalid("Invalid landing binding kind")),
+        },
+        SEAL_FAMILY_LANDING_PAYLOAD_V1 => FamilyRequest::SealRootLandingPayload {
+            family: frame.uuid("family")?, reservation: frame.reservation()?,
+            target: frame.root_target()?, carrier: frame.tail(body, MAX_ROOT_CARRIER_BYTES)?,
+        },
+        OPEN_FAMILY_LANDING_PAYLOAD_V1 => FamilyRequest::OpenRootLandingPayload {
+            family: frame.uuid("family")?, stage: frame.stage()?,
+            binding: frame.root_binding()?, envelope: frame.tail(body, MAX_ROW_BYTES)?,
+        },
         REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 => FamilyRequest::RequireLiveOccurrence { family: frame.uuid("family")?, occurrence: frame.occurrence()? },
         REQUIRE_FAMILY_POSITION_OPEN_V1 => FamilyRequest::RequirePositionOpen(frame.position()?),
         REGISTER_FAMILY_DERIVED_V1 => {

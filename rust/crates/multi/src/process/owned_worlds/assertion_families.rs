@@ -63,6 +63,22 @@ impl Scope {
                 positions = [Some(reservation.source), Some(placement.position)];
                 None
             }
+            FamilyRequest::ActivateRootLanding { binding, .. } | FamilyRequest::OpenRootLandingPayload { binding, .. } => {
+                // The switch can have retired the source world. Activation
+                // authenticates its previously admitted reservation in the vault.
+                if binding.position.line_generation != self.root_line {
+                    return Err(scope_mismatch("The Root landing belongs to another line"));
+                }
+                None
+            }
+            FamilyRequest::SealRootLandingPayload { reservation, .. } => {
+                positions[0] = Some(reservation.source);
+                None
+            }
+            FamilyRequest::SealRootLandingLink { reservation, reviewed_source, .. } => {
+                positions = [Some(reservation.source), Some(*reviewed_source)];
+                None
+            }
             FamilyRequest::EnrollOriginal(row) | FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, true)),
             FamilyRequest::Scope | FamilyRequest::RegisterDerived { .. } | FamilyRequest::SealWorldRow { .. }
             | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
@@ -207,6 +223,29 @@ pub(super) async fn serve(
             };
             let envelope = link.seal(reservation, placement, destination_scope, vault()?, &region).await?;
             FamilyReply::Sealed(Bytes::from(envelope))
+        }
+        FamilyRequest::ActivateRootLanding { family, binding, reservation, link } => {
+            families.activate_root_landing(
+                scope.family(family), scope.reservation(reservation)?, binding, link, vault()?,
+            ).await?;
+            FamilyReply::Done
+        }
+        FamilyRequest::SealRootLandingLink { family, reservation, target, reviewed_source, payload_digest } => {
+            let envelope = families.seal_root_landing_link(
+                scope.family(family), scope.reservation(reservation)?, target, reviewed_source, payload_digest, vault()?,
+            ).await?;
+            FamilyReply::Sealed(Bytes::from(envelope))
+        }
+        FamilyRequest::SealRootLandingPayload { family, reservation, target, carrier } => {
+            let envelope = families.seal_root_landing_payload(
+                scope.family(family), scope.reservation(reservation)?, target, vault()?, carrier,
+            ).await?;
+            FamilyReply::Sealed(Bytes::from(envelope))
+        }
+        FamilyRequest::OpenRootLandingPayload { family, stage, binding, envelope } => {
+            FamilyReply::Opened(families.open_root_landing_payload(
+                scope.family(family), scope.stage(stage)?, binding, envelope, vault()?,
+            ).await?)
         }
         FamilyRequest::RequireLiveOccurrence { family, occurrence } => {
             families.require_live_occurrence(scope.family(family), scope.occurrence(occurrence)?).await?;

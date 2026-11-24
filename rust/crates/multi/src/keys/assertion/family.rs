@@ -1,5 +1,7 @@
 //! Private current custody for a Proposal occurrence and its landed copies.
 
+mod root_landing;
+
 use std::{collections::BTreeSet, fmt, fs, io::ErrorKind, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
