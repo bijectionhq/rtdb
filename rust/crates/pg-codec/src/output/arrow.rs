@@ -8,11 +8,12 @@ use rtdb_columnar::ArrowCell;
 use rtdb_types::{ListKind, LogicalType};
 
 use super::{
-    Anomaly, EncodedValue, Format, MemoryBudget, MemoryReservation, PgType, Result,
-    SessionEnvironment, TimestampText, Value, Write, array_payload, date_binary, date_text,
-    duration_text, encode, encode_value, float4_bytes, float8_bytes, float_text, integer_bytes, interval_text, invalid, nanos, size_error, time_binary,
-    time_text, timestamp_text, translate_output_error, unsupported, write_bytes, write_error,
-    write_json, write_json_error, write_range, write_timestamp,
+    Anomaly, ArrayElement, EncodedValue, Format, MemoryBudget, MemoryReservation, PgType, Result,
+    SessionEnvironment, TimestampText, Value, Write, array_element_type, array_payload, date_binary,
+    date_text, duration_text, encode, encode_value, float_text, interval_text, invalid, nanos,
+    size_error, time_binary, time_text, timestamp_text, translate_output_error, unsupported,
+    write_array_payload, write_bytes, write_error, write_json, write_json_error, write_range,
+    write_timestamp,
 };
 use std::sync::Arc;
 
@@ -41,6 +42,23 @@ pub fn write_arrow_cell(
     } else {
         ty
     };
+    match ty {
+        PgType::Transit => {
+            if cell.is_null()? {
+                return Ok(ArrowWrite::Null);
+            }
+            if !transit_streamable(cell, 0) {
+                return Ok(ArrowWrite::Unsupported);
+            }
+            let _reservation = memory.reserve(structured_bound(cell)?)?;
+            write_transit(cell, output)?;
+            return Ok(ArrowWrite::Written);
+        }
+        PgType::Int4s | PgType::Int8s | PgType::Texts | PgType::Float4s | PgType::Float8s => {
+            return write_arrow_array(ty, format, cell, memory, output);
+        }
+        _ => {}
+    }
     if !matches!(
         ty,
         PgType::Json
@@ -109,59 +127,142 @@ pub fn encode_arrow(
         return settle(bytes, reservation);
     }
     if matches!(ty, PgType::Json | PgType::JsonLd | PgType::Transit) {
-        let bound = cell
-            .payload_bytes()?
-            .checked_mul(32)
-            .and_then(|n| n.checked_add(8192))
-            .ok_or_else(size_error)?;
-        let reservation = memory.reserve(bound)?;
-        let bytes = if ty == PgType::Transit {
-            let mut output = Vec::new();
-            rtdb_format::transit::write_arrow_json(&mut output, cell).map_err(translate_output_error)?;
-            output
+        let reservation = memory.reserve(structured_bound(cell)?)?;
+        let mut bytes = Vec::new();
+        if ty == PgType::Transit {
+            write_transit(cell, &mut bytes)?;
         } else {
-            let mut output = Vec::new();
-            json_cell(cell, ty == PgType::JsonLd, &mut output, None, 0)?;
-            output
-        };
+            json_cell(cell, ty == PgType::JsonLd, &mut bytes, None, 0)?;
+        }
         return settle(bytes, reservation);
     }
     if matches!(ty, PgType::Int4s | PgType::Int8s | PgType::Texts | PgType::Float4s | PgType::Float8s)
         && matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_)))
         && let Some(values) = cell.sequence()
     {
-        let element_bytes = if matches!(ty, PgType::Float4s | PgType::Float8s) {
-            values.len().checked_mul(64).ok_or_else(size_error)?
-        } else { 0 };
-        let bound = cell.payload_bytes()?.checked_mul(16).and_then(|bytes| bytes.checked_add(element_bytes)).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
-        let reservation = memory.reserve(bound)?;
+        let reservation = memory.reserve(array_bound(ty, cell, values.len())?)?;
         let bytes = array_payload(ty, format, values, |element, cell| {
             let cell = cell.physical()?;
-            if cell.is_null()? { return Ok(None); }
-            if matches!(element, PgType::Int4 | PgType::Int8) && let Some(value) = cell.integer() {
-                return Ok(Some(integer_bytes(element, format, value)));
+            if let Some(value) = typed_array_element(element, cell)? {
+                return Ok(value);
             }
-            if element == PgType::Text && let Some(text) = cell.utf8() {
-                return Ok(Some(text.as_bytes().to_vec()));
-            }
-            if cell.field.metadata().is_empty() {
-                match (element, cell.field.data_type()) {
-                    (PgType::Float4, DataType::Float32) =>
-                        return Ok(Some(float4_bytes(format, cell.array.as_primitive::<Float32Type>().value(cell.row)))),
-                    (PgType::Float8, DataType::Float32) =>
-                        return Ok(Some(float8_bytes(format, f64::from(cell.array.as_primitive::<Float32Type>().value(cell.row))))),
-                    (PgType::Float8, DataType::Float64) =>
-                        return Ok(Some(float8_bytes(format, cell.array.as_primitive::<Float64Type>().value(cell.row)))),
-                    _ => {}
-                }
-            }
-            encode_value(element, format, &read_leaf(cell)?, environment).map(Some)
+            encode_value(element, format, &read_leaf(cell)?, environment).map(ArrayElement::Encoded)
         })?;
         return settle(bytes, reservation);
     }
     let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(cell.field, cell.array, cell.row)?)?;
     let value = rtdb_columnar::read_value_as(logical, cell.field, cell.array, cell.row)?;
     encode(ty, format, &value, environment, memory)
+}
+
+fn structured_bound(cell: ArrowCell<'_>) -> Result<usize> {
+    cell.payload_bytes()?
+        .checked_mul(32)
+        .and_then(|bytes| bytes.checked_add(8192))
+        .ok_or_else(size_error)
+}
+
+fn write_transit(cell: ArrowCell<'_>, output: &mut impl Write) -> Result<()> {
+    rtdb_format::transit::write_arrow_json(output, cell).map_err(translate_output_error)
+}
+
+fn transit_streamable(cell: ArrowCell<'_>, depth: usize) -> bool {
+    if depth > rtdb_types::transit_value::MAX_DEPTH {
+        return false;
+    }
+    let Ok(cell) = cell.physical() else { return false };
+    if matches!(cell.is_null(), Ok(true)) {
+        return true;
+    }
+    // MessagePack cache references can expand past the owned codec's wire reservation.
+    if cell.field.extension_type_name() == Some("xt/transit+msgpack") {
+        return false;
+    }
+    if let Some(mut children) = cell.structure() {
+        return children.all(|child| transit_streamable(child, depth + 1));
+    }
+    if let Some(mut children) = cell.sequence() {
+        return children.all(|child| transit_streamable(child, depth + 1));
+    }
+    true
+}
+
+fn array_bound(ty: PgType, cell: ArrowCell<'_>, len: usize) -> Result<usize> {
+    let element_bytes = if matches!(ty, PgType::Float4s | PgType::Float8s) {
+        len.checked_mul(64).ok_or_else(size_error)?
+    } else {
+        0
+    };
+    cell.payload_bytes()?
+        .checked_mul(16)
+        .and_then(|bytes| bytes.checked_add(element_bytes))
+        .and_then(|bytes| bytes.checked_add(8192))
+        .ok_or_else(size_error)
+}
+
+fn write_arrow_array(
+    ty: PgType,
+    format: Format,
+    cell: ArrowCell<'_>,
+    memory: &Arc<MemoryBudget>,
+    output: &mut impl Write,
+) -> Result<ArrowWrite> {
+    if cell.is_null()? {
+        return Ok(ArrowWrite::Null);
+    }
+    if !matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_))) {
+        return Ok(ArrowWrite::Unsupported);
+    }
+    let Some((field, array, range)) = cell.sequence_range() else {
+        return Ok(ArrowWrite::Unsupported);
+    };
+    let values = || range.clone().map(move |row| ArrowCell { field, array, row });
+    let element = array_element_type(ty);
+    let mut has_nulls = false;
+    for value in values() {
+        let Ok(Some(value)) = value.physical().and_then(|value| typed_array_element(element, value))
+        else {
+            return Ok(ArrowWrite::Unsupported);
+        };
+        has_nulls |= matches!(value, ArrayElement::Null);
+    }
+    let _reservation = memory.reserve(array_bound(ty, cell, range.len())?)?;
+    write_array_payload(
+        ty,
+        format,
+        values(),
+        has_nulls,
+        |element, value| typed_array_element(element, value.physical()?)?.ok_or_else(size_error),
+        output,
+    )?;
+    Ok(ArrowWrite::Written)
+}
+
+fn typed_array_element(element: PgType, cell: ArrowCell<'_>) -> Result<Option<ArrayElement<'_>>> {
+    if cell.is_null()? {
+        return Ok(Some(ArrayElement::Null));
+    }
+    if matches!(element, PgType::Int4 | PgType::Int8) {
+        return Ok(cell.integer().map(ArrayElement::Integer));
+    }
+    if element == PgType::Text {
+        return Ok(cell.utf8().map(ArrayElement::Text));
+    }
+    if !cell.field.metadata().is_empty() {
+        return Ok(None);
+    }
+    let ArrowCell { field, array, row } = cell;
+    Ok(match (element, field.data_type()) {
+        (PgType::Float4, DataType::Float32) =>
+            Some(ArrayElement::Float4(array.as_primitive::<Float32Type>().value(row))),
+        (PgType::Float4, DataType::Float64) =>
+            Some(ArrayElement::Float4(array.as_primitive::<Float64Type>().value(row) as f32)),
+        (PgType::Float8, DataType::Float32) =>
+            Some(ArrayElement::Float8(f64::from(array.as_primitive::<Float32Type>().value(row)))),
+        (PgType::Float8, DataType::Float64) =>
+            Some(ArrayElement::Float8(array.as_primitive::<Float64Type>().value(row))),
+        _ => None,
+    })
 }
 
 fn settle(bytes: Vec<u8>, reservation: Arc<MemoryReservation>) -> Result<Option<EncodedValue>> {
@@ -438,8 +539,8 @@ fn map_entry(cell: ArrowCell<'_>) -> Result<(ArrowCell<'_>, ArrowCell<'_>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArrowCell, Format, MemoryBudget, PgType, SessionEnvironment, Value, encode,
-        encode_arrow, encode_value,
+        ArrowCell, ArrowWrite, Format, MemoryBudget, PgType, SessionEnvironment, Value, encode,
+        encode_arrow, encode_value, write_arrow_cell,
     };
     use rtdb_format::transit::TransitValue;
     use rtdb_types::{DecimalValue, EntityId, StructFields};
@@ -449,8 +550,27 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let environment = SessionEnvironment::default();
         let cases = [
-            (PgType::Int4s, Value::list(vec![Value::I32(-4), Value::I32(17)])),
-            (PgType::Texts, Value::list(vec![Value::Utf8("hello, world".into()), Value::Null])),
+            (PgType::Int4s, Value::list(vec![Value::I32(i32::MIN), Value::I32(17)])),
+            (PgType::Int8s, Value::list(vec![Value::I64(i64::MIN), Value::I64(i64::MAX)])),
+            (PgType::Texts, Value::list(vec![
+                Value::Utf8("hello,\"\\é".into()),
+                Value::Utf8("NULL".into()),
+                Value::Utf8(String::new()),
+                Value::Null,
+            ])),
+            (PgType::Float4s, Value::list(vec![
+                Value::F32(-0.0),
+                Value::Null,
+                Value::F32(f32::from_bits(0x7fc0_1345)),
+                Value::F32(f32::INFINITY),
+            ])),
+            (PgType::Float8s, Value::list(vec![
+                Value::F32(0.2),
+                Value::F64(-0.0),
+                Value::F64(f64::NEG_INFINITY),
+                Value::Null,
+            ])),
+            (PgType::Float8s, Value::list(vec![])),
             (PgType::Transit, Value::list(vec![Value::F32(0.2), Value::Null, Value::F64(-0.0)])),
         ];
         for (ty, value) in cases {
@@ -460,9 +580,77 @@ mod tests {
             let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
             for format in [Format::Text, Format::Binary] {
                 let expected = encode_value(ty, format, &value, &environment).unwrap();
-                let output = encode_arrow(ty, format, &logical, cell, &environment, &memory).unwrap().unwrap();
-                assert_eq!(output.bytes, expected);
+                let mut bytes = Vec::new();
+                assert!(matches!(
+                    write_arrow_cell(ty, format, cell, &environment, &memory, &mut bytes).unwrap(),
+                    ArrowWrite::Written
+                ));
+                assert_eq!(bytes, expected, "{ty:?} {format:?}");
+                if ty == PgType::Texts && format == Format::Text {
+                    assert_eq!(bytes.as_slice(), r#"{"hello,\"\\é","NULL","",NULL}"#.as_bytes());
+                }
             }
+        }
+    }
+
+    #[test]
+    fn binary_arrow_arrays_preserve_element_lengths_and_float_bits() {
+        let value = Value::FixedSizeList(vec![Value::F32(f32::from_bits(0x7fa0_0001)), Value::Null].into());
+        let logical = value.logical_type();
+        let field = rtdb_columnar::to_field("result", &logical).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, &[value]).unwrap();
+        let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+        let mut output = Vec::new();
+        let written = write_arrow_cell(
+            PgType::Float4s, Format::Binary, cell, &SessionEnvironment::default(),
+            &MemoryBudget::new(1 << 20), &mut output,
+        ).unwrap();
+        assert!(matches!(written, ArrowWrite::Written));
+        let words = [1i32, 1, 700, 2, 1, 4, 0x7fa0_0001, -1];
+        assert_eq!(output, words.into_iter().flat_map(i32::to_be_bytes).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn arrow_integer_array_admission_precedes_binary_null_refusal() {
+        let value = Value::list(vec![Value::I64(-1), Value::Null]);
+        let logical = value.logical_type();
+        let field = rtdb_columnar::to_field("result", &logical).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+        let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+        let environment = SessionEnvironment::default();
+        let mut output = Vec::new();
+        let error = write_arrow_cell(
+            PgType::Int8s, Format::Binary, cell, &environment, &MemoryBudget::new(0), &mut output,
+        ).err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert!(output.is_empty());
+
+        let error = write_arrow_cell(
+            PgType::Int8s, Format::Binary, cell, &environment, &MemoryBudget::new(1 << 20), &mut output,
+        ).err().unwrap();
+        assert_eq!(error, encode_value(PgType::Int8s, Format::Binary, &value, &environment).unwrap_err());
+    }
+
+    #[test]
+    fn arrow_array_with_scalar_conversion_declines_before_writing() {
+        let value = Value::list(vec![
+            Value::Utf8("plain".into()),
+            Value::Keyword(rtdb_types::Keyword::from_name("qualified/key")),
+        ]);
+        let logical = value.logical_type();
+        let field = rtdb_columnar::to_field("result", &logical).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+        let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(1 << 20);
+        for format in [Format::Text, Format::Binary] {
+            let mut output = b"previous cell".to_vec();
+            let written = write_arrow_cell(PgType::Texts, format, cell, &environment, &memory, &mut output).unwrap();
+            assert!(matches!(written, ArrowWrite::Unsupported));
+            assert_eq!(output.as_slice(), b"previous cell");
+            let encoded = encode_arrow(PgType::Texts, format, &logical, cell, &environment, &memory).unwrap().unwrap();
+            let expected = encode_value(PgType::Texts, format, &value, &environment).unwrap();
+            assert_eq!(encoded.as_slice(), expected.as_slice());
         }
     }
 
@@ -507,6 +695,12 @@ mod tests {
         };
         let memory = MemoryBudget::new(1 << 20);
         let environment = SessionEnvironment::default();
+        let mut direct = b"previous cell".to_vec();
+        assert!(matches!(
+            write_arrow_cell(PgType::Transit, Format::Text, cell, &environment, &memory, &mut direct).unwrap(),
+            ArrowWrite::Unsupported
+        ));
+        assert_eq!(direct.as_slice(), b"previous cell");
         let arrow = encode_arrow(
             PgType::Transit,
             Format::Text,
@@ -585,6 +779,14 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(encoded.as_slice(), expected.as_slice(), "{ty:?} {format:?}");
+                if ty == PgType::Transit {
+                    let mut output = Vec::new();
+                    assert!(matches!(
+                        write_arrow_cell(ty, format, cell, &environment, &memory, &mut output).unwrap(),
+                        ArrowWrite::Written
+                    ));
+                    assert_eq!(output.as_slice(), expected.as_slice());
+                }
             }
         }
     }
