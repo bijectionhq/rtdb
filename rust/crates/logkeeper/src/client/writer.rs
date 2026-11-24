@@ -1410,7 +1410,7 @@ mod tests {
                 assert!(timely_original_sync_upper(&copied[0], &original).is_some());
                 drop(moved);
             } else {
-                assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), expected);
+                assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), (-1, expected));
             }
         }
 
