@@ -15,6 +15,8 @@ use super::{
     OwnedVersionRequest, historical_owned_read,
 };
 
+mod group;
+
 pub const OWNED_MERGED_CHANGE_RELATIONS: usize = 32;
 
 /// A SQL as-of edge covers the whole history-time band. A publication edge ends
@@ -681,16 +683,20 @@ impl OwnedReadSession {
             complete_boundary: if reverse { after } else { upper },
             tied_continuation: false,
         };
+        let mut positions = Vec::with_capacity(journals.len());
+        let select_next = |positions: &mut Vec<_>, journals: &[Journal<'_>]| {
+            positions.clear();
+            positions.extend(journals.iter().map(|journal| {
+                in_window(journal).then_some(journal.next.publication.tx_id.0)
+            }));
+            group::next_group(positions, reverse)
+        };
         while page.commits.len() < limit {
             guarded.check_cancelled()?;
-            let Some(publication) = journals
-                .iter()
-                .filter(|journal| in_window(journal))
-                .map(|journal| journal.next.publication)
-                .reduce(|a, b| if (reverse && a.tx_id > b.tx_id) || (!reverse && a.tx_id < b.tx_id) { a } else { b })
-            else {
+            let Some(selected) = select_next(&mut positions, &journals) else {
                 break;
             };
+            let publication = journals[selected].next.publication;
             let mut changes = Vec::new();
             let mut charges = Vec::new();
             let mut bytes = 0;
@@ -710,11 +716,22 @@ impl OwnedReadSession {
                 };
                 let through = entry.through_events;
                 let events = i64::try_from(touches.len()).map_err(|_| change_feed_uncovered())?;
-                if events == 0
-                    || entry.publication != publication || journal.next.publication != publication
-                    || through != journal.next.through_events
-                    || journal.previous_through.checked_add(events) != Some(through)
-                {
+                if !group::admits_fragment(
+                    publication.tx_id.0,
+                    publication.system_time.0,
+                    group::Fragment {
+                        position: journal.next.publication.tx_id.0,
+                        history_time: journal.next.publication.system_time.0,
+                        through_events: journal.next.through_events,
+                    },
+                    group::Fragment {
+                        position: entry.publication.tx_id.0,
+                        history_time: entry.publication.system_time.0,
+                        through_events: through,
+                    },
+                    journal.previous_through,
+                    events,
+                ) {
                     return Err(change_feed_uncovered());
                 }
                 let group_bytes = touches.iter().try_fold(0usize, |bytes, touch| {
@@ -764,7 +781,7 @@ impl OwnedReadSession {
             page.commits.push(OwnedChangeCommit { publication, changes });
         }
         guarded.check_cancelled()?;
-        page.complete = journals.iter().all(|journal| !in_window(journal));
+        page.complete = select_next(&mut positions, &journals).is_none();
         if !page.complete && let Some(last) = page.commits.last() {
             page.tied_continuation = journals.iter().any(|journal|
                 in_window(journal) && journal.next.publication.system_time == last.publication.system_time);
