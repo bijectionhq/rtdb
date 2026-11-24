@@ -1018,7 +1018,7 @@ async fn world_mutations_refuse_source_operations_without_held_admission() {
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
-        ancestor: None,
+        ancestors: Vec::new(),
         fork_lineage: Vec::new(),
         id: Iid([8; 16]), pin: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
         basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) },
@@ -1231,8 +1231,30 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
     assert_eq!(stale_empty.result().error().unwrap().code, "rtdb.owned/stale-range");
 
     let shadowed = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
-        source(vec![put("briefly", 5, 400, 500), put("briefly", 8, 400, 500)]), &context).await.unwrap();
+        source(vec![
+            put("briefly", 5, 400, 500),
+            put("briefly", 9, 500, 550),
+            put("briefly", 8, 400, 500),
+        ]), &context).await.unwrap();
     assert!(shadowed.result().committed(), "{:?}", shadowed.result().error());
+    let journal = relation.change_journal("owner").unwrap();
+    let journal_batch = shadowed.writes().tables()[&journal].batch().unwrap();
+    let StoredOperation::Put(entry) = journal_batch.view().read_event(0).unwrap().operation else {
+        panic!("Expected an owned journal entry");
+    };
+    let key = |key| FixedRangeKey::from_cells(
+        &Value::Binary(vec![key]), &rtdb_types::EntityId::String("briefly".into()),
+    ).unwrap().to_value();
+    let side = |slot, before, after| Value::Struct(StructFields::from([
+        ("event_slot".into(), Value::I64(slot)),
+        ("valid_at".into(), Value::I64(450)),
+        ("before".into(), before),
+        ("after".into(), after),
+    ]));
+    assert_eq!(entry["fixed_assertion_keys"], Value::Struct(StructFields::from([
+        ("event_count".into(), Value::I64(3)),
+        ("sides".into(), Value::list(vec![side(0, Value::Null, key(5)), side(2, key(5), key(8))])),
+    ])));
     let stale_shadowed = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
         source(vec![check(enter.result().tx_key(), 5, 4)]), &context).await.unwrap();
     assert_eq!(stale_shadowed.result().error().unwrap().code, "rtdb.owned/stale-range");

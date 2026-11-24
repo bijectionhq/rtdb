@@ -699,6 +699,7 @@ fn batch_observers_exclude_the_publishing_world_and_include_clock_only_worlds() 
 
 struct FixedRangeSide {
     id: EntityId,
+    valid_at: Timestamp,
     before: Value,
     after: Value,
 }
@@ -708,7 +709,7 @@ struct PendingOwnedChanges {
     bytes: usize,
     erased: bool,
     touches: Vec<Value>,
-    fixed_sides: Option<Vec<FixedRangeSide>>,
+    fixed_sides: Option<Vec<(i64, FixedRangeSide)>>,
     fixed_bytes: usize,
     reservations: Vec<Arc<MemoryReservation>>,
 }
@@ -3221,8 +3222,9 @@ impl<'a> OpenTransaction<'a> {
                 if sides.len() < rtdb_types::FIXED_RANGE_MAX_IDS
                     && group.fixed_bytes.saturating_add(charge.bytes()) <= fixed_range::MAX_SIDE_BYTES =>
             {
+                let slot = i64::try_from(group.touches.len()).map_err(|_| overflow())?;
                 group.fixed_bytes += charge.bytes();
-                sides.push(pair);
+                sides.push((slot, pair));
                 group.reservations.push(charge);
             },
             (_, Ok(None)) | (None, _) => (),
@@ -3290,11 +3292,15 @@ impl<'a> OpenTransaction<'a> {
             if let Some(sides) = group.fixed_sides
                 && (base.contains_table(&rule_table) || self.buffer.has_pending_table(&rule_table))
             {
-                let events = through - previous;
                 entry.insert("fixed_assertion_keys".into(), Value::Struct(StructFields::from([
-                    ("event_count".into(), Value::I64(events)),
+                    ("event_count".into(), Value::I64(through - previous)),
                     ("sides".into(), Value::list(sides.into_iter()
-                        .map(|side| Value::list(vec![side.before, side.after])).collect())),
+                        .map(|(slot, side)| Value::Struct(StructFields::from([
+                            ("event_slot".into(), Value::I64(slot)),
+                            ("valid_at".into(), Value::I64(side.valid_at.0)),
+                            ("before".into(), side.before),
+                            ("after".into(), side.after),
+                        ]))).collect())),
                 ])));
             }
             self.buffer.put(journal, entry, Interval::ALL)?;

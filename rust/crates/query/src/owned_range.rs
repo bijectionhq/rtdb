@@ -62,14 +62,27 @@ pub async fn verify_owned_fixed_range(
     };
     for revision in evidence.revision + 1..=head {
         context.check_cancelled()?;
-        let entry = crate::read_owned_fixed_range_changes(
+        let entry = crate::read_owned_change_entry(
             Arc::clone(context),
             owner,
             relation,
             revision,
         )
         .await?;
-        let Value::Struct(fields) = entry.value else {
+        let Value::List(touches) = entry.value else {
+            return Ok(false);
+        };
+        let events = i64::try_from(touches.len()).map_err(|_| rtdb_types::change_feed_uncovered())?;
+        if events == 0 || !ordered_group(previous, entry.publication, head_publication)
+            || through.checked_add(events) != Some(entry.through_events)
+        {
+            return Ok(false);
+        }
+        let keys = crate::read_owned_fixed_range_changes(Arc::clone(context), owner, relation, revision).await?;
+        if keys.publication != entry.publication || keys.through_events != entry.through_events {
+            return Ok(false);
+        }
+        let Value::Struct(fields) = keys.value else {
             return Ok(false);
         };
         let (Some(Value::I64(events)), Some(Value::List(sides))) =
@@ -77,25 +90,44 @@ pub async fn verify_owned_fixed_range(
         else {
             return Ok(false);
         };
-        if *events <= 0
-            || !ordered_group(previous, entry.publication, head_publication)
-            || through.checked_add(*events) != Some(entry.through_events)
+        if fields.len() != 2 || usize::try_from(*events).ok() != Some(touches.len())
             || sides.len() > FIXED_RANGE_MAX_IDS
         {
             return Ok(false);
         }
-        for side in sides.iter() {
-            let Value::List(pair) = side.as_ref() else {
+        let mut sides = sides.iter();
+        for (slot, touch) in touches.iter().enumerate() {
+            let touch = OwnedChange::from_value(touch.as_ref())?;
+            if !touch.valid.contains(evidence.rule.valid_at) {
+                continue;
+            }
+            let Some(side) = sides.next() else {
                 return Ok(false);
             };
-            if pair.len() != 2 {
+            let Value::Struct(side) = side.as_ref() else {
+                return Ok(false);
+            };
+            let (Some(Value::I64(event_slot)), Some(Value::I64(valid_at)), Some(before), Some(after)) =
+                (side.get("event_slot"), side.get("valid_at"), side.get("before"), side.get("after"))
+            else {
+                return Ok(false);
+            };
+            if side.len() != 4 || usize::try_from(*event_slot).ok() != Some(slot)
+                || *valid_at != evidence.rule.valid_at.0
+            {
                 return Ok(false);
             }
-            for key in pair.iter() {
-                if *key != Value::Null && evidence.contains(&FixedRangeKey::from_value(key.as_ref())?) {
-                    return Ok(false);
+            for key in [before, after] {
+                if *key != Value::Null {
+                    let key = FixedRangeKey::from_value(key)?;
+                    if !key.belongs_to(&touch.id) || evidence.contains(&key) {
+                        return Ok(false);
+                    }
                 }
             }
+        }
+        if sides.next().is_some() {
+            return Ok(false);
         }
         through = entry.through_events;
         previous = entry.publication;

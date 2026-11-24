@@ -99,6 +99,10 @@ impl FixedRangeKey {
         };
         Self::new(binary, id)
     }
+
+    pub fn belongs_to(&self, id: &EntityId) -> bool {
+        matches!(id, EntityId::String(id) if id == &self.id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,6 +1,5 @@
 use rtdb_types::{
-    EntityId, FIXED_RANGE_MAX_IDS, FixedRangeKey,
-    FixedRangeRule, OwnedRelation,
+    EntityId, FixedRangeKey, FixedRangeRule, OwnedRelation,
 };
 
 use super::*;
@@ -87,7 +86,7 @@ impl OpenTransaction<'_> {
         }
         let previous = self.owned_changes.get(relation.name())
             .and_then(|group| group.fixed_sides.as_ref())
-            .and_then(|sides| sides.iter().rev().find(|side| &side.id == id));
+            .and_then(|sides| sides.iter().rev().find_map(|(_, side)| (&side.id == id).then_some(side)));
         let before = match previous {
             Some(side) => side.after.clone(),
             None => self.fixed_key_at(
@@ -114,7 +113,9 @@ impl OpenTransaction<'_> {
             return Err(rtdb_types::change_feed_uncovered());
         }
         let charge = self.context.memory.reserve(size)?;
-        Ok(Some((super::FixedRangeSide { id: id.clone(), before, after }, charge)))
+        Ok(Some((super::FixedRangeSide {
+            id: id.clone(), valid_at: rule.valid_at, before, after,
+        }, charge)))
     }
 
     async fn fixed_key_at(
