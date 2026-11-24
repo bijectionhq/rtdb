@@ -691,6 +691,7 @@ contract LogService {
         -- The broker admits one position under a current replay ticket and retains its own directory region through delivery and provider drain.
         -- It matches the supplied reference to the quorum-certified frame and verifies the exact provider publication and body digest.
         -- The detached storage namespace and unit-key vault belong to the broker.
+        -- A cross-cell successor reseals detached bodies under its broker and binds the returned publication into the new committed frame.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.

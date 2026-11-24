@@ -345,7 +345,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 140 } else { 16 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 141 } else { 17 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
         };
@@ -687,8 +687,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
             let from_keys = key_service(arguments.required("from-keys")?).await?;
             let to_keys = key_service(arguments.required("to-keys")?).await?;
-            let from = admin::CellHandle { name: arguments.required("from")?, directory: &from_directory, storage: &from_storage, keys: from_keys.as_ref(), maximum_deployments: usize::MAX };
-            let to = admin::CellHandle { name: arguments.required("to")?, directory: &to_directory, storage: &to_storage, keys: to_keys.as_ref(), maximum_deployments: usize::MAX };
+            let from_broker = replay_broker_client(&arguments, "from-")?;
+            let to_broker = replay_broker_client(&arguments, "to-")?;
+            let from = admin::CellHandle { name: arguments.required("from")?, directory: &from_directory, storage: &from_storage, keys: from_keys.as_ref(), broker: from_broker.as_ref(), maximum_deployments: usize::MAX };
+            let to = admin::CellHandle { name: arguments.required("to")?, directory: &to_directory, storage: &to_storage, keys: to_keys.as_ref(), broker: to_broker.as_ref(), maximum_deployments: usize::MAX };
             match command.as_str() {
                 "move-cell" => {
                     let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);

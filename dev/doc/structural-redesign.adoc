@@ -195,7 +195,9 @@ Directory-managed serving writes publish detached bodies through the replay brok
 The broker verifies the committed position without opening the sealed journal frame and holds its own admission through delivery and drain. It opens only the detached object namespace and unit-key vault.
 Archive suffix capture, terminal transfer replay and timestamp-fork reads redeem their detached references through the same broker.
 Checkpoint transfer seeds detached bodies through a separate transfer credential and binds the destination provider publication into the re-sealed pointer.
-Hosted credential provisioning and cross-cell recovery routes still need to switch to that owner before independent payload settlement.
+Cross-cell handoff retains the original replay interval and republishes each detached body under the destination broker before seeding its journal.
+The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
+Independent payload settlement still requires complete installed references and a recovery dependency fence.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.

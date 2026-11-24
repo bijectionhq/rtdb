@@ -410,44 +410,86 @@ impl TerminalReplicaCipher {
 
 /// Copies one sealed source history into a different residence and key vault.
 pub(crate) async fn reseal_live_journal(
-    source: &DeploymentRecord,
-    source_stream: &rtdb_logkeeper::StreamConfig,
-    source_keys: &dyn KeyService,
-    target: &DeploymentRecord,
-    target_stream: &rtdb_logkeeper::StreamConfig,
-    target_keys: &dyn KeyService,
+    from: &crate::admin::CellHandle<'_>, source: &DeploymentRecord, source_stream: &rtdb_logkeeper::StreamConfig,
+    to: &crate::admin::CellHandle<'_>, target: &DeploymentRecord, target_stream: &rtdb_logkeeper::StreamConfig,
+    task: Option<&HostedTask>,
 ) -> Result<()> {
     use rtdb_logkeeper::{bootstrap_committed_page, certify_committed_range, seal_recover_bounds, verify_certified_range};
     use rtdb_storage::log::LogOffset;
 
     let (trim, through) = seal_recover_bounds(source_stream, source.epoch).await?;
+    let trim = LogOffset(source.replica_anchor.as_ref().map_or(trim.0, |anchor| anchor.interval[1].max(trim.0)));
     let first = LogOffset(trim.0.checked_add(1).ok_or_else(suffix_unavailable)?);
+    if trim > through { return Err(suffix_unavailable()); }
     if first > through {
         return bootstrap_committed_page(target_stream, source.epoch, trim, first, &[], true).await;
     }
 
-    let io = IoRegion::new();
-    let source_cipher = TerminalReplicaCipher::open(source, source_keys, Arc::clone(&io)).await?;
-    let target_units = crate::logs::JournalUnits::open(
-        target_keys, &target.key_id(), &target.replica_seal_scope(), io,
-    ).await?;
-    let certificate = certify_committed_range(source_stream, first.0, through.0).await?;
-    let cursor = rtdb_logkeeper::CertifiedRangeReader::new(source_stream, &certificate)?;
-    let mut segments = CertifiedSegments::new(cursor);
-    while let Some(mut entries) = segments.next().await? {
-        let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
-        let last = entries.last().ok_or_else(suffix_unavailable)?.lsn;
-        let page = certify_committed_range(source_stream, first, last).await?;
-        verify_certified_range(&page, &entries)?;
-        source_cipher.open_page(&mut entries).await?;
-        for entry in &mut entries {
-            entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
-        }
-        bootstrap_committed_page(target_stream, source.epoch, trim, LogOffset(first), &entries, last == through.0).await?;
-        let chosen = certify_committed_range(target_stream, first, last).await?;
-        verify_certified_range(&chosen, &entries)?;
+    with_region(
+        from.directory.as_ref(), from.keys, &source.id, from.storage, task, None, None,
+        |current| {
+            if current.lifecycle != Lifecycle::Moving || current.holder.is_some()
+                || current.epoch != source.epoch || current.log_epoch != source.log_epoch
+                || current.storage_prefix() != source.storage_prefix()
+                || current.cell_transfer != source.cell_transfer
+            {
+                return Err(suffix_unavailable());
+            }
+            Ok(Some(crate::hosted_recovery::replay_start(current, trim.0)?))
+        },
+        |current, region, io| async move {
+            let source_cipher = TerminalReplicaCipher::open(&current, from.keys, Arc::clone(&io)).await?;
+            let target_units = crate::logs::JournalUnits::open(
+                to.keys, &target.key_id(), &target.replica_seal_scope(), io,
+            ).await?;
+            let certificate = certify_committed_range(source_stream, first.0, through.0).await?;
+            let memory = MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes);
+            let _pages = memory.reserve(32 << 20)?;
+            let payloads = ServingPayloads::new(&current, region, &certificate, from.broker, &memory)?;
+            let cursor = rtdb_logkeeper::CertifiedRangeReader::new(source_stream, &certificate)?;
+            let mut segments = CertifiedSegments::new(cursor);
+            while let Some(mut entries) = segments.next().await? {
+                let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
+                let last = entries.last().ok_or_else(suffix_unavailable)?.lsn;
+                let page = certify_committed_range(source_stream, first, last).await?;
+                verify_certified_range(&page, &entries)?;
+                source_cipher.open_page(&mut entries).await?;
+                for entry in &mut entries {
+                    if ReplicaFrame::has_external_payload(&entry.payload)? {
+                        let envelope = ReplicaEnvelope::decode(&entry.payload)?.ok_or_else(suffix_unavailable)?;
+                        let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
+                            .ok_or_else(suffix_unavailable)?;
+                        let object = key(&relative)?;
+                        let (resolved, body) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
+                        let body = Bytes::from_owner(body);
+                        let broker = to.broker.ok_or_else(suffix_unavailable)?;
+                        let publication = broker.copy(target, entry.lsn, &object, body.clone()).await?;
+                        entry.payload = target_payload_proxy(&envelope, &resolved, &body, publication)?;
+                    }
+                    entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
+                }
+                bootstrap_committed_page(target_stream, source.epoch, trim, LogOffset(first), &entries, last == through.0).await?;
+                let chosen = certify_committed_range(target_stream, first, last).await?;
+                verify_certified_range(&chosen, &entries)?;
+            }
+            Ok(())
+        },
+    ).await
+}
+
+pub(super) fn target_payload_proxy(
+    original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8],
+    publication: Option<rtdb_types::PhysicalObjectVersion>,
+) -> Result<bytes::Bytes> {
+    let rtdb_format::envelope::ReplicaBody::OversizedMessage(reference) = &original.message else {
+        return Err(inconsistent("The target payload has no certified reference"));
+    };
+    let id = reference.payload_id.clone().ok_or_else(|| inconsistent("The target payload has no object identity"))?;
+    let mut proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
+    if let Some(publication) = publication {
+        proxy.bind_offload_publication(publication)?;
     }
-    Ok(())
+    Ok(proxy.encode().into())
 }
 
 /// Exact replay coordinates retained while the terminal interval is read in

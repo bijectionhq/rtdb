@@ -79,6 +79,13 @@ enum Action {
 enum PublishRoute {
     Writer { epoch: u64 },
     Transfer { operation: Uuid, bootstrap: [u8; 32], position: i64 },
+    CellTransfer { generation: Uuid, position: i64 },
+}
+
+impl PublishRoute {
+    fn requires_transfer_credential(self) -> bool {
+        !matches!(self, Self::Writer { .. })
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -184,6 +191,14 @@ impl Client {
         self.publish_with(History::of(target)?, route, object, bytes).await
     }
 
+    pub(crate) async fn copy(
+        &self, target: &DeploymentRecord, position: i64, object: &ObjectKey, bytes: Bytes,
+    ) -> Result<Option<PhysicalObjectVersion>> {
+        let generation = target.storage_generation.ok_or_else(refused)?;
+        let route = PublishRoute::CellTransfer { generation, position };
+        self.publish_with(History::of(target)?, route, object, bytes).await
+    }
+
     async fn publish_with(
         &self, history: History, route: PublishRoute, object: &ObjectKey, bytes: Bytes,
     ) -> Result<Option<PhysicalObjectVersion>> {
@@ -213,7 +228,7 @@ impl Client {
 impl Remote {
     async fn connect(&self, history: History, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let token = match &action {
-            Action::Publish { route: PublishRoute::Transfer { .. }, .. } =>
+            Action::Publish { route, .. } if route.requires_transfer_credential() =>
                 self.transfer_token.as_ref().ok_or_else(refused)?,
             _ => &self.token,
         };
@@ -311,7 +326,7 @@ impl Service {
     async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<TcpStream>) -> Result<()> {
         let request: Request = socket_work(receive_header(socket)).await?;
         let verifier = match &request.action {
-            Action::Publish { route: PublishRoute::Transfer { .. }, .. } => &self.transfer_token,
+            Action::Publish { route, .. } if route.requires_transfer_credential() => &self.transfer_token,
             _ => &self.token,
         };
         if !verifier.as_ref().is_some_and(|token| token.accepts(&request.token)) { return Err(refused()); }
@@ -534,6 +549,20 @@ fn require_publication(
                 || stage.intent.operation != operation || receipt.ciphertext_sha256 != bootstrap
                 || position <= stage.checkpoint.boundary || position > terminal.replica_through
                 || !crate::archive::admits_seeded_transfer_payload(record, stage, key.as_str())
+            {
+                return Err(refused());
+            }
+            Ok(())
+        }
+        PublishRoute::CellTransfer { generation, position } => {
+            let transfer = record.cell_transfer.as_deref().ok_or_else(refused)?;
+            let attempt = transfer.attempt.as_ref().ok_or_else(refused)?;
+            if record.lifecycle != Lifecycle::Moving || record.holder.is_some()
+                || transfer.destination_incarnation != record.incarnation || transfer.epoch != record.epoch
+                || record.move_from.as_ref().is_none_or(Vec::is_empty)
+                || record.storage_generation != Some(generation) || attempt.generation != generation
+                || record.abandoned_generations.contains_key(&generation)
+                || position < 0
             {
                 return Err(refused());
             }

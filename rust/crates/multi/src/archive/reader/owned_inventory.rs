@@ -335,7 +335,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                         let publication = payload.body.retaining(
                             broker.seed(&target, &reserved, entry.lsn, &payload.path, payload.body.bytes.clone()),
                         ).await?;
-                        entry.payload = target_payload_proxy(&envelope, resolved, &payload.body.bytes, publication)?;
+                        entry.payload = replica_suffix::target_payload_proxy(&envelope, resolved, &payload.body.bytes, publication)?;
                     }
                 }
                 next += entries.len() as i64;
@@ -374,21 +374,6 @@ async fn observe_transfer_payload(
     let body = artifact.read_payload(offset, chain, memory).await?;
     let resolved = envelope.unwrap_payload(&body.bytes)?;
     Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
-}
-
-fn target_payload_proxy(
-    original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8],
-    publication: Option<rtdb_types::PhysicalObjectVersion>,
-) -> Result<bytes::Bytes> {
-    let rtdb_format::envelope::ReplicaBody::OversizedMessage(reference) = &original.message else {
-        return Err(inconsistent("The target payload has no certified reference"));
-    };
-    let id = reference.payload_id.clone().ok_or_else(|| inconsistent("The target payload has no object identity"))?;
-    let mut proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
-    if let Some(publication) = publication {
-        proxy.bind_offload_publication(publication)?;
-    }
-    Ok(proxy.encode().into())
 }
 
 fn transfer_first(stage: &rtdb_directory::CheckpointStage) -> Result<i64> {

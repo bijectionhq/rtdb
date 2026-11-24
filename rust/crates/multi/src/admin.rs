@@ -831,6 +831,7 @@ pub struct CellHandle<'a> {
     pub directory: &'a Arc<dyn Directory>,
     pub storage: &'a CellStorage,
     pub keys: &'a dyn KeyService,
+    pub broker: Option<&'a crate::replay_broker::Client>,
     pub maximum_deployments: usize,
 }
 
@@ -1471,7 +1472,7 @@ async fn prepare_cell_move(
     }
 
     crate::archive::reseal_live_journal(
-        &source, &source_stream, from.keys, &staged, &target_stream, to.keys,
+        from, &source, &source_stream, to, &staged, &target_stream, hosted_task.as_ref(),
     ).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
         if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch

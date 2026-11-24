@@ -796,8 +796,8 @@ async fn an_engine_pin_without_a_compatible_destination_prevents_cell_move_fenci
     let mut west = Cell::start_in("west", map.clone(), 0).await;
     west.add_node_with_engine(Some("next-image".into())).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 23)").await.unwrap();
@@ -2009,6 +2009,7 @@ async fn parked_checkpoint_keeps_serving_and_recapturing_after_original_packs_go
         directory: &cell.directory,
         storage: &storage,
         keys: &keys,
+        broker: None,
         maximum_deployments: 1,
     };
     let to = admin::CellHandle {
@@ -2016,6 +2017,7 @@ async fn parked_checkpoint_keeps_serving_and_recapturing_after_original_packs_go
         directory: &destination.directory,
         storage: &destination.storage(),
         keys: &destination.keys(),
+        broker: None,
         maximum_deployments: 1,
     };
     let intent = rtdb_directory::CellTransferIntent {
@@ -2247,6 +2249,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
         directory: &cell.directory,
         storage: &storage,
         keys: &cell.keys(),
+        broker: None,
         maximum_deployments: 1,
     };
     let to = admin::CellHandle {
@@ -2254,6 +2257,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
         directory: &destination.directory,
         storage: &destination.storage(),
         keys: &destination.keys(),
+        broker: None,
         maximum_deployments: 1,
     };
     let intent = rtdb_directory::CellTransferIntent {
@@ -3209,8 +3213,8 @@ async fn exercise_interrupted_cell_move(east: Option<CellStorage>, west: Option<
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
@@ -3307,7 +3311,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let west = Cell::start_in("west", map.clone(), 1).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
     fn handle<'a>(name: &'a str, cell: &'a Cell, storage: &'a rtdb_multi::deployment::CellStorage, keys: &'a rtdb_multi::keys::LocalKeyService, maximum_deployments: usize) -> admin::CellHandle<'a> {
-        admin::CellHandle { name, directory: &cell.directory, storage, keys, maximum_deployments }
+        admin::CellHandle { name, directory: &cell.directory, storage, keys, broker: None, maximum_deployments }
     }
     let (placed, _) = admin::create_in_cells(map.as_ref(), &[handle("east", &east, &east_storage, &east_keys, 10), handle("west", &west, &west_storage, &west_keys, 0)], "shop", "acme", 3).await.unwrap();
     assert_eq!(placed, "east", "a deployment goes to a cell with room");
@@ -4452,7 +4456,7 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
     let east = Cell::start_in("east", map.clone(), 1).await;
     let west = Cell::start_in("west", map.clone(), 0).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
     let deployment = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap().1;
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
@@ -4481,7 +4485,7 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
         (&west_storage, &aliased_keys, "rtdb.multi/shared-cell-keys"),
         (&west_storage, &west_keys, "rtdb.multi/key-conflict"),
     ] {
-        let to = admin::CellHandle { name: "west", directory: &west.directory, storage, keys, maximum_deployments: 10 };
+        let to = admin::CellHandle { name: "west", directory: &west.directory, storage, keys, broker: None, maximum_deployments: 10 };
         let error = admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.unwrap_err();
         assert_eq!(error.code, expected);
         let after = east.directory.deployment(&deployment.id).await.unwrap().unwrap();
@@ -4515,8 +4519,8 @@ async fn exercise_conflicting_copy(managed: bool) {
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     if managed {
         admin::set_linearizable_reads(east.directory.as_ref(), "shop", true).await.unwrap();
@@ -4659,8 +4663,8 @@ async fn exercise_interrupted_replacement(case: Replacement) {
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
