@@ -149,6 +149,12 @@ pub trait ObjectStore: Send + Sync {
     /// Identifies a loose allocation by the S3 address this owner will use,
     /// including for names reserved before the first provider write.
     fn s3_publication_address(&self, _key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> { None }
+    /// Resolves the provider address selected by the current held storage view.
+    async fn replica_publication_address(&self, key: &ObjectKey) -> Result<Option<(rtdb_types::S3ObjectNamespace, String)>> {
+        let observed = self.observe_head(key).await?;
+        Ok(observed.version.map(|version| (version.namespace, version.key))
+            .or_else(|| self.s3_publication_address(key)))
+    }
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }

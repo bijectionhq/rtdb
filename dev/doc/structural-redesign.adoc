@@ -202,7 +202,9 @@ Cross-cell handoff retains the original replay interval and republishes each det
 The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
 Independent payload settlement still requires complete installed references and a recovery dependency fence.
 Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
-Inline appends without new provider dependencies publish an empty reference set. Upload, trie, artefact and detached-body appends still need complete references.
+Inline appends without new provider dependencies publish an empty reference set.
+Installed upload, trie, artefact and detached-body appends resolve their dependencies against the admitted replay catalog and attest the observed S3 publication addresses.
+Unidentified provider addresses or unknown record types keep the journal fence closed.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
@@ -245,7 +247,9 @@ New held-world suffixes authenticate exact business effects before leaving recei
 Classic S3 can settle an exact compacted receipt version bound to an installed release and the publication recorded by compaction.
 Active installed grants submit receipt trie publications with their exact installed removal. The S3 consumer verifies the successor and asks the journal for an exact object fence before withdrawing the key slot and settling the version or terminal publication.
 The v3 suffix cutover requires exact copied-payload evidence and reset installations. The reaper requires both the target and release publication and leaves unbound copies outside its grant.
-Active files remain pending when the journal lacks complete root and tail references or the provider lacks an exact publication witness. Quiet histories depend on the ordered clock work in T4.
+Installed checkpoint and replay producers submit the S3 allocation references used by the fence.
+Active files remain pending when any selected dependency lacks a complete reference or the provider lacks an exact publication witness.
+Quiet histories depend on the ordered clock work in T4.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.

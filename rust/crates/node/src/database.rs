@@ -392,6 +392,7 @@ impl DatabaseFactory {
                 }
                 recovered.with_source_floor(logs.source_floor()?)
             };
+            logs.install_replica_reference_source(recovered.block.clone(), self.options.file_size_target)?;
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());

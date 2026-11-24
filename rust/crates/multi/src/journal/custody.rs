@@ -652,6 +652,10 @@ impl ExactStore {
 
 #[async_trait]
 impl ObjectStore for ExactStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        let (_, physical) = self.member(key).ok()?;
+        self.bucket.s3_publication_address(&physical)
+    }
     fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         Ok(self.observe_head(key).await?.value)

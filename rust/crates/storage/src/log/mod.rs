@@ -172,11 +172,22 @@ pub struct AppendCapacity {
     pub last_data: Option<LogOffset>,
 }
 
+pub struct ReplicaReferenceSource {
+    pub store: Arc<dyn crate::ObjectStore>,
+    pub cache: Arc<crate::cache::BufferPool>,
+    pub memory: Arc<rtdb_columnar::MemoryBudget>,
+    pub checkpoint: Option<rtdb_format::catalog::BlockCatalog>,
+    pub version: rtdb_types::StorageVersion,
+    pub epoch: rtdb_types::StorageEpoch,
+    pub file_size_target: i64,
+}
+
 #[async_trait]
 pub trait Log: Send + Sync {
     fn needs_published_recovery_checkpoint(&self) -> bool { false }
     /// This replica log confers offload access only through a delivered payload permit.
     fn requires_replica_payload_permit(&self) -> bool { false }
+    fn install_replica_reference_source(&self, _source: ReplicaReferenceSource) -> Result<()> { Ok(()) }
     /// Publishes a detached body under the replica path's custody.
     async fn publish_replica_payload(
         &self, store: &dyn crate::ObjectStore, key: &crate::ObjectKey, body: Bytes,
