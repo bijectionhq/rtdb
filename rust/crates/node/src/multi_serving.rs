@@ -260,7 +260,7 @@ fn changes_page(
         Ok(basis.position())
     };
     let floor = history.floor.0 - 1;
-    let after = request.after.map(position).transpose()?.unwrap_or(floor);
+    let after = request.after.map(position).transpose()?.unwrap_or(0);
     if after < floor {
         return Err(Anomaly::new(
             AnomalyCategory::NotFound,
@@ -275,6 +275,13 @@ fn changes_page(
             "The change interval is inverted",
         ));
     }
+    if after > history.head.0 {
+        return Err(Anomaly::new(
+            AnomalyCategory::Unavailable,
+            "rtdb/change-basis-ahead",
+            "The requested basis has not applied",
+        ));
+    }
     let upper = until.unwrap_or(u64::MAX).min(history.head.0);
     let index = history.index;
     index.view(&request.branch, At::Latest, Layer::Merged, history.now)?;
@@ -286,7 +293,7 @@ fn changes_page(
         Box::new(groups)
     };
     let mut page = Vec::new();
-    let mut has_more = false;
+    let mut next = None;
     for group in order
         .filter(|group| group.cut.basis.position() > after && group.cut.basis.position() <= upper)
     {
@@ -342,7 +349,7 @@ fn changes_page(
             continue;
         }
         if page.len() == request.limit {
-            has_more = true;
+            next = Some(group.cut.basis.position());
             break;
         }
         page.push(ChangeGroup {
@@ -350,16 +357,16 @@ fn changes_page(
             rows,
         });
     }
-    let through = match (descending, has_more, page.last()) {
-        (true, true, Some(group)) => group.cut.basis.position().saturating_sub(1),
-        (false, true, Some(group)) => group.cut.basis.position(),
-        (true, _, _) => after,
+    let through = match (descending, next, page.last()) {
+        (true, Some(next), _) => next,
+        (false, Some(_), Some(group)) => group.cut.basis.position(),
+        (true, None, _) => after,
         _ => upper.max(after),
     };
     Ok(ChangePage {
         groups: page,
         through: Basis::new(incarnation, through),
-        complete: !has_more && until.is_none_or(|until| until <= history.head.0),
+        complete: next.is_none() && until.is_none_or(|until| until <= history.head.0),
         custody_groups: BTreeSet::new(),
     })
 }
@@ -554,6 +561,9 @@ mod tests {
             .await
             .unwrap();
         let error = driver.changes(changes(), &cancel).await.err().unwrap();
+        assert_eq!(error.code, "rtdb/cursor-expired");
+        let from_beginning = Changes { after: None, ..changes() };
+        let error = driver.changes(from_beginning, &cancel).await.err().unwrap();
         assert_eq!(error.code, "rtdb/cursor-expired");
     }
 
