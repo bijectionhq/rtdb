@@ -131,7 +131,7 @@ impl BranchIndex {
                 .as_ref()
                 .map(|original| original.commitment(group))
                 != Some(reservation.original)
-            || !record.has_occurrence(group, reservation.source)
+            || record.occurrence(group, reservation.source).is_none()
             || self
                 .used_custody_placements
                 .contains(&reservation.destination)

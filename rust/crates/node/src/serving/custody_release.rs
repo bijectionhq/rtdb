@@ -1,12 +1,18 @@
 use async_trait::async_trait;
 use rtdb_index::branches::{BranchIndex, CustodyGroupId, CustodyRelease};
-use rtdb_tx::transact::{Op, Outcome, Transact, Window};
+use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, TrustedCustodyRelease};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
-use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
 
 use super::ServingDriver;
 use crate::Clock;
+
+mod original;
+pub use original::{
+    AttachedCustodyCarrierJournal, OriginalCarrierObservations, OriginalCarrierReceipt,
+    OriginalReceipt, OriginalWriterPoint, original_writer_commitment,
+};
 
 pub use rtdb_index::branches::{
     CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart,
@@ -24,6 +30,7 @@ pub enum CarrierObservation {
 #[async_trait]
 pub trait CustodyCarrierJournal: Send + Sync {
     fn authority(&self, attachment: &dyn ServingDriver) -> Result<CustodyCarrierAuthority>;
+    async fn writer_fence(&self, cancellation: &CancellationToken) -> Result<CustodyWriterFence>;
     async fn observe(
         &self,
         registration: CustodyReleaseRegistration,
@@ -136,31 +143,87 @@ impl ResponseRelease<'_> {
         Ok(index.custody_releases_drained(group))
     }
 
+    pub async fn check_all(
+        &self,
+        expected: &BTreeSet<(CustodyGroupId, [u8; 32])>,
+        registrations: &[CustodyReleaseRegistration],
+    ) -> Result<()> {
+        if expected.len() != registrations.len()
+            || registrations.iter().any(|registration| {
+                !expected.contains(&(registration.group, registration.occurrence))
+            })
+        {
+            return Err(release_unavailable());
+        }
+        self.check_registrations(registrations, true).await
+    }
+
     async fn check_live(
         &self,
         registration: CustodyReleaseRegistration,
         promoted: bool,
     ) -> Result<()> {
-        self.require_live_registration(registration).await?;
-        let index = self.current(registration.authority).await?;
-        require_live_group(&index, registration)?;
-        match index.custody_release_phase(registration)? {
-            Some(CustodyReleasePhase::Promoted) => (),
-            Some(CustodyReleasePhase::Private) if !promoted => (),
-            _ => return Err(release_unavailable()),
+        self.check_registrations(&[registration], promoted).await
+    }
+
+    async fn check_registrations(
+        &self,
+        registrations: &[CustodyReleaseRegistration],
+        promoted: bool,
+    ) -> Result<()> {
+        let Some(first) = registrations.first() else {
+            return Err(release_unavailable());
+        };
+        if registrations.len() > 512 {
+            return Err(release_unavailable());
+        }
+        let mut groups = BTreeSet::new();
+        let mut attempts = BTreeSet::new();
+        for &registration in registrations {
+            if registration.authority != first.authority
+                || registration.part != first.part
+                || registration.expires_at != first.expires_at
+                || !attempts.insert(registration.attempt())
+            {
+                return Err(release_unavailable());
+            }
+            self.require_live_registration(registration).await?;
+            groups.insert(registration.group);
+        }
+        let (index, writer) = self.current_with_writer(first.authority).await?;
+        for &registration in registrations {
+            require_live_group(&index, registration)?;
+            match index.custody_release_phase(registration)? {
+                Some(CustodyReleasePhase::Promoted) => (),
+                Some(CustodyReleasePhase::Private) if !promoted => (),
+                _ => return Err(release_unavailable()),
+            }
         }
         self.driver
-            .check_custody_delivery(&[registration.group].into(), self.cancellation)
+            .check_custody_release_delivery(&groups, &writer, self.cancellation)
             .await?;
-        self.require_authority(registration.authority)?;
-        registration.require_live_time(self.clock.now())
+        self.require_authority(first.authority)?;
+        first.require_live_time(self.clock.now())
     }
 
     async fn current(&self, authority: CustodyCarrierAuthority) -> Result<BranchIndex> {
+        self.current_with_writer(authority)
+            .await
+            .map(|(index, _)| index)
+    }
+
+    async fn current_with_writer(
+        &self,
+        authority: CustodyCarrierAuthority,
+    ) -> Result<(BranchIndex, CustodyWriterFence)> {
         self.require_authority(authority)?;
+        let writer = self.original.writer_fence(self.cancellation).await?;
         let index = self.driver.current_custody(self.cancellation).await?;
         self.require_authority(authority)?;
-        Ok(index)
+        if !writer.matches(&index)? {
+            return Err(release_unavailable());
+        }
+        Ok((index, writer))
     }
 
     fn require_authority(&self, authority: CustodyCarrierAuthority) -> Result<()> {
@@ -203,35 +266,18 @@ impl ResponseRelease<'_> {
         phase: CustodyReleasePhase,
     ) -> Result<()> {
         self.require_authority(registration.authority)?;
-        let discriminator = match phase {
-            CustodyReleasePhase::Private => 0,
-            CustodyReleasePhase::Promoted => 1,
-            CustodyReleasePhase::Cancelled => 2,
-            CustodyReleasePhase::Disposed { .. } => 3,
+        let writer = self.original.writer_fence(self.cancellation).await?;
+        self.require_authority(registration.authority)?;
+        let command = TrustedCustodyRelease {
+            release: CustodyRelease {
+                registration,
+                phase,
+            },
+            writer,
         };
-        let mut hash = Sha256::new();
-        hash.update(b"rtdb/v1/custody-response-phase\0");
-        hash.update(registration.attempt());
-        hash.update([discriminator]);
         let receipt = self
             .driver
-            .transact(
-                Transact {
-                    key: hash.finalize().to_vec(),
-                    require: Vec::new(),
-                    window: Window::default(),
-                    guards: Vec::new(),
-                    ops: vec![Op::CustodyRelease(CustodyRelease {
-                        registration,
-                        phase,
-                    })],
-                    otherwise: Vec::new(),
-                    requires: Vec::new(),
-                    custody_request_digest: None,
-                    request_memory: None,
-                },
-                self.cancellation,
-            )
+            .submit_custody_release(command, self.cancellation)
             .await?;
         match receipt.outcome {
             Outcome::Then => Ok(()),
@@ -244,6 +290,22 @@ impl ResponseRelease<'_> {
     }
 }
 
+pub(crate) fn check_release_cut(
+    index: &BranchIndex,
+    writer: &CustodyWriterFence,
+    groups: &BTreeSet<CustodyGroupId>,
+) -> Result<()> {
+    if !writer.matches(index)? {
+        return Err(release_unavailable());
+    }
+    for &group in groups {
+        if !index.custody_group_live(group)? {
+            return Err(rtdb_crypt::erased_under_view());
+        }
+    }
+    Ok(())
+}
+
 fn require_live_group(index: &BranchIndex, registration: CustodyReleaseRegistration) -> Result<()> {
     if index.custody_group_live(registration.group)? {
         Ok(())
@@ -252,7 +314,7 @@ fn require_live_group(index: &BranchIndex, registration: CustodyReleaseRegistrat
     }
 }
 
-fn release_unavailable() -> Anomaly {
+pub(crate) fn release_unavailable() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Unavailable,
         "rtdb/custody-release-authority",
@@ -268,11 +330,12 @@ mod tests {
     };
 
     use rtdb_tx::transact::{
-        CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, ROW_CUSTODY, Receipt,
-        Resolution, Row, TransactState, TransactionRecord,
+        Cell, CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, Op, ROW_CUSTODY,
+        Resolution, Row, TRANSACT_REQUIRES, Transact, TransactState, TransactionRecord, ValidTime,
+        Window,
     };
     use rtdb_types::{
-        EntityId, StructFields, TableRef, Timestamp,
+        EntityId, Interval, StructFields, TableRef, Timestamp, Value,
         rtdb_v1::{At, ClaimSealer, Layer, MAIN_BRANCH},
     };
     use tokio::sync::Mutex;
@@ -308,12 +371,24 @@ mod tests {
             Ok(self.state.lock().await.index().clone())
         }
 
-        async fn check_custody_delivery(
+        async fn submit_custody_release(
             &self,
-            groups: &std::collections::BTreeSet<CustodyGroupId>,
+            command: TrustedCustodyRelease,
+            cancellation: &CancellationToken,
+        ) -> Result<Receipt> {
+            self.transact(command.into_request(), cancellation).await
+        }
+
+        async fn check_custody_release_delivery(
+            &self,
+            groups: &BTreeSet<CustodyGroupId>,
+            writer: &CustodyWriterFence,
             cancellation: &CancellationToken,
         ) -> Result<()> {
             let index = self.current_custody(cancellation).await?;
+            if !writer.matches(&index)? {
+                return Err(release_unavailable());
+            }
             for &group in groups {
                 if !index.custody_group_live(group)? {
                     return Err(rtdb_crypt::erased_under_view());
@@ -330,7 +405,7 @@ mod tests {
                 &request,
                 position,
                 TestClock.now(),
-                &[ROW_CUSTODY],
+                &[ROW_CUSTODY, TRANSACT_REQUIRES],
                 &claims,
             )? {
                 Resolution::Answer(receipt) => receipt,
@@ -363,38 +438,46 @@ mod tests {
         async fn changes(&self, _: Changes, _: &CancellationToken) -> Result<ChangePage> {
             unreachable!()
         }
-        async fn tx_status(&self, _: &[u8], _: &CancellationToken) -> Result<Receipt> {
-            unreachable!()
+        async fn tx_status(&self, key: &[u8], _: &CancellationToken) -> Result<Receipt> {
+            self.state.lock().await.tx_status(key)
         }
     }
 
-    struct Carrier<'a> {
-        driver: &'a Driver,
-        identity: CustodyCarrierAuthority,
-        observation: Mutex<Option<(CustodyReleaseRegistration, CarrierObservation)>>,
+    struct Carrier {
+        writer: OriginalReceipt,
+        observation: Mutex<Option<OriginalCarrierReceipt>>,
     }
 
     #[async_trait]
-    impl CustodyCarrierJournal for Carrier<'_> {
-        fn authority(&self, attachment: &dyn ServingDriver) -> Result<CustodyCarrierAuthority> {
-            if !std::ptr::addr_eq(attachment, self.driver as &dyn ServingDriver) {
-                return Err(release_unavailable());
-            }
-            Ok(self.identity)
+    impl OriginalCarrierObservations for Carrier {
+        async fn confirmed_writer(
+            &self,
+            _: CustodyCarrierAuthority,
+            _: &CancellationToken,
+        ) -> Result<OriginalReceipt> {
+            Ok(self.writer.clone())
         }
 
-        async fn observe(
+        async fn registered_carrier(
             &self,
             registration: CustodyReleaseRegistration,
             _: &CancellationToken,
-        ) -> Result<CarrierObservation> {
+        ) -> Result<OriginalCarrierReceipt> {
             self.observation
                 .lock()
                 .await
                 .as_ref()
-                .filter(|(admitted, _)| *admitted == registration)
-                .map(|(_, observed)| *observed)
+                .filter(|observed| observed.registration == registration)
+                .cloned()
                 .ok_or_else(release_unavailable)
+        }
+    }
+
+    fn witness(receipt: &Receipt) -> OriginalReceipt {
+        OriginalReceipt {
+            key: receipt.key.clone(),
+            basis: receipt.basis,
+            system_time: receipt.system_time,
         }
     }
 
@@ -419,6 +502,36 @@ mod tests {
             lose_reply: AtomicBool::new(false),
         };
         let cancellation = CancellationToken::new();
+        let writer = OriginalWriterPoint {
+            table: TableRef::new("public", "installation"),
+            id: EntityId::Integer(1),
+            valid_at: Timestamp(0),
+        };
+        let writer_receipt = driver
+            .transact(
+                request(
+                    1,
+                    vec![Op::Put {
+                        branch: MAIN_BRANCH.into(),
+                        table: writer.table.clone(),
+                        if_absent: false,
+                        rows: vec![Row {
+                            id: writer.id.clone(),
+                            valid: Some(ValidTime::Literal(Interval::ALL)),
+                            cells: StructFields::from([(
+                                "writer".into(),
+                                Cell::Value(Value::I64(1)),
+                            )]),
+                            custody_group: None,
+                            custody_payload: None,
+                            protected_columns: Vec::new(),
+                        }],
+                    }],
+                ),
+                &cancellation,
+            )
+            .await
+            .unwrap();
         let row = Row {
             id: EntityId::Integer(1),
             valid: None,
@@ -433,7 +546,7 @@ mod tests {
         let placed = driver
             .transact(
                 request(
-                    1,
+                    2,
                     vec![
                         Op::CreateCustodyGroup { group: GROUP },
                         Op::PlaceCustodyRow {
@@ -475,11 +588,12 @@ mod tests {
                 source_history: [6; 32],
                 installation: [7; 16],
                 registry: [8; 32],
-                original_writer: [9; 32],
+                original_writer: original_writer_commitment([7; 16], &writer_receipt.key),
             },
             group: GROUP,
             original: occurrence,
             occurrence,
+            carrier_receipt_sha256: witness(&placed).commitment(),
             expires_at: Timestamp(50),
             part: CustodyResponsePart {
                 transport_history: [10; 16],
@@ -490,26 +604,49 @@ mod tests {
             },
         };
         let carrier = Carrier {
-            driver: &driver,
-            identity: registration.authority,
+            writer: witness(&writer_receipt),
             observation: Mutex::new(None),
         };
+        let original =
+            AttachedCustodyCarrierJournal::new(&driver, registration.authority, writer, &carrier)
+                .unwrap();
         let release = ResponseRelease {
             driver: &driver,
-            original: &carrier,
+            original: &original,
             clock: &TestClock,
             cancellation: &cancellation,
         };
         assert_eq!(release.prepare(registration).await.unwrap(), registration);
         assert!(release.stage(registration).await.is_err());
-        *carrier.observation.lock().await = Some((registration, CarrierObservation::Live));
+        *carrier.observation.lock().await = Some(OriginalCarrierReceipt {
+            registration,
+            receipt: witness(&placed),
+            observation: CarrierObservation::Live,
+        });
+        let wrong_carrier = OriginalCarrierReceipt {
+            registration,
+            receipt: witness(&writer_receipt),
+            observation: CarrierObservation::Live,
+        };
+        let prior = carrier.observation.lock().await.replace(wrong_carrier);
+        assert!(release.stage(registration).await.is_err());
+        *carrier.observation.lock().await = prior;
         release.stage(registration).await.unwrap();
         release.promote(registration).await.unwrap();
+        let expected = [(GROUP, occurrence)].into();
+        release.check_all(&expected, &[registration]).await.unwrap();
+        let incomplete = [(GROUP, occurrence), ([99; 16], [99; 32])].into();
+        assert!(
+            release
+                .check_all(&incomplete, &[registration])
+                .await
+                .is_err()
+        );
         let inventory_sha256 = index.custody_inventory(GROUP).unwrap().sha256;
         let fenced = driver
             .transact(
                 request(
-                    2,
+                    3,
                     vec![Op::RevokeCustodyGroup {
                         group: GROUP,
                         inventory_sha256,
@@ -548,12 +685,13 @@ mod tests {
                 .custody_releases_drained(GROUP)
         );
 
-        *carrier.observation.lock().await = Some((
+        *carrier.observation.lock().await = Some(OriginalCarrierReceipt {
             registration,
-            CarrierObservation::Disposed {
+            receipt: witness(&placed),
+            observation: CarrierObservation::Disposed {
                 evidence_sha256: [14; 32],
             },
-        ));
+        });
         driver.lose_reply.store(true, Ordering::SeqCst);
         assert_eq!(
             release.dispose(registration).await.unwrap_err().code,

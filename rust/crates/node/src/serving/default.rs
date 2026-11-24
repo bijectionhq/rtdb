@@ -5,7 +5,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_index::branches::BranchIndex;
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
-use rtdb_tx::transact::{CustodyGroupId, ROW_CUSTODY, Receipt, Transact};
+use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyRelease};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
 
@@ -100,6 +100,19 @@ impl ServingDriver for DefaultServing {
 
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
         Ok(self.handle.view(At::Linearizable, cancellation).await?.index)
+    }
+
+    async fn submit_custody_release(&self, command: TrustedCustodyRelease, cancellation: &CancellationToken) -> Result<Receipt> {
+        if !self.writable { return Err(super::custody_release::release_unavailable()); }
+        self.handle.submit_custody_release(command, cancellation).await
+    }
+
+    async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
+                                            cancellation: &CancellationToken) -> Result<()> {
+        let vault = self.tokens.authority().await?.custody_vault();
+        for &group in groups { vault.check_readable(group).await?; }
+        let index = self.current_custody(cancellation).await?;
+        super::custody_release::check_release_cut(&index, writer, groups)
     }
 
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {

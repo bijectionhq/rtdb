@@ -53,9 +53,9 @@ pub(super) struct RetiredLabel {
 }
 
 impl CustodyGroup {
-    pub(super) fn has_occurrence(&self, group: CustodyGroupId, commitment: [u8; 32]) -> bool {
+    pub(super) fn occurrence(&self, group: CustodyGroupId, commitment: [u8; 32]) -> Option<&CustodyOccurrence> {
         self.original.iter().chain(self.reservations.values().filter_map(|entry| entry.occurrence.as_ref()))
-            .any(|occurrence| occurrence.commitment(group) == commitment)
+            .find(|occurrence| occurrence.commitment(group) == commitment)
     }
 
     fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {

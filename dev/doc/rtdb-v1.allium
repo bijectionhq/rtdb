@@ -114,6 +114,10 @@ surface StatelessDatabase {
 
     @guarantee ProtectedResponseRelease
         -- The installed original carrier journal authenticates the exact attachment, original writer, response part, admitted occurrence and immutable cutoff.
+        -- The original writer and carrier receipt are observed independently and verified by exact request key, basis and system time on the original attachment.
+        -- The carrier receipt selects the admitted occurrence and its commitment is retained in the release registration.
+        -- The response release command checks the observed writer version in the same order as the hold or terminal.
+        -- The response owner holds every group and occurrence in its authenticated contributor inventory through delivery.
         -- The ordered release fold serializes private registration, promotion, cancellation and disposal with revocation.
         -- Final delivery requires a promoted release, current authority, a live group and an unexpired cutoff.
         -- Only private cancellation or authenticated durable transport disposal terminates an admitted release.

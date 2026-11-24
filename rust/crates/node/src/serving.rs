@@ -6,7 +6,7 @@ use rtdb_index::{
     Snapshot,
     branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage},
 };
-use rtdb_tx::transact::{CustodyGroupId, Receipt, Transact};
+use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyRelease};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
     EntityId, Interval, Result, TableRef, Timestamp,
@@ -174,6 +174,15 @@ pub trait ServingDriver: Send + Sync {
 
     async fn current_custody(&self, _cancellation: &CancellationToken) -> Result<BranchIndex> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no ordered custody catalog"))
+    }
+
+    async fn submit_custody_release(&self, _command: TrustedCustodyRelease, _cancellation: &CancellationToken) -> Result<Receipt> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no trusted release submission"))
+    }
+
+    async fn check_custody_release_delivery(&self, _groups: &BTreeSet<CustodyGroupId>, _writer: &CustodyWriterFence,
+                                            _cancellation: &CancellationToken) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no original release delivery authority"))
     }
 
     async fn reconcile_custody(&self, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }

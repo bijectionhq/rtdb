@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::{RawValue, to_raw_value};
 use sha2::{Digest, Sha256};
 
+mod custody_release;
 mod operations;
 mod pipeline;
 
+pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +82,22 @@ impl Transact {
         self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::Erase { .. }))
     }
 
+    fn is_response_release(&self) -> bool {
+        matches!(self.ops.as_slice(), [Op::CustodyRelease(_)])
+            && self.otherwise.is_empty() && self.guards.is_empty()
+            && matches!(self.requires.as_slice(),
+                [Guard::Version { branch, valid_at: Some(_), expect: Version::Written(_), .. }] if branch == MAIN_BRANCH)
+            && self.window == Window::default()
+    }
+
+    pub fn contains_response_release(&self) -> bool {
+        self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::CustodyRelease(_)))
+    }
+
+    pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
+        scope.or_else(|| self.is_response_release().then_some(CUSTODY_RELEASE_NAMESPACE))
+    }
+
     pub fn require_sealed_custody(&self, features: &[&str]) -> Result<()> {
         if !self.has_unsealed_custody() { return Ok(()); }
         Err(if features.contains(&ROW_CUSTODY) {
@@ -87,16 +105,6 @@ impl Transact {
         } else {
             feature_required(ROW_CUSTODY)
         })
-    }
-
-    fn is_response_release(&self) -> bool {
-        matches!(self.ops.as_slice(), [Op::CustodyRelease(_)])
-            && self.otherwise.is_empty() && self.guards.is_empty() && self.requires.is_empty()
-            && self.window == Window::default()
-    }
-
-    pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
-        scope.or_else(|| self.is_response_release().then_some(*b"rtdb/v1/custody-release-receipt\0"))
     }
 
     fn has_unsealed_custody(&self) -> bool {
@@ -230,10 +238,11 @@ pub enum Op {
     RevokeCustodyGroup { group: CustodyGroupId, inventory_sha256: [u8; 32] },
     ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
     PlaceCustodyRow { branch: Branch, table: TableRef, row: Row, placement: CustodyPlacement },
+    #[serde(skip_deserializing)]
     CustodyRelease(CustodyRelease),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CustodyPlacement {
     pub placement_id: CustodyPlacementId,
     pub reservation: Option<[u8; 32]>,
@@ -243,7 +252,7 @@ pub struct CustodyPlacement {
     pub commitments: Option<CustodyPlacementCommitments>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct CustodyPlacementCommitments {
     pub carrier_sha256: [u8; 32],
     pub link_sha256: Option<[u8; 32]>,
@@ -704,9 +713,14 @@ impl TransactState {
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
             return Err(feature_required(TRANSACT_REQUIRES));
         }
-        // The response adapter supplies this internal operation after authenticating the original registry.
-        if !request.is_response_release() && !features.contains(&ROW_CUSTODY) && request.uses_custody() {
-            return Err(feature_required(ROW_CUSTODY));
+        if request.uses_custody() {
+            let response_release = request.is_response_release();
+            if request.contains_response_release() && (!response_release || scope.is_some()) {
+                return Err(Anomaly::incorrect("rtdb/custody-release", "Response release requires its original writer and private receipt namespace"));
+            }
+            if !response_release && !features.contains(&ROW_CUSTODY) {
+                return Err(feature_required(ROW_CUSTODY));
+            }
         }
         let Window { not_before, before } = request.window;
         if not_before.zip(before).is_some_and(|(start, end)| start >= end) {

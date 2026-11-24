@@ -68,6 +68,20 @@ impl Database {
     }
     pub fn serving_driver(&self) -> Option<&dyn crate::serving::ServingDriver> { self.serving.as_deref() }
 
+    pub fn original_custody_carrier_journal<'a>(
+        &'a self,
+        authority: crate::serving::custody_release::CustodyCarrierAuthority,
+        writer: crate::serving::custody_release::OriginalWriterPoint,
+        original: &'a dyn crate::serving::custody_release::OriginalCarrierObservations,
+    ) -> Result<crate::serving::custody_release::AttachedCustodyCarrierJournal<'a>> {
+        use crate::serving::custody_release::{AttachedCustodyCarrierJournal, release_unavailable};
+        if self.read_only || self.audience_storage.is_some() || self.cancellation.is_cancelled() {
+            return Err(release_unavailable());
+        }
+        let driver = self.serving_driver().ok_or_else(release_unavailable)?;
+        AttachedCustodyCarrierJournal::new(driver, authority, writer, original)
+    }
+
     pub async fn wire_incarnation(&self) -> Result<uuid::Uuid> { self.tokens.incarnation().await }
 
     pub async fn token_authority(&self) -> Result<rtdb_crypt::tokens::TokenAuthority> {

@@ -743,7 +743,7 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
     use rtdb_index::branches::{CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
 
     let group = [8; 16];
-    let features = [LINEARIZABLE, ROW_CUSTODY];
+    let features = [LINEARIZABLE, ROW_CUSTODY, TRANSACT_REQUIRES];
     let mut state = TransactState::new(INCARNATION);
     let write = |state: &mut TransactState, at, request: &Transact| {
         let prepared = plan(state, request, at, at as i64 * 10, &features);
@@ -765,7 +765,7 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
     };
     let valid = Interval::new(Timestamp(0), Timestamp(1_000)).unwrap();
     let original_id = [11; 16];
-    assert_eq!(write(&mut state, 1, &request(1, vec![Op::CreateCustodyGroup { group },
+    assert_eq!(write(&mut state, 1, &request(1, vec![Op::CreateCustodyGroup { group }, put(MAIN_BRANCH, 99, "writer"),
         place(MAIN_BRANCH, original_id, None, valid, [7; 32], None)])).outcome, Outcome::Then);
     let occurrence_at = |state: &TransactState, stage| {
         let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(30)).unwrap();
@@ -812,25 +812,36 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
         authority: CustodyCarrierAuthority {
             incarnation: INCARNATION, source_history: [15; 32], installation: [16; 16], registry: [17; 32], original_writer: [18; 32],
         },
-        group, original, occurrence: active.commitment(group), expires_at: Timestamp(120),
+        group, original, occurrence: active.commitment(group), carrier_receipt_sha256: [31; 32], expires_at: Timestamp(120),
         part: CustodyResponsePart {
             transport_history: [19; 16], producer: [20; 16], consumer: [21; 16], response: [22; 16], ordinal: NonZeroU64::MIN,
         },
     };
-    let release = |phase| Op::CustodyRelease(CustodyRelease { registration, phase });
-    let stage = request(8, vec![release(CustodyReleasePhase::Private)]);
+    let release = |phase| TrustedCustodyRelease {
+        release: CustodyRelease { registration, phase },
+        writer: CustodyWriterFence { table: table(), id: EntityId::Integer(99), valid_at: Timestamp(20), written: basis(1) },
+    }.into_request();
+    let stage = release(CustodyReleasePhase::Private);
+    let mut displaced = state.clone();
+    let mut replacement = put(MAIN_BRANCH, 99, "replacement");
+    let Op::Put { rows, .. } = &mut replacement else { unreachable!() };
+    rows[0].valid = Some(Interval::ALL.into());
+    assert_eq!(commit(&mut displaced, 8, &request(16, vec![replacement])).outcome, Outcome::Then);
+    assert!(matches!(commit(&mut displaced, 9, &stage).outcome,
+        Outcome::Refused { error } if error.code == REQUIREMENT_FAILED));
+    assert!(displaced.index().custody_release_phase(registration).unwrap().is_none());
     assert_eq!(commit(&mut state, 8, &stage).outcome, Outcome::Then);
     assert!(state.tx_status(&stage.key).is_err());
-    assert_eq!(commit(&mut state, 9, &request(9, vec![release(CustodyReleasePhase::Promoted)])).outcome, Outcome::Then);
+    assert_eq!(commit(&mut state, 9, &release(CustodyReleasePhase::Promoted)).outcome, Outcome::Then);
     let inventory = state.index().custody_inventory(group).unwrap();
     let revoke = request(10, vec![stale(inventory.sha256)]);
     let revocation = write(&mut state, 10, &revoke);
     assert_eq!(revocation.outcome, Outcome::Then);
     assert!(!state.index().custody_releases_drained(group));
-    assert!(matches!(commit(&mut state, 11, &request(11, vec![release(CustodyReleasePhase::Cancelled)])).outcome,
+    assert!(matches!(commit(&mut state, 11, &release(CustodyReleasePhase::Cancelled)).outcome,
         Outcome::Refused { error } if error.code == "rtdb/custody-release"));
     let terminal = CustodyReleasePhase::Disposed { evidence_sha256: [23; 32] };
-    let dispose = request(12, vec![release(terminal)]);
+    let dispose = release(terminal);
     let disposed = commit(&mut state, 12, &dispose);
     assert_eq!(disposed.outcome, Outcome::Then);
     let checkpoint = state.encode_checkpoint().unwrap();
