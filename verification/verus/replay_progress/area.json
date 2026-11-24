@@ -1,0 +1,19 @@
+{
+  "summary": "The installed replica consumer keeps a recorded source watermark and the original applied transaction receipt together and refuses regressing progress.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 3,
+  "controls": {
+    "replace_recorded_source_with_tx": {
+      "defect": "Substitute the transaction ID for the recorded source position.",
+      "mutate": [{ "file": "rust/crates/replication/src/replay_progress.rs", "find": "        Some(position) => position,\n        None if external_source", "replace": "        Some(_) => transaction,\n        None if external_source" }],
+      "expect": [{ "file": "rust/crates/replication/src/replay_progress.rs", "function": "replayed_source", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 2
+    },
+    "lose_applied_transaction": {
+      "defect": "Advance the source watermark without the selected original receipt.",
+      "mutate": [{ "file": "rust/crates/replication/src/replay_progress.rs", "find": "    Ok(AppliedUpdate { source, completed })", "replace": "    Ok(AppliedUpdate { source, completed: None })" }],
+      "expect": [{ "file": "rust/crates/replication/src/replay_progress.rs", "function": "applied_update", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 2
+    }
+  }
+}

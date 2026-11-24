@@ -1233,7 +1233,12 @@ impl ReplicationDriver {
                                 if let Err(error) = self.effects.apply_db_op(operation).await { if !error.is_caller_error() { return Err(error); } }
                             }
                         }
-                        let source = message.src_msg_id.map(SourcePosition).unwrap_or_else(|| if self.config.external_source { self.progress.current().source_position } else { SourcePosition(result.tx_key().tx_id.0) });
+                        let source = SourcePosition(crate::replay_progress::replayed_source(
+                            message.src_msg_id,
+                            self.config.external_source,
+                            self.progress.source_position().0,
+                            result.tx_key().tx_id.0,
+                        ));
                         self.progress.applied(Some(source), Some(AppliedTransaction::new(Arc::new(result), placed_attempt)), message.external_source_token.clone())?;
                     }
                     if placed {
