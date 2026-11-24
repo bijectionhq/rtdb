@@ -1,0 +1,17 @@
+remotes:
+  cluster: !Kafka
+    bootstrapServers: !Env RTDB_KAFKA_BOOTSTRAP
+log: !Kafka
+  cluster: cluster
+  topic: !Env RTDB_KAFKA_TOPIC
+  autoCreateTopic: false
+storage: !Remote
+  objectStore: !S3
+    bucket: !Env RTDB_BUCKET
+    region: !Env AWS_REGION
+server: null
+flightSql:
+  host: 0.0.0.0
+  port: 3000
+authn: !SingleRootUser
+  password: !Env RTDB_ROOT_PASSWORD
