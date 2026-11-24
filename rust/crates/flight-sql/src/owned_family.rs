@@ -9,7 +9,7 @@ use rtdb_types::{AssertionId, PlacementBinding, Position, RootLandingBinding, Ro
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::{error::{invalid, status, unsupported}, service::{Call, Service}, wire};
+use crate::{error::{invalid, status, unsupported}, service::{Call, Service}, state::Owner, wire};
 
 pub(crate) const ASSERTION_FAMILY_SCOPE_V1: &str = "rtdb.owned.AssertionFamilyScope.v1";
 pub(crate) const ENROLL_ASSERTION_FAMILY_V1: &str = "rtdb.owned.EnrollAssertionFamily.v1";
@@ -507,11 +507,23 @@ fn encode_fence(fence: &FamilyFenceReply) -> Result<BytesMut, Status> {
     Ok(out)
 }
 
+fn is_authenticated_original_attachment(owner: Owner, placement: Option<&str>, database: &str) -> bool {
+    matches!(owner, Owner::Authenticated(_)) && placement == Some(database)
+}
+
 impl Service {
+    pub(crate) fn supports_retired_original_family(&self, call: &Call) -> bool {
+        self.0.config.owned_native_actions && self.0.config.owned_world_host.is_some()
+            && !call.session.fresh_replica && call.session.audience_source().is_none()
+            && is_authenticated_original_attachment(call.session.caller.owner, call.session.placed_database(), &call.database)
+    }
+
     pub(crate) async fn assertion_family_action(&self, call: &Call, action: &str, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || call.session.audience_source().is_some() { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        if matches!(action, FAMILY_RESPONSE_RELEASE_V2 | RETIRED_ORIGINAL_FAMILY_V1) && !self.supports_hosted_upload(call) {
+        if (action == FAMILY_RESPONSE_RELEASE_V2 && !self.supports_hosted_upload(call))
+            || (action == RETIRED_ORIGINAL_FAMILY_V1 && !self.supports_retired_original_family(call))
+        {
             return Err(unsupported());
         }
         let request = decode(action, body)?;
@@ -521,6 +533,7 @@ impl Service {
         let mut session = connection.borrow().await?;
         crate::owned_actions::require_idle(&session)?;
         if let FamilyRequest::Retired(request) = &request && request.signed_body.first() == Some(&3) {
+            if !self.supports_hosted_upload(call) { return Err(unsupported()); }
             let enrollment = host.retired_family_fence(
                 crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
                 request,
@@ -566,6 +579,15 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_family_transport_accepts_only_a_named_authenticated_attachment() {
+        let reader = Owner::Authenticated(Uuid::from_u128(1));
+        assert!(is_authenticated_original_attachment(reader, Some("original"), "original"));
+        assert!(!is_authenticated_original_attachment(reader, Some("successor"), "original"));
+        assert!(!is_authenticated_original_attachment(reader, None, "original"));
+        assert!(!is_authenticated_original_attachment(Owner::Anonymous, Some("original"), "original"));
+    }
 
     #[test]
     fn retired_family_frames_keep_the_signed_operation_and_exact_payload() {

@@ -301,12 +301,14 @@ Original custody orders the grant and its replay authorization together under `f
 The grant binds the deployment incarnation, placed history, family vault, Original and target installations, archive fence and frontier, exact target replay receipt and Root activation.
 The holder checks both exact signed rows at a fresh Original barrier after the retired frontier.
 The reader and Original controller have distinct Ed25519 keys.
+The successor uses an authenticated Flight session with read access to the current Original attachment and signs its request with the enrolled reader key.
 Operation 0 checks the exact live activation and returns byte 1.
 Operation 1 wraps the family response-release operations and requires the exact kind 4 input for prepare and stage.
 Operation 2 takes the exact promoted registration followed by the Original outer envelope and returns its row-unit-sealed contents.
 The response handoff rechecks the current grant, registry, family marker and cutoff.
 The Original carrier registry keeps the same release addresses and records the enrollment locator as creator and the controller's signed `family_custody_proof` for the exact live or disposed phase.
 The controller uses operation 4 to plan the exact order and operation 3 to submit its ordinary inline Root retirement decision with the sealed installation revision and a zero writer field.
+The ordered decision also requires the Original's authenticated hosted-control owner on the current attachment.
 The resolver matches the same current paired enrollment and closed Original authority before the existing ordered predicates authenticate the selected carrier and retirement inventory.
 The custody decision admits the Original Root fence and its bounded erasure and acknowledgement effects.
 
