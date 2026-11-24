@@ -29,7 +29,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway [--directory DIR] [--installed-journals FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
@@ -346,7 +346,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 149 } else { 18 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 150 } else { 19 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,
@@ -514,7 +514,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 return Err(usage("--audience-journal-port requires the node's audience Flight listener".into()));
             }
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
-            agent.replica_payload_reclamation = arguments.present("replica-payload-reclamation");
             if arguments.present("s3-write-role") {
                 let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
                 agent.s3_write_role = Some(rtdb_multi::agent::S3WriteRole { arn: arguments.required("s3-write-role")?.to_owned(),

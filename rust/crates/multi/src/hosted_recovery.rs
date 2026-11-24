@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rtdb_directory::{Cas, DeploymentRecord, Directory, JournalAnchor, MemberId, MemberRecord, ReplicaJournalUnit, ReplicaPayloadCandidate, ReplicaPayloadTrim};
-use rtdb_format::{envelope::ReplicaEnvelope, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
+use rtdb_format::{envelope::ReplicaEnvelope, keys::CURRENT_STORAGE_VERSION};
 use rtdb_logkeeper::{JournalDigest, StreamConfig};
-use rtdb_storage::{Error, IoRegion, ObjectKey, log::LogOffset};
-use rtdb_types::{JournalEndpoint, Result, StorageEpoch};
+use rtdb_storage::{Error, IoRegion, log::LogOffset};
+use rtdb_types::{Result, StorageEpoch};
 
-use crate::deployment::{CellStorage, ensemble_servers, write_quorum};
+use crate::deployment::{ensemble_servers, write_quorum};
 use crate::replica_retention::{excluded_replay_start, replica_trim_through};
 
 pub(crate) fn replay_start(record: &DeploymentRecord, after: i64) -> rtdb_storage::Result<i64> {
@@ -68,11 +68,6 @@ struct TrimScope {
 const REPLICA_PAYLOAD_TRIM_BATCH: i64 = 64;
 const MAX_PENDING_REPLICA_PAYLOADS: usize = 128;
 
-fn known_journals(record: &DeploymentRecord, active: &[JournalEndpoint]) -> BTreeSet<JournalEndpoint> {
-    record.replica_journals.iter().chain(&record.log_copy_servers)
-        .chain(record.move_from.iter().flatten()).chain(active).cloned().collect()
-}
-
 impl ReplicaTrimPlan {
     pub(crate) fn new(record: DeploymentRecord, adopted_boundary: i64, trimmed: i64, now_ms: i64) -> Option<Self> {
         let published = record.checkpoint?;
@@ -86,7 +81,7 @@ impl ReplicaTrimPlan {
     }
 
     pub(crate) async fn authorize(mut self, directory: &dyn Directory, members: &BTreeMap<MemberId, MemberRecord>,
-        storage: &CellStorage, keys: &dyn crate::keys::KeyService, enabled: bool) -> Result<Option<ReplicaTrimGrant>> {
+        keys: &dyn crate::keys::KeyService, offloads: bool) -> Result<Option<ReplicaTrimGrant>> {
         let servers = ensemble_servers(&self.record, members)?;
         let stream = StreamConfig {
             write_quorum: write_quorum(servers.len()), servers,
@@ -102,8 +97,6 @@ impl ReplicaTrimPlan {
                 return Ok(None);
             }
         }
-        let offloads = matches!(storage, CellStorage::S3 { .. })
-            && (enabled || self.record.replica_payload_trim.as_ref().is_some_and(|trim| trim.belongs_to(&self.record)));
         let mut retirement = None;
         let mut changed = false;
         let anchor = self.record.replica_anchor.as_deref();
@@ -114,12 +107,7 @@ impl ReplicaTrimPlan {
                 || anchor.is_none_or(|anchor| anchor.interval[1] != pending.through)
             { return Ok(None); }
             self.through = LogOffset(pending.through);
-            let mut pending = pending.clone();
-            let routes = pending.journals.iter().cloned().chain(known_journals(&self.record, &stream.servers)).collect();
-            pending.journals = crate::admin::retirement_journals(routes, members)?.into_iter().collect();
-            changed = self.record.replica_payload_trim.as_deref() != Some(&pending);
-            self.record.replica_payload_trim = Some(Box::new(pending.clone()));
-            retirement = Some((self.record.id.clone(), pending));
+            retirement = Some((self.record.id.clone(), pending.clone()));
         } else if anchor.is_none_or(|anchor| anchor.interval[1] < self.through.0) {
             let transferred_first = self.record.checkpoint_transfer_activation.as_deref()
                 .and_then(|activation| activation.replica.bootstrap.terminal.fence.destination.checkpoint.boundary.checked_add(1));
@@ -152,18 +140,15 @@ impl ReplicaTrimPlan {
             };
             let Some(digest) = proof.digest_bytes() else { return Ok(None); };
             {
-                let journals = crate::admin::retirement_journals(
-                    known_journals(&self.record, &stream.servers).into_iter().collect(), members,
-                )?.into_iter().collect();
                 let mut candidates = self.record.replica_payload_trim.as_ref()
                     .filter(|trim| trim.belongs_to(&self.record)).map(|trim| trim.candidates.clone()).unwrap_or_default();
                 let (journal_units, detached) = trim_census(
-                    &self.record, &stream, storage, keys, first, self.through.0, offloads,
+                    &self.record, &stream, keys, first, self.through.0, offloads,
                 ).await?;
                 candidates.extend(detached);
                 if candidates.len() > MAX_PENDING_REPLICA_PAYLOADS { return Ok(None); }
                 let pending = ReplicaPayloadTrim { incarnation: self.record.incarnation, log_epoch: self.record.log_epoch,
-                    through: self.through.0, journals, applied: false, candidates, journal_units };
+                    through: self.through.0, generation: self.record.storage_generation, applied: false, candidates, journal_units };
                 self.record.replica_payload_trim = Some(Box::new(pending.clone()));
                 retirement = Some((self.record.id.clone(), pending));
             }
@@ -197,13 +182,13 @@ impl ReplicaTrimPlan {
 }
 
 impl ReplicaTrimGrant {
-    pub(crate) async fn apply(mut self, directory: &dyn Directory, keys: &dyn crate::keys::KeyService) -> Result<i64> {
+    pub(crate) async fn apply(self, directory: &dyn Directory, keys: &dyn crate::keys::KeyService) -> Result<i64> {
         let mut settlement = None;
         if let Some((deployment, pending)) = self.retirement {
             let current = directory.deployment(&deployment).await?;
             if !current.as_ref().is_some_and(|record| {
                 pending.belongs_to(record) && record.key_id() == self.residence_key
-                    && record.replica_payload_trim.as_deref() == Some(&pending)
+                    && record.replica_payload_trim.as_deref().is_some_and(|current| current.same_journal_work(&pending))
                     && record.replica_anchor.as_ref().is_some_and(|anchor| anchor.digest == self.scope.anchor)
             }) {
                 return Err(Error::Task("The exact journal retirement grant no longer owns this prefix".into()).into());
@@ -211,21 +196,14 @@ impl ReplicaTrimGrant {
             if !complete_unit_census(&pending.journal_units, self.through.0) {
                 return Err(Error::Task("The journal retirement grant has an incomplete unit census".into()).into());
             }
-            if pending.journals.iter().any(|journal| journal.journal().is_none()) {
-                return Err(Error::Task("Replica payload settlement requires every journal's physical identity".into()).into());
-            }
-            self.stream.servers = pending.journals.iter().cloned().collect();
-            self.stream.write_quorum = write_quorum(self.stream.servers.len());
-            rtdb_logkeeper::trim_all(&self.stream, self.through).await?;
+            rtdb_logkeeper::trim(&self.stream, self.through).await?;
             let labels = pending.journal_units.iter().map(|unit| unit.label.clone()).collect::<Vec<_>>();
             crate::keys::withdraw_archive_records(keys, &self.residence_key, &labels, &IoRegion::new()).await?;
             let stored = crate::admin::update_installation(directory, &deployment, |record| {
                 let matches = pending.belongs_to(record)
                     && record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] == pending.through)
-                    && record.replica_payload_trim.as_deref() == Some(&pending)
-                    && record.key_id() == self.residence_key
-                    && known_journals(record, &[]).iter().all(|endpoint|
-                        pending.journals.iter().any(|journal| endpoint.journal() == journal.journal()));
+                    && record.replica_payload_trim.as_deref().is_some_and(|current| current.same_journal_work(&pending))
+                    && record.key_id() == self.residence_key;
                 if !matches {
                     return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Conflict,
                         "rtdb.multi/replica-trim-changed", "The authorized replica trim changed before settlement"));
@@ -259,7 +237,7 @@ fn complete_unit_census(units: &[ReplicaJournalUnit], through: i64) -> bool {
             && unit.label.starts_with("rtdb.multi/journal-unit/") && unit.label.len() <= 256)
 }
 
-async fn trim_census(record: &DeploymentRecord, stream: &StreamConfig, storage: &CellStorage,
+async fn trim_census(record: &DeploymentRecord, stream: &StreamConfig,
     keys: &dyn crate::keys::KeyService, first: i64, through: i64, offloads: bool,
 ) -> Result<(Vec<ReplicaJournalUnit>, Vec<ReplicaPayloadCandidate>)> {
     let certificate = rtdb_logkeeper::certify_committed_range(stream, first, through).await?;
@@ -282,16 +260,9 @@ async fn trim_census(record: &DeploymentRecord, stream: &StreamConfig, storage: 
             let Some((_, version)) = envelope.offload_publication()? else { continue; };
             let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
                 .ok_or_else(|| Error::Task("A replica publication has no payload key".into()))?;
-            candidates.push(ReplicaPayloadCandidate { key: relative, position: entry.lsn, frame_sha256, version });
+            candidates.push(ReplicaPayloadCandidate { key: relative, position: entry.lsn, frame_sha256, version, grant: None });
         }
     }
-    if candidates.is_empty() { return Ok((units, candidates)); }
-    let CellStorage::S3 { config } = storage else { return Ok((units, Vec::new())); };
-    let inventory = CellStorage::s3_inventory(config).await?;
-    let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
-    let prefix = record.storage_prefix();
-    candidates.retain(|candidate| ObjectKey::new(format!("{prefix}/{root}/{}", candidate.key))
-        .is_ok_and(|key| inventory.owns_publication(&key, &candidate.version)));
     Ok((units, candidates))
 }
 
