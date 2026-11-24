@@ -81,23 +81,17 @@ impl AsRef<[u8]> for ChargedBytes {
 
 impl MultiServing {
     pub async fn maintain_ranked_catalog(&self, cancellation: &CancellationToken) -> Result<()> {
-        let Some(build) = self.database.lock().await.ranked_build()? else {
-            return Ok(());
-        };
-        let basis = build.index.head().basis;
         {
             let mut schedule = self.ranked_schedule.lock().await;
             let now = Instant::now();
-            match *schedule {
-                Some((previous, allowed)) if previous == basis && now >= allowed => (),
-                Some((previous, _)) if previous == basis => return Ok(()),
-                _ => {
-                    *schedule = Some((basis, now + PUBLISH_INTERVAL));
-                    return Ok(());
-                }
+            if schedule.is_some_and(|allowed| now < allowed) {
+                return Ok(());
             }
-            *schedule = Some((basis, now + PUBLISH_INTERVAL));
+            *schedule = Some(now + PUBLISH_INTERVAL);
         }
+        let Some(build) = self.database.lock().await.ranked_build()? else {
+            return Ok(());
+        };
         let Some((inventory, files)) = stage(&build, &self.memory, cancellation).await? else {
             return Ok(());
         };

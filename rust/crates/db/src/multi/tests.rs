@@ -84,7 +84,7 @@ fn live(n: u8) -> BTreeSet<IpAddr> {
 }
 
 #[tokio::test]
-async fn ranked_catalog_replays_at_its_exact_cut_and_refuses_a_stale_build() {
+async fn ranked_catalog_replays_at_the_built_cut_after_later_writes() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
@@ -107,11 +107,13 @@ async fn ranked_catalog_replays_at_its_exact_cut_and_refuses_a_stale_build() {
 
     let second = writer.transact(&put(2, 2, "second")).await.unwrap();
     let second = rtdb_index::branches::BranchCut { basis: second.basis, system_time: second.system_time };
-    let stale = writer.ranked_build().unwrap().unwrap();
-    writer.transact(&put(3, 3, "third")).await.unwrap();
-    writer.publish_ranked_catalog(stale, vec![2], vec![Bytes::from_static(b"stale")], &memory).await.unwrap();
+    let build = writer.ranked_build().unwrap().unwrap();
+    let third = writer.transact(&put(3, 3, "third")).await.unwrap();
+    let third = rtdb_index::branches::BranchCut { basis: third.basis, system_time: third.system_time };
+    writer.publish_ranked_catalog(build, vec![2], vec![Bytes::from_static(b"second trie")], &memory).await.unwrap();
     follower.fresh_index().await.unwrap();
-    assert!(follower.ranked_publication(second).is_none());
+    assert_eq!(follower.ranked_publication(second).unwrap().open(&memory).await.unwrap().cut, second);
+    assert!(follower.ranked_publication(third).is_none());
     assert!(follower.ranked_publication(first).is_some());
     assert!(follower.ranked_publication(rtdb_index::branches::BranchCut {
         system_time: Timestamp(first.system_time.0 + 1), ..first

@@ -71,13 +71,7 @@ impl MultiDatabase {
         let state = self.state();
         let index = state.transactions.index();
         let cut = index.head();
-        if cut.basis.position() == 0
-            || index.has_custody_groups()
-            || index.has_visibility_history()
-            || state.transactions.pending_erasure().is_some()
-            || state.transactions.recover_pending().is_some()
-            || self.ranked_record(cut).is_some()
-        {
+        if !self.may_publish_ranked(cut) {
             return Ok(None);
         }
         Ok(Some(RankedBuild {
@@ -98,11 +92,8 @@ impl MultiDatabase {
         self.refresh().await?;
         let lease = self.authority()?;
         self.require_armed_rotation()?;
-        let Some(current) = self.ranked_build()? else {
-            return Ok(());
-        };
-        if (build.cut, build.epoch, build.generation)
-            != (current.cut, current.epoch, current.generation)
+        if (build.epoch, build.generation) != (lease.epoch.0, self.state().generation)
+            || !self.may_publish_ranked(build.cut)
         {
             return Ok(());
         }
@@ -201,6 +192,19 @@ impl MultiDatabase {
             }
             _ => None,
         })
+    }
+
+    fn may_publish_ranked(&self, cut: BranchCut) -> bool {
+        let state = self.state();
+        let index = state.transactions.index();
+        cut.basis.position() != 0
+            && index.require_local_custody().is_ok()
+            && !index.has_custody_groups()
+            && !index.has_visibility_history()
+            && state.transactions.pending_erasure().is_none()
+            && state.transactions.recover_pending().is_none()
+            && index.exact(cut.basis).ok() == Some(cut)
+            && self.ranked_record(cut).is_none()
     }
 }
 

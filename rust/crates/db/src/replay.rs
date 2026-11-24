@@ -308,12 +308,16 @@ impl Committed {
                 checkpoint.key_generation
             }
             Record::RankedCatalog(catalog) => {
+                let cut = BranchCut {
+                    basis: Basis::new(previous.basis.incarnation(), catalog.position),
+                    system_time: Timestamp(catalog.system_time),
+                };
                 if catalog.manifest.database.as_bytes() != &previous.basis.incarnation()
                     || catalog.manifest.epoch != entry.epoch.0
                     || self.lease.map(|(epoch, _)| epoch) != Some(entry.epoch)
                     || catalog.key_generation != self.generation
-                    || catalog.position != previous.basis.position()
-                    || catalog.system_time != previous.system_time.0
+                    || catalog.position == 0
+                    || self.transactions.index().exact(cut.basis).ok() != Some(cut)
                     || self.transactions.recover_pending().is_some()
                     || self.transactions.pending_erasure().is_some()
                 {

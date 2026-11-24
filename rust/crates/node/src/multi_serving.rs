@@ -55,7 +55,7 @@ pub struct MultiServing {
     tokens: TokenAuthority,
     memory: Arc<MemoryBudget>,
     route: Option<Arc<dyn MultiWriteRoute>>,
-    ranked_schedule: Mutex<Option<(Basis, Instant)>>,
+    ranked_schedule: Mutex<Option<Instant>>,
 }
 
 pub struct MultiFollower {
@@ -957,7 +957,6 @@ mod tests {
             writer.query_ranked_ivf(source(written.basis), &target, Timestamp(10), &cancel).await.err().unwrap().code,
             "rtdb.vector/native-uncovered",
         );
-        *writer.ranked_schedule.lock().await = Some((written.basis, Instant::now()));
         writer.maintain_ranked_catalog(&cancel).await.unwrap();
 
         let follower = Arc::new(MultiServing::new(open(1), Arc::clone(&memory)));
@@ -996,7 +995,6 @@ mod tests {
         let restored = destination.restore_checkpoint(export, &cancel).await.unwrap();
         assert_eq!(restored.basis.incarnation(), *Uuid::from_u128(2).as_bytes());
         assert!(destination.query_ranked_ivf(source(restored.basis), &target, Timestamp(10), &cancel).await.is_err());
-        *destination.ranked_schedule.lock().await = Some((restored.basis, Instant::now()));
         destination.maintain_ranked_catalog(&cancel).await.unwrap();
         let (view, _) = destination.query_ranked_ivf(source(restored.basis), &target, Timestamp(10), &cancel).await.unwrap();
         assert_eq!(view.cut, restored);

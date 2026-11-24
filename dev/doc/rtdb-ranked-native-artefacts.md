@@ -46,7 +46,8 @@ An empty persisted inventory, a live tail, missing or invalid objects, unmatched
 ## Multi publication and mount
 
 The Multi writer selects a settled merged-main basis and its ordered IVF declarations.
-Maintenance waits for a stable cut before staging primary level-zero tries and their IVF files with the common Arrow writers.
+Maintenance stages primary level-zero tries and their IVF files with the common Arrow writers.
+Later writes can advance the head while the writer builds the selected cut.
 The writer seals each file into its own allocation at the selected storage key generation and commits the complete manifest under its journal epoch.
 The publication binds the database incarnation, basis, system clock, declaration generations, primary owners, lengths, IVF locators and provider versions.
 The journal retains that root with its files until trim.
