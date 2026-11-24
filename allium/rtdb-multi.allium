@@ -860,6 +860,10 @@ contract FencedStreamWriter {
         -- A checkpoint image carries the applied transaction cut, active pins and the publishing writer's lease.
         -- A follower starts from the retained checkpoint and applies its committed suffix in position order.
 
+    @invariant AppliedServingCut
+        -- A linearizable query captures a fresh journal head and reads the applied branch view at that prefix.
+        -- A tracked query authenticates the branch, layer and applied basis used by the query.
+        -- Changes reports only settled effects, with coverage derived from the retained journal interval.
 }
 
 contract EpochScopedStorage {
