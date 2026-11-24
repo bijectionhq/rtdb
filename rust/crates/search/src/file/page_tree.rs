@@ -463,26 +463,30 @@ impl TreeReader {
     }
 
     pub async fn find_ordinals(&self, directory: DirectoryRef, ordinals: Vec<usize>) -> Result<Vec<(usize, PageRef)>> {
-        if ordinals.is_empty() { return Ok(Vec::new()); }
         let keys: Vec<_> = ordinals.iter().map(|&ordinal| super::tree_file::ordinal(ordinal)).collect();
-        let mut found = Vec::with_capacity(keys.len());
+        ordinals.into_iter().zip(self.find_sorted_keys(directory, &keys).await?).map(|(ordinal, page)| {
+            page.map(|page| (ordinal, page)).ok_or_else(|| corrupt("Search page is absent from its directory"))
+        }).collect()
+    }
+
+    pub(super) async fn find_sorted_keys<K: AsRef<[u8]> + Sync>(&self, directory: DirectoryRef, keys: &[K]) -> Result<Vec<Option<PageRef>>> {
+        if keys.is_empty() { return Ok(Vec::new()); }
         let mut level = vec![(directory.page, 0..keys.len())];
         for _ in 0..directory.height {
-            let keys = &keys;
             level = futures::stream::iter(level).map(|(page, rows)| async move {
                 let children = self.children(page).await?;
                 let selected = &keys[rows.clone()];
                 let mut following = Vec::new();
                 for child in children {
-                    let first = selected.partition_point(|key| key.as_slice() < child.lower.as_slice());
-                    let last = selected.partition_point(|key| key.as_slice() <= child.upper.as_slice());
+                    let first = selected.partition_point(|key| key.as_ref() < child.lower.as_slice());
+                    let last = selected.partition_point(|key| key.as_ref() <= child.upper.as_slice());
                     if first < last { following.push((child.page, rows.start + first..rows.start + last)); }
                 }
                 Ok::<_, rtdb_types::Anomaly>(following)
             }).buffered(8).try_concat().await?;
         }
-        for (page, rows) in level { found.extend(ordinals[rows].iter().map(|&ordinal| (ordinal, page))); }
-        if found.len() != ordinals.len() { return Err(corrupt("Search page is absent from its directory")); }
+        let mut found = vec![None; keys.len()];
+        for (page, rows) in level { found[rows].fill(Some(page)); }
         Ok(found)
     }
 
@@ -553,6 +557,10 @@ mod tests {
 
         assert_eq!(reader.find(directory, &ordinal(second)).await?, Some(second_leaf));
         assert_eq!(reader.find(directory, &ordinal(1)).await?, None);
+        assert_eq!(
+            reader.find_sorted_keys(directory, &[ordinal(first), ordinal(first), ordinal(1), ordinal(second)]).await?,
+            vec![Some(first_leaf), Some(first_leaf), None, Some(second_leaf)],
+        );
         assert_eq!(reader.find_ordinals(directory, vec![first, second]).await?, vec![(first, first_leaf), (second, second_leaf)]);
         assert_eq!(pool.pool_retained_bytes(), 0);
         Ok(())

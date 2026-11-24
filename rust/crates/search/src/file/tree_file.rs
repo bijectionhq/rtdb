@@ -656,16 +656,33 @@ impl TreeFile {
         if self.format >= PACKED_FORMAT_VERSION && !table(&self.root, Table::Terms).is_empty() {
             return Ok(names.iter().map(|_| Some(self.root.clone())).collect());
         }
-        let mut in_flight = futures::stream::FuturesOrdered::new();
-        let mut requests = Vec::with_capacity(names.len());
-        for name in names {
-            let key = term_key(column, name);
-            in_flight.push_back(async move { self.reference(TERM, &key).await }.boxed());
-            if in_flight.len() == 8 {
-                requests.push(in_flight.try_next().await?.expect("queued term returns its reference"));
+        let requests = if let Some(children) = self.routes.get(&TERM) {
+            names.iter().map(|name| direct_reference(children, &term_key(column, name))).collect::<Vec<_>>()
+        } else {
+            let mut positions: Vec<_> = names.iter().enumerate().map(|(i, name)| (term_key(column, name), i)).collect();
+            positions.sort_unstable();
+            let keys: Vec<_> = positions.iter().map(|(key, _)| key.as_slice()).collect();
+            match self.reader.find_sorted_keys(self.directories[&TERM], &keys).await {
+                Ok(pages) => {
+                    let mut requests = vec![None; names.len()];
+                    for ((_, position), page) in positions.into_iter().zip(pages) { requests[position] = page; }
+                    requests
+                },
+                Err(_) => {
+                    let mut in_flight = futures::stream::FuturesOrdered::new();
+                    let mut requests = Vec::with_capacity(names.len());
+                    for name in names {
+                        let key = term_key(column, name);
+                        in_flight.push_back(async move { self.reference(TERM, &key).await }.boxed());
+                        if in_flight.len() == 8 {
+                            requests.push(in_flight.try_next().await?.expect("queued term returns its reference"));
+                        }
+                    }
+                    while let Some(reference) = in_flight.try_next().await? { requests.push(reference); }
+                    requests
+                },
             }
-        }
-        while let Some(reference) = in_flight.try_next().await? { requests.push(reference); }
+        };
         let unique = requests.iter().flatten().copied().collect::<BTreeSet<_>>().into_iter().collect();
         let pages = self.reader.pages(unique, PageKind::Terms).await?;
         Ok(requests.into_iter().map(|request| request.map(|page| pages[&page].clone())).collect())
