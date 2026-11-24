@@ -15,6 +15,9 @@
 -- Arming requires an exact position census through the observed broker tip and preserves every key in the retained suffix.
 -- The provider persists the key admission floor before withdrawing slots and resumes withdrawal from durable progress.
 -- Classic retention continues to settle keys through the broker's verified floor.
+-- Local erasure persists the exact replacement root as a recovery floor before closing either sealed log prefix.
+-- Both local prefixes bind the same ordered checkpoint digest and original deadline.
+-- Per-frame withdrawal preserves the log record coordinates and the suffix used to replay the retirement record.
 -- A default attachment with a stable branch authority shares main-branch relation effects between the physical partition and the v1 transaction fold.
 -- Default development and the bundled default cluster configuration enable this route for the primary database.
 -- Replicas use the incarnation published in that database's object store.

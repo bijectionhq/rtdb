@@ -682,6 +682,7 @@ impl ReplicationDriver {
                 (!waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands())
                     || leader.deferred_commands.len() < 128
             });
+            let retry_erasure = self.retry_default_erasure();
             let check_capacity = waiting_for_checkpoint && self.pending_block.is_none()
                 && self.leader.as_ref().is_some_and(|leader| leader.confirmed && leader.accepting());
             let mut empty_poll = None;
@@ -709,7 +710,7 @@ impl ReplicationDriver {
                 _ = async {}, if ready_source => Event::Source,
                 _ = async {}, if ready_deferred => Event::Deferred,
                 command = self.commands.recv(), if accept_commands => Event::Command(command),
-                _ = capacity_poll.tick(), if check_capacity => Event::Capacity,
+                _ = capacity_poll.tick(), if check_capacity || retry_erasure => Event::Capacity,
             };
             match event {
                 Event::ReplicaBatch(tail, records) => {
@@ -754,7 +755,7 @@ impl ReplicationDriver {
                 Event::Command(Some(command)) => self.command(command).await?,
                 Event::Command(None) => return Ok(()),
                 Event::Capacity => {
-                    if let Ok(Some(capacity)) = self.logs.available_append_capacity().await {
+                    if check_capacity && let Ok(Some(capacity)) = self.logs.available_append_capacity().await {
                         self.advance_capacity_checkpoint(capacity).await?;
                     }
                 }

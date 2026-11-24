@@ -64,7 +64,10 @@ pub(crate) struct ErasureRetirement {
 pub(crate) enum DefaultErasure {
     Applied(AppliedErasure),
     Selected(SelectedRewrite),
-    Retiring(ErasureRetirement),
+    Retiring {
+        intent: ErasureRetirement,
+        local_logs_settled: bool,
+    },
 }
 
 impl AppliedErasure {
@@ -100,6 +103,7 @@ impl AppliedErasure {
         {
             return Err(invalid());
         }
+        logs.local_erasure_logs().ok_or_else(unsupported)?;
         let local = logs.local_recovery_store().ok_or_else(unsupported)?;
         let custody = local.hold_recovery_open().await?;
         let store = blocks.object_store();
@@ -236,8 +240,7 @@ pub(crate) async fn recover_rewrite(
     let Some(evidence) = serving::checkpoint_rewrite(image.bytes())? else {
         return Ok(None);
     };
-    if logs.local_recovery_store().is_none()
-        || blocks.object_store().local_classic_key_slots().is_none()
+    if blocks.object_store().local_classic_key_slots().is_none()
     {
         return Err(unsupported());
     }
@@ -333,6 +336,36 @@ impl SelectedRewrite {
 }
 
 impl ErasureRetirement {
+    pub async fn settle_local_logs(self, logs: &PartitionLogs) -> Result<bool> {
+        use rtdb_storage::{LocalErasureRecovery, log::LocalLogRetirement};
+        let (source, replica) = logs.local_erasure_logs().ok_or_else(unsupported)?;
+        let local = logs.local_recovery_store().ok_or_else(unsupported)?;
+        let plan = |through| LocalLogRetirement {
+            through,
+            checkpoint_sha256: self.root_sha256,
+            unreadable_by: self.unreadable_by,
+        };
+        let source_plan = plan(self.evidence.cut.source.after_offset(logs.source_epoch));
+        let replica_plan = plan(self.evidence.boundary.after_offset(logs.replica_epoch));
+        source.validate_erasure_prefix(source_plan).await?;
+        replica.validate_erasure_prefix(replica_plan).await?;
+        if !local
+            .close_erasure_recovery(LocalErasureRecovery {
+                block: self.block,
+                boundary: self.evidence.boundary,
+                source: self.evidence.cut.source,
+                root_sha256: self.root_sha256,
+                unreadable_by: self.unreadable_by,
+            })
+            .await?
+        {
+            return Ok(false);
+        }
+        let source_done = source.settle_erasure_prefix(source_plan).await?;
+        let replica_done = replica.settle_erasure_prefix(replica_plan).await?;
+        Ok(source_done && replica_done)
+    }
+
     pub fn observe(selected: SelectedRewrite, upper: Timestamp, lease_micros: u64) -> Result<Self> {
         let upload = selected.uploaded.ok_or_else(invalid)?;
         let unreadable_by = upper

@@ -277,7 +277,9 @@ impl BlockStore {
     /// Restore an exact published business checkpoint without opening its receipt tables.
     pub async fn recover_held(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, checkpoint: PublishedCheckpoint) -> Result<RecoveredPartition> {
         IoRegion::reading_recovery(self.store.as_ref(), async {
+            self.require_recovery_floor(checkpoint.block, None).await?;
             let block = self.load_fresh_catalog(checkpoint.block).await?;
+            self.require_recovery_floor(checkpoint.block, Some(&block)).await?;
             if checkpoint.root_sha256.is_none() || block.publication_sha256() != checkpoint.root_sha256 || !checkpoint.accepts(&block) {
                 return Err(invalid("The held checkpoint does not match its exact published root"));
             }
@@ -361,14 +363,22 @@ impl BlockStore {
                 Some(previous) => crate::checkpoint_discovery::newer_checkpoint(previous.0, latest.map(|index| index.0)).map(BlockIndex),
                 None => latest,
             };
-            let Some(mut index) = selected else { return Ok(None); };
+            let Some(mut index) = selected else {
+                self.require_recovery_floor(BlockIndex(-1), None).await?;
+                return Ok(None);
+            };
             let root_sha256 = match discovery {
                 BlockDiscovery::FromRestored { root_sha256, .. } => root_sha256,
                 _ => published.and_then(|checkpoint| checkpoint.root_sha256),
             };
             let refresh = root_sha256.is_none() && matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
             loop {
+                self.require_recovery_floor(index, None).await?;
                 match self.load_checkpoint(index, published, root_sha256).await {
+                    Ok((catalog, tables)) => {
+                        self.require_recovery_floor(index, Some(&catalog)).await?;
+                        return Ok(Some((catalog, tables)));
+                    }
                     Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
                         let listed = self.latest_block(BlockDiscovery::List).await?.map(|index| index.0);
                         let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
@@ -376,10 +386,21 @@ impl BlockStore {
                         };
                         index = BlockIndex(next);
                     }
-                    result => return result.map(Some),
+                    Err(error) => return Err(error),
                 }
             }
         }).await
+    }
+
+    async fn require_recovery_floor(&self, block: BlockIndex, catalog: Option<&BlockCatalog>) -> Result<()> {
+        let Some(local) = self.store.local_maintenance_store() else { return Ok(()); };
+        let Some(fence) = local.erasure_recovery_fence().await? else { return Ok(()); };
+        if let Some(catalog) = catalog {
+            fence.require(block, catalog.latest_source_position(), catalog.boundary_replica_position(), catalog.publication_sha256())?;
+        } else if block < fence.block {
+            return Err(rtdb_crypt::erased_under_view());
+        }
+        Ok(())
     }
 
     async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
@@ -396,6 +417,7 @@ impl BlockStore {
             BlockDiscovery::FromRestored { checkpoint, root_sha256: Some(_), .. } => BlockDiscovery::At(checkpoint),
             other => other,
         };
+        if let BlockDiscovery::At(block) = discovery { self.require_recovery_floor(block, None).await?; }
         let mut latest = match discovery {
             BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
             BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),

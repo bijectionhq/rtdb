@@ -4,7 +4,7 @@ pub(crate) mod local;
 mod memory;
 mod read_only;
 
-pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
+pub use local::{LocalLog, LocalLogDriver, LocalLogOptions, LocalLogRetirement};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
@@ -283,6 +283,8 @@ impl AppendBuffer {
 
 #[async_trait]
 pub trait Log: Send + Sync {
+    /// Supplies the opened sealed local log that can retire its own checkpoint-covered prefix.
+    fn local_erasure_log(&self) -> Option<&LocalLog> { None }
     /// The identity stored in the opened native replica journal, if it has a lineage header.
     fn journal_lineage(&self) -> Option<uuid::Uuid> { None }
     fn shared(&self) -> Option<&dyn SharedLog> { None }

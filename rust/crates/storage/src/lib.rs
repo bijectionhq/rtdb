@@ -11,11 +11,13 @@ pub mod read_lease;
 pub mod sealing;
 mod lease_decision;
 mod local_catalog;
+mod local_erasure;
 mod classic_catalog_drain;
 mod classic_retirement;
 mod repair_anchor_decision;
 mod remote_version_step;
 pub use local_catalog::LocalRepairAnchor;
+pub use local_erasure::LocalErasureRecovery;
 mod durability;
 pub use durability::{sync_directory, sync_file};
 #[cfg(feature = "remote")]

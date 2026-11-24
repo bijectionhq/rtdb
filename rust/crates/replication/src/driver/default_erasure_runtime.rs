@@ -48,8 +48,31 @@ impl ReplicationDriver {
                     &self.resolve.memory,
                 )
             }
+            Some(DefaultErasure::Retiring {
+                intent,
+                local_logs_settled: false,
+            }) => {
+                let intent = *intent;
+                let local_logs_settled = intent.settle_local_logs(&self.logs).await?;
+                self.default_erasure = Some(DefaultErasure::Retiring {
+                    intent,
+                    local_logs_settled,
+                });
+                Ok(())
+            }
             _ => Ok(()),
         }
+    }
+
+    pub(super) fn retry_default_erasure(&self) -> bool {
+        self.leader.as_ref().is_some_and(|leader| leader.confirmed)
+            && matches!(
+                self.default_erasure,
+                Some(DefaultErasure::Retiring {
+                    local_logs_settled: false,
+                    ..
+                })
+            )
     }
 
     pub(super) fn require_default_erasure_order(&self, record: &ReplicaRecord) -> Result<()> {
@@ -60,7 +83,7 @@ impl ReplicationDriver {
                 ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_),
             ) => true,
             (
-                Some(DefaultErasure::Selected(_) | DefaultErasure::Retiring(_)),
+                Some(DefaultErasure::Selected(_) | DefaultErasure::Retiring { .. }),
                 ReplicaBody::BlockUploaded(_),
             ) => true,
             (Some(_), ReplicaBody::NoOp(message)) => ErasureRetirement::decode(message)?.is_some(),
@@ -81,7 +104,8 @@ impl ReplicationDriver {
         let Some(intent) = ErasureRetirement::decode(message)? else {
             return Ok(false);
         };
-        if let Some(DefaultErasure::Retiring(prior)) = self.default_erasure.as_ref() {
+        if let Some(DefaultErasure::Retiring { intent: prior, .. }) = self.default_erasure.as_ref()
+        {
             return if prior == &intent {
                 Ok(true)
             } else {
@@ -92,7 +116,10 @@ impl ReplicationDriver {
             return Err(default_erasure::invalid());
         };
         intent.require_selected(*selected, position)?;
-        self.default_erasure = Some(DefaultErasure::Retiring(intent));
+        self.default_erasure = Some(DefaultErasure::Retiring {
+            intent,
+            local_logs_settled: false,
+        });
         Ok(true)
     }
 

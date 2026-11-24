@@ -157,6 +157,9 @@ impl PartitionLogs {
     pub(crate) fn recovery_block_store(&self, file_size_target: i64) -> Result<Arc<crate::BlockStore>> {
         crate::BlockStore::new(Arc::clone(&self.store), Arc::clone(&self.cache), Arc::clone(&self.memory), file_size_target)
     }
+    pub(crate) fn local_erasure_logs(&self) -> Option<(&rtdb_storage::log::LocalLog, &rtdb_storage::log::LocalLog)> {
+        Some((self.source.local_erasure_log()?, self.replica.local_erasure_log()?))
+    }
     pub(crate) fn requires_checkpoint_digest(&self) -> bool { self.replica.requires_checkpoint_digest() }
     pub(crate) async fn confirms_recovery_checkpoint(&self, catalog: &rtdb_format::catalog::BlockCatalog) -> bool {
         if !self.replica.needs_published_recovery_checkpoint() { return true; }

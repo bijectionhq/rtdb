@@ -13,6 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+pub(crate) mod erasure;
+pub use erasure::LocalLogRetirement;
+
 const HEADER_BYTES: u64 = 13;
 const TRAILER_BYTES: u64 = 8;
 const RECORD_SEPARATOR: u8 = 0x1e;
@@ -502,6 +505,7 @@ impl LocalLog {
                 file.stream_position().map_err(|error| Error::io(path.as_path(), error))
             }).await?
         };
+        if let Some(keys) = &self.keys { keys.require_local_offset(next as i64)?; }
         Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() })
     }
 }
@@ -521,6 +525,7 @@ impl super::SharedLog for LocalLog {
 
 #[async_trait]
 impl Log for LocalLog {
+    fn local_erasure_log(&self) -> Option<&LocalLog> { self.keys.as_ref().map(|_| self) }
     fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
     fn shared(&self) -> Option<&dyn super::SharedLog> { Some(self) }
     fn retains_synced_history(&self) -> bool { true }
