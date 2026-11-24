@@ -768,6 +768,7 @@ contract LogService {
 
     @invariant TimedAppendRequiresProviderSupport
         -- A request with a journal cutoff can stage an accepting record only if its installed provider can enforce timed original quorum durability during append and recovery.
+        -- A funded DecisionClock acceptance commits the exact canonical admission and original certificate under the active writer's timed quorum.
         -- A writer-local staging sample carries only staging authority.
 
     @invariant GuardedTailRequiresOriginalQuorum

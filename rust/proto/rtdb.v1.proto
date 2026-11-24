@@ -9,6 +9,7 @@ import "google/protobuf/empty.proto";
 service Rtdb {
   rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
   rpc Query(QueryRequest) returns (stream QueryFrame);
+  rpc OfferDecisionClock(OfferDecisionClockRequest) returns (DecisionClockOffer);
   rpc Transact(TransactRequest) returns (Receipt);
   rpc TxStatus(TxStatusRequest) returns (Receipt);
   rpc Changes(ChangesRequest) returns (stream ChangesFrame);
@@ -205,8 +206,22 @@ message TransactRequest {
   repeated Op otherwise = 6;
   // Preconditions on the original state. CountAtMost uses WHEN_BEFORE here.
   repeated Guard requires = 7;
+  // Funded requests also list transact.decision-clock-offer in require.
+  optional bytes decision_clock_offer = 8;
 }
 message TxStatusRequest { bytes key = 1; }
+message OfferDecisionClockRequest {
+  // The exact logical Transact to book, with decision_clock_offer absent.
+  TransactRequest transaction = 1;
+  Basis predecessor = 2;
+}
+message DecisionClockOffer {
+  bytes booking = 1;
+  Basis predecessor = 2;
+  // Original writer coordinates are omitted from a scoped response.
+  optional sint64 reading_micros = 3;
+  optional sint64 before_micros = 4;
+}
 
 message WorkloadHolder { bytes assignment_id = 1; string holder = 2; }
 message WorkloadPlacement { uint64 epoch = 1; WorkloadHolder assignment = 2; }
@@ -508,6 +523,7 @@ message Receipt {
   }
   bool replayed = 7;
   Erasure erasure = 8;
+  DecisionClockOffer decision_clock = 9;
 }
 enum Order { ORDER_ASCENDING = 0; ORDER_DESCENDING = 1; }
 enum Images {

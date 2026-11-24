@@ -196,6 +196,19 @@ surface StatelessDatabase {
         -- Classic-only receipt controls preserve the original lookup identity through authenticated read-through.
         -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
 
+    @guarantee FundedDecisionClock
+        -- A writer advertises transact.decision-clock-offer after installing an authenticated receiver clock, a certificate verifier and a journal provider that attests the timed original quorum.
+        -- A funded request lists transact.decision-clock-offer among its required capabilities.
+        -- OfferDecisionClock books the exact canonical Transact request and predecessor under the caller's existing receipt key and namespace.
+        -- A retry of that booking recovers the original seat.
+        -- Transact field 8 consumes the seat under the same request, caller and incarnation.
+        -- The original receiver lineage and the inclusive lower and exclusive upper bounds govern eligibility.
+        -- The advertised reading supplies transaction-relative terms.
+        -- The original-quorum append binds the receiver certificate and exclusive journal cutoff to the exact accepting record.
+        -- Receipt field 9 preserves the original offer on terminal acknowledgement and keyed recovery.
+        -- A scoped request evaluates an effect-free validation against its projected history and returns only the opaque booking and projected predecessor.
+        -- Independently identical receiver evidence and projected histories produce identical scoped outcomes.
+
     @guarantee TransactionRequirements
         -- A write route that supports requirements advertises transact.requires.
         -- TransactRequest carries the ordered requires list as repeated Guard at protobuf field 7.

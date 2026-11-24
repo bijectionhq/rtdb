@@ -1,9 +1,10 @@
 //! The live receiver's independently ordered clock, separate from history time and source append time.
-use rtdb_types::{Anomaly, Result, Timestamp, TxId};
+use rtdb_types::{Anomaly, Result, TimedJournalCutoff, Timestamp, TxId, rtdb_v1::Basis};
+use serde::{Deserialize, Serialize};
 
 use crate::OwnedClockSlot;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionObservation {
     pub domain: [u8; 16],
     pub epoch: u64,
@@ -95,6 +96,21 @@ fn invalid_observation() -> Anomaly {
 #[async_trait::async_trait]
 pub trait DecisionClock: Send + Sync {
     async fn observe(&self) -> Result<DecisionObservation>;
+
+    fn supports_funded_offers(&self) -> bool { false }
+
+    /// An installed verifier supplies the original receiver certificate's cutoffs.
+    async fn authorize_offer(
+        &self, _predecessor: Basis, _receiver: DecisionObservation, _before: Timestamp,
+    ) -> Result<FundedCutoff> {
+        Err(crate::transact::funding_unsupported())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FundedCutoff {
+    pub decision_before: Timestamp,
+    pub journal: TimedJournalCutoff,
 }
 
 #[cfg(test)]

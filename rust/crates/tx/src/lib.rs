@@ -1,6 +1,6 @@
 mod decision_clock;
 pub mod transact;
-pub use decision_clock::{DecisionClock, DecisionObservation, OrderedClockEvidence};
+pub use decision_clock::{DecisionClock, DecisionObservation, FundedCutoff, OrderedClockEvidence};
 
 mod values;
 mod ipc;

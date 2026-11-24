@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
-    ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ROW_VISIBILITY,
+    ChangeGroup, ChangeOrder, ChangePage, Changes, FundingSubmission, QuerySource, QueryView, ROW_VISIBILITY,
     ServingDriver, ServingScope, WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
@@ -481,6 +481,20 @@ impl ServingDriver for MultiServing {
     async fn transact_scoped(&self, request: Transact, scope: ServingScope,
                              cancellation: &CancellationToken) -> Result<Receipt> {
         self.transact_routed(request, Some(scope), cancellation).await
+    }
+
+    async fn supports_funded_transact(&self) -> bool {
+        self.database.lock().await.supports_funded_transact()
+    }
+
+    async fn transact_funded(
+        &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
+        cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        let scope = scope.map(|scope| (scope.labels, scope.receipt_namespace));
+        cancellation.run_until_cancelled(self.writes.transact_funded(
+            request, scope, funding.owner, funding.command, funding.clock,
+        )).await.ok_or_else(interrupted)?
     }
 
     async fn tx_status_scoped(&self, key: &[u8], scope: &ServingScope,

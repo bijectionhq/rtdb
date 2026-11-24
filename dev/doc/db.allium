@@ -98,6 +98,8 @@
 -- The matching term-admitted read-back advances the applied branch fold and source position, releases the receipt and publishes settled effect keys with the applied basis.
 -- A timed original retains its source position for recovery, and read-back of Settle or Refuse installs that source position and the final receipt.
 -- A writer recovering a timed original orders Refuse before it resumes the source after that position.
+-- A funded DecisionClock source request carries the canonical request and the authenticated booking command in one admission.
+-- The confirmed writer resolves funded acceptance against installed receiver evidence and orders the accepting record through the timed original quorum.
 -- Read-only validation answers at a linearizable applied cut.
 -- A block produced for the branch attachment carries its fold and receipt checkpoint at the block boundary.
 -- An append receipt reports the durable position and timestamp of the record.

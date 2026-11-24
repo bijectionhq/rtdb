@@ -4,7 +4,7 @@ use super::*;
 
 impl Candidate<'_> {
     pub(super) fn execute(&mut self, ops: &[Op], request_key: &[u8], before: Option<Timestamp>) -> Result<()> {
-        let cut = self.index.head();
+        let cut = self.terms();
         for (index, op) in ops.iter().enumerate() {
             match op {
                 Op::Put { branch, table, rows, if_absent } => {
@@ -208,7 +208,7 @@ impl Candidate<'_> {
     }
 
     fn put_image(&mut self, branch: &str, table: &TableRef, definition: &BranchTable, row: &Row) -> Result<(Interval, Arc<RowImage>)> {
-        let cut = self.index.head();
+        let cut = self.terms();
         if let Some(group) = row.custody_group {
             self.require_unrestricted()?;
             if !self.index.custody_group_live(group)? {
@@ -262,7 +262,7 @@ impl Candidate<'_> {
     }
 
     fn view<'a>(&'a self, branch: &'a str, layer: Layer) -> Result<BranchView<'a>> {
-        self.index.view(branch, At::Latest, layer, self.index.head().system_time)
+        self.index.view(branch, At::Latest, layer, self.terms().system_time)
     }
 
     fn write(&mut self, branch: &str, table: &TableRef, id: EntityId, valid: Interval, image: Option<Arc<RowImage>>) -> Result<()> {
@@ -383,7 +383,7 @@ impl Candidate<'_> {
 
     fn declare(&mut self, table: &TableRef, change: &Declaration) -> Result<()> {
         validate_table(table)?;
-        let cut = self.index.head();
+        let cut = self.terms();
         let mut definition = self.index.definition(table, cut.basis).cloned().unwrap_or_default();
         if definition.dropped && !matches!(change, Declaration::Schema(_)) {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-table", "Redeclaring a dropped table requires its schema"));
@@ -534,7 +534,7 @@ impl Candidate<'_> {
     }
 
     pub(super) fn check_constraints(&self) -> Result<()> {
-        let cut = self.index.head();
+        let cut = self.terms();
         for (table, definition) in self.index.tables(cut.basis) {
             if definition.constraints.is_empty() && definition.grouped_constraints.is_empty() { continue; }
             for branch in self.index.active_names(cut.system_time) {

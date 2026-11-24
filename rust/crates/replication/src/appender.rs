@@ -214,7 +214,11 @@ impl ReplicaAppender {
                         }
                         _ => body,
                     };
-                    let guarded = matches!(body, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
+                    let guarded = match body {
+                        ReplicaBody::ResolvedTx(tx) => tx.acceptance_stage.is_some(),
+                        ReplicaBody::NoOp(message) => crate::serving::is_funded_original(message),
+                        _ => false,
+                    };
                     let observation = self.durable_commit_observation(&request.write.body);
                     let enqueue = self.logs.enqueue_replica_with(self.term, Some(sequence), body, request.write.block, || (self.clock)(), allow_offload,
                         |frame| request.write.stamp_append(sequence, frame));

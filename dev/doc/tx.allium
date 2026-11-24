@@ -1872,6 +1872,11 @@ invariant TimedEffectsFollowSettle {
         EffectsVisible(tx) implies Settled(tx)
 }
 
+-- A funded DecisionClock booking orders a canonical receipt admission with the exact predecessor and authenticated receiver lineage.
+-- The terminal record consumes that seat under the same receipt identity and preserves the original clock and outcome.
+-- A funded accepting record requires a certificate-bound append under the original quorum before its exclusive cutoff.
+-- A funded scoped validation resolves against the projected history at the advertised reading.
+
 ---- Open Questions
 
 open question "AutoCommitDml stamps opts with user and default_tz only. Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"

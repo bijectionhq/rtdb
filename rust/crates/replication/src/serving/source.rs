@@ -20,12 +20,21 @@ pub(crate) struct SourceAuthority {
 
 #[derive(Serialize, Deserialize)]
 struct Admission<C> {
-    request: Box<RawValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<Box<RawValue>>,
     scope: Option<NativeServingScope>,
     claims: C,
     custody_request_digest: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    funded: Option<FundedAdmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     release: Option<ReleaseAdmission>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FundedAdmission {
+    request: Box<RawValue>,
+    input: rtdb_tx::transact::FundingInput,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,15 +91,21 @@ impl SourceAuthority {
     pub(super) async fn seal_release(&self, command: TrustedCustodyCommand) -> Result<Bytes> {
         let transaction = command.clone().into_request()?;
         let release = ReleaseAdmission { namespace: CUSTODY_RELEASE_NAMESPACE, command };
-        self.seal_request(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default() }, Some(release)).await
+        self.seal_request(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default(), funding: None }, Some(release)).await
     }
 
     async fn seal_request(&self, request: NativeRequest, release: Option<ReleaseAdmission>) -> Result<Bytes> {
+        let canonical = request.transaction.canonical_request()?;
+        let (canonical, funded) = match request.funding {
+            Some(input) => (None, Some(FundedAdmission { request: canonical, input })),
+            None => (Some(canonical), None),
+        };
         let admission: Admission<VerifiedClaims> = Admission {
-            request: request.transaction.canonical_request()?,
+            request: canonical,
             scope: request.scope,
             claims: request.claims,
             custody_request_digest: request.transaction.custody_request_digest,
+            funded,
             release,
         };
         let bytes = serde_json::to_vec(&admission).map_err(super::encoding_error)?;
@@ -103,6 +118,12 @@ impl SourceAuthority {
         let request = (|| {
             let clear = key.open(self.incarnation, bytes)?;
             let admission: Admission<SourceClaims> = serde_json::from_slice(&clear).map_err(super::encoding_error)?;
+            let (request, funding) = match (admission.request, admission.funded) {
+                (Some(request), None) => (request, None),
+                (None, Some(funded)) if admission.release.is_none() && admission.custody_request_digest.is_none() =>
+                    (funded.request, Some(funded.input)),
+                _ => return Err(rtdb_tx::transact::funding_invalid()),
+            };
             let mut transaction = match admission.release {
                 Some(release) => {
                     if release.namespace != CUSTODY_RELEASE_NAMESPACE || admission.scope.is_some()
@@ -111,18 +132,18 @@ impl SourceAuthority {
                         return Err(invalid_release());
                     }
                     let transaction = release.command.into_request()?;
-                    if transaction.canonical_request()?.get() != admission.request.get() { return Err(invalid_release()); }
+                    if transaction.canonical_request()?.get() != request.get() { return Err(invalid_release()); }
                     transaction
                 }
                 None => {
                     if admission.scope.as_ref().is_some_and(|scope| scope.receipt_namespace == CUSTODY_RELEASE_NAMESPACE) {
                         return Err(invalid_release());
                     }
-                    Transact::decode_canonical_request(admission.request.get().as_bytes())?
+                    Transact::decode_canonical_request(request.get().as_bytes())?
                 }
             };
             transaction.custody_request_digest = admission.custody_request_digest;
-            Ok(NativeRequest { transaction, scope: admission.scope, claims: admission.claims })
+            Ok(NativeRequest { transaction, scope: admission.scope, claims: admission.claims, funding })
         })();
         Ok(request)
     }
@@ -178,7 +199,7 @@ mod tests {
         let claims = tokens.verify_claims_in(transaction.claims(), Some(&labels)).await;
         let scope = NativeServingScope { labels: labels.clone(), receipt_namespace: [4; 32] };
         let submitter = SourceAuthority::new(Arc::clone(&store), *database.as_bytes());
-        let bytes = submitter.seal(NativeRequest { transaction, scope: Some(scope), claims }).await.unwrap();
+        let bytes = submitter.seal(NativeRequest { transaction, scope: Some(scope), claims, funding: None }).await.unwrap();
 
         let writer = SourceAuthority::new(store, *database.as_bytes());
         let replay = writer.open(&bytes).await.unwrap().unwrap();
@@ -238,7 +259,7 @@ mod release_tests {
         assert_eq!(reopened.transaction.receipt_namespace(None), Some(CUSTODY_RELEASE_NAMESPACE));
         assert_eq!(reopened.transaction.canonical_request().unwrap().get(), canonical.get());
 
-        let request = || NativeRequest { transaction: command.clone().into_request(), scope: None, claims: VerifiedClaims::default() };
+        let request = || NativeRequest { transaction: command.clone().into_request(), scope: None, claims: VerifiedClaims::default(), funding: None };
         assert!(submitter.seal(request()).await.is_err());
         let mismatched_namespace = submitter.seal_request(request(), Some(ReleaseAdmission {
             namespace: [0; 32], command: TrustedCustodyCommand::Phase(command.clone()),
@@ -259,7 +280,7 @@ mod release_tests {
         let transaction = admit.clone().into_request().unwrap();
         let canonical = transaction.canonical_request().unwrap();
         assert!(Transact::decode_canonical_request(canonical.get().as_bytes()).is_err());
-        assert!(submitter.seal(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default() }).await.is_err());
+        assert!(submitter.seal(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default(), funding: None }).await.is_err());
         let sealed = submitter.seal_release(admit).await.unwrap();
         let reopened = writer.open(&sealed).await.unwrap().unwrap();
         assert_eq!(reopened.transaction.receipt_namespace(None), Some(CUSTODY_RELEASE_NAMESPACE));

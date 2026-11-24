@@ -38,6 +38,14 @@ type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
     Transact(Work),
+    Funded {
+        transaction: Transact,
+        scope: Option<Scope>,
+        owner: [u8; 32],
+        command: rtdb_tx::transact::FundingCommand,
+        clock: Arc<dyn rtdb_tx::DecisionClock>,
+        reply: Reply<Receipt>,
+    },
     Workload(workload::Request, Reply<workload::Reply>),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
     PublishRanked {
@@ -158,6 +166,14 @@ impl WritePipeline {
         self.request(|reply| Command::Workload(request, reply)).await
     }
 
+    pub async fn transact_funded(
+        &self, transaction: Transact, scope: Option<(LabelScope, [u8; 32])>, owner: [u8; 32],
+        command: rtdb_tx::transact::FundingCommand, clock: Arc<dyn rtdb_tx::DecisionClock>,
+    ) -> Result<Receipt> {
+        let scope = scope.map(|(labels, namespace)| Scope { labels, namespace });
+        self.request(|reply| Command::Funded { transaction, scope, owner, command, clock, reply }).await
+    }
+
     pub async fn tick(&self, live: BTreeSet<IpAddr>) -> Result<Role> {
         self.request(|reply| Command::Tick(live, reply)).await
     }
@@ -216,6 +232,24 @@ pub(super) struct Authority {
 }
 
 impl Authority {
+    async fn append_funded(
+        &self, write: &Append, decision_before: Timestamp, cutoff: rtdb_types::TimedJournalCutoff,
+    ) -> std::result::Result<(), AttemptError> {
+        let batch = self.stream.batch.as_ref().filter(|batch| batch.maximum_timed_original_bytes().is_some())
+            .ok_or_else(|| AttemptError::Local(rtdb_tx::transact::funding_unsupported()))?;
+        if self.next != write.at { return Err(AttemptError::Local(order_error("The funded append must follow the acknowledged prefix"))); }
+        let bytes = self.stream.encode(write.at, &write.entry).await.map_err(AttemptError::Local)?;
+        let upper = self.upper();
+        if upper >= decision_before || cutoff.before().0 > self.lease.until {
+            return Err(AttemptError::Local(Anomaly::new(AnomalyCategory::Conflict,
+                "rtdb/window-expired", "The original timed append missed its admission bounds")));
+        }
+        let appended = batch.append_timed_original(self.stream.id(), self.lease.epoch, write.at, bytes, cutoff)
+            .await.map_err(AttemptError::Journal)?;
+        if appended != write.at { return Err(AttemptError::Local(order_error("The journal acknowledged a different funded position"))); }
+        Ok(())
+    }
+
     fn upper(&self) -> Timestamp {
         Timestamp((self.clock)().0.saturating_add(self.drift_micros))
     }
@@ -298,6 +332,12 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             }
             Command::Workload(request, reply) => {
                 let result = database.lock().await.managed_workload(request).await;
+                let _ = reply.send(result);
+            }
+            Command::Funded { transaction, scope, owner, command, clock, reply } => {
+                let result = database.lock().await.transact_funded_serial(
+                    &transaction, scope.as_ref().map(Scope::authority), owner, command, clock.as_ref(),
+                ).await;
                 let _ = reply.send(result);
             }
             Command::Tick(live, reply) => {
@@ -578,6 +618,60 @@ pub(super) enum Planned {
 }
 
 impl MultiDatabase {
+    pub fn supports_funded_transact(&self) -> bool {
+        self.authority().is_ok() && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some()
+    }
+
+    async fn transact_funded_serial(
+        &mut self, request: &Transact, scope: Option<ScopedTransact<'_>>, owner: [u8; 32],
+        command: rtdb_tx::transact::FundingCommand, clock: &dyn rtdb_tx::DecisionClock,
+    ) -> Result<Receipt> {
+        self.refresh().await?;
+        self.require_active()?;
+        if !self.supports_funded_transact() || !clock.supports_funded_offers() {
+            return Err(rtdb_tx::transact::funding_unsupported());
+        }
+        self.require_armed_rotation()?;
+        let record_limit = self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes())
+            .ok_or_else(rtdb_tx::transact::funding_unsupported)?.saturating_sub(1024);
+        let claims = self.tokens.verify_claims_in(request.claims(), scope.map(|scope| scope.labels)).await;
+        let mut funding = rtdb_tx::transact::FundingInput::new(command, owner);
+        funding.verify(request, clock).await;
+        let lease = self.authority()?;
+        let generation = self.state().generation;
+        let coordinates = self.state().coordinates;
+        let now = (self.clock)();
+        let features = if scope.is_some() { SCOPED_FEATURES } else { self.write_features() };
+        let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
+            .decide_funded(request, now, features, &claims, scope, None, funding, record_limit)?;
+        let write = match plan(decision, lease, generation, coordinates)? {
+            Planned::Answer(receipt) => return self.project_receipt(receipt, scope),
+            Planned::Append(write) => write,
+        };
+        let at = write.at;
+        let funded = match &write.entry.record {
+            Record::Tx { payload, .. } => match TransactionRecord::decode(payload)? {
+                TransactionRecord::Tx(tx) => tx.funded_guard()?,
+                _ => return Err(order_error("The funded command must append one resolved transaction")),
+            },
+            _ => return Err(order_error("The funded command must append one transaction envelope")),
+        };
+        let receipts = if let Some((_, decision_before, cutoff)) = funded {
+            let authority = self.append_authority(lease.epoch)?;
+            let result = authority.append_funded(&write, decision_before, cutoff).await;
+            if let Err(error) = result {
+                let error = self.begin_write_recovery(error);
+                let _ = self.recover_writer().await;
+                return Err(error);
+            }
+            self.publish_staged(lease, vec![write]).await
+                .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?
+        } else {
+            self.commit_one(lease, write).await?.1
+        };
+        self.project_receipt(receipt_for(receipts, coordinates.position(at)?, &request.key)?, scope)
+    }
+
     pub fn write_features(&self) -> &'static [&'static str] {
         if self.supports_row_custody() { CUSTODY_FEATURES } else { FEATURES }
     }

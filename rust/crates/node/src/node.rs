@@ -365,6 +365,10 @@ impl Node {
         }
     }
 
+    pub fn funded_offer_clock(&self) -> Option<Arc<dyn rtdb_tx::DecisionClock>> {
+        self.factory.decision_clock.as_ref().filter(|clock| clock.supports_funded_offers()).cloned()
+    }
+
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
     pub fn query_instant(&self) -> rtdb_types::Instant { self.factory.clock.query_instant() }

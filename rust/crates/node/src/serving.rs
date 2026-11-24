@@ -152,6 +152,12 @@ pub(crate) fn append_change_rows(
     Ok(())
 }
 
+pub struct FundingSubmission {
+    pub command: rtdb_tx::transact::FundingCommand,
+    pub owner: [u8; 32],
+    pub clock: Arc<dyn rtdb_tx::DecisionClock>,
+}
+
 /// An admitted database attachment. Each mode establishes its own barriers and publishes only applied state.
 #[async_trait]
 pub trait ServingDriver: Send + Sync {
@@ -159,6 +165,15 @@ pub trait ServingDriver: Send + Sync {
     fn features(&self) -> &[&str];
     fn token_authority(&self) -> Option<TokenAuthority> { None }
     fn uses_database_tokens(&self) -> bool { false }
+
+    async fn supports_funded_transact(&self) -> bool { false }
+
+    async fn transact_funded(
+        &self, _request: Transact, _scope: Option<ServingScope>, _funding: FundingSubmission,
+        _cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        Err(rtdb_tx::transact::funding_unsupported())
+    }
 
     async fn apply_token_key_rotation(&self, _generation: u64, _unreadable_by: i64) -> Result<()> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/token-rotation", "This driver does not own token key rotation"))

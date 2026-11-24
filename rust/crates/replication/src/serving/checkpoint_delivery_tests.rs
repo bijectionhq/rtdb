@@ -78,6 +78,7 @@ fn pending_erasure_receipts_cannot_be_delivered() -> Result<()> {
         outcome: Outcome::Then,
         replayed: false,
         erasure: Some(Erasure::Pending),
+        decision_clock: None,
     };
     assert_eq!(
         project_receipt(&index, receipt.clone(), None)

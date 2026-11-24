@@ -19,6 +19,21 @@ pub trait JournalBatchAppender: Send + Sync {
         epoch: Epoch,
         records: Vec<(Lsn, Bytes)>,
     ) -> BoxFuture<'_, journal_contract::Result<Lsn>>;
+
+    fn maximum_timed_original_bytes(&self) -> Option<usize> { None }
+
+    /// A committed entry attests the exact payload, writer epoch and certificate
+    /// under the original quorum, before the exclusive journal cutoff.
+    fn append_timed_original(
+        &self,
+        _stream: StreamId,
+        _epoch: Epoch,
+        _at: Lsn,
+        _payload: Bytes,
+        _cutoff: rtdb_types::TimedJournalCutoff,
+    ) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        Box::pin(async { Err(JournalError::Unavailable) })
+    }
 }
 
 #[derive(Clone)]
@@ -45,7 +60,7 @@ impl Stream {
         }
     }
 
-    fn id(&self) -> StreamId {
+    pub(crate) fn id(&self) -> StreamId {
         StreamId(u128::from_be_bytes(*self.database.as_bytes()))
     }
 

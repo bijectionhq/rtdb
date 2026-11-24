@@ -57,6 +57,7 @@ pub struct Terminal {
 enum Entry {
     /// An ordinary decision; `after` is the index once it applies.
     Untimed { after: BranchIndex, receipt: Receipt, fingerprint: [u8; 32], workload: Option<WorkloadFamily> },
+    Funded { record: TransactionRecord },
     /// A timed write's original record. It publishes at its terminal record.
     TimedTx { record: TransactionRecord },
     /// A timed write's `Settle` or `Refuse`.
@@ -154,22 +155,30 @@ impl TransactPipeline {
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>,
     ) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, authority, time_floor, None)
+        self.decide_with_admission(request, now, features, claims, authority, time_floor, None, None)
     }
 
     pub fn decide_workload(&mut self, request: &Transact, now: Timestamp, features: &[&str],
                            claims: &dyn ClaimVerifier, workload: &workload::Admission) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, None, None, Some(workload))
+        self.decide_with_admission(request, now, features, claims, None, None, Some(workload), None)
+    }
+
+    pub fn decide_funded(
+        &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
+        authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>, funding: FundingInput, record_limit: usize,
+    ) -> Result<Decision> {
+        self.decide_with_admission(request, now, features, claims, authority, time_floor, None, Some((funding, record_limit)))
     }
 
     fn decide_with_admission(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>, workload: Option<&workload::Admission>,
+        funding: Option<(FundingInput, usize)>,
     ) -> Result<Decision> {
         let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace));
         let identity = TxKey { namespace: request.receipt_namespace(namespace), key: request.key.clone() };
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
-        if workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty() {
+        if funding.is_none() && workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.
             let view = View {
                 index: &self.durable.index,
@@ -179,7 +188,7 @@ impl TransactPipeline {
                 time_floor,
             };
             let position = self.durable.index.head().basis.position();
-            return match TransactState::resolve_in(view, request, position, now, features, claims, authority, workload)?.0 {
+            return match TransactState::resolve_in(view, request, position, now, features, claims, authority, workload, None)?.0 {
                 Resolution::Answer(receipt) => Ok(Decision::Answer(receipt)),
                 Resolution::Append(_) => Err(order_error("A validation cannot append")),
             };
@@ -196,7 +205,8 @@ impl TransactPipeline {
             pending: false,
             time_floor,
         };
-        let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority, workload)?;
+        let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority, workload,
+            funding.map(|(input, _)| input))?;
         let prepared = match resolution {
             Resolution::Answer(receipt) => return Ok(Decision::Answer(receipt)),
             Resolution::Append(prepared) => prepared,
@@ -204,9 +214,21 @@ impl TransactPipeline {
         let after = after.ok_or_else(|| order_error("An append carries its resulting index"))?;
         let bytes = prepared.record.encode()?;
         let TransactionRecord::Tx(tx) = &prepared.record else { return Err(order_error("A decision prepares a Tx record")) };
+        if let Some((_, limit)) = funding {
+            let charge = if authority.is_some() {
+                tx.canonical_request().ok_or_else(invalid_record)?.get().len().saturating_mul(4).saturating_add(4096)
+            } else {
+                bytes.len()
+            };
+            if charge > limit {
+                return Err(Anomaly::incorrect("rtdb/decision-clock-record-size", "The funded transaction exceeds the journal record limit"));
+            }
+        }
         let timed = tx.before.is_some();
         let next = position.checked_add(if timed { 2 } else { 1 }).ok_or_else(exhausted)?;
-        let entry = if timed {
+        let entry = if funding.is_some() {
+            Entry::Funded { record: prepared.record }
+        } else if timed {
             // Kept to derive the terminal record; the in-flight copy is folded on acknowledgement.
             let entry = Entry::TimedTx { record: TransactionRecord::Tx(tx.clone()) };
             self.timed.insert(position, (prepared, after.clone()));
@@ -303,6 +325,12 @@ impl TransactPipeline {
                         return Err(order_error("A timed write publishes only at its terminal record"));
                     }
                 }
+                Entry::Funded { record } => {
+                    let receipt = self.durable.apply(position, record)?
+                        .ok_or_else(|| order_error("A funded decision publishes its booking or receipt"))?;
+                    self.deciding.remove(&key);
+                    released.push(receipt);
+                }
                 Entry::Terminal { record } => {
                     self.timed.remove(&(position - 1));
                     let receipt = self.durable.apply(position, record)?
@@ -337,8 +365,11 @@ impl TransactPipeline {
     /// the acknowledged prefix, in position order. A returned receipt is final and may be
     /// released to a caller that is asking `TxStatus`.
     pub fn recover(&mut self, position: u64, record: &[u8]) -> Result<Option<Receipt>> {
+        self.recover_decoded(position, TransactionRecord::decode(record)?)
+    }
+
+    pub fn recover_decoded(&mut self, position: u64, record: TransactionRecord) -> Result<Option<Receipt>> {
         if !self.in_flight.is_empty() { return Err(order_error("Withdraw before recovering committed records")); }
-        let record = TransactionRecord::decode(record)?;
         let terminal_of = match &record {
             TransactionRecord::Settle { tx_lsn } | TransactionRecord::Refuse { tx_lsn } => Some(*tx_lsn),
             TransactionRecord::Tx(_) => None,

@@ -37,6 +37,8 @@ pub(crate) const SHARED_CHECKPOINT: u8 = b'S';
 const SOURCE_DECISION_FRAME: u8 = 3;
 const SOURCE_REPLY_FRAME: u8 = 4;
 const SHARED_DECISION_FRAME: u8 = 5;
+const FUNDED_DECISION_FRAME: u8 = 6;
+const SHARED_FUNDED_DECISION_FRAME: u8 = 7;
 const SOURCE_DECISION_HEADER_BYTES: usize = FRAME_HEADER_BYTES + 8;
 const MAX_SOURCE_REPLIES: usize = 4096;
 const FRAME_HEADER_BYTES: usize = 9;
@@ -74,6 +76,7 @@ impl NativeServingScope {
 
 pub(crate) struct NativeRequest<C = VerifiedClaims> {
     pub(crate) transaction: Transact,
+    pub(crate) funding: Option<rtdb_tx::transact::FundingInput>,
     claims: C,
     scope: Option<NativeServingScope>,
 }
@@ -163,9 +166,26 @@ pub struct NativeServingHandle {
     pub(crate) source_authority: Arc<SourceAuthority>,
     pub(crate) source_replies: Arc<SourceReplies>,
     pub(crate) local_read_fence: Option<Arc<crate::LocalDefaultErasureReadFence>>,
+    pub(crate) funded_writer: bool,
 }
 
 impl NativeServingHandle {
+    pub fn supports_funded_transact(&self) -> bool {
+        self.funded_writer && self.is_compatible()
+            && matches!(self.replication.watch_status().borrow().role, crate::Role::Leading(_))
+    }
+
+    pub async fn transact_funded(
+        &self, transaction: Transact, claims: VerifiedClaims, scope: Option<NativeServingScope>,
+        funding: rtdb_tx::transact::FundingInput, cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        if !self.supports_funded_transact() { return Err(rtdb_tx::transact::funding_unsupported()); }
+        let request = NativeRequest { transaction, claims, scope: scope.clone(), funding: Some(funding) };
+        let bytes = cancellation.run_until_cancelled(self.source_authority.seal(request)).await
+            .ok_or_else(interrupted)??;
+        self.submit_admitted(bytes, scope, cancellation).await
+    }
+
     pub fn authority(&self) -> &NativeServingAuthority { &self.authority }
     pub fn has_local_erasure_fence(&self) -> bool { self.local_read_fence.is_some() }
     pub fn supports_row_custody(&self) -> bool {
@@ -274,7 +294,7 @@ impl NativeServingHandle {
 
     pub async fn transact(&self, transaction: Transact, claims: VerifiedClaims, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
         if !self.is_compatible() { return Err(incompatible()); }
-        let request = NativeRequest { transaction, claims, scope };
+        let request = NativeRequest { transaction, claims, scope, funding: None };
         if request.is_validation() {
             self.replication.serving_barrier(cancellation).await?;
             return self.replication.serving_validate(request, cancellation).await;
@@ -331,7 +351,7 @@ impl NativeServingHandle {
 
 impl<C> NativeRequest<C> {
     fn is_validation(&self) -> bool {
-        self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
+        self.funding.is_none() && self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
     }
 
     fn check_source_admission(&self, physical_erasure: bool, row_custody: bool) -> Result<()> {
@@ -368,6 +388,7 @@ pub(crate) struct NativeServing {
     fold: Option<TransactState>,
     position: u64,
     pipeline: Option<TransactPipeline>,
+    pub(crate) funded_record_limit: Option<usize>,
     collect_checkpoints: bool,
     writer: Option<(Term, Arc<Mutex<WriterObjects>>)>,
     pending: BTreeMap<u64, proto::NoOp>,
@@ -519,6 +540,7 @@ impl NativeServing {
         });
         let source_authority = Arc::new(SourceAuthority::new(store, authority.incarnation));
         Ok((Self {
+            funded_record_limit: None,
             authority, fold: Some(fold), position, pipeline: None,
             collect_checkpoints, writer: None, pending: BTreeMap::new(),
             timed_source: None, erasure_in_flight: false, physical_erasure: false, pending_replies: 0,
@@ -633,15 +655,26 @@ impl NativeServing {
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
         let scope = request.scope.as_ref().map(NativeServingScope::authority);
-        let decision = pipeline.decide_after(&request.transaction, now, &features, &request.claims, scope, time_floor);
+        let decision = match (request.funding, self.funded_record_limit) {
+            (Some(funding), Some(limit)) =>
+                pipeline.decide_funded(&request.transaction, now, &features, &request.claims, scope, time_floor, funding, limit),
+            (Some(_), None) => Err(rtdb_tx::transact::funding_unsupported()),
+            (None, _) => pipeline.decide_after(&request.transaction, now, &features, &request.claims, scope, time_floor),
+        };
         match decision {
             Ok(Decision::Answer(receipt)) => self.source_reply(source, Ok(receipt)),
-            Err(error) if error.is_caller_error() => self.source_reply(source, Err(error)),
+            Err(error) if error.is_caller_error()
+                || request.funding.is_some() && error.code == "rtdb/window-pending" =>
+                self.source_reply(source, Err(error)),
             Err(error) => Err(error),
             Ok(Decision::Append { position, record }) => {
                 self.erasure_in_flight = request.transaction.uses_erasure();
-                let installs_source = request.transaction.window.before.is_none();
-                let message = decision_message(position, &record, Some(source), installs_source, self.shares_main);
+                let installs_source = request.funding.is_some() || request.transaction.window.before.is_none();
+                let guarded = request.funding.is_some() && record_funded_guard(&record)?.is_some();
+                let frame = if guarded {
+                    if self.shares_main { SHARED_FUNDED_DECISION_FRAME } else { FUNDED_DECISION_FRAME }
+                } else if self.shares_main { SHARED_DECISION_FRAME } else { SOURCE_DECISION_FRAME };
+                let message = decision_message_in(frame, position, &record, Some(source), installs_source);
                 self.pending.insert(position, message.clone());
                 Ok(message)
             }
@@ -720,12 +753,18 @@ impl NativeServing {
         }
         let terminal = self.durable().recover_pending().is_some();
         if terminal && source != self.timed_source { return Err(invalid()); }
-        let shared = frame.first() == Some(&SHARED_DECISION_FRAME);
+        let shared = matches!(frame.first().copied(), Some(SHARED_DECISION_FRAME | SHARED_FUNDED_DECISION_FRAME));
         if !shared && !terminal { self.shares_main = false; }
         if shared != self.shares_main { return Err(invalid()); }
+        let decoded = (!own || self.shares_main && installed.is_some() || funded_frame(frame))
+            .then(|| TransactionRecord::decode(bytes)).transpose()?;
+        if let Some(record) = &decoded
+            && funded_frame(frame) != transaction_funded_guard(record)?.is_some()
+        {
+            return Err(invalid());
+        }
         let projection = if self.shares_main && installed.is_some() {
-            let record = TransactionRecord::decode(bytes)?;
-            let (effects, namespace) = match record {
+            let (effects, namespace) = match decoded.as_ref().ok_or_else(invalid)? {
                 TransactionRecord::Tx(tx) => (tx.effects().to_vec(), tx.receipt_namespace()),
                 TransactionRecord::Settle { .. } => (self.durable().pending_effects().ok_or_else(invalid)?.to_vec(), self.durable().pending_receipt_namespace()),
                 TransactionRecord::Refuse { .. } => (Vec::new(), self.durable().pending_receipt_namespace()),
@@ -734,8 +773,11 @@ impl NativeServing {
         } else { None };
         let receipts = match &mut self.pipeline {
             Some(pipeline) if own => pipeline.acknowledge(position)?,
-            Some(pipeline) => pipeline.recover(position, bytes)?.into_iter().collect(),
-            None => self.fold.as_mut().ok_or_else(invalid)?.apply(position, TransactionRecord::decode(bytes)?)?.into_iter().collect(),
+            Some(pipeline) => pipeline.recover_decoded(position, decoded.ok_or_else(invalid)?)?.into_iter().collect(),
+            None => {
+                let record = match decoded { Some(record) => record, None => TransactionRecord::decode(bytes)? };
+                self.fold.as_mut().ok_or_else(invalid)?.apply(position, record)?.into_iter().collect()
+            }
         };
         self.position = position;
         if own { self.pending.remove(&position); }
@@ -1022,12 +1064,16 @@ fn require_armed_erase_receipt(receipt: &Receipt) -> Result<()> {
 }
 
 fn decision_message(position: u64, record: &[u8], source: Option<SourcePosition>, installs_source: bool, shared: bool) -> proto::NoOp {
-    let mut frame = BytesMut::with_capacity(SOURCE_DECISION_HEADER_BYTES + record.len());
     let version = match (source, shared) {
         (Some(_), true) => SHARED_DECISION_FRAME,
         (Some(_), false) => SOURCE_DECISION_FRAME,
         (None, _) => FRAME_VERSION,
     };
+    decision_message_in(version, position, record, source, installs_source)
+}
+
+fn decision_message_in(version: u8, position: u64, record: &[u8], source: Option<SourcePosition>, installs_source: bool) -> proto::NoOp {
+    let mut frame = BytesMut::with_capacity(SOURCE_DECISION_HEADER_BYTES + record.len());
     frame.put_u8(version);
     frame.put_u64(position);
     if let Some(source) = source { frame.put_i64(source.0); }
@@ -1047,9 +1093,34 @@ fn invalid_source_request() -> Anomaly {
     Anomaly::incorrect("rtdb/source-admission", "Source intake requires a transaction with operations")
 }
 
+pub(crate) fn is_funded_original(message: &proto::NoOp) -> bool {
+    message.serving_record.as_deref().is_some_and(funded_frame)
+}
+
+fn funded_frame(frame: &[u8]) -> bool {
+    matches!(frame.first().copied(), Some(FUNDED_DECISION_FRAME | SHARED_FUNDED_DECISION_FRAME))
+}
+
+fn record_funded_guard(bytes: &[u8]) -> Result<Option<(Timestamp, Timestamp, rtdb_types::TimedJournalCutoff)>> {
+    transaction_funded_guard(&TransactionRecord::decode(bytes)?)
+}
+
+fn transaction_funded_guard(record: &TransactionRecord) -> Result<Option<(Timestamp, Timestamp, rtdb_types::TimedJournalCutoff)>> {
+    match record {
+        TransactionRecord::Tx(tx) => tx.funded_guard(),
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn funded_guard(message: &proto::NoOp) -> Result<Option<(Timestamp, Timestamp, rtdb_types::TimedJournalCutoff)>> {
+    if !is_funded_original(message) { return Ok(None); }
+    let (_, _, record) = decode(message.serving_record.as_deref().ok_or_else(invalid)?)?;
+    record_funded_guard(record)?.map(Some).ok_or_else(invalid)
+}
+
 fn decode(frame: &[u8]) -> Result<(u64, Option<SourcePosition>, &[u8])> {
     let header_len = match frame.first().copied() {
-        Some(SOURCE_DECISION_FRAME | SHARED_DECISION_FRAME) => SOURCE_DECISION_HEADER_BYTES,
+        Some(SOURCE_DECISION_FRAME | SHARED_DECISION_FRAME | FUNDED_DECISION_FRAME | SHARED_FUNDED_DECISION_FRAME) => SOURCE_DECISION_HEADER_BYTES,
         Some(FRAME_VERSION) => FRAME_HEADER_BYTES,
         Some(1) => LEGACY_FRAME_HEADER_BYTES,
         _ => return Err(invalid()),
@@ -1176,7 +1247,7 @@ mod tests {
         rows[0].protected_columns = vec!["protected".into()];
         rows[0].custody_payload = Some(rtdb_tx::transact::CustodyPayload { binding: [2; 32], envelope: vec![3] });
         let source = SourcePosition(5);
-        let envelope = serving.source_authority.seal(NativeRequest { transaction, claims: VerifiedClaims::default(), scope: None }).await.unwrap();
+        let envelope = serving.source_authority.seal(NativeRequest { transaction, claims: VerifiedClaims::default(), scope: None, funding: None }).await.unwrap();
         let request = serving.source_authority.open(&envelope).await.unwrap();
         let message = serving.decide_source(source, Timestamp(40), None, request).unwrap();
         assert_eq!(message.serving_record.as_deref().unwrap()[0], SOURCE_REPLY_FRAME);
@@ -1283,7 +1354,7 @@ mod tests {
     }
 
     fn unscoped(transaction: Transact) -> SourceRequest {
-        NativeRequest { transaction, claims: source::SourceClaims::default(), scope: None }
+        NativeRequest { transaction, claims: source::SourceClaims::default(), scope: None, funding: None }
     }
 
     #[test]
@@ -1407,7 +1478,7 @@ mod tests {
         rows[0].valid = Some(rtdb_types::Interval::ALL.into());
         rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![7])));
         let fingerprint = submission.logical_sha256().unwrap();
-        let request = NativeRequest { transaction: submission, claims: source::SourceClaims::default(), scope: Some(scope.clone()) };
+        let request = NativeRequest { transaction: submission, claims: source::SourceClaims::default(), scope: Some(scope.clone()), funding: None };
         let message = serving.decide_source(SourcePosition(2), Timestamp(41), None, Ok(request)).unwrap();
         let receipt = serving.apply(&message, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap();
         let receipt = project_receipt(serving.durable().index(), receipt, Some(&scope)).unwrap();

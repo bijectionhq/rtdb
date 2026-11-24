@@ -502,8 +502,11 @@ impl LeaderState {
             && self.awaiting_placed.is_none() && !self.settling_placed
     }
     fn pending_strict_write(&self) -> bool {
-        self.pending.front().is_some_and(|pending| matches!(&pending.body,
-            WriteBody::Resolved(tx, _) if tx.staging_clock_upper().is_some()))
+        self.pending.front().is_some_and(|pending| match &pending.body {
+            WriteBody::Resolved(tx, _) => tx.staging_clock_upper().is_some(),
+            WriteBody::Message(ReplicaBody::NoOp(message)) => serving::is_funded_original(message),
+            _ => false,
+        })
     }
     fn accepting(&self) -> bool { self.can_poll_source() && self.resolution.is_none() }
     fn drained_for_strict_source(&self) -> bool { self.pending.is_empty() && self.production.is_none() }
@@ -657,8 +660,12 @@ impl ReplicationDriver {
         }
         let source_authority = Arc::clone(&serving.source_authority);
         let source_replies = Arc::clone(&serving.source_replies);
+        if !self.config.external_source && self.resolve.decision_clock.as_ref().is_some_and(|clock| clock.supports_funded_offers()) {
+            serving.funded_record_limit = self.logs.replica_timed_original_append_limit().map(|limit| limit.saturating_sub(1024));
+        }
+        let funded_writer = serving.funded_record_limit.is_some();
         self.serving = Some(serving);
-        Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies,
+        Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies, funded_writer,
             local_read_fence: self.local_erasure_read_fence.clone() })
     }
 
@@ -1980,7 +1987,7 @@ impl ReplicationDriver {
         let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
         let request = match request {
             Ok(request) if serving.request_pending(&request)
-                || request.transaction.uses_erasure() && !leader.drained_for_strict_source()
+                || (request.transaction.uses_erasure() || request.funding.is_some()) && !leader.drained_for_strict_source()
                 || leader.pending.iter().any(|write| matches!(&write.body, WriteBody::Resolved(..))) =>
             {
                 leader.waiting_strict_source = Some(StrictSource::Serving { position, request });
@@ -1998,6 +2005,18 @@ impl ReplicationDriver {
             }
             request => request,
         };
+        let mut request = request;
+        if let Ok(candidate) = &mut request
+            && let Some(funding) = &mut candidate.funding
+        {
+            let clock = self.resolve.decision_clock.as_ref().filter(|clock| clock.supports_funded_offers());
+            if let Some(clock) = clock.filter(|_| self.logs.replica_timed_original_append_limit().is_some()) {
+                self.cancellation.run_until_cancelled(funding.verify(&candidate.transaction, clock.as_ref()))
+                    .await.ok_or_else(stopped)?;
+            } else {
+                request = Err(rtdb_tx::transact::funding_unsupported());
+            }
+        }
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
         let message = serving.decide_source(position, (self.clock)(), time_floor, request)?;
         let block = self.partition.value().live().block_index();

@@ -20,6 +20,9 @@ pub(super) fn request(
     memory: &Arc<MemoryBudget>,
 ) -> Result<Transact, Status> {
     super::check_key(&request.key)?;
+    if request.decision_clock_offer.is_some() {
+        return Err(error::incorrect("A DecisionClock booking must be consumed through Transact"));
+    }
     let mut require = request.require;
     require.sort_unstable();
     require.dedup();
@@ -536,10 +539,20 @@ pub(super) fn receipt(receipt: tx::Receipt) -> proto::Receipt {
             tx::Outcome::Refused { error: anomaly } => Outcome::Refused(error::detail(anomaly)),
         }),
         replayed: receipt.replayed,
+        decision_clock: None,
         erasure: match receipt.erasure {
             Some(tx::Erasure::Armed { unreadable_by }) => Some(proto::Erasure { unreadable_by_micros: unreadable_by.0 }),
             _ => None,
         },
+    }
+}
+
+pub(super) fn decision_clock(offer: tx::FundedReceipt, scoped: bool) -> proto::DecisionClockOffer {
+    proto::DecisionClockOffer {
+        booking: offer.booking().to_vec(),
+        predecessor: Some(offer.predecessor().into()),
+        reading_micros: (!scoped).then(|| offer.reading().0),
+        before_micros: (!scoped).then(|| offer.before().0),
     }
 }
 

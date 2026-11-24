@@ -312,7 +312,7 @@ mod tests {
             ..Default::default()
         }};
         let receipt = |basis, time| Receipt { basis, system_time: Timestamp(time), key: vec![1; 16], outcome: Outcome::Then,
-            replayed: false, erasure: None };
+            replayed: false, erasure: None, decision_clock: None };
         let write = stage_source(partition.snapshot(), &index, SourcePosition(30), &receipt(basis, 10), std::slice::from_ref(&define), &memory).unwrap();
         let batch = write.tables()[&catalog].batch().unwrap();
         let event = batch.view().read_event(0).unwrap();
@@ -361,7 +361,7 @@ mod tests {
 
         let cut = BranchCut { basis: Basis::new([7; 16], 2), system_time: Timestamp(2) };
         let receipt = Receipt { key: vec![3; 16], basis: cut.basis, system_time: cut.system_time, outcome: Outcome::Then,
-            replayed: false, erasure: None };
+            replayed: false, erasure: None, decision_clock: None };
         let protected = Interval::new(Timestamp(6), Timestamp(10)).unwrap();
         let protect = |id| BranchEffect::Write { branch: MAIN_BRANCH.into(), table: table.clone(), event: BranchEvent {
             id: EntityId::Integer(id), valid: protected, cut, written: WrittenVersion::Branch,

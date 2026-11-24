@@ -326,13 +326,16 @@ impl PartitionLogs {
     pub(crate) async fn enqueue_replica_with(&self, term: Term, sequence: Option<TermSequence>, body: &ReplicaBody, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
         allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
         let stage = match body {
-            ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?,
+            ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?
+                .map(|stage| (stage.clock_upper, stage.cutoff, stage.journal)),
+            ReplicaBody::NoOp(message) => crate::serving::funded_guard(message)?
+                .map(|(upper, cutoff, journal)| (upper, cutoff, Some(journal))),
             _ => None,
         };
         let mut payload = self.encode_replica(term, sequence, body)?;
         before_enqueue(payload.payload())?;
-        if let Some(stage) = stage {
-            let guard = GuardedAppend::new(&clock, stage.clock_upper, stage.cutoff, stage.journal);
+        if let Some((upper, cutoff, journal)) = stage {
+            let guard = GuardedAppend::new(&clock, upper, cutoff, journal);
             let receipt = self.replica.enqueue_buffer(&mut payload, AppendMode::Guarded(guard)).await.map_err(|error| match error {
                 error @ StorageError::GuardedAppendCutoff => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_CUTOFF, error.to_string()),
                 error @ StorageError::GuardedAppendUnavailable => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_UNAVAILABLE, error.to_string()),

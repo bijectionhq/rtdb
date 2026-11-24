@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 mod custody_prepare;
 mod custody_release;
+mod funding;
 mod operations;
 mod pipeline;
 pub mod workload;
@@ -30,6 +31,8 @@ use workload::Family as WorkloadFamily;
 pub use custody_prepare::prepare_custody;
 pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
+pub use funding::{DECISION_CLOCK_OFFER, FundedReceipt, FundingCommand, FundingInput, funding_invalid, funding_unsupported};
+use funding::{FundingDecision, resolve_funding};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
@@ -341,6 +344,8 @@ pub struct Receipt {
     pub replayed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub erasure: Option<Erasure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_clock: Option<FundedReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +402,7 @@ impl PreparedAppend {
 }
 
 const RECORD_VERSION: u8 = 2;
+const FUNDED_RECORD_VERSION: u8 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -410,20 +416,27 @@ impl TransactionRecord {
         if matches!(self, Self::Tx(tx) if tx.request.is_none()) {
             return Err(Anomaly::fault("rtdb/transaction-encoding", "An admitted transaction needs its canonical request"));
         }
-        serde_json::to_vec(&(RECORD_VERSION, self)).map(Bytes::from)
+        let version = if self.carries_funding() { FUNDED_RECORD_VERSION } else { RECORD_VERSION };
+        serde_json::to_vec(&(version, self)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-encoding", error.to_string()))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (version, record): (u8, Self) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-decoding", error.to_string()))?;
-        if version != RECORD_VERSION {
+        if (version, record.carries_funding()) != (RECORD_VERSION, false)
+            && (version, record.carries_funding()) != (FUNDED_RECORD_VERSION, true)
+        {
             return Err(Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version"));
         }
         if let Self::Tx(tx) = &record {
             tx.validate_admission()?;
         }
         Ok(record)
+    }
+
+    fn carries_funding(&self) -> bool {
+        matches!(self, Self::Tx(tx) if tx.receipt.decision_clock.is_some())
     }
 }
 
@@ -455,6 +468,15 @@ impl ResolvedTransact {
 
     pub fn receipt_namespace(&self) -> Option<[u8; 32]> { self.receipt_namespace }
 
+    pub fn funded_guard(&self) -> Result<Option<(Timestamp, Timestamp, rtdb_types::TimedJournalCutoff)>> {
+        if let Some(funding) = self.receipt.decision_clock
+            && !matches!(self.receipt.outcome, Outcome::Refused { .. })
+        {
+            return funding.journal_guard();
+        }
+        Ok(None)
+    }
+
     fn validate_admission(&self) -> Result<()> {
         #[derive(Deserialize)]
         struct AdmissionFields {
@@ -466,6 +488,20 @@ impl ResolvedTransact {
             before: Option<Timestamp>,
         }
 
+        if let Some(funding) = self.receipt.decision_clock {
+            let request = self.request.as_ref().ok_or_else(invalid_record)?;
+            let request = Transact::decode_canonical_request(request.get().as_bytes()).map_err(|_| invalid_record())?;
+            request.check_funded_shape(self.receipt_namespace.is_some()).map_err(|_| invalid_record())?;
+            funding.check_admission(&request, &self.receipt, self.receipt.basis.position(), self.receipt_namespace)?;
+            if request.key != self.receipt.key || request.logical_sha256()? != self.fingerprint
+                || self.before.is_some() || self.workload.is_some() || self.receipt.erasure.is_some()
+                || (funding.booked() && (!self.effects.is_empty() || self.receipt.outcome != Outcome::Then))
+                || (!funding.booked() && !matches!(self.receipt.outcome, Outcome::Refused { .. }) && !funding.acceptance_is_valid())
+            {
+                return Err(invalid_record());
+            }
+            return Ok(());
+        }
         // Older v2 records are replayable using their stored effects and digest.
         if let Some(request) = &self.request {
             let fields: AdmissionFields = serde_json::from_str(request.get()).map_err(|_| invalid_record())?;
@@ -673,6 +709,7 @@ impl TransactState {
             let stored = receipts.get(key)?;
             (stored.receipt.basis == basis
                 && (namespace.is_none() || stored.workload == Some(WorkloadFamily::CustodyWrite))
+                && !stored.receipt.decision_clock.is_some_and(|offer| offer.booked())
                 && stored.receipt.erasure != Some(Erasure::Pending)
                 && !matches!(stored.receipt.outcome, Outcome::Refused { .. }))
                 .then_some(&stored.receipt)
@@ -696,8 +733,13 @@ impl TransactState {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         self.index.restore_in(incarnation)?;
+        self.receipts.retain(|_, receipts| {
+            receipts.retain(|_, stored| !stored.receipt.decision_clock.is_some_and(|offer| offer.booked()));
+            !receipts.is_empty()
+        });
         for stored in self.receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
             stored.receipt.basis = Basis::new(incarnation, stored.receipt.basis.position());
+            stored.receipt.decision_clock = None;
             stored.installed = None;
         }
         Ok(())
@@ -706,7 +748,10 @@ impl TransactState {
     fn encode_checkpoint_index(&self, index: &BranchIndex) -> Result<Bytes> {
         let receipts = self.receipts.values().flat_map(|namespace| namespace.values())
             .filter(|stored| stored.receipt.basis <= index.head().basis).collect::<Vec<_>>();
-        serde_json::to_vec(&(RECORD_VERSION, index, receipts)).map(Bytes::from)
+        let version = if receipts.iter().any(|stored| stored.receipt.decision_clock.is_some()) {
+            FUNDED_RECORD_VERSION
+        } else { RECORD_VERSION };
+        serde_json::to_vec(&(version, index, receipts)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
     }
 
@@ -714,7 +759,10 @@ impl TransactState {
         let invalid = || Anomaly::fault("rtdb/transaction-checkpoint", "Checkpoint does not match the expected cut");
         let (version, index, receipts): (u8, BranchIndex, Vec<StoredReceipt>) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
-        if version != RECORD_VERSION || index.head() != expected || index.exact(expected.basis)? != expected {
+        let funded = receipts.iter().any(|stored| stored.receipt.decision_clock.is_some());
+        if (version, funded) != (RECORD_VERSION, false) && (version, funded) != (FUNDED_RECORD_VERSION, true)
+            || index.head() != expected || index.exact(expected.basis)? != expected
+        {
             return Err(invalid());
         }
         let mut state = Self { index, receipts: BTreeMap::new(), pending: None, pending_erasure: None };
@@ -792,7 +840,9 @@ impl TransactState {
         }) {
             return Err(pending_error());
         }
-        self.receipts.get(&namespace).and_then(|receipts| receipts.get(key)).ok_or_else(unknown_receipt)
+        let stored = self.receipts.get(&namespace).and_then(|receipts| receipts.get(key)).ok_or_else(unknown_receipt)?;
+        if stored.receipt.decision_clock.is_some_and(|offer| offer.booked()) { return Err(pending_error()); }
+        Ok(stored)
     }
 
     pub fn resolve(
@@ -827,7 +877,7 @@ impl TransactState {
             pending: self.pending.is_some(),
             time_floor: None,
         };
-        Self::resolve_in(view, request, position, now, features, claims, authority, None).map(|(resolution, _)| resolution)
+        Self::resolve_in(view, request, position, now, features, claims, authority, None, None).map(|(resolution, _)| resolution)
     }
 
     /// Resolves `request` at `position` against `view`. For an append it also returns the
@@ -836,7 +886,7 @@ impl TransactState {
     /// then the effects in order).
     pub(crate) fn resolve_in(
         view: View<'_>, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
-        authority: Option<ScopedTransact<'_>>, workload: Option<&workload::Admission>,
+        authority: Option<ScopedTransact<'_>>, workload: Option<&workload::Admission>, funding: Option<FundingInput>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         view.index.require_local_custody()?;
         validate_key(&request.key)?;
@@ -861,12 +911,23 @@ impl TransactState {
                 (Sha256::digest(request.get().as_bytes()).into(), Some(request))
             }
         };
-        if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
+        let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
+        if let Some(stored) = stored {
             if stored.fingerprint != fingerprint || stored.workload != family {
                 return Err(conflicting_key());
             }
-            return Ok((Resolution::Answer(replay(&stored.receipt)), None));
+            if funding.is_none() {
+                if stored.receipt.decision_clock.is_some() { return Err(conflicting_key()); }
+                return Ok((Resolution::Answer(replay(&stored.receipt)), None));
+            }
         }
+        let funded = if let Some(input) = funding {
+            if workload.is_some() { return Err(funding_invalid()); }
+            match resolve_funding(&view, request, input, stored, authority)? {
+                FundingDecision::Replay(receipt) => return Ok((Resolution::Answer(receipt), None)),
+                decision => Some(decision),
+            }
+        } else { None };
         if workload.is_some() {
             for claim in request.claims() {
                 if claims.verify(claim)?.scope.branch != MAIN_BRANCH { return Err(workload::denied()); }
@@ -886,8 +947,10 @@ impl TransactState {
 
         if view.pending { return Err(pending_error()); }
         let head = view.index.head();
-        let validation = workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty();
-        let before = if validation {
+        let validation = funding.is_none() && workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty();
+        let before = if funded.is_some() {
+            None
+        } else if validation {
             if !features.contains(&LINEARIZABLE) { return Err(feature_required(LINEARIZABLE)); }
             None
         } else {
@@ -919,7 +982,24 @@ impl TransactState {
         let decision_time = now.max(cut.system_time);
         let advanced = base.clone();
         let scope = authority.map(|authority| authority.labels);
-        let result = if let Some(command) = hold {
+        let mut decision_clock = None;
+        let result = if let Some(funded) = funded {
+            match funded {
+                FundingDecision::Book(offer) => {
+                    decision_clock = Some(offer);
+                    Ok((Outcome::Then, Vec::new(), base))
+                }
+                FundingDecision::Consume { receipt, sample, refusal } => {
+                    decision_clock = Some(receipt);
+                    match refusal {
+                        Some(error) => Err(error),
+                        None => Self::decide(request, base, sample, sample, features, claims, scope,
+                            view.durable_index, Some(receipt.reading())),
+                    }
+                }
+                FundingDecision::Replay(_) => unreachable!("replay answered above"),
+            }
+        } else if let Some(command) = hold {
             let labels = scope.ok_or_else(invalid_scoped_hold)?;
             base.check_scoped_hold(command, labels, now).and_then(|()| {
                 let effect = BranchEffect::ScopedHold { command: command.clone(), observed_at: now };
@@ -931,7 +1011,7 @@ impl TransactState {
         } else if workload.is_some() && before.is_some_and(|deadline| decision_time >= deadline) {
             return Err(workload::denied());
         } else {
-            Self::decide(request, base, now, decision_time, features, claims, scope, view.durable_index)
+            Self::decide(request, base, now, decision_time, features, claims, scope, view.durable_index, None)
         };
         let (outcome, effects, after) = match result {
             Ok(decision) => decision,
@@ -941,6 +1021,7 @@ impl TransactState {
         let receipt = Receipt {
             key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome, replayed: false,
             erasure: effects.iter().any(|effect| matches!(effect, BranchEffect::Erase { .. })).then_some(Erasure::Pending),
+            decision_clock,
         };
         if validation {
             Ok((Resolution::Answer(receipt), None))
@@ -958,10 +1039,12 @@ impl TransactState {
     fn decide(
         request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
         features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>, durable: &BranchIndex,
+        terms_time: Option<Timestamp>,
     ) -> Result<(Outcome, Vec<BranchEffect>, BranchIndex)> {
         if let Some(feature) = request.require.iter().filter(|feature| {
             !features.contains(&feature.as_str())
                 && !(feature.as_str() == REVIEWED_CUSTODY_PLACEMENT && features.contains(&ROW_CUSTODY))
+                && !(feature.as_str() == DECISION_CLOCK_OFFER && terms_time.is_some())
         }).min() {
             return Err(feature_required(feature));
         }
@@ -1023,6 +1106,11 @@ impl TransactState {
 
         let visibility = std::cell::OnceCell::new();
         let evaluate = |guard: &Guard, index: &BranchIndex| {
+            if let (Some(reading), Some(scope)) = (terms_time, scope) {
+                let projected = visibility.get_or_init(|| durable.project_main_visibility(scope))
+                    .as_ref().map_err(Clone::clone)?;
+                return guard.evaluate_funded_scope(projected, reading, claims);
+            }
             let visible = match (scope, guard) {
                 (Some(scope), Guard::Version { expect: Version::Written(_), .. }) => Some(
                     visibility.get_or_init(|| durable.project_main_visibility(scope))
@@ -1030,7 +1118,7 @@ impl TransactState {
                 ),
                 _ => None,
             };
-            guard.evaluate(index, time, claims, visible)
+            guard.evaluate(index, terms_time.unwrap_or(time), claims, visible)
         };
         for (i, requirement) in request.requires.iter().enumerate() {
             if requirement.after() {
@@ -1072,6 +1160,7 @@ impl TransactState {
         }
         if failed.is_empty() {
             let mut then = Candidate::new(base.clone(), scope);
+            then.terms_time = terms_time;
             then.execute(&request.ops, &request.key, before)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
                 if !evaluate(guard, &then.index)? { failed.push(i); }
@@ -1082,6 +1171,7 @@ impl TransactState {
             }
         }
         let mut otherwise = Candidate::new(base, scope);
+        otherwise.terms_time = terms_time;
         otherwise.execute(&request.otherwise, &request.key, before)?;
         if !request.otherwise.is_empty() { otherwise.check_constraints()?; }
         Ok((Outcome::Otherwise { failed }, otherwise.effects, otherwise.index))
@@ -1096,13 +1186,22 @@ impl TransactState {
         match record {
             TransactionRecord::Tx(tx) => {
                 let receipt = &tx.receipt;
+                if receipt.decision_clock.is_some() { tx.validate_admission()?; }
                 let expected = if tx.before.is_some() { position.checked_add(1) } else { Some(position) };
                 let head = self.index.head();
+                let previous = self.receipts.get(&tx.receipt_namespace).and_then(|namespace| namespace.get(&receipt.key));
+                let exact_booking = match (receipt.decision_clock, previous) {
+                    (Some(offer), None) => offer.booked() && self.index.exact(offer.original()).is_ok(),
+                    (Some(offer), Some(previous)) => previous.fingerprint == tx.fingerprint
+                        && previous.receipt.decision_clock.is_some_and(|booked| offer.terminal_of(booked)),
+                    (None, None) => true,
+                    (None, Some(_)) => false,
+                };
                 if self.pending.is_some() || position <= head.basis.position()
                     || Some(receipt.basis.position()) != expected
                     || receipt.basis.incarnation() != head.basis.incarnation() || receipt.system_time <= head.system_time
                     || receipt.replayed || validate_key(&receipt.key).is_err()
-                    || self.receipts.get(&tx.receipt_namespace).is_some_and(|namespace| namespace.contains_key(&receipt.key))
+                    || !exact_booking
                     || (matches!(&receipt.outcome, Outcome::Refused { .. }) && !tx.effects.is_empty())
                     || matches!(receipt.erasure, Some(Erasure::Armed { .. }))
                     || (receipt.erasure == Some(Erasure::Pending)
@@ -1170,8 +1269,7 @@ impl TransactState {
             candidate.apply(effect)?;
         }
         self.index = candidate;
-        let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload });
-        debug_assert!(previous.is_none());
+        self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload });
         Ok(receipt)
     }
 }
@@ -1216,6 +1314,24 @@ fn validate_key(key: &[u8]) -> Result<()> {
 }
 
 impl Guard {
+    fn evaluate_funded_scope(
+        &self, history: &VisibleHistory, reading: Timestamp, claims: &dyn ClaimVerifier,
+    ) -> Result<bool> {
+        match self {
+            Self::Unchanged(claim) => {
+                let mut evidence = claims.verify(claim)?;
+                if evidence.scope.branch != MAIN_BRANCH || evidence.scope.layer != Layer::Merged {
+                    return Err(funding_invalid());
+                }
+                evidence.scope.basis = history.projected_cut(evidence.scope.basis)?.basis;
+                history.index().claim_unchanged(&evidence, reading)
+            }
+            Self::Version { branch, .. } | Self::CountAtMost { branch, .. } if branch != MAIN_BRANCH =>
+                Err(funding_invalid()),
+            _ => self.evaluate(history.index(), reading, claims, None),
+        }
+    }
+
     fn after(&self) -> bool {
         matches!(self, Self::CountAtMost { when: When::After, .. })
     }
@@ -1261,6 +1377,7 @@ struct Candidate<'a> {
     touched: BTreeSet<Branch>,
     declared: BTreeSet<TableRef>,
     scope: Option<&'a LabelScope>,
+    terms_time: Option<Timestamp>,
     affected_labels: BTreeSet<Vec<u8>>,
     single_label: bool,
 }
@@ -1269,7 +1386,7 @@ impl<'a> Candidate<'a> {
     fn new(index: BranchIndex, scope: Option<&'a LabelScope>) -> Self {
         Self {
             index, effects: Vec::new(), touched: BTreeSet::new(), declared: BTreeSet::new(),
-            scope, affected_labels: BTreeSet::new(), single_label: false,
+            scope, terms_time: None, affected_labels: BTreeSet::new(), single_label: false,
         }
     }
 
@@ -1277,6 +1394,11 @@ impl<'a> Candidate<'a> {
         self.index.apply(effect.clone())?;
         self.effects.push(effect);
         Ok(())
+    }
+
+    fn terms(&self) -> BranchCut {
+        let cut = self.index.head();
+        BranchCut { system_time: self.terms_time.unwrap_or(cut.system_time), ..cut }
     }
 }
 
