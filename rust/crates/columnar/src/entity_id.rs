@@ -4,7 +4,7 @@ use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, UnionArray,
     builder::{FixedSizeBinaryBuilder, Int64Builder, StringBuilder},
     cast::AsArray,
-    types::{Int8Type, Int16Type, Int32Type, Int64Type},
+    types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, UnionMode};
@@ -97,21 +97,31 @@ pub fn read_entity_id<'a>(field: &Field, array: &'a dyn Array, row: usize) -> Re
         _ if array.is_null(row) => Err(invalid()),
         _ => {
             let logical = from_field(field)?;
-            let logical = match &logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
-            Ok(match logical {
-                LogicalType::Scalar(ScalarType::Utf8) => EntityIdRef::String(array.as_string::<i32>().value(row)),
-                LogicalType::Scalar(ScalarType::Keyword) => EntityIdRef::Keyword(array.as_string::<i32>().value(row)),
-                LogicalType::Scalar(ScalarType::I8) => EntityIdRef::Integer(i64::from(array.as_primitive::<Int8Type>().value(row))),
-                LogicalType::Scalar(ScalarType::I16) => EntityIdRef::Integer(i64::from(array.as_primitive::<Int16Type>().value(row))),
-                LogicalType::Scalar(ScalarType::I32) => EntityIdRef::Integer(i64::from(array.as_primitive::<Int32Type>().value(row))),
-                LogicalType::Scalar(ScalarType::I64) => EntityIdRef::Integer(array.as_primitive::<Int64Type>().value(row)),
-                LogicalType::Scalar(ScalarType::Uuid) => EntityIdRef::Uuid(
-                    array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(invalid)?.value(row).try_into().map_err(|_| invalid())?,
-                ),
-                _ => return Err(invalid()),
-            })
+            borrow_id_scalar(&logical, array, row, false).ok_or_else(invalid)
         }
     }
+}
+
+pub(crate) fn borrow_id_scalar<'a>(
+    logical: &LogicalType, array: &'a dyn Array, row: usize, execution: bool,
+) -> Option<EntityIdRef<'a>> {
+    use ScalarType::*;
+    let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+    let LogicalType::Scalar(scalar) = logical else { return None; };
+    Some(match scalar {
+        Utf8 => EntityIdRef::String(array.as_string_opt::<i32>()?.value(row)),
+        Keyword => EntityIdRef::Keyword(array.as_string_opt::<i32>()?.value(row)),
+        I8 => EntityIdRef::Integer(i64::from(array.as_primitive_opt::<Int8Type>()?.value(row))),
+        I16 => EntityIdRef::Integer(i64::from(array.as_primitive_opt::<Int16Type>()?.value(row))),
+        I32 => EntityIdRef::Integer(i64::from(array.as_primitive_opt::<Int32Type>()?.value(row))),
+        I64 => EntityIdRef::Integer(array.as_primitive_opt::<Int64Type>()?.value(row)),
+        U8 if execution => EntityIdRef::Integer(i64::from(array.as_primitive_opt::<UInt8Type>()?.value(row) as i8)),
+        U16 if execution => EntityIdRef::Integer(i64::from(array.as_primitive_opt::<UInt16Type>()?.value(row) as i16)),
+        U32 if execution => EntityIdRef::Integer(i64::from(array.as_primitive_opt::<UInt32Type>()?.value(row) as i32)),
+        U64 if execution => EntityIdRef::Integer(array.as_primitive_opt::<UInt64Type>()?.value(row) as i64),
+        Uuid => EntityIdRef::Uuid(array.as_any().downcast_ref::<FixedSizeBinaryArray>()?.value(row).try_into().ok()?),
+        _ => return None,
+    })
 }
 
 pub fn entity_id_type() -> LogicalType {
@@ -158,7 +168,7 @@ pub fn entity_id_array<'a>(ids: impl IntoIterator<Item = EntityIdRef<'a>>) -> Re
     Ok(Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(type_ids), Some(ScalarBuffer::from(offsets)), children).map_err(crate::arrow_error)?))
 }
 
-fn invalid() -> Anomaly {
+pub(crate) fn invalid() -> Anomaly {
     Anomaly::incorrect("xtdb/invalid-id", "An ID must be a string, keyword, signed integer, or UUID")
 }
 
@@ -187,6 +197,29 @@ mod tests {
             EntityIdRef::Uuid([4; 16]),
         ] {
             assert_eq!(id.iid(), id.into_owned().iid());
+        }
+    }
+
+    #[test]
+    fn entity_ids_borrow_from_sliced_runs_with_raw_and_execution_semantics() {
+        use rtdb_types::{RunEndWidth, Value};
+
+        for value in [Value::U64(u64::MAX), Value::Utf8("東京".into())] {
+            let logical = LogicalType::RunEndEncoded {
+                width: RunEndWidth::I32, value: Box::new(value.logical_type().maybe()),
+            };
+            let array = crate::build_array(&logical, &[value.clone(), value, Value::Null]).unwrap();
+            let array = array.slice(1, 2);
+            let field = to_field("_id", &logical).unwrap();
+            let reader = crate::ColumnReader::new(&field).unwrap();
+            let expected = reader.read(array.as_ref(), 0).unwrap().entity_id();
+            let actual = reader.read_entity_id(array.as_ref(), 0).map(|id| id.unwrap().into_owned());
+            assert_eq!(actual, expected);
+            let expected = crate::read_execution_value(&field, array.as_ref(), 0).unwrap().entity_id().unwrap();
+            let actual = crate::read_execution_entity_id_as(None, &field, array.as_ref(), 0).unwrap().unwrap();
+            assert_eq!(actual.into_owned(), expected);
+            assert_eq!(actual.iid(), expected.iid());
+            assert_eq!(reader.read_entity_id(array.as_ref(), 1).unwrap(), None);
         }
     }
 }

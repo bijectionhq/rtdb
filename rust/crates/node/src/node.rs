@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
-use rtdb_columnar::{ArrowCell, MemoryBudget, read_value};
+use rtdb_columnar::{ArrowCell, ColumnReader, EntityIdRef, MemoryBudget, read_execution_entity_id_as, read_value};
 use rtdb_format::basis::decode_tx_basis;
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{SourceBody, SourceMessage}, log::proto::{AttachDatabase, DetachDatabase, resolved_tx::DbOp}};
 use rtdb_maintenance::CollectionObserver;
@@ -32,7 +32,7 @@ use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, PlacedAttempt, PlacedDecision, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -2751,12 +2751,12 @@ impl OwnedReadSession {
         if let Some(batch) = &page.batch {
             let batch = batch.batch();
             let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(lifetime_read_unavailable)?;
+            let ids = batch.column(column).as_ref();
             for row in 0..batch.num_rows() {
                 context.check_cancelled()?;
-                let ids = batch.column(column).as_ref();
                 let size = rtdb_columnar::estimate_read_value_bytes(field, ids, row)?;
                 let _identity = context.memory.reserve(size.saturating_add(4096))?;
-                let id = read_value(field, ids, row)?.entity_id()?;
+                let id = owned_range_id(ColumnReader::new(field)?.read_entity_id(ids, row)?)?;
                 let mut point = rtdb_query::open_owned_point(
                     Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from", "_valid_from", "_valid_to"]),
                 ).await?.ok_or_else(lifetime_read_unavailable)?;
@@ -2899,7 +2899,7 @@ impl OwnedReadSession {
             for row in 0..array.len() {
                 let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
                 let _charge = context.memory.reserve(bytes.saturating_add(4096))?;
-                let id = rtdb_columnar::read_execution_value(field, array, row)?.entity_id()?;
+                let id = owned_range_id(read_execution_entity_id_as(None, field, array, row)?)?;
                 self.check_point_purge_floor(relation, &id, system).await?;
             }
         }
@@ -3014,6 +3014,10 @@ fn scoped_root_denied() -> Anomaly {
 fn lifetime_read_unavailable() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/lifetime-uncovered",
         "The owned lifetime requires a point at the original store-issued present")
+}
+
+fn owned_range_id(id: Option<EntityIdRef<'_>>) -> Result<EntityId> {
+    id.map_or_else(|| Value::Null.entity_id(), |id| Ok(id.into_owned()))
 }
 
 impl Drop for OwnedReadSession {

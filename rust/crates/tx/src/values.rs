@@ -610,8 +610,7 @@ impl ArrowDocuments {
             let column = self.array.column(*index);
             if column.data_type() != &DataType::Null && column.is_valid(row) {
                 let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(&self.array.fields()[*index], column.as_ref(), row)?)?;
-                let value = reader.read(column.as_ref(), row)?;
-                if !matches!(value, Value::Null | Value::Undefined) { return Ok(value.entity_id()?.iid()); }
+                if let Some(id) = reader.read_entity_id(column.as_ref(), row)? { return Ok(id.iid()); }
             }
         }
         if let Ok(Some(error)) = self.missing_float_document_id(row, memory) {

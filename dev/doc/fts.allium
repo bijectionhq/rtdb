@@ -17,6 +17,7 @@
 -- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
 -- Both ranking paths apply the same typed overlay shadows before computing corpus statistics.
 -- Shadow text comes from the selected Arrow field when its presence marker names that field.
+-- Held corpus accounting uses the complete identity's typed payload size and the fixed allowance for its retained entry.
 -- A declared optional text column with only null or absent values contributes an empty corpus.
 -- Owned runs carry their full typed identity.
 -- Owned ranked candidates share a projected primary cursor in bounded batches.
@@ -335,6 +336,7 @@ rule RepairUnreadableSearchFile {
 --      A claimed bound covers the work through publication of its children and verified outcomes.
 --      Verification resolves the candidate's full history and gathers the visible row's text, SQL rank keys and predicate columns.
 --      The verifier checks the SQL predicates and scores that payload.
+--      Verification reads an integer tie key from its selected Arrow cell with the scan's signed execution semantics.
 --      A stale posting supplies no verified score for its revision.
 --   3. The query stops when all work is exhausted, or when its verified cutoff strictly precedes every queued and claimed bound.
 --      Pending verification has a bound until the verifier reports.

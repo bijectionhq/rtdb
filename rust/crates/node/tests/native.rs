@@ -1000,6 +1000,68 @@ async fn a_retired_owned_relation_refuses_writes_and_declarations() {
 }
 
 #[tokio::test]
+async fn held_ranges_read_arrow_ids_at_lifetime_and_historical_cuts() {
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    settings.automatic_artefacts = false;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let ids = [Value::Utf8("order/first".into()), Value::Utf8("order/second".into())];
+    let lifetime = 10_000_000;
+    for (name, policy) in [
+        ("lifetime-range", format!(r#""validity":"acceptance","lifetime_micros":{lifetime}"#)),
+        ("historical-range", r#""validity":"explicit""#.into()),
+    ] {
+        let relation = OwnedRelation::new(name).unwrap();
+        let path = OwnedRelation::new(format!("by-priority-{name}")).unwrap();
+        let schema = OwnedSchema::from_json(format!(r#"{{{policy},"fields":[
+            {{"name":"priority","type":{{"kind":"i64"}},"optional":false,"nullable":false}}
+        ]}}"#).as_bytes()).unwrap();
+        let governed = schema.lifetime_micros().is_some();
+        for operation in [
+            TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+            TxOp::OwnedDeclarePath { relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()] },
+        ] {
+            let result = writer.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await.unwrap();
+            assert!(result.committed(), "{:?}", result.error());
+        }
+        let mut first = None;
+        for (offset, id) in ids.iter().enumerate() {
+            let documents = Documents::new(vec![StructFields::from([
+                ("_id".into(), id.clone()), ("priority".into(), Value::I64(offset as i64)),
+            ])], node.memory()).unwrap();
+            let result = writer.state_mut().execute_tx(vec![TxOp::OwnedInsertDocs {
+                relation: relation.clone(), documents, valid_from: (!governed).then_some(Timestamp(0)), valid_to: None,
+            }], AutonomousTxOptions::default()).await.unwrap();
+            assert!(result.committed(), "{:?}", result.error());
+            first.get_or_insert(result.tx_key().system_time);
+        }
+
+        let first = first.unwrap();
+        let held = writer.open_owned_read().await.unwrap();
+        let request = OwnedRangeRequest { lower: None, upper: None, after: None, descending: false, limit: 2 };
+        let (page, expected) = if governed {
+            let (page, _, expiry) = held.range_page_by_key_lifetime(&relation, &path, request, None).await.unwrap();
+            assert_eq!(expiry, Some(Timestamp(first.0 + lifetime)));
+            (page, ids.as_slice())
+        } else {
+            let page = held.range_page_by_key_at_system(&relation, &path, request, first, Timestamp(0)).await.unwrap();
+            (page, &ids[..1])
+        };
+        let batch = page.batch.unwrap();
+        let (index, field) = page.schema.column_with_name("_id").unwrap();
+        let actual = (0..batch.batch().num_rows()).map(|row| {
+            read_value(field, batch.batch().column(index).as_ref(), row).unwrap()
+        }).collect::<Vec<_>>();
+        assert_eq!(actual.as_slice(), expected);
+    }
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     use rtdb_types::OwnedRelation;
 

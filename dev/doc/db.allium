@@ -431,7 +431,8 @@ variant TxMessage : SourceMessage {
     -- PATCH replay binds compatible document and IID vectors to the mutation plan as one list of records.
     -- Put and create-only insert replay retain their Arrow document vectors.
     -- Governed Arrow writes fill acceptance-relative binary slots during staging and give the filled buffers to their selected Arrow columns.
-    -- A put record without an IID vector derives its IIDs from the document ID cells.
+    -- For an Arrow document, source encoding and replay derive any required IID from its active typed ID cell.
+    -- A missing ID reports the original document in its error context.
     -- A static INSERT from compatible positional Arrow batches projects Arrow arguments into source document vectors in upload order, including supported lists and structs.
     -- Static INSERT and PATCH retain projected floating-point Arrow arguments while evaluating scalar operands and valid-time bounds.
     -- The projected INSERT document batch carries each row's evaluated validity bounds and keeps the original row order.

@@ -3,11 +3,11 @@ use std::{
     sync::Arc,
 };
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 
 use crate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
 
@@ -72,7 +72,7 @@ impl HeldTextCorpus {
         })
     }
 
-    fn observe(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
+    fn observe(&mut self, partition: usize, id: &EntityId, text: Option<&str>) -> Result<()> {
         self.identities += 1;
         if self.identities > MAX_IDENTITIES {
             return Err(corpus_limit());
@@ -95,11 +95,11 @@ impl HeldTextCorpus {
             }
         }
         if matched {
-            let charge = id.as_value().retained_bytes()? + 256 + 4 * frequencies.capacity();
+            let charge = identity_charge(id) + 256 + 4 * frequencies.capacity();
             let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
             retained.grow_to(retained.bytes().saturating_add(charge))?;
             self.matches.push(Match {
-                id,
+                id: id.clone(),
                 partition,
                 length: rtdb_text::stored_length(tokens.len()),
                 frequencies,
@@ -110,8 +110,8 @@ impl HeldTextCorpus {
 
     /// Register an exact typed overlay shadow, even if it contributes no text.
     pub fn shadow(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
-        self.observe(partition, id.clone(), text)?;
-        let charge = id.as_value().retained_bytes()? + 192;
+        self.observe(partition, &id, text)?;
+        let charge = identity_charge(&id) + 192;
         let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
         retained.grow_to(retained.bytes().saturating_add(charge))?;
         if !self.shadows.entry(partition).or_default().insert(id) {
@@ -216,6 +216,11 @@ impl HeldTextCorpus {
     }
 }
 
+fn identity_charge(id: &EntityId) -> usize {
+    // Keep the charge for a compact copy and the original Value-sized allowance.
+    std::mem::size_of::<Value>() + EntityIdRef::from(id).owned_payload_bytes()
+}
+
 fn corpus_limit() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Unavailable,
@@ -244,6 +249,32 @@ mod tests {
         assert_eq!(page.total, 3);
         assert_eq!(page.hits[0].id, EntityId::Integer(2));
         assert_eq!(page.hits[0].score.to_bits(), scorer.bm25_arrow(&rtdb_text::analyze("a b")).to_bits());
+    }
+
+    #[test]
+    fn held_corpus_charges_compact_ids_for_shadows_and_matches() {
+        let mut text = String::with_capacity(1024);
+        text.push_str("places/東京");
+        let ids = [
+            EntityId::String(text.clone()),
+            EntityId::Keyword(rtdb_types::Keyword::from_name(text)),
+            EntityId::Integer(i64::MIN),
+            EntityId::Uuid([3; 16]),
+        ];
+        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), "apples").unwrap();
+        for (partition, id) in ids.into_iter().enumerate() {
+            let expected = id.as_value().retained_bytes().unwrap();
+            let before = corpus.retained.bytes();
+            corpus.shadow(partition, id, Some("apples")).unwrap();
+            let matched = corpus.matches.last().unwrap();
+            assert_eq!(corpus.retained.bytes() - before, 2 * expected + 192 + 256 + 4 * matched.frequencies.capacity());
+        }
+        let before = corpus.retained.bytes();
+        let id = EntityId::String("deleted".into());
+        let expected = id.as_value().retained_bytes().unwrap();
+        corpus.shadow(0, id, None).unwrap();
+        assert_eq!(corpus.retained.bytes() - before, expected + 192);
+        assert_eq!(corpus.matches.len(), 4);
     }
 
     #[test]

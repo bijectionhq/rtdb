@@ -237,6 +237,7 @@ entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
     -- Ordinary document operations and SQL put mutations stage document vectors with the event headers for their selected positions.
+    -- When an Arrow document supplies the identity, staging derives its IID from that typed cell.
     -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.
     -- A typed staging copy reserves its selected positions and output arrays under the transaction memory budget.
     -- Staging packs row-backed writes and collects their positions alongside the existing Arrow event positions in command order.

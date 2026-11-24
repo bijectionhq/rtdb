@@ -1358,6 +1358,25 @@ impl crate::columnar::BatchCursor for OrderedPayload {
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
 struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
 
+fn ranked_integer_id(column: &crate::columnar::Column, row: usize) -> Result<Option<i64>> {
+    match column.arrow_cell(row) {
+        Some(Some((array, field, logical, offset))) => {
+            match rtdb_columnar::read_execution_entity_id_as(logical, field, array, offset) {
+                Ok(Some(rtdb_columnar::EntityIdRef::Integer(id))) => Ok(Some(id)),
+                Ok(_) => Ok(None),
+                Err(error) if error.code == "xtdb/invalid-id" => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        Some(None) => Ok(None),
+        None => Ok(match column.value(row)?.entity_id() {
+            Ok(EntityId::Integer(id)) => Some(id),
+            _ => None,
+        }),
+    }
+}
+
+
 impl ScanVerifier<'_> {
     async fn point_batch(&self, scan: &Scan, bounds: TemporalBounds, partitions: &[Snapshot],
         iids: &BTreeSet<Iid>) -> Result<Option<Option<crate::columnar::ColumnBatch>>> {
@@ -1501,11 +1520,14 @@ impl ScanVerifier<'_> {
             let _scratch = memory.reserve(256usize.saturating_add(token_bytes))?;
             let score = scorer.bm25_text(text);
             let key = match id {
-                Some(id) => match batch.columns[id].value(position_in_batch)?.entity_id() {
-                    Ok(rtdb_types::EntityId::Integer(id)) => RankKey::integer(score, Some(id)),
-                    Ok(rtdb_types::EntityId::Uuid(id)) => RankKey::uuid(score, id),
-                    _ => return Ok(None),
-                },
+                Some(id) => {
+                    let column = &batch.columns[id];
+                    if let Some(id) = ranked_integer_id(column, position_in_batch)? {
+                        RankKey::integer(score, Some(id))
+                    } else if let Ok(EntityId::Uuid(id)) = column.value(position_in_batch)?.entity_id() {
+                        RankKey::uuid(score, id)
+                    } else { return Ok(None); }
+                }
                 None => RankKey::integer(score, None),
             };
             if !score.is_finite() || score < 0.0 { return Ok(None); }
@@ -1559,18 +1581,7 @@ impl ScanVerifier<'_> {
                 selected.append_value(iid.0).map_err(|error| invalid("verifier-iid", error))?;
                 scores.append_value(score);
                 if let Some((position, ids)) = id_position.zip(ranked_ids.as_mut()) {
-                    let column = &batch.columns[position];
-                    let id = match column.arrow_cell(row).flatten().and_then(|(array, field, _, offset)| {
-                        rtdb_columnar::read_entity_id(field, array, offset).ok()
-                    }) {
-                        Some(rtdb_columnar::EntityIdRef::Integer(id)) => Some(id),
-                        Some(_) => None,
-                        None => match column.value(row)?.entity_id() {
-                            Ok(EntityId::Integer(id)) => Some(id),
-                            _ => None,
-                        },
-                    };
-                    ids.append_option(id);
+                    ids.append_option(ranked_integer_id(&batch.columns[position], row)?);
                 }
             }
         }
@@ -2544,6 +2555,30 @@ mod tests {
     use rtdb_trie::TrieConfig;
     use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn ranked_integer_ids_follow_execution_types_and_selected_offsets() {
+        use crate::columnar::{Column, SelectedColumn};
+
+        let values = [Value::U8(u8::MAX), Value::Null, Value::I16(-20), Value::Utf8("other".into()), Value::Binary(vec![0; 16])];
+        let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+        let field = Arc::new(rtdb_columnar::to_field("_id", &logical).unwrap());
+        let array = rtdb_columnar::copy_array(&logical, &values).unwrap();
+        let columns = Column::Selected(SelectedColumn::new(
+            vec![Some((array, field, Some(logical), None)), None],
+            Arc::new(vec![(0, 2), (0, 0), (0, 1), (0, 3), (0, 4), (1, 0)]),
+        ));
+        let actual = (0..6).map(|row| ranked_integer_id(&columns, row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(actual, [Some(-20), Some(-1), None, None, None, None]);
+
+        let uri = LogicalType::Scalar(ScalarType::Uri);
+        let unreadable = Column::Arrow {
+            array: Arc::new(arrow_array::StringArray::from(vec!["not a URI"])),
+            field: Arc::new(rtdb_columnar::to_field("_id", &uri).unwrap()),
+            logical: Some(uri),
+        };
+        assert_eq!(ranked_integer_id(&unreadable, 0).unwrap_err(), unreadable.value(0).unwrap_err());
+    }
 
     #[test]
     fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_known_iids() {

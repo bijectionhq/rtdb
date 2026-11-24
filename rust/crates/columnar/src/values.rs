@@ -6,7 +6,7 @@ use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuff
 use arrow_schema::{DataType, Field, Fields, UnionMode};
 use rtdb_types::{Anomaly, ListBuilder, DecimalValue, IntervalUnit, ListKind, ListValue, ListView, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
 
-use crate::{from_field, leg_name, to_field};
+use crate::{EntityIdRef, entity_id::borrow_id_scalar, from_field, leg_name, to_field};
 
 /// Builds arrays with exact logical value types; numeric coercions belong to expressions.
 /// Undefined cells are accepted only for bottom-typed fields.
@@ -661,6 +661,23 @@ impl<'a> ColumnReader<'a> {
     pub fn new(field: &'a Field) -> Result<Self> { Ok(Self { logical: from_field(field)?, field }) }
     pub fn read(&self, array: &dyn Array, row: usize) -> Result<Value> { read_typed(&self.logical, self.field, array, row) }
     pub fn logical(&self) -> &LogicalType { &self.logical }
+
+    /// Reads a raw entity ID, returning absence for a null cell.
+    pub fn read_entity_id<'b>(&self, array: &'b dyn Array, row: usize) -> Result<Option<EntityIdRef<'b>>> {
+        read_selected(&self.logical, self.field, array, row, read_id::<false>)
+    }
+}
+
+/// Borrows an entity ID with the same signed-integer interpretation as an execution value.
+pub fn read_execution_entity_id_as<'a>(
+    logical: Option<&LogicalType>, field: &Field, array: &'a dyn Array, row: usize,
+) -> Result<Option<EntityIdRef<'a>>> {
+    let derived;
+    let logical = match logical {
+        Some(logical) => logical,
+        None => { derived = from_field(field)?; &derived }
+    };
+    read_selected(logical, field, array, row, read_id::<true>)
 }
 
 /// `read_value` for a caller that has derived `logical` from `field` once, for many cells of the column.
@@ -676,20 +693,30 @@ pub(crate) fn union_read_type<'a>(logical: &'a LogicalType, child: &Field) -> Re
 
 /// `read_value` with the field's logical type already derived, so nested cells reuse their parent's types.
 fn read_typed(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
-    if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
-    if field.data_type() != array.data_type() { return Err(layout_error()); }
-    read(logical, field, array, row)
+    read_selected(logical, field, array, row, read)
 }
 
-fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
+fn read_selected<'a, T>(
+    logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize,
+    read_leaf: impl Fn(&LogicalType, &Field, &'a dyn Array, usize) -> Result<T> + Copy,
+) -> Result<T> {
+    if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
+    if field.data_type() != array.data_type() { return Err(layout_error()); }
     if matches!(logical, LogicalType::Nothing) { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
     if let DataType::RunEndEncoded(ends, values) = field.data_type() {
         let derived;
         let value = match logical { LogicalType::RunEndEncoded { value, .. } => value.as_ref(), _ => { derived = from_field(values)?; &derived } };
+        fn read_run<'a, R: arrow_array::types::RunEndIndexType, T>(
+            logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize,
+            read_leaf: impl Fn(&LogicalType, &Field, &'a dyn Array, usize) -> Result<T> + Copy,
+        ) -> Result<T> {
+            let runs = downcast::<RunArray<R>>(array)?;
+            read_selected(logical, field, runs.values().as_ref(), runs.get_physical_index(row), read_leaf)
+        }
         return match ends.data_type() {
-            DataType::Int16 => { let runs = downcast::<RunArray<Int16Type>>(array)?; read_typed(value, values, runs.values().as_ref(), runs.get_physical_index(row)) }
-            DataType::Int32 => { let runs = downcast::<RunArray<Int32Type>>(array)?; read_typed(value, values, runs.values().as_ref(), runs.get_physical_index(row)) }
-            DataType::Int64 => { let runs = downcast::<RunArray<Int64Type>>(array)?; read_typed(value, values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            DataType::Int16 => read_run::<Int16Type, _>(value, values, array, row, read_leaf),
+            DataType::Int32 => read_run::<Int32Type, _>(value, values, array, row, read_leaf),
+            DataType::Int64 => read_run::<Int64Type, _>(value, values, array, row, read_leaf),
             _ => Err(layout_error()),
         };
     }
@@ -698,12 +725,39 @@ fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> 
         let id = union.type_id(row);
         let child = fields.iter().find_map(|(child_id, field)| (child_id == id).then_some(field)).ok_or_else(layout_error)?;
         let leg = union_read_type(logical, child)?;
-        return read_typed(&leg, child, union.child(id).as_ref(), union.value_offset(row));
+        return read_selected(&leg, child, union.child(id).as_ref(), union.value_offset(row), read_leaf);
     }
+    if let LogicalType::Maybe(inner) = logical
+        && array.is_valid(row)
+    {
+        return read_selected(inner, field, array, row, read_leaf);
+    }
+    read_leaf(logical, field, array, row)
+}
+
+fn read_id<'a, const EXECUTION: bool>(
+    logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize,
+) -> Result<Option<EntityIdRef<'a>>> {
+    if array.is_null(row) || *logical == LogicalType::Null { return Ok(None); }
+    if let Some(id) = borrow_id_scalar(logical, array, row, EXECUTION) { return Ok(Some(id)); }
+    match logical {
+        LogicalType::Scalar(ScalarType::Binary) => { downcast::<BinaryArray>(array)?; }
+        LogicalType::Scalar(ScalarType::FixedSizeBinary(_)) => { downcast::<FixedSizeBinaryArray>(array)?; }
+        // A non-ID cell can still fail decoding before ID validation (for example, a malformed URI).
+        _ => {
+            let mut value = read(logical, field, array, row)?;
+            if EXECUTION { crate::admit_execution_value(&mut value)?; }
+            value.entity_id()?;
+            return Err(layout_error());
+        }
+    }
+    Err(crate::entity_id::invalid())
+}
+
+fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
     if array.is_null(row) { return Ok(Value::Null); }
     match logical {
         LogicalType::Null => Ok(Value::Null),
-        LogicalType::Maybe(inner) => read(inner, field, array, row),
         LogicalType::Scalar(scalar) => read_scalar(scalar, array, row),
         LogicalType::Struct(children) => {
             let array = downcast::<StructArray>(array)?;

@@ -3507,6 +3507,52 @@ mod tests {
     }
 
     #[test]
+    fn arrow_document_ids_preserve_iids_errors_and_source_bytes() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let values = [
+            Value::I8(i8::MIN), Value::I16(i16::MIN), Value::I32(i32::MIN), Value::I64(i64::MIN),
+            Value::Utf8("places/東京".into()), Value::Keyword(rtdb_types::Keyword::from_name("places/東京")),
+            Value::Uuid([3; 16]),
+        ];
+        let rows = |values: &[Value]| values.iter().map(|value| {
+            StructFields::from([("_id".into(), value.clone()), ("body".into(), Value::Utf8("document".into()))])
+        }).collect::<Vec<_>>();
+        let arrow = |values: &[Value]| {
+            let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+            let text = LogicalType::Scalar(rtdb_types::ScalarType::Utf8);
+            let fields = vec![to_field("_id", &logical).unwrap(), to_field("body", &text).unwrap()].into();
+            let columns = [rtdb_columnar::copy_array(&logical, values).unwrap(),
+                rtdb_columnar::copy_array(&text, &vec![Value::Utf8("document".into()); values.len()]).unwrap()];
+            let layout = DecodedDocumentLayout::new(&fields, &memory).unwrap();
+            let array = rtdb_columnar::build_struct_array(fields, &columns, values.len(), None).unwrap();
+            ArrowDocuments::from_source(array.as_struct(), layout, array.get_array_memory_size(), &memory).unwrap().unwrap()
+        };
+        let put_arrow = |documents| SourceTransaction::new(vec![TxOp::PutArrowDocs {
+            table: table.clone(), documents,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let put_rows = |values: &[Value]| SourceTransaction::new(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(rows(values), &memory).unwrap(),
+            valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+
+        let batch = arrow(&values);
+        let reader = batch.id_reader().unwrap();
+        for (row, value) in values.iter().enumerate() {
+            assert_eq!(batch.iid(row, reader.as_ref(), &memory).unwrap(), value.entity_id().unwrap().iid());
+        }
+        let columnar = put_arrow(batch);
+        let scalar = put_rows(&values);
+        assert_eq!(columnar.encode().unwrap().as_slice(), scalar.encode().unwrap().as_slice());
+        assert_eq!(columnar.body_digest().unwrap(), scalar.body_digest().unwrap());
+
+        for bad in [Value::Binary(vec![3; 16]), Value::FixedSizeBinary(vec![3; 16]), Value::DateDay(0), Value::Null] {
+            let values = [Value::I64(1), bad, Value::Bool(false)];
+            assert_eq!(put_arrow(arrow(&values)).encode().unwrap_err(), put_rows(&values).encode().unwrap_err());
+        }
+    }
+
+    #[test]
     fn uuid_uploads_keep_row_codec_bytes_for_nulls_with_hidden_payloads() {
         use arrow_array::{FixedSizeBinaryArray, Int64Array};
         use arrow_buffer::{Buffer, NullBuffer};

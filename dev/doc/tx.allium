@@ -150,6 +150,7 @@
 -- A creation-lifetime relation declares its immutable acceptance extent before any fact exists.
 -- Its original ordered creation fixes the exclusive expiry and reserves the full identity across that expiry.
 -- A live point uses the live admission clock reading and reports the fact's exclusive expiry.
+-- A live lifetime range reads the complete identities from the selected Arrow rows when establishing their release horizon.
 -- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
@@ -282,6 +283,7 @@
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
 -- The derived hold shares the original generation and lease and admits point, valid-window, version, ordered page and count reads in its fixed root scope.
 -- Historical ordered pages and counts use a fully covered index revision at the admitted system cut and explicit valid instant.
+-- Historical ordered pages check the purge floor using complete identities from the selected Arrow rows.
 -- Historical index coverage includes ordered erasures, and historical pages and counts carry no commit evidence.
 
 -- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys for each assertion at the authored instant, including assertions shadowed later in the same commit.
