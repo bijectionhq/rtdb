@@ -284,6 +284,24 @@
       ],
       "min_verified_functions": 54
     },
+    "discard-decoded-envelope-term": {
+      "defect": "The decoded frame loses its retained term when converted into an envelope.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "Some(message) => Some(ReplicaEnvelope { term: self.term, term_sequence: self.term_sequence, message }),",
+          "replace": "Some(message) => Some(ReplicaEnvelope { term: Term(0), term_sequence: self.term_sequence, message }),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "into_envelope",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 54
+    },
     "omit-encoded-source-body": {
       "defect": "A source protobuf encode loses the message it must round-trip.",
       "mutate": [
