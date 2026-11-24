@@ -74,7 +74,7 @@ impl Scope {
             }
             FamilyRequest::EnrollOriginal(row) | FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, true)),
             FamilyRequest::Scope | FamilyRequest::RegisterDerived { .. } | FamilyRequest::SealWorldRow { .. }
-            | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
+            | FamilyRequest::ResolveMember { .. } | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
         };
         let mut worlds = positions.into_iter().flatten()
             .filter(|position| position.line_generation != self.root_line)
@@ -224,6 +224,12 @@ pub(super) async fn serve(
             FamilyReply::Opened(families.open_root_landing_payload(
                 scope.family(family), scope.stage(stage)?, binding, envelope, vault()?,
             ).await?)
+        }
+        FamilyRequest::ResolveMember { family, assertion } => {
+            let member = families.resolve_member(scope.family(family), assertion).await?;
+            let capability = wire_stage(member.capability);
+            scope.stage(capability)?;
+            FamilyReply::Member(FamilyOccurrenceWire { position: member.position, assertion, capability })
         }
         FamilyRequest::RequireLiveOccurrence { family, occurrence } => {
             families.require_live_occurrence(scope.family(family), scope.occurrence(occurrence)?).await?;

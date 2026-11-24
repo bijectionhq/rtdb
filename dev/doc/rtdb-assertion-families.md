@@ -125,6 +125,15 @@ The reservation must be enrolled in the live family.
 The link body binds the intent, the source position, the destination position, the vault family identity and the review slot.
 Retiring the link capability later leaves the destination row readable.
 
+### `rtdb.owned.ResolveFamilyMember.v1`
+
+Hosted protocol 219 adds this action.
+
+Request: family `uuid`, member `assertion`.
+Reply: the exact admitted member `occurrence` in the live family.
+A reviewed rewrite supplies its member assertion to recover the reservation coordinate while retaining its own authenticated winning position for the sealed link.
+An unpositioned original and a pending destination refuse.
+
 ### `rtdb.owned.RequireLiveFamilyOccurrence.v1`
 
 Request: family `uuid`, `occurrence`.

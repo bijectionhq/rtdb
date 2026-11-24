@@ -20,6 +20,7 @@ pub(crate) const ACTIVATE_FAMILY_LANDING_V2: &str = "rtdb.owned.ActivateFamilyLa
 pub(crate) const SEAL_FAMILY_LANDING_LINK_V2: &str = "rtdb.owned.SealFamilyLandingLink.v2";
 pub(crate) const SEAL_FAMILY_LANDING_PAYLOAD_V1: &str = "rtdb.owned.SealFamilyLandingPayload.v1";
 pub(crate) const OPEN_FAMILY_LANDING_PAYLOAD_V1: &str = "rtdb.owned.OpenFamilyLandingPayload.v1";
+pub(crate) const RESOLVE_FAMILY_MEMBER_V1: &str = "rtdb.owned.ResolveFamilyMember.v1";
 pub(crate) const REQUIRE_LIVE_FAMILY_OCCURRENCE_V1: &str = "rtdb.owned.RequireLiveFamilyOccurrence.v1";
 pub(crate) const REQUIRE_FAMILY_POSITION_OPEN_V1: &str = "rtdb.owned.RequireFamilyPositionOpen.v1";
 pub(crate) const REGISTER_FAMILY_DERIVED_V1: &str = "rtdb.owned.RegisterFamilyDerived.v1";
@@ -32,7 +33,7 @@ pub(crate) fn is_family_action(action: &str) -> bool {
     matches!(action, ASSERTION_FAMILY_SCOPE_V1 | ENROLL_ASSERTION_FAMILY_V1 | ENROLL_FAMILY_WORLD_ROW_V1
         | REGISTER_ASSERTION_FAMILY_V1 | RESERVE_FAMILY_LANDING_V1 | ACTIVATE_FAMILY_LANDING_V2
         | SEAL_FAMILY_LANDING_LINK_V2 | SEAL_FAMILY_LANDING_PAYLOAD_V1 | OPEN_FAMILY_LANDING_PAYLOAD_V1
-        | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
+        | RESOLVE_FAMILY_MEMBER_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
         | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1)
 }
@@ -116,6 +117,7 @@ pub enum FamilyRequest {
     OpenRootLandingPayload {
         family: Uuid, stage: FamilyStage, binding: RootLandingBinding, envelope: Bytes,
     },
+    ResolveMember { family: Uuid, assertion: AssertionId },
     RequireLiveOccurrence { family: Uuid, occurrence: FamilyOccurrenceWire },
     RequirePositionOpen(Position),
     RegisterDerived { family: Uuid, rows: Vec<FamilyDerivedRow> },
@@ -137,6 +139,7 @@ pub struct FamilyFenceReply {
 pub enum FamilyReply {
     Scope { deployment: Uuid, incarnation: NonZeroU64, root_line: [u8; 16] },
     Done,
+    Member(FamilyOccurrenceWire),
     Sealed(Bytes),
     Opened(Bytes),
     Fence(FamilyFenceReply),
@@ -321,6 +324,7 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
             family: frame.uuid("family")?, stage: frame.stage()?,
             binding: frame.root_binding()?, envelope: frame.tail(body, MAX_ROW_BYTES)?,
         },
+        RESOLVE_FAMILY_MEMBER_V1 => FamilyRequest::ResolveMember { family: frame.uuid("family")?, assertion: frame.assertion()? },
         REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 => FamilyRequest::RequireLiveOccurrence { family: frame.uuid("family")?, occurrence: frame.occurrence()? },
         REQUIRE_FAMILY_POSITION_OPEN_V1 => FamilyRequest::RequirePositionOpen(frame.position()?),
         REGISTER_FAMILY_DERIVED_V1 => {
@@ -419,6 +423,13 @@ impl Service {
                 out.freeze()
             }
             FamilyReply::Done => Bytes::from_static(b"\x01"),
+            FamilyReply::Member(member) => {
+                let mut out = BytesMut::with_capacity(104);
+                out.extend_from_slice(&member.position.to_bytes());
+                out.extend_from_slice(&member.assertion.to_bytes());
+                put_stage(&mut out, member.capability);
+                out.freeze()
+            },
             FamilyReply::Sealed(bytes) | FamilyReply::Opened(bytes) => {
                 let charge = call.reserve(bytes.len())?;
                 wire::retain(bytes, charge)

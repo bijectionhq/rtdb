@@ -506,6 +506,23 @@ impl<'a> AssertionFamilies<'a> {
         }).await
     }
 
+    /// Locate the admitted member of a reviewed world rewrite.
+    pub async fn resolve_member(&self, family: Uuid, assertion: AssertionId) -> Result<FamilyOccurrence> {
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        let occurrence = if record.original.assertion == assertion {
+            let position = record.original_position.ok_or_else(conflict)?.0;
+            FamilyOccurrence { position, assertion, capability: record.original.capability }
+        } else {
+            let landing = record.landings.iter().find(|landing| landing.reservation.destination == assertion)
+                .ok_or_else(conflict)?;
+            let position = landing.accepted.as_ref().ok_or_else(conflict)?.position;
+            FamilyOccurrence { position, assertion, capability: landing.reservation.capability }
+        };
+        self.require_position_open(occurrence.position).await?;
+        Ok(occurrence)
+    }
+
     /// Current check for the exact occurrence already admitted for release.
     /// The caller owns the final release fence and draining previously admitted work.
     pub async fn require_live_occurrence(&self, family: Uuid, occurrence: FamilyOccurrence) -> Result<()> {
@@ -936,12 +953,15 @@ mod tests {
             families.enroll_original(family, enrolment(original)).await?;
             families.register(family, original).await?;
             families.reserve_landing(family, first).await?;
+            assert_eq!(families.resolve_member(family, original.assertion).await?, original);
+            assert!(families.resolve_member(family, copy.assertion).await.is_err());
             assert!(families.require_live_occurrence(family, copy).await.is_err());
             families.activate_ordered_landing(family, binding, first).await?;
             families.activate_ordered_landing(family, binding, first).await?;
             let changed = PlacementBinding { address_extent_commitment: [9; 32], ..binding };
             assert!(families.activate_ordered_landing(family, changed, first).await.is_err());
             families.require_live_occurrence(family, copy).await?;
+            assert_eq!(families.resolve_member(family, copy.assertion).await?, copy);
             families.reserve_landing(family, pending).await?;
 
             let closed = if close_from_copy { copy.position } else { original.position };
