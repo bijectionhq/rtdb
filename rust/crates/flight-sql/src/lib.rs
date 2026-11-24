@@ -23,6 +23,8 @@ mod owned_actions;
 mod owned_landing_wire;
 
 mod owned_world;
+mod owned_family;
+pub use owned_family::{FamilyDerivedRow, FamilyFenceReply, FamilyOccurrenceWire, FamilyReply, FamilyRequest, FamilyReservationWire, FamilyStage, WorldRowAuthoring};
 pub use owned_world::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, PreparedWorldOverlay, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldParentVersion, WorldParentVersions, WorldPointResult, WorldPointRow};
 
 /// Private Flight gateway request marker and response cutoff.

@@ -2742,6 +2742,12 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.ReadHeldWorldParentChangesAt.v2",
         "rtdb.owned.ReadHeldWorldAncestorChanges.v2",
         "rtdb.owned.CloseWorldRead.v1",
+        "rtdb.owned.RegisterAssertionFamily.v1", "rtdb.owned.ReserveFamilyLanding.v1",
+        "rtdb.owned.ActivateFamilyLanding.v1", "rtdb.owned.SealFamilyLandingLink.v1",
+        "rtdb.owned.RequireLiveFamilyOccurrence.v1", "rtdb.owned.RequireFamilyPositionOpen.v1",
+        "rtdb.owned.RegisterFamilyDerived.v1", "rtdb.owned.SealWorldOverlayRow.v1",
+        "rtdb.owned.OpenWorldOverlayRow.v1", "rtdb.owned.FenceAssertionFamily.v1",
+        "rtdb.owned.SettleAssertionFamily.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unimplemented, "{action}");

@@ -34,6 +34,11 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
         root: rtdb_node::OwnedRootSection, observed: rtdb_node::OwnedWorldObservations, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
+
+    /// The placed deployment's assertion-family vault (dev/doc/rtdb-assertion-families.md).
+    fn assertion_family<'a>(
+        &'a self, call: WorldCall<'a>, request: crate::FamilyRequest,
+    ) -> BoxFuture<'a, Result<crate::FamilyReply>>;
 }
 
 /// The independently archived overlay position and its bounded preparation lease.

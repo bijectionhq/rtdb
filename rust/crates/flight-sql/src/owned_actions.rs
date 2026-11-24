@@ -1010,7 +1010,7 @@ fn require_identity(batch: OwnedBatch) -> Result<OwnedBatch, Status> {
     Ok(batch)
 }
 
-fn require_idle(native: &NativeSession) -> Result<(), Status> {
+pub(crate) fn require_idle(native: &NativeSession) -> Result<(), Status> {
     if native.state().auto_commit() && native.state().status() == TransactionStatus::Idle { return Ok(()); }
     Err(Status::failed_precondition("Owned actions require an idle autocommit session"))
 }

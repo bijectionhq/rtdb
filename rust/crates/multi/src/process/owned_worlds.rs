@@ -14,6 +14,8 @@ use crate::{
     keys::KeyService,
 };
 
+mod assertion_families;
+
 pub(super) struct PlacedWorldHost {
     pub(super) directory: Arc<dyn Directory>,
     pub(super) agent: Arc<super::FenceSlot>,
@@ -156,6 +158,16 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
+    fn assertion_family<'a>(
+        &'a self, call: WorldCall<'a>, request: rtdb_flight_sql::FamilyRequest,
+    ) -> BoxFuture<'a, Result<rtdb_flight_sql::FamilyReply>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let record = self.directory.deployment(&deployment.to_string()).await?
+                .ok_or_else(OwnedWorld::unavailable)?;
+            assertion_families::serve(self.keys.as_ref(), deployment, record.incarnation, request).await
+        })
+    }
 }
 
 impl OwnedWorldRead for HeldCheckpointWorld {

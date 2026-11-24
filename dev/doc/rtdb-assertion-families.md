@@ -2,7 +2,7 @@
 
 This is the Flight contract a placed writer's client uses to keep per-copy custody of a protected row.
 The vault owner is `AssertionFamilies` in `rust/crates/multi/src/keys/assertion/family.rs`.
-The Flight decoding lives in `rust/crates/flight-sql/src/owned_family.rs` and the placed host in `rust/crates/multi/src/process/owned_worlds.rs`.
+The Flight decoding lives in `rust/crates/flight-sql/src/owned_family.rs` and the placed host in `rust/crates/multi/src/process/owned_worlds/assertion_families.rs`.
 Hosted protocol 214 introduces every action below.
 
 ## Model
