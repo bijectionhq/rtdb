@@ -3798,8 +3798,8 @@ impl Service {
         if overlay.is_some() && !nearest.observe {
             return Err(invalid("Staged nearest requires original evidence"));
         }
-        let overlay = overlay.as_ref()
-            .map(|input| self.nearest_shadows(&nearest, input.batch()))
+        let overlay = overlay
+            .map(|input| self.nearest_shadows(&nearest, input))
             .transpose()?;
         let ((page, approximate), witnesses) = held.snapshot.nearest_batch(
             &nearest.partitions, &nearest.query, nearest.observe, valid, overlay,
@@ -3857,7 +3857,7 @@ impl Service {
             }
             None => None,
         };
-        let vector_overlay = hybrid.vector_overlay.as_ref().map(|input| self.nearest_shadows(nearest, input.batch())).transpose()?;
+        let vector_overlay = hybrid.vector_overlay.map(|input| self.nearest_shadows(nearest, input)).transpose()?;
         let (text_page, witnesses) = held.snapshot.ranked_search_batch(
             &rank.partitions, rank.query, 0, rank.limit, true, valid, text_overlay,
         ).await.map_err(status)?;
@@ -3925,7 +3925,7 @@ impl Service {
         };
         let scope = owned_rank_scope(domain, body, "");
         let text_overlay = hybrid.text_overlay.as_ref().map(|input| self.search_shadows(rank, input.batch())).transpose()?;
-        let vector_overlay = hybrid.vector_overlay.as_ref().map(|input| self.nearest_shadows(nearest, input.batch())).transpose()?;
+        let vector_overlay = hybrid.vector_overlay.map(|input| self.nearest_shadows(nearest, input)).transpose()?;
         let (partitions, query) = (rank.partitions.clone(), rank.query.to_owned());
         let (vectors, probe) = (nearest.partitions.clone(), nearest.query.clone());
         let (text_read, vector_read) = if let Some(system) = parent_at {
@@ -3957,7 +3957,8 @@ impl Service {
         Ok(reply)
     }
 
-    fn nearest_shadows(&self, nearest: &OwnedNearestRequest, input: &RecordBatch) -> Result<rtdb_node::nearest::HeldVectorOverlay, Status> {
+    fn nearest_shadows(&self, nearest: &OwnedNearestRequest, staged: OwnedBatch) -> Result<rtdb_node::nearest::HeldVectorOverlay, Status> {
+        let input = staged.batch();
         let filters = nearest.query.filter_count();
         let malformed = || invalid("Invalid staged nearest overlay layout");
         if !(1..=rtdb_node::nearest::MAX_NEAREST_SHADOWS).contains(&input.num_rows()) || input.num_columns() != 3 + filters {
@@ -3987,20 +3988,16 @@ impl Service {
                 if range.len() != nearest.query.dimensions() || range.clone().any(|index| components.is_null(index)) {
                     return Err(invalid("A staged nearest vector does not have the probe's dimensions"));
                 }
-                Some(components.values().slice(range.start, range.len()))
+                Some(&components.values()[range])
             };
             let cells = filter_columns.iter()
-                .map(|column| (!column.is_null(row)).then(|| {
-                    let offsets = column.value_offsets();
-                    let start = offsets[row] as usize;
-                    column.values().slice_with_length(start, offsets[row + 1] as usize - start)
-                }))
-                .collect();
+                .map(|column| column.is_valid(row).then(|| column.value(row)));
             overlay.shadow_staged(
                 partitions.value(row) as usize,
-                rtdb_types::EntityId::String(ids.value(row).to_owned()),
+                EntityIdRef::String(ids.value(row)),
                 vector,
                 cells,
+                &nearest.query,
             ).map_err(status)?;
         }
         Ok(overlay)
@@ -4061,8 +4058,8 @@ impl Service {
             WorldHistoricalRead::EarlierParent => b"rtdb.owned.nearest.world-parent-at.v1\0".as_slice(),
         };
         let scope = owned_rank_scope(domain, body, "");
-        let overlay = overlay.as_ref()
-            .map(|input| self.nearest_shadows(&nearest, input.batch()))
+        let overlay = overlay
+            .map(|input| self.nearest_shadows(&nearest, input))
             .transpose()?;
         let partitions = nearest.partitions.clone();
         let query = nearest.query.clone();
