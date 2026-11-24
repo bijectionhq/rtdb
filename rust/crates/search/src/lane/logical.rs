@@ -406,11 +406,12 @@ impl SearchBuilder {
                     Ok(PostingPage { page, number, columns: columns.len(), forward: &forward,
                         revisions: Vec::with_capacity(capacity), _scratch: scratch })
                 });
-                let (_, summaries) = write_group_as(&columns, [counted], &identity, Some(version), None, &mut output,
+                let (_, summaries, tree) = write_group_as(&columns, [counted], &identity, Some(version), None, &mut output,
                     Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
                 let digest = output.into_digest();
                 let forward = forward.into_inner().and_then(|output| output.finish().ok());
-                Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, digest, source_rows, has_erases, summaries, forward))
+                let tree = tree.ok_or_else(|| fault("Logical search run has no written root"))?;
+                Ok::<_, rtdb_types::Anomaly>((tree.encode(false), digest, source_rows, has_erases, summaries, forward))
             };
             match build(forward_owner, indexing) {
                 Err(error) if forward_owner.is_some() && error.code == "rtdb/memory-budget-exceeded" && !token.is_cancelled() => {
@@ -884,10 +885,10 @@ impl SearchBuilder {
         let (identity, columns, version) = (run_identity(slug, &index.id, index.version, &blocks, rebuild, &allocation), columns.to_vec(), index.version);
         let (locator, digest, summaries) = tokio::task::spawn_blocking(move || {
             let mut output = FileDigestWriter::new(BufWriter::new(File::create(&file).map_err(fault)?));
-            let (_, summaries) = write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, &mut output,
+            let (_, summaries, tree) = write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, &mut output,
                 Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
-            let digest = output.into_digest();
-            Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, digest, summaries))
+            let tree = tree.ok_or_else(|| fault("Logical search run has no written root"))?;
+            Ok::<_, rtdb_types::Anomaly>((tree.encode(false), output.into_digest(), summaries))
         }).await.map_err(fault)??;
         let run = self.publish_run(index, slug, &output, blocks, rebuild, source_rows, has_erases, locator, digest, allocation, source_receipt, cancellation).await?;
         Ok(PreparedLogicalRun { run, summaries })
@@ -929,11 +930,6 @@ impl SearchPage for MergedRows {
         Ok(IndexedRow { header: EventHeader { position, iid: row.iid(), system_from, commit_position,
             valid_time: Interval::ALL, op }, key: None, sql_id, values, revisions })
     }
-}
-
-fn read_locator(path: &Path) -> Result<EncodedTreeLocator> {
-    let mut file = File::open(path).map_err(fault)?;
-    EncodedTreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION, false)
 }
 
 async fn publish_change(publisher: &dyn ArtefactPublisher, storage: (StorageVersion, StorageEpoch), index: &LogicalIndex,

@@ -323,6 +323,7 @@ where P: IntoIterator<Item = Result<Vec<SearchRow>>>,
     write::write_group(columns, members, identity, None, ceiling, output, None, FORMAT_VERSION)
 }
 
+#[cfg(test)]
 pub(crate) fn write_versioned_group<P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: i64,
     ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, format: i32,

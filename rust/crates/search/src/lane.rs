@@ -12,7 +12,7 @@ use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{Anomaly, EventOp, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchRow, file::{IndexedRow, SearchPage, artefact_identity, write_versioned_group}, definitions::SearchDefinition};
+use crate::{SearchRow, file::{BuildMode, IndexedRow, SearchPage, artefact_identity, write_group_as}, definitions::SearchDefinition};
 use rtdb_maintenance::input::{download, read_page};
 
 mod logical;
@@ -393,19 +393,18 @@ impl ArtefactBuilder for SearchBuilder {
                 if history { rows.mode = crate::file::BuildMode::History; }
                 rows
             });
-            let sections = if history {
-                crate::file::write_group_as(&columns, members, &identity, Some(version), ceiling, file, Some(indexing), format, crate::file::BuildMode::History)?.0
-            } else {
-                write_versioned_group(&columns, members, &identity, version, ceiling, file, Some(indexing), format)?
-            };
-            let mut file = std::fs::File::open(output).map_err(fault)?;
+            let mode = if history { BuildMode::History } else { BuildMode::Combined };
+            let (sections, _, tree) = write_group_as(&columns, members, &identity, Some(version), ceiling, file, Some(indexing), format, mode)?;
             match format {
                 crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION | crate::file::LOGICAL_FORMAT_VERSION => {
                     let canonical = uuid_iids.is_some_and(|proof| proof.load(Ordering::Relaxed));
-                    let locator = crate::file::EncodedTreeLocator::read(&mut file, format, canonical)?;
-                    crate::file::encode_tree_stats(&sections, locator.text)
+                    let tree = tree.ok_or_else(|| fault("Search tree has no written root"))?;
+                    crate::file::encode_tree_stats(&sections, tree.encode(canonical).text)
                 }
-                crate::file::FORMAT_VERSION => crate::file::encode_catalog_stats(&sections, Some(&crate::file::FooterLocator::read(&mut file)?)),
+                crate::file::FORMAT_VERSION => {
+                    let mut file = std::fs::File::open(output).map_err(fault)?;
+                    crate::file::encode_catalog_stats(&sections, Some(&crate::file::FooterLocator::read(&mut file)?))
+                }
                 crate::file::TANTIVY_FORMAT_VERSION => Ok(crate::file::encode_tantivy_stats(&sections)),
                 _ => crate::file::encode_catalog_stats(&sections, None),
             }

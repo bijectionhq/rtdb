@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::{fs::File, io::{Read, Seek, SeekFrom}};
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, UInt32Array, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
@@ -12,8 +13,11 @@ use sha2::{Digest, Sha256};
 use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
 
-use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
+use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{PageRef, Table, Writer, item_of, list, table},
     page_tree::{Child, DecodedChild, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
+
+#[cfg(test)]
+use super::layout::FooterLocator;
 
 pub(super) const POSTING: u8 = 0;
 pub(super) const TERM: u8 = 1;
@@ -108,7 +112,7 @@ fn text_revision_rows(columns: &[FixedSizeBinaryArray], start: usize, len: usize
 pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, StructArray)>,
     [(_, events), (_, runs), (_, row_runs)]: [(Table, StructArray); 3], plan: PostingPlan,
     positions: Option<Vec<u32>>, revisions: Option<Vec<FixedSizeBinaryArray>>, token_sequences: Option<StructArray>,
-    erases: Option<StructArray>) -> Result<TermSummaries> {
+    erases: Option<StructArray>) -> Result<(TermSummaries, WrittenRoot)> {
     let take = |fields: &mut Vec<(Table, StructArray)>, field: Table| -> StructArray {
         let at = fields.iter().position(|(table, _)| *table as usize == field as usize).expect("writer populated this table");
         fields.remove(at).1
@@ -265,10 +269,38 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
         }
         fields.push((Table::Routes, inline_routes(&direct)?));
     }
-    let root = writer.page(fields)?;
-    let range = root.range()?;
+    let (page, raw) = writer.root_page(fields)?;
+    let range = page.range()?;
     if range.end - range.start > MAX_ROOT_BYTES { return Err(fault("Search root exceeds its read budget")); }
-    Ok(summaries)
+    let inline = raw.map(|root| lz4_flex::block::compress(&root)).filter(|root| root.len() <= INLINE_ROOT_BYTES);
+    Ok((summaries, WrittenRoot { page, synopsis, inline }))
+}
+
+pub(super) struct WrittenRoot {
+    page: PageRef,
+    synopsis: [u8; SYNOPSIS_BYTES],
+    inline: Option<Vec<u8>>,
+}
+
+impl WrittenRoot {
+    pub(super) fn finish(self, length: u64, format: i32) -> WrittenTree {
+        WrittenTree { root: self, length, format }
+    }
+}
+
+pub(crate) struct WrittenTree {
+    root: WrittenRoot,
+    length: u64,
+    format: i32,
+}
+
+impl WrittenTree {
+    pub(crate) fn encode(self, canonical_uuid_iids: bool) -> EncodedTreeLocator {
+        let WrittenRoot { page, synopsis, inline } = self.root;
+        let locator = TreeLocator { length: self.length, page, synopsis: Some(Arc::new(synopsis)),
+            format: self.format, inline_root: None, canonical_uuid_iids };
+        EncodedTreeLocator { length: self.length, text: locator.encode_with_inline_root(|| inline) }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +318,7 @@ pub(crate) struct EncodedTreeLocator {
     pub text: String,
 }
 
+#[cfg(test)]
 impl EncodedTreeLocator {
     pub fn read(input: &mut File, format: i32, canonical_uuid_iids: bool) -> Result<Self> {
         let locator = FooterLocator::read(input)?;
@@ -315,10 +348,8 @@ impl EncodedTreeLocator {
         let synopsis = table(&root, Table::Synopsis);
         let bits = synopsis.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search synopsis layout");
         if bits.len() != 1 || bits.is_null(0) { return Err(corrupt("Search root has no complete term synopsis")); }
-        let synopsis = Arc::new(bits.value(0).try_into().map_err(fault)?);
-        let length = locator.length as u64;
-        let locator = TreeLocator { length, page, synopsis: Some(synopsis), format, inline_root: None, canonical_uuid_iids };
-        Ok(Self { length, text: locator.encode_with_inline_root(|| inline_root) })
+        let synopsis = bits.value(0).try_into().map_err(fault)?;
+        Ok(WrittenRoot { page, synopsis, inline: inline_root }.finish(locator.length as u64, format).encode(canonical_uuid_iids))
     }
 }
 
@@ -1006,8 +1037,11 @@ mod tests {
             vec![Ok(vec![newer]), Ok(vec![older])],
             vec![Ok(vec![row(9, 2, EventOp::Put, Some("separate report"))])],
         ];
-        super::super::write_versioned_group(&columns, members, "pack", 1, None, &mut file, None, PACKED_FORMAT_VERSION).unwrap();
-        let encoded = EncodedTreeLocator::read(&mut file, PACKED_FORMAT_VERSION, true).unwrap();
+        let (_, _, tree) = super::super::write_group_as(&columns, members, "pack", Some(1), None, &mut file, None,
+            PACKED_FORMAT_VERSION, super::super::BuildMode::Combined).unwrap();
+        let encoded = tree.unwrap().encode(true);
+        let readback = EncodedTreeLocator::read(&mut file, PACKED_FORMAT_VERSION, true).unwrap();
+        assert_eq!((encoded.length, &encoded.text), (readback.length, &readback.text));
         let locator = TreeLocator::decode(&encoded.text).unwrap();
         assert!(locator.has_canonical_uuid_iids());
         assert_eq!(locator.encode(), encoded.text);
