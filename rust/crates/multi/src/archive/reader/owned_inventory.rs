@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::{StageReadAuthority, StageSelector, inconsistent, unavailable, with_stage};
 use crate::{deployment::CellStorage, keys::KeyService};
 use super::super::replica_artifact::{PayloadBytes, ReplicaArtifact};
+use super::super::inventory_identity::{next_owned_file, stage_transaction_matches};
 
 const MAX_OWNED_RELATIONS: usize = 4096;
 const OWNED_FILES_ACK: &[u8] = b"RTDB checkpoint owned event files 1\n";
@@ -566,7 +567,8 @@ async fn write_event_files(
         if tries.is_empty() { continue; }
         let entry = snapshot.table_entry(table)
             .ok_or_else(|| inconsistent("A staged owned relation has no registered table slug"))?;
-        for trie in tries {
+        let mut index = 0;
+        while let Some((trie, next)) = next_owned_file(&tries, index) {
             authority.confirm(database).await?;
             let key = ObjectKey::new(entry.slug.data_key(&trie.key))?;
             let file = storage.get_or(&key, &memory).await?;
@@ -575,6 +577,7 @@ async fn write_event_files(
             }
             write_header(stream, &EventFileHeader { trie: trie.key.to_string(), bytes: file.as_slice().len() }).await?;
             write_bytes(stream, file.as_slice()).await?;
+            index = next;
         }
     }
     authority.confirm(database).await?;
@@ -665,8 +668,9 @@ async fn open_owned_snapshot(
         BlockDiscovery::AtPublished(published),
     ).await?;
     let snapshot = recovered.partition.snapshot();
+    let basis = snapshot.tx_basis().map(|key| (key.tx_id.0, key.system_time.0));
     let transaction = recovered.progress.tx_key.filter(|cut| {
-        cut.tx_id.0 >= 0 && cut.system_time.0 == checkpoint.system_time && snapshot.tx_basis() == Some(*cut)
+        stage_transaction_matches(checkpoint.system_time, cut.tx_id.0, cut.system_time.0, basis)
     })
         .ok_or_else(|| inconsistent("The staged checkpoint has a different transaction key"))?;
     Ok((recovered, transaction, storage, memory, options))

@@ -335,7 +335,10 @@ async fn open_inventory(
         .ok_or_else(|| inconsistent("Staged checkpoint inventory exceeds its bound"))?;
     let sealed = files.get_fresh_exact(&manifest_path, length).await?;
     let bytes = cipher.open_object(&manifest_path, sealed).await?;
-    if stage.staged_manifest_sha256.as_deref() != Some(digest(&bytes).as_str()) {
+    let observed_digest = digest(&bytes);
+    if !stage.staged_manifest_sha256.as_deref().is_some_and(|expected| {
+        super::inventory_identity::matches_bytes(observed_digest.as_bytes(), expected.as_bytes())
+    }) {
         return Err(inconsistent(
             "The staged inventory differs from its accepted digest",
         ));

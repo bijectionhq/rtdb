@@ -81,6 +81,7 @@ use crate::{
 
 pub(crate) mod stage;
 mod reader;
+mod inventory_identity;
 pub use stage::stage_checkpoint;
 pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
@@ -815,11 +816,15 @@ impl ArchivedObject {
     }
 
     fn matches_sealed(&self, name: &ObjectKey, sealed: &[u8]) -> bool {
-        sealed.len() as u64 == self.bytes && self.name == name.as_str() && digest(sealed) == self.sha256
+        use inventory_identity::matches_bytes;
+
+        sealed.len() as u64 == self.bytes
+            && matches_bytes(name.as_str().as_bytes(), self.name.as_bytes())
+            && matches_bytes(digest(sealed).as_bytes(), self.sha256.as_bytes())
             && self.frame_header_sha256.as_ref().is_none_or(|expected|
                 crate::cipher::object::framed(name)
                     && sealed.get(..crate::cipher::object::SEALED_HEADER_BYTES)
-                        .is_some_and(|header| digest(header) == *expected))
+                        .is_some_and(|header| matches_bytes(digest(header).as_bytes(), expected.as_bytes())))
     }
 
     fn is_legacy_trie(&self, name: &ObjectKey) -> bool {
