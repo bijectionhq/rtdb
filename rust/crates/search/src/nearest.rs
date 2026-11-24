@@ -86,6 +86,10 @@ impl NearestQuery {
             dot += f64::from(left) * right;
             norm += right * right;
         }
+        self.finish_distance(dot, norm)
+    }
+
+    fn finish_distance(&self, dot: f64, norm: f64) -> Distance {
         let norm = norm.sqrt();
         if norm == 0.0 { return Ok(None); }
         let distance = 1.0 - dot / (self.norm * norm);
@@ -160,7 +164,7 @@ impl HeldVectorOverlay {
     ) -> Result<()> {
         let row = row.filter(|row| row.num_rows() != 0);
         let vector = row.and_then(|row| ArrowCell::named(row, &selected.vector, 0))
-            .map(read_vector).transpose()?.flatten();
+            .map(|cell| read_vector(cell, query)).transpose()?.flatten();
         let filters = selected.filters.iter().map(|name| match row.and_then(|row| ArrowCell::named(row, name, 0)) {
             Some(cell) => rtdb_columnar::binary_cell(cell.field, cell.array, cell.row),
             None => Ok(None),
@@ -443,7 +447,7 @@ async fn rank_rows(
             // Keep the same admission and refusal point for borrowed and decoded cells.
             let bytes = rtdb_columnar::estimate_read_value_bytes(vector_field, vectors, row)?;
             let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
-            let Some(vector) = read_vector(ArrowCell { field: vector_field, array: vectors, row })? else { continue; };
+            let Some(vector) = read_vector(ArrowCell { field: vector_field, array: vectors, row }, query)? else { continue; };
             let Some(distance) = vector.distance(query)? else { continue; };
             let id = match admitted_id {
                 Some(id) => id,
@@ -463,7 +467,7 @@ enum VectorCell<'a> {
     F32(&'a [f32]),
     F64(&'a [f64]),
     Numeric(NumericSpan<'a>),
-    Decoded(Vec<f64>),
+    Decoded { length: usize, distance: Distance },
 }
 
 impl VectorCell<'_> {
@@ -472,7 +476,7 @@ impl VectorCell<'_> {
             Self::F32(values) => values.len(),
             Self::F64(values) => values.len(),
             Self::Numeric(values) => values.len(),
-            Self::Decoded(values) => values.len(),
+            Self::Decoded { length, .. } => *length,
         }
     }
 
@@ -489,7 +493,7 @@ impl VectorCell<'_> {
                 NumericCell::I64(value) => value as f64,
                 _ => unreachable!("admitted vector component"),
             })),
-            Self::Decoded(values) => query.distance(values.into_iter()),
+            Self::Decoded { distance, .. } => distance,
         }
     }
 }
@@ -526,7 +530,7 @@ fn packed_vector_element(field: &Field) -> bool {
     }
 }
 
-fn read_vector(cell: ArrowCell<'_>) -> Result<Option<VectorCell<'_>>> {
+fn read_vector<'a>(cell: ArrowCell<'a>, query: &NearestQuery) -> Result<Option<VectorCell<'a>>> {
     let ArrowCell { field, array, row } = cell;
     if array.is_null(row) { return Ok(None); }
     if let Some(list) = plain_vector_list(cell)
@@ -560,10 +564,17 @@ fn read_vector(cell: ArrowCell<'_>) -> Result<Option<VectorCell<'_>>> {
     let value = rtdb_columnar::read_value(field, array, row)?;
     let list = match &value {
         Value::Null | Value::Undefined => return Ok(None),
-        Value::List(list) | Value::FixedSizeList(list) => list.view(),
+        Value::List(list) | Value::FixedSizeList(list) => list,
         _ => return Err(not_a_vector()),
     };
-    let mut vector = Vec::with_capacity(list.len());
+    Ok(Some(VectorCell::Decoded { length: list.len(), distance: score_decoded_list(list, query)? }))
+}
+
+fn score_decoded_list(list: &ListValue, query: &NearestQuery) -> Result<Distance> {
+    let list = list.view();
+    let mut valid = list.len() == query.dimensions();
+    let mut dot = 0.0;
+    let mut norm = 0.0;
     for index in 0..list.len() {
         let component = match list.float_component(index) {
             Some(component) => component,
@@ -577,9 +588,14 @@ fn read_vector(cell: ArrowCell<'_>) -> Result<Option<VectorCell<'_>>> {
                 _ => return Err(not_a_vector()),
             },
         };
-        vector.push(component);
+        // A malformed cell is a decode error even if dimension or finiteness has already failed.
+        valid &= component.is_finite();
+        if valid {
+            dot += f64::from(query.probe[index]) * component;
+            norm += component * component;
+        }
     }
-    Ok(Some(VectorCell::Decoded(vector)))
+    Ok(if valid { query.finish_distance(dot, norm) } else { Err(InvalidComponents) })
 }
 
 fn identity_charge(id: &EntityId) -> usize {
@@ -727,7 +743,7 @@ mod tests {
             (&doubles as &dyn Array, [-0.3, 0.125]),
         ] {
             let field = Field::new("vector", array.data_type().clone(), false);
-            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }).unwrap().unwrap();
+            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }, &nearest).unwrap().unwrap();
             assert!(matches!(&cell, VectorCell::F32(_) | VectorCell::F64(_)));
             let mut dot = 0.0;
             let mut norm = 0.0;
@@ -745,7 +761,7 @@ mod tests {
         let array = ListArray::from_iter_primitive::<Float32Type, _, _>([Some([Some(f32::NAN), None, Some(1.0)])]);
         let field = Field::new("vector", array.data_type().clone(), false);
         let cell = ArrowCell { field: &field, array: &array, row: 0 };
-        assert_eq!(read_vector(cell).err(), Some(not_a_vector()));
+        assert_eq!(read_vector(cell, &query(Vec::new(), 1)).err(), Some(not_a_vector()));
     }
 
     #[test]
@@ -780,7 +796,7 @@ mod tests {
             (&mixed as &dyn Array, [large as f64, f64::from(-0.3_f32), 0.125]),
         ] {
             let field = Field::new("vector", array.data_type().clone(), false);
-            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }).unwrap().unwrap();
+            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }, &nearest).unwrap().unwrap();
             assert!(matches!(&cell, VectorCell::Numeric(_)));
             let expected = nearest.distance(expected.into_iter()).unwrap().unwrap();
             assert_eq!(cell.distance(&nearest).unwrap().unwrap().to_bits(), expected.to_bits());
@@ -788,8 +804,8 @@ mod tests {
 
         let field = Field::new("vector", mixed.data_type().clone(), false);
         let malformed = ArrowCell { field: &field, array: &mixed, row: 1 };
-        assert_eq!(read_vector(malformed).err(), Some(not_a_vector()));
-        let nonfinite = read_vector(ArrowCell { row: 2, ..malformed }).unwrap().unwrap();
+        assert_eq!(read_vector(malformed, &nearest).err(), Some(not_a_vector()));
+        let nonfinite = read_vector(ArrowCell { row: 2, ..malformed }, &nearest).unwrap().unwrap();
         assert!(nonfinite.distance(&nearest).is_err());
     }
 
@@ -799,7 +815,22 @@ mod tests {
         let field = Field::new("vector", array.data_type().clone(), false);
         let cell = ArrowCell { field: &field, array: &array, row: 0 };
         assert!(cell.numeric_list_span().is_some());
-        assert_eq!(read_vector(cell).err(), Some(not_a_vector()));
+        assert_eq!(read_vector(cell, &query(Vec::new(), 1)).err(), Some(not_a_vector()));
+    }
+
+    #[test]
+    fn nearest_scores_decoded_lists_without_changing_refusal_precedence() {
+        let nearest = NearestQuery::new(vec![0.25, -0.5], Vec::new(), 1).unwrap();
+        let list = |values: Vec<Value>| ListValue::try_from_cells(values.into_iter().map(Ok)).unwrap();
+        let decoded = list(vec![Value::I64(7), Value::F32(-0.25)]);
+        let expected = nearest.distance([7.0, -0.25].into_iter()).unwrap().unwrap();
+        let actual = score_decoded_list(&decoded, &nearest).unwrap().unwrap().unwrap();
+        assert_eq!(actual.to_bits(), expected.to_bits());
+
+        let invalid = list(vec![Value::F64(f64::NAN), Value::I64(7)]);
+        assert!(score_decoded_list(&invalid, &nearest).unwrap().is_err());
+        let malformed = list(vec![Value::F64(f64::NAN), Value::I64(7), Value::Null]);
+        assert_eq!(score_decoded_list(&malformed, &nearest).err(), Some(not_a_vector()));
     }
 
     #[test]
