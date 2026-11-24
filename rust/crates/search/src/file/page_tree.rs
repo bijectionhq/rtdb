@@ -286,9 +286,9 @@ impl TreeReader {
         Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(format)), MetadataVersion::V5), packed: format >= super::PACKED_FORMAT_VERSION }
     }
 
-    pub fn inline_page(&self, page: PageRef, bytes: Arc<[u8]>) -> Result<RecordBatch> {
+    pub fn inline_page(&self, page: PageRef, bytes: bytes::Bytes) -> Result<RecordBatch> {
         audience_work::decode_bytes(bytes.len())?;
-        page.decode(Buffer::from(bytes::Bytes::from_owner(bytes)), &self.decoder)
+        page.decode(Buffer::from(bytes), &self.decoder)
     }
 
     pub async fn page(&self, page: PageRef, kind: PageKind) -> Result<RecordBatch> {
