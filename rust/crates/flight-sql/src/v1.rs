@@ -24,6 +24,7 @@ mod transact;
 
 const API: &str = "rtdb.v1";
 const RECEIVER_CLOCK: &str = "query.receiver-clock";
+const APPLIED_POSITION: &str = "query.applied-position";
 const MAX_PAGE_ROWS: u32 = 4096;
 const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -111,6 +112,9 @@ impl Service {
                             }
                             if database.serving_driver().is_some() {
                                 features.push(RECEIVER_CLOCK.into());
+                                if call.session.caller.verified_credential {
+                                    features.push(APPLIED_POSITION.into());
+                                }
                             }
                         } else {
                             features.retain(|feature| feature != "query.track" && feature != "query.page" && feature != CLEAR_RANK_INPUT);

@@ -1917,13 +1917,13 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     });
     let mut options = rtdb_node::NodeOptions::default();
     options.replication.rows_per_block = 2;
-    let running = Running::start_with_resources(None, FlightConfig::default(), &[], None, options, None, Some(Arc::new(resources))).await;
+    let running = Running::start_with_resources(Some("secret"), FlightConfig::default(), &[], None, options, None, Some(Arc::new(resources))).await;
     let database = running.node.catalog().database("xtdb").unwrap();
     let mut status = database.watch_status();
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
         matches!(status.role, rtdb_replication::Role::Leading(_))
     })).await.unwrap().unwrap();
-    let mut client = Client::connect(&running.server, None).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
     let put = |branch: &str, id| v1::Op { op: Some(v1::op::Op::Put(v1::Put {
         branch: branch.into(), table: "public.native_branch".into(), if_absent: false,
         rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(id * 10))].into_iter().collect(), custody_group: Vec::new(), protected_columns: Vec::new() }],
@@ -1933,10 +1933,12 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     }).await.unwrap();
     let mut read = input("SELECT n FROM native_branch ORDER BY n");
     read.track = true;
+    read.observe_applied_position = true;
     read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.clone().map(Selection::AtLeast) });
     let (rows, main) = query(&mut client, read.clone()).await;
     assert_eq!(ints(&rows), [10]);
     assert_eq!(main.basis, first.basis);
+    assert_eq!(main.applied_position, Some(Basis::from_bytes(&first.basis.as_ref().unwrap().value).unwrap().position()));
     let validated = transact_wire(&mut client, v1::TransactRequest {
         key: vec![2; 16],
         guards: vec![v1::Guard { guard: Some(v1::guard::Guard::Unchanged(main.claim.unwrap())) }],

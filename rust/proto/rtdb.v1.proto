@@ -67,6 +67,9 @@ message QueryRequest {
   bool custody_release_evidence = 7;
   // Require a tracked exact cut whose full applied branch view is proved clear.
   bool require_clear_rank_input = 8;
+  // Obtain the comparable position of this Query's selected native cut.
+  // Available only on an unscoped native database route.
+  bool observe_applied_position = 9;
 }
 message QueryTrailer {
   Basis basis = 1;
@@ -78,6 +81,8 @@ message QueryTrailer {
   // Present only on the authenticated Original owner's proof route. The
   // sealed proof and this inventory cover the same complete contributor set.
   CustodyReadInventory custody_release_inventory = 7;
+  // Compare positions only within the same database incarnation and branch.
+  optional uint64 applied_position = 8;
 }
 message CustodyReadInventory {
   repeated CustodyReadContributor contributors = 1;

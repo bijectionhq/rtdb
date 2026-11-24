@@ -92,6 +92,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     if query.observe_receiver_clock { hash.update(b"receiver-clock"); }
     if query.custody_release_evidence { hash.update(b"custody-release-evidence"); }
     if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
+    if query.observe_applied_position { hash.update(b"observe-applied-position"); }
     hash.finalize().into()
 }
 
@@ -216,6 +217,14 @@ impl Service {
                 || !database.wire_tokens_supported()
         ) {
             return Err(error::unsupported(super::RECEIVER_CLOCK));
+        }
+        if request.observe_applied_position && (
+            !call.session.caller.verified_credential || visibility.is_some()
+                || call.session.audience_source().is_some() || call.session.fresh_replica
+                || driver.is_none_or(|driver| !driver.supports_query_tokens())
+                || !database.wire_tokens_supported()
+        ) {
+            return Err(error::unsupported(super::APPLIED_POSITION));
         }
         if request.custody_release_evidence && (
             driver.is_none_or(|driver| !driver.supports_query_tokens()) || visibility.is_some() || !database.wire_tokens_supported()
@@ -391,6 +400,7 @@ impl Service {
             receiver_clock,
             custody_release_proof,
             custody_release_inventory,
+            applied_position: request.observe_applied_position.then(|| page.basis.position()),
         };
         Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }
