@@ -64,8 +64,8 @@ impl ReplicaEnvelope {
     }
 
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-        ensures out is Ok ==> self.message matches ReplicaBody::OversizedMessage(reference)
-            && (reference.payload_sha256 matches Some(expected) ==> expected@ == sha256(bytes@)),
+        ensures out is Ok ==> (self.message matches ReplicaBody::OversizedMessage(reference)
+            && (reference.payload_sha256 matches Some(expected) ==> expected@ == sha256(bytes@))),
     ))]
     fn check_payload_digest(&self, bytes: &[u8]) -> Result<()> {
         let ReplicaBody::OversizedMessage(reference) = &self.message else {

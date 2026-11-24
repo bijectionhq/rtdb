@@ -1,5 +1,5 @@
 ---------------------------- MODULE RTDBRecovery ----------------------------
-EXTENDS Integers, FiniteSets, Sequences
+EXTENDS Integers, FiniteSets, Sequences, TLC
 
 CONSTANTS Keepers, Payloads, MaxEpoch, MaxWrites, MaxLost, AllowEarlyTrim, AllowPartialSync
 VARIABLE state
@@ -7,6 +7,7 @@ VARIABLE state
 Epochs == 1..MaxEpoch
 Positions == 1..MaxWrites
 Quorum == (Cardinality(Keepers) \div 2) + 1
+KeeperSymmetry == Permutations(Keepers)
 Writes == [position: Positions, epoch: Epochs, payload: Payloads]
 NoWrite == [position |-> 0, epoch |-> 0, payload |-> 0]
 EmptyJournal == [promise |-> 1, synced |-> 1, trimmed |-> 0, tail |-> <<>>]

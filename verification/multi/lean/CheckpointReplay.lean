@@ -13,6 +13,42 @@ theorem replay_suffix_from_checkpoint
     rw [List.take_take, Nat.min_eq_left checkpointBeforeBasis]
   rw [← atCheckpoint, List.take_append_drop]
 
+/-- A renewed hold preserves the current cut. Failed delivery and cancellation
+also preserve it. Successful delivery consumes one original journal record. -/
+inductive CursorReplay (history : List Event) : Nat → Nat → List Event → Prop where
+  | stop (cut : Nat) : CursorReplay history cut cut []
+  | retry : CursorReplay history start through delivered → CursorReplay history start through delivered
+  | deliver (original : history[start]? = some event)
+      (rest : CursorReplay history (start + 1) through delivered) :
+      CursorReplay history start through (event :: delivered)
+
+theorem cursor_replay_covers_exact_segment
+    (replay : CursorReplay history start through delivered) :
+    start ≤ through ∧ delivered.length = through - start ∧
+      delivered ++ history.drop through = history.drop start := by
+  induction replay with
+  | stop => simp
+  | retry _ ih => exact ih
+  | @deliver position event _ _ original _ ih =>
+    obtain ⟨present, same⟩ := List.getElem?_eq_some_iff.mp original
+    obtain ⟨ordered, count, suffix⟩ := ih
+    refine ⟨by omega, by simp only [List.length_cons]; omega, ?_⟩
+    rw [List.cons_append, suffix, List.drop_eq_getElem_cons present, same]
+
+theorem certified_checkpoint_with_retried_delivery
+    (applyEvent : State → Event → State) (initial : State)
+    (replay : CursorReplay history checkpoint basis delivered) :
+    delivered.foldl applyEvent ((history.take checkpoint).foldl applyEvent initial) =
+      (history.take basis).foldl applyEvent initial := by
+  obtain ⟨ordered, count, suffix⟩ := cursor_replay_covers_exact_segment replay
+  have exactSegment : delivered = (history.take basis).drop checkpoint := by
+    have selected := congrArg (List.take (basis - checkpoint)) suffix
+    rw [List.take_drop, Nat.add_sub_of_le ordered] at selected
+    rw [← count, List.take_append_of_le_length (Nat.le_refl _), List.take_length] at selected
+    exact selected
+  rw [exactSegment]
+  exact replay_suffix_from_checkpoint applyEvent initial history checkpoint basis ordered
+
 def snapshotAt (applyEvent : State → Event → State) (initial : State)
     (checkpointHistory : List Event) (basis : Nat) : Option State :=
   if basis ≤ checkpointHistory.length then
@@ -30,6 +66,8 @@ theorem snapshot_reply_is_at_the_requested_basis
   split at reply <;> simp_all
 
 #print axioms replay_suffix_from_checkpoint
+#print axioms cursor_replay_covers_exact_segment
+#print axioms certified_checkpoint_with_retried_delivery
 #print axioms snapshot_reply_is_at_the_requested_basis
 
 end RTDB.Recovery
