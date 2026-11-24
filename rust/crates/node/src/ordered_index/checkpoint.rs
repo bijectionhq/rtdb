@@ -38,11 +38,27 @@ pub(super) struct Checkpoint {
     _allocation: Option<Arc<MemoryReservation>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct Manifest<'a> {
     checksum: String,
     #[serde(borrow)]
     layout: &'a serde_json::value::RawValue,
+}
+
+fn encode_legacy_manifest(checkpoint: &Checkpoint) -> Result<Vec<u8>> {
+    const PREFIX: &[u8] = br#"{"checksum":""#;
+    const SEPARATOR: &[u8] = br#"","layout":"#;
+    const CHECKSUM_BYTES: usize = 64;
+    let end_checksum = PREFIX.len() + CHECKSUM_BYTES;
+    let mut bytes = PREFIX.to_vec();
+    bytes.resize(end_checksum, b'0');
+    bytes.extend_from_slice(SEPARATOR);
+    let layout = bytes.len();
+    serde_json::to_writer(&mut bytes, checkpoint).map_err(format_error)?;
+    let checksum = format!("{:x}", Sha256::digest(&bytes[layout..]));
+    bytes[PREFIX.len()..end_checksum].copy_from_slice(checksum.as_bytes());
+    bytes.push(b'}');
+    Ok(bytes)
 }
 
 fn decode_legacy_manifest(bytes: &[u8]) -> Result<Checkpoint> {
@@ -371,9 +387,7 @@ pub(super) async fn publish(
     let encoded = if tree.arrow_references {
         ipc::encode(&encode_manifest(&checkpoint)?)?
     } else {
-        let layout = serde_json::value::to_raw_value(&checkpoint).map_err(format_error)?;
-        let checksum = format!("{:x}", Sha256::digest(layout.get().as_bytes()));
-        serde_json::to_vec(&Manifest { checksum, layout: &layout }).map_err(format_error)?
+        encode_legacy_manifest(&checkpoint)?
     };
     if cancellation.is_cancelled() {
         return Err(cancelled());
@@ -510,8 +524,7 @@ mod tests {
         let decoded = decode_legacy_manifest(manifest.as_bytes()).unwrap();
         assert_eq!(decoded.through, 7);
         assert_eq!(decoded.source_rows, 9);
-        let raw = serde_json::value::to_raw_value(&decoded).unwrap();
-        assert_eq!(serde_json::to_vec(&Manifest { checksum, layout: &raw }).unwrap(), manifest.as_bytes());
+        assert_eq!(encode_legacy_manifest(&decoded).unwrap(), manifest.as_bytes());
         let spaced = manifest.replace(r#""scope":0"#, r#""scope": 0"#);
         assert_eq!(decode_legacy_manifest(spaced.as_bytes()).unwrap().scope, 0);
         let corrupt = manifest.replace(r#""scope":0"#, r#""scope":1"#);
