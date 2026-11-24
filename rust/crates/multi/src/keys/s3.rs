@@ -9,7 +9,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use uuid::Uuid;
 
 use super::{
-    ArchiveKey, ArchiveKeyWithdrawal, AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
+    ArchiveKey, ArchiveKeyWithdrawal, AssertionAuthoring, AssertionFamilies, AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
     KeyService, NAMESPACE_KEY_ID, UnitOperation, UnitOutput, UnitScope, UnitSlot, malformed, new_key,
     require_matching_key, journal::key_error, unit::{self, OPERATION_LIMIT},
 };
@@ -17,6 +17,7 @@ use super::{
 use super::assertion::{MAX_CAPABILITY_BYTES, StagedCapability, stage_used};
 
 mod assertion_deadline;
+mod assertion_family;
 mod captures;
 mod units;
 
@@ -268,6 +269,10 @@ impl KeyService for S3KeyService {
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {
         Some(self)
+    }
+
+    fn assertion_families(&self, region: Arc<IoRegion>) -> Option<AssertionFamilies<'_>> {
+        Some(AssertionFamilies::new(self, region))
     }
 
     async fn install(&self, id: &str, key: [u8; KEY_BYTES]) -> Result<()> {

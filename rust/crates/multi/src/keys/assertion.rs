@@ -5,15 +5,19 @@ use bytes::{Bytes, BytesMut};
 use ring::{digest, hmac};
 use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, Result};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD};
 
 use super::{DESTROYED, KEY_BYTES, LocalKeyService, io, is_destroyed, new_key};
 
+pub(super) mod family;
+
 /// The immutable pre-ordering identity. The receiver must bind it to the original
 /// assertion before an accepted-history reader can use the envelope.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "StageCoordinates", into = "StageCoordinates")]
 pub struct AssertionStage {
     deployment: Uuid,
     incarnation: NonZeroU64,
@@ -34,6 +38,22 @@ impl AssertionStage {
 
     pub(super) fn key_id(self) -> String {
         format!("{}{}-{}-{}", Self::KEY_PREFIX, self.deployment, self.incarnation, self.stage)
+    }
+}
+
+type StageCoordinates = (Uuid, NonZeroU64, Uuid);
+
+impl TryFrom<StageCoordinates> for AssertionStage {
+    type Error = Anomaly;
+
+    fn try_from((deployment, incarnation, stage): StageCoordinates) -> Result<Self> {
+        Self::new(deployment, incarnation, stage)
+    }
+}
+
+impl From<AssertionStage> for StageCoordinates {
+    fn from(stage: AssertionStage) -> Self {
+        (stage.deployment, stage.incarnation, stage.stage)
     }
 }
 
@@ -404,7 +424,7 @@ impl LocalKeyService {
 }
 
 pub(super) fn require_other_key_namespace(id: &str) -> Result<()> {
-    if id.starts_with(AssertionStage::KEY_PREFIX) {
+    if id.starts_with(AssertionStage::KEY_PREFIX) || id.starts_with(family::LOCAL_PREFIX) {
         return Err(Anomaly::new(
             AnomalyCategory::Forbidden, "rtdb.multi/key-non-exportable",
             "An assertion stage belongs to its operation broker",

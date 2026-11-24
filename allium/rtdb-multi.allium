@@ -527,6 +527,14 @@ contract LogService {
         -- Serving storage releases bodies only within a journal-issued serving lease.
         -- A detached replica object reader uses the lease captured at its admission for cryptography.
 
+    @invariant OriginalAssertionFamilyCustody
+        -- The original operation vault keeps current assertion family records outside data archives.
+        -- A landing enrolls its destination and separate private link stages in a live family before provisioning either capability.
+        -- A fenced family denies activation and current admission for every enrolled occurrence.
+        -- Either the Proposal original or an active landed occurrence can close the same family.
+        -- The first family fence fixes the live positions and includes both capabilities of every pending landing in its destruction inventory.
+        -- Family custody supplies a current admission check for installed publication and release owners.
+
     @invariant InstalledJournalErasureCommit
         -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.
         -- Ordinary checkpoint selection preserves replay of that committed marker.

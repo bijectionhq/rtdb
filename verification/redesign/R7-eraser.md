@@ -76,6 +76,12 @@ Accepted-history opening requires current custody and an independently certified
 The vault and its tombstones are outside the backup. A file-system snapshot of the local broker is outside the admitted fixed profile.
 Raw deployment-key transfer cannot install an assertion stage. Restoring a passive record cannot create or rewrite a capability.
 
+The original local or S3 vault serializes family enrollment, activation, and fencing in a current private record.
+A reservation enrolls a fresh destination stage and a distinct stage for the encrypted link.
+A fence from the Proposal original or any active copy inventories all active positions and both capabilities for pending landings.
+The stage and family operations require an installed publication verifier and release owner before use in serving.
+Terminal family settlement also needs per-position denials and destruction of the private link and family inventory.
+
 Native ordered sealed ingress, the exact original fence and roster, current release admission, and installed holder adapters are required before operating this profile.
 The scheduler supports bounded page reads and exact retry, while a configured capacity and fault envelope has yet to establish a service bound.
 The per-deadline cohort report verifies source-signed membership and includes the original custody authority's attestation for each member.

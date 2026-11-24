@@ -27,6 +27,7 @@ mod unit;
 pub use rtdb_storage::sealing::{UnitOperation, UnitOutput};
 pub use unit::{UnitScope, UnitSlot};
 pub(crate) use unit::UnitLedger;
+pub use assertion::family::{AssertionFamilies, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation};
 pub use assertion::{AssertionAuthoring, AssertionBackup, AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;
 pub use archive::ArchiveKey;
@@ -93,6 +94,7 @@ pub trait KeyService: Send + Sync {
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> { None }
+    fn assertion_families(&self, _region: Arc<IoRegion>) -> Option<AssertionFamilies<'_>> { None }
 
     async fn use_unit_key(&self, _slot: UnitSlot, _name: rtdb_storage::ObjectKey, _operation: UnitOperation,
         _io: &Arc<IoRegion>) -> rtdb_storage::Result<UnitOutput> {
@@ -429,6 +431,10 @@ impl KeyService for LocalKeyService {
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {
         self.provision_archive_keys.then_some(self as &dyn AssertionKeyService)
+    }
+
+    fn assertion_families(&self, region: Arc<IoRegion>) -> Option<AssertionFamilies<'_>> {
+        self.provision_archive_keys.then(|| AssertionFamilies::new(self, region))
     }
 
     async fn use_unit_key(&self, slot: UnitSlot, name: rtdb_storage::ObjectKey, operation: UnitOperation,
