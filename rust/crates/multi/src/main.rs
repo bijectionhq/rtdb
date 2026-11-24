@@ -22,6 +22,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
+       rtdb-multi stage-sql-erasure --name NAME --at HOLDER --operation FILE --cell-secret FILE\n\
        rtdb-multi custody-domain --domain UUID --action FILE --replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE [--replay-broker-custody-token-file FILE]
 \
        rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE [--transfer-token-file FILE] [--custody-token-file FILE] --config FILE [--ecs-cluster ARN]\n\
@@ -348,7 +349,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 175 } else { 37 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 176 } else { 38 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,
@@ -409,6 +410,23 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:0")?)
                 .await.map_err(io)?;
             service.serve(listener, tls, cancellation).await
+        }
+        "stage-sql-erasure" => {
+            let file = std::fs::File::open(arguments.required("operation")?).map_err(io)?;
+            let request = serde_json::from_reader(file).map_err(|error| usage(error.to_string()))?;
+            let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+            let response = rtdb_multi::control::call(arguments.required("at")?,
+                &rtdb_multi::control::Request::StageSqlErasure { name: arguments.required("name")?.to_owned(), request },
+                Duration::from_secs(35), &control).await?;
+            match response {
+                rtdb_multi::control::Response::SqlErasureStaged { checkpoint } => {
+                    println!("{}", serde_json::to_string(&checkpoint).map_err(|error| usage(error.to_string()))?);
+                    Ok(())
+                }
+                rtdb_multi::control::Response::Refused { code, message } =>
+                    Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, code, message)),
+                _ => Err(usage("The original SQL writer returned a different control response".into())),
+            }
         }
         "custody-domain" => {
             let broker = replay_broker_client(&arguments, "")?.ok_or_else(|| usage("The custody command requires the original broker route".into()))?;

@@ -100,6 +100,7 @@ impl RecoveredPartition {
         replay: SnapshotReplay,
         transaction: TransactionKey,
         position: ReplicaPosition,
+        store: Arc<dyn ObjectStore>,
         cancellation: &CancellationToken,
     ) -> Result<SqlErasureSource> {
         if position <= replay.after || position > replay.cut.through {
@@ -122,7 +123,7 @@ impl RecoveredPartition {
         Ok(SqlErasureSource {
             authenticated_head, cut, checkpoint, source_position: self.progress.source_position, transaction,
             targets, custody, snapshot: self.partition.snapshot(),
-            store: Arc::clone(logs.storage()), memory: Arc::clone(memory),
+            store, memory: Arc::clone(memory),
             fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
         })
     }

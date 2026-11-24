@@ -265,7 +265,10 @@ The broker checks root-signed switch and drain evidence and each duty's own sign
 A new domain generation opens after every enrolled root records its provider disposition.
 Detached broker replay egress and copy requests participate when the broker enables custody control.
 SQL declarations persist separately from inferred row types in replica transactions and table checkpoints.
-Protected replay extracts the committed erase effects and authenticates their exact selected head. SQL staging rebuilds the selected placement’s primary survivor closure from live and persisted events and keeps derivatives out of the staged checkpoint until they rebuild. Production SQL still needs a caller that coordinates dependent roots, inventories retiring keys and live custody participants, and drives their drain and provider destruction.
+Protected replay extracts the committed erase effects and authenticates their exact selected head. SQL staging rebuilds the selected placement’s primary survivor closure from live and persisted events and keeps derivatives out of the staged checkpoint until they rebuild. The installed SQL writer can initiate exact-head staging from a broker-selected committed erase marker.
+Logkeeper fences appends and normal grants while that erasure preparation owns the head.
+The coordinator requires the broker's signed domain drain before enabling provider retirement.
+Production processing still needs dependent-root survivor staging, live SQL and egress participation in the signed roster, and an installed adapter that signs the domain and provider evidence.
 
 |8
 |Transaction metadata retention.

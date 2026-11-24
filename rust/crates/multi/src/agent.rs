@@ -843,6 +843,29 @@ impl NodeAgent {
         }
     }
 
+    async fn stage_sql_erasure(
+        &self, name: &str, request: crate::journal::hosted::erasure::SqlErasureRequest,
+    ) -> Result<Response> {
+        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/sql-erasure-holder",
+            "The original SQL writer and custody broker must be available to stage erasure");
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let placement = self.ordered.by_name(name).ok_or_else(unavailable)?;
+        let broker = self.replay_broker().ok_or_else(unavailable)?;
+        let (admission, database) = self.holdings.lock().get(name).and_then(|holding| {
+            match &holding.authority {
+                HoldingAuthority::Journal(admission) => Some((*admission, holding.database.upgrade()?)),
+                HoldingAuthority::Directory { .. } => None,
+            }
+        }).ok_or_else(unavailable)?;
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let checkpoint = tokio::time::timeout(self.options.activation_timeout,
+            placement.stage_sql_erasure(&self.node, &database, admission, broker, &self.keys, request, &cancellation))
+            .await.map_err(|_| checkpoint_timeout(name))??;
+        Ok(Response::SqlErasureStaged { checkpoint })
+    }
+
     pub async fn flush(&self, name: &str) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
@@ -1899,6 +1922,7 @@ impl Handler for NodeAgent {
                 Ok(()) => self.flush(&name).await,
                 Err(error) => Err(error),
             },
+            Request::StageSqlErasure { name, request } => self.stage_sql_erasure(&name, request).await,
             Request::PinCheckpointSuffix { name, deployment, lease, capture, basis, expires_at_ms } =>
                 self.pin_checkpoint_suffix(&name, deployment, lease, capture, basis, expires_at_ms).await,
             Request::PublishCompaction { name, notification, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.publish_compaction(&name, &notification).await, Err(error) => Err(error) }

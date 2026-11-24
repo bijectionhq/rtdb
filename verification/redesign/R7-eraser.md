@@ -112,6 +112,11 @@ The broker commits the complete domain drain only after it verifies those root s
 Each root then attests its original provider's disposition against that domain drain.
 The broker retains the aggregate completion and opens the next generation after all enlisted roots settle.
 With custody control enabled, a detached broker request registers before accepting plaintext and signs its terminal observation after provider and socket drain.
+The installed writer's staging call checks the broker's target and enrolled root, pauses user submissions, and replays the original committed erase marker through the exact certified head.
+It builds the successor from the protected snapshot store.
+The ordered erasure preparation keeps that head stable across normal appends and grants.
+The placement coordinator submits its joined root witness to the broker and requires the completed domain drain before it arms key retirement.
+It binds the verified provider disposition to the same drain when reporting root completion.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
 The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring key inventory, custody work roster and latest destruction time.
 The fixed commitment binds both inventories and the deadline to the authenticated switch.

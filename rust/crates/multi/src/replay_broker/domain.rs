@@ -1,6 +1,6 @@
 //! Admission and drain records held by the credential-separated custody owner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use ring::{
@@ -148,6 +148,7 @@ struct State {
     root_drains: BTreeMap<Uuid, SignedRootDrain>,
     destruction: BTreeMap<Uuid, RootDestruction>,
     last_completed: Option<Completion>,
+    completed_operations: BTreeSet<Uuid>,
 }
 
 impl State {
@@ -162,6 +163,7 @@ impl State {
             root_drains: BTreeMap::new(),
             destruction: BTreeMap::new(),
             last_completed: None,
+            completed_operations: BTreeSet::new(),
         }
     }
 
@@ -211,6 +213,22 @@ impl State {
     fn apply(&mut self, action: &Action) -> Result<()> {
         match action {
             Action::Status => (),
+            Action::AuthorizeRoot {
+                operation,
+                root,
+                history,
+            } => {
+                if self.operation != Some(*operation)
+                    || self
+                        .roots
+                        .get(root)
+                        .is_none_or(|enrolled| enrolled.history != *history)
+                {
+                    return Err(conflict(
+                        "The root is outside the closing custody operation",
+                    ));
+                }
+            }
             Action::Enroll {
                 generation,
                 root,
@@ -251,7 +269,11 @@ impl State {
                     return Ok(());
                 }
                 self.require_open(*generation)?;
-                if self.roots.is_empty() || operation.is_nil() || *target == [0; 32] {
+                if self.roots.is_empty()
+                    || operation.is_nil()
+                    || *target == [0; 32]
+                    || self.completed_operations.contains(operation)
+                {
                     return Err(conflict(
                         "Erasure requires enrolled roots and an exact target",
                     ));
@@ -418,6 +440,7 @@ impl State {
                     operation: *operation,
                     evidence,
                 });
+                self.completed_operations.insert(operation.erase);
                 self.generation = self
                     .generation
                     .checked_add(1)
@@ -436,6 +459,11 @@ impl State {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Status,
+    AuthorizeRoot {
+        operation: Operation,
+        root: Uuid,
+        history: [u8; 32],
+    },
     Enroll {
         generation: u64,
         root: Uuid,
@@ -475,7 +503,8 @@ impl Action {
     pub(super) fn requires_custodian(&self) -> bool {
         matches!(
             self,
-            Self::Enroll { .. }
+            Self::AuthorizeRoot { .. }
+                | Self::Enroll { .. }
                 | Self::Begin { .. }
                 | Self::Admit { .. }
                 | Self::RootDrain { .. }
@@ -509,6 +538,23 @@ pub fn directory_domain(namespace: [u8; 32], organisation: &str, lineage: &str) 
 
 pub(super) fn directory_history(history: History) -> Result<[u8; 32]> {
     fingerprint(b"rtdb.custody/directory-root/v1\0", &history)
+}
+
+pub(crate) fn installed_history(
+    placement: ordered_logkeeper::ordered::Placement,
+) -> Result<[u8; 32]> {
+    fingerprint(b"rtdb.custody/installed-root/v1\0", &placement)
+}
+
+pub fn sql_target(
+    placement: ordered_logkeeper::ordered::Placement,
+    transaction: rtdb_types::TransactionKey,
+    position: rtdb_types::ReplicaPosition,
+) -> Result<[u8; 32]> {
+    fingerprint(
+        b"rtdb.custody/sql-erasure-target/v1\0",
+        &(placement, transaction, position),
+    )
 }
 
 fn verify(key: [u8; 32], message: &[u8], signature: &[u8]) -> Result<()> {

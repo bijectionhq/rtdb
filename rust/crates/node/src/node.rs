@@ -621,6 +621,31 @@ impl Node {
             .map(|context| context.with_query_cpu(query_cpu))
     }
 
+    /// Replays an original committed erase in the exact ordered snapshot store.
+    pub async fn sql_erasure_source(
+        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
+        transaction: TransactionKey, position: ReplicaPosition, cancellation: &CancellationToken,
+    ) -> Result<rtdb_replication::SqlErasureSource> {
+        let replay = cancellation.run_until_cancelled(
+            rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
+        ).await.ok_or_else(cancelled)??;
+        let owner = replay.provider().ok_or_else(crate::sql_snapshots::unretained)?;
+        let custody = replay.custody().ok_or_else(crate::sql_snapshots::unretained)?;
+        rtdb_storage::IoRegion::retaining(custody, async {
+            let store = database.object_store().open_log_snapshot(owner).await?;
+            let storage = Arc::new(BufferPool::with_budget(Arc::clone(&store), Arc::clone(database.storage.budget())));
+            let blocks = rtdb_replication::BlockStore::new(Arc::clone(&store),
+                storage, Arc::clone(self.memory()), self.factory.options.file_size_target)?;
+            let mut recovered = match checkpoint {
+                Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
+                    database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
+                    .await.ok_or_else(cancelled)??,
+                None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
+            };
+            recovered.replay_sql_erasure(&database.logs, replay, transaction, position, store, cancellation).await
+        }).await
+    }
+
     pub(crate) async fn recover_sql_snapshot(
         &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
         cancellation: &CancellationToken,

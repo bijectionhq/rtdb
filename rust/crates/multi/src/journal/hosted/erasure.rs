@@ -17,6 +17,7 @@ use crate::journal::{
     refused,
 };
 use crate::keys::{JournalKey, KeyService};
+use crate::replay_broker::{Client as CustodyBroker, domain};
 
 mod drain;
 mod evidence;
@@ -32,6 +33,15 @@ pub use evidence::{
 };
 
 const OPERATIONAL_TARGET_MS: u64 = 120_000;
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlErasureRequest {
+    pub operation: crate::replay_broker::domain::Operation,
+    pub transaction: rtdb_types::TransactionKey,
+    pub position: rtdb_types::ReplicaPosition,
+    pub rotation: RequestId,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Erasure {
@@ -165,6 +175,18 @@ pub trait ErasureCustody: Send + Sync {
     /// the same operation returns the original receipt and expiry.
     async fn commit_and_arm(&self, ready: CleanRecoverySlots) -> Result<ErasureCommit>;
 
+    async fn sign_root_drain(
+        &self, _operation: domain::Operation, _commit: ErasureCommit, _drain: domain::RootDrain,
+    ) -> Result<Vec<u8>> {
+        Err(evidence::authority_unavailable())
+    }
+
+    async fn sign_root_destruction(
+        &self, _operation: domain::Operation, _commit: ErasureCommit, _result: &domain::RootDestruction,
+    ) -> Result<Vec<u8>> {
+        Err(evidence::authority_unavailable())
+    }
+
     /// Read back the original owner's physical disposition after the custody
     /// drain. A pending or ambiguous provider result has no completion evidence.
     async fn destruction(
@@ -185,6 +207,8 @@ pub struct ErasureCoordinator<'a> {
     provider: &'a CheckpointCustody,
     keys: &'a dyn KeyService,
     authority: Option<CustodyEvidence>,
+    broker: &'a CustodyBroker,
+    operation: domain::Operation,
 }
 
 impl<'a> ErasureCoordinator<'a> {
@@ -193,6 +217,8 @@ impl<'a> ErasureCoordinator<'a> {
         custodian: &'a InstalledJournal,
         provider: &'a CheckpointCustody,
         keys: &'a dyn KeyService,
+        broker: &'a CustodyBroker,
+        operation: domain::Operation,
     ) -> Result<Self> {
         if !matches!(worker.authority(), Authority::Worker { .. })
             || !matches!(custodian.authority(), Authority::Custody)
@@ -208,6 +234,8 @@ impl<'a> ErasureCoordinator<'a> {
             provider,
             keys,
             authority: None,
+            broker,
+            operation,
         })
     }
 
@@ -229,6 +257,7 @@ impl<'a> ErasureCoordinator<'a> {
         cancellation: &CancellationToken,
     ) -> Result<PreparedErasure> {
         self.require_incumbent(erasure)?;
+        self.authorize_root().await?;
         let route = self.custodian.route().await?;
         if !drain::retirement_completed(self.provider, route.placement, route.erasure_floor).await? {
             return Err(invalid("The previous erasure still has unconfirmed destruction"));
@@ -294,9 +323,17 @@ impl<'a> ErasureCoordinator<'a> {
         Ok(prepared)
     }
 
+    async fn authorize_root(&self) -> Result<()> {
+        let placement = self.custodian.placement();
+        self.broker.custody_domain(self.operation.domain, domain::Action::AuthorizeRoot {
+            operation: self.operation, root: placement.deployment, history: domain::installed_history(placement)?,
+        }).await?;
+        Ok(())
+    }
+
     fn require_incumbent(&self, erasure: Erasure) -> Result<()> {
-        if erasure.placement != self.worker.placement()
-            || !matches!(self.worker.authority(), Authority::Worker { enrollment } if enrollment == erasure.incumbent.enrollment)
+        if erasure.placement != self.worker.placement() || erasure.operation != self.operation.erase
+            || erasure.custody_domain != self.operation.domain || !matches!(self.worker.authority(), Authority::Worker { enrollment } if enrollment == erasure.incumbent.enrollment)
         {
             return Err(invalid(
                 "Erasure must address the installed credential of the incumbent",
@@ -322,6 +359,7 @@ impl<'a> ErasureCoordinator<'a> {
         erasure: Erasure,
     ) -> Result<ErasureCommit> {
         self.require_incumbent(erasure)?;
+        self.authorize_root().await?;
         coordinate(self, self.keys, custody, erasure, self.authority.as_ref()).await
     }
 
@@ -374,11 +412,7 @@ impl<'a> ErasureCoordinator<'a> {
         custody: &dyn ErasureCustody,
         commit: ErasureCommit,
     ) -> Result<Option<DestructionEvidence>> {
-        if commit.prepared.erasure.placement != self.custodian.placement() {
-            return Err(invalid(
-                "The destruction receipt belongs to another placement",
-            ));
-        }
+        self.require_incumbent(commit.prepared.erasure)?;
         let authority = self
             .authority
             .as_ref()
@@ -386,18 +420,43 @@ impl<'a> ErasureCoordinator<'a> {
         let Some(journal) = self.resume_drain(commit).await? else { return Ok(None); };
         let Some(joined) = journal.joined().await? else { return Ok(None); };
         let already = journal.destruction().await?;
-        if already.is_none() {
-            let route = self.custodian.route().await?;
-            if route.erasure_floor != commit.prepared.checkpoint.cut.next_lsn {
-                return Err(invalid("The destruction receipt has a different ordered erasure cut"));
+        let checkpoint = commit.prepared.checkpoint;
+        let placement = self.custodian.placement();
+        if let Some(receipt) = already.as_ref() {
+            authority.verify_destruction(commit, receipt)?;
+            if drain::retirement_completed(self.provider, placement, checkpoint.cut.next_lsn).await? {
+                return Ok(Some(receipt.clone()));
             }
-            let Some(retiring) = route.erasure_retirement else {
-                return Err(invalid("The custodian cannot read the ordered erasure drain"));
-            };
-            if retiring.outstanding_holds != 0 { return Ok(None); }
-            drain::record_cut(self.provider, commit, "joined-custody").await?;
-            if retiring.unsettled_checkpoints != 0 { return Ok(None); }
+            let view = self.broker.custody_domain(self.operation.domain, domain::Action::Status).await?;
+            if view.last_completed.is_some_and(|completion| completion.operation == self.operation) {
+                let domain_drain = drain::admitted_domain(self.provider, commit).await?;
+                drain::record_cut(self.provider, commit, "destruction-confirmed", domain_drain).await?;
+                return Ok(Some(receipt.clone()));
+            }
         }
+        let route = self.custodian.route().await?;
+        if route.erasure_floor != checkpoint.cut.next_lsn {
+            return Err(invalid("The destruction receipt has a different ordered erasure cut"));
+        }
+        let Some(retiring) = route.erasure_retirement else {
+            return Err(invalid("The custodian cannot read the ordered erasure drain"));
+        };
+        if retiring.outstanding_holds != 0 { return Ok(None); }
+        let joined_custody = journal.joined_fingerprint(&joined)?;
+        let root_drain = domain::RootDrain {
+            original_head: crate::journal::head_identity(placement, checkpoint.cut),
+            successor: checkpoint.manifest,
+            ordered_switch: commit.switch_evidence,
+            joined_custody,
+        };
+        let signature = custody.sign_root_drain(self.operation, commit, root_drain).await?;
+        let view = self.broker.custody_domain(self.operation.domain, domain::Action::RootDrain {
+            operation: self.operation, root: placement.deployment,
+            evidence: domain::SignedRootDrain { drain: root_drain, signature },
+        }).await?;
+        let Some(domain_drain) = view.drained else { return Ok(None); };
+        drain::record_cut(self.provider, commit, "joined-custody", domain_drain).await?;
+        if retiring.unsettled_checkpoints != 0 { return Ok(None); }
         let erasure = commit.prepared.erasure;
         let Some(serving) = serving_disposition(
             self.provider, erasure.placement, commit.prepared.checkpoint.cut.next_lsn, erasure.incumbent.epoch,
@@ -430,7 +489,14 @@ impl<'a> ErasureCoordinator<'a> {
             return Err(invalid("The destruction receipt differs from the durable custody observations"));
         }
         if already.is_none() { journal.record_destruction(&receipt).await?; }
-        drain::record_cut(self.provider, commit, "destruction-confirmed").await?;
+        let mut provider = domain::RootDestruction {
+            domain_drain, provider_disposition: receipt.disposition, signature: Vec::new(),
+        };
+        provider.signature = custody.sign_root_destruction(self.operation, commit, &provider).await?;
+        self.broker.custody_domain(self.operation.domain, domain::Action::RootDestruction {
+            operation: self.operation, root: placement.deployment, evidence: provider,
+        }).await?;
+        drain::record_cut(self.provider, commit, "destruction-confirmed", domain_drain).await?;
         Ok(Some(receipt))
     }
 }

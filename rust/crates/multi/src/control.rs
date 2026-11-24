@@ -77,6 +77,7 @@ pub enum Request {
     Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
+    StageSqlErasure { name: String, request: crate::journal::hosted::erasure::SqlErasureRequest },
     /// Pin the named captured checkpoint through this writer's exact installed basis.
     PinCheckpointSuffix {
         name: String,
@@ -159,6 +160,7 @@ pub enum Response {
     ReadLoads { loads: Vec<crate::read_width::ReadLoad> },
     Done,
     Flushed { checkpoint: rtdb_directory::Checkpoint },
+    SqlErasureStaged { checkpoint: ordered_logkeeper::ordered::Checkpoint },
     CheckpointSuffixPinned { pin: rtdb_directory::CheckpointSuffixPin },
     Published { position: i64 },
     /// A fragment's rows: length-prefixed Arrow IPC streams, in base64.

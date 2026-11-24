@@ -175,6 +175,7 @@ struct RetirementAdmission {
     operation: uuid::Uuid,
     switch: [u8; 32],
     through_epoch: u64,
+    domain_drain: [u8; 32],
 }
 
 pub(in crate::journal::hosted) async fn retirement_admitted(
@@ -201,7 +202,7 @@ async fn cut_record(provider: &CheckpointCustody, placement: Placement, floor: u
     let cut = provider.erasure_cut_records(placement, floor)?;
     let Some(bytes) = cut.get(name).await? else { return Ok(None); };
     let admission: RetirementAdmission = serde_json::from_slice(&bytes).map_err(serialization)?;
-    if admission.operation.is_nil() || admission.switch == [0; 32] || admission.through_epoch == 0 {
+    if admission.operation.is_nil() || admission.switch == [0; 32] || admission.through_epoch == 0 || admission.domain_drain == [0; 32] {
         return Err(invalid("The recorded custody decision has no exact identity"));
     }
     Ok(Some(admission))
@@ -213,13 +214,26 @@ pub(in crate::journal::hosted) async fn serving_retirement_epoch(
     Ok(cut_record(provider, placement, floor, "joined-custody").await?.map(|admission| admission.through_epoch))
 }
 
-pub(super) async fn record_cut(provider: &CheckpointCustody, commit: ErasureCommit, name: &str) -> Result<()> {
+pub(super) async fn admitted_domain(
+    provider: &CheckpointCustody, commit: ErasureCommit,
+) -> Result<[u8; 32]> {
+    let erasure = commit.prepared.erasure;
+    let admission = cut_record(provider, erasure.placement, commit.prepared.checkpoint.cut.next_lsn, "joined-custody").await?
+        .ok_or_else(|| invalid("The domain drain has no durable admission record"))?;
+    if admission.operation != erasure.operation || admission.switch != commit.switch_evidence {
+        return Err(invalid("The domain drain belongs to a different ordered switch"));
+    }
+    Ok(admission.domain_drain)
+}
+
+pub(super) async fn record_cut(provider: &CheckpointCustody, commit: ErasureCommit, name: &str, domain_drain: [u8; 32]) -> Result<()> {
     let erasure = commit.prepared.erasure;
     provider.erasure_cut_records(erasure.placement, commit.prepared.checkpoint.cut.next_lsn)?
         .put(name, encode(&RetirementAdmission {
             operation: erasure.operation,
             switch: commit.switch_evidence,
             through_epoch: erasure.incumbent.epoch,
+            domain_drain,
         })?).await
 }
 
@@ -412,6 +426,14 @@ impl<'a> ErasureDrainJournal<'a> {
             joined.push(join.work);
         }
         Ok(Some(joined))
+    }
+
+    pub(super) fn joined_fingerprint(&self, joined: &[DrainedWork]) -> Result<[u8; 32]> {
+        let mut hash = Context::new(&SHA256);
+        hash.update(b"rtdb.custody/installed-root-joined/v1\0");
+        hash.update(&self.closure.commit);
+        hash.update(&encode(&(self.closure.closed_at_ms, joined))?);
+        Ok(hash.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
     /// Settle only the incumbent journal key selected by this switch.

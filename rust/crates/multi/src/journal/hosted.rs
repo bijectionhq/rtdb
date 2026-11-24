@@ -366,6 +366,67 @@ fn worker_endpoints(peers: Vec<WorkerEndpoint>) -> Result<BTreeMap<Enrollment, W
 }
 
 impl Placement {
+    pub(crate) async fn stage_sql_erasure(
+        &self, node: &rtdb_node::Node, database: &rtdb_node::Database, admission: WriterAdmission,
+        broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>, request: erasure::SqlErasureRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Checkpoint> {
+        use crate::replay_broker::domain;
+
+        let custodian = self.custodian.as_ref().ok_or_else(|| invalid("This placement has no erasure custodian"))?;
+        let placement = custodian.placement();
+        let operation = request.operation;
+        if domain::sql_target(placement, request.transaction, request.position)? != operation.target {
+            return Err(invalid("The SQL erasure marker differs from the broker's target"));
+        }
+        broker.custody_domain(operation.domain, domain::Action::AuthorizeRoot {
+            operation, root: placement.deployment, history: domain::installed_history(placement)?,
+        }).await?;
+
+        let _publication = self.publication.lock().await;
+        let _transactions = cancellation.run_until_cancelled(database.pause_transactions()).await
+            .ok_or_else(|| invalid("SQL erasure staging was cancelled"))??;
+        let route = custodian.route().await?;
+        if route.writer.grant != Some(admission.grant) {
+            return Err(invalid("The SQL erasure writer no longer holds the installed journal"));
+        }
+        let revision = route.checkpoint.custody.revision.checked_add(1)
+            .ok_or_else(|| invalid("The checkpoint custody revision space is exhausted"))?;
+        let reservation = self.checkpoint_reservations.get(&revision).copied()
+            .ok_or_else(|| invalid("The next erasure checkpoint allocation is unfunded"))?;
+        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        let epoch = self.worker.log_epoch();
+        let position = |next: u64| {
+            let offset = i64::try_from(next).ok().and_then(|next| next.checked_sub(1))
+                .ok_or_else(|| invalid("The checkpoint exceeds the native replica position space"))?;
+            rtdb_types::ReplicaPosition::from_epoch_offset(epoch, offset)
+        };
+        let checkpoint = if genesis(route.checkpoint) {
+            None
+        } else {
+            let opened = provider.open(route.checkpoint).await?;
+            Some(rtdb_replication::PublishedCheckpoint {
+                block: rtdb_types::BlockIndex(opened.checkpoint.block),
+                boundary: position(route.checkpoint.cut.next_lsn)?,
+                root_sha256: Some(route.checkpoint.root),
+            })
+        };
+        let cut = rtdb_types::CatalogCut {
+            storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
+            storage_epoch: StorageEpoch(0),
+            replica_epoch: epoch,
+            through: position(route.head.next_lsn)?,
+        };
+        let selection = node.sql_erasure_source(database, cut, checkpoint,
+            request.transaction, request.position, cancellation).await?;
+        let coordinator = erasure::ErasureCoordinator::new(&self.worker, custodian, &provider, keys.as_ref(), broker, operation)?;
+        let staged = coordinator.stage_survivor(erasure::Erasure {
+            placement, operation: operation.erase, custody_domain: operation.domain,
+            incumbent: admission.grant, timing: erasure::ErasureTiming::OperationalTarget,
+        }, request.rotation, reservation, &selection, cancellation).await?;
+        Ok(staged.checkpoint)
+    }
+
     /// Replenish only bytes the installed voters have already paid for. The
     /// ordered decision recomputes the limit against concurrent appends.
     pub(crate) async fn replenish(&self, route: &Route) -> Result<()> {
