@@ -384,7 +384,8 @@ fn suffix_artifact<'a>(
     identity.archive_sha256 = None;
     let (version, domain): (_, &'static [u8]) = match pin.custody {
         CheckpointSuffixCustody::Capture => ("v3", b"RTDB checkpoint suffix segments v3\0"),
-        _ => ("v3", b"RTDB held business suffix segments v3\0"),
+        CheckpointSuffixCustody::World | CheckpointSuffixCustody::RetiringWorld =>
+            ("v4", b"RTDB held business suffix segments v4\0"),
     };
     ReplicaArtifact::new(
         bucket, cipher, format!("{}/{version}", archive_prefix(deployment, suffix, pin)),
