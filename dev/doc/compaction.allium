@@ -7,6 +7,11 @@
 -- On a residence with coordinated retirement, a compaction job admits its live inputs under the catalog floor before opening them.
 -- The hold follows admitted provider requests through cancellation.
 -- Native compaction reserves the temporary buffers for each authenticated input range or for a whole-object input before downloading it.
+-- Native compaction charges each input pair's admitted lengths against the job's cumulative temporary input allowance before reading it.
+-- Small uncompressed metadata can be decoded from its original reserved object bytes.
+-- Its retained input allocations share a per-job ceiling of 1 MiB or one eighth of the memory budget, whichever is smaller.
+-- The metadata and its reservations are released when merge task planning completes.
+-- Spill decoding uses the layout inspected from the same metadata bytes.
 --
 -- This assumes understanding of the "Building a Bitemporal Index" trilogy:
 -- https://xtdb.com/blog/building-a-bitemp-index-1-taxonomy

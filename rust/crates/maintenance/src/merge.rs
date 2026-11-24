@@ -5,18 +5,19 @@ mod row_heap;
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
+use bytes::Bytes;
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_schema, copy_compaction_batch}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_index::{PartitionValue, TrieState};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -90,7 +91,20 @@ impl SegmentCompactor {
     }
 }
 
-struct InputSegment { key: TrieKey, metadata: MetadataFile, reader: ArrowFile, _reservations: Vec<Arc<MemoryReservation>> }
+struct InputSegment { key: TrieKey, reader: ArrowFile, _reservation: Arc<MemoryReservation> }
+
+struct InputMetadata {
+    file: MetadataFile,
+    _reservation: Arc<MemoryReservation>,
+}
+
+struct InputBytes(RetainedBytes);
+
+impl AsRef<[u8]> for InputBytes {
+    fn as_ref(&self) -> &[u8] { self.0.as_slice() }
+}
+
+const RETAINED_INPUT_METADATA_BYTES: usize = 1024 * 1024;
 
 struct MergeOutput {
     path: PathBuf,
@@ -213,28 +227,101 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
 }
 
 pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
-    let object = store.head(key).await?;
+    download_sized(store, memory, key, path, store.head(key).await?.size, cancellation).await
+}
+
+fn reserve_input_read(
+    store: &dyn ObjectStore, key: &ObjectKey, count: usize, ranges: bool,
+    retained_memory: &Arc<MemoryBudget>, memory: &Arc<MemoryBudget>,
+) -> Result<ReadReservation> {
+    let allocation = if ranges { store.scan_range_allocation(key, count)? } else { store.whole_object_allocation(key, count)? };
+    let retained = retained_memory.reserve(allocation.retained_bytes.max(count))?;
+    let scratch = (allocation.scratch_bytes > 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
+    Ok(ReadReservation::funded(count, retained, scratch))
+}
+
+async fn read_input_bytes(
+    store: &dyn ObjectStore, key: &ObjectKey, position: u64, ranges: bool,
+    reservation: ReadReservation, cancellation: &CancellationToken,
+) -> Result<RetainedBytes> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    let bytes = if ranges {
+        store.get_reserved_scan_range(key, position..position + reservation.length() as u64, reservation).await?
+    } else {
+        store.get_reserved_object(key, reservation).await?
+    };
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    Ok(bytes)
+}
+
+async fn download_sized(
+    store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path,
+    size: u64, cancellation: &CancellationToken,
+) -> Result<File> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
     let mut file = create_file(path)?;
     let ranges = store.supports_scan_ranges(key);
     let mut position = 0;
-    while position < object.size {
+    while position < size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
-        let remaining = object.size - position;
+        let remaining = size - position;
         let count = usize::try_from(if ranges { remaining.min(1024 * 1024) } else { remaining }).map_err(crate::invalid)?;
-        let allocation = if ranges { store.scan_range_allocation(key, count)? } else { store.whole_object_allocation(key, count)? };
-        let retained = memory.reserve(allocation.retained_bytes)?;
-        let scratch = (allocation.scratch_bytes > 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
-        let reservation = ReadReservation::funded(count, retained, scratch);
-        let bytes = if ranges {
-            store.get_reserved_scan_range(key, position..position + count as u64, reservation).await?
-        } else {
-            store.get_reserved_object(key, reservation).await?
-        };
+        let reservation = reserve_input_read(store, key, count, ranges, memory, memory)?;
+        let bytes = read_input_bytes(store, key, position, ranges, reservation, cancellation).await?;
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }
     file.seek(SeekFrom::Start(0)).map_err(crate::invalid)?;
     Ok(file)
+}
+
+fn if_memory_available<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn open_metadata(
+    store: &dyn ObjectStore, key: &ObjectKey, path: &Path, size: u64,
+    memory: &Arc<MemoryBudget>, retained_memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<InputMetadata> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    let ranges = store.supports_scan_ranges(key);
+    let (mut file, inspected) = if let Ok(count) = usize::try_from(size)
+        && count > 0 && count <= retained_memory.limit_bytes()
+        && let Some(reservation) = if_memory_available(reserve_input_read(store, key, count, ranges, retained_memory, memory))?
+    {
+        let bytes = read_input_bytes(store, key, 0, ranges, reservation, cancellation).await?;
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let inspected = match if_memory_available(inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes)))? {
+            Some(layout) if layout.uncompressed => {
+                if let Some(reservation) = if_memory_available(memory.reserve(layout.full_allocation_bound()?))? {
+                    if cancellation.is_cancelled() { return Err(crate::closed()); }
+                    let buffer = Bytes::from_owner(InputBytes(bytes)).into();
+                    let file = ArrowFile::from_inspected_buffer(buffer, None, layout)?;
+                    return Ok(InputMetadata { file: MetadataFile::read_file(file)?, _reservation: reservation });
+                }
+                Some(layout)
+            }
+            layout => layout,
+        };
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let mut file = create_file(path)?;
+        file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
+        (file, inspected)
+    } else {
+        (download_sized(store, memory, key, path, size, cancellation).await?, None)
+    };
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    let layout = match inspected {
+        Some(layout) => layout,
+        None => inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?,
+    };
+    let reservation = memory.reserve(layout.full_allocation_bound()?)?;
+    let file = ArrowFile::from_inspected_reader(file, None, layout)?;
+    Ok(InputMetadata { file: MetadataFile::read_file(file)?, _reservation: reservation })
 }
 
 pub fn open_input(
@@ -397,19 +484,26 @@ impl SegmentCompactor {
         let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
         let entry = snapshot.table_catalog().entry(&job.table).cloned().ok_or_else(|| crate::invalid("Compaction table has no recorded slug"))?;
         let mut inputs = Vec::new();
+        let mut metadata = Vec::new();
+        let retained_metadata = self.memory.scope_with_limit(RETAINED_INPUT_METADATA_BYTES.min(self.memory.limit_bytes() / 8));
+        let mut input_bytes = 0u64;
         for (index, key) in job.inputs.iter().enumerate() {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let data_key = ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?;
             let meta_key = ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?;
-            let size = self.store.head(&data_key).await.map_err(crate::invalid)?.size.checked_add(self.store.head(&meta_key).await.map_err(crate::invalid)?.size).ok_or_else(|| crate::invalid("Input file size overflow"))?;
-            check_disk(directory.path(), self.config.temporary_byte_limit, size)?;
-            let data = download(self.store.as_ref(), &self.memory, &data_key, &directory.path().join(format!("input-{index}.arrow")), cancellation).await?;
-            let mut metadata = download(self.store.as_ref(), &self.memory, &meta_key, &directory.path().join(format!("meta-{index}.arrow")), cancellation).await?;
-            let metadata_layout = inspect_file_reserved(&mut metadata, |bytes| self.memory.reserve(bytes))?;
-            let metadata_charge = self.memory.reserve(metadata_layout.full_allocation_bound()?)?;
-            let metadata = MetadataFile::read_reader(metadata)?;
+            let data_size = self.store.head(&data_key).await.map_err(crate::invalid)?.size;
+            let metadata_size = self.store.head(&meta_key).await.map_err(crate::invalid)?.size;
+            input_bytes = input_bytes.checked_add(data_size).and_then(|bytes| bytes.checked_add(metadata_size))
+                .ok_or_else(|| crate::invalid("Input file size overflow"))?;
+            if input_bytes > self.config.temporary_byte_limit {
+                return Err(crate::invalid("Compaction temporary disk budget exceeded"));
+            }
+            let data = download_sized(self.store.as_ref(), &self.memory, &data_key,
+                &directory.path().join(format!("input-{index}.arrow")), data_size, cancellation).await?;
+            metadata.push(open_metadata(self.store.as_ref(), &meta_key, &directory.path().join(format!("meta-{index}.arrow")),
+                metadata_size, &self.memory, &retained_metadata, cancellation).await?);
             let (reader, reservation) = open_input(data, &self.memory)?;
-            inputs.push(InputSegment { key: key.clone(), metadata, reader, _reservations: vec![reservation, metadata_charge] });
+            inputs.push(InputSegment { key: key.clone(), reader, _reservation: reservation });
         }
         let keyed = job.table.is_owned_event_data();
         let topology = job.table.is_owned_world_topology();
@@ -426,7 +520,8 @@ impl SegmentCompactor {
         }));
         let put = merged_put_schema(&inputs)?.map(Arc::new);
         let carry = self.config.within_file_recency_branching && job.output.recency().is_some() && inputs.iter().all(|input| input.reader.schema().index_of("_recency").is_ok());
-        let tasks = planner::plan(&inputs, &job.part)?;
+        let tasks = planner::plan(&metadata, &job.part)?;
+        drop(metadata);
         let tie_order = self.config.tie_order(job.output.epoch());
         let mut sources: Vec<_> = (0..inputs.len()).collect();
         sources.sort_by(|&left, &right| inputs[left].key.scan_precedence().cmp(&inputs[right].key.scan_precedence()));
@@ -722,6 +817,41 @@ mod tests {
         let mut body = Vec::new();
         file.read_to_end(&mut body).map_err(crate::invalid)?;
         assert_eq!(body.as_slice(), input.0.as_ref());
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_metadata_retains_original_bytes_up_to_the_job_limit() -> Result<()> {
+        use rtdb_format::metadata::{LeafColumns, MetadataNode};
+
+        let metadata = MetadataFile::from_nodes(vec![MetadataNode::Leaf {
+            data_page_index: 3,
+            columns: LeafColumns::new(Vec::new()),
+        }], false)?;
+        let store = WholeInput(Bytes::from(metadata.write()?));
+        let size = store.0.len();
+        let key = ObjectKey::new("metadata.arrow")?;
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryBudget::new(8 << 20);
+        let retained = memory.scope_with_limit(size);
+        let cancellation = CancellationToken::new();
+        let first_path = directory.path().join("first.arrow");
+        let second_path = directory.path().join("second.arrow");
+        let first = open_metadata(&store, &key, &first_path, size as u64, &memory, &retained, &cancellation).await?;
+        assert!(!first_path.exists());
+        assert_eq!(retained.used_bytes(), size);
+
+        let second = open_metadata(&store, &key, &second_path, size as u64, &memory, &retained, &cancellation).await?;
+        assert_eq!(std::fs::read(second_path).map_err(crate::invalid)?.as_slice(), store.0.as_ref());
+        assert_eq!(retained.used_bytes(), size);
+
+        let inputs = [first, second];
+        let tasks = planner::plan(&inputs, &[])?;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].pages.iter().map(|page| (page.segment, page.page)).collect::<Vec<_>>(), [(0, 3), (1, 3)]);
+        drop(inputs);
+        assert_eq!(retained.used_bytes(), 0);
         assert_eq!(memory.used_bytes(), 0);
         Ok(())
     }
