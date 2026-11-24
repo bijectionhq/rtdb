@@ -1996,6 +1996,7 @@ rule RetireOrderedIndexPages {
         and EveryAdmittedProviderUploadSettled(scope)
 
     ensures:
+        GenerationKeyScopeWithdrawn(scope)
         EveryObjectVersionAndUploadRemoved(scope)
         EmptyProviderInventoryRecorded(scope)
 }

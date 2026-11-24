@@ -28,8 +28,9 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, object};
 use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
-use crate::keys::{DeploymentDelivery, KeyService};
+use crate::keys::{DeploymentDelivery, KeyService, UnitLedger, UnitOperation, UnitOutput, UnitScope};
 pub use rtdb_storage::sealing::EncryptingStore;
+use rtdb_storage::sealing::ObjectCipher;
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
 use crate::reference::custody::ReferenceReads;
@@ -312,14 +313,65 @@ impl RemoteStorageFactory for CellStoreFactory {
             Some(material) => material,
             None => self.enroll_serving_key(&config, &id).await?,
         };
-        let delivery = DeploymentDelivery::new(self.keys.clone(), id, &material);
-        let ordinary = EncryptingStore::with_deployment_delivery(cached, &material, delivery.clone())?;
-        let ordinary = Arc::new(ordinary);
+        let keys: Arc<dyn ObjectCipher> = Arc::new(ServingKeys {
+            keys: Arc::clone(&self.keys),
+            residence: record.storage_prefix(),
+            directory: Arc::clone(&self.directory),
+            installation: record.id.clone(),
+            writer_epoch: config.writer_epoch,
+            io: IoRegion::new(),
+            deployment: Cipher::new(&material)?,
+            delivery: DeploymentDelivery::new(self.keys.clone(), id, &material),
+        });
+        let ordinary = Arc::new(EncryptingStore::with_units(cached, Arc::clone(&keys)));
         let audience = audience.zip(self.audience_writer(&config, &record)).map(|(store, source)| {
-            let store = Arc::new(AudienceObjectStore(EncryptingStore::with_deployment_delivery(store, &material, delivery)?));
-            Ok::<_, Anomaly>(AudienceReadStorage { source, store })
-        }).transpose()?;
+            let store = Arc::new(AudienceObjectStore(EncryptingStore::with_units(store, keys)));
+            AudienceReadStorage { source, store }
+        });
         Ok(OpenedServingStores { ordinary, audience })
+    }
+}
+
+struct ServingKeys {
+    keys: Arc<dyn KeyService>,
+    residence: String,
+    directory: Arc<dyn Directory>,
+    installation: String,
+    writer_epoch: Option<u64>,
+    io: Arc<IoRegion>,
+    deployment: Cipher,
+    delivery: Arc<DeploymentDelivery>,
+}
+
+#[async_trait]
+impl ObjectCipher for ServingKeys {
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        if let Some((index, generation)) = ordered_index_storage::page_generation(name.as_str()) {
+            if operation.provisions() {
+                let epoch = self.writer_epoch.ok_or_else(|| Error::Closed("The index writer is fenced".into()))?;
+                let definition = format!("/{}/{index}", rtdb_format::keys::ORDERED_INDEX_ROOT);
+                let current = self.directory.deployment(&self.installation).await
+                    .map_err(|error| publication_error(name, error))?;
+                let admitted = current.is_some_and(|record| {
+                    record.storage_prefix() == self.residence && record.epoch == epoch && record.holder.is_some()
+                        && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                        && record.ordered_indexes.iter().any(|(name, state)| {
+                            name.ends_with(&definition) && state.admits(generation)
+                                && state.generations.get(&generation).is_some_and(|users| !users.is_empty())
+                        })
+                });
+                if !admitted {
+                    return Err(Error::Closed("The directory has no admitted index page generation".into()));
+                }
+            }
+            let scope = UnitScope::ordered_index(&self.residence, index, generation);
+            return UnitLedger::new(Arc::clone(&self.keys), scope, Arc::clone(&self.io))
+                .operate(name, operation).await;
+        }
+        if matches!(operation, UnitOperation::Grant) {
+            return self.delivery.operate(name, operation).await;
+        }
+        operation.apply(&self.deployment, name)
     }
 }
 
@@ -1320,6 +1372,9 @@ impl ObjectStore for GarbageStore {
         Ok(objects.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.contains_key(&object.key)).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        if self.index_pages.is_some() && ordered_index_storage::page_generation(key.as_str()).is_some() {
+            return Err(Error::Closed("The index page generation owns its retirement".into()));
+        }
         if key.as_str().starts_with("oversized/") {
             return Err(Error::Remote { key: key.to_string(), message: "An offloaded replica payload belongs to the retained journal".into() });
         }
@@ -1450,7 +1505,8 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 StoredRelease::Replica { .. } => { reaped.waiting += 1; continue; }
                 StoredRelease::Path(record) => record,
             };
-            if !permits_release(record, &store, &released, false) || !recovery_covers_release(record, &released)
+            if ordered_index_storage::page_generation(&released.key).is_some()
+                || !permits_release(record, &store, &released, false) || !recovery_covers_release(record, &released)
                 || !oversized_payload_collectable(record, &released.key, now_ms)
                 || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
@@ -1596,6 +1652,7 @@ pub async fn run_reaper(
                         }
                     }
                     for record in &deployments {
+                        let Some(keys) = keys.as_deref() else { break; };
                         if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
                             || (record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty())
                         {
@@ -1607,7 +1664,7 @@ pub async fn run_reaper(
                             continue;
                         };
                         match cancellation.run_until_cancelled(
-                            ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &current)
+                            ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &current, keys)
                         ).await {
                             None => return,
                             Some(Ok(())) => {}
@@ -2802,6 +2859,8 @@ mod tests {
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
 
         let directory = rtdb_directory::MemoryDirectory::new();
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path()).unwrap();
         let region = Uuid::new_v4();
         let attempt = Uuid::new_v4();
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
@@ -2835,12 +2894,12 @@ mod tests {
             Ok(())
         }).await.unwrap();
         assert!(journal.admit(&object, Uuid::new_v4(), &upload).await.is_err());
-        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &closed).await.unwrap();
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &closed, &keys).await.unwrap();
         assert!(!inventory.is_empty(&old).await.unwrap());
 
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         let drained = directory.deployment(&record.id).await.unwrap().unwrap();
-        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &drained).await.unwrap();
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &drained, &keys).await.unwrap();
         assert!(inventory.complete(&upload_path, &upload, Bytes::from_static(b"late")).await.is_err());
         assert!(inventory.is_empty(&old).await.unwrap());
         assert!(!inventory.is_empty(&replacement).await.unwrap());
