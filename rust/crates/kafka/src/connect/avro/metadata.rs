@@ -116,6 +116,7 @@ fn collect(raw: &Json, namespace: &str, names: &mut BTreeMap<String, Json>) {
 pub(super) fn is_map_entry(raw: &Json) -> bool {
     raw.get("connect.internal.type").and_then(Json::as_str) == Some("MapEntry") || raw.get("name").and_then(Json::as_str) == Some("io.confluent.connect.avro.MapEntry") || (raw.get("name").and_then(Json::as_str) == Some("MapEntry") && raw.get("namespace").and_then(Json::as_str) == Some("io.confluent.connect.avro"))
 }
+#[cfg(test)]
 pub(super) fn coerce(value: Value, schema: &ConnectSchema) -> Result<Value> {
     let schema = schema.resolved();
     Ok(match (value, &schema.kind) {
@@ -226,15 +227,15 @@ mod tests {
         use super::super::default_json::DefaultJson;
         let mut date = ConnectSchema::new(SchemaKind::I32);
         date.name = Some("org.apache.kafka.connect.data.Date".into());
-        assert_eq!(raw_default_value(&DefaultJson::Number("1e50".into()), &date, false).unwrap(), super::super::super::data::date_value(i64::from(i32::MAX) * 86_400_000));
-        assert_eq!(raw_default_value(&DefaultJson::Number("-1".into()), &date, false).unwrap(), super::super::super::data::date_value(-86_400_000));
+        assert_eq!(raw_default_value(&DefaultJson::from_str("1e50").unwrap(), &date, false).unwrap(), super::super::super::data::date_value(i64::from(i32::MAX) * 86_400_000));
+        assert_eq!(raw_default_value(&DefaultJson::from_str("-1").unwrap(), &date, false).unwrap(), super::super::super::data::date_value(-86_400_000));
         let mut time = ConnectSchema::new(SchemaKind::I32);
         time.name = Some("org.apache.kafka.connect.data.Time".into());
-        assert_eq!(raw_default_value(&DefaultJson::Number("86400000".into()), &time, false).unwrap(), super::super::super::data::date_value(86_400_000));
-        assert!(raw_default_value(&DefaultJson::Number("86400001".into()), &time, false).is_err());
-        assert!(raw_default_value(&DefaultJson::Number("-1".into()), &time, false).is_err());
+        assert_eq!(raw_default_value(&DefaultJson::from_str("86400000").unwrap(), &time, false).unwrap(), super::super::super::data::date_value(86_400_000));
+        assert!(raw_default_value(&DefaultJson::from_str("86400001").unwrap(), &time, false).is_err());
+        assert!(raw_default_value(&DefaultJson::from_str("-1").unwrap(), &time, false).is_err());
         time.kind = SchemaKind::I8;
-        assert!(raw_default_value(&DefaultJson::Number("0".into()), &time, false).is_err());
+        assert!(raw_default_value(&DefaultJson::from_str("0").unwrap(), &time, false).is_err());
     }
     #[test]
     fn decimal_defaults_preserve_full_scale_and_reject_invalid_schema_scales() {

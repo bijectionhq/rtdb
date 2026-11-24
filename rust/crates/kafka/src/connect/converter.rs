@@ -4,7 +4,7 @@ use arrow_array::{Array, ArrayRef, NullArray, UnionArray, builder::{Float64Build
 use arrow_schema::{DataType, Field, UnionFields};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rtdb_types::{DecimalValue, ListValue, Result, StructFields, TimeUnit, Value};
+use rtdb_types::{DecimalValue, ListBuilder, ListValue, Result, StructFields, TimeUnit, Value};
 use super::json_value::JsonValue as Json;
 use super::{ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, PluginSpec, SchemaKind, error, numeric};
 mod charset;
@@ -67,13 +67,54 @@ impl Converter for JsonConverter {
         context.reserve(budget.remaining)?;
         budget.claim(bytes.len().saturating_mul(64))?;
         let json = Json::from_slice(bytes).map_err(|cause| error("conversion-error", cause))?;
+        if !self.enabled {
+            return Ok(ConnectData::schemaless(schemaless(json, 0, &mut budget)?));
+        }
         let (schema, value) = if let Some(schema) = &self.schema { (Some(Arc::clone(schema)), &json) }
-        else if self.enabled {
+        else {
             json.as_object().filter(|object| object.len() == 2 && json.get("schema").is_some() && json.get("payload").is_some()).ok_or_else(|| error("conversion-error", "JsonConverter requires exactly schema and payload fields"))?;
             (schema(json.get("schema").expect("validated envelope"), self.replace, 0, &mut budget)?, json.get("payload").expect("validated envelope"))
-        } else { (None, &json) };
+        };
         let value = convert_budget(&schema, value, self.replace, 0, &mut budget)?;
         Ok(ConnectData { schema, value })
+    }
+}
+fn schemaless(json: Json, depth: usize, budget: &mut DecodeBudget) -> Result<Value> {
+    budget.claim(512)?;
+    if depth > 128 {
+        return Err(error("conversion-error", "Connect value nesting limit exceeded"));
+    }
+    Ok(match json {
+        Json::Null => Value::Null,
+        Json::Boolean(value) => Value::Bool(value),
+        Json::String(value) => {
+            budget.claim(value.len().saturating_mul(2))?;
+            Value::Utf8(value)
+        }
+        Json::Number(_) | Json::Decimal(_) => schemaless_number(&json)?,
+        Json::Array(values) if values.iter().all(|value| value.is_null() || value.is_number()) => {
+            let mut list = ListBuilder::with_capacity(values.len());
+            for value in values {
+                list.push(schemaless(value, depth + 1, budget)?);
+            }
+            Value::List(list.finish())
+        }
+        Json::Array(values) => Value::list(values.into_iter()
+            .map(|value| schemaless(value, depth + 1, budget)).collect::<Result<_>>()?),
+        Json::Object(fields) => Value::Map {
+            entries: fields.into_iter().map(|(name, value)| {
+                Ok((Value::Utf8(name), schemaless(value, depth + 1, budget)?))
+            }).collect::<Result<_>>()?,
+            sorted: false,
+        },
+    })
+}
+
+fn schemaless_number(json: &Json) -> Result<Value> {
+    if json.is_integral() {
+        Ok(Value::I64(json.long_value().expect("integral number")))
+    } else {
+        Ok(Value::F64(json.double_value().ok_or_else(|| error("conversion-error", "Invalid number"))?))
     }
 }
 fn schema(json: &Json, replace: bool, depth: usize, budget: &mut DecodeBudget) -> Result<Option<Arc<ConnectSchema>>> {
@@ -174,7 +215,7 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
         Some(SchemaKind::Reference(_)) => unreachable!("schema references resolve before conversion"),
         None => match json {
             Json::Null => Value::Null, Json::Boolean(value) => Value::Bool(*value), Json::String(value) => Value::Utf8(value.clone()),
-            Json::Number(_) | Json::Decimal(_) => if json.is_integral() { Value::I64(integral()) } else { Value::F64(json.double_value().ok_or_else(|| error("conversion-error", "Invalid number"))?) },
+            Json::Number(_) | Json::Decimal(_) => schemaless_number(json)?,
             Json::Array(values) => Value::List(json_array(values, None, replace, false, depth + 1, budget)?),
             Json::Object(values) => Value::Map { entries: values.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), convert_budget(&None, value, replace, depth + 1, budget)?))).collect::<Result<_>>()?, sorted: false },
         },
@@ -457,4 +498,30 @@ mod tests {
         assert_eq!(integer.value(0), i64::MAX);
         assert!(union.child(0).data_type() == &arrow_schema::DataType::Null);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn f5_schemaless_converter_preserves_packed_list_layout_and_budget() {
+    let bytes = br#"{"x":[null,-0.0,9223372036854775807,1.25],"x":[null,-0.0,9223372036854775807,1.25],"text":"value"}"#;
+    let json = Json::from_slice(bytes).unwrap();
+    let mut legacy_budget = DecodeBudget::new(bytes.len()).unwrap();
+    legacy_budget.claim(bytes.len().saturating_mul(64)).unwrap();
+    let legacy = convert_budget(&None, &json, true, 0, &mut legacy_budget).unwrap();
+    let mut direct_budget = DecodeBudget::new(bytes.len()).unwrap();
+    direct_budget.claim(bytes.len().saturating_mul(64)).unwrap();
+    let direct = schemaless(json, 0, &mut direct_budget).unwrap();
+    let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+    let converted = JsonConverter { enabled: false, replace: true, schema: None }
+        .decode("events", Some(bytes), &mut context).await.unwrap();
+    assert_eq!(direct_budget.remaining, legacy_budget.remaining);
+    assert_eq!(serde_json::to_vec(&converted.value).unwrap(), serde_json::to_vec(&legacy).unwrap());
+    let Value::Map { entries: direct, .. } = direct else { panic!("expected map"); };
+    let Value::Map { entries: legacy, .. } = legacy else { panic!("expected map"); };
+    let (Value::List(direct), Value::List(legacy)) = (&direct[0].1, &legacy[0].1) else { panic!("expected list"); };
+    let (direct_field, direct_array) = direct.packed_column().unwrap();
+    let (legacy_field, legacy_array) = legacy.packed_column().unwrap();
+    assert_eq!(direct_field, legacy_field);
+    assert_eq!(direct_array.to_data(), legacy_array.to_data());
+    assert_eq!(rtdb_types::Value::F64(-0.0), direct.get(1).unwrap().into_owned());
 }

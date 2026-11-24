@@ -110,24 +110,30 @@ impl ReaderBinding {
                 plan.convert(datum, context).map(Decoded::Data)
             }
             ReaderPlan::Avro { writer, selection, outputs } => {
-                let (reader, datum) = match selection {
-                    AvroSelection::Writer => {
-                        let datum = writer.decode_datum(bytes, context)?;
-                        (&*writer, writer.binary_result(datum, context)?)
+                if let AvroSelection::Reader { plan, decode: AvroRead::Migration } = selection {
+                    let datum = writer.decode_datum(bytes, context)?;
+                    let datum = writer.binary_result(datum, context)?;
+                    let json = writer.to_json_datum(datum, context)?;
+                    for migration in &self.migrations {
+                        if let Some(rule) = migration.check(false)? {
+                            return Ok(Decoded::Dlq { rule, original: Original::Json(super::json_value::JsonValue::from_serde(json)) });
+                        }
                     }
+                    let datum = plan.from_json_datum(json, context)?;
+                    let is_null = datum.is_null();
+                    if let Some(rule) = self.read_rules.check(is_null)? { return Ok(Decoded::Dlq { rule, original: Original::Framed }); }
+                    if is_null { return Err(error("conversion-error", "Avro converter returned no schema and value")); }
+                    let (output, datum) = writer.prepare_output(plan, datum, context)?;
+                    let output = avro_output(outputs, output, writer, plan, self.writer.version, next_union, context)?;
+                    return output.convert(datum, next_union, context).map(Decoded::Data);
+                }
+                let (reader, datum) = match selection {
+                    AvroSelection::Writer => (&*writer, writer.wire_result(writer.decode_wire(bytes, context)?, context)?),
                     AvroSelection::Reader { plan, decode } => {
                         let datum = match decode {
-                            AvroRead::Binary(resolution) => writer.binary_result(resolution.decode_datum(bytes, context)?, context)?,
-                            AvroRead::RawBytes => writer.decode_datum(bytes, context)?,
-                            AvroRead::Migration => {
-                                let datum = writer.decode_datum(bytes, context)?;
-                                let datum = writer.binary_result(datum, context)?;
-                                let json = writer.to_json_datum(datum, context)?;
-                                for migration in &self.migrations {
-                                    if let Some(rule) = migration.check(false)? { return Ok(Decoded::Dlq { rule, original: Original::Json(super::json_value::JsonValue::from_serde(json)) }); }
-                                }
-                                plan.from_json_datum(json, context)?
-                            }
+                            AvroRead::Binary(resolution) => writer.wire_result(resolution.decode_wire(bytes, context)?, context)?,
+                            AvroRead::RawBytes => writer.decode_wire(bytes, context)?,
+                            AvroRead::Migration => unreachable!("migration uses Avro JSON"),
                         };
                         (&*plan, datum)
                     }
@@ -135,16 +141,35 @@ impl ReaderBinding {
                 let is_null = datum.is_null();
                 if let Some(rule) = self.read_rules.check(is_null)? { return Ok(Decoded::Dlq { rule, original: Original::Framed }); }
                 if is_null { return Err(error("conversion-error", "Avro converter returned no schema and value")); }
-                let (output, datum) = writer.prepare_output(reader, datum, context)?;
-                if !outputs.contains_key(&output) {
-                    let (plan, branch) = match output { super::avro::AvroOutput::Writer => (&*writer, None), super::avro::AvroOutput::Reader { branch } => (reader, branch) };
-                    outputs.insert(output, plan.connect_plan(branch, Some(self.writer.version), next_union, context)?);
-                }
-                outputs[&output].convert(datum, next_union, context).map(Decoded::Data)
+                let output = writer.prepare_wire_output(reader, &datum, context)?;
+                let output = avro_output(outputs, output, writer, reader, self.writer.version, next_union, context)?;
+                output.convert_wire(datum, next_union, context).map(Decoded::Data)
             }
         }
     }
 }
+fn avro_output<'a>(
+    outputs: &'a mut BTreeMap<super::avro::AvroOutput, super::avro::AvroPlan>,
+    output: super::avro::AvroOutput,
+    writer: &Arc<super::avro::AvroDatumPlan>,
+    reader: &Arc<super::avro::AvroDatumPlan>,
+    version: i32,
+    next_union: &mut i32,
+    context: &mut ConversionContext,
+) -> Result<&'a super::avro::AvroPlan> {
+    use std::collections::btree_map::Entry;
+    Ok(match outputs.entry(output) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let (plan, branch) = match output {
+                super::avro::AvroOutput::Writer => (writer, None),
+                super::avro::AvroOutput::Reader { branch } => (reader, branch),
+            };
+            entry.insert(plan.connect_plan(branch, Some(version), next_union, context)?)
+        }
+    })
+}
+
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 struct RegistrySchema {
     schema: String,

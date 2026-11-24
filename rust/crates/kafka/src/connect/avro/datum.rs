@@ -3,7 +3,9 @@ mod map_order;
 mod binary;
 mod numeric;
 pub(super) use numeric::{NumericInput, NumericKind, PackedArray, PackedLayout};
-pub(super) use binary::{bytes as read_bytes, block as read_block, value as read_value};
+mod build;
+pub(super) use build::{BuildDatum, PhysicalBuilder};
+pub(super) use binary::{bytes as read_bytes, block as read_block, read as read_with, scalar as read_scalar};
 #[cfg(test)] mod utf8_tests;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,18 +24,18 @@ impl MapKey {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum AvroMap { Insertions { first_block: usize, entries: Vec<(MapKey, Avro)>, strings: bool }, Ordered(Vec<(MapKey, Avro)>) }
-impl AvroMap {
-    pub(super) fn new(first_block: usize, entries: Vec<(MapKey, Avro)>, strings: bool) -> Self { Self::Insertions { first_block, entries, strings } }
-    fn entries(&self) -> &[(MapKey, Avro)] { match self { Self::Insertions { entries, .. } | Self::Ordered(entries) => entries } }
-    pub(super) fn iter(&self) -> impl Iterator<Item = &(MapKey, Avro)> { self.entries().iter() }
+pub(super) enum AvroMap<T = Avro> { Insertions { first_block: usize, entries: Vec<(MapKey, T)>, strings: bool }, Ordered(Vec<(MapKey, T)>) }
+impl<T> AvroMap<T> {
+    pub(super) fn new(first_block: usize, entries: Vec<(MapKey, T)>, strings: bool) -> Self { Self::Insertions { first_block, entries, strings } }
+    fn entries(&self) -> &[(MapKey, T)] { match self { Self::Insertions { entries, .. } | Self::Ordered(entries) => entries } }
+    pub(super) fn iter(&self) -> impl Iterator<Item = &(MapKey, T)> { self.entries().iter() }
     pub(super) fn is_empty(&self) -> bool { self.entries().is_empty() }
     pub(super) fn with_strings(self, strings: bool) -> Self { match self { Self::Insertions { first_block, entries, .. } => Self::new(first_block, entries, strings), Self::Ordered(entries) => Self::new(entries.len(), entries, strings) } }
-    pub(super) fn map_values(self, mut map: impl FnMut(Avro) -> Result<Avro>) -> Result<Self> {
-        let transform = |entries: Vec<(MapKey, Avro)>, map: &mut dyn FnMut(Avro) -> Result<Avro>| entries.into_iter().map(|(key, value)| Ok((key, map(value)?))).collect::<Result<Vec<_>>>();
+    pub(super) fn map_values(self, mut map: impl FnMut(T) -> Result<T>) -> Result<Self> {
+        let transform = |entries: Vec<(MapKey, T)>, map: &mut dyn FnMut(T) -> Result<T>| entries.into_iter().map(|(key, value)| Ok((key, map(value)?))).collect::<Result<Vec<_>>>();
         Ok(match self { Self::Insertions { first_block, entries, strings } => Self::new(first_block, transform(entries, &mut map)?, strings), Self::Ordered(entries) => Self::Ordered(transform(entries, &mut map)?) })
     }
-    pub(super) fn map_visible_values(self, map: impl FnMut(Avro) -> Result<Avro>) -> Result<Self> { Self::Ordered(self.ordered()?).map_values(map) }
+    pub(super) fn map_visible_values(self, map: impl FnMut(T) -> Result<T>) -> Result<Self> { Self::Ordered(self.ordered()?).map_values(map) }
     fn order(&self) -> Result<Vec<usize>> {
         match self {
             Self::Ordered(entries) => Ok((0..entries.len()).collect()),
@@ -44,8 +46,8 @@ impl AvroMap {
             Self::Insertions { first_block, entries, strings: false } => map_order::indices(*first_block, entries.iter().map(|(key, _)| key)),
         }
     }
-    pub(super) fn first_value(&self) -> Result<Option<&Avro>> { Ok(self.order()?.first().map(|index| &self.entries()[*index].1)) }
-    pub(super) fn ordered(self) -> Result<Vec<(MapKey, Avro)>> {
+    pub(super) fn first_value(&self) -> Result<Option<&T>> { Ok(self.order()?.first().map(|index| &self.entries()[*index].1)) }
+    pub(super) fn ordered(self) -> Result<Vec<(MapKey, T)>> {
         if let Self::Ordered(entries) = self { return Ok(entries); }
         let order = self.order()?;
         let Self::Insertions { entries, strings, .. } = self else { unreachable!() };

@@ -223,5 +223,5 @@ fn physical(schema: &Schema) -> &Schema { match schema { Schema::Decimal(decimal
 fn byte_text(bytes: Vec<u8>) -> String { bytes.into_iter().map(char::from).collect() }
 fn latin1(text: &str) -> Vec<u8> { text.chars().map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?')).collect() }
 fn nesting(depth: usize) -> Result<()> { if depth > 128 { Err(error("avro-json", "Avro JSON datum nesting limit exceeded")) } else { Ok(()) } }
-fn invalid() -> rtdb_types::Anomaly { error("avro-json", "JSON datum does not match its Avro schema") }
+pub(super) fn invalid() -> rtdb_types::Anomaly { error("avro-json", "JSON datum does not match its Avro schema") }
 fn overflow() -> rtdb_types::Anomaly { super::resolution::overflow() }

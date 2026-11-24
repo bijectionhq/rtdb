@@ -1553,6 +1553,11 @@ rule LeaderFlushTimeout {
 
 ---- Rules: External Source
 
+-- Kafka Connect interprets each record's JSON tokens in wire order and retains typed numbers for Connect coercion and optional JSON Schema validation.
+-- Avro Connect projection applies the selected schema to the admitted binary datum, preserving reader resolution and the writer's Connect output rules.
+-- Kafka transforms receive Connect values with their declared schema and logical annotations.
+-- The Kafka document indexer submits each transformed record as a transaction using its offset as the resume token.
+
 -- An external-source leader does NOT take transactions from the source log.
 -- The source is handed an indexing callback on assignment and feeds transactions in directly.
 -- Flush and tries coordination still use the source log, so the leader also reads it — but transaction, attach and detach messages MUST NOT appear there, being rejected at submit time (ClientSubmitsTransactionToExternalSourceDb).

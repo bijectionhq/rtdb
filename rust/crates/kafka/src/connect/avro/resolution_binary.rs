@@ -1,19 +1,30 @@
 use super::*;
-use super::super::{AvroMap, BinaryWindow, MapKey, Preflight, datum};
+use super::super::{BinaryWindow, MapKey, Preflight, datum, wire::{Tape, WireDatum}};
+use datum::{BuildDatum, PhysicalBuilder};
 #[cfg(test)] #[path = "resolution_binary_tests.rs"] mod tests;
 
 impl AvroResolution {
     pub fn decode_datum(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<AvroDatum> {
+        if self.writer.raw_bytes() { return self.resolve(self.writer.decode_datum(bytes, context)?, context); }
+        let value = self.decode_with(bytes, context, &mut PhysicalBuilder)?;
+        Ok(AvroDatum { value, plan: Arc::clone(&self.reader) })
+    }
+
+    pub(in crate::connect) fn decode_wire(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<WireDatum> {
+        let mut tape = Tape::default();
+        let root = self.decode_with(bytes, context, &mut tape)?;
+        Ok(WireDatum { plan: Arc::clone(&self.reader), tape, root })
+    }
+
+    fn decode_with<B: BuildDatum>(&self, bytes: &[u8], context: &mut ConversionContext, builder: &mut B) -> Result<B::Node> {
         self.writer.retain_source(context)?;
         self.reader.retain_source(context)?;
-        if self.writer.raw_bytes() { return self.resolve(self.writer.decode_datum(bytes, context)?, context); }
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
         let mut reader = Preflight { bytes, offset: 0, window: BinaryWindow::new(bytes.len()), allocated: 4096, limit: context.allocation_limit(), names: &self.writer.names, view_bytes: 0 };
         self.preflight(self.root, &self.writer.root, &mut reader, 0)?;
         context.reserve(reader.allocated)?;
         reader.offset = 0; reader.window = BinaryWindow::new(bytes.len());
-        let value = self.read(self.root, &self.writer.root, &mut reader, 0)?;
-        Ok(AvroDatum { value, plan: Arc::clone(&self.reader) })
+        self.read(self.root, &self.writer.root, &mut reader, 0, builder)
     }
 
     fn preflight(&self, id: usize, schema: &Schema, reader: &mut Preflight<'_>, depth: usize) -> Result<()> {
@@ -81,58 +92,63 @@ impl AvroResolution {
         }
     }
 
-    fn read(&self, id: usize, schema: &Schema, reader: &mut Preflight<'_>, depth: usize) -> Result<Avro> {
+    fn read<B: BuildDatum>(&self, id: usize, schema: &Schema, reader: &mut Preflight<'_>, depth: usize, builder: &mut B) -> Result<B::Node> {
         nesting(depth)?;
         let schema = physical(super::super::resolve(schema, &self.writer.names)?);
         match &self.actions[id] {
             Action::Error(message) => Err(error("avro-resolution", message)),
-            Action::Scalar { .. } => self.apply(id, datum::read_value(schema, reader, depth)?, depth),
+            Action::Scalar { .. } => Ok(builder.scalar(self.apply(id, datum::read_scalar(schema, reader)?, depth)?)),
             Action::Enum(symbols) => {
                 let index = usize::try_from(reader.int()?).map_err(|cause| error("avro-decode", cause))?;
                 let (index, symbol) = symbols.get(index).and_then(Option::as_ref).ok_or_else(invalid)?;
-                Ok(Avro::Enum(*index, symbol.clone()))
+                Ok(builder.scalar(Avro::Enum(*index, symbol.clone())))
             }
             Action::Record { fields, reader_names, defaults, .. } => {
                 let Schema::Record(record) = schema else { return Err(invalid()); };
-                let mut output = vec![None; reader_names.len()];
+                let mut output: Vec<_> = std::iter::repeat_with(|| None).take(reader_names.len()).collect();
                 for (field, action) in record.fields.iter().zip(fields) {
-                    if let Some((index, child)) = action { output[*index] = Some(self.read(*child, &field.schema, reader, depth + 1)?); }
+                    if let Some((index, child)) = action { output[*index] = Some(self.read(*child, &field.schema, reader, depth + 1, builder)?); }
                     else { reader.skip(&field.schema, depth + 1)?; }
                 }
-                for (index, value) in defaults { output[*index] = Some(value.clone()); }
-                Ok(Avro::Record(reader_names.iter().cloned().zip(output).map(|(name, value)| Ok((name, value.ok_or_else(invalid)?))).collect::<Result<_>>()?))
+                for (index, value) in defaults { output[*index] = Some(builder.reader_default(value)); }
+                let fields = reader_names.iter().cloned().zip(output).map(|(name, value)| Ok((name, value.ok_or_else(invalid)?))).collect::<Result<_>>()?;
+                Ok(builder.record(fields))
             }
             Action::Array { child, packed } => {
                 let Schema::Array(array) = schema else { return Err(invalid()); };
-                if let Some(target) = packed
+                if builder.accepts_packed_arrays()
+                    && let Some(target) = packed
                     && let Some(writer) = datum::NumericInput::from_schema(&array.items)
                     && self.can_pack_array(*child, writer, *target)
                 {
-                    return Ok(Avro::PackedArray(datum::PackedArray::read(writer, *target, reader, depth + 1)?));
+                    return Ok(builder.scalar(Avro::PackedArray(datum::PackedArray::read(writer, *target, reader, depth + 1)?)));
                 }
                 let mut values = Vec::new();
                 loop {
                     let count = datum::read_block(reader)?;
                     if count == 0 { break; }
-                    for _ in 0..count { values.push(self.read(*child, &array.items, reader, depth + 1)?); }
+                    for _ in 0..count { values.push(self.read(*child, &array.items, reader, depth + 1, builder)?); }
                 }
-                Ok(Avro::Array(values))
+                Ok(builder.array(values))
             }
             Action::Map { child, strings } => {
                 let Schema::Map(map) = schema else { return Err(invalid()); };
                 let first = datum::read_block(reader)?; let mut count = first; let mut entries = Vec::new();
                 while count != 0 {
-                    for _ in 0..count { entries.push((MapKey::Utf8(datum::read_bytes(reader)?), self.read(*child, &map.types, reader, depth + 1)?)); }
+                    for _ in 0..count { entries.push((MapKey::Utf8(datum::read_bytes(reader)?), self.read(*child, &map.types, reader, depth + 1, builder)?)); }
                     count = datum::read_block(reader)?;
                 }
-                Ok(Avro::Map(AvroMap::new(first, entries, *strings)))
+                Ok(builder.map(first, entries, *strings))
             }
             Action::WriterUnion { branches, equivalent } => {
                 let (index, branch) = branch(schema, reader)?;
-                let value = self.read(*branches.get(index).ok_or_else(invalid)?, branch, reader, depth + 1)?;
-                Ok(if *equivalent { Avro::Union(index as u32, Box::new(value)) } else { value })
+                let value = self.read(*branches.get(index).ok_or_else(invalid)?, branch, reader, depth + 1, builder)?;
+                Ok(if *equivalent { builder.union(index as u32, value) } else { value })
             }
-            Action::ReaderUnion { index, child } => Ok(Avro::Union(*index, Box::new(self.read(*child, schema, reader, depth + 1)?))),
+            Action::ReaderUnion { index, child } => {
+                let value = self.read(*child, schema, reader, depth + 1, builder)?;
+                Ok(builder.union(*index, value))
+            }
         }
     }
 }

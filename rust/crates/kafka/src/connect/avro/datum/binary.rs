@@ -1,3 +1,4 @@
+use super::{BuildDatum, PhysicalBuilder};
 use super::{Avro, AvroDatumPlan, AvroMap, BinaryWindow, MapKey, NumericInput, PackedArray, Preflight, Result, Schema, error, resolve, resolution};
 
 pub(super) fn decode(plan: &AvroDatumPlan, bytes: &[u8]) -> Result<Avro> {
@@ -14,9 +15,58 @@ pub(in crate::connect::avro) fn block(reader: &mut Preflight<'_>) -> Result<usiz
     usize::try_from(count).map_err(|cause| error("avro-decode", cause))
 }
 pub(in crate::connect::avro) fn value(schema: &Schema, reader: &mut Preflight<'_>, depth: usize) -> Result<Avro> {
+    read(schema, reader, depth, &mut PhysicalBuilder)
+}
+
+pub(in crate::connect::avro) fn read<B: BuildDatum>(schema: &Schema, reader: &mut Preflight<'_>, depth: usize, builder: &mut B) -> Result<B::Node> {
     if depth > 128 { return Err(error("avro-decode", "Avro datum nesting limit exceeded")); }
     let names = reader.names;
-    Ok(match resolve(schema, names)? {
+    let schema = resolve(schema, names)?;
+    let value = match schema {
+        Schema::Union(union) => {
+            let index = usize::try_from(reader.int()?).map_err(|cause| error("avro-decode", cause))?;
+            let schema = union.variants().get(index).ok_or_else(|| error("avro-decode", "Union index is out of range"))?;
+            let child = read(schema, reader, depth + 1, builder)?;
+            return Ok(builder.union(index as u32, child));
+        }
+        Schema::Record(record) => {
+            let fields = record.fields.iter().map(|field| Ok((field.name.clone(), read(&field.schema, reader, depth + 1, builder)?))).collect::<Result<_>>()?;
+            return Ok(builder.record(fields));
+        }
+        Schema::Array(array) => {
+            if builder.accepts_packed_arrays()
+                && let Some(layout) = PackedArray::layout(&array.items)
+                && let Some(writer) = NumericInput::from_schema(&array.items) {
+                return Ok(builder.scalar(Avro::PackedArray(PackedArray::read(writer, layout, reader, depth + 1)?)));
+            }
+            let mut values = Vec::new();
+            loop {
+                let count = block(reader)?;
+                if count == 0 { break; }
+                for _ in 0..count { values.push(read(&array.items, reader, depth + 1, builder)?); }
+            }
+            return Ok(builder.array(values));
+        }
+        Schema::Map(map) => {
+            let first = block(reader)?;
+            let mut count = first;
+            let mut entries = Vec::new();
+            while count != 0 {
+                for _ in 0..count {
+                    entries.push((MapKey::Utf8(bytes(reader)?), read(&map.types, reader, depth + 1, builder)?));
+                }
+                count = block(reader)?;
+            }
+            return Ok(builder.map(first, entries, map.attributes.get("avro.java.string").and_then(serde_json::Value::as_str) == Some("String")));
+        }
+        Schema::Decimal(decimal) => return read(&decimal.inner, reader, depth + 1, builder),
+        _ => scalar(schema, reader)?,
+    };
+    Ok(builder.scalar(value))
+}
+
+pub(in crate::connect::avro) fn scalar(schema: &Schema, reader: &mut Preflight<'_>) -> Result<Avro> {
+    Ok(match schema {
         Schema::Null => Avro::Null,
         Schema::Boolean => Avro::Boolean(reader.take(1)?[0] == 1),
         Schema::Int | Schema::Date | Schema::TimeMillis => Avro::Int(reader.int()?),
@@ -27,37 +77,12 @@ pub(in crate::connect::avro) fn value(schema: &Schema, reader: &mut Preflight<'_
         Schema::Bytes | Schema::BigDecimal => Avro::Bytes(bytes(reader)?),
         Schema::Fixed(fixed) => Avro::Fixed(fixed.size, reader.take(fixed.size)?.to_vec()),
         Schema::Duration => Avro::Fixed(12, reader.take(12)?.to_vec()),
-        Schema::Decimal(decimal) => value(&decimal.inner, reader, depth + 1)?,
         Schema::Enum(enumeration) => {
             let index = usize::try_from(reader.int()?).map_err(|cause| error("avro-decode", cause))?;
             let symbol = enumeration.symbols.get(index).ok_or_else(|| error("avro-decode", "Enum index is out of range"))?;
             Avro::Enum(index as u32, symbol.clone())
         }
-        Schema::Union(union) => {
-            let index = usize::try_from(reader.int()?).map_err(|cause| error("avro-decode", cause))?;
-            let schema = union.variants().get(index).ok_or_else(|| error("avro-decode", "Union index is out of range"))?;
-            Avro::Union(index as u32, Box::new(value(schema, reader, depth + 1)?))
-        }
-        Schema::Record(record) => Avro::Record(record.fields.iter().map(|field| Ok((field.name.clone(), value(&field.schema, reader, depth + 1)?))).collect::<Result<_>>()?),
-        Schema::Array(array) => {
-            if let Some(layout) = PackedArray::layout(&array.items)
-                && let Some(writer) = NumericInput::from_schema(&array.items)
-            {
-                return Ok(Avro::PackedArray(PackedArray::read(writer, layout, reader, depth + 1)?));
-            }
-            let mut values = Vec::new();
-            loop { let count = block(reader)?; if count == 0 { break; } for _ in 0..count { values.push(value(&array.items, reader, depth + 1)?); } }
-            Avro::Array(values)
-        }
-        Schema::Map(map) => {
-            let first = block(reader)?; let mut count = first; let mut entries = Vec::new();
-            while count != 0 {
-                for _ in 0..count { entries.push((MapKey::Utf8(bytes(reader)?), value(&map.types, reader, depth + 1)?)); }
-                count = block(reader)?;
-            }
-            Avro::Map(AvroMap::new(first, entries, map.attributes.get("avro.java.string").and_then(serde_json::Value::as_str) == Some("String")))
-        }
-        Schema::Ref { .. } => return Err(error("avro-schema", "Unresolved schema reference")),
+        _ => return Err(error("avro-schema", "Unresolved schema reference")),
     })
 }
 

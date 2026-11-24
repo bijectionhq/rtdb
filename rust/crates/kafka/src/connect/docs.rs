@@ -85,7 +85,7 @@ fn convert_document(value: Value) -> Result<Value> {
         value => value,
     })
 }
-fn convert_with_schema(value: Value, schema: Option<&super::ConnectSchema>) -> Result<Value> { convert_schema_value(value, schema, 0) }
+pub(super) fn convert_with_schema(value: Value, schema: Option<&super::ConnectSchema>) -> Result<Value> { convert_schema_value(value, schema, 0) }
 fn convert_schema_value(value: Value, schema: Option<&super::ConnectSchema>, depth: usize) -> Result<Value> {
     if depth > 128 { return Err(error("conversion-error", "Connect document nesting limit exceeded")); }
     if value == Value::Null { return Ok(Value::Null); }

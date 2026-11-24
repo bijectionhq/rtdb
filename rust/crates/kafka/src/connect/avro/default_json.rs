@@ -6,16 +6,21 @@ use super::error;
 pub(super) use super::super::json_value::JsonValue as DefaultJson;
 use super::super::json_value::RawObject;
 
-impl DefaultJson {
-    fn metadata_value(&self) -> serde_json::Value {
-        match self {
-            Self::Null => serde_json::Value::Null, Self::Boolean(value) => (*value).into(), Self::String(value) => value.clone().into(),
-            Self::Number(value) => serde_json::from_str(value).unwrap_or(serde_json::Value::Null),
-            Self::Decimal(value) => serde_json::from_str(&value.text()).unwrap_or(serde_json::Value::Null),
-            Self::Array(values) => values.iter().map(Self::metadata_value).collect(),
-            Self::Object(values) => serde_json::Value::Object(values.iter().map(|(key, value)| (key.clone(), value.metadata_value())).collect()),
+fn default_metadata(raw: &RawValue, depth: usize) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    if depth > 128 { return Err(error("avro-schema", "Default nesting limit exceeded")); }
+    Ok(match raw.get().as_bytes().first() {
+        Some(b'{') => {
+            let RawObject(fields) = json(raw.get())?;
+            Value::Object(fields.into_iter().map(|(key, value)| {
+                Ok((key, default_metadata(value, depth + 1)?))
+            }).collect::<Result<_>>()?)
         }
-    }
+        Some(b'[') => Value::Array(json::<Vec<&RawValue>>(raw.get())?.into_iter()
+            .map(|value| default_metadata(value, depth + 1)).collect::<Result<_>>()?),
+        Some(b'-' | b'0'..=b'9') => serde_json::from_str(raw.get()).unwrap_or(Value::Null),
+        _ => json(raw.get())?,
+    })
 }
 pub(super) fn field_default_class(value: &DefaultJson, schema: &apache_avro::Schema, names: &BTreeMap<String, apache_avro::Schema>) -> Result<Option<bool>> {
     use apache_avro::Schema;
@@ -23,9 +28,9 @@ pub(super) fn field_default_class(value: &DefaultJson, schema: &apache_avro::Sch
     let schema = if let Schema::Decimal(decimal) = schema { decimal.inner.as_ref() } else { schema };
     if let Schema::Union(union) = schema { return field_default_class(value, union.variants().first().ok_or_else(|| error("avro-schema", "Empty default union"))?, names); }
     Ok(match value {
-        DefaultJson::Number(number) => {
-            if number.contains(['.', 'e', 'E']) { if matches!(schema, Schema::Float | Schema::Double) { Some(true) } else { None } }
-            else if let Ok(value) = number.parse::<i64>() {
+        DefaultJson::Number(_) => {
+            if !value.is_integral() { if matches!(schema, Schema::Float | Schema::Double) { Some(true) } else { None } }
+            else if let Some(value) = value.as_i64() {
                 match schema {
                     Schema::Int | Schema::Date | Schema::TimeMillis => Some(i32::try_from(value).is_ok()),
                     Schema::Long | Schema::TimestampMillis | Schema::Float | Schema::Double => Some(true),
@@ -92,7 +97,7 @@ pub(super) fn metadata_text(text: &str) -> Result<String> {
             Some(b'{') => {
                 let fields: RawObject<'_> = json(raw.get())?;
                 Ok(serde_json::Value::Object(fields.0.into_iter().map(|(key, raw)| {
-                    let value = if key == "default" { DefaultJson::parse(raw, depth + 1)?.metadata_value() } else { value(raw, depth + 1)? };
+                    let value = if key == "default" { default_metadata(raw, depth + 1)? } else { value(raw, depth + 1)? };
                     Ok((key, value))
                 }).collect::<Result<_>>()?))
             }

@@ -10,6 +10,10 @@ mod resolution;
 mod migration;
 mod datum;
 mod output;
+mod projection;
+#[cfg(test)] mod projection_tests;
+mod wire;
+use wire::WireDatum;
 mod default_json;
 mod reader;
 mod names;
@@ -32,7 +36,7 @@ pub(super) struct AvroDatumPlan {
     schema_bytes: usize,
     source: Option<java_schema::AdmittedSource>,
 }
-pub(super) struct AvroPlan { datum: Arc<AvroDatumPlan>, branch: Option<u32>, connect: Arc<ConnectSchema>, charges: Vec<Arc<rtdb_columnar::MemoryReservation>> }
+pub(super) struct AvroPlan { datum: Arc<AvroDatumPlan>, branch: Option<u32>, connect: Arc<ConnectSchema>, projection: projection::Projection, charges: Vec<Arc<rtdb_columnar::MemoryReservation>> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum AvroOutput { Writer, Reader { branch: Option<u32> } }
 impl AvroPlan {
@@ -46,9 +50,11 @@ impl AvroPlan {
     pub fn parse_version_index(text: &str, references: &[String], options: &BTreeMap<String, String>, version: Option<i32>, next_union: &mut i32) -> Result<Self> {
         let datum = Arc::new(AvroDatumPlan::parse(text, references, options)?);
         let connect = datum.build_connect(None, version, next_union)?;
-        Ok(Self { datum, branch: None, connect, charges: Vec::new() })
+        let projection = projection::Projection::compile(&datum.root, &connect, &datum);
+        Ok(Self { datum, branch: None, connect, projection, charges: Vec::new() })
     }
-    pub fn convert(&self, datum: AvroDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
+    #[cfg(test)]
+    pub fn legacy_convert(&self, datum: AvroDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
         self.datum.retain_source(context)?;
         datum.plan.retain_source(context)?;
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
@@ -63,10 +69,35 @@ impl AvroPlan {
         let value = metadata::coerce(convert(self.datum.selected_root(self.branch)?, value, &self.datum.names, self.datum.unions, &self.connect, 0)?, &self.connect)?;
         Ok(ConnectData { schema: Some(Arc::clone(&self.connect)), value })
     }
+    pub fn convert(&self, datum: AvroDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
+        let mut tape = wire::Tape::default();
+        let root = tape.physical(datum.value);
+        self.convert_wire(WireDatum { plan: datum.plan, tape, root }, next_union, context)
+    }
+
+    pub fn convert_wire(&self, mut datum: WireDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
+        self.datum.retain_source(context)?;
+        datum.plan.retain_source(context)?;
+        for charge in &self.charges { context.retain(Arc::clone(charge))?; }
+        let bytes = datum.tape.bound(datum.root, 0)?.checked_mul(self.connect.view_allocation_bound().checked_div(4096).unwrap_or(0).checked_add(2).ok_or_else(resolution::overflow)?).ok_or_else(resolution::overflow)?;
+        context.reserve(bytes)?;
+        let root = if !Arc::ptr_eq(&self.datum, &datum.plan) {
+            context.reserve(datum.plan.schema_bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(resolution::overflow)?)?;
+            output::retarget(&mut datum.tape, self.datum.selected_root(self.branch)?, &datum.plan.root, datum.root, &self.connect, &self.datum, &datum.plan, next_union, context, 0)?
+        } else if self.branch.is_some() {
+            let wire::Node::Union(_, child) = datum.tape.node(datum.root) else { return Err(error("avro-decode", "Selected record output requires union datum")); };
+            *child
+        } else {
+            datum.root
+        };
+        let value = self.projection.project(&mut datum.tape, root)?;
+        Ok(ConnectData { schema: Some(Arc::clone(&self.connect)), value })
+    }
+
     #[cfg(test)]
     pub fn decode(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<ConnectData> {
         self.datum.validate_reader(None)?;
-        self.convert(self.datum.decode_datum(bytes, context)?, &mut 0, context)
+        self.convert_wire(self.datum.decode_wire(bytes, context)?, &mut 0, context)
     }
 }
 /// Java's `Schema.Parser` accepts any reference text, but only named declarations enter the shared name table.
@@ -162,7 +193,8 @@ impl AvroDatumPlan {
         let bytes = self.connect_allocation_bound(branch)?;
         let charge = context.reserve(bytes)?;
         let connect = self.build_connect(branch, version, next_union)?;
-        Ok(AvroPlan { datum: Arc::clone(self), branch, connect, charges: vec![charge] })
+        let projection = projection::Projection::compile(self.selected_root(branch)?, &connect, self);
+        Ok(AvroPlan { datum: Arc::clone(self), branch, connect, projection, charges: vec![charge] })
     }
     fn selected_root(&self, branch: Option<u32>) -> Result<&Schema> {
         match (resolve(&self.root, &self.names)?, branch) {
@@ -210,12 +242,27 @@ impl AvroDatumPlan {
         if !matches!(resolve(reader.selected_root(branch)?, &reader.names)?, Schema::Record(_)) { return Err(error("avro-decode", "Record writer resolved to a non-record output")); }
         Ok(AvroOutput::Reader { branch })
     }
+    pub fn prepare_wire_output(&self, reader: &Self, datum: &WireDatum, context: &mut ConversionContext) -> Result<AvroOutput> {
+        self.retain_source(context)?;
+        reader.retain_source(context)?;
+        datum.plan.retain_source(context)?;
+        if !self.root_record() { return Ok(AvroOutput::Writer); }
+        let branch = match datum.tape.node(datum.root) { wire::Node::Union(tag, _) => Some(*tag), _ => None };
+        if !matches!(resolve(reader.selected_root(branch)?, &reader.names)?, Schema::Record(_)) {
+            return Err(error("avro-decode", "Record writer resolved to a non-record output"));
+        }
+        Ok(AvroOutput::Reader { branch })
+    }
     pub fn prepare_output(&self, reader: &Self, datum: AvroDatum, context: &mut ConversionContext) -> Result<(AvroOutput, AvroDatum)> {
         self.retain_source(context)?;
         reader.retain_source(context)?;
         datum.plan.retain_source(context)?;
         let output = self.select_output(reader, &datum)?;
         Ok((output, datum))
+    }
+    pub fn wire_result(self: &Arc<Self>, mut datum: WireDatum, context: &mut ConversionContext) -> Result<WireDatum> {
+        datum.string_result(self, context)?;
+        Ok(datum)
     }
     pub fn binary_result(self: &Arc<Self>, mut datum: AvroDatum, context: &mut ConversionContext) -> Result<AvroDatum> {
         self.retain_source(context)?;
@@ -401,6 +448,7 @@ impl Preflight<'_> {
         }
     }
 }
+#[cfg(test)]
 fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, unions: graph::UnionOptions, connect: &ConnectSchema, depth: usize) -> Result<Value> {
     if depth > 128 { return Err(error("avro-decode", "Avro datum nesting limit exceeded")); }
     let schema = resolve(schema, names)?;
@@ -496,8 +544,11 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
     Ok(converted)
 }
 fn decimal_value(bytes: Vec<u8>, schema: &ConnectSchema) -> Result<Value> {
+    decimal_value_with_scale(bytes, schema.parameters.get("scale").map(String::as_str))
+}
+fn decimal_value_with_scale(bytes: Vec<u8>, scale: Option<&str>) -> Result<Value> {
     if bytes.is_empty() { return Err(error("avro-decode", "Decimal coefficient bytes are empty")); }
-    let text = schema.parameters.get("scale").ok_or_else(|| error("avro-decode", "Decimal schema has no scale"))?;
+    let text = scale.ok_or_else(|| error("avro-decode", "Decimal schema has no scale"))?;
     let (negative, digits) = if let Some(digits) = text.strip_prefix('-') { (true, digits) } else { (false, text.strip_prefix('+').unwrap_or(text)) };
     let invalid = || error("avro-decode", "Decimal scale is not a signed 32-bit integer");
     if digits.is_empty() { return Err(invalid()); }

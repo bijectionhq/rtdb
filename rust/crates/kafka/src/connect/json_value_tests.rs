@@ -66,3 +66,33 @@ fn registry_decimal_nodes_keep_scale_narrow_without_double_rounding_and_compare_
     assert_ne!(parse("1.0").unwrap(), JsonValue::from_str("1.0").unwrap());
     assert_eq!(parse("18014399583223809.0").unwrap().float_value().unwrap().to_bits(), 0x5a800001);
 }
+
+#[test]
+fn f5_single_pass_json_matches_record_corpus() {
+    let examples = [
+        r#"{"nested":[[],{"mix":[-0,-0.0,1e7,18446744073709551617,18014399583223809,1.00]}],"nested":[true,null,2]}"#,
+        r#"{"escaped\u0020key":"\uD83D\uDE00","$serde_json::private::Number":"literal","a":1,"\u0061":2}"#,
+        r#"{"a":1e2147483649,"a":1,"b":-1e-2147483648,"b":null}"#,
+        r#"{"a":"\ud800","a":"valid"}"#,
+        r#"[0,1.0,-0.0,-1e-9999,1e9999,1e-2147483647,1e2147483648,-18446744073709551617,null]"#,
+        r#"[1,]"#,
+        r#"{"a":01}"#,
+        r#"{"a":"\ud800"}"#,
+        r#"{"a":1} false"#,
+    ];
+    for mode in [NumberMode::Double, NumberMode::Decimal] {
+        for text in examples {
+            let actual = JsonValue::from_slice_mode(text.as_bytes(), mode);
+            let legacy = JsonValue::diagnostic_parse(text.as_bytes(), mode);
+            match (actual, legacy) {
+                (Ok(actual), Ok(legacy)) => {
+                    assert_eq!(actual, legacy, "{text}");
+                    assert_eq!(actual.to_vec().unwrap(), legacy.to_vec().unwrap(), "{text}");
+                    assert_eq!(actual.encoded_bound().unwrap(), legacy.encoded_bound().unwrap(), "{text}");
+                }
+                (Err(actual), Err(legacy)) => assert_eq!((actual.code, actual.message), (legacy.code, legacy.message), "{text}"),
+                (actual, legacy) => panic!("{text}: {actual:?} differs from {legacy:?}"),
+            }
+        }
+    }
+}
