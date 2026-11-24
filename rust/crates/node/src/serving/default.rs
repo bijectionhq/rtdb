@@ -39,10 +39,10 @@ impl DefaultServing {
     ) -> Result<Snapshot> {
         use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 
-        let spatial = || branch.tables().flat_map(|(table, definition)| definition.ranked_indexes.iter()
-            .filter(|(_, index)| matches!(&index.definition.kind, RankedIndexKind::Spatial { .. }))
+        let indexes = || branch.tables().flat_map(|(table, definition)| definition.ranked_indexes.iter()
+            .filter(|(_, index)| !matches!(&index.definition.kind, RankedIndexKind::Search { .. }))
             .map(move |(name, declaration)| (table, name, declaration)));
-        let count = spatial().count();
+        let count = indexes().count();
         if count == 0 {
             return rtdb_query::branch_snapshot(branch, &self.memory);
         }
@@ -60,8 +60,13 @@ impl DefaultServing {
             "UTC", QueryOptions::default(), cancellation)?;
         let _ready = self.memory.reserve(count.saturating_mul(128))?;
         let mut ready = BTreeSet::new();
-        for (table, name, declaration) in spatial() {
-            match rtdb_spatial::committed_native_ready(Arc::clone(&context), table, name, declaration).await {
+        for (table, name, declaration) in indexes() {
+            let verified = match &declaration.definition.kind {
+                RankedIndexKind::Spatial { .. } => rtdb_spatial::committed_native_ready(Arc::clone(&context), table, name, declaration).await,
+                RankedIndexKind::Ivf { .. } => rtdb_vector::committed_native_ready(Arc::clone(&context), table, name, declaration).await,
+                RankedIndexKind::Search { .. } => continue,
+            };
+            match verified {
                 Ok(true) => { ready.insert(name.as_str()); }
                 Ok(false) => {}
                 Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),

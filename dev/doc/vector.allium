@@ -35,6 +35,9 @@ entity ProbePlan {
 -- IVF is the only method.
 -- An owned Root relation declares its approximate vector path with `rtdb.owned.DeclareVectorPath.v1` in the principal's `.vector-paths` catalog, with the same fields; its partition is the relation.
 -- The method name and the generation file layout participate in every artefact address.
+-- The Default shared-main projection supplies native IVF declarations to the existing generation writer.
+-- Native readiness at the installed exact cut reopens every current-trie file for the declared generation and validates its directory and clusters.
+-- The permitted exact SQL route reports approximate false.
 -- COSINE_DISTANCE_F32 evaluates equal-dimension float32 vectors in component order with binary64 products and sums.
 -- A zero vector has no distance, and a zero probe is invalid.
 -- A bounded exact Query can select the effective filtered corpus before ranking, including replacements and tombstones staged by the caller.

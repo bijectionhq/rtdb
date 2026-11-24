@@ -6,7 +6,7 @@ use arrow_array::{Float32Array, Float64Array, RecordBatch};
 use rtdb_columnar::{ArrowCell, MemoryBudget, read_execution_value};
 use rtdb_index::Snapshot;
 use rtdb_maintenance::ArtefactDefinition;
-use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, Instant, ListKind, LogicalType, Result, ScalarType, TableRef, Value};
 use tokio_util::sync::CancellationToken;
@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 pub const KIND: &str = "vector";
 /// The catalog relation holding vector index definitions (vector.allium: VectorIndexDefinition).
 pub const DEFINITIONS: (&str, &str) = ("xt", "vector_indexes");
+const NATIVE_DEFINITIONS: &str = "SELECT index_name || '~native' AS name, schema_name, table_name, column_name,
+    partition_columns, dimensions, method, recall, version FROM xt.native_vector_builds";
 /// The generation file layout; it participates in every artefact address.
 pub(crate) const FILE_VERSION: u32 = 1;
 
@@ -93,7 +95,48 @@ pub async fn definitions_in(
     let context = QueryContext::new(catalog, Arc::clone(&memory), now, "UTC", QueryOptions::default(), cancellation)?;
     let sql = "SELECT _id, schema_name, table_name, column_name, partition_columns, dimensions, method, recall, version FROM xt.vector_indexes";
     let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory)?;
-    let mut cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, Vec::new()).await?;
+    let cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, Vec::new()).await?;
+    collect_sql(cursor).await
+}
+
+pub(crate) async fn native_definitions_in(
+    database: &str, snapshot: Snapshot, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, now: impl Into<Instant>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<VectorDefinition>> {
+    let catalog = CatalogSnapshot::new(database, BTreeMap::from([(
+        database.to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage },
+    )]), false)?;
+    let context = QueryContext::new(catalog, memory, now, "UTC", QueryOptions::default(), cancellation)?;
+    native_definitions(context, None).await
+}
+
+pub(crate) async fn committed_native_definition(
+    context: Arc<QueryContext>, table: &TableRef, name: &str,
+) -> Result<Option<VectorDefinition>> {
+    let id = rtdb_types::rtdb_v1::ranked_build_id(table, name);
+    let mut definitions = native_definitions(context, Some(id)).await?;
+    Ok(definitions.pop().filter(|definition| definitions.is_empty()
+        && &definition.table == table && definition.name == format!("{name}~native")))
+}
+
+async fn native_definitions(context: Arc<QueryContext>, id: Option<String>) -> Result<Vec<VectorDefinition>> {
+    let table = TableRef::new("xt", rtdb_types::rtdb_v1::VECTOR_BUILD_CATALOG);
+    if !context.catalog.database(context.catalog.default_database())?.partitions.iter()
+        .any(|snapshot| snapshot.contains_table(&table))
+    {
+        return Ok(Vec::new());
+    }
+    let (sql, arguments) = match id {
+        Some(id) => (Cow::Owned(format!("{NATIVE_DEFINITIONS} WHERE _id = $1")), vec![Value::Utf8(id)]),
+        None => (Cow::Borrowed(NATIVE_DEFINITIONS), Vec::new()),
+    };
+    let memory = Arc::clone(&context.memory);
+    let prepared = rtdb_sql::prepare_in(&sql, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory)?;
+    let cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, arguments).await?;
+    collect_sql(cursor).await
+}
+
+async fn collect_sql(mut cursor: QueryCursor) -> Result<Vec<VectorDefinition>> {
     let mut definitions = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();

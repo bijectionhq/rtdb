@@ -18,6 +18,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::ipc::{UncompressedBuffer, write_uncompressed_stream_from_buffers};
+use rtdb_storage::cache::CacheLease;
 use rtdb_types::{Anomaly, Iid, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -80,6 +81,30 @@ impl Locator {
     }
 
     pub(crate) fn directory_range(&self) -> Range<u64> { self.directory.0..self.directory.0.saturating_add(self.directory.1) }
+}
+
+pub(crate) fn verify_generation(
+    bytes: CacheLease, locator: &Locator, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<()> {
+    let index = |offset| usize::try_from(offset).map_err(|_| corrupt("Vector generation range exceeds addressable memory"));
+    let start = index(locator.directory.0)?;
+    let length = index(locator.directory.1)?;
+    let end = start.checked_add(length).ok_or_else(|| corrupt("Vector directory range overflow"))?;
+    if bytes.as_slice().get(end..) != Some(footer(locator.directory.0, locator.directory.1, locator.dimensions).as_slice()) {
+        return Err(corrupt("The persisted vector footer does not match its catalogue locator"));
+    }
+    let directory = Directory::read(bytes.slice(start..end)?, locator, memory)?;
+    let mut previous_end = 0;
+    for row in 0..directory.len() {
+        if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
+        let cluster = directory.cluster(row);
+        if cluster.range.start < previous_end { return Err(corrupt("Vector cluster ranges overlap or are out of order")); }
+        previous_end = cluster.range.end;
+        let from = index(cluster.range.start)?;
+        let to = index(cluster.range.end)?;
+        Block::read(bytes.slice(from..to)?, &cluster, directory.dimensions, memory)?;
+    }
+    Ok(())
 }
 
 fn footer(offset: u64, length: u64, dimensions: u32) -> [u8; FOOTER_BYTES] {
@@ -479,6 +504,34 @@ mod tests {
             rows.push_unit(header, partition, &[angle.cos() as f32, angle.sin() as f32]);
         }
         rows
+    }
+
+    #[tokio::test]
+    async fn native_readiness_requires_the_persisted_footer_and_every_cluster() {
+        let cancellation = CancellationToken::new();
+        let memory = MemoryBudget::new(1 << 20);
+        let store = Arc::new(MemoryStore::default());
+        let pool = BufferPool::new(Arc::clone(&store) as Arc<dyn ObjectStore>, 1 << 20);
+        let mut generation = Vec::new();
+        let written = write_generation(rows(0..16), &mut generation, &cancellation).unwrap();
+        let length = generation.len();
+        let key = ObjectKey::new("ready-vector").unwrap();
+        store.put(&key, Bytes::from(generation.clone())).await.unwrap();
+        let bytes = pool.get_fresh_exact_or(&key, length, &memory).await.unwrap();
+        verify_generation(bytes, &written.locator, &memory, &cancellation).unwrap();
+        for (name, offset) in [("bad-cluster", 0), ("bad-footer", length - 1)] {
+            let key = ObjectKey::new(name).unwrap();
+            let mut altered = generation.clone();
+            altered[offset] ^= 1;
+            store.put(&key, Bytes::from(altered)).await.unwrap();
+            let bytes = pool.get_fresh_exact_or(&key, length, &memory).await.unwrap();
+            assert_eq!(verify_generation(bytes, &written.locator, &memory, &cancellation).unwrap_err().code,
+                "rtdb.vector/corrupt-generation");
+        }
+        let bytes = pool.get_exact_cached_or(&key, length, &memory).await.unwrap();
+        store.delete(&key).await.unwrap();
+        assert!(pool.get_fresh_exact_or(&key, length, &memory).await.is_err());
+        assert_eq!(bytes.as_slice().len(), length);
     }
 
     #[test]

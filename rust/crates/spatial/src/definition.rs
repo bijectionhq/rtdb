@@ -93,7 +93,7 @@ pub(crate) async fn definitions(
 pub(crate) async fn committed_native_definition(
     context: Arc<QueryContext>, table: &TableRef, name: &str,
 ) -> Result<Option<Definition>> {
-    let id = rtdb_types::rtdb_v1::spatial_build_id(table, name);
+    let id = rtdb_types::rtdb_v1::ranked_build_id(table, name);
     let Some(cursor) = rtdb_query::open_native_spatial_builds(context, Some(&id)).await? else { return Ok(None); };
     let mut definitions = collect(cursor, None).await?;
     Ok(definitions.pop().filter(|definition| definitions.is_empty() && &definition.table == table
@@ -167,7 +167,7 @@ async fn collect(mut cursor: QueryCursor, owned_catalog: Option<&TableRef>) -> R
             if !(1..=16).contains(&columns.len())
                 || owned_catalog.is_some_and(|catalog| !catalog.owns_path_target(&table))
                 || (owned_catalog.is_none()
-                    && text("_id")? != rtdb_types::rtdb_v1::spatial_build_id(&table, text("index_name")?))
+                    && text("_id")? != rtdb_types::rtdb_v1::ranked_build_id(&table, text("index_name")?))
             {
                 return Err(malformed());
             }

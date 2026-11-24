@@ -6,7 +6,7 @@ use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut,
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
-    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SPATIAL_BUILD_CATALOG, spatial_build_id}};
+    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SPATIAL_BUILD_CATALOG, VECTOR_BUILD_CATALOG, ranked_build_id}};
 use tokio_util::sync::CancellationToken;
 
 pub(super) fn data_table(table: &TableRef) -> bool {
@@ -173,45 +173,63 @@ pub(crate) fn stage_source(snapshot: Snapshot, prior: &BranchIndex, source: Sour
             _ => (),
         }
     }
-    stage_spatial_builds(prior, effects, &mut buffer, memory)?;
+    stage_ranked_builds(prior, effects, &mut buffer, memory)?;
     buffer.stage()
 }
 
-fn stage_spatial_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &mut TransactionBuffer, memory: &Arc<MemoryBudget>) -> Result<()> {
+fn stage_ranked_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &mut TransactionBuffer, memory: &Arc<MemoryBudget>) -> Result<()> {
     let declarations = effects.iter().filter_map(|effect| match effect {
         BranchEffect::Declare { table, definition } if data_table(table) => Some((table, definition)),
         _ => None,
     });
     let _scratch = memory.reserve(declarations.clone().count().saturating_mul(128))?;
     let final_tables: BTreeMap<_, _> = declarations.collect();
-    let catalog = TableRef::new("xt", SPATIAL_BUILD_CATALOG);
+    let catalog = |kind: &RankedIndexKind| match kind {
+        RankedIndexKind::Search { .. } => None,
+        RankedIndexKind::Spatial { .. } => Some(SPATIAL_BUILD_CATALOG),
+        RankedIndexKind::Ivf { .. } => Some(VECTOR_BUILD_CATALOG),
+    };
     for (table, final_definition) in final_tables {
         let old = prior.definition(table, prior.head().basis).filter(|definition| !definition.dropped);
         let final_indexes = &final_definition.ranked_indexes;
-        let id = |name: &str| spatial_build_id(table, name);
+        let id = |name: &str| ranked_build_id(table, name);
         if let Some(old) = old {
             for (name, declaration) in &old.ranked_indexes {
-                if matches!(&declaration.definition.kind, RankedIndexKind::Spatial { .. })
-                    && !final_indexes.get(name).is_some_and(|index| matches!(&index.definition.kind, RankedIndexKind::Spatial { .. }))
+                if let Some(catalog_name) = catalog(&declaration.definition.kind)
+                    && final_indexes.get(name).and_then(|index| catalog(&index.definition.kind)) != Some(catalog_name)
                 {
-                    buffer.delete(catalog.clone(), &EntityId::String(id(name)), Interval::ALL)?;
+                    buffer.delete(TableRef::new("xt", catalog_name), &EntityId::String(id(name)), Interval::ALL)?;
                 }
             }
         }
         for (name, declaration) in final_indexes {
-            let RankedIndexKind::Spatial { geometry_encoding } = &declaration.definition.kind else { continue; };
+            let Some(catalog) = catalog(&declaration.definition.kind) else { continue; };
             if old.and_then(|old| old.ranked_indexes.get(name)) == Some(declaration) { continue; }
             let Ok(generation) = i64::try_from(declaration.position) else { continue; };
-            let row = StructFields::from([
+            let mut row = StructFields::from([
                 ("_id".into(), Value::Utf8(id(name))),
                 ("index_name".into(), Value::Utf8(name.clone())),
                 ("schema_name".into(), Value::Utf8(table.schema.clone())),
                 ("table_name".into(), Value::Utf8(table.table.clone())),
-                ("columns".into(), Value::list(declaration.definition.columns.iter().cloned().map(Value::Utf8).collect())),
-                ("geometry_encoding".into(), Value::Utf8(geometry_encoding.clone())),
                 ("version".into(), Value::I64(generation)),
             ]);
-            buffer.put(catalog.clone(), row, Interval::ALL)?;
+            let columns = &declaration.definition.columns;
+            match &declaration.definition.kind {
+                RankedIndexKind::Spatial { geometry_encoding } => {
+                    row.insert("columns".into(), Value::list(columns.iter().cloned().map(Value::Utf8).collect()));
+                    row.insert("geometry_encoding".into(), Value::Utf8(geometry_encoding.clone()));
+                }
+                RankedIndexKind::Ivf { dimensions, recall_bits } => {
+                    let Some((column, partition)) = columns.split_first() else { continue; };
+                    row.insert("column_name".into(), Value::Utf8(column.clone()));
+                    row.insert("partition_columns".into(), Value::list(partition.iter().cloned().map(Value::Utf8).collect()));
+                    row.insert("dimensions".into(), Value::I64(i64::from(*dimensions)));
+                    row.insert("method".into(), Value::Utf8("ivf".into()));
+                    row.insert("recall".into(), Value::F64(f64::from_bits(*recall_bits)));
+                }
+                RankedIndexKind::Search { .. } => continue,
+            }
+            buffer.put(TableRef::new("xt", catalog), row, Interval::ALL)?;
         }
     }
     Ok(())

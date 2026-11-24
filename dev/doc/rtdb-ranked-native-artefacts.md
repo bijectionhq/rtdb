@@ -13,6 +13,16 @@ Native definitions use a distinct artefact identifier within that owner.
 Dropping the table withdraws the projected definition through the same ordered path.
 Retained declarations that predate the projection need replay of their ordered declaration or a writer-authorized backfill.
 
+## IVF build and readback
+
+The same ordered projection stages IVF definitions in `xt.native_vector_builds`.
+The existing generation writer uses the exact value column, ordered equality partitions, dimensions, recall, and original native declaration position.
+Native generations keep a distinct artefact identity under each current trie and retain the main writer's funded component spans and IPC ownership.
+For physical readiness the checker requires each selected current trie's persisted generation.
+It reopens the immutable object, checks the footer and directory against the recorded locator, and uses the funded decoder to verify every indexed cluster.
+The check reports current-trie generation coverage.
+The native v1 query still uses the exact SQL route until a mounted shortlist reader can report the realized method for that query.
+
 ## Readiness dependencies
 
 The native Default read builds its SQL snapshot from the selected branch fold.
@@ -23,7 +33,7 @@ The checker verifies the file length, digest, and Arrow layout within the existi
 An empty persisted inventory, a live tail, missing or invalid objects, unmatched cuts, and routes without this association report false.
 
 Multi's committed view returns the native fold and key generation, and the native query snapshot constructs its own live rows.
-Multi needs a committed primary catalogue and an artefact publication under its existing writer and storage authority before the same spatial proof can be made.
+Multi needs a committed primary catalogue and an artefact publication under its existing writer and storage authority before the same spatial or IVF proof can be made.
 The reader needs the associated storage generation and a retained read on the selected catalogue.
 
 Negotiate `query.ranked-artefact-readiness` and set `verify_ranked_artefacts = true` (QueryRequest field 10) along with the clear exact-cut guard and tracking.

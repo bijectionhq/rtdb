@@ -31,6 +31,8 @@ impl Builder {
             Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
         definitions.extend(definition::owned_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
             Arc::clone(&database.memory), (database.clock)(), cancellation).await?);
+        definitions.extend(definition::native_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
+            Arc::clone(&database.memory), (database.clock)(), cancellation).await?);
         Ok(definitions)
     }
 }

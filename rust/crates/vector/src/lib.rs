@@ -9,12 +9,14 @@ mod file;
 mod kmeans;
 mod lane;
 mod probe;
+mod readiness;
 mod shortlist;
 mod rows;
 
 pub use accelerate::{PREDICATE, VectorAccelerator};
 pub use definition::{Approximate, DEFINITIONS, KIND, Method, VectorDefinition, definitions_in, owned_definition};
 pub use lane::VectorArtefacts;
+pub use readiness::committed_native_ready;
 pub use rows::Partition;
 pub use shortlist::{Budget, Cut, Round, Shortlist, declined};
 
