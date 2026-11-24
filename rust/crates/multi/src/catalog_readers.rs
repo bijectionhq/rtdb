@@ -293,7 +293,7 @@ impl CatalogReaders {
         }
         record.catalog_readers.insert(reader, CatalogReader {
             owner: self.owner, storage_root: self.storage_root.clone(), replica_epoch: self.replica_epoch.0, cut,
-            catalog_file_paths: paths.map(<[String]>::to_vec),
+            catalog_file_paths: paths.map(|paths| rtdb_types::CatalogFilePaths { members: paths.to_vec() }),
         });
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::{Error as ProviderError, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, CatalogFilePaths, Result};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -15,7 +15,7 @@ type CatalogHolds = BTreeMap<Uuid, CatalogHold>;
 #[serde(deny_unknown_fields)]
 struct CatalogHold {
     cut: Option<CatalogCut>,
-    catalog_file_paths: Option<Vec<String>>,
+    catalog_file_paths: Option<CatalogFilePaths>,
 }
 
 impl CatalogHold {
@@ -55,7 +55,7 @@ impl CatalogLedger {
                 && paths.iter().all(|path| rtdb_format::keys::is_catalog_retirement_file(path))
                 && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
                     <= rtdb_types::CATALOG_FILE_PATH_BYTES
-        }).map(<[String]>::to_vec) };
+        }).map(|paths| CatalogFilePaths { members: paths.to_vec() }) };
         let admission: IoAdmission = io.admit_read(self.clone(), self.key.clone())?;
         let ledger = Arc::clone(self);
         let (answer, result) = oneshot::channel();

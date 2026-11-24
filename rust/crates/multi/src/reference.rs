@@ -265,7 +265,7 @@ impl ReferencingStore {
         self
     }
 
-    async fn read<T>(&self, key: &ObjectKey, read: impl for<'a> Fn(&'a dyn ObjectStore, &'a ObjectKey) -> BoxFuture<'a, rtdb_storage::Result<T>>) -> rtdb_storage::Result<T> {
+    async fn read<T>(&self, key: &ObjectKey, read: impl for<'a> Fn(&'a dyn ObjectStore, &'a ObjectKey) -> BoxFuture<'a, rtdb_storage::Result<T>> + Send + Sync) -> rtdb_storage::Result<T> {
         let own = read(self.own.as_ref(), key).await;
         if !matches!(own, Err(Error::MissingObject(_))) { return own; }
         let Some(owner) = self.base.objects.get(key.as_str()) else { return own; };

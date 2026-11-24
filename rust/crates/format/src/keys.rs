@@ -123,9 +123,17 @@ pub fn is_compacted_primary_file(key: &str) -> bool {
         .is_some_and(|trie| trie.level() > 0)
 }
 
+/// A primary file or recorded artefact owned by one compacted trie.
+pub fn is_compacted_catalog_file(key: &str) -> bool {
+    if is_compacted_primary_file(key) { return true; }
+    let Some((slug, _)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
+    TableSlug::recorded(slug).ok().and_then(|slug| slug.parse_artefact_key(key))
+        .is_some_and(|(owner, _, _, _)| matches!(owner, ArtefactOwner::Trie(trie) if trie.level() > 0))
+}
+
 /// Serving catalog paths covered by the bounded exact reader inventory.
 pub fn is_catalog_retirement_file(key: &str) -> bool {
-    is_compacted_primary_file(key) || crate::search_manifest::is_run_key(key)
+    is_compacted_catalog_file(key) || crate::search_manifest::is_run_key(key)
 }
 
 /// The data and metadata objects of an engine receipt table.
@@ -455,4 +463,16 @@ pub fn oversized_block_index(key: &str) -> Option<BlockIndex> {
     let (index, payload) = name.split_once('-')?;
     if payload.is_empty() { return None; }
     signed_position(index).ok().map(BlockIndex)
+}
+
+#[cfg(test)]
+mod catalog_retirement_tests {
+    use super::*;
+
+    #[test]
+    fn compacted_artifact_scope_covers_only_its_recorded_trie() {
+        assert!(is_compacted_catalog_file("tables/docs/artefacts/l01-rc-b00/search/docs-v1.bin"));
+        assert!(!is_compacted_catalog_file("tables/docs/artefacts/l00-rc-b00/search/docs-v1.bin"));
+        assert!(!is_compacted_catalog_file("tables/docs/artefacts/packs/pack~l02-rc-p0-b00~l02-rc-p1-b00/search/docs-v1.bin"));
+    }
 }

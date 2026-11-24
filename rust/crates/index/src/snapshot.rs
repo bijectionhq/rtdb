@@ -62,7 +62,7 @@ impl Snapshot {
     /// Returns the conservative installed prefix captured with this physical catalog.
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
-    /// Complete paths for live compacted primaries and published search runs.
+    /// Complete paths for compacted primaries and their recorded artefacts, and published search runs.
     /// A claim exceeding the bound retains the conservative scope.
     pub fn catalog_file_paths(&self) -> Option<Arc<[String]>> {
         let mut paths = Vec::new();
@@ -75,9 +75,19 @@ impl Snapshot {
         };
         for table in self.trie_catalog.tables() {
             let entry = self.table_catalog.entry(table)?;
-            for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0 && trie.state == TrieState::Live) {
-                retain(entry.slug.data_key(&trie.key))?;
-                retain(entry.slug.metadata_key(&trie.key))?;
+            for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0) {
+                if trie.state == TrieState::Live {
+                    retain(entry.slug.data_key(&trie.key))?;
+                    retain(entry.slug.metadata_key(&trie.key))?;
+                }
+                for record in &trie.artefacts {
+                    if !matches!(rtdb_format::keys::ArtefactOwner::of(&trie.key, record).ok()?,
+                        rtdb_format::keys::ArtefactOwner::Trie(_))
+                    {
+                        continue;
+                    }
+                    retain(entry.slug.recorded_artefact_key(&trie.key, record).ok()?)?;
+                }
             }
             for run in self.trie_catalog.search_runs(table) {
                 retain(run.object_key(&entry.slug).ok()?)?;

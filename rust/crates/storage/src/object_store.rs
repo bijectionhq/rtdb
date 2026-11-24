@@ -192,7 +192,7 @@ pub trait ObjectStore: Send + Sync {
             None => self.retain_catalog(Some(cut)).await,
         }
     }
-    /// Registers the complete compacted primary and published search paths of the captured catalog.
+    /// Registers the complete collectable file paths of the captured catalog.
     async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)
         -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.retain_catalog(cut).await
@@ -212,7 +212,7 @@ pub trait ObjectStore: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
     /// Closes stale catalog admissions and checks current holds for each Classic candidate.
-    /// A path is supplied only when the installed receipt identifies an immutable compacted file.
+    /// A path is supplied only when the installed receipt identifies an immutable file of a compacted trie.
     async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
         Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()])
     }

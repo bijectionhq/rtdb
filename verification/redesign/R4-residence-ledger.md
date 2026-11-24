@@ -140,7 +140,8 @@ Existing executions keep their independent registrations through provider and de
 An abandoned ticket without drain evidence remains in the ledger.
 Independent maintenance and complete recovery-root retention still require custody and settlement integration.
 
-A bounded serving catalog claim records live compacted primaries and the immutable files selected by its active search runs.
+A bounded serving catalog claim records live compacted primaries, artefacts recorded on each compacted trie, and the immutable files selected by its active search runs.
+The versioned Classic S3 and hosted owners accept exact witnessed trie-owned artefacts from installed trie retirement receipts. A claim for a former catalog can omit an unrelated artefact and does not block its grant.
 Hosted search retirement submits an installed retired run directly to the exact storage owner.
 An opaque or oversized claim keeps the conservative scope. Search staging and uncoordinated readers still need their separate retirement paths.
 

@@ -1293,7 +1293,7 @@ impl ObjectStore for GarbageStore {
         files.sort_by_key(|file| file.release_order());
         let paths = files.iter().map(|file| {
             let exact = file.terminal_publication.is_some() || file.matches_publication && file.version.is_some();
-            (exact && rtdb_format::keys::is_compacted_primary_file(&file.key)).then_some(file.key.as_str())
+            (exact && rtdb_format::keys::is_compacted_catalog_file(&file.key)).then_some(file.key.as_str())
         }).collect::<Vec<_>>();
         let (floor, allowed) = readers.close_admission(installed.cut(), &paths).await?;
         for (file, allowed) in files.into_iter().zip(&allowed) {

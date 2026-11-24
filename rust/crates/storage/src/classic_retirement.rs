@@ -3,7 +3,7 @@ use std::{fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::Arc};
 use fs2::FileExt;
 
 use bytes::Bytes;
-use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
+use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_catalog_file, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
@@ -47,7 +47,7 @@ impl<'a> TrieDeletionGrant<'a> {
         } else { None };
 
         let exact_paths = files.iter().map(|(key, version)| {
-            (version.is_some() && is_compacted_primary_file(key.as_str())).then_some(key.as_str())
+            (version.is_some() && is_compacted_catalog_file(key.as_str())).then_some(key.as_str())
         }).collect::<Vec<_>>();
         let permitted = store.close_classic_trie_admission(installed.cut(), &exact_paths).await?;
         if permitted.len() != files.len() {

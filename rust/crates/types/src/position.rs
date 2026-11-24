@@ -35,6 +35,20 @@ pub struct CatalogCheckpoint {
 /// Maximum charge of an inline catalog file claim.
 pub const CATALOG_FILE_PATH_BYTES: usize = 4096;
 
+/// Complete bounded claims for the independently collectable files named by a catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogFilePaths {
+    pub members: Vec<String>,
+}
+
+impl std::ops::Deref for CatalogFilePaths {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] { &self.members }
+}
+
+
 /// Identifies the provider namespace within which object versions are meaningful.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3ObjectNamespace {
