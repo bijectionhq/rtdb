@@ -222,6 +222,49 @@ fn extension_layout_error(name: &str) -> Anomaly {
     Anomaly::incorrect("rtdb/extension-storage-type", format!("Arrow storage type disagrees with extension {name}"))
 }
 
+pub(crate) fn numeric_field_matches(field: &Field, logical: &LogicalType) -> Result<bool> {
+    let DataType::Union(fields, UnionMode::Dense) = field.data_type() else {
+        let ty = plain_field_type(field)?;
+        return Ok(if field.is_nullable() && ty != LogicalType::Null {
+            matches!(logical, LogicalType::Maybe(inner) if **inner == ty)
+        } else {
+            *logical == ty
+        });
+    };
+    let (value, nullable) = match logical {
+        LogicalType::Null => (None, true),
+        LogicalType::Maybe(inner) => (Some(inner.as_ref()), true),
+        LogicalType::Union(legs) => {
+            let nullable = legs.contains(&LogicalType::Null);
+            if legs.len() - usize::from(nullable) < 2 { return Ok(false); }
+            (None, nullable)
+        }
+        ty => (Some(ty), false),
+    };
+    let mut seen_null = field.is_nullable() || fields.is_empty();
+    let mut seen = [false; 129];
+    let mut distinct = 0;
+    for (_, child) in fields.iter() {
+        let ty = plain_field_type(child)?;
+        seen_null |= child.is_nullable();
+        if ty == LogicalType::Null { continue; }
+        let index = match logical {
+            LogicalType::Union(legs) => legs.get_index_of(&ty),
+            _ => (value == Some(&ty)).then_some(0),
+        };
+        let Some(present) = index.and_then(|index| seen.get_mut(index)) else { return Ok(false); };
+        if !*present {
+            *present = true;
+            distinct += 1;
+        }
+    }
+    let expected = match logical {
+        LogicalType::Union(legs) => legs.len() - usize::from(nullable),
+        _ => usize::from(value.is_some()),
+    };
+    Ok(nullable == seen_null && distinct == expected)
+}
+
 fn plain_field_type(field: &Field) -> Result<LogicalType> {
     use DataType::*;
     let scalar = match field.data_type() {

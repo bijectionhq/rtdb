@@ -26,6 +26,22 @@ async fn query(source: &str,arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
     result
 }
 
+#[tokio::test]
+async fn hot_expression_sql_array_literals_preserve_bits_nulls_and_demand_order() {
+    let rows = query("SELECT ARRAY[1, -0.0, NULL], COSINE_DISTANCE(ARRAY[v, 0], ARRAY[1, 0]) FROM (VALUES (1), (-1)) AS t(v) ORDER BY v DESC", vec![]).await.unwrap();
+    for (row, score) in rows.iter().zip([0.0, 2.0]) {
+        let list = row[0].list_view().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.get(0).unwrap().as_ref(), &V::I64(1));
+        let V::F64(zero) = *list.get(1).unwrap() else { panic!("expected a double"); };
+        assert_eq!(zero.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(list.get(2).unwrap().as_ref(), &V::Null);
+        assert_eq!(row[1], V::F64(score));
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(query("SELECT CARDINALITY(ARRAY[1, 1 / 0])", vec![]).await.unwrap(), [vec![V::I32(2)]]);
+    assert_eq!(query("SELECT COSINE_DISTANCE(ARRAY[1, 1 / 0], ARRAY[1])", vec![]).await.unwrap_err().code, "xtdb.expression/division-by-zero");
+}
 
 #[tokio::test]
 async fn prepared_parameter_types_preserve_scalar_control_and_case_boxing() {

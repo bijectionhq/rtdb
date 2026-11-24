@@ -1,8 +1,8 @@
 use rtdb_types::StructFields;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use rtdb_columnar::MemoryBudget;
-use rtdb_expr::{EvalContext,EvaluationScope,evaluate,evaluate_async,function_type};
-use rtdb_plan::{BinaryOp,CastTarget,Expr,Schema,UnaryOp};
+use rtdb_expr::{EvalContext,EvaluationScope,ExpressionInvocation,ExpressionRow,ParameterLookup,Parameters,RowInput,evaluate,evaluate_async,function_type};
+use rtdb_plan::{BinaryOp,CastTarget,ColumnId,Expr,Field,Schema,UnaryOp};
 use rtdb_types::{CivilDate,DateUnit,LogicalType,ScalarType,TimeUnit,Value};
 
 fn call(name: &str,args: Vec<Expr>) -> Expr {
@@ -16,6 +16,109 @@ fn text(expr: Expr) -> Expr { Expr::Cast { expr: Box::new(expr),target: CastTarg
 fn field(expr: Expr,name: &str) -> Expr { let data_type = match expr.data_type() { LogicalType::Struct(fields) => fields[name].clone(),_ => panic!() };Expr::Field { expr: Box::new(expr),name: name.into(),data_type } }
 fn nth(expr: Expr,index: i64) -> Expr { call("nth",vec![expr,literal(Value::I64(index))]) }
 fn run(expr: &Expr) -> rtdb_types::Result<Value> { evaluate(expr,&Schema::default(),&[],&EvalContext::default()) }
+
+#[test]
+fn hot_expression_prepared_literals_reuse_packed_buffers_across_rows() {
+    let negative_zero = Expr::unary(UnaryOp::Negate, literal(Value::F64(0.0)));
+    let expression = Expr::List(vec![literal(Value::I64(2)), negative_zero, literal(Value::Null)]);
+    let schema = Schema::default();
+    let memory = MemoryBudget::new(1 << 20);
+    let preparation = EvaluationScope::new(&memory).unwrap();
+    let context = EvalContext { allocation: Some(&preparation), ..EvalContext::default() };
+    let invocation = ExpressionInvocation::prepare(&expression, &schema, &context).unwrap();
+    let first_row = EvaluationScope::new(&memory).unwrap();
+    let second_row = EvaluationScope::new(&memory).unwrap();
+    let first = invocation.evaluate(&[], &EvalContext { allocation: Some(&first_row), ..context }).unwrap();
+    let second = invocation.evaluate(&[], &EvalContext { allocation: Some(&second_row), ..context }).unwrap();
+    let (Value::List(first), Value::List(second)) = (first, second) else { panic!("expected lists"); };
+    let (_, first_array) = first.packed_column().unwrap();
+    let (_, second_array) = second.packed_column().unwrap();
+    assert!(first_array.to_data().ptr_eq(&second_array.to_data()));
+    assert_eq!(first.get(0).unwrap().as_ref(), &Value::I64(2));
+    let Value::F64(zero) = *first.get(1).unwrap() else { panic!("expected a double"); };
+    assert_eq!(zero.to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(first.get(2).unwrap().as_ref(), &Value::Null);
+}
+
+#[tokio::test]
+async fn hot_expression_cosine_borrows_plain_columns_and_parameters() {
+    use arrow_array::RecordBatch;
+    use rtdb_columnar::{ArrowCell, copy_array, to_field};
+    use rtdb_types::{Anomaly, Result};
+
+    struct ArrowInput { batch: RecordBatch, row: usize }
+    fn unexpected_read() -> Anomaly { Anomaly::fault("test/scalar-read", "Scalar input was demanded") }
+    impl RowInput for ArrowInput {
+        fn value(&self, _: usize, _: Option<&EvaluationScope>) -> Result<Option<Value>> { Err(unexpected_read()) }
+        fn arrow_cell(&self, index: usize) -> Option<ArrowCell<'_>> {
+            Some(ArrowCell {
+                field: self.batch.schema_ref().fields().get(index)?,
+                array: self.batch.columns().get(index)?.as_ref(),
+                row: self.row,
+            })
+        }
+    }
+    impl ParameterLookup for ArrowInput {
+        fn width(&self) -> usize { self.batch.num_columns() }
+        fn value(&self, _: usize) -> Result<Option<&Value>> { Err(unexpected_read()) }
+        fn known_value(&self, _: usize) -> Option<&Value> { None }
+        fn arrow_cell(&self, index: usize) -> Option<ArrowCell<'_>> { RowInput::arrow_cell(self, index) }
+    }
+
+    let ty = LogicalType::list(LogicalType::Scalar(ScalarType::F64).maybe()).maybe();
+    let vector = |values: &[f64]| Value::list(values.iter().copied().map(Value::F64).collect());
+    let left = vector(&[4.0, -0.0, 1e-90]);
+    let right = vector(&[-2.0, 6.0, 2e90]);
+    let bad = Value::list(vec![Value::F64(1.0), Value::Null, Value::F64(2.0)]);
+    let schema = Schema::new(["v", "w", "unreadable"].into_iter().enumerate().map(|(index, name)| Field {
+        id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone(),
+    }).collect()).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![to_field("v", &ty).unwrap(), to_field("w", &ty).unwrap()])), vec![
+        copy_array(&ty, &[left.clone(), Value::Null, vector(&[0.0; 3]), bad]).unwrap(),
+        copy_array(&ty, &[right.clone(), right.clone(), right.clone(), right.clone()]).unwrap(),
+    ]).unwrap();
+    let parameter = ArrowInput { batch: batch.clone(), row: 0 };
+    let parameter_types = [ty.clone(), ty.clone()];
+    let context = EvalContext { parameters: Parameters::Lookup(&parameter), parameter_types: Some(&parameter_types), ..EvalContext::default() };
+    let column = |id| Expr::Column { id: ColumnId(id), data_type: ty.clone() };
+    let expected = run(&call("cosine_distance", vec![literal(left), literal(right)])).unwrap();
+    let Value::F64(expected) = expected else { panic!("expected a score"); };
+    for (other, parameter_types) in [
+        (column(1), Some(parameter_types.as_slice())),
+        (Expr::Parameter { index: 1, data_type: ty.clone() }, Some(parameter_types.as_slice())),
+        (Expr::Parameter { index: 1, data_type: LogicalType::Nothing }, None),
+    ] {
+        let context = EvalContext { parameter_types, ..context };
+        let expression = call("cosine_distance", vec![column(0), other]);
+        let invocation = ExpressionInvocation::prepare(&expression, &schema, &context).unwrap();
+        for row in 0..4 {
+            let input = ArrowInput { batch: batch.clone(), row };
+            let result = invocation.evaluate_projection_row_async(ExpressionRow::Borrowed(&input), &context).await;
+            match row {
+                0 => {
+                    let Value::F64(value) = result.unwrap() else { panic!("expected a score"); };
+                    assert_eq!(value.to_bits(), expected.to_bits());
+                }
+                1 => assert_eq!(result.unwrap(), Value::Null),
+                2 => assert_eq!(result.unwrap_err().code, "rtdb.vector/zero-norm"),
+                _ => assert_eq!(result.unwrap_err().code, "rtdb.vector/component"),
+            }
+        }
+    }
+
+    let expression = call("cosine_distance", vec![column(0), column(2)]);
+    let invocation = ExpressionInvocation::prepare(&expression, &schema, &context).unwrap();
+    for row in [1, 2, 3] {
+        let input = ArrowInput { batch: batch.clone(), row };
+        let error = invocation.evaluate_projection_row_async(ExpressionRow::Borrowed(&input), &context).await.unwrap_err();
+        assert_eq!(error.code, "test/scalar-read");
+    }
+    let expression = call("cosine_distance", vec![column(0), column(1)]);
+    let invocation = ExpressionInvocation::prepare(&expression, &schema, &context).unwrap();
+    let wide_date = Value::list(vec![Value::calendar_date(CivilDate::MAX, DateUnit::Day)]);
+    assert_eq!(invocation.evaluate(&[Value::Null, wide_date.clone()], &context).unwrap(), Value::Null);
+    assert_eq!(invocation.evaluate(&[wide_date, Value::I64(1)], &context).unwrap_err().code, "rtdb.vector/type");
+}
 
 #[test]
 fn struct_fields_are_boxed_before_field_selection_and_outer_text_cast() {

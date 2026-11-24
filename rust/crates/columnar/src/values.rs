@@ -2,7 +2,8 @@ use rtdb_types::StructFields;
 use std::{borrow::{Borrow, Cow}, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
-use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
+use arrow_buffer::{BooleanBufferBuilder, IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
+use arrow_data::transform::MutableArrayData;
 use arrow_schema::{DataType, Field, Fields, UnionMode};
 use rtdb_types::{Anomaly, ListBuilder, DecimalValue, IntervalUnit, ListKind, ListValue, ListView, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
 
@@ -870,19 +871,17 @@ fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn 
         let ty = match element { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
         let admit = |list| match kind { ListKind::List => Value::List(list), _ => Value::FixedSizeList(list) };
         if matches!(ty, LogicalType::Scalar(ScalarType::F32)) && let Some(array) = values.as_any().downcast_ref::<Float32Array>() {
-            return Ok(admit(rtdb_types::ListValue::from_f32(array.iter().collect())));
+            return Ok(admit(ListValue::from_f32(copy_float_components(array))));
         }
         if matches!(ty, LogicalType::Scalar(ScalarType::F64)) && let Some(array) = values.as_any().downcast_ref::<Float64Array>() {
-            return Ok(admit(rtdb_types::ListValue::from_f64(array.iter().collect())));
+            return Ok(admit(ListValue::from_f64(copy_float_components(array))));
         }
     }
     if matches!(kind, ListKind::List | ListKind::FixedSizeList(_))
         && ListValue::supports_numeric_arrow(child_field)
-        && &from_field(child_field)? == element
+        && crate::schema::numeric_field_matches(child_field, element)?
     {
-        let end = i32::try_from(values.len()).map_err(|_| layout_error())?;
-        let indices = Int32Array::from_iter_values(0..end);
-        let copied = arrow_select::take::take(values.as_ref(), &indices, None).map_err(super::arrow_error)?;
+        let copied = copy_numeric_components(values.as_ref())?;
         let packed = ListValue::from_numeric_arrow(Arc::clone(child_field), copied).ok_or_else(layout_error)?;
         return Ok(if matches!(kind, ListKind::List) { Value::List(packed) } else { Value::FixedSizeList(packed) });
     }
@@ -1106,6 +1105,68 @@ fn repack_mixed_scalar_list(
     Ok(ListValue::from_scalar_arrow(output, Arc::new(array)))
 }
 
+fn copy_float_components<T: arrow_array::types::ArrowPrimitiveType>(
+    array: &arrow_array::PrimitiveArray<T>,
+) -> arrow_array::PrimitiveArray<T> {
+    // Owned reads detach from the batch reservation and preserve the zero payload of null float slots.
+    let mut values = array.values().to_vec();
+    let nulls = array.nulls().filter(|nulls| nulls.null_count() != 0).map(|nulls| {
+        let mut end = 0;
+        for (start, next_end) in nulls.valid_slices() {
+            values[end..start].fill(T::Native::default());
+            end = next_end;
+        }
+        values[end..].fill(T::Native::default());
+        let mut bitmap = BooleanBufferBuilder::new(array.len());
+        bitmap.append_buffer(nulls.inner());
+        NullBuffer::new(bitmap.finish())
+    });
+    arrow_array::PrimitiveArray::new(values.into(), nulls)
+}
+
+fn copy_numeric_components(values: &dyn Array) -> Result<ArrayRef> {
+    let length = values.len();
+    i32::try_from(length).map_err(|_| layout_error())?;
+    let data = values.to_data();
+    let DataType::Union(fields, UnionMode::Dense) = values.data_type() else {
+        let mut copy = MutableArrayData::new(vec![&data], false, length);
+        copy.extend(0, 0, length);
+        return Ok(make_array(copy.freeze()));
+    };
+
+    let union = downcast::<UnionArray>(values)?;
+    let mut lengths = [0_i32; 128];
+    let mut offsets = Vec::with_capacity(length);
+    for &tag in union.type_ids().iter() {
+        let count = &mut lengths[tag as usize];
+        offsets.push(*count);
+        *count += 1;
+    }
+    let mut positions = [0; 128];
+    let mut children = fields.iter().zip(data.child_data()).enumerate().map(|(position, ((tag, _), child))| {
+        positions[tag as usize] = position;
+        MutableArrayData::new(vec![child], false, lengths[tag as usize] as usize)
+    }).collect::<Vec<_>>();
+    let mut pending = [(0, 0); 128];
+    for (&tag, &offset) in union.type_ids().iter().zip(union.offsets().ok_or_else(layout_error)?.iter()) {
+        let (start, end) = &mut pending[tag as usize];
+        let offset = offset as usize;
+        if offset != *end {
+            if start != end { children[positions[tag as usize]].extend(0, *start, *end); }
+            *start = offset;
+        }
+        *end = offset + 1;
+    }
+    let children = fields.iter().zip(children).map(|((tag, _), mut child)| {
+        let (start, end) = pending[tag as usize];
+        if start != end { child.extend(0, start, end); }
+        make_array(child.freeze())
+    }).collect();
+    let tags = ScalarBuffer::from(union.type_ids().to_vec());
+    let copied = UnionArray::try_new(fields.clone(), tags, Some(offsets.into()), children).map_err(super::arrow_error)?;
+    Ok(Arc::new(copied))
+}
+
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
 fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
 fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width") }
@@ -1114,6 +1175,58 @@ fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "Arra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_expression_owned_float_lists_copy_sliced_values_and_validity() {
+        let nan = f32::from_bits(0x7f80_0100);
+        let values = Float32Array::new(
+            vec![13.0, -0.0, 42.0, nan, 8.0].into(),
+            Some(NullBuffer::from(vec![true, true, false, true, true])),
+        );
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let lists = ListArray::try_new(item, OffsetBuffer::new(vec![0, 1, 4, 5].into()), Arc::new(values.clone()), None).unwrap();
+        let field = Field::new("lists", lists.data_type().clone(), false);
+        let result = ColumnReader::new(&field).unwrap().read(&lists.slice(1, 1), 0).unwrap();
+        let Some(ListView::F32(result)) = result.list_view() else { panic!("expected float buffer"); };
+
+        assert_ne!(values.values().inner().data_ptr(), result.values().inner().data_ptr());
+        assert_ne!(values.nulls().unwrap().buffer().data_ptr(), result.nulls().unwrap().buffer().data_ptr());
+        drop(lists);
+        drop(values);
+        assert_eq!(result.values().iter().map(|value| value.to_bits()).collect::<Vec<_>>(), [(-0.0_f32).to_bits(), 0, nan.to_bits()]);
+        assert_eq!(result.nulls().unwrap().iter().collect::<Vec<_>>(), [true, false, true]);
+    }
+
+    #[test]
+    fn hot_expression_owned_numeric_union_keeps_compact_layout_and_raw_bits() {
+        let fields = arrow_schema::UnionFields::try_new(
+            [2, 9],
+            [Field::new("u64", DataType::UInt64, true), Field::new("i16", DataType::Int16, false)],
+        ).unwrap();
+        let unsigned = UInt64Array::new(
+            vec![99, u64::MAX, 123, 55].into(),
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        );
+        let union = UnionArray::try_new(
+            fields, vec![2, 2, 9, 2, 2, 9].into(), Some(vec![0, 2, 1, 1, 1, 0].into()),
+            vec![Arc::new(unsigned.clone()), Arc::new(Int16Array::from(vec![10, 20]))],
+        ).unwrap();
+        let item = Arc::new(Field::new("item", union.data_type().clone(), true));
+        let lists = FixedSizeListArray::try_new(item, 4, Arc::new(union.slice(1, 4)), None).unwrap();
+        let field = Field::new("vectors", lists.data_type().clone(), false);
+        let decoded = read_value(&field, &lists, 0).unwrap();
+        let Some(ListView::Numeric(packed)) = decoded.list_view() else { panic!("expected numeric buffer"); };
+        let copied = downcast::<UnionArray>(packed.array().as_ref()).unwrap();
+        assert_eq!(copied.type_ids().as_ref(), &[2, 9, 2, 2]);
+        assert_eq!(copied.offsets().unwrap().as_ref(), &[0, 0, 1, 2]);
+        let child = downcast::<UInt64Array>(copied.child(2).as_ref()).unwrap();
+        assert_ne!(unsigned.values().inner().data_ptr(), child.values().inner().data_ptr());
+        assert_eq!(child.values().as_ref(), &[123, u64::MAX, u64::MAX]);
+        assert!(child.is_null(0));
+        assert_eq!(downcast::<Int16Array>(copied.child(9).as_ref()).unwrap().values().as_ref(), &[20]);
+        let execution = crate::read_execution_value(&field, &lists, 0).unwrap();
+        assert_eq!(execution.list_view().unwrap().get(2).unwrap().as_ref(), &Value::I64(-1));
+    }
 
     fn joined(plain: &LogicalType, value: &Value) -> bool {
         if matches!(value, Value::Undefined) { return matches!(plain, LogicalType::Nothing); }

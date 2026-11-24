@@ -97,6 +97,11 @@
 -- Relation name casts resolve against an identity map for the captured catalog.
 -- Column tables preserve one semantic page across the input list's batches.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
+-- Owned numeric list reads copy the selected child range into buffers charged to the result and preserve the bits of present components and their validity.
+-- Dense-union list copies retain their leg identifiers and compact the child offsets in selection order.
+-- Fixed-width list read bounds account for the selected length and any null-sensitive payload charge.
+-- An expression invocation shares the prepared storage of eligible literal arrays across its rows.
+-- Cosine scoring borrows compatible Arrow list columns and bound Arrow list parameters at their selected child positions.
 -- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.
 -- A list cast to REAL or DOUBLE PRECISION elements converts the packed components of a numeric list in one pass, through binary64 as each scalar cast does.
 -- A packed numeric list derives its observed element type from the first selected occurrence of each present leg and of null.

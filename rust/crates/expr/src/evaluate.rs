@@ -494,7 +494,7 @@ macro_rules! expression_body {
 /// A reached nonzero SLEEP returns `rtdb.expr/async-required`; production callers accepting SLEEP use `evaluate_async`.
 /// Returned values borrow no inputs; retain the allocation scope until their memory charge is transferred or dropped.
 /// Scalar calendar intermediates retain their range; struct fields and demanded list cells undergo typed-box admission.
-/// List size and type checks do not read elements; each element read reruns its expression.
+/// List size and type checks do not demand elements; computed elements run when selected.
 /// Returned collections are fully materialized and completed dates undergo expression-vector narrowing.
 pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
     ExpressionInvocation::prepare(expr,schema,context)?.evaluate(row,context)

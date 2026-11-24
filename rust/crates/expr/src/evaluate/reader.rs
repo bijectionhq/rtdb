@@ -3,6 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
 use rtdb_columnar::ArrowCell;
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
+use super::invocation::{PreparedList, Replacements};
 use super::{EvalContext, ExpressionRow, boolean, integer, nullish, overflow};
 
 mod compare;
@@ -27,11 +28,22 @@ enum ListReader<'a> {
     Expressions(&'a [Expr]),
     Values(Vec<Value>),
     Stored(rtdb_types::ListValue),
+    Prepared(&'a PreparedList),
     Arrow(ArrowCell<'a>),
     Cast { input: EvalValue<'a>, element: Target<'a> },
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
     RangeBins(crate::temporal_functions::RangeBins),
+}
+
+impl ListReader<'_> {
+    fn stored(&self) -> Option<&rtdb_types::ListValue> {
+        match self {
+            Self::Stored(items) => Some(items),
+            Self::Prepared(list) => Some(&list.values),
+            _ => None,
+        }
+    }
 }
 
 struct EvaluationFrame<'a> { schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>, asynchronous: bool, replacements: Option<&'a super::invocation::Replacements<'a>> }
@@ -47,6 +59,18 @@ impl<'a> EvaluationFrame<'a> {
             _ => None,
         }
     }
+
+    fn prepared_list(&self, expr: &Expr) -> Option<&'a PreparedList> {
+        self.replacements.and_then(|invocation| invocation.list(expr))
+    }
+}
+
+fn packed_numeric_cell(cell: ArrowCell<'_>) -> bool {
+    use arrow_schema::DataType;
+    let Ok(cell) = cell.physical() else { return false; };
+    matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_)))
+        && matches!(cell.field.data_type(), DataType::List(child) | DataType::FixedSizeList(child, _)
+            if rtdb_types::ListValue::supports_numeric_arrow(child))
 }
 
 #[derive(Clone,Copy)]
@@ -80,31 +104,33 @@ fn value_type_bound(value: &Value) -> Result<usize> {
     Ok(bytes)
 }
 
-fn expression_type_bound(expr: &Expr) -> Result<usize> {
-    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_type_bound_at(expr))
+pub(super) fn expression_type_bound(expr: &Expr, prepared: Option<&Replacements<'_>>) -> Result<usize> {
+    if let Some(list) = prepared.and_then(|invocation| invocation.list(expr)) { return Ok(list.type_bound); }
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || expression_type_bound_at(expr, prepared))
 }
-fn expression_type_bound_at(expr: &Expr) -> Result<usize> {
+fn expression_type_bound_at(expr: &Expr, prepared: Option<&Replacements<'_>>) -> Result<usize> {
+    let bound = |expr| expression_type_bound(expr, prepared);
     let mut bytes = 512usize;
     let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?;Ok(()) };
     match expr {
         Expr::Literal(value) => add(value_type_bound(value)?)?,
         Expr::DurationLiteral(_) => {},
         Expr::Column { data_type,.. } | Expr::Parameter { data_type,.. } | Expr::Correlated { data_type,.. } => add(data_type.retained_bytes()?)?,
-        Expr::Field { data_type,expr,.. } => { add(data_type.retained_bytes()?)?;add(expression_type_bound(expr)?)?; }
-        Expr::Subscript { data_type,expr,index } => { add(data_type.retained_bytes()?)?;add(expression_type_bound(expr)?)?;add(expression_type_bound(index)?)?; }
-        Expr::Unary { expr,.. } => add(expression_type_bound(expr)?)?,
-        Expr::Cast { expr,target } => { add(expression_type_bound(expr)?)?;add(target_bound(target)?)?; }
-        Expr::Binary { left,right,.. } => { add(expression_type_bound(left)?)?;add(expression_type_bound(right)?)?; }
-        Expr::Call { name,args,return_type } => { add(name.len())?;add(return_type.retained_bytes()?)?;for expr in args { add(expression_type_bound(expr)?)?; } }
-        Expr::RegexReplace { source,return_type,.. } => { add(return_type.retained_bytes()?)?;add(expression_type_bound(source)?)?; }
-        Expr::List(items) | Expr::Coalesce(items) => for expr in items { add(expression_type_bound(expr)?)?; },
-        Expr::Struct(fields) => for (name,expr) in fields { add(name.len())?;add(expression_type_bound(expr)?)?; },
+        Expr::Field { data_type,expr,.. } => { add(data_type.retained_bytes()?)?;add(bound(expr)?)?; }
+        Expr::Subscript { data_type,expr,index } => { add(data_type.retained_bytes()?)?;add(bound(expr)?)?;add(bound(index)?)?; }
+        Expr::Unary { expr,.. } => add(bound(expr)?)?,
+        Expr::Cast { expr,target } => { add(bound(expr)?)?;add(target_bound(target)?)?; }
+        Expr::Binary { left,right,.. } => { add(bound(left)?)?;add(bound(right)?)?; }
+        Expr::Call { name,args,return_type } => { add(name.len())?;add(return_type.retained_bytes()?)?;for expr in args { add(bound(expr)?)?; } }
+        Expr::RegexReplace { source,return_type,.. } => { add(return_type.retained_bytes()?)?;add(bound(source)?)?; }
+        Expr::List(items) | Expr::Coalesce(items) => for expr in items { add(bound(expr)?)?; },
+        Expr::Struct(fields) => for (name,expr) in fields { add(name.len())?;add(bound(expr)?)?; },
         Expr::RowCopy(fields) => for field in fields { add(field.name.len())?;add(field.data_type.retained_bytes()?)?; },
-        Expr::Between { operand,low,high,.. } => { add(expression_type_bound(operand)?)?;add(expression_type_bound(low)?)?;add(expression_type_bound(high)?)?; }
-        Expr::SimpleCase { operand,branches,otherwise } => { add(expression_type_bound(operand)?)?;for (candidate,value) in branches { add(expression_type_bound(candidate)?)?;add(expression_type_bound(value)?)?; } add(expression_type_bound(otherwise)?)?; }
-        Expr::Case { branches,otherwise } => { for (condition,value) in branches { add(expression_type_bound(condition)?)?;add(expression_type_bound(value)?)?; } add(expression_type_bound(otherwise)?)?; }
-        Expr::In { expr,values,.. } => { add(expression_type_bound(expr)?)?;for expr in values { add(expression_type_bound(expr)?)?; } }
-        Expr::Like { expr,pattern,.. } => { add(expression_type_bound(expr)?)?;add(expression_type_bound(pattern)?)?; }
+        Expr::Between { operand,low,high,.. } => { add(bound(operand)?)?;add(bound(low)?)?;add(bound(high)?)?; }
+        Expr::SimpleCase { operand,branches,otherwise } => { add(bound(operand)?)?;for (candidate,value) in branches { add(bound(candidate)?)?;add(bound(value)?)?; } add(bound(otherwise)?)?; }
+        Expr::Case { branches,otherwise } => { for (condition,value) in branches { add(bound(condition)?)?;add(bound(value)?)?; } add(bound(otherwise)?)?; }
+        Expr::In { expr,values,.. } => { add(bound(expr)?)?;for expr in values { add(bound(expr)?)?; } }
+        Expr::Like { expr,pattern,.. } => { add(bound(expr)?)?;add(bound(pattern)?)?; }
     }
     Ok(bytes)
 }
@@ -133,8 +159,12 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
         }
         EvalValue::List(kind,reader) => {
             let element = match reader.as_ref() {
+                ListReader::Prepared(list) => {
+                    frame.context.reserve(list.element.retained_bytes()?)?;
+                    list.element.clone()
+                }
                 ListReader::Expressions(items) => {
-                    frame.context.reserve(items.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
+                    frame.context.reserve(items.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr, frame.replacements)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
                     LogicalType::join_all(&items.iter().map(|expr|scalar::emitted_type(expr,frame)).collect::<Result<Vec<_>>>()?)
                 }
                 ListReader::Values(items) => {
@@ -205,7 +235,7 @@ pub(super) fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<
     if context.parameter_types.is_some_and(|types| types.len() != context.parameters.width()) {
         return Err(Anomaly::fault("rtdb.expr/parameter-schema", "Parameter values and declared types have different widths"));
     }
-    context.reserve(expression_type_bound(expr)?.checked_mul(8).ok_or_else(overflow)?)?;
+    context.reserve(expression_type_bound(expr, None)?.checked_mul(8).ok_or_else(overflow)?)?;
     scalar::emitted_type(expr,&EvaluationFrame { schema,row: ExpressionRow::Values(&[]),context,asynchronous: false,replacements: None })
 }
 
@@ -215,7 +245,7 @@ pub(super) fn required(expr: &Expr) -> bool {
         Expr::Literal(Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Struct(_)) => true,
         Expr::Unary { .. } | Expr::Binary { .. } | Expr::Cast { .. } | Expr::Field { .. } => true,
         Expr::Call { name, return_type: LogicalType::Null | LogicalType::Nothing, .. } if !["set","trim_array","trim-array","regexp_replace","regexp-replace"].iter().any(|special| name.eq_ignore_ascii_case(special)) => true,
-        Expr::Call { name, .. } if scalar::ordinary_call(name) => true,
+        Expr::Call { name, .. } if calls::is_cosine(name) || scalar::ordinary_call(name) => true,
         Expr::Call { name, args, .. } if !args.is_empty() && crate::temporal_functions::strict_call(name) || crate::interval_constructor::is_name(name) || crate::bitwise::is_name(name) || ["is_true","is-true","is_false","is-false","distinct_from","distinct-from","_meta_double","_meta-double","get_field","get-field","compare","compare_nulls_first","compare-nulls-first","compare_nulls_last","compare-nulls-last","like","ilike"].iter().any(|function| name.eq_ignore_ascii_case(function)) => true,
         Expr::Call { name,args, .. } => ["_id_eq_any","nth","set","trim_array","trim-array","array_upper","array-upper","array_lower","array-lower","array_length","array-length","col_description","col-description","pg_indexam_has_property","pg-indexam-has-property","mod","generate_series","generate-series","range_bins","range-bins","date_bin","date-bin"].iter().any(|function| name.eq_ignore_ascii_case(function)) || args.iter().any(required),
         Expr::Subscript { .. } => true,
@@ -399,6 +429,7 @@ fn len(value: &EvalValue<'_>) -> Result<usize> {
     match reader.as_ref() {
         ListReader::Expressions(items) => Ok(items.len()), ListReader::Values(items) => Ok(items.len()),
         ListReader::Stored(items) => Ok(items.len()),
+        ListReader::Prepared(list) => Ok(list.values.len()),
         ListReader::Arrow(cell) => Ok(cell.sequence().ok_or_else(|| invalid("list length"))?.len()),
         ListReader::Cast { input, .. } => len(input),
         ListReader::Trim { size,.. } => crate::collection::view_size(*size),
@@ -412,8 +443,8 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
         let value = match reader.as_ref() {
             ListReader::Expressions(items) => evaluate((*items).get(index).ok_or_else(|| invalid("nth"))?,frame)?.await?,
             ListReader::Values(items) => from_value(super::retained_clone(items.get(index).ok_or_else(|| invalid("nth"))?,frame.context)?,frame)?,
-            ListReader::Stored(items) => {
-                let value = items.view().get(index).ok_or_else(|| invalid("nth"))?;
+            list @ (ListReader::Stored(_) | ListReader::Prepared(_)) => {
+                let value = list.stored().expect("stored list").get(index).ok_or_else(|| invalid("nth"))?;
                 from_value(super::retained_clone(value.as_ref(), frame.context)?, frame)?
             },
             ListReader::Arrow(cell) => {
@@ -443,7 +474,7 @@ fn borrowed_vector<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::Vector
 
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
     match reader.as_ref() {
-        ListReader::Stored(list) => Some(VectorInput::Stored(list.view())),
+        ListReader::Stored(_) | ListReader::Prepared(_) => Some(VectorInput::Stored(reader.stored()?.view())),
         ListReader::Arrow(cell) => VectorInput::from_arrow(*cell),
         ListReader::Trim { input, size } => {
             let size = crate::collection::view_size(*size).ok()?;
@@ -552,9 +583,12 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
             }
             value @ EvalValue::List(kind,_) => {
                 if let EvalValue::List(_, reader) = &value
-                    && let ListReader::Stored(items) = reader.as_ref()
-                    && items.array().is_some()
+                    && let Some(items) = reader.stored()
+                    && (items.array().is_some() || matches!(reader.as_ref(), ListReader::Prepared(_)))
                 {
+                    if matches!(reader.as_ref(), ListReader::Prepared(_)) {
+                        frame.context.reserve(items.retained_payload_bytes()?)?;
+                    }
                     return Ok(match kind {
                         Kind::List => Value::List(items.clone()),
                         Kind::Fixed => Value::FixedSizeList(items.clone()),
@@ -679,13 +713,12 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             let value = from_arrow(cell, frame)?;
             return if matches!(expr, Expr::Field { .. }) { box_cell(value) } else { Ok(value) };
         }
-        if !required(expr) {
-            let value = if frame.asynchronous { super::evaluate_async_inner(expr,frame.schema,frame.row,frame.context).await? }
-                else { super::evaluate_inner(expr,frame.schema,frame.row,frame.context)? };
-            return from_value(value,frame);
-        }
+        if !required(expr) { return evaluate_scalar(expr, frame).await; }
         match expr {
-            Expr::List(items) => make_list(Kind::List,ListReader::Expressions(items),frame),
+            Expr::List(items) => {
+                let list = frame.prepared_list(expr).map_or(ListReader::Expressions(items), ListReader::Prepared);
+                make_list(Kind::List, list, frame)
+            }
             Expr::Struct(fields) => {
                 let mut values = StructFields::new();
                 for (name,expr) in fields {
@@ -703,7 +736,7 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             Expr::Call { name, .. } if scalar::ordinary_call(name) => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::Call { name,.. } if crate::temporal_functions::strict_call(name) || crate::interval_constructor::is_name(name) || ["nth","col_description","col-description","pg_indexam_has_property","pg-indexam-has-property","mod","array_upper","array-upper","array_lower","array-lower","array_length","array-length","generate_series","generate-series","range_bins","range-bins","date_bin","date-bin"].iter().any(|function| name.eq_ignore_ascii_case(function)) => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::Call { name, .. } if crate::bitwise::is_name(name) || ["is_true","is-true","is_false","is-false","distinct_from","distinct-from","_meta_double","_meta-double","get_field","get-field","compare","compare_nulls_first","compare-nulls-first","compare_nulls_last","compare-nulls-last","like","ilike"].iter().any(|function| name.eq_ignore_ascii_case(function)) => scalar::prepare(expr,frame)?.await?.demand().await,
-            Expr::Call { name,args, .. } => calls::call(name,args,frame)?.await,
+            Expr::Call { name,args, .. } => calls::call(expr,name,args,frame)?.await,
             Expr::Unary { .. } | Expr::Binary { .. } => scalar::prepare(expr,frame)?.await?.demand().await,
             Expr::In { expr,values,negated } => {
                 let value = evaluate(expr,frame)?.await?;
@@ -719,6 +752,15 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             _ => Err(Anomaly::fault("rtdb.expr/collection-dispatch","Expression has no collection dispatch")),
         }
     },frame)
+}
+
+async fn evaluate_scalar<'a>(expr: &Expr, frame: &'a EvaluationFrame<'a>) -> Result<EvalValue<'a>> {
+    from_value(scalar_value(expr, frame).await?, frame)
+}
+
+async fn scalar_value(expr: &Expr, frame: &EvaluationFrame<'_>) -> Result<Value> {
+    if frame.asynchronous { super::evaluate_async_inner(expr,frame.schema,frame.row,frame.context).await }
+    else { super::evaluate_inner(expr,frame.schema,frame.row,frame.context) }
 }
 
 #[cfg(test)]

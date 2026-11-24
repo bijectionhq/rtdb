@@ -64,12 +64,62 @@ fn type_predicate(name: &str,value: &EvalValue<'_>) -> Option<bool> {
     }
 }
 
-pub(super) fn call<'a>(name: &'a str,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
+pub(super) fn is_cosine(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance")
+}
+
+pub(super) fn validate(expr: &Expr, name: &str, args: &[Expr], frame: &EvaluationFrame<'_>) -> Result<()> {
+    if name == "cosine_distance" {
+        if args.len() != 2 { rtdb_plan::function_type(name, &[])?; }
+        return Ok(());
+    }
+    if let Some(invocation) = frame.replacements
+        && args.iter().any(|arg| invocation.list(arg).is_some())
+    {
+        return invocation.validate_call(expr, name, args);
+    }
+    rtdb_plan::function_type_with_args(name, args)?;
+    Ok(())
+}
+
+enum CosineArgument<'a> { Arrow(ArrowCell<'a>), Value(Value) }
+
+impl<'a> CosineArgument<'a> {
+    async fn read(expr: &Expr, cell: Option<ArrowCell<'a>>, frame: &EvaluationFrame<'_>) -> Result<Self> {
+        Ok(match cell {
+            Some(cell) if cell.is_null()? => Self::Value(Value::Null),
+            Some(cell) => Self::Arrow(cell),
+            None => Self::Value(scalar_value(expr, frame).await?),
+        })
+    }
+
+    fn is_null(&self) -> bool { matches!(self, Self::Value(value) if nullish(value)) }
+
+    fn vector(&self) -> Result<crate::vector::VectorInput<'_>> {
+        use crate::vector::VectorInput;
+        match self {
+            Self::Arrow(cell) => VectorInput::from_arrow(*cell).ok_or_else(crate::vector::invalid_vector_type),
+            Self::Value(value) => crate::vector::components(value).map(VectorInput::Stored),
+        }
+    }
+}
+
+pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
     boxed(async move {
+        if is_cosine(name) && let [left, right] = args && args.iter().all(|arg| !required(arg)) {
+            let left_cell = frame.arrow_input(left).filter(|cell| packed_numeric_cell(*cell));
+            let right_cell = frame.arrow_input(right).filter(|cell| packed_numeric_cell(*cell));
+            if left_cell.is_none() && right_cell.is_none() { return evaluate_scalar(expr, frame).await; }
+            // Both arguments are evaluated before null propagation or score validation.
+            let left = CosineArgument::read(left, left_cell, frame).await?;
+            let right = CosineArgument::read(right, right_cell, frame).await?;
+            if left.is_null() || right.is_null() { return Ok(scalar(Value::Null)); }
+            return Ok(scalar(crate::vector::score_pair(left.vector()?, right.vector()?)?));
+        }
         frame.context.reserve(name.len().checked_mul(8).and_then(|n|n.checked_add(256)).ok_or_else(overflow)?)?;
         let name = name.to_lowercase().replace('-',"_");
-        frame.context.reserve(args.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
-        rtdb_plan::function_type_with_args(&name,args)?;
+        frame.context.reserve(args.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr, frame.replacements)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
+        validate(expr, &name, args, frame)?;
         if name == "_id_eq_any" {
             let id = evaluate(&args[0], frame)?.await?;
             let array = evaluate(&args[1], frame)?.await?;
@@ -182,7 +232,14 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
             }
         }
         if name == "cosine_distance" && let [left, right] = values.as_slice() {
-            if let (Some(left), Some(right)) = (borrowed_vector(left), borrowed_vector(right)) {
+            let allows_packed = |input: &EvalValue<'_>, other: &EvalValue<'_>| {
+                !matches!((input, other), (EvalValue::List(_, input), EvalValue::List(_, other))
+                    if matches!(input.as_ref(), ListReader::Prepared(_))
+                        && matches!(other.as_ref(), ListReader::Arrow(cell) if !packed_numeric_cell(*cell)))
+            };
+            if allows_packed(left, right) && allows_packed(right, left)
+                && let (Some(left), Some(right)) = (borrowed_vector(left), borrowed_vector(right))
+            {
                 return Ok(scalar(crate::vector::score_pair(left, right)?));
             }
         }

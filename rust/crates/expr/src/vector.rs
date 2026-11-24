@@ -142,11 +142,15 @@ impl CosineVector {
     }
 }
 
-fn components(vector: &Value) -> Result<ListView<'_>> {
+pub(crate) fn components(vector: &Value) -> Result<ListView<'_>> {
     match vector {
         Value::List(_) | Value::FixedSizeList(_) => Ok(vector.list_view().unwrap()),
-        _ => Err(Anomaly::incorrect("rtdb.vector/type", "Cosine distance requires numeric lists")),
+        _ => Err(invalid_vector_type()),
     }
+}
+
+pub(crate) fn invalid_vector_type() -> Anomaly {
+    Anomaly::incorrect("rtdb.vector/type", "Cosine distance requires numeric lists")
 }
 
 fn scale(values: VectorInput<'_>) -> Result<f64> {

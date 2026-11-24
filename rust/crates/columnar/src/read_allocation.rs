@@ -4,6 +4,8 @@ use rtdb_types::{Anomaly, Result, Value};
 
 use crate::interleave::Padding;
 
+const CELL_BYTES: usize = 256 + 2 * std::mem::size_of::<Value>();
+
 /// Bounds `read_value`'s temporary schema construction and owned result without allocating.
 /// Only the selected cell, active union leg, and selected list offsets contribute value bytes.
 /// Existing Arrow buffers retain their own reservations; sum this bound before reading multiple cells.
@@ -31,7 +33,7 @@ pub fn estimate_event_copy_cell_bytes(field: &Field, array: &dyn Array, row: usi
 fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: Option<Padding>) -> Result<usize> {
     if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
     if field.data_type() != array.data_type() { return Err(layout()); }
-    let base = add(mul(std::mem::size_of::<Value>(), 2)?, 256)?;
+    let base = CELL_BYTES;
     if field.data_type() == &DataType::Null && !field.is_nullable() && copy.is_none() { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
     if let DataType::RunEndEncoded(ends, values) = field.data_type() {
         let child = match ends.data_type() {
@@ -102,7 +104,7 @@ pub fn estimate_event_null_cell_bytes(field: &Field) -> Result<usize> {
 }
 
 pub(crate) fn null_copy_bytes(field: &Field, padding: Padding) -> Result<usize> {
-    let base = 256 + 2 * std::mem::size_of::<Value>();
+    let base = CELL_BYTES;
     let children = match field.data_type() {
         DataType::Struct(fields) => fields.iter().try_fold(0, |bytes, field| add(bytes, null_copy_bytes(field, padding.under_null_parent())?))?,
         DataType::FixedSizeList(child, count) => mul(usize::try_from(*count).map_err(|_| layout())?, null_copy_bytes(child, padding.under_null_parent())?)?,
@@ -119,7 +121,22 @@ pub(crate) fn null_copy_bytes(field: &Field, padding: Padding) -> Result<usize> 
 
 fn range(field: &Field, values: &dyn Array, start: usize, end: usize, copy: Option<Padding>) -> Result<usize> {
     if start > end || end > values.len() { return Err(layout()); }
-    let mut bytes = add(256, mul(end - start, mul(std::mem::size_of::<Value>(), 2)?)?)?;
+    let length = end - start;
+    let mut bytes = add(256, mul(length, 2 * std::mem::size_of::<Value>())?)?;
+    if length == 0 { return Ok(bytes); }
+    if field.data_type() != values.data_type() { return Err(layout()); }
+    let ty = field.data_type();
+    if ty.primitive_width().is_some() || ty == &DataType::Boolean {
+        bytes = add(bytes, mul(length, CELL_BYTES)?)?;
+        let payload = match ty {
+            DataType::Timestamp(_, zone) => zone.as_ref().map_or(0, |zone| zone.len()),
+            DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => 64,
+            _ => 0,
+        };
+        if payload == 0 { return Ok(bytes); }
+        let present = values.nulls().map_or(length, |nulls| nulls.inner().slice(start, length).count_set_bits());
+        return add(bytes, mul(present, payload)?);
+    }
     for row in start..end { bytes = add(bytes, estimate_cell_bytes(field, values, row, copy)?)?; }
     Ok(bytes)
 }
@@ -177,6 +194,32 @@ fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_
 fn mul(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Arrow cell allocation bound exceeds address space") }
 fn layout() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
+
+#[test]
+fn hot_expression_list_bounds_match_component_charges() {
+    use arrow_array::{Decimal128Array, Int64Array, TimestampMicrosecondArray};
+
+    let arrays: [&dyn Array; 3] = [
+        &Int64Array::from(vec![Some(9), None, Some(3), None, Some(4)]),
+        &TimestampMicrosecondArray::from(vec![Some(9), None, Some(3), None, Some(4)]).with_timezone("Asia/Tokyo"),
+        &Decimal128Array::from(vec![Some(9), None, Some(3), None, Some(4)]),
+    ];
+    for array in arrays {
+        let field = Field::new("item", array.data_type().clone(), true);
+        for array in [array.slice(0, array.len()), array.slice(1, 3)] {
+            for padding in [None, Some(Padding::Null), Some(Padding::Event)] {
+                for start in 0..=array.len() {
+                    let end = array.len();
+                    let overhead = 256 + (end - start) * 2 * std::mem::size_of::<Value>();
+                    let component_bytes: usize = (start..end).map(|row| {
+                        estimate_cell_bytes(&field, array.as_ref(), row, padding).unwrap()
+                    }).sum();
+                    assert_eq!(range(&field, array.as_ref(), start, end, padding).unwrap(), overhead + component_bytes);
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn copying_a_null_fixed_list_skips_its_hidden_child_payload() {

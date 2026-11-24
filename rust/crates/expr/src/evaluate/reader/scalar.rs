@@ -77,7 +77,7 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
             if let Some(ty) = frame.context.parameter_types.and_then(|types| types.get(*index)) { retained_type(ty,frame)? }
             else if *data_type == LogicalType::Nothing {
                 if let Some(cell) = frame.context.parameters.arrow_cell(*index)
-                    && (cell.is_null()? || cell.float_list_span().is_some()) {
+                    && (cell.is_null()? || packed_numeric_cell(cell)) {
                     frame.context.reserve(cell.observed_type_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
                     return Ok(rtdb_columnar::execution_type(&cell.observed_type()?));
                 }
@@ -126,7 +126,7 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
                 if ["null_eq","null-eq","distinct_from","distinct-from","nullif"].iter().any(|candidate|name.eq_ignore_ascii_case(candidate)) && types.len() == 2 { rtdb_plan::validate_equality_types(&types[0],&types[1])?; }
                 let arguments = args.iter().zip(types).enumerate().map(|(index,(arg,ty))| {
                     if literal_argument(name,index) {
-                        frame.context.reserve(expression_type_bound(arg)?.checked_mul(8).ok_or_else(overflow)?)?;
+                        frame.context.reserve(expression_type_bound(arg, frame.replacements)?.checked_mul(8).ok_or_else(overflow)?)?;
                         frame.context.reserve(literal_payload_bound(arg)?)?;
                         Ok(arg.clone())
                     } else { Ok(Expr::Parameter { index: 0,data_type: ty }) }
@@ -135,7 +135,15 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
             }
         }
         Expr::Like { expr,pattern,case_insensitive,.. } => rtdb_plan::function_type(if *case_insensitive { "ilike" } else { "like" }, &[child(expr)?,child(pattern)?])?,
-        Expr::List(items) => LogicalType::list(LogicalType::join_all(&items.iter().map(child).collect::<Result<Vec<_>>>()?)),
+        Expr::List(items) => {
+            let element = if let Some(list) = frame.prepared_list(expr) {
+                frame.context.reserve(list.element.retained_bytes()?)?;
+                list.element.clone()
+            } else {
+                LogicalType::join_all(&items.iter().map(child).collect::<Result<Vec<_>>>()?)
+            };
+            LogicalType::list(element)
+        }
         Expr::Struct(fields) => LogicalType::Struct(fields.iter().map(|(name,expr)|Ok((name.clone(),child(expr)?))).collect::<Result<_>>()?),
         Expr::RowCopy(fields) => LogicalType::Struct(fields.iter().map(|field|Ok((field.name.clone(),retained_type(&frame.schema.get(field.id).ok_or_else(||Anomaly::fault("rtdb.expr/missing-column","Raw record input column is unavailable"))?.data_type,frame)?))).collect::<Result<_>>()?),
         Expr::In { expr,values,negated } => {
@@ -149,7 +157,7 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
 // expression.clj's continuations select a type before consuming its payload; polymorphic returns box the payload first.
 pub(super) fn prepare<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Continuation<'a>>> {
     boxed(async move {
-        frame.context.reserve(expression_type_bound(expr)?.checked_mul(8).ok_or_else(overflow)?)?;
+        frame.context.reserve(expression_type_bound(expr, frame.replacements)?.checked_mul(8).ok_or_else(overflow)?)?;
         let ty = emitted_type(expr,frame)?;
         let boxed_return = ty.legs().len() > 1;
         let continuation = prepare_inner(expr,ty,frame)?.await?;
@@ -289,7 +297,7 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
             Expr::Call { name,args,.. } => {
                 frame.context.reserve(name.len().checked_mul(8).and_then(|bytes|bytes.checked_add(256)).ok_or_else(overflow)?)?;
                 let name = name.to_lowercase().replace('-',"_");
-                rtdb_plan::function_type_with_args(&name,args)?;
+                calls::validate(expr, &name, args, frame)?;
                 match name.as_str() {
                     "coalesce" => coalesce(args,frame)?.await,
                     "nullif" => nullif(args,frame)?.await,
