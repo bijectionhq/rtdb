@@ -87,6 +87,14 @@ impl Session {
     pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
     pub fn audience_seat(&self) -> Option<crate::AudienceSeat> { self.audience.as_ref().map(|audience| audience.seat) }
 
+    pub(crate) fn register_read(&self, register: impl FnOnce() -> Result<(), Status>) -> Result<(), Status> {
+        let state = self.state.lock().expect("session lock");
+        if matches!(*state, SessionState::Closed) {
+            return Err(Status::not_found("session closed"));
+        }
+        register()
+    }
+
     pub(crate) fn with_audience_handoff<T>(
         &self,
         cleanup: bool,

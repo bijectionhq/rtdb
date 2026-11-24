@@ -61,6 +61,22 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
         self.live.store(0, std::sync::atomic::Ordering::Release);
         for entry in entries.into_values() { if let Entry::Live(live) = entry { live.value.close(); } }
     }
+    pub fn close_where(&self, predicate: impl Fn(&V) -> bool) {
+        let mut closed = Vec::new();
+        {
+            let mut entries = self.entries.lock().expect("lease lock");
+            entries.retain(|_, entry| {
+                if let Entry::Live(live) = entry && predicate(&live.value) {
+                    closed.push(Arc::clone(&live.value));
+                    false
+                } else {
+                    true
+                }
+            });
+            self.live.fetch_sub(closed.len(), std::sync::atomic::Ordering::AcqRel);
+        }
+        for value in closed { value.close(); }
+    }
     pub fn len(&self) -> usize { self.live.load(std::sync::atomic::Ordering::Acquire) }
     fn expire(&self, entry: &mut Entry<V>, now: Timestamp) {
         if expire(entry, now) { self.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }

@@ -546,18 +546,16 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let audience = configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
             let installed_journals = arguments.optional("installed-journals").map(PathBuf::from);
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
-                Some(directory) => open_directory(directory, audience).await?,
+                Some(directory) => open_directory(directory, audience && arguments.present("audience-journal-port")).await?,
                 None if installed_journals.is_some() && !audience => rtdb_directory::MemoryDirectory::new(),
                 None => return Err(usage("--directory is required without an installed journal manifest".into())),
             };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.installed_journal_manifest = installed_journals;
             agent.replay_broker = replay_broker_client(&arguments, "")?;
-            if audience {
-                agent.audience_journal_port = Some(arguments.required("audience-journal-port")?.parse::<u16>().ok()
+            if let Some(port) = arguments.optional("audience-journal-port") {
+                agent.audience_journal_port = Some(port.parse::<u16>().ok()
                     .filter(|port| *port != 0).ok_or_else(|| usage("--audience-journal-port must be a positive port".into()))?);
-            } else if arguments.present("audience-journal-port") {
-                return Err(usage("--audience-journal-port requires the node's audience Flight listener".into()));
             }
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
             if arguments.present("s3-write-role") {
@@ -615,12 +613,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             };
             let installed_journals = arguments.optional("installed-journals")
                 .map(|path| rtdb_multi::journal::hosted::GatewayRoutes::read(std::path::Path::new(path))).transpose()?.map(Arc::new);
+            let classic_audience = arguments.present("directory") && audience.is_some_and(|(_, profile)| {
+                installed_journals.as_ref().is_none_or(|routes| !routes.contains_deployment(profile.source()))
+            });
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
-                Some(address) => open_directory(address, audience.is_some()).await?,
-                None if installed_journals.is_some() && audience.is_none() => rtdb_directory::MemoryDirectory::new(),
-                None => return Err(usage("--directory is required for audience Flight or without an installed journal manifest".into())),
+                Some(address) => open_directory(address, classic_audience).await?,
+                None if installed_journals.is_some() => rtdb_directory::MemoryDirectory::new(),
+                None => return Err(usage("--directory is required without an installed journal manifest".into())),
             };
-            if audience.is_some() { directory.require_audience_reads()?; }
+            if classic_audience { directory.require_audience_reads()?; }
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
             eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
             let tls = if let Some(path) = arguments.optional("config") {

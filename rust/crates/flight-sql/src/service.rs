@@ -187,6 +187,10 @@ impl Service {
         if let Lookup::Found(registered) = self.sessions(session.audience_source().is_some()).take(&session.id) {
             registered.close();
         }
+        if session.audience_source().is_none() {
+            self.0.owned_reads.close_where(|read| read.session == session.id);
+            self.0.owned_world_reads.close_where(|read| read.session == session.id);
+        }
     }
     pub fn sweep(&self) {
         if let Some(audience) = &self.0.audience {
@@ -390,6 +394,9 @@ impl Service {
                     SeatDecision::Mint(permit) => {
                         let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
                         let claim = self.reserve_audience_seat(Arc::downgrade(authenticated), requested.index(), permit).await?;
+                        if authenticated.requires_anchored_catalog() {
+                            self.0.node.confirm_audience_route(authenticated, source).await.map_err(status)?;
+                        }
                         if tokio::time::Instant::now() >= expires_at {
                             return Err(Status::deadline_exceeded("The audience session ceiling elapsed during handshake"));
                         }

@@ -321,6 +321,7 @@ struct OrderedReadIndex { journal: Arc<crate::journal::JournalLog>, deployment: 
 #[async_trait]
 impl ReplicaReadIndex for OrderedReadIndex {
     fn deployment(&self) -> Option<uuid::Uuid> { self.deployment }
+    fn requires_anchored_catalog(&self) -> bool { true }
     async fn confirm(&self) -> Result<LogOffset> { self.journal.confirm().await }
     async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> { self.journal.protect(applied).await }
 }

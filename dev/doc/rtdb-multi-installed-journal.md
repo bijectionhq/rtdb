@@ -59,10 +59,45 @@ The manifests contain arrays. A node entry includes:
 - For SQL erasure, `custody_work` supplies the broker domain UUID and the path to the enrolled PKCS#8 `admission_key`. The installed custodian also supplies `erasure_signing_key` with the separate PKCS#8 credential that matches the root's broker-enrolled evidence key. Provide the custody broker route and its privileged token to the custodian.
 - Optionally, `journal_window_bytes` to cap each automatically replenished append window. The actual funded amount is bounded by paid, currently reusable voter space.
 
-A gateway entry includes `name`, the exact `deployment` UUID, a `journal` scope with routing authority and credential paths, and the same enrolled worker endpoints. Native PGWire and ordinary Flight SQL follow the journal route, authenticate worker readiness, and compare it with the current grant. A Flight session must reconnect when the journal orders a different grant. The ordered installation currently serves fresh reads on the holder. The explicit frozen-snapshot selector and audience Flight use separate recovery paths.
+A gateway entry includes `name`, the exact `deployment` UUID, a `journal` scope with routing authority and credential paths, and the same enrolled worker endpoints.
+Native PGWire and ordinary Flight SQL follow the journal route, authenticate worker readiness, and compare it with the current grant.
+A Flight session must reconnect when the journal orders a different grant.
 
 The installed Logkeeper adapter currently supports the writer-local staging deadline.
 The physical receiver requires timed original quorum durability and refuses accepting writes on this adapter.
+
+### Owned Flight reads
+
+An installed catalog hold protects an exact checkpoint root and the suffix ending at the captured catalog cut.
+The worker checks the returned scope against those coordinates before it exposes a handle.
+
+| Action | Admission and lifetime on an installed route |
+| --- | --- |
+| `OpenRead.v3` | Reserve the owned read's ordered present, confirm with a fresh `Barrier`, and use `ProtectCheckpoint` for the exact catalog at the reservation. If apply has already advanced past that catalog, retry with a new reservation. |
+| `OpenFreshRead.v2` | Order a fresh `Barrier`, apply through its cut, and use `ProtectCheckpoint` for that exact catalog. If apply has already advanced, take a fresh barrier while retaining the caller's supplied transaction floor. |
+| `PrepareAppliedRead.v3` | On an audience session, check the supplied transaction floor against the writer's applied catalog, admit its checkpoint and suffix with `ProtectCheckpoint`, and retain the preparation until session close or expiry. Each subsequent open checks the attachment and the prepared lower cut and acquires its own hold. |
+| `OpenAppliedRead.v5` | Capture one already applied writer catalog covering the supplied exact transaction floor and admit its checkpoint and suffix with `ProtectCheckpoint`. Audience opens require a live preparation and a newer read generation. |
+| `OpenWorldRead.v6` and world `ReadHeld*` | World reads require custody of the world and every retained parent. The installed route returns `rtdb.owned/ordered-world-unheld` on open because it cannot acquire that set as one exact basis. `ProtectRoot` retains one root. |
+| `ReadHeld*` | Use the handle's protected catalog under its attachment and lease. The action set remains limited by the handle's ordinary or applied admission and by the audience projection. |
+| `CloseRead.v1` | Retire the handle and send `Release` for its exact hold when the last user and its admitted I/O drain. |
+| `CloseSession` | Retire the session and its handles. The preparation and read holds release independently after their last users drain. |
+
+`ProtectRange` protects the replay of a bounded record interval.
+An owned catalog also needs the root and its dependencies.
+The PGWire `rtdb.read=snapshot` connection selector returns `rtdb.multi/ordered-pgwire-checkpoint-unheld` until the connection can carry a frozen, protected checkpoint.
+
+A lost barrier reply triggers `ReleaseRead` with the original invocation identity.
+Settlement tracks uncertain invocations through their retry horizon.
+An exact protection receipt can be reconciled by retrying its original mutation identity.
+A lost Flight open reply can leave a handle until close or expiry, and an audience open with a new generation retires the previous handle.
+A lost preparation reply may require a new audience session.
+Each read retry is a new admission under D01 at the same requested basis or floor.
+
+For an installed audience, configure the existing audience listener and reader-seat headers.
+The gateway resolves the ordered holder and dials its configured audience Flight port on the enrolled endpoint's host.
+The node compares the exact ordered grant with its current leading attachment and checks the monotonic serving lease.
+The durable reader-seat claim still requires the DynamoDB seat store and the installed deployment reservation.
+The installed audience path can omit `--audience-journal-port`; classic audiences use that port and their dedicated directory read transport.
 
 ## Observe recovery and maintenance
 

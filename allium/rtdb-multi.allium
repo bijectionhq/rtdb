@@ -3479,9 +3479,10 @@ actor Gateway {
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
     -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
-    -- An audience handshake locates the existing holder using strongly consistent point reads of the installed deployment and its assigned member over the audience directory transport.
-    -- The audience route derives the holder endpoint from that member's advertised host and the installed audience port.
-    -- It cannot activate or warm a deployment or ask the ordinary control endpoint for a route.
+    -- A directory-backed audience handshake locates the holder and its advertised host over the audience directory transport.
+    -- An installed audience handshake locates the exact current ordered grant and uses its enrolled worker's host.
+    -- The audience route dials the configured audience port on that host.
+    -- Audience route discovery cannot activate a deployment.
     -- An audience handshake names one of two session seats per prepaid turn and an exact mint attempt.
     -- An audience handshake supplies one reader seat header using a canonical decimal turn, a single alternate digit, and a lowercase hyphenated non-nil attempt UUID.
     -- The holder obtains the deployment-wide seat claim before minting a session within its local reservation.
@@ -3495,6 +3496,8 @@ actor Gateway {
     -- Every new data action checks current placement standing.
     -- An audience placement must recover its commissioning checkpoint before it serves.
     -- Each prepared capture checks its catalog pin and projected transaction floor while standing is fenced by the current holder and writer epoch.
+    -- An installed capture holds the exact catalog checkpoint and suffix through its final user and admitted I/O.
+    -- An installed audience admits a capture only while the recovered leading attachment matches the current ordered grant and its serving lease is live.
     -- Audience actions exclude the whole-Root publication head and the provider-issuer control.
     -- An audience historical Root page scans at most five forward nominations under the prepared read, at equal valid and system coordinates less than 60 seconds before the hold.
     -- A detached audience operation polls with the same action and turn allowances as its admitting call.

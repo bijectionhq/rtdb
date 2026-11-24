@@ -343,7 +343,8 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     let options = &router.options;
     if let Some(installed) = options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
         if router.snapshot {
-            return Err(Anomaly::unsupported("rtdb.multi/ordered-snapshot", "The installed route serves fresh reads at its writer"));
+            return Err(Anomaly::unsupported("rtdb.multi/ordered-pgwire-checkpoint-unheld",
+                "The installed PGWire checkpoint selector cannot bind a connection to an exact protected checkpoint"));
         }
         if router.deployment.as_deref().is_some_and(|id| Uuid::parse_str(id).ok() != Some(installed.deployment)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));

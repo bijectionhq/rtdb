@@ -573,14 +573,26 @@ impl Node {
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = snapshot.with_system_time_cap(cap)?;
+            let storage = match hosted_fence.map(|(_, _, admission)| admission) {
+                Some(AppliedCatalogAdmission::PrepareAudience(storage)) => Arc::clone(storage),
+                Some(AppliedCatalogAdmission::PreparedAudience(preparation)) => Arc::clone(preparation.storage()),
+                _ => Arc::clone(&database.storage),
+            };
             let snapshot = if let Some((fence, expected_history, admission)) = hosted_fence {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
-                let permit = match admission {
-                    AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
-                    AppliedCatalogAdmission::PrepareAudience(storage) =>
-                        storage.hold_catalog(Some(cut)).await?,
-                    AppliedCatalogAdmission::Ordinary =>
-                        database.storage.hold_catalog_with_paths(Some(cut), snapshot.catalog_file_paths()).await?,
+                let permit = if database.requires_anchored_catalog() {
+                    if let AppliedCatalogAdmission::PreparedAudience(preparation) = admission {
+                        preparation.pin(&database, cut)?;
+                    }
+                    let checkpoint = snapshot.catalog_checkpoint()?.ok_or_else(applied_catalog_unretained)?;
+                    storage.hold_anchored_catalog(cut, checkpoint, None).await?
+                } else {
+                    match admission {
+                        AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
+                        AppliedCatalogAdmission::PrepareAudience(_) => storage.hold_catalog(Some(cut)).await?,
+                        AppliedCatalogAdmission::Ordinary =>
+                            storage.hold_catalog_with_paths(Some(cut), snapshot.catalog_file_paths()).await?,
+                    }
                 };
                 if !permit.is_registered() { return Err(applied_catalog_unretained()); }
                 let history = match admission {
@@ -595,11 +607,6 @@ impl Node {
                 snapshot.with_catalog_read(permit)
             } else {
                 rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?
-            };
-            let storage = match hosted_fence.map(|(_, _, admission)| admission) {
-                Some(AppliedCatalogAdmission::PrepareAudience(storage)) => Arc::clone(storage),
-                Some(AppliedCatalogAdmission::PreparedAudience(preparation)) => Arc::clone(preparation.storage()),
-                _ => Arc::clone(&database.storage),
             };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage });
         }

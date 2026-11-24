@@ -130,6 +130,10 @@ impl Database {
         self.replica_read_index.is_some()
     }
 
+    pub fn requires_anchored_catalog(&self) -> bool {
+        self.replica_read_index.as_ref().is_some_and(|index| index.requires_anchored_catalog())
+    }
+
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
         if let Some(index) = &self.replica_read_index {
             self.confirm_replica_cut(index.as_ref(), cancellation).await?;

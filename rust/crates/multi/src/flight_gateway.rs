@@ -366,10 +366,22 @@ impl Router {
         &self, name: &str, installation: Option<Uuid>, route: AudienceRoute,
     ) -> std::result::Result<Target, Status> {
         let source = route.profile.source();
-        if installation.is_some_and(|id| id != source)
-            || self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)).is_some()
-        {
+        if installation.is_some_and(|id| id != source) {
             return Err(Status::not_found("No matching installed Flight audience"));
+        }
+        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+            if installed.deployment != source {
+                return Err(Status::not_found("No matching installed Flight audience"));
+            }
+            let current = installed.journal.route().await.map_err(|_| moved())?;
+            let grant = current.writer.grant.ok_or_else(moved)?;
+            let worker = installed.endpoints.get(&grant.enrollment).ok_or_else(moved)?;
+            return Ok(Target {
+                name: name.to_owned(), deployment: source.to_string(),
+                holder: MemberId(grant.enrollment.worker.to_string()), epoch: grant.epoch,
+                address: audience_holder_address(&worker.pgwire, route.holder_port)?,
+                enrollment: Some(grant.enrollment), replica: None, ordered_reader: None, fresh: false,
+            });
         }
         let (record, member) = self.directory.audience_holder(&source.to_string()).await.map_err(directory_error)?
             .ok_or_else(moved)?;

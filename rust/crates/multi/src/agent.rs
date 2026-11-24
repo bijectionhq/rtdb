@@ -685,13 +685,17 @@ impl NodeAgent {
         task: Option<&rtdb_directory::HostedTask>) -> Result<Option<Box<dyn rtdb_directory::AudienceSeatClaim>>> {
         let unavailable = || Anomaly::new(AnomalyCategory::Unavailable,
             "rtdb.multi/audience-seat-unavailable", "The audience seat is not available at this placement");
+        let database = database.upgrade().ok_or_else(unavailable)?;
         let (id, epoch) = {
-            let database = database.upgrade().ok_or_else(unavailable)?;
             self.holdings.lock().get(database.name())
                 .filter(|holding| holding.linearizable && holding.database.as_ptr() == Arc::as_ptr(&database))
                 .map(|holding| (holding.id.clone(), holding.epoch)).ok_or_else(unavailable)?
         };
         let source = uuid::Uuid::parse_str(&id).map_err(|_| unavailable())?;
+        if database.requires_anchored_catalog() {
+            self.confirm_audience_read(&database, false).await?;
+            return self.directory.prepare_installed_audience_seat(source, index, task).await;
+        }
         self.directory.prepare_audience_seat(source, index, &self.member(), epoch, task).await
     }
 
@@ -700,13 +704,26 @@ impl NodeAgent {
         let unavailable = || Anomaly::new(
             AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold a linearizable database for {name}"),
         );
-        let (id, epoch, ordered) = self.holdings.lock().get(name)
+        let (id, epoch, grant) = self.holdings.lock().get(name)
             .filter(|holding| holding.linearizable && std::ptr::eq(holding.database.as_ptr(), database))
-            .map(|holding| (holding.id.clone(), holding.epoch, matches!(&holding.authority, HoldingAuthority::Journal(_))))
+            .map(|holding| (holding.id.clone(), holding.epoch, match &holding.authority {
+                HoldingAuthority::Journal(admission) => Some(admission.grant),
+                HoldingAuthority::Directory { .. } => None,
+            }))
             .ok_or_else(unavailable)?;
-        if ordered {
-            if !matches!(check, HostedReadCheck::Ordinary) { return Err(unavailable()); }
-            database.confirm_replica_snapshot(&CancellationToken::new()).await?;
+        if let Some(grant) = grant {
+            let placement = self.ordered.by_name(name).filter(|placement| placement.record.id == id)
+                .ok_or_else(unavailable)?;
+            let lease = database.object_store().catalog_delivery_lease().await?.ok_or_else(unavailable)?;
+            if placement.worker.route().await?.writer.grant != Some(grant)
+                || !matches!(database.status().role, DriverRole::Leading(_))
+                || !self.holdings.lock().get(name).is_some_and(|holding|
+                    std::ptr::eq(holding.database.as_ptr(), database)
+                        && matches!(&holding.authority, HoldingAuthority::Journal(current) if current.grant == grant))
+            {
+                return Err(unavailable());
+            }
+            lease.check()?;
             return Ok(id);
         }
         let member_id = self.member();

@@ -25,7 +25,7 @@ use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -365,7 +365,7 @@ const OWNED_CHANGE_COVERAGE: &str = "rtdb.owned.change_coverage_micros";
 pub(crate) struct OwnedReadResource {
     snapshot: OwnedReadSession,
     owner: ResourceOwner,
-    session: String,
+    pub(crate) session: String,
     database: String,
     audience_work: Option<rtdb_storage::audience_work::TurnAllowance>,
     audience_projection_work: Option<rtdb_storage::audience_work::TurnAllowance>,
@@ -506,7 +506,7 @@ pub(crate) struct OwnedWorldReadResource {
     world: Uuid,
     conditions: Mutex<BTreeMap<Uuid, RetainedWorldWitness>>,
     owner: ResourceOwner,
-    session: String,
+    pub(crate) session: String,
     database: String,
     _permit: OwnedSemaphorePermit,
     _reservation: Arc<MemoryReservation>,
@@ -2054,7 +2054,8 @@ impl Service {
         if call.session.audience_source().is_some() {
             call.session.install_audience_read(generation, handle, held)?;
         } else {
-            self.0.owned_reads.insert(handle, held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+            call.session.register_read(||
+                self.0.owned_reads.insert(handle, held, READ_IDLE, READ_IDLE, false, 16).map_err(status))?;
         }
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
     }
@@ -3907,11 +3908,15 @@ impl Service {
 
     pub(crate) async fn open_world_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let bytes: [u8; 16] = body.try_into().map_err(|_| invalid("Owned world read open requires a world UUID"))?;
         let world = Uuid::from_bytes(bytes);
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
+        if attachment.requires_anchored_catalog() {
+            return Err(status(Anomaly::unsupported("rtdb.owned/ordered-world-unheld",
+                "The installed journal cannot protect the world and all of its parent checkpoints")));
+        }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
@@ -3948,7 +3953,9 @@ impl Service {
             owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             _permit: permit, _reservation: reservation,
         });
-        self.0.owned_world_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+        call.session.register_read(|| self.0.owned_world_reads.insert(
+            Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16,
+        ).map_err(status))?;
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
     }
 

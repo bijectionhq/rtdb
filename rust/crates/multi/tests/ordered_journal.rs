@@ -716,7 +716,7 @@ async fn start_disposal_node(
     );
     let pgwire_port = pgwire_address.port();
     let configuration = rtdb_server::config::NodeConfiguration::from_yaml(&format!(
-        "authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: {pgwire_port}\n  numThreads: 4\nflightSql: {{port: 0}}\n",
+        "authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: {pgwire_port}\n  numThreads: 4\nflightSql: {{port: 0, ownedNativeActions: true}}\n",
     )).unwrap();
     let mut agent = AgentOptions::new(storage);
     agent.installed_journal_manifest = Some(manifest);
@@ -743,6 +743,141 @@ async fn start_disposal_node(
     process::start_node(MemoryDirectory::new(), settings)
         .await
         .unwrap()
+}
+
+#[test]
+fn installed_owned_reads_hold_their_cut_and_retry_a_discarded_reply() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                tokio::time::timeout(DEADLINE, exercise_installed_owned_reads()).await.unwrap();
+            });
+        }));
+        runtime.shutdown_timeout(DEADLINE);
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }).unwrap().join().unwrap();
+}
+
+async fn exercise_installed_owned_reads() {
+    use arrow_flight::{Action, flight_service_client::FlightServiceClient};
+    use tonic::{Code, transport::Channel};
+
+    struct Reader;
+    #[async_trait::async_trait]
+    impl rtdb_node::SessionIdentity for Reader {
+        fn user(&self) -> Option<&str> { Some("xtdb") }
+        async fn revalidate(&self, _: rtdb_types::Timestamp) -> rtdb_types::Result<()> { Ok(()) }
+        fn authorize_database(&self, _: &str, _: rtdb_node::DatabaseAccess) -> rtdb_types::Result<()> { Ok(()) }
+    }
+
+    let record = DeploymentRecord::new("shop", "acceptance", Vec::new(), now_ms());
+    let deployment = record.id.parse().unwrap();
+    let authority = Authority::new(deployment, 1 << 20, 24 << 20, 16);
+    let mut cohort = authority.start("owned-reads").await;
+    let keys = LocalKeyService::new(authority.data.path().join("keys")).unwrap();
+    keys.key(&record.key_id()).await.unwrap();
+    keys.provision_journal_key(rtdb_multi::keys::JournalKey::new(authority.placement, 1)).await.unwrap();
+    let node = start_disposal_node(&authority, &cohort, record.clone(), false).await;
+    let manifest = authority.data.path().join("owned-gateway.json");
+    write_json(&manifest, &json!([{
+        "name": "shop",
+        "deployment": deployment,
+        "journal": {
+            "incarnation": record.incarnation, "log_epoch": record.log_epoch,
+            "authority": {"kind": "routing"}, "route": cohort.route,
+            "credentials": authority.router.credentials,
+        },
+        "endpoints": [{
+            "enrollment": authority.enrollments[1],
+            "control": node.control_address, "pgwire": node.pgwire_address,
+        }],
+    }]));
+    let options = GatewayOptions {
+        capabilities: Some(common::secret()),
+        installed_journals: Some(Arc::new(GatewayRoutes::read(&manifest).unwrap())),
+        ..Default::default()
+    };
+    let directory: Arc<dyn Directory> = MemoryDirectory::new();
+    let stop = CancellationToken::new();
+    let flight = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flight_address = flight.local_addr().unwrap();
+    let flight = tokio::spawn(flight_gateway::serve(flight, directory, options, stop.clone()));
+
+    let session = flight_client(flight_address, deployment).await;
+    let channel = Channel::from_shared(format!("http://{flight_address}")).unwrap().connect().await.unwrap();
+    let mut client = FlightServiceClient::new(channel);
+    let action = |name: &str, body: Vec<u8>| {
+        let mut request = tonic::Request::new(Action { r#type: name.to_owned(), body: body.into() });
+        request.metadata_mut().insert("authorization", format!("Bearer {}", session.token().unwrap()).parse().unwrap());
+        request
+    };
+    let open = client.do_action(action("rtdb.owned.OpenRead.v3", vec![])).await.unwrap()
+        .into_inner().message().await.unwrap().unwrap().body;
+    assert_eq!(open.len(), 40);
+    let mut fresh = deployment.as_bytes().to_vec();
+    fresh.push(0);
+    let lost = client.do_action(action("rtdb.owned.OpenFreshRead.v2", fresh.clone())).await.unwrap();
+    drop(lost);
+    let retained = client.do_action(action("rtdb.owned.OpenFreshRead.v2", fresh)).await.unwrap()
+        .into_inner().message().await.unwrap().unwrap().body;
+    assert_ne!(&open[..16], &retained[..16]);
+    assert_eq!(&open[16..32], &retained[16..32]);
+
+    let mut floor = deployment.as_bytes().to_vec();
+    floor.push(1);
+    floor.extend_from_slice(&retained[24..32]);
+    floor.extend_from_slice(&retained[16..24]);
+    floor.extend_from_slice(&0_u64.to_be_bytes());
+    let applied = client.do_action(action("rtdb.owned.OpenAppliedRead.v5", floor)).await.unwrap()
+        .into_inner().message().await.unwrap().unwrap().body;
+    assert_eq!(&applied[16..32], &retained[16..32]);
+    let mut usage = retained[..16].to_vec();
+    usage.extend_from_slice(&1_u16.to_be_bytes());
+    usage.extend_from_slice(&6_u16.to_be_bytes());
+    usage.extend_from_slice(b"orders");
+    let usage = client.do_action(action("rtdb.owned.ReadHeldStorageUsage.v1", usage)).await.unwrap()
+        .into_inner().message().await.unwrap().unwrap();
+    assert!(!usage.body.is_empty());
+    let mut closed = client.do_action(action("rtdb.owned.CloseRead.v1", open[..16].to_vec())).await.unwrap().into_inner();
+    assert!(closed.message().await.unwrap().is_none());
+    let error = match client.do_action(action("rtdb.owned.OpenWorldRead.v6", Uuid::new_v4().as_bytes().to_vec())).await {
+        Ok(reply) => reply.into_inner().message().await.unwrap_err(),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert!(String::from_utf8_lossy(&error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap())
+        .contains("rtdb.owned/ordered-world-unheld"));
+    let mut closed = client.do_action(action("CloseSession", vec![])).await.unwrap().into_inner();
+    assert!(closed.message().await.unwrap().is_some());
+
+    let local = node.server.node();
+    let db = local.catalog().database("shop").unwrap();
+    local.confirm_audience_route(&db, deployment).await.unwrap();
+    let tx = local.latest_completed_transactions().unwrap()["shop"][0].unwrap();
+    let prepaid = local.memory().prepay(32 << 20).unwrap();
+    let cache = rtdb_storage::cache::CacheBudget::with_memory(local.memory().prepay(32 << 20).unwrap());
+    let mut audience = local.audience_session("shop", Arc::new(Reader), deployment, prepaid, cache).unwrap();
+    let floor = rtdb_node::AppliedReadFloor::new(deployment, vec![tx]).unwrap();
+    assert!(audience.prepare_applied_owned_reads(&floor).await.unwrap() > 0);
+    drop(audience.open_applied_owned_read(&floor).await.unwrap());
+    drop(audience);
+    let worker = authority.workers[1].client(&cohort.route);
+    let prior = route(&worker).await;
+    let grant = prior.writer.grant.unwrap();
+    assert!(execute(&worker, request(prior, Principal::Worker(grant.enrollment), Command::Vacate { grant }))
+        .await.receipt.outcome.is_ok());
+    assert!(local.confirm_audience_route(&db, deployment).await.is_err());
+
+    stop.cancel();
+    flight.await.unwrap().unwrap();
+    node.shutdown().await.unwrap();
+    for voter in &mut cohort.voters { voter.stop().await; }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

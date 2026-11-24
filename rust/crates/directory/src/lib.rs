@@ -1425,6 +1425,9 @@ pub trait Directory: Send + Sync {
     fn require_audience_reads(&self) -> Result<()> {
         Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
     }
+    fn require_installed_audience_seats(&self) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no durable audience seat authority"))
+    }
     /// Locates the existing holder using the audience's point-read transport.
     /// The caller must still check its exact name, authority, and eligibility.
     async fn audience_holder(&self, _id: &str) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
@@ -1438,6 +1441,10 @@ pub trait Directory: Send + Sync {
     /// Prepares a revision-fenced claim for one of the deployment's prepaid Flight seats.
     async fn prepare_audience_seat(&self, _source: uuid::Uuid, _index: usize, _member: &MemberId,
         _epoch: u64, _task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
+        Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no audience seat authority"))
+    }
+    async fn prepare_installed_audience_seat(&self, _source: uuid::Uuid, _index: usize,
+        _task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
         Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no audience seat authority"))
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;

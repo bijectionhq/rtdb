@@ -75,11 +75,20 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     });
     ordered.reserve_deployments(directory.as_ref()).await?;
     let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
-    if audience.is_some() != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
+    if settings.agent.audience_journal_port == Some(0)
+        || audience.is_none() && settings.agent.audience_journal_port.is_some()
+        || audience.is_some() && settings.agent.audience_journal_port.is_none() && settings.agent.installed_journal_manifest.is_none()
+    {
         return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
-            "An audience Flight listener and its read-only journal port must be installed together"));
+            "A classic audience Flight listener requires its read-only journal port"));
     }
-    if audience.is_some() { directory.require_audience_reads()?; }
+    if audience.is_some() {
+        if settings.agent.audience_journal_port.is_some() {
+            directory.require_audience_reads()?;
+        } else {
+            directory.require_installed_audience_seats()?;
+        }
+    }
     if let Some(archive) = &settings.agent.world_archive {
         crate::archive::require_independent_world_archive(&settings.agent.storage, archive)?;
     }

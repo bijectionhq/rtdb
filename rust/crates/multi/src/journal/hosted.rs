@@ -142,6 +142,10 @@ impl GatewayRoutes {
         self.0.get(name)
     }
 
+    pub fn contains_deployment(&self, deployment: Uuid) -> bool {
+        self.0.values().any(|route| route.deployment == deployment)
+    }
+
     pub async fn reserve_deployments(&self, directory: &dyn rtdb_directory::Directory) -> Result<()> {
         for placement in self.0.values() {
             directory.reserve_installed_journal(placement.deployment).await?;

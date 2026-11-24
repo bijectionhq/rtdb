@@ -16,7 +16,7 @@ use futures::future::BoxFuture;
 use ordered_logkeeper::ordered::{Grant, Hold, Placement};
 use prost_types::Any;
 use rtdb_format::trie_retirement::InstalledRetirement;
-use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
+use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_replication::{BlockDiscovery, PublishedCheckpoint};
 use rtdb_storage::{
     Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadLease,
@@ -120,6 +120,19 @@ impl RemoteStorageFactory for StoreFactory {
         false
     }
 
+    async fn wrap_stores(
+        &self, configuration: &Any, ordinary: Arc<dyn ObjectStore>, audience: Option<Arc<dyn ObjectStore>>,
+        _: Option<rtdb_storage::sealing::PublicationSealing>,
+    ) -> Result<OpenedServingStores> {
+        let audience = if let Some(store) = audience {
+            let (placement, _) = self.routes.resolve(configuration)?;
+            Some(AudienceReadStorage { source: placement.worker.deployment(), store })
+        } else {
+            None
+        };
+        Ok(OpenedServingStores { ordinary, audience })
+    }
+
     async fn open(
         &self,
         configuration: &Any,
@@ -214,7 +227,7 @@ impl RemoteStorageFactory for StoreFactory {
             Arc::clone(&io),
         );
         let upper: Arc<dyn ObjectStore> = Arc::new(EncryptingStore::with_units(upper, Arc::new(ledger)));
-        let store = Arc::new(ServingStore {
+        let store: Arc<dyn ObjectStore> = Arc::new(ServingStore {
             lower,
             upper,
             snapshot: Some(snapshot::Source {
@@ -236,10 +249,11 @@ impl RemoteStorageFactory for StoreFactory {
                 _protection: protection,
             }),
         });
+        let audience = Some(Arc::clone(&store));
         Ok(OpenedRecoveryStore {
             store,
             blocks,
-            audience: None,
+            audience,
             checkpoint_metadata: None,
             fragment_storage: None,
             publication_sealing: None,

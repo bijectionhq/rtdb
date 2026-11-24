@@ -18,6 +18,7 @@ pub type TransactionClock = dyn Fn() -> Result<Timestamp> + Send + Sync;
 #[async_trait]
 pub trait ReplicaReadIndex: Send + Sync {
     fn deployment(&self) -> Option<uuid::Uuid> { None }
+    fn requires_anchored_catalog(&self) -> bool { false }
 
     /// Bounds writes completed before the call on the replica log opened with this capability.
     async fn confirm(&self) -> Result<rtdb_storage::log::LogOffset>;

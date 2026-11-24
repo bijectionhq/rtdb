@@ -426,6 +426,39 @@ fn member_item(record: &MemberRecord) -> Result<Item> {
 }
 
 impl DynamoDirectory {
+    async fn prepare_seat_claim(&self, source: uuid::Uuid, index: usize, task: Option<&HostedTask>,
+        deployment: ConditionCheck) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
+        let name = format!("{AUDIENCE_SEAT_PREFIX}{source}/{index}");
+        let revision = match self.get(&self.tables.deployment_names, NAME, &name).await? {
+            None => SeatRevision::Missing,
+            Some(item) => {
+                let revision = uuid::Uuid::parse_str(string_attribute(&item, SEAT_REVISION)?)
+                    .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-revision", error.to_string()))?.as_u128();
+                match item.get(SEAT_CHARGED) {
+                    Some(AttributeValue::Bool(false)) => SeatRevision::Free(revision),
+                    Some(AttributeValue::Bool(true)) => {
+                        let stopped = match item.get(RECORD) {
+                            Some(AttributeValue::S(record)) => {
+                                let owner: HostedTask = serde_json::from_str(record)
+                                    .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-owner", error.to_string()))?;
+                                self.hosted_task_stopped(&owner).await?
+                            }
+                            None => false,
+                            _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-owner", "Invalid audience seat owner")),
+                        };
+                        SeatRevision::Charged { revision, stopped }
+                    }
+                    _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-state", "Invalid audience seat state")),
+                }
+            }
+        };
+        let Some(predecessor) = claim_predecessor(revision) else { return Ok(None); };
+        Ok(Some(Box::new(DynamoAudienceSeat {
+            client: self.client.clone(), names: self.tables.deployment_names.clone(), deployment, name, predecessor,
+            claimed: uuid::Uuid::new_v4().as_u128(), released: uuid::Uuid::new_v4().as_u128(), task: task.cloned(),
+        })))
+    }
+
     async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>,
         stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
@@ -744,31 +777,6 @@ impl Directory for DynamoDirectory {
 
     async fn prepare_audience_seat(&self, source: uuid::Uuid, index: usize, member: &MemberId,
         epoch: u64, task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
-        let name = format!("{AUDIENCE_SEAT_PREFIX}{source}/{index}");
-        let revision = match self.get(&self.tables.deployment_names, NAME, &name).await? {
-            None => SeatRevision::Missing,
-            Some(item) => {
-                let revision = uuid::Uuid::parse_str(string_attribute(&item, SEAT_REVISION)?)
-                    .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-revision", error.to_string()))?.as_u128();
-                match item.get(SEAT_CHARGED) {
-                    Some(AttributeValue::Bool(false)) => SeatRevision::Free(revision),
-                    Some(AttributeValue::Bool(true)) => {
-                        let stopped = match item.get(RECORD) {
-                            Some(AttributeValue::S(record)) => {
-                                let owner: HostedTask = serde_json::from_str(record)
-                                    .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-owner", error.to_string()))?;
-                                self.hosted_task_stopped(&owner).await?
-                            }
-                            None => false,
-                            _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-owner", "Invalid audience seat owner")),
-                        };
-                        SeatRevision::Charged { revision, stopped }
-                    }
-                    _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-state", "Invalid audience seat state")),
-                }
-            }
-        };
-        let Some(predecessor) = claim_predecessor(revision) else { return Ok(None); };
         let deployment = ConditionCheck::builder().table_name(&self.tables.deployments)
             .key(ID, AttributeValue::S(source.to_string()))
             .condition_expression("#holder = :holder AND #epoch = :epoch")
@@ -776,10 +784,20 @@ impl Directory for DynamoDirectory {
             .expression_attribute_values(":holder", AttributeValue::S(member.as_str().to_owned()))
             .expression_attribute_values(":epoch", number(epoch))
             .build().map_err(build_fault)?;
-        Ok(Some(Box::new(DynamoAudienceSeat {
-            client: self.client.clone(), names: self.tables.deployment_names.clone(), deployment, name, predecessor,
-            claimed: uuid::Uuid::new_v4().as_u128(), released: uuid::Uuid::new_v4().as_u128(), task: task.cloned(),
-        })))
+        self.prepare_seat_claim(source, index, task, deployment).await
+    }
+
+    fn require_installed_audience_seats(&self) -> Result<()> { Ok(()) }
+
+    async fn prepare_installed_audience_seat(&self, source: uuid::Uuid, index: usize,
+        task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
+        let deployment = ConditionCheck::builder().table_name(&self.tables.deployments)
+            .key(ID, AttributeValue::S(installed_journal_id(source)?))
+            .condition_expression("#installed = :installed")
+            .expression_attribute_names("#installed", INSTALLED_JOURNAL)
+            .expression_attribute_values(":installed", AttributeValue::Bool(true))
+            .build().map_err(build_fault)?;
+        self.prepare_seat_claim(source, index, task, deployment).await
     }
 
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
