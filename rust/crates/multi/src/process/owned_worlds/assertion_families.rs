@@ -247,8 +247,11 @@ pub(super) async fn serve(
             FamilyReply::Sealed(Bytes::from(envelope))
         }
         FamilyRequest::OpenRootLandingPayload { family, stage, binding, envelope } => {
+            let stage = scope.stage(stage)?;
+            original.current(deployment, session.state().cancellation()).await?
+                .require_unretired_family_source().await?;
             let body = families.open_root_landing_payload(
-                scope.family(family), scope.stage(stage)?, binding, envelope, vault()?,
+                scope.family(family), stage, binding, envelope, vault()?,
             ).await?;
             families.track_family_delivery(family)?;
             FamilyReply::Opened(body)

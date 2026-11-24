@@ -281,6 +281,7 @@ The RTDB adapter derives the registry commitment from the original placed histor
 It authenticates the exact row creator against the current original `bj_installation` writer and checks the original registry address at the same barrier.
 Registration observation also requires the current Original control view to cover the exact transaction sampled when it opened the carrier journal authority.
 Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
+The placed Original route checks the archive source fence before opening a Root landing and at family plaintext handoff.
 
 ### Ranked response contributor inventory
 
