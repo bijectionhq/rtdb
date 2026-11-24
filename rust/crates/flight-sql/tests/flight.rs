@@ -61,6 +61,16 @@ impl rtdb_node::PlacedReceiptCodec for HostedFixtureReceipts {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)
             .map_err(|_| Anomaly::incorrect("test/placed-receipt", "Invalid fixture receipt"))
     }
+
+    fn seal_snapshot(&self, value: &[u8]) -> Result<String> {
+        Ok(format!("snapshot-{}", self.seal(value)?))
+    }
+
+    fn open_snapshot(&self, token: &str) -> Result<Vec<u8>> {
+        let token = token.strip_prefix("snapshot-")
+            .ok_or_else(|| Anomaly::incorrect("test/placed-snapshot", "Invalid fixture snapshot"))?;
+        self.open(token)
+    }
 }
 
 #[async_trait]
@@ -129,11 +139,18 @@ impl Client {
         Self::connect_with_database(server, basic, None).await
     }
     async fn connect_with_database(server: &ServerHandle, basic: Option<&str>, database: Option<&str>) -> Self {
+        Self::connect_with_peer(server, basic, database, None).await
+    }
+
+    async fn connect_with_peer(server: &ServerHandle, basic: Option<&str>, database: Option<&str>, proof: Option<&str>) -> Self {
         let channel = Channel::from_shared(format!("http://{}", server.address())).unwrap().connect().await.unwrap();
         let client = FlightServiceClient::new(channel); let mut this = Self { client, headers: MetadataMap::new() };
         if let Some(basic) = basic { use base64::Engine; this.headers.insert("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(basic)).parse().unwrap()); }
         if let Some(database) = database { this.headers.insert("x-xtdb-database", database.parse().unwrap()); }
-        let request = this.request(futures::stream::iter(vec![arrow_flight::HandshakeRequest::default()]));
+        let mut request = this.request(futures::stream::iter(vec![arrow_flight::HandshakeRequest::default()]));
+        if let Some(proof) = proof {
+            request.metadata_mut().insert(rtdb_flight_sql::FORWARDED_PEER_HEADER, proof.parse().unwrap());
+        }
         let response = this.client.handshake(request).await.unwrap();
         if let Some(cookie) = response.metadata().get("set-cookie") { this.headers.insert("cookie", cookie.clone()); }
         if let Some(auth) = response.metadata().get("authorization") { this.headers.insert("authorization", auth.clone()); }
@@ -1328,8 +1345,19 @@ async fn hosted_source_confirmation_checks_the_exact_prior_positions() {
 
 #[tokio::test]
 async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
+    #[derive(Debug)]
+    struct FreshPeer;
+
+    impl rtdb_flight_sql::FlightPeerVerifier for FreshPeer {
+        fn verify(&self, proof: &str, _: &rtdb_node::Database) -> Result<(std::net::IpAddr, bool)> {
+            assert_eq!(proof, "fresh-fixture");
+            Ok((std::net::Ipv4Addr::LOCALHOST.into(), true))
+        }
+    }
+
     let running = Running::start_with_placements(Some("secret"), FlightConfig {
         owned_native_actions: true,
+        forwarded_peer: Some(Arc::new(FreshPeer)),
         hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
             owner: "xtdb".into(),
             relations: ["bj_relation_declarations".to_owned()].into(),
@@ -1349,6 +1377,11 @@ async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
     let request = |selector| Bytes::from([hold, &[selector]].concat());
     let action = "rtdb.owned.ReadHeldRootCatalog.v1";
     assert_eq!(other.action(action, request(7)).await.unwrap_err().code(), tonic::Code::NotFound);
+    let mut replica = Client::connect_with_peer(
+        &running.server, Some("xtdb:secret"), Some("application"), Some("fresh-fixture"),
+    ).await;
+    assert_eq!(replica.action(action, request(7)).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(replica.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     assert_eq!(owner.action(action, request(0)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     owner.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(-1 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
 
