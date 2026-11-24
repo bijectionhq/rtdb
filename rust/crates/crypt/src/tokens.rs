@@ -381,7 +381,7 @@ impl TokenIssuer {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct VerifiedClaims(Vec<(Claim, Result<ClaimEvidence>)>);
 
 impl VerifiedClaims {

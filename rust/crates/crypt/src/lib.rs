@@ -4,6 +4,8 @@ mod aead;
 mod custody;
 mod file;
 mod local;
+mod source;
+pub use source::SourceAdmissionKey;
 pub mod tokens;
 
 use async_trait::async_trait;

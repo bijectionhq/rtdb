@@ -1021,6 +1021,127 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     assert_eq!(recovered.partition.value().table_catalog().metadata(&TableRef::new("public", "docs")).unwrap().row_count, 1);
 }
 
+fn serving_source_put(key: u8) -> rtdb_tx::transact::Transact {
+    use rtdb_tx::transact::{Cell, Op, Row, Transact, Window};
+    use rtdb_types::EntityId;
+
+    Transact {
+        key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), requires: Vec::new(),
+        ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "intake"), if_absent: false,
+            rows: vec![Row { id: EntityId::Integer(i64::from(key)), valid: None,
+                cells: StructFields::from([("value".into(), Cell::Value(Value::I64(i64::from(key))))]), custody_group: None,
+                protected_columns: Vec::new(), custody_payload: None }] }],
+        otherwise: Vec::new(), custody_request_digest: None, request_memory: None,
+    }
+}
+
+#[tokio::test]
+async fn default_serving_recovers_a_lost_source_reply_and_consumes_retries_in_order() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_tx::transact::{Op, Outcome};
+    use rtdb_types::rtdb_v1::At;
+
+    let clock = Arc::new(AtomicI64::new(100));
+    let sample = Arc::clone(&clock);
+    let mut fixture = fixture_with_clock(
+        ReplicationConfig { assertion_interval: Duration::from_millis(5), ..Default::default() },
+        1 << 27, Some(Arc::new(move || Timestamp(sample.load(Ordering::Acquire)))),
+    ).await;
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    let request = serving_source_put(1);
+    let disconnected = CancellationToken::new();
+    let submit = serving.transact(request.clone(), VerifiedClaims::default(), None, &disconnected);
+    tokio::pin!(submit);
+    assert!(futures::poll!(&mut submit).is_pending());
+    assert_eq!(fixture.logs.latest_source_position().unwrap(), SourcePosition(0));
+    assert_eq!(fixture.handle.progress().current().source_position, SourcePosition(-1));
+    assert_eq!(serving.view(At::Latest, &disconnected).await.unwrap().index.head().basis.position(), 0);
+    disconnected.cancel();
+    assert_eq!(submit.await.unwrap_err().code, "rtdb/transaction-outcome-unknown");
+
+    let forged = fixture.handle.submit_source(
+        &SourceMessage::Protobuf(SourceBody::ServingTransact(Bytes::copy_from_slice(request.canonical_request().unwrap().get().as_bytes()))),
+        Timestamp(100),
+    ).await.unwrap();
+    assert_eq!(forged, SourcePosition(1));
+    let between = fixture.handle.submit_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(Default::default())), Timestamp(100)).await.unwrap();
+    assert_eq!(between, SourcePosition(2));
+    clock.store(200, Ordering::Release);
+    let driver = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    let (receipt, conflict) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut other = request.clone();
+        other.ops = vec![Op::DropBranch { branch: "different".into() }];
+        tokio::join!(
+            serving.transact(request, VerifiedClaims::default(), None, &cancellation),
+            serving.transact(other, VerifiedClaims::default(), None, &cancellation),
+        )
+    }).await.unwrap();
+    let receipt = receipt.unwrap();
+    assert!(receipt.replayed);
+    assert_eq!(receipt.outcome, Outcome::Then);
+    assert_eq!(receipt.system_time, Timestamp(200));
+    assert_eq!(receipt.basis.position(), 1);
+    assert_eq!(conflict.unwrap_err().code, "rtdb/idempotency-key");
+    assert_eq!(fixture.handle.progress().current().source_position, SourcePosition(4));
+    assert_eq!(serving.view(At::Latest, &cancellation).await.unwrap().index.head().basis, receipt.basis);
+    fixture.handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn new_term_refuses_a_durable_timed_original_before_resuming_the_source() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_tx::transact::Outcome;
+
+    let interval = Duration::from_millis(5);
+    let mut fixture = fixture(ReplicationConfig { assertion_interval: interval, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let authority = || NativeServingAuthority { incarnation: [7; 16], checkpoints: None };
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), authority(), false).await.unwrap();
+    let mut request = serving_source_put(1);
+    request.window.before = Some(Timestamp::MAX);
+    let disconnected = CancellationToken::new();
+    let submit = serving.transact(request.clone(), VerifiedClaims::default(), None, &disconnected);
+    tokio::pin!(submit);
+    assert!(futures::poll!(&mut submit).is_pending());
+    assert_eq!(fixture.logs.latest_source_position().unwrap(), SourcePosition(0));
+    disconnected.cancel();
+    assert_eq!(submit.await.unwrap_err().code, "rtdb/transaction-outcome-unknown");
+
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp::default()));
+    fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    fixture.driver.consume(opening).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    let mut source = fixture.source.read_range(LogOffset(0), LogOffset(1)).await.unwrap();
+    fixture.driver.leader.as_mut().unwrap().source_batch.push_back(source.pop().unwrap());
+    fixture.driver.resolve_next_source().await.unwrap();
+    let mut replica_tail = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    let original = next_local_record(replica_tail.as_mut()).await;
+    let envelope = ReplicaEnvelope::decode(&original.payload).unwrap().unwrap();
+    assert!(matches!(envelope.message, ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none() && noop.serving_record.is_some()));
+    assert_eq!(fixture.handle.progress().current().source_position, SourcePosition(-1));
+    fixture.driver.demote().await.unwrap();
+
+    let (handle, mut driver) = local_recovery_driver(fixture.source.clone(), fixture.replica.clone(), fixture.store.clone(), true, interval).await;
+    let serving = driver.attach_native_serving(handle.clone(), authority(), false).await.unwrap();
+    let running = tokio::spawn(driver.run());
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(Duration::from_secs(5), handle.await_source(SourcePosition(0), &cancellation)).await.unwrap().unwrap();
+    assert!(matches!(handle.status().role, Role::Leading(term) if term > Term(1)));
+    let refusal = serving.tx_status(request.key.clone(), None, &cancellation).await.unwrap();
+    assert!(matches!(&refusal.outcome, Outcome::Refused { error } if error.code == "rtdb/timed-transaction-refused"));
+    assert_eq!(refusal.basis.position(), 2);
+    let retry = serving.transact(request, VerifiedClaims::default(), None, &cancellation).await.unwrap();
+    assert_eq!(retry, refusal);
+    let next = serving.transact(serving_source_put(2), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+    assert_eq!(next.basis.position(), 3);
+    assert_eq!(handle.progress().current().source_position, SourcePosition(2));
+    handle.shutdown();
+    running.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn the_leader_records_artefacts_of_live_tries_and_deletes_the_files_of_entries_for_tries_it_does_not_hold() {
     let fixture = fixture(ReplicationConfig { rows_per_block: 2, assertion_interval: Duration::from_millis(10), ..Default::default() }, 1 << 27).await;
