@@ -20,7 +20,9 @@
 -- Embedded JVM ADBC owns an independent copy of bound Arrow buffers before it lends them to the native statement.
 -- Its result reader imports the stream schema once and reuses it for each Arrow array.
 -- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
--- A v1 Query can bind its admitted batch by position when all parameter cells are present Booleans, signed integers, Float32 or Float64 in unannotated fields.
+-- A v1 Query can bind an admitted batch by position for unencoded scalar fields and nullable Arrow Null fields.
+-- Present nonempty List and FixedSizeList cells can bind in Arrow when their fields are unannotated and their required Float32 or Float64 children use the canonical name.
+-- Unsigned scalar columns share their value and validity buffers with signed columns at the same width during execution.
 -- Other parameter layouts and plans that decline direct binding use the scalar binding path.
 -- Embedded Clojure SQL plans bind compatible positional arguments as one C Data row with their native widths and nulls.
 -- Flight SQL uploads retain the message body as backing storage for compatible record and dictionary buffers.
