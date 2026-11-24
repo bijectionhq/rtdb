@@ -359,7 +359,7 @@ impl Service {
         {
             return Err(call.error(Status::resource_exhausted("The audience reply exceeds its transport allowance")));
         }
-        self.publish(); action_result_stream(call, results, plaintext)
+        self.publish(); action_result_stream(call, results, plaintext).await
     }
     fn claim_transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {
         self.transaction(call, handle)?; found(self.0.transactions.take(handle), "transaction")

@@ -23,7 +23,7 @@ impl ConnectionDriver {
         config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>,
         cancellation: CancellationToken, draining: CancellationToken,
     ) -> Self {
-        Self { process, stream: Box::new(stream), address, encrypted, node, auth, config, registry, cancellation, draining }
+        Self { process, stream: Box::new(rtdb_query::DeliveryIo::new(stream)), address, encrypted, node, auth, config, registry, cancellation, draining }
     }
     pub async fn run(self) -> Result<()> {
         let memory = Arc::clone(self.node.memory());
@@ -40,9 +40,10 @@ impl ConnectionDriver {
         let _read_session = settings.replica_read.then(|| session.track_replica_read_session()).transpose()?;
         let registration = self.registry.register(self.process);
         if let Some(observer) = self.node.execution_observer() { observer.connection_event(rtdb_plan::ConnectionEvent::Opened); }
+        let gateway = settings.gateway_session_state;
         let mut protocol = crate::protocol::ProtocolSession::new(session, self.node, self.config.clone(), settings, Arc::clone(&registration.slot));
-        let (read, write) = tokio::io::split(stream);
-        let mut reader = Reader::new(read, Arc::clone(&memory)); let mut writer = Writer::new(tokio::io::BufWriter::with_capacity(64 * 1024, write), memory);
+        let (read, write) = tokio::io::split(rtdb_query::DeliveryIo::new(stream));
+        let mut reader = Reader::new(read, Arc::clone(&memory)); let mut writer = Writer::new(tokio::io::BufWriter::with_capacity(64 * 1024, write), memory).through_gateway(gateway);
         let reader_stop = self.cancellation.child_token();
         let (sender, mut receiver) = mpsc::channel(64);
         let reader_token = reader_stop.clone(); let slot = Arc::clone(&registration.slot); let limit = self.config.maximum_message_bytes;

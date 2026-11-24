@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit};
+use rtdb_pgwire::{GATEWAY_ANSWER_DEADLINE_KIND, GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit};
+use rtdb_storage::sealing::{DeliveryDeadline, DeliveryIo};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,6 +23,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
 pub(crate) const DEFAULT_GATEWAY_FRAME_BYTES: usize = 1 << 30;
+const ANSWER_EXPIRED: &str = "rtdb.multi/answer-delivery-expired";
 const FRAME_MEMORY: &str = "rtdb.multi/gateway-frame-memory";
 pub(crate) const STARTUP_WITHIN: Duration = Duration::from_secs(35);
 const STARTUP_TIMEOUT: &str = "rtdb.multi/startup-timeout";
@@ -71,6 +73,71 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin), memory: &Arc<MemoryBu
     bytes.resize(length - 4, 0);
     reader.read_exact(&mut bytes).await?;
     Ok(Some(Frame { tag, body: Bytes::from_owner(BufferedBody { bytes, _reservation: reservation }) }))
+}
+
+struct AnswerRelay {
+    forward_stamp: bool,
+    next: Option<(Frame, DeliveryDeadline)>,
+}
+
+impl AnswerRelay {
+    fn new(forward_stamp: bool) -> Self { Self { forward_stamp, next: None } }
+
+    fn stamp(&mut self, frame: &Frame) -> Result<bool> {
+        if frame.tag != GATEWAY_SESSION_STATE_TAG || frame.body.first() != Some(&GATEWAY_ANSWER_DEADLINE_KIND) {
+            return Ok(false);
+        }
+        let cutoff = frame.body[1..].try_into().ok().map(u64::from_be_bytes)
+            .and_then(DeliveryDeadline::from_wire_nanos).ok_or_else(answer_expired)?;
+        if self.next.is_some() { return Err(answer_expired()); }
+        self.next = Some((frame.clone(), cutoff));
+        Ok(true)
+    }
+
+    async fn write(&mut self, client: &mut (impl AsyncWrite + Unpin), frame: &Frame) -> Result<()> {
+        let pending = self.next.take();
+        let send = async {
+            if let Some((stamp, _)) = &pending && self.forward_stamp {
+                client.write_all(&stamp.encode()).await?;
+            }
+            client.write_all(&frame.encode()).await?;
+            client.flush().await
+        };
+        if let Some((_, cutoff)) = &pending {
+            // A partly written frame poisons the connection, whatever the underlying I/O error.
+            cutoff.writing(send).await.map_err(|_| answer_expired())
+        } else {
+            send.await.map_err(io)
+        }
+    }
+}
+
+/// Preserves the original answer cutoff at the outermost gateway's socket.
+pub(crate) async fn relay_cell(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    backend: TcpStream,
+    memory: &Arc<MemoryBudget>,
+    forward_stamp: bool,
+) -> Result<()> {
+    let (mut requests, mut client) = tokio::io::split(DeliveryIo::new(client));
+    let (mut responses, mut backend) = backend.into_split();
+    let upload = async {
+        tokio::io::copy(&mut requests, &mut backend).await.map_err(io)?;
+        backend.shutdown().await.map_err(io)
+    };
+    let download = async {
+        let mut relay = AnswerRelay::new(forward_stamp);
+        while let Some(frame) = read_frame(&mut responses, memory).await.map_err(io)? {
+            if !relay.stamp(&frame)? { relay.write(&mut client, &frame).await?; }
+        }
+        if relay.next.is_some() { return Err(answer_expired()); }
+        Ok(())
+    };
+    let mut download = std::pin::pin!(download);
+    tokio::select! {
+        result = &mut download => result,
+        result = upload => { result?; download.await }
+    }
 }
 
 /// Reads frames off `reader` into a channel, so the session can wait on both directions without losing a partly read frame.
@@ -358,12 +425,13 @@ impl Session {
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
     pub async fn run(self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_control: Option<String>, first_epoch: u64) -> Result<()> {
-        self.run_before(client, first, first_control, first_epoch, tokio::time::Instant::now() + STARTUP_WITHIN).await
+        self.run_before(client, first, first_control, first_epoch, tokio::time::Instant::now() + STARTUP_WITHIN, false).await
     }
 
     pub(crate) async fn run_before(mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_control: Option<String>, first_epoch: u64,
-                                   startup_deadline: tokio::time::Instant) -> Result<()> {
-        let (client_read, mut client_write) = tokio::io::split(client);
+                                   startup_deadline: tokio::time::Instant, forward_stamp: bool) -> Result<()> {
+        let (client_read, mut client_write) = tokio::io::split(DeliveryIo::new(client));
+        let mut answers = AnswerRelay::new(forward_stamp);
         let (mut requests, mut client_reader) = pump(client_read, Arc::clone(&self.frame_memory));
         let mut copying_in = false;
         let mut replay_deadline = None;
@@ -389,6 +457,7 @@ impl Session {
                         _ = wait_for_retirement(self.record.as_mut()) => Event::Retired,
                         _ = tokio::time::sleep_until(startup_deadline), if !self.greeting.done => return Err(startup_timeout()),
                         _ = wait_until(replay_deadline) => return Err(replay_timeout()),
+                        _ = wait_until(answers.next.as_ref().map(|(_, cutoff)| cutoff.instant().into())) => return Err(answer_expired()),
                         event = async {
                             if let Some(deadline) = current.drain_deadline {
                                 let reply = tokio::time::timeout_at(deadline, current.frames.recv()).await
@@ -453,6 +522,7 @@ impl Session {
                         self.status = Status::Busy;
                     }
                     Event::Reply(Some(Ok(frame))) => {
+                        if answers.stamp(&frame)? { continue; }
                         if frame.tag == GATEWAY_SESSION_STATE_TAG {
                             if !self.greeting.done {
                                 backend.as_mut().expect("greeting backend").keys.observe(&frame.body);
@@ -581,8 +651,7 @@ impl Session {
                             }
                             _ => {}
                         }
-                        client_write.write_all(&frame.encode()).await.map_err(io)?;
-                        client_write.flush().await.map_err(io)?;
+                        answers.write(&mut client_write, &frame).await?;
                     }
                     Event::Reply(Some(Err(error))) if error.kind() == std::io::ErrorKind::OutOfMemory => {
                         if self.status != Status::Idle && self.greeting.done {
@@ -591,6 +660,7 @@ impl Session {
                         break Err(io(error));
                     }
                     Event::Reply(Some(Err(_)) | None) => {
+                        if answers.next.is_some() { return Err(answer_expired()); }
                         if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
                         let protected = backend.take().is_some_and(|current| self.replayable(current.keys));
                         // A refusal whose ReadyForQuery never came is over with its backend: the resent command's replies are the client's.
@@ -611,7 +681,7 @@ impl Session {
                 }
             }
         }.await;
-        if let Err(error) = &outcome {
+        if let Err(error) = &outcome && error.code != ANSWER_EXPIRED {
             let code = match error.code.as_ref() {
                 STARTUP_TIMEOUT => "57P03",
                 FRAME_MEMORY => "53200",
@@ -824,6 +894,9 @@ pub fn error_frame(sqlstate: &str, message: &str) -> Frame {
 }
 
 fn lost(message: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/holder-lost", message) }
+fn answer_expired() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, ANSWER_EXPIRED, "The PostgreSQL answer did not reach its socket within its delivery grant")
+}
 fn replay_timeout() -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, REPLAY_TIMEOUT, "Timed out recovering the command, whose outcome is unknown") }
 
 async fn wait_until(deadline: Option<tokio::time::Instant>) {
@@ -847,6 +920,31 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn relay_preserves_the_sender_cutoff_and_consumes_it_on_the_public_socket() {
+        let cutoff = DeliveryDeadline::answer_window().wire_nanos().unwrap();
+        let mut body = BytesMut::new();
+        body.put_u8(GATEWAY_ANSWER_DEADLINE_KIND);
+        body.put_u64(cutoff);
+        let stamp = Frame { tag: GATEWAY_SESSION_STATE_TAG, body: body.freeze() };
+        let row = Frame { tag: b'D', body: Bytes::from_static(b"data") };
+        for forward in [true, false] {
+            let mut relay = AnswerRelay::new(forward);
+            assert!(relay.stamp(&stamp).unwrap());
+            let mut wire = Vec::new();
+            relay.write(&mut DeliveryIo::new(&mut wire), &row).await.unwrap();
+            let expected = if forward { [stamp.encode(), row.encode()].concat() } else { row.encode().to_vec() };
+            assert_eq!(wire, expected);
+        }
+
+        let mut expired = BytesMut::new();
+        expired.put_u8(GATEWAY_ANSWER_DEADLINE_KIND);
+        expired.put_u64(0);
+        let expired = Frame { tag: GATEWAY_SESSION_STATE_TAG, body: expired.freeze() };
+        let mut relay = AnswerRelay::new(false);
+        assert_eq!(relay.stamp(&expired).unwrap_err().code, ANSWER_EXPIRED);
+    }
 
     #[tokio::test]
     async fn an_installed_route_has_no_directory_retirement_signal() {
@@ -1036,7 +1134,7 @@ mod tests {
         let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
         let session = Session::new(Bytes::from_static(b"startup"), router, directory, record.id, None, true);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-        let running = tokio::spawn(session.run_before(gateway, first, None, 0, deadline));
+        let running = tokio::spawn(session.run_before(gateway, first, None, 0, deadline, false));
 
         let (tag, body) = tokio::time::timeout(Duration::from_secs(3), receive(&mut client)).await.unwrap();
         assert_eq!(tag, b'E');

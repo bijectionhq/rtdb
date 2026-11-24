@@ -191,10 +191,14 @@ impl Service {
         };
         let (mut cursor, read) = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         let schema = wire::plan_schema(cursor.schema(), self.memory()).map_err(|error| call.error(error))?;
-        let headers = call.response(())?.metadata().clone(); let service = self.clone();
+        let initial = cursor.delivery_grant().await.map_err(status)?;
+        let (headers, cutoff) = call.delivery_headers(&initial, true)?;
+        let service = self.clone();
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let _call = call;
-            yield wire::schema_data(&schema, service.memory())?;
+            let schema_data = wire::schema_data(&schema, service.memory())?;
+            _call.handoff(initial, cutoff)?;
+            yield schema_data;
             let mut encoder = match wire::Encoder::new(&schema, service.memory()) { Ok(encoder) => encoder, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
             loop {
                 read.admit(&service, &_call).await?;
@@ -215,8 +219,7 @@ impl Service {
                 for data in encoded {
                     {
                         let grant = cursor.delivery_grant().await.map_err(status)?;
-                        grant.check().map_err(status)?;
-                        grant.observe_answer();
+                        _call.handoff(grant, cutoff)?;
                     }
                     yield data;
                 }

@@ -3,14 +3,17 @@
 use std::{
     collections::BTreeMap,
     future::{Future, poll_fn},
+    io::{self, IoSlice},
+    pin::Pin,
     sync::Arc,
-    task::Poll,
-    time::{Duration, Instant},
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::residence_trace::CertifiedRead;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{ObjectCipher, UnitOperation};
 use crate::{Error, HeldView, IoRegion, ObjectKey, ReadLease, Result};
@@ -26,14 +29,66 @@ pub async fn drain_unit_delivery() {
     tokio::time::sleep(GRANT_WINDOW * 2).await;
 }
 
+/// A fixed transport cutoff checked by both the scheduling and wall clocks on this host.
+#[derive(Clone, Copy)]
+pub struct DeliveryDeadline {
+    instant: Instant,
+    wall: SystemTime,
+}
+
+impl DeliveryDeadline {
+    fn sampled(now: Instant, wall: SystemTime, until: Instant) -> Self {
+        Self { instant: until, wall: wall.checked_add(until.saturating_duration_since(now)).unwrap_or(wall) }
+    }
+
+    pub fn answer_window() -> Self {
+        let now = Instant::now();
+        Self::sampled(now, SystemTime::now(), now + GRANT_WINDOW)
+    }
+
+    pub fn earlier(self, other: Self) -> Self {
+        Self { instant: self.instant.min(other.instant), wall: self.wall.min(other.wall) }
+    }
+
+    pub fn covers(self, other: Self) -> bool {
+        self.instant >= other.instant && self.wall >= other.wall
+    }
+
+    pub fn is_live(self) -> bool { Instant::now() < self.instant && SystemTime::now() < self.wall }
+
+    pub fn instant(self) -> Instant { self.instant }
+
+    pub fn wire_nanos(self) -> Option<u64> {
+        self.wall.duration_since(UNIX_EPOCH).ok()?.as_nanos().try_into().ok()
+    }
+
+    pub fn from_wire_nanos(until: u64) -> Option<Self> {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH.checked_add(Duration::from_nanos(until))?;
+        let remaining = wall.duration_since(SystemTime::now()).ok()?.min(GRANT_WINDOW);
+        if remaining.is_zero() { return None; }
+        Some(Self { instant: now.checked_add(remaining)?, wall })
+    }
+
+    pub async fn writing<T>(self, work: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+        if !self.is_live() { return Err(handoff_expired()); }
+        let handoff = Handoff { deadline: self, lease: None };
+        let result = tokio::time::timeout_at(self.instant.into(), ANSWER_HANDOFF.scope(handoff, work))
+            .await.map_err(|_| handoff_expired())??;
+        if !self.is_live() { return Err(handoff_expired()); }
+        Ok(result)
+    }
+}
+
 tokio::task_local! {
     static PLAINTEXT_VIEWS: Arc<[Arc<PlaintextView>]>;
+    static ANSWER_HANDOFF: Handoff;
 }
 
 struct Unit {
     cipher: Arc<dyn ObjectCipher>,
     name: ObjectKey,
-    expires: Mutex<Option<Instant>>,
+    expires: Mutex<Option<DeliveryDeadline>>,
     read_lease: Mutex<Option<Arc<ReadLease>>>,
     _allocation: Arc<MemoryReservation>,
 }
@@ -129,7 +184,7 @@ impl PlaintextView {
         let (allocation, units) = {
             let units = self.units.lock();
             let element = std::mem::size_of::<Arc<Unit>>() + std::mem::size_of::<Arc<dyn Send + Sync>>();
-            let bytes = units.len().saturating_mul(element);
+            let bytes = units.len().saturating_mul(element).saturating_add(std::mem::size_of::<PlaintextDelivery>());
             (
                 self.memory.reserve(bytes)?,
                 units.values().cloned().collect::<Vec<_>>(),
@@ -139,6 +194,7 @@ impl PlaintextView {
         let mut custody = Vec::new();
         for unit in units {
             let now = Instant::now();
+            let wall = SystemTime::now();
             let mut cutoff = now + GRANT_WINDOW;
             let read_lease = unit.read_lease.lock().clone();
             if let Some(lease) = &read_lease {
@@ -153,9 +209,10 @@ impl PlaintextView {
             if cutoff <= now {
                 return Err(expired());
             }
+            let sampled = DeliveryDeadline::sampled(now, wall, cutoff);
             let cached = *unit.expires.lock();
-            let expires = match cached.filter(|expires| *expires > now + Duration::from_secs(1)) {
-                Some(expires) => expires.min(cutoff),
+            let expires = match cached.filter(|expires| expires.is_live() && expires.instant > now + Duration::from_secs(1)) {
+                Some(expires) => expires.earlier(sampled),
                 None => {
                     let check = IoRegion::leased(
                         read_lease,
@@ -165,7 +222,7 @@ impl PlaintextView {
                         .await
                         .map_err(|_| expired())??;
                     let (until, held) = checked.granted()?;
-                    let cutoff = until.map_or(cutoff, |until| until.min(cutoff));
+                    let cutoff = until.map_or(sampled, |until| DeliveryDeadline::sampled(now, wall, until.min(cutoff)));
                     if let Some(held) = held {
                         custody.push(held);
                     } else {
@@ -174,7 +231,7 @@ impl PlaintextView {
                     cutoff
                 }
             };
-            deadline = Some(deadline.map_or(expires, |prior: Instant| prior.min(expires)));
+            deadline = Some(deadline.map_or(expires, |prior: DeliveryDeadline| prior.earlier(expires)));
         }
         let certified_reads = self.certified_reads.lock();
         let trace_bytes = self.memory.reserve(certified_reads.len().saturating_mul(std::mem::size_of::<Arc<CertifiedRead>>()))?;
@@ -240,7 +297,7 @@ fn expired() -> rtdb_types::Anomaly {
 pub struct PlaintextDelivery {
     certified_reads: Vec<Arc<CertifiedRead>>,
     _trace_bytes: Arc<MemoryReservation>,
-    deadline: Option<Instant>,
+    deadline: Option<DeliveryDeadline>,
     view: Option<(Arc<HeldView>, Option<Arc<ReadLease>>)>,
     _custody: Vec<Arc<dyn Send + Sync>>,
     _allocation: Arc<MemoryReservation>,
@@ -254,60 +311,104 @@ impl PlaintextDelivery {
     }
 
     pub fn holding(mut self, view: Arc<HeldView>, lease: Option<Arc<ReadLease>>) -> Self {
+        if let Some(lease) = &lease {
+            let sampled = Instant::now();
+            let wall = SystemTime::now();
+            let cutoff = sampled.checked_add(lease.remaining()).unwrap_or(sampled);
+            let cutoff = DeliveryDeadline::sampled(sampled, wall, cutoff);
+            self.deadline = Some(self.deadline.map_or(cutoff, |prior| prior.earlier(cutoff)));
+        }
         self.view = Some((view, lease));
         self
     }
 
-    pub fn is_bounded(&self) -> bool {
-        self.deadline.is_some() || self.view.as_ref().is_some_and(|(_, lease)| lease.is_some())
-    }
+    pub fn is_bounded(&self) -> bool { self.deadline.is_some() }
+
+    pub fn transport_deadline(&self) -> Option<DeliveryDeadline> { self.deadline }
 
     pub fn check(&self) -> rtdb_types::Result<()> {
-        if let Some((_, Some(lease))) = &self.view {
-            lease.check()?;
-        }
-        if self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if let Some((_, Some(lease))) = &self.view { lease.check()?; }
+        if self.deadline.is_some_and(|deadline| !deadline.is_live()) {
             return Err(expired());
         }
         Ok(())
     }
 
-    /// Keeps a protocol message inside the earliest grant and wakes a
-    /// backpressured write at expiry. Callers close a partially written frame.
+    /// Keeps custody through the final flush. The transport checks the same
+    /// original cutoff on every socket handoff while polling this future.
     pub async fn deliver<T>(
         &self,
         work: impl Future<Output = rtdb_types::Result<T>>,
     ) -> rtdb_types::Result<T> {
         self.check()?;
-        let lease = self
-            .view
-            .as_ref()
-            .and_then(|(_, lease)| lease.as_ref())
-            .and_then(|lease| Instant::now().checked_add(lease.remaining()));
-        let deadline = match (self.deadline, lease) {
-            (Some(grant), Some(lease)) => Some(grant.min(lease)),
-            (grant, lease) => grant.or(lease),
-        };
-        let Some(deadline) = deadline else {
-            return work.await;
-        };
+        let Some(deadline) = self.deadline else { return work.await; };
+        let handoff = Handoff { deadline, lease: self.view.as_ref().and_then(|(_, lease)| lease.clone()) };
         let mut work = std::pin::pin!(work);
-        let result = tokio::time::timeout_at(
-            deadline.into(),
-            poll_fn(|cx| {
-                if let Err(error) = self.check() {
-                    return Poll::Ready(Err(error));
-                }
-                work.as_mut().poll(cx)
-            }),
-        )
-        .await
-        .map_err(|_| expired())??;
+        let result = tokio::time::timeout_at(deadline.instant.into(), ANSWER_HANDOFF.scope(handoff, poll_fn(|cx| {
+            if let Err(error) = self.check() { return Poll::Ready(Err(error)); }
+            work.as_mut().poll(cx)
+        }))).await.map_err(|_| expired())??;
         self.check()?;
         Ok(result)
+    }
+}
+
+struct Handoff {
+    deadline: DeliveryDeadline,
+    lease: Option<Arc<ReadLease>>,
+}
+
+pub fn current_delivery_deadline() -> Option<DeliveryDeadline> {
+    ANSWER_HANDOFF.try_with(|handoff| handoff.deadline).ok()
+}
+
+fn handoff_expired() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "The plaintext delivery grant expired at the socket")
+}
+
+fn check_handoff() -> io::Result<()> {
+    ANSWER_HANDOFF.try_with(|handoff| {
+        if !handoff.deadline.is_live() || handoff.lease.as_ref().is_some_and(|lease| lease.check().is_err()) {
+            return Err(handoff_expired());
+        }
+        Ok(())
+    }).unwrap_or(Ok(()))
+}
+
+/// Checks a scoped answer grant on each write, including writes resumed inside a buffered protocol or TLS flush.
+pub struct DeliveryIo<W>(W);
+
+impl<W> DeliveryIo<W> {
+    pub fn new(io: W) -> Self { Self(io) }
+}
+
+impl<W: AsyncRead + Unpin> AsyncRead for DeliveryIo<W> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, bytes)
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for DeliveryIo<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        check_handoff()?;
+        Pin::new(&mut self.0).poll_write(cx, bytes)
+    }
+
+    fn is_write_vectored(&self) -> bool { self.0.is_write_vectored() }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        check_handoff()?;
+        Pin::new(&mut self.0).poll_write_vectored(cx, bytes)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        check_handoff()?;
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        check_handoff()?;
+        Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
 
@@ -375,6 +476,29 @@ mod tests {
 
         key.0.store(false, Ordering::Relaxed);
         assert_eq!(view.grant().await.err().unwrap().code, "rtdb/erased-under-view");
+    }
+
+    #[tokio::test]
+    async fn socket_write_checks_again_after_work_runs_in_the_same_poll() {
+        use tokio::io::AsyncWriteExt;
+
+        let view = PlaintextView::new(MemoryBudget::new(64 << 10));
+        let now = Arc::new(AtomicI64::new(0));
+        let clock: Arc<dyn Fn() -> i64 + Send + Sync> = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::Relaxed))
+        };
+        let lease = Arc::new(ReadLease::new(Some(10_000_000), clock));
+        let grant = view.grant().await.unwrap().holding(HeldView::recovery(Arc::new(())), Some(lease));
+        let mut bytes = Vec::new();
+        let error = grant.deliver(async {
+            now.store(10_000_000, Ordering::Relaxed);
+            let error = DeliveryIo::new(&mut bytes).write_all(b"plaintext").await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            Err::<(), _>(expired())
+        }).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/plaintext-delivery-expired");
+        assert!(bytes.is_empty());
     }
 
     #[tokio::test]

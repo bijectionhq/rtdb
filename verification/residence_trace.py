@@ -395,7 +395,8 @@ def project(trace):
             outcome = event.get("outcome", "")
             observed_time = event.get("system_time", -1)
             require(all(type(number) is int for number in (cut, epoch, observed_time)), "expected integer coordinates")
-            if kind in {"install", "authorize-version", "remove-version", "settle-version", "copy-fork", "erase-residence",
+            transport = kind in {"admit-transport-answer", "handoff-transport-answer", "advance-transport-time", "refuse-transport-answer"}
+            if transport or kind in {"install", "authorize-version", "remove-version", "settle-version", "copy-fork", "erase-residence",
                         "prepare-erasure", "arm-erasure", "revoke-key", "read-old-cache"}:
                 publication = identities[scope(event["publication"], ("key", "version", "epoch"))]
             if kind in {"prepare-fork", "publish-fork", "copy-fork"}:
@@ -408,8 +409,12 @@ def project(trace):
                 require(event["recovery_root"] == trace["recovery_root"], "recovery fence names another closure")
             if kind in {"attempt-outcome", "receipt-clock", "redeem-receipt", "collect-receipt"}:
                 require(event["attempt"] == trace["attempt"], "receipt observation names another attempt")
-            if kind in {"prepare-erasure", "arm-erasure", "revoke-key", "read-old-cache"}:
-                require(event["key_slot"] == trace["key_slot"], "erasure observation names another key slot")
+            if transport or kind in {"prepare-erasure", "arm-erasure", "revoke-key", "read-old-cache"}:
+                require(event["key_slot"] == trace["key_slot"], "observation names another key slot")
+            if transport:
+                require(event["answer"] == trace["answer"], "transport observation names another answer")
+            if kind == "handoff-transport-answer":
+                require(outcome in {"partial", "complete"}, "transport handoff has no delivery state")
             require(all(isinstance(item, str) for item in (kind, publication, outcome)), "expected textual event fields")
             result.append([kind, cut, publication, epoch, outcome, observed_time])
         except (KeyError, TypeError, ValueError) as error:

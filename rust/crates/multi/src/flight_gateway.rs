@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, convert::Infallible, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, io, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -8,8 +8,9 @@ use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, servic
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
+use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
 use rtdb_flight_sql::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS};
+use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpListener, sync::{OwnedSemaphorePermit, Semaphore}};
@@ -80,6 +81,7 @@ struct RoutedBody {
     body: Incoming,
     admission: Arc<GatewayCall>,
     _deployment: Option<DeploymentConnection>,
+    deadline: Option<DeliveryDeadline>,
 }
 
 struct GatewayCall {
@@ -98,10 +100,13 @@ impl AsRef<[u8]> for RoutedData {
 
 impl Body for RoutedBody {
     type Data = Bytes;
-    type Error = hyper::Error;
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<std::result::Result<Frame<Bytes>, hyper::Error>>> {
+    type Error = io::Error;
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<std::result::Result<Frame<Bytes>, io::Error>>> {
+        if self.deadline.is_some_and(|deadline| !deadline.is_live()) {
+            return Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::TimedOut, "The routed Flight answer expired"))));
+        }
         Pin::new(&mut self.body).poll_frame(cx).map(|frame| frame.map(|result| {
-            result.map(|frame| {
+            result.map_err(io::Error::other).map(|frame| {
                 if self.admission.transport.is_none() { return frame; }
                 frame.map_data(|data| Bytes::from_owner(RoutedData {
                     data, _admission: Arc::clone(&self.admission),
@@ -178,14 +183,16 @@ async fn serve_listener(
         tokio::spawn(async move {
             let _connection = connection;
             let _codec = codec;
+            let egress = Arc::new(FlightEgress::default());
+            let stream = FlightEgressIo::new(stream, egress.clone());
             let io = async {
                 match tls {
                     Some(tls) => {
                         if let Ok(Ok(stream)) = tokio::time::timeout(router.timeout, tls.accept(stream)).await {
-                            serving(stream, remote.ip(), router).await;
+                            serving(stream, remote.ip(), router, egress).await;
                         }
                     }
-                    None => serving(stream, remote.ip(), router).await,
+                    None => serving(stream, remote.ip(), router, egress).await,
                 }
             };
             let _ = cancellation.run_until_cancelled(io).await;
@@ -193,12 +200,13 @@ async fn serve_listener(
     }
 }
 
-async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, remote: IpAddr, router: Arc<Router>) {
+async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, remote: IpAddr, router: Arc<Router>, egress: Arc<FlightEgress>) {
     let audience = router.audience.is_some();
     let service = service_fn(move |request| {
         let router = Arc::clone(&router);
+        let egress = Arc::clone(&egress);
         async move {
-            let response = match router.proxy(request, remote).await {
+            let response = match router.proxy(request, remote, &egress).await {
                 Ok(response) => response,
                 Err(status) => status.into_http::<Empty<Bytes>>().map(Either::Left),
             };
@@ -380,7 +388,7 @@ impl Router {
         if current { Ok(()) } else { Err(moved()) }
     }
 
-    async fn proxy(&self, mut request: Request<Incoming>, remote: IpAddr) -> std::result::Result<Response<ProxyBody>, Status> {
+    async fn proxy(&self, mut request: Request<Incoming>, remote: IpAddr, egress: &FlightEgress) -> std::result::Result<Response<ProxyBody>, Status> {
         if request.method() != http::Method::POST || !request.uri().path().starts_with("/arrow.flight.protocol.FlightService/") {
             return Err(Status::unimplemented("This listener serves Arrow Flight SQL"));
         }
@@ -469,6 +477,7 @@ impl Router {
         headers.remove(AUDIENCE_FLIGHT_HEADER);
         headers.remove(FRESH_HEADER);
         headers.remove(AUDIENCE_SEAT_HEADER);
+        headers.insert(GATEWAY_ANSWER_DEADLINE_HEADER, HeaderValue::from_static("forward"));
         if let Some(seat) = seat {
             headers.insert(AUDIENCE_SEAT_HEADER, header_value(&seat.to_string())?);
         }
@@ -496,8 +505,15 @@ impl Router {
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
         let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL attachment disconnected"))?;
+        let deadline = single_header(response.headers(), GATEWAY_ANSWER_DEADLINE_HEADER)?
+            .map(|header| header.parse::<u64>().ok().and_then(DeliveryDeadline::from_wire_nanos)
+                .ok_or_else(|| Status::unavailable("The Flight holder's answer deadline expired"))).transpose()?;
+        response.headers_mut().remove(GATEWAY_ANSWER_DEADLINE_HEADER);
+        if let Some(deadline) = deadline {
+            egress.restrict(deadline).map_err(|_| Status::unavailable("The Flight answer cannot reach this socket before expiry"))?;
+        }
         self.rewrite_response(response.headers_mut(), target, audience, seat)?;
-        Ok(response.map(|body| Either::Right(RoutedBody { body, admission, _deployment: deployment })))
+        Ok(response.map(|body| Either::Right(RoutedBody { body, admission, _deployment: deployment, deadline })))
     }
 
     fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>, seat: Option<AudienceSeat>) -> std::result::Result<(), Status> {
