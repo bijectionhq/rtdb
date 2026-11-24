@@ -179,6 +179,10 @@ impl EventPosition {
 /// Private assertion metadata used to compare a held point at ordering.
 pub const OWNED_EVENT_POSITION_COLUMN: &str = "_rtdb_owned_event_position";
 
+/// System-order endpoints of a private, frozen archive history scan.
+pub const ARCHIVE_TX_FROM: &str = "_rtdb_archive_tx_from";
+pub const ARCHIVE_TX_TO: &str = "_rtdb_archive_tx_to";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedPointVersion {
     pub position: EventPosition,

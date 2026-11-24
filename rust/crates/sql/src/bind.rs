@@ -1072,14 +1072,21 @@ impl Context<'_> {
                 if purpose != TablePurpose::Query && alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { return Err(error("Mutation targets do not accept column lists")); }
                 let mut visible = alias.as_ref().filter(|alias| !alias.columns.is_empty()).map(|alias| alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect::<Vec<_>>())
                     .unwrap_or_else(|| binding.columns.keys().cloned().collect());
+                let archive_column = |name: &str| matches!(name, rtdb_types::ARCHIVE_TX_FROM | rtdb_types::ARCHIVE_TX_TO);
                 let mut seen = BTreeSet::new();
-                visible.retain(|name| seen.insert(name.clone()));
+                visible.retain(|name| !archive_column(name) && seen.insert(name.clone()));
                 let mut requested = visible.clone();
                 for name in ["_iid", "_valid_from", "_valid_to", "_system_from", "_system_to"] {
                     if !requested.iter().any(|column| column == name) { requested.push(name.into()); }
                 }
                 if purpose != TablePurpose::Erase {
-                    for name in &self.period_columns { if !requested.contains(name) { requested.push(name.clone()); } }
+                    for name in &self.period_columns {
+                        if archive_column(name) && (!matches!(&system_time, TemporalFilter::All)
+                            || purpose != TablePurpose::Query || !binding.columns.contains_key(name)) {
+                            continue;
+                        }
+                        if !requested.contains(name) { requested.push(name.clone()); }
+                    }
                 }
                 let mut columns = Vec::new();
                 let mut periods = Vec::new();

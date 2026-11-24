@@ -17,7 +17,7 @@ use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
-use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
 use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
@@ -577,10 +577,17 @@ impl ScanCursor {
         if !execution.context.catalog.permits_table(&scan.table.name) {
             return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
         }
+        let archive_history = projects_archive_history(&scan);
+        if archive_history && (!execution.context.catalog.admits_archive_history(&scan.table.name)
+            || !matches!(&scan.system_time, TemporalFilter::All)
+            || !scan.matches.is_empty() || scan.top_k.is_some() || scan.ordered_top_k.is_some())
+        {
+            return Err(invalid("archive-history", "An admitted archive relation with FOR ALL SYSTEM_TIME is required"));
+        }
         let virtual_metadata = retained_metadata::is_projected(&scan)
             && database_partitions.iter().any(retained_metadata::has_sidecar);
-        let pushdowns = if virtual_metadata { None } else { pushdowns };
-        let accelerate = accelerate && !virtual_metadata;
+        let pushdowns = if virtual_metadata || archive_history { None } else { pushdowns };
+        let accelerate = accelerate && !virtual_metadata && !archive_history;
         if virtual_metadata {
             // The filter above this scan evaluates the projected values.
             let metadata = scan.columns.iter().find(|field| field.name == "user_metadata").map(|field| field.id);
@@ -622,7 +629,7 @@ impl ScanCursor {
             };
             Some(RankProjection { output, source: source.name.clone(), scorer, verified: None })
         } else { None };
-        let fragmenter = if virtual_metadata { None } else { execution.context.catalog.fragmenter.clone() };
+        let fragmenter = if virtual_metadata || archive_history { None } else { execution.context.catalog.fragmenter.clone() };
         let shared_basis = database_partitions.windows(2).all(|pair| pair[0].system_time_cap() == pair[1].system_time_cap());
         let shared_rank = (accelerate && ranking.is_some() && database_partitions.len() > 1 && shared_basis)
             .then(|| crate::PartitionRanking::new(Arc::clone(&execution.context.memory)));
@@ -921,6 +928,7 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
     if !execution.context.catalog.permits_table(&scan.table.name) {
         return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
     }
+    if projects_archive_history(scan) { return Ok(None); }
     use crate::operators::OrderedInput;
     let full;
     let positions = match projection {
@@ -1296,6 +1304,10 @@ impl PageCursor for ScanCursor {
     }
 }
 
+fn projects_archive_history(scan: &Scan) -> bool {
+    scan.columns.iter().any(|field| matches!(field.name.as_str(), ARCHIVE_TX_FROM | ARCHIVE_TX_TO))
+}
+
 impl PartitionScan {
     fn pruning(&self) -> PruningOptions {
         let iid = match &self.candidate_iids {
@@ -1305,7 +1317,7 @@ impl PartitionScan {
         PruningOptions { bounds: self.bounds, projects_temporal_columns: self.scan.columns.iter().any(|field| matches!(field.name.as_str(), "_valid_from" | "_valid_to" | "_system_from" | "_system_to")),
             clamp_valid_time: self.scan.clamp_valid_time,
             bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning
-                || self.execution.context.catalog.uses_owned_event_cut(),
+                || self.execution.context.catalog.uses_owned_event_cut() || projects_archive_history(&self.scan),
             iid }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
@@ -1679,7 +1691,17 @@ impl PartitionScan {
                 if header.iid <= range_upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
             }
         }
-        let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
+        let archive_history = projects_archive_history(&self.scan);
+        if archive_history && !self.execution.context.catalog.admits_archive_history(&self.scan.table.name) {
+            return Err(invalid("archive-history", "The scan has no frozen archive authority"));
+        }
+        let mut resolver_bounds = self.bounds;
+        if archive_history {
+            // The held SQL cap still limits input events. On those events,
+            // resolve the system dimension by transaction position.
+            resolver_bounds.system_time = Interval::ALL;
+        }
+        let mut resolver = HistoryResolver::new_in(resolver_bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let keyed = self.scan.table.name.table.is_owned_event_data();
         let position_mask = self.execution.context.catalog.owned_position_mask;
         let transaction_cut = self.execution.context.catalog.owned_transaction_cut;
@@ -1725,6 +1747,13 @@ impl PartitionScan {
                     && head.header.commit_position >= from
                     && head.header.op != EventOp::Erase
             }) { continue; }
+            let mut header = head.header;
+            if archive_history {
+                if !self.bounds.system_time.contains(header.system_from) { continue; }
+                let position = header.position.filter(|position| (0..i64::MAX).contains(&position.transaction.0))
+                    .ok_or_else(|| invalid("archive-event-position", "An archive control lacks its original position"))?;
+                header.system_from = Timestamp(position.transaction.0);
+            }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
             let resolver = if keyed {
                 let key = batch.view().entity_key(row as usize)?.ok_or_else(|| {
@@ -1755,7 +1784,7 @@ impl PartitionScan {
             // The merge visits rows in IID order across the task's pages, which one group keeps and a group per page does not.
             let group: &mut Vec<_> = &mut groups[if self.order.is_some() { 0 } else { head.active }];
             let memory = &self.execution.context.memory;
-            resolver.resolve_fragments(&head.header, |valid_time, system_time| {
+            resolver.resolve_fragments(&header, |valid_time, system_time| {
                 if group.len() == group.capacity() {
                     let capacity = group.capacity().saturating_mul(2).max(64);
                     let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<(u32, u32)>>()).ok_or_else(|| invalid("scan-row-size", "Scan rows exceed addressable memory"))?;
@@ -1796,6 +1825,23 @@ impl PartitionScan {
                             .map(|header| Value::I64(i64::from(header.commit_position)))
                     }).collect::<Result<Vec<_>>>()?;
                     return Ok(Some(crate::columnar::Column::Values(ordinals)));
+                }
+                if archive_history {
+                    let values = match self.scan.columns[position].name.as_str() {
+                        ARCHIVE_TX_FROM => rows.iter().map(|row| Value::I64(row.system_time.lower().0)).collect(),
+                        ARCHIVE_TX_TO => rows.iter().map(|row| {
+                            let end = row.system_time.upper();
+                            if end == Timestamp::MAX { Value::Null } else { Value::I64(end.0) }
+                        }).collect(),
+                        "_system_from" => rows.iter().map(|row| {
+                            let (batch, index) = row.source;
+                            let value = batches[batch as usize].header(index as usize)?.system_from.0;
+                            Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })
+                        }).collect::<Result<Vec<_>>>()?,
+                        "_system_to" => vec![Value::Null; rows.len()],
+                        _ => return self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose(),
+                    };
+                    return Ok(Some(crate::columnar::Column::Values(values)));
                 }
                 if self.scan.columns[position].name == rtdb_types::OWNED_EVENT_POSITION_COLUMN
                     && self.execution.context.catalog.owned_identity().is_some()
@@ -3931,6 +3977,59 @@ mod tests {
         assert_eq!(cursor.scan_counts().unwrap().files_used, 1);
         drop(cursor);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn frozen_control_history_resolves_ties_by_position_and_respects_erase() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let table = TableRef::new("public", "bj_archive_fixture");
+        let memory = MemoryBudget::new(1 << 24);
+        for (id, value) in [(0, 9), (1, 10)] {
+            let key = TransactionKey { tx_id: TxId(id), system_time: Timestamp(100) };
+            let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            for entity in [1, 2] {
+                write.put(table.clone(), StructFields::from([
+                    ("_id".into(), Value::I64(entity)), ("v".into(), Value::I64(value)),
+                ]), Interval::ALL).unwrap();
+            }
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(100) };
+        let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+        write.erase(table.clone(), &EntityId::Integer(2)).unwrap();
+        state.apply(&write.stage().unwrap()).unwrap();
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let name = QualifiedTable { database: "xtdb".into(), table };
+        assert!(!catalog.table(&name).unwrap().unwrap().columns.contains_key(ARCHIVE_TX_FROM));
+        let catalog = catalog.with_archive_history();
+        let binding = catalog.table(&name).unwrap().unwrap();
+        let columns = ["v", ARCHIVE_TX_FROM, ARCHIVE_TX_TO, "_system_from"].into_iter().enumerate()
+            .map(|(index, name)| Field {
+                id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false,
+                unnamed: false, data_type: binding.scan_column_type(name),
+            }).collect();
+        let scan = Scan {
+            table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
+        };
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
+        };
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() {
+            rows.extend(page.rows().iter().map(|row| row.values.clone()));
+        }
+        let time = Value::Timestamp { value: 100, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        assert_eq!(rows, [
+            vec![Value::I64(10), Value::I64(1), Value::Null, time.clone()],
+            vec![Value::I64(9), Value::I64(0), Value::I64(1), time],
+        ]);
     }
 
     #[tokio::test]

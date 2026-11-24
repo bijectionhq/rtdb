@@ -67,6 +67,7 @@ pub struct NodeServices {
 #[async_trait::async_trait]
 pub trait ReadFence: Send + Sync {
     async fn confirm(&self, database: &str) -> Result<()>;
+    fn archive_history(&self, _database: &str) -> bool { false }
     fn hold_active_call(&self, _database: &Database) -> Option<Box<dyn Send + Sync>> { None }
     async fn hold_transaction_custody(&self, _database: &Database) -> Result<Option<Arc<dyn Send + Sync>>> { Ok(None) }
     async fn confirm_hosted(&self, _database: &Database) -> Result<String> {
@@ -609,7 +610,9 @@ impl Node {
         let basis = applied_basis.as_ref().unwrap_or(basis);
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory));
-        if !audience { catalog = catalog.with_fragmenter(self.scan_fragmenter.clone(), fragment_residence); }
+        let archive_history = self.read_fence.as_ref().is_some_and(|fence| fence.archive_history(database));
+        if archive_history { catalog = catalog.with_archive_history(); }
+        if !audience && !archive_history { catalog = catalog.with_fragmenter(self.scan_fragmenter.clone(), fragment_residence); }
         if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
         let memory = match cut {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),

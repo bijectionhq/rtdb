@@ -397,7 +397,9 @@ pub(super) fn parse_statement_syntax<'input>(
     let period_columns = prefix.iter().filter_map(|token| match &token.token {
         Token::Word(word) => {
             let name = if word.quote_style.is_some() { word.value.clone() } else { word.value.to_lowercase() };
-            matches!(name.as_str(), "_valid_time" | "_system_time").then_some(name)
+            matches!(name.as_str(),
+                "_valid_time" | "_system_time" | rtdb_types::ARCHIVE_TX_FROM | rtdb_types::ARCHIVE_TX_TO
+            ).then_some(name)
         }
         _ => None,
     }).collect();

@@ -64,6 +64,7 @@ pub struct CatalogSnapshot {
     pub(crate) default_database: String,
     pub(crate) databases: Arc<BTreeMap<String, DatabaseSnapshot>>,
     transaction_scoped: bool,
+    archive_history: bool,
     owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
     pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
     pub(crate) owned_transaction_cut: Option<rtdb_types::TxId>,
@@ -86,8 +87,21 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, resumed_storage_owner: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, archive_history: false, owned_relation: None, owned_position_mask: None, owned_transaction_cut: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, resumed_storage_owner: None })
     }
+    /// Enable explicit positional control history on a dedicated archive reader.
+    pub fn with_archive_history(mut self) -> Self {
+        self.archive_history = true;
+        self
+    }
+
+    pub(crate) fn admits_archive_history(&self, name: &QualifiedTable) -> bool {
+        self.archive_history && self.owned_relation.is_none()
+            && name.database == self.default_database
+            && name.table.schema == "public"
+            && name.table.table.starts_with("bj_")
+    }
+
     pub(crate) fn uses_owned_event_cut(&self) -> bool {
         self.owned_transaction_cut.is_some() || self.owned_position_mask.is_some()
     }
@@ -184,7 +198,13 @@ impl CatalogSnapshot {
             let next = snapshot.column_types(table);
             columns = Some(match columns { Some(previous) => rtdb_index::merge_column_types(&previous, &next), None => next });
         }
-        Ok(Some(TableBinding { name, oid, columns: columns.unwrap_or_default() }))
+        let mut columns = columns.unwrap_or_default();
+        if self.admits_archive_history(&name) {
+            use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, ScalarType};
+            columns.insert(ARCHIVE_TX_FROM.into(), LogicalType::Scalar(ScalarType::I64));
+            columns.insert(ARCHIVE_TX_TO.into(), LogicalType::Scalar(ScalarType::I64).maybe());
+        }
+        Ok(Some(TableBinding { name, oid, columns }))
     }
 }
 

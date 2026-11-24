@@ -278,6 +278,8 @@ impl StageReadAuthority {
 
 #[async_trait::async_trait]
 impl ReadFence for StageReadAuthority {
+    fn archive_history(&self, database: &str) -> bool { database == self.stage.intent.name }
+
     async fn confirm(&self, database: &str) -> Result<()> {
         if database != self.stage.intent.name {
             return Err(inconsistent(
