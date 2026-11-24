@@ -16,6 +16,7 @@ use crate::Clock;
 pub(crate) struct DefaultServing {
     pub(crate) handle: NativeServingHandle,
     pub(crate) memory: Arc<MemoryBudget>,
+    pub(crate) storage: Arc<rtdb_storage::cache::BufferPool>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) tokens: Arc<crate::database::tokens::DatabaseTokens>,
     pub(crate) writable: bool,
@@ -35,9 +36,11 @@ impl DefaultServing {
 impl ServingDriver for DefaultServing {
     fn incarnation(&self) -> [u8; 16] { self.handle.authority().incarnation }
     fn uses_database_tokens(&self) -> bool { true }
+    fn supports_query_tokens(&self) -> bool { self.handle.is_compatible() }
     fn supports_row_visibility(&self) -> bool { self.handle.is_compatible() && self.tokens.supported() }
 
     fn features(&self) -> &[&str] {
+        if self.handle.has_classic_read() { return &["query", "query.linearizable"]; }
         if !self.handle.is_compatible() { return &[]; }
         if self.writable { NATIVE_WRITE_FEATURES } else { NATIVE_READ_FEATURES }
     }
@@ -45,6 +48,14 @@ impl ServingDriver for DefaultServing {
     async fn query(
         &self, source: QuerySource, track: bool, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
+        if self.handle.has_classic_read() {
+            if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged || track {
+                return Err(Anomaly::unsupported("rtdb/classic-query-scope", "The Classic catalog only serves untracked queries on merged main"));
+            }
+            let (snapshot, cut) = self.handle.classic_read(source.at, cancellation).await?;
+            let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage).await?;
+            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new() });
+        }
         let snapshot = self.handle.view(source.at, cancellation).await?;
         let at = if source.at == At::Linearizable { At::Latest } else { source.at };
         let branch = snapshot.index.view(&source.branch, at, source.layer, now)?;

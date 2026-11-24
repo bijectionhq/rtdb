@@ -169,10 +169,13 @@ impl QueryContext {
         let catalog = &mut context.catalog;
         let database = Arc::make_mut(&mut catalog.databases).get_mut(&catalog.default_database)
             .ok_or_else(|| invalid("wire-cut", "The read requires its captured database"))?;
+        let physical = snapshot.catalog_cut().is_some();
         database.partitions = vec![snapshot];
         catalog.reset_sql_snapshot_view(None, None);
-        catalog.runtime = None;
-        catalog.ordered_indexes = None;
+        if !physical {
+            catalog.runtime = None;
+            catalog.ordered_indexes = None;
+        }
         self.with_wire_cut(system_time, current_time)
     }
 

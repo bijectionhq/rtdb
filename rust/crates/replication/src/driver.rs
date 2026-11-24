@@ -138,6 +138,9 @@ impl ReplicationHandle {
     }
     pub async fn await_tx(&self, id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> { self.progress.await_tx(id, cancellation).await }
     pub async fn await_source(&self, position: SourcePosition, cancellation: &CancellationToken) -> Result<()> { self.progress.await_source(position, cancellation).await }
+    pub(crate) fn serving_partition(&self) -> Option<Snapshot> {
+        self.partition.current_published_snapshot()
+    }
     pub(crate) async fn serving_barrier(&self, cancellation: &CancellationToken) -> Result<()> {
         let required = self.logs.latest_replica_position()?;
         let mut status = self.watch_status();
@@ -575,8 +578,8 @@ impl ReplicationDriver {
         };
         let store = Arc::clone(self.resolve.storage.object_store());
         let (serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_deref(), collect_checkpoints)?;
-        if block.as_ref().and_then(|block| block.latest_completed_tx()).is_some() {
-            serving.mark_classic_writes();
+        if let Some(block) = block.as_ref() {
+            serving.recover_classic(&self.partition.snapshot(), block.boundary_replica_position());
         }
         let source_authority = Arc::clone(&serving.source_authority);
         let source_replies = Arc::clone(&serving.source_replies);
@@ -584,8 +587,13 @@ impl ReplicationDriver {
         Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies })
     }
 
-    async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>) -> Result<()> {
-        if let Some(serving) = &self.serving { serving.mark_classic_writes(); }
+    async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>, replica: ReplicaPosition) -> Result<()> {
+        self.install_classic_transaction(write, search_delta).await?;
+        if let Some(serving) = &self.serving { serving.observe_classic(write, replica); }
+        Ok(())
+    }
+
+    async fn install_classic_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>) -> Result<()> {
         let Some(builder) = &self.serving_search else { return self.partition.apply(write); };
         let prepared = self.partition.prepare_write(write)?;
         let search = builder.install_delta(prepared.snapshot(), write, search_delta, &self.cancellation).await?;
@@ -1352,7 +1360,7 @@ impl ReplicationDriver {
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
                             let delta = confirmed_search_delta(pending.body.search_delta(), message.search_delta.as_ref());
-                            self.apply_transaction(head.writes(), delta).await?;
+                            self.apply_transaction(head.writes(), delta, record.metadata.position).await?;
                             if head.result().committed() {
                                 self.observe_erasure(record.metadata.position, head.writes())?;
                                 if let Some(operation) = head.db_op() { self.effects.apply_db_op(operation).await?; }
@@ -1379,7 +1387,7 @@ impl ReplicationDriver {
                         }
                         let value = self.partition.value();
                         let rtdb_tx::ReplayedTransaction { writes, result, placed_attempt } = rtdb_tx::decode_replica(message, value.live().latest_completed_tx(), value.live().block_index(), &self.resolve.memory)?;
-                        self.apply_transaction(&writes, message.search_delta.clone().map(SearchDelta::Replayed)).await?;
+                        self.apply_transaction(&writes, message.search_delta.clone().map(SearchDelta::Replayed), record.metadata.position).await?;
                         if result.committed() { self.observe_erasure(record.metadata.position, &writes)?; }
                         if !leading && message.committed.unwrap_or(false) {
                             if let Some(operation) = &message.db_op {

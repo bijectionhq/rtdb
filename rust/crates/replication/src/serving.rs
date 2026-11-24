@@ -4,11 +4,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
-use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
+use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchIndex, BranchWrite}};
 use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
+use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
 use parking_lot::Mutex as ReplyLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot, watch};
@@ -94,6 +94,7 @@ pub struct NativeServingView {
     pub floor: Basis,
     pub changes: Arc<VecDeque<(BranchCut, Vec<BranchWrite>)>>,
     compatible: bool,
+    classic_head: Option<ReplicaPosition>,
 }
 
 #[derive(Clone)]
@@ -108,6 +109,53 @@ pub struct NativeServingHandle {
 impl NativeServingHandle {
     pub fn authority(&self) -> &NativeServingAuthority { &self.authority }
     pub fn is_compatible(&self) -> bool { self.view.borrow().compatible }
+
+    pub fn has_classic_read(&self) -> bool {
+        let view = self.view.borrow();
+        !view.compatible && view.index.head().basis.position() == 0 && view.classic_head.is_some()
+    }
+
+    pub async fn classic_read(&self, at: At, cancellation: &CancellationToken) -> Result<(Snapshot, BranchCut)> {
+        if at == At::Linearizable { self.replication.serving_barrier(cancellation).await?; }
+        let mut status = self.replication.watch_status();
+        loop {
+            let (role, published) = {
+                let status = status.borrow_and_update();
+                (status.role, status.installed.is_some())
+            };
+            if role == crate::Role::Stopped { return Err(unavailable()); }
+            let classic = {
+                let view = self.view.borrow();
+                if view.compatible || view.index.head().basis.position() != 0 { return Err(incompatible()); }
+                view.classic_head.ok_or_else(unavailable)?
+            };
+            if published {
+                let snapshot = self.replication.serving_partition().ok_or_else(unavailable)?;
+                let through = snapshot.catalog_cut().ok_or_else(unavailable)?.through;
+                if through >= classic {
+                    let position = u64::try_from(through.0).ok().and_then(|offset| offset.checked_add(1)).ok_or_else(invalid)?;
+                    let basis = Basis::new(self.authority.incarnation, position);
+                    let system_time = snapshot.tx_basis().ok_or_else(invalid)?.system_time;
+                    let ready = match at {
+                        At::Exactly(requested) | At::AtLeast(requested) if requested.incarnation() != basis.incarnation() => return Err(foreign_basis()),
+                        At::Exactly(requested) if requested < basis => return Err(Anomaly::new(
+                            AnomalyCategory::NotFound, "rtdb/cursor-expired", "The Classic catalog no longer holds the requested replica cut",
+                        )),
+                        At::Exactly(requested) if requested > basis => return Err(Anomaly::new(
+                            AnomalyCategory::NotFound, "rtdb/unknown-basis", "The Classic catalog has not installed the requested replica cut",
+                        )),
+                        At::AtLeast(requested) => requested <= basis,
+                        At::AsOf(time) if time < system_time => return Err(Anomaly::unsupported(
+                            "rtdb/classic-historical-basis", "The Classic catalog has no retained replica cut for the requested time",
+                        )),
+                        _ => true,
+                    };
+                    if ready { return Ok((snapshot, BranchCut { basis, system_time })); }
+                }
+            }
+            cancellation.run_until_cancelled(status.changed()).await.ok_or_else(interrupted)?.map_err(|_| unavailable())?;
+        }
+    }
 
     pub async fn view(&self, at: At, cancellation: &CancellationToken) -> Result<NativeServingView> {
         if at == At::Linearizable {
@@ -151,7 +199,9 @@ impl NativeServingHandle {
             if error.category == AnomalyCategory::Interrupted { interrupted() } else { error }
         })?;
         let receipt = self.source_replies.get(position).ok_or_else(interrupted)??;
-        project_receipt(&self.view.borrow().index, receipt, scope.as_ref())
+        let Some(scope) = &scope else { return Ok(receipt); };
+        let index = self.view.borrow().index.clone();
+        project_receipt(&index, receipt, Some(scope))
     }
 
     pub async fn tx_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
@@ -268,7 +318,7 @@ impl NativeServing {
         let (view, receiver) = watch::channel(NativeServingView {
             index: fold.index().clone(),
             floor: fold.index().head().basis,
-            changes: Arc::default(), compatible: true,
+            changes: Arc::default(), compatible: true, classic_head: None,
         });
         let source_authority = Arc::new(SourceAuthority::new(store, authority.incarnation));
         Ok((Self {
@@ -464,13 +514,33 @@ impl NativeServing {
         }
     }
 
-    pub(crate) fn mark_classic_writes(&self) {
-        self.view.send_if_modified(|view| std::mem::replace(&mut view.compatible, false));
+    pub(crate) fn recover_classic(&self, snapshot: &Snapshot, replica: Option<ReplicaPosition>) {
+        if snapshot.tx_basis().is_some() && snapshot.table_names().any(classic_data_table) {
+            self.observe_classic_data(replica);
+        }
+    }
+
+    pub(crate) fn observe_classic(&self, write: &StagedWrite, replica: ReplicaPosition) {
+        let touches_data = write.tables().iter().any(|(table, write)| {
+            classic_data_table(table) && (write.batch().is_some_and(|batch| !batch.is_empty()) || !write.declared_columns().is_empty())
+        });
+        if touches_data { self.observe_classic_data(Some(replica)); }
+    }
+
+    fn observe_classic_data(&self, replica: Option<ReplicaPosition>) {
+        self.view.send_modify(|view| {
+            view.compatible = false;
+            view.classic_head = replica;
+        });
     }
 }
 
 impl Drop for NativeServing {
     fn drop(&mut self) { self.withdraw(); }
+}
+
+fn classic_data_table(table: &TableRef) -> bool {
+    !(table.stores_expiring_transaction_metadata() || table.schema == "xt" && matches!(table.table.as_str(), "txs" | "role_membership"))
 }
 
 fn project_receipt(index: &BranchIndex, mut receipt: Receipt, scope: Option<&NativeServingScope>) -> Result<Receipt> {
