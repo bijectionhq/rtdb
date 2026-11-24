@@ -171,6 +171,39 @@ impl Closure {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RetirementAdmission {
+    operation: uuid::Uuid,
+    switch: [u8; 32],
+}
+
+pub(in crate::journal::hosted) async fn retirement_admitted(
+    provider: &CheckpointCustody,
+    placement: Placement,
+    erasure_floor: u64,
+) -> Result<bool> {
+    if erasure_floor == 0 {
+        return Ok(true);
+    }
+    let cut = provider.erasure_cut_records(placement, erasure_floor)?;
+    let Some(bytes) = cut.get("joined-custody").await? else { return Ok(false); };
+    let admission: RetirementAdmission = serde_json::from_slice(&bytes).map_err(serialization)?;
+    Ok(!admission.operation.is_nil() && admission.switch != [0; 32])
+}
+
+pub(super) async fn admit_retirement(
+    provider: &CheckpointCustody,
+    commit: ErasureCommit,
+) -> Result<()> {
+    let erasure = commit.prepared.erasure;
+    provider.erasure_cut_records(erasure.placement, commit.prepared.checkpoint.cut.next_lsn)?
+        .put("joined-custody", encode(&RetirementAdmission {
+            operation: erasure.operation,
+            switch: commit.switch_evidence,
+        })?).await
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JournalKeyWithdrawal {
     namespace: [u8; 32],
     key: String,

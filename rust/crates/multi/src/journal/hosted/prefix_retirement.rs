@@ -257,6 +257,12 @@ async fn superseded_prefixes(provider: &Provider, placement: &Placement, route: 
 pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &Arc<dyn KeyService>) -> Result<Vec<(u64, Outcome)>> {
     let Some(custodian) = placement.custodian.as_ref() else { return Ok(Vec::new()); };
     let route = custodian.route().await?;
+    if route.erasure_floor != 0 {
+        let custody = placement.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        if !super::erasure::retirement_admitted(&custody, route.placement, route.erasure_floor).await? {
+            return Ok(Vec::new());
+        }
+    }
     let Some(provider) = Provider::qualify(storage).await? else { return Ok(Vec::new()); };
     let bucket = storage.bucket(IoRegion::new()).await?;
     let mut epochs = superseded_prefixes(&provider, placement, &route).await?;

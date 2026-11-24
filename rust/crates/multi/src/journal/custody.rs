@@ -701,6 +701,19 @@ impl CheckpointCustody {
 }
 
 impl CheckpointCustody {
+    pub(super) fn erasure_cut_records(&self, placement: Placement, next_lsn: u64) -> Result<ErasureRecords<'_>> {
+        if self.placement != placement || next_lsn == 0 {
+            return Err(invalid("The erasure cut belongs to another placement"));
+        }
+        Ok(ErasureRecords {
+            provider: self,
+            scope: format!("{}/{}/{}/erasure-cut/{}/{next_lsn}", self.prefix.as_str(), placement.deployment,
+                placement.incarnation, placement.generation),
+        })
+    }
+}
+
+impl CheckpointCustody {
     pub(super) fn erasure_generation_records(&self, placement: Placement, generation: u64) -> Result<ErasureRecords<'_>> {
         if self.placement != placement || generation == 0 {
             return Err(invalid("The custody generation belongs to another placement"));

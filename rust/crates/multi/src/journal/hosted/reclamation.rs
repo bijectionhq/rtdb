@@ -187,6 +187,9 @@ pub(super) async fn settle_receipts(
     let inventory = CellStorage::s3_inventory(config).await?;
     if config.terminal_scope.is_none() { inventory.require_versioned().await?; }
     let checkpoint = placement.checkpoint_custody(Arc::clone(&io), Arc::clone(keys)).await?;
+    if !super::erasure::retirement_admitted(&checkpoint, route.placement, route.erasure_floor).await? {
+        return Ok(());
+    }
     checkpoint.open(route.checkpoint).await?;
     let provider = storage.custody_namespace()?;
     let ledger = Arc::new(super::storage::serving_ledger(Arc::clone(keys), route.placement, provider, &source, io));

@@ -700,12 +700,18 @@ impl Placement {
         let Some(retired) = route.retirement else {
             return Ok(());
         };
-        if !retired.closed {
+        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        let closed_by_erasure = retired.checkpoint.cut.next_lsn < route.erasure_floor;
+        if closed_by_erasure
+            && !erasure::retirement_admitted(&provider, route.placement, route.erasure_floor).await?
+        {
+            return Ok(());
+        }
+        if !retired.closed || closed_by_erasure {
             custodian
                 .close_checkpoint(&route, retired.checkpoint)
                 .await?;
         }
-        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
         let disposition = match &self.archive {
             crate::deployment::CellStorage::S3 { config } => {
                 provider.retire_s3(config, retired.checkpoint).await?

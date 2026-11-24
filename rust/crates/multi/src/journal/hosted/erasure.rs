@@ -21,6 +21,7 @@ use crate::keys::{JournalKey, KeyService};
 mod drain;
 mod evidence;
 pub use drain::{DrainRegistration, ErasureDrainJournal, SignedDrainJoin};
+pub(super) use drain::retirement_admitted;
 use evidence::CustodyEvidence;
 pub use evidence::{
     CustodyDrain, CustodyWork, DeadlineReservation, DestructionEvidence, DrainParticipant,
@@ -218,6 +219,9 @@ impl<'a> ErasureCoordinator<'a> {
     ) -> Result<PreparedErasure> {
         self.require_incumbent(erasure)?;
         let route = self.custodian.route().await?;
+        if !retirement_admitted(self.provider, route.placement, route.erasure_floor).await? {
+            return Err(invalid("The previous erasure is still draining its closed custody"));
+        }
         let epoch = self.worker.log_epoch();
         let base_matches = match selection.checkpoint() {
             Some(base) => base.root_sha256 == Some(route.checkpoint.root)
@@ -370,6 +374,7 @@ impl<'a> ErasureCoordinator<'a> {
             .ok_or_else(evidence::authority_unavailable)?;
         let Some(journal) = self.resume_drain(commit).await? else { return Ok(None); };
         let Some(joined) = journal.joined().await? else { return Ok(None); };
+        drain::admit_retirement(self.provider, commit).await?;
         let closed_at_ms = journal.closed_at_ms();
         let latest_join = joined.iter().map(|work| work.observed_at_ms).max().unwrap_or(closed_at_ms);
         let (journal_key_disposition, journal_key_observed_at_ms) =
