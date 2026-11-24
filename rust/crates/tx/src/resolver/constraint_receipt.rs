@@ -85,7 +85,7 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
     }
     let mut copied_attempts = std::collections::BTreeSet::new();
     let writes_data = primary.iter().filter_map(write_relation)
-        .any(|relation| !matches!(relation.name(), ATTEMPTS | PUBLICATIONS));
+        .any(|relation| !matches!(relation.name(), ATTEMPTS | PUBLICATIONS | rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION));
     let has_count = primary.iter().any(|op| matches!(op,
         Operation::Public(TxOp::OwnedCheckCapacity { .. })
     ));
@@ -322,6 +322,7 @@ fn validate_continuation_choice(primary: &[Operation], refusal: &[Operation], pl
     let mut copied_attempts = std::collections::BTreeSet::new();
     let mut head = None;
     let mut completion = None;
+    let mut public_version = false;
     let mut followup = false;
     for op in refusal {
         match op {
@@ -364,11 +365,17 @@ fn validate_continuation_choice(primary: &[Operation], refusal: &[Operation], pl
                 if head.is_some() { return Err(invalid()); }
                 head = Some(marker_id(documents.rows()).ok_or_else(invalid)?);
             }
+            _ if crate::hosted_control::source_public_root_version_marker(op) => {
+                if public_version { return Err(invalid()); }
+                public_version = true;
+            }
             _ => return Err(invalid()),
         }
     }
     let clock = completion.ok_or_else(invalid)?;
-    if copied_attempts.len() != attempts.len() || followup && !clock
+    let primary_public = primary.iter().any(crate::hosted_control::source_public_root_version_marker);
+    if public_version != (clock && primary_public)
+        || copied_attempts.len() != attempts.len() || followup && !clock
         || head != Some(if clock { ROOT_HEAD } else { RECEIPT_HEAD })
     {
         return Err(invalid());
@@ -593,6 +600,7 @@ fn same_binding(
 
 fn primary_op(op: &Operation) -> bool {
     match op {
+        _ if crate::hosted_control::source_public_root_version_marker(op) => true,
         Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. }
             | TxOp::OwnedForkWorld { .. } | TxOp::HostedControl(_)) => true,
         Operation::Public(
