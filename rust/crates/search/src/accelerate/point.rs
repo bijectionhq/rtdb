@@ -179,11 +179,11 @@ impl PackedVisibility {
             }).collect();
             if selected.is_empty() { continue; }
             let bytes = file.read(range.range()).await?;
-            let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
-            let page = range.read_forward(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)), definition.columns.len())?;
+            let page = range.read_forward(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)),
+                definition.columns.len(), self.column, request.memory)?;
             for (row, index) in selected {
                 let iid = row.version.iid;
-                if let Some(revision) = page.revision(index as usize, iid, row.origin.expect("stable forward event"), self.column)? {
+                if let Some(revision) = page.revision(index as usize, iid, row.origin.expect("stable forward event"))? {
                     result.insert(iid, revision);
                 }
             }
