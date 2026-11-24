@@ -2,15 +2,15 @@ package xtdb.operator
 
 import org.apache.arrow.memory.BufferAllocator
 import xtdb.api.ICursor
+import xtdb.arrow.MaskedRelation
 import xtdb.arrow.RelationReader
+import xtdb.util.closeAll
 import java.util.function.Consumer
 
 class SelectCursor(
     private val al: BufferAllocator,
     private val inCursor: ICursor,
     private val selector: SelectionSpec,
-    private val schema: Map<String, Any>,
-    private val args: RelationReader
 ) : ICursor {
 
     override val cursorType get() = "select"
@@ -20,10 +20,19 @@ class SelectCursor(
 
         while (!advanced) {
             inCursor.tryAdvance { inRel ->
-                val sel = selector.select(al, inRel, schema, args)
-                if (sel.isNotEmpty()) {
-                    c.accept(inRel.select(sel))
-                    advanced = true
+                val mask = selector.select(inRel)
+                when (mask.cardinality) {
+                    0 -> {}
+
+                    inRel.rowCount -> {
+                        c.accept(inRel)
+                        advanced = true
+                    }
+
+                    else -> {
+                        c.accept(MaskedRelation.of(inRel, mask))
+                        advanced = true
+                    }
                 }
             } || break
         }
@@ -31,5 +40,5 @@ class SelectCursor(
         return advanced
     }
 
-    override fun close() = inCursor.close()
+    override fun close() = listOf(selector, inCursor).closeAll()
 }

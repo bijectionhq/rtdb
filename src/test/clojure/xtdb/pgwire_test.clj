@@ -27,7 +27,7 @@
            (java.time Clock Instant LocalDate LocalDateTime LocalTime OffsetDateTime ZoneId ZoneOffset ZonedDateTime)
            (java.time.temporal Temporal)
            (java.util Arrays Calendar List Map TimeZone)
-           (java.util.concurrent CountDownLatch Executor TimeUnit)
+           (java.util.concurrent CountDownLatch Executor ThreadPoolExecutor TimeUnit)
            (org.postgresql.util PGobject PSQLException)
            (xtdb.arrow Relation)
            (xtdb.pgwire PgType)
@@ -595,6 +595,23 @@
 
       (.close server)
       (check-server-resources-freed server))))
+
+(deftest closing-the-server-closes-connections-still-waiting-for-a-handler
+  (with-open [server (serve {:num-threads 1})]
+    (binding [*server* server, *port* (:port server)]
+      (logging/with-log-level 'xtdb.pgwire :off
+        (with-open [held (jdbc-conn)]
+          (ping held)
+          (let [queued (future
+                         (try
+                           (with-open [_ (jdbc-conn {"socketTimeout" 10})] :connected)
+                           (catch PSQLException _ :refused)))
+                ^ThreadPoolExecutor pool (:thread-pool server)]
+            (while (.isEmpty (.getQueue pool)) (Thread/sleep 10))
+
+            (.close server)
+
+            (is (= :refused (deref queued 2000 :timeout)))))))))
 
 (deftest concurrent-conns-close-midway-test
   (with-open [server (serve {:num-threads 2 :accept-so-timeout 10})]
@@ -2990,6 +3007,53 @@ ORDER BY 1,2;")
                  "SELECT CASE WHEN _id = 2 THEN d ELSE DATE '2020-01-01' END FROM dm"]]
       (t/is (= (read-val false sql) (read-val true sql)) sql))))
 
+(t/deftest test-binary-timestamp-sends-the-micro-text-shows
+  (doseq [input ["'1901-12-13T20:45:52.888842999'::TIMESTAMP(9)"
+                 "CASE WHEN true THEN TIMESTAMP '2020-01-01 00:00:01.123456' ELSE '1901-12-13T20:45:52.888842999'::TIMESTAMP(9) END"
+                 "CASE WHEN false THEN TIMESTAMP '2020-01-01 00:00:01.123456' ELSE '1901-12-13T20:45:52.888842999'::TIMESTAMP(9) END"]
+          :let [read-val (fn [binary?]
+                           (with-open [conn (pgjdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
+                                       stmt (.prepareStatement conn (str "SELECT " input " v"))
+                                       rs (.executeQuery stmt)]
+                             (.next rs)
+                             (.getObject rs 1 LocalDateTime)))]]
+    (t/is (= (read-val false) (read-val true)) input)))
+
+(t/deftest test-filtered-batch-serialises-each-column-in-step
+  (with-open [conn (pgjdbc-conn)
+              stmt (.createStatement conn)]
+    (.execute stmt "INSERT INTO docs (_id, n, s, l, ts, tsn, tstz)
+                    VALUES (1, 10, {a: 1, b: 'x'}, [1, 2], TIMESTAMP '2024-01-01 00:00:01.123456',
+                            '2024-01-01T00:00:01.123456789'::TIMESTAMP(9), TIMESTAMP '2024-01-01 00:00:01.5Z'),
+                           (2, 20, {a: 2, b: 'y'}, [3], TIMESTAMP '2024-01-02 00:00:02',
+                            '2024-01-02T00:00:02.000000001'::TIMESTAMP(9), TIMESTAMP '2024-01-02 00:00:02Z'),
+                           (3, NULL, NULL, NULL, NULL, NULL, NULL),
+                           (4, 40, {a: 4, b: 'z'}, [], TIMESTAMP '1441-07-25 18:00:11.888842',
+                            '1901-12-13T20:45:52.888842'::TIMESTAMP(9), TIMESTAMP '1441-07-25 18:00:11Z')"))
+
+  (let [expected [["1" "10" "{\"a\":1,\"b\":\"x\"}" [1 2] "2024-01-01 00:00:01.123456" "2024-01-01 00:00:01.123456" #xt/odt "2024-01-01T00:00:01.5Z"]
+                  ["3" nil nil nil nil nil nil]
+                  ["4" "40" "{\"a\":4,\"b\":\"z\"}" [] "1441-07-25 18:00:11.888842" "1901-12-13 20:45:52.888842" #xt/odt "1441-07-25T18:00:11Z"]]
+        read-row (fn [^ResultSet rs]
+                   [(.getString rs "_id") (.getString rs "n") (.getString rs "s")
+                    (some-> (.getArray rs "l") .getArray vec)
+                    (.getString rs "ts") (.getString rs "tsn")
+                    (.getObject rs "tstz" OffsetDateTime)])]
+    (doseq [binary? [false true]
+            fetch-size [0 1]]
+      (with-open [conn (pgjdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary? "timezone" "UTC"})]
+        (.setAutoCommit conn false)
+        (let [stmt (doto (.prepareStatement conn "SELECT _id, n, s, l, ts, tsn, tstz FROM docs WHERE _id <> 2")
+                     (.setFetchSize fetch-size))]
+          (with-open [rs (.executeQuery stmt)]
+            (t/is (= expected
+                     (->> (loop [rows []]
+                            (if (.next rs)
+                              (recur (conj rows (read-row rs)))
+                              rows))
+                          (sort-by #(parse-long (first %)))))
+                  (format "binary? %s, fetch-size %d" binary? fetch-size))))))))
+
 (defn- compare-decimals-with-scale [^BigDecimal d1 ^BigDecimal d2]
   (and (= (.scale d1) (.scale d2))
        (= (.unscaledValue d1) (.unscaledValue d2))))
@@ -3456,12 +3520,14 @@ ORDER BY 1,2;")
       (t/is (= "Asia/Tokyo" (show "SHOW TIME ZONE" :timezone)))
       (t/is (= "bar" (show "SHOW foo" :foo)))
       (t/is (some? (show "SHOW AWAIT_TOKEN" :await_token)))
+      (t/is (seq (q conn ["SHOW LATEST_SUBMITTED_TX"])))
 
       (exec conn "DISCARD ALL")
 
       (t/is (= default-tz (show "SHOW TIME ZONE" :timezone)) "time zone back to the startup value")
       (t/is (nil? (show "SHOW foo" :foo)) "SET parameters cleared")
       (t/is (nil? (show "SHOW AWAIT_TOKEN" :await_token)) "await token cleared")
+      (t/is (= [] (q conn ["SHOW LATEST_SUBMITTED_TX"])) "last submitted tx cleared")
 
       (exec conn "BEGIN")
       (exec conn "INSERT INTO docs RECORDS {_id: 1}")

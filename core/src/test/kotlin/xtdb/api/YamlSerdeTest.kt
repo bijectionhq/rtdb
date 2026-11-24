@@ -6,6 +6,7 @@ import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
+import xtdb.api.error.Incorrect
 import org.junit.jupiter.api.Test
 import xtdb.api.Authenticator.Factory.OpenIdConnect
 import xtdb.api.Authenticator.Factory.SingleRootUser
@@ -363,13 +364,13 @@ class YamlSerdeTest {
     }
 
     @Test
-    fun testCompactorReeIids() {
+    fun testCompactorOptIn221() {
         val input = """
         compactor:
-          reeIids: true
+          optIn221: true
         """.trimIndent()
 
-        assertEquals(true, nodeConfig(input).compactor.reeIids)
+        assertEquals(true, nodeConfig(input).compactor.optIn221)
     }
 
     @Test
@@ -461,6 +462,21 @@ class YamlSerdeTest {
             ),
             nodeConfig(input).authn
         )
+    }
+
+    @Test
+    fun testMalformedRemoteAddressFailsConfigLoad() {
+        val input = """
+        authn: !UserList
+          users: {}
+          rules:
+            - remoteAddress: 10.0.0.0/33
+              method: TRUST
+        """.trimIndent()
+
+        val thrown = assertThrows(Incorrect::class.java) { nodeConfig(input) }
+
+        assertEquals("remoteAddress must be an IP address or CIDR block: 10.0.0.0/33", thrown.message)
     }
 
     @Test

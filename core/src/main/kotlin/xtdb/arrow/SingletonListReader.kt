@@ -19,7 +19,6 @@ class SingletonListReader(override val name: String, private val elReader: Vecto
 
     override fun isNull(idx: Int) = false
 
-    override fun getObject(idx: Int) = listOf(elReader.asList)
     override fun getObject(idx: Int, keyFn: IKeyFn<*>) = listOf(elReader.toList(keyFn))
 
     override val listElements get() = elReader
@@ -32,7 +31,7 @@ class SingletonListReader(override val name: String, private val elReader: Vecto
         return RowCopier { idx ->
             check(idx == 0)
 
-            elCopier.copyRange(0, valueCount)
+            elCopier.copyRange(0, elReader.valueCount)
             dest.endList()
             idx
         }
@@ -40,16 +39,24 @@ class SingletonListReader(override val name: String, private val elReader: Vecto
 
     override fun hashCode(idx: Int, hasher: Hasher): Int {
         var hash = 0
-        for (i in 0 until valueCount) {
+        for (i in 0 until elReader.valueCount) {
             hash = ByteFunctionHelpers.combineHash(hash, elReader.hashCode(i, hasher))
         }
         return hash
     }
 
-    override fun valueReader() = object : ValueReader {
+    override fun valueReader() = object : RowValueReader {
         val startIdx = getListStartIndex(0)
         val valueCount = getListCount(0)
         val elValueReader = elReader.valueReader()
+
+        override fun hasNext() = pos < 0
+
+        override var pos = -1
+            set(value) {
+                check(value == 0)
+                field = value
+            }
 
         override val isNull get() = false
         override fun readObject(keyFn: IKeyFn<*>) = getObject(0, keyFn)
