@@ -1268,6 +1268,28 @@ mod tests {
     }
 
     #[test]
+    fn journal_readers_preserve_the_activation_publication_mode() {
+        assert_eq!(Record { certified: true, ..Record::default() }.encode_to_vec(), [0x88, 0x01, 0x01]);
+
+        for certified in [false, true] {
+            let original = Record {
+                stream: 7,
+                kind: Some(Kind::Synced(4)),
+                active_ensemble: Bytes::from_static(&[0x42; 32]),
+                original_append: None,
+                certified,
+            };
+            let mut buffer = BytesMut::new();
+            frame_record(original.clone(), &mut buffer);
+            let framed = buffer.freeze();
+            let length = framed.len() as u64;
+            let mut reader = framed.as_ref();
+            assert_eq!(read_record(&mut reader, length).unwrap(), Some((original.clone(), length)));
+            assert_eq!(decode_located_record(&framed), Some(original));
+        }
+    }
+
+    #[test]
     fn a_torn_final_record_is_cut_off_and_earlier_records_replay() {
         let directory = tempfile::tempdir().unwrap();
         let segments = directory.path().join("segments");

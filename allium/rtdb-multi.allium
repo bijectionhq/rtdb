@@ -470,6 +470,7 @@ contract LogService {
 
     @invariant JournalReplayUsesCompleteFrames
         -- Replay consumes consecutive records with a complete length and checksum header, the exact declared body, a matching checksum, and a decoded journal record.
+        -- A decoded activation preserves the journal's recorded publication mode.
         -- Replay stops at the first incomplete or damaged frame.
         -- A read at a retained record location consumes exactly the recorded frame extent.
 

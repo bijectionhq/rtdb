@@ -7,7 +7,7 @@
     "prost-log-message",
     "prost-journal-record"
   ],
-  "min_verified_functions": 55,
+  "min_verified_functions": 56,
   "controls": {
     "ignore-delimited-length": {
       "defect": "A short length-delimited field is clipped to the available bytes.",
@@ -175,6 +175,78 @@
         }
       ],
       "min_verified_functions": 54
+    },
+    "write-uncertified-activation": {
+      "defect": "A certified record is written with its certification bit cleared.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    let body = encode_record(&record);",
+          "replace": "    let body = encode_record(&Record { certified: false, ..record });"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "frame_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 55
+    },
+    "discard-stream-certification": {
+      "defect": "A sequential journal read clears the record's certification bit.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    Ok(Some((record, end as u64)))",
+          "replace": "    Ok(Some((Record { certified: false, ..record }, end as u64)))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "read_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 55
+    },
+    "discard-located-certification": {
+      "defect": "A read at a retained record location clears the certification bit.",
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "find": "    decode_record(body)\n",
+          "replace": "    let record = decode_record(body)?;\n    Some(Record { certified: false, ..record })\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/journal/framing.rs",
+          "function": "decode_located_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 55
+    },
+    "discard-round-trip-certification": {
+      "defect": "The composed writer and located reader return a record with its certification bit cleared.",
+      "mutate": [
+        {
+          "file": "verification/verus/framing_decoders/laws.rs",
+          "find": "    decode_located_record(&bytes)\n",
+          "replace": "    let decoded = decode_located_record(&bytes)?;\n    Some(Record { certified: false, ..decoded })\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/framing_decoders/laws.rs",
+          "function": "a_written_journal_frame_round_trips",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 55
     },
     "discard-replica-term": {
       "defect": "Decoding an encoded replica envelope replaces its term with a default.",

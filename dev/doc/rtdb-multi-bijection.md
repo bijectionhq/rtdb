@@ -177,8 +177,8 @@ It abstracts the first frame sync and the second observation sync as separate tr
 
 #### Framing decoder evidence
 
-On 2026-11-23, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 55 items in the [framing decoder area](../../verification/verus/framing_decoders/area.json).
-All 23 mutations failed at their declared laws.
+**Proof checked on 2026-11-24.** Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0 checked 56 items in the [framing decoder area](../../verification/verus/framing_decoders/area.json).
+All 27 mutations failed at their declared laws, including clearing the certification bit on write, on each of the two reads, and at the end of the composed round trip.
 
 The checks cover the shipped source and replica header dispatch, replica frame and envelope mapping, eligible source, replica and journal round trips, fixed retirement bytes, and canonical Flight seat text.
 The protobuf wire traversal checks field keys and lengths, progresses across the complete outer envelope, and bounds group nesting at 100.
@@ -186,15 +186,21 @@ Recovery hold detection validates all outer fields before using the presence of 
 The journal reader checks the declared length against the remaining extent before requesting the body, checks the checksum of the exact body, and decodes that body.
 A proper prefix of an encoded frame cannot match a complete record, even when its shorter body could otherwise decode.
 A read at a retained location also requires its whole extent to match the declared frame.
+The frame writer and located decoder round-trip the whole record, including the certification bit, under the Prost contract.
+The sequential reader returns the exact Prost-decoded record on every successful read, including the certification bit.
 The Flight holder admits a seat header only for an audience handshake with exactly one value, and the parser requires the prepaid turn, one alternate digit, and the canonical non-nil attempt UUID.
 
-Source inspection traced the replay iterator and retained payload lookup to the checked journal functions, and the Flight holder and gateway to the shared header names and seat parser.
+**Source inspection.** Replay and retained payload lookup call the checked journal functions, and the Flight holder and gateway use the shared header names and seat parser.
+The activation writer stores the publication mode in protobuf field 17 of the journal record, and replay restores it from that activation or from the compacted snapshot's own mode field.
+The mode determines whether publication requires a decision certificate.
+`JournalProvenance` abstracts retained entry origins and sync samples, and `ActiveLogletReadIndex` abstracts decisions and their quorum installation.
 The [Prost contract](../../verification/verus/foreign_contracts/prost.md) is a premise for generated-message behavior, including full consumption, unknown fields and round trips within the supported nesting depth.
 Protobuf permits non-minimal varints, valid extra fields and equivalent serializations.
 The legacy source flush marker keeps its historical interpretation.
 The remaining premises are exact reads, byte-buffer and endian operations, CRC calculation, available encoding capacity and journal bodies that fit the u32 length field, the existing placed-attempt codec and stage validator, canonical UUID formatting and parsing, and the HTTP metadata libraries' delivery of the header values.
-Filesystem durability and the recovery decision to truncate the final segment are outside the decoder proof.
-The adapter conformance cases were authored in this session.
+Filesystem durability, application of replayed records to stream state, and the recovery decision to truncate the final segment are outside the decoder proof.
+**Authored.** The Prost conformance cases include a wire-tag and reader fixture for both activation modes.
+Native execution of those cases remains unverified.
 
 ### Query from the application
 

@@ -1,4 +1,5 @@
 use crate::{Record, journal_codec_leaves::*};
+use crate::framing::{decode_located_record, frame_record};
 use vstd::prelude::*;
 
 verus! {
@@ -31,6 +32,21 @@ proof fn a_torn_encoding_cannot_match_a_shorter_record(record: Record, other: Re
     if cut >= 8 {
         assert(frame.take(cut).take(4) =~= length);
     }
+}
+
+fn a_written_journal_frame_round_trips(record: Record, buffer: BytesMut) -> (out: Option<Record>)
+    requires buffer@.len() == 0, encode(record).len() <= u32::MAX,
+    ensures out == Some(record),
+{
+    let ghost original = record;
+    let mut buffer = buffer;
+    frame_record(record, &mut buffer);
+    let bytes = Bytes { contents: buffer.contents };
+    proof {
+        assert(bytes@ =~= frame_bytes(encode(original)));
+        a_prost_record_round_trips_through_journal_framing(original);
+    }
+    decode_located_record(&bytes)
 }
 
 }

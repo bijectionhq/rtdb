@@ -20,6 +20,7 @@ pub struct Record {
     kind: Option<Kind>,
     active_ensemble: journal_codec_leaves::Bytes,
     original_append: Option<bool>,
+    certified: bool,
 }
 
 fn main() {}

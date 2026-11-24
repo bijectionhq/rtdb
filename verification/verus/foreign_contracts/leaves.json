@@ -38,7 +38,7 @@
   "prost-journal-record": {
     "model": "verification/verus/framing_decoders/journal_leaves.rs",
     "dependency": "prost 0.14.6",
-    "contract": "The supplied journal body is consumed as one generated Record. Successful decode of a complete encoder-produced Record gives the original fields and kind within the supported nesting depth.",
-    "conformance": "journal::tests::journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body"
+    "contract": "The supplied journal body is consumed as one generated Record. An encoder-produced Record decodes to its original fields, including the certified publication mode and kind, within the supported nesting depth.",
+    "conformance": "journal::tests::journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body and journal::tests::journal_readers_preserve_the_activation_publication_mode"
   }
 }

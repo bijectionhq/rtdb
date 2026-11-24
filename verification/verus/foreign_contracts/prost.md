@@ -9,6 +9,7 @@ An incomplete key, scalar, length-delimited field or group fails decoding.
 A complete unknown field can be consumed and discarded.
 A legal non-minimal varint and a valid extra protobuf field can contribute to a successful decode.
 Decoding Prost's own encoding yields the original generated message, using value equality for the source, replica and journal schemas covered here.
+This includes the journal's `certified` boolean at protobuf field 17, whose default value is `false`.
 The round-trip premise applies to values within the encoder's available memory and the decoder's supported nested-message depth.
 
 The [envelope leaf](../framing_decoders/decoder_leaves.rs) relates the entire source or replica body to an abstract decoded value.
@@ -16,5 +17,6 @@ The [journal leaf](../framing_decoders/journal_leaves.rs) relates the exact decl
 They use normal whole-buffer `decode`.
 The framing proof checks which byte span reaches each leaf and what the RTDB wrapper does with its result.
 
-The authored conformance cases are `replica_decoding_consumes_unknown_fields_and_rejects_malformed_suffixes` in `rust/crates/format/tests/term_sequence.rs`, `generated_source_decoding_rejects_an_incomplete_field_after_a_known_body` in `rust/crates/format/tests/source_classification.rs`, and `journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body` in `rust/crates/logkeeper/src/server/journal.rs`.
-They were not run in the formal-only session.
+The authored conformance cases are `replica_decoding_consumes_unknown_fields_and_rejects_malformed_suffixes` in `rust/crates/format/tests/term_sequence.rs` and `generated_source_decoding_rejects_an_incomplete_field_after_a_known_body` in `rust/crates/format/tests/source_classification.rs`.
+The journal cases in `rust/crates/logkeeper/src/server/journal.rs` are `journal_readers_require_the_declared_body_and_prost_consumes_that_entire_body` and `journal_readers_preserve_the_activation_publication_mode`.
+The cases remain unverified by native execution in the formal-only sessions.
