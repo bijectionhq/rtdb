@@ -98,11 +98,14 @@ impl DataFileReader {
         Ok((batch, charged))
     }
 
-    async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+    async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>, expected_metadata: Option<&[u8]>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let wire = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
+        if expected_metadata.is_some_and(|metadata| !wire.as_slice().starts_with(metadata)) {
+            return Err(invalid("page-metadata", "Arrow page header changed after row admission"));
+        }
         let reserve = |bound| {
             audience_work::decode_bytes(bound)?;
             memory.reserve(bound)
@@ -177,25 +180,44 @@ impl DataFileReader {
     }
 }
 
+/// Visits pages up to the row limit and returns the number of rows visited.
+/// `None` means the next page exceeded the limit after any earlier pages were visited.
 #[doc(hidden)]
 pub async fn visit_trie_iids(
     context: &crate::QueryContext, storage: Arc<BufferPool>, slug: &TableSlug, trie: &TrieKey,
-    mut visit: impl FnMut(Iid) -> Result<()>,
-) -> Result<()> {
+    limit: usize, mut visit: impl FnMut(Iid) -> Result<()>,
+) -> Result<Option<usize>> {
     context.check_cancelled()?;
     let mut file = DataFileReader::new(&storage, ObjectKey::new(slug.data_key(trie))?);
-    let pages = file.open(&context.memory).await?.layout.decoder.page_count();
+    let memory = &context.memory;
+    let pages = file.open(memory).await?.layout.decoder.page_count();
+    let mut rows = 0;
     for page in 0..pages {
         context.check_cancelled()?;
         if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
-            visit_iids(context, held.batch.view().iids()?, &mut visit)?;
+            let batch = held.batch.view();
+            if batch.len() > limit - rows { return Ok(None); }
+            visit_iids(context, batch.iids()?, &mut visit)?;
+            rows += batch.len();
         } else {
-            let (batch, _charged) = file.decode_spatial_page(page, &context.memory, PageProjection::Iid).await?;
-            let iids = batch.column_by_name("_iid").ok_or_else(|| invalid("page-iid", "Arrow page has no IID column"))?;
-            visit_iids(context, IidView::new(iids.as_ref())?, &mut visit)?;
+            let opened = file.opened.as_ref().expect("the data file is open");
+            let decoder = &opened.layout.decoder;
+            let metadata = file.read_range(opened.whole.as_ref(), decoder.page_metadata_range(page)?, memory).await?;
+            let page_rows = decoder.page_rows(page, metadata.as_slice())?;
+            if page_rows > limit - rows { return Ok(None); }
+
+            context.check_cancelled()?;
+            let (batch, _charged) = file.decode_spatial_page(page, memory, PageProjection::Iid, Some(metadata.as_slice())).await?;
+            let column = batch.column_by_name("_iid").ok_or_else(|| invalid("page-iid", "Arrow page has no IID field"))?;
+            let iids = IidView::new(column.as_ref())?;
+            if iids.len() != page_rows {
+                return Err(invalid("page-rows", "Arrow IID count differs from the admitted page row count"));
+            }
+            visit_iids(context, iids, &mut visit)?;
+            rows += page_rows;
         }
     }
-    Ok(())
+    Ok(Some(rows))
 }
 
 #[doc(hidden)]
@@ -2204,7 +2226,7 @@ impl PartitionScan {
                 let context = &self.execution.context;
                 let (page, charged) = if context.spatial_refinement {
                     let selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
-                    data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected)).await?
+                    data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected), None).await?
                 } else {
                     data.decode_page(*page_index, &context.memory).await?
                 };
@@ -3672,13 +3694,71 @@ mod tests {
         let (_, execution, _) = descriptor_scan(snapshot, table, Arc::clone(&storage));
         let context = execution.context.as_ref();
         let mut iids = Vec::new();
-        visit_trie_iids(context, Arc::clone(&storage), &slug, &trie, |iid| {
+        let rows = visit_trie_iids(context, Arc::clone(&storage), &slug, &trie, 3, |iid| {
             iids.push(iid);
             Ok(())
         }).await.unwrap();
+        assert_eq!(rows, Some(3));
         assert_eq!(iids, events.iter().map(|event| event.iid).collect::<Vec<_>>());
         assert_eq!(trie_row_count_up_to(context, Arc::clone(&storage), &slug, &trie, 3).await.unwrap(), Some(3));
         assert_eq!(trie_row_count_up_to(context, storage, &slug, &trie, 2).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn spatial_iid_nomination_admits_wide_pages_and_refuses_over_limit_before_reading_body() {
+        let (state, table, mut events) = live_table();
+        let captured = state.value();
+        let snapshot = captured.snapshot();
+        let slug = snapshot.table_entry(&table).unwrap().slug.clone();
+        let trie = TrieKey::l0(captured.live().block_index()).unwrap();
+        let key = ObjectKey::new(slug.data_key(&trie)).unwrap();
+        for (index, event) in events.iter_mut().enumerate() {
+            let StoredOperation::Put(document) = &mut event.operation else { panic!("Expected a put") };
+            let payload = if index == 0 { "small".into() } else { "payload".repeat(64 << 10) };
+            document.insert("v".into(), Value::Utf8(payload));
+        }
+        let fields = StructFields::from([
+            ("_id".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("v".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ]);
+        let pages = [&events[..1], &events[1..]].map(|events| {
+            build_event_batch(events, Some(fields.clone()), Some(rtdb_types::RunEndWidth::I32)).unwrap()
+        });
+        let data = write_file(pages[0].schema_ref(), &pages).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        store.put(&key, data.into()).await.unwrap();
+        let storage = Arc::new(BufferPool::new(store.clone(), 128 << 20));
+        let (_, execution, _) = descriptor_scan(snapshot, table, Arc::clone(&storage));
+        let mut context = execution.context.as_ref().clone();
+        context.memory = MemoryBudget::new(256 << 10);
+        let mut iids = Vec::new();
+        let mut visit = |iid| { iids.push(iid); Ok(()) };
+
+        let small_pool = Arc::new(BufferPool::new(store, 128 << 10));
+        assert_eq!(visit_trie_iids(&context, Arc::clone(&small_pool), &slug, &trie, 2, &mut visit).await.unwrap(), None);
+        assert_eq!(visit_trie_iids(&context, small_pool, &slug, &trie, 3, &mut visit).await.unwrap_err().code,
+            "rtdb.storage/memory-limit");
+
+        assert_eq!(visit_trie_iids(&context, Arc::clone(&storage), &slug, &trie, 3, &mut visit).await.unwrap(), Some(3));
+        let mut file = DataFile {
+            storage: Arc::clone(&storage), key: key.clone(),
+            metadata: ObjectKey::new(slug.metadata_key(&trie)).unwrap(), opened: None,
+        };
+        let warmup = MemoryBudget::new(16 << 20);
+        for page in 0..2 {
+            let (batch, charged) = file.decode_page(page, &warmup).await.unwrap();
+            let bound = charged.bytes();
+            if page == 1 { assert!(bound > context.memory.limit_bytes()); }
+            let headers = storage.admit(IndexBatch::header_bytes(batch.num_rows()).unwrap()).unwrap();
+            let owned = OwnedBatch::with_reservation(batch, storage.admit(bound).unwrap()).unwrap();
+            let batch = IndexBatch::from_owned_with_headers(owned, headers).unwrap();
+            assert!(storage.insert_view(&key, View::Page(page), Arc::new(CachedPage { batch, bound })));
+        }
+
+        assert_eq!(visit_trie_iids(&context, Arc::clone(&storage), &slug, &trie, 2, &mut visit).await.unwrap(), None);
+        assert_eq!(visit_trie_iids(&context, storage, &slug, &trie, 3, &mut visit).await.unwrap(), Some(3));
+        assert_eq!(iids, [0, 0, 0, 1, 2, 0, 0, 1, 2].map(|index| events[index].iid));
+        assert_eq!(context.memory.used_bytes(), 0);
     }
 
     /// Persists one page per event; `misplaced` writes the second event's page in the first one's place too.

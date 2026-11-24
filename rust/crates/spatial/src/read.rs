@@ -726,14 +726,17 @@ pub(super) async fn visit_matches(
         }
         let size = u64::try_from(trie.data_file_size).map_err(|_| postings::work_limit())?;
         charge_bytes(&mut candidates.unindexed_bytes, size, MAX_UNINDEXED_BYTES)?;
-        rtdb_query::visit_trie_iids(
+        let rows = rtdb_query::visit_trie_iids(
             &context,
             Arc::clone(&database.storage),
             &table.slug,
             &trie.key,
-            |iid| candidates.insert_unindexed(iid),
+            MAX_UNINDEXED_ROWS - candidates.unindexed_rows,
+            |iid| candidates.insert(iid),
         )
-        .await?;
+        .await?
+        .ok_or_else(postings::work_limit)?;
+        candidates.unindexed_rows += rows;
     }
     for segment in snapshot.iter_segments(&definition.table) {
         for batch in segment.batches() {
