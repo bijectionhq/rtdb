@@ -1,0 +1,63 @@
+{
+  "summary": "The owned Flight resolver decisions check the independent installed authority result and every predecessor stamp, select only the registered refusal, and preserve the accepting revision and submitted marker identity.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 10,
+  "controls": {
+    "skip_installed_authority": {
+      "defect": "Use matching caller controls as sufficient authority.",
+      "mutate": [{
+        "file": "rust/crates/tx/src/resolver/owned_flight_decision.rs",
+        "find": "    if !authority_current {",
+        "replace": "    if false {"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/resolver/owned_flight_decision.rs",
+        "function": "check_controls",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 9
+    },
+    "skip_later_stamp": {
+      "defect": "A matching first control hides a stale later stamp.",
+      "mutate": [{
+        "file": "rust/crates/tx/src/resolver/control_order.rs",
+        "find": "        if !revision_matches(stamp.observed, stamp.expected) {",
+        "replace": "        if index == 0 && !revision_matches(stamp.observed, stamp.expected) {"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/resolver/control_order.rs",
+        "function": "hosted_stamps_current",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 9
+    },
+    "apply_alternative_after_failed_fence": {
+      "defect": "Let a failed predecessor check authorize the registered alternative.",
+      "mutate": [{
+        "file": "rust/crates/tx/src/resolver/owned_flight_decision.rs",
+        "find": "        PrimaryResult::Failed(error) => Publish::Abort(error),\n    }\n}",
+        "replace": "        PrimaryResult::Failed(error) => match registered {\n            Some(refusal) => Publish::StageRefusal(refusal),\n            None => Publish::Abort(error),\n        },\n    }\n}"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/resolver/owned_flight_decision.rs",
+        "function": "select_publication",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 9
+    },
+    "substitute_marker_revision": {
+      "defect": "Emit the original fingerprint at a different revision.",
+      "mutate": [{
+        "file": "rust/crates/tx/src/resolver/owned_flight_decision.rs",
+        "find": "    Some(MarkerWrite { context, fingerprint, revision })",
+        "replace": "    Some(MarkerWrite { context, fingerprint, revision: 0 })"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/resolver/owned_flight_decision.rs",
+        "function": "stage_marker",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 9
+    }
+  }
+}
