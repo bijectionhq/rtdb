@@ -75,6 +75,7 @@ pub fn branch_snapshot_with(
             append_lineage(view, &mut buffer)?;
             append_ordered_indexes(view, &mut buffer)?;
             append_custody_inventory(view, &mut buffer)?;
+            append_custody_placements(view, &mut buffer)?;
         }
         live = Arc::new(live.apply(&buffer.stage()?)?);
     }
@@ -156,6 +157,38 @@ fn append_custody_inventory(view: &BranchView<'_>, buffer: &mut TransactionBuffe
             ("inventory_sha256".into(), Value::Binary(entry.sha256.to_vec())),
             ("placements".into(), Value::U64(entry.placements)),
             ("revoked_at".into(), entry.revoked_at.map_or(Value::Null, basis_value)),
+        ]);
+        buffer.put(catalog.clone(), cells, Interval::ALL)?;
+    }
+    Ok(())
+}
+
+fn append_custody_placements(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+    let catalog = TableRef::new("xt", "custody_placements");
+    let binary = LogicalType::Scalar(ScalarType::Binary);
+    let columns = StructFields::from([
+        ("_id".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ("group_id".into(), binary.clone()),
+        ("enrolled_basis".into(), binary.clone()),
+        ("reservation_sha256".into(), binary.clone()),
+        ("occurrence_sha256".into(), binary.clone()),
+        ("carrier_sha256".into(), binary.clone()),
+        ("written_basis".into(), binary),
+        ("ordinal".into(), LogicalType::Scalar(ScalarType::U64)),
+    ]);
+    buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
+    buffer.declare_document_types(&catalog, &columns)?;
+    let binary = |bytes: [u8; 32]| Value::Binary(bytes.to_vec());
+    for entry in view.custody_placements() {
+        let cells = StructFields::from([
+            ("_id".into(), Value::Utf8(format!("{:032x}", u128::from_be_bytes(entry.placement_id)))),
+            ("group_id".into(), Value::Binary(entry.group.to_vec())),
+            ("enrolled_basis".into(), basis_value(entry.enrolled)),
+            ("reservation_sha256".into(), entry.reservation.map_or(Value::Null, binary)),
+            ("occurrence_sha256".into(), entry.occurrence.map_or(Value::Null, |occurrence| binary(occurrence.commitment(entry.group)))),
+            ("carrier_sha256".into(), entry.occurrence.map_or(Value::Null, |occurrence| binary(occurrence.carrier_sha256))),
+            ("written_basis".into(), entry.occurrence.map_or(Value::Null, |occurrence| basis_value(occurrence.written))),
+            ("ordinal".into(), entry.occurrence.map_or(Value::Null, |occurrence| Value::U64(occurrence.ordinal))),
         ]);
         buffer.put(catalog.clone(), cells, Interval::ALL)?;
     }

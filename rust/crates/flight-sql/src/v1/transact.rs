@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_tx::transact::{
     self as tx, Cell, CountRange, Declaration, Guard, IndexDefinition, Op, Row, Transact, Version,
-    ValidTime, ValidTimeBound, When, Window,
+    CustodyPlacement, CustodyReservation, CustodyTarget, ValidTime, ValidTimeBound, When, Window,
 };
 use rtdb_types::{
     EntityId, TableRef, Timestamp, Value,
@@ -171,12 +171,46 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
                 branch: branch(drop.branch)?,
             },
             WireOp::CreateCustodyGroup(create) => Op::CreateCustodyGroup {
-                group: custody_group(&create.group)?,
+                group: custody_identity(&create.group)?,
             },
             WireOp::RevokeCustodyGroup(revoke) => Op::RevokeCustodyGroup {
-                group: custody_group(&revoke.group)?,
-                inventory_sha256: revoke.inventory_sha256.as_slice().try_into()
-                    .map_err(|_| error::incorrect("Custody revocation needs a 32-byte inventory digest"))?,
+                group: custody_identity(&revoke.group)?,
+                inventory_sha256: commitment(&revoke.inventory_sha256)?,
+            },
+            WireOp::ReserveCustodyPlacement(reserve) => {
+                let target = reserve.target.ok_or_else(|| error::incorrect("Missing custody placement target"))?;
+                let valid = target.valid.ok_or_else(|| error::incorrect("Missing custody placement interval"))?;
+                let ValidTime::Literal(valid) = interval(valid)? else {
+                    return Err(error::incorrect("The custody placement target requires literal valid time"));
+                };
+                Op::ReserveCustodyPlacement {
+                    group: custody_identity(&reserve.group)?,
+                    reservation: CustodyReservation {
+                        original: commitment(&reserve.original_occurrence_sha256)?,
+                        source: commitment(&reserve.source_occurrence_sha256)?,
+                        destination: custody_identity(&reserve.destination)?,
+                        link: custody_identity(&reserve.link)?,
+                        target: CustodyTarget {
+                            branch: branch(target.branch)?, table: table(&target.table)?,
+                            id: entity(target.id, memory)?, valid,
+                        },
+                        review_sha256: commitment(&reserve.review_sha256)?,
+                        carrier_sha256: commitment(&reserve.carrier_sha256)?,
+                        link_sha256: commitment(&reserve.link_sha256)?,
+                    },
+                }
+            }
+            WireOp::PlaceCustodyRow(place) => Op::PlaceCustodyRow {
+                branch: branch(place.branch)?,
+                table: table(&place.table)?,
+                row: decode_row(place.row.ok_or_else(|| error::incorrect("Missing custody row"))?, memory)?,
+                placement: CustodyPlacement {
+                    placement_id: custody_identity(&place.placement_id)?,
+                    reservation: place.reservation_sha256.as_deref().map(commitment).transpose()?,
+                    carrier_column: place.carrier_column,
+                    link_column: place.link_column,
+                    commitments: None,
+                },
             },
         },
     )
@@ -235,7 +269,7 @@ fn declaration(
 }
 
 fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status> {
-    let custody_group = (!row.custody_group.is_empty()).then(|| custody_group(&row.custody_group)).transpose()?;
+    let custody_group = (!row.custody_group.is_empty()).then(|| custody_identity(&row.custody_group)).transpose()?;
     let mut fields = row.cells.into_iter().collect::<BTreeMap<_, _>>();
     let id = entity(fields.remove("_id"), memory)?;
     let from = fields.remove("_valid_from");
@@ -268,12 +302,16 @@ fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status
     })
 }
 
-fn custody_group(bytes: &[u8]) -> Result<[u8; 16], Status> {
-    let group = bytes.try_into().map_err(|_| error::incorrect("A custody group must contain 16 bytes"))?;
-    if group == [0; 16] {
-        return Err(error::incorrect("A custody group needs a nonzero identity"));
+fn custody_identity(bytes: &[u8]) -> Result<[u8; 16], Status> {
+    let identity = bytes.try_into().map_err(|_| error::incorrect("A custody identity must contain 16 bytes"))?;
+    if identity == [0; 16] {
+        return Err(error::incorrect("A custody identity must be nonzero"));
     }
-    Ok(group)
+    Ok(identity)
+}
+
+fn commitment(bytes: &[u8]) -> Result<[u8; 32], Status> {
+    bytes.try_into().map_err(|_| error::incorrect("A custody commitment must contain 32 bytes"))
 }
 
 fn put_valid_bound(field: Option<proto::Cell>, default: Timestamp, memory: &Arc<MemoryBudget>) -> Result<ValidTimeBound, Status> {

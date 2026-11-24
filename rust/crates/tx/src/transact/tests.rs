@@ -734,3 +734,111 @@ fn row_visibility_scoped_claims_check_hidden_effects_without_returning_them() {
     validation.guards[0] = Guard::Unchanged(claims().seal(&evidence).unwrap());
     assert!(matches!(validate(&state, &validation, caller).outcome, Outcome::Refused { error } if error.code == "rtdb/invalid-claim"));
 }
+
+#[test]
+fn custody_reservation_activation_and_release_share_the_revocation_order() {
+    use std::num::NonZeroU64;
+    use rtdb_index::branches::{CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
+
+    let group = [8; 16];
+    let features = [LINEARIZABLE, ROW_CUSTODY];
+    let mut state = TransactState::new(INCARNATION);
+    let write = |state: &mut TransactState, at, request: &Transact| {
+        let prepared = plan(state, request, at, at as i64 * 10, &features);
+        apply(state, at, prepared.record()).unwrap()
+    };
+    let place = |branch: &str, stage: CustodyPlacementId, reservation, valid, carrier_sha256, link_sha256: Option<[u8; 32]>| {
+        Op::PlaceCustodyRow {
+            branch: branch.into(), table: table(),
+            row: Row {
+                id: EntityId::Integer(1), valid: Some(ValidTime::Literal(valid)), cells: StructFields::new(),
+                custody_group: Some(group), custody_payload: Some(CustodyPayload { binding: [3; 32], envelope: vec![stage[0]] }),
+                protected_columns: if link_sha256.is_some() { vec!["carrier".into(), "link".into()] } else { vec!["carrier".into()] },
+            },
+            placement: CustodyPlacement {
+                placement_id: stage, reservation, carrier_column: "carrier".into(), link_column: link_sha256.map(|_| "link".into()),
+                commitments: Some(CustodyPlacementCommitments { carrier_sha256, link_sha256 }),
+            },
+        }
+    };
+    let valid = Interval::new(Timestamp(0), Timestamp(1_000)).unwrap();
+    let original_id = [11; 16];
+    assert_eq!(write(&mut state, 1, &request(1, vec![Op::CreateCustodyGroup { group },
+        place(MAIN_BRANCH, original_id, None, valid, [7; 32], None)])).outcome, Outcome::Then);
+    let occurrence_at = |state: &TransactState, stage| {
+        let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(30)).unwrap();
+        view.custody_placements().find(|entry| entry.placement_id == stage).unwrap().occurrence.unwrap().clone()
+    };
+    let original = occurrence_at(&state, original_id).commitment(group);
+    let plan_before_reserving = state.index().custody_inventory(group).unwrap().sha256;
+    let reservation = CustodyReservation {
+        original, source: original, destination: [12; 16], link: [13; 16],
+        target: CustodyTarget { branch: "copy".into(), table: table(), id: EntityId::Integer(1), valid },
+        review_sha256: [15; 32], carrier_sha256: [16; 32], link_sha256: [17; 32],
+    };
+    let reserved = reservation.commitment(INCARNATION, group);
+    assert_eq!(write(&mut state, 2, &request(2, vec![fork("copy", 1), Op::ReserveCustodyPlacement {
+        group, reservation: reservation.clone(),
+    }])).outcome, Outcome::Then);
+    let pending_inventory = state.index().custody_inventory(group).unwrap();
+    assert_eq!(pending_inventory.placements, 2);
+    assert_ne!(pending_inventory.sha256, plan_before_reserving);
+    let stale = |inventory_sha256| Op::RevokeCustodyGroup { group, inventory_sha256 };
+    assert!(matches!(write(&mut state, 3, &request(3, vec![stale(plan_before_reserving)])).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-inventory-changed"));
+    let activate = |carrier| place("copy", reservation.destination, Some(reserved), valid, carrier, Some(reservation.link_sha256));
+    assert!(matches!(write(&mut state, 4, &request(4, vec![activate([18; 32])])).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+    assert_eq!(state.index().custody_inventory(group).unwrap().sha256, pending_inventory.sha256);
+    let activation = request(5, vec![activate(reservation.carrier_sha256)]);
+    let mut fence_first = state.clone();
+    assert_eq!(write(&mut fence_first, 5, &request(14, vec![stale(pending_inventory.sha256)])).outcome, Outcome::Then);
+    assert!(matches!(write(&mut fence_first, 6, &activation).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/erased-under-view"));
+    let fenced = fence_first.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(60)).unwrap();
+    assert!(fenced.custody_placements().find(|entry| entry.placement_id == reservation.destination).unwrap().occurrence.is_none());
+    let first = write(&mut state, 5, &activation);
+    assert_eq!(first.outcome, Outcome::Then);
+    let active = occurrence_at(&state, reservation.destination);
+    assert_eq!((active.written, active.ordinal, active.reservation), (first.basis, 1, Some(reserved)));
+    assert!(matches!(write(&mut state, 6, &request(6, vec![activate(reservation.carrier_sha256)])).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+    assert!(matches!(write(&mut state, 7, &request(7, vec![stale(pending_inventory.sha256)])).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-inventory-changed"));
+
+    let registration = CustodyReleaseRegistration {
+        authority: CustodyCarrierAuthority {
+            incarnation: INCARNATION, source_history: [15; 32], installation: [16; 16], registry: [17; 32], original_writer: [18; 32],
+        },
+        group, original, occurrence: active.commitment(group), expires_at: Timestamp(120),
+        part: CustodyResponsePart {
+            transport_history: [19; 16], producer: [20; 16], consumer: [21; 16], response: [22; 16], ordinal: NonZeroU64::MIN,
+        },
+    };
+    let release = |phase| Op::CustodyRelease(CustodyRelease { registration, phase });
+    let stage = request(8, vec![release(CustodyReleasePhase::Private)]);
+    assert_eq!(commit(&mut state, 8, &stage).outcome, Outcome::Then);
+    assert!(state.tx_status(&stage.key).is_err());
+    assert_eq!(commit(&mut state, 9, &request(9, vec![release(CustodyReleasePhase::Promoted)])).outcome, Outcome::Then);
+    let inventory = state.index().custody_inventory(group).unwrap();
+    let revoke = request(10, vec![stale(inventory.sha256)]);
+    let revocation = write(&mut state, 10, &revoke);
+    assert_eq!(revocation.outcome, Outcome::Then);
+    assert!(!state.index().custody_releases_drained(group));
+    assert!(matches!(commit(&mut state, 11, &request(11, vec![release(CustodyReleasePhase::Cancelled)])).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-release"));
+    let terminal = CustodyReleasePhase::Disposed { evidence_sha256: [23; 32] };
+    let dispose = request(12, vec![release(terminal)]);
+    let disposed = commit(&mut state, 12, &dispose);
+    assert_eq!(disposed.outcome, Outcome::Then);
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    assert_eq!(state.index().custody_release_phase(registration).unwrap(), Some(terminal));
+    assert!(state.index().custody_releases_drained(group));
+    assert!(state.index().custody_release_phase(CustodyReleaseRegistration { expires_at: Timestamp(121), ..registration }).is_err());
+    assert_eq!(state.index().custody_release_phase(CustodyReleaseRegistration { occurrence: original, ..registration }).unwrap(), None);
+    for (request, prior) in [(activation, first), (revoke, revocation), (dispose, disposed)] {
+        assert!(matches!(state.resolve(&request, 13, Timestamp(130), &features, &claims()).unwrap(),
+            Resolution::Answer(replay) if replay.replayed && replay.basis == prior.basis && replay.outcome == prior.outcome));
+    }
+}

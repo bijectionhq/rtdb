@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
-use rtdb_index::branches::{BranchCut, BranchEffect, BranchWrite};
+use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact};
 use rtdb_types::{
     Anomaly, AnomalyCategory, MemoryBudget, Result, TableRef, Timestamp,
@@ -192,6 +192,14 @@ impl ServingDriver for MultiServing {
             let (index, generation) = self.database.lock().await.fresh_view().await?;
             crate::serving::custody::check_delivery(&index, &self.tokens.custody_vault(), groups).await?;
             self.database.lock().await.check_generation(generation).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
+        cancellation.run_until_cancelled(async {
+            let (index, generation) = self.database.lock().await.fresh_view().await?;
+            self.database.lock().await.check_generation(generation).await?;
+            Ok(index)
         }).await.ok_or_else(interrupted)?
     }
 

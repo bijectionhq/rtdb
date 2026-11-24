@@ -1786,6 +1786,18 @@ surface ConnectionLifecycle {
 -- A scoped Written selector resolves its basis against the acknowledged projection before comparing the row version.
 -- Erasure removes the authorized historical payloads and follows the storage erasure contract.
 
+---- RTDB v1 ordered custody
+
+-- Resolved custody placement effects use the same transaction order and replay boundary as the protected row.
+-- The resolved occurrence names the physical authoring branch, target row, valid interval, written basis and within-transaction ordinal.
+-- Copy activation binds the exact reservation, carrier and link and consumes its destination identity.
+-- A reserved destination and its link remain in the revocation inventory until the group's permanent denial.
+-- The latest revoked inventory keeps the first revocation basis and its digest.
+-- Authenticated release phase effects use the same order as revocation and hold their own receipt namespace.
+-- A promoted release requires positive durable disposal from the original carrier journal, while a private release can be durably cancelled.
+-- The terminal retains the original registration and evidence after checkpoint and trim.
+-- The original ordered revocation time fixes the key retirement deadline and destruction waits for the admitted release holds to drain.
+
 rule ValidateRtdbV1 {
     when: TransactValidationRequested(request, reader)
     requires: LinearizablePrefix(reader, basis)

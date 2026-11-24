@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, BranchView, BranchWrite, RowImage},
+    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage},
 };
 use rtdb_tx::transact::{CustodyGroupId, Receipt, Transact};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
@@ -15,6 +15,7 @@ use rtdb_types::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod custody;
+pub mod custody_release;
 pub(crate) mod default;
 mod visibility;
 pub use visibility::{ServingScope, ROW_VISIBILITY};
@@ -158,6 +159,10 @@ pub trait ServingDriver: Send + Sync {
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, _cancellation: &CancellationToken) -> Result<()> {
         if groups.is_empty() { return Ok(()); }
         Err(rtdb_types::Anomaly::unsupported("rtdb/row-custody", "The query route has no protected delivery authority"))
+    }
+
+    async fn current_custody(&self, _cancellation: &CancellationToken) -> Result<BranchIndex> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no ordered custody catalog"))
     }
 
     async fn reconcile_custody(&self, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }

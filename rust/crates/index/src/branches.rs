@@ -13,8 +13,12 @@ use rtdb_types::{
 use serde::{Deserialize, Serialize};
 
 mod custody;
+mod custody_placement;
+mod custody_release;
 mod visibility;
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
+pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyTarget};
+pub use custody_release::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +125,9 @@ pub enum BranchEffect {
     Erase { branch: Option<Branch>, table: TableRef, id: EntityId },
     CreateCustodyGroup { group: CustodyGroupId },
     RevokeCustodyGroup { group: CustodyGroupId },
+    ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
+    ActivateCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence },
+    CustodyRelease(CustodyRelease),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +185,8 @@ pub struct BranchIndex {
     custody: Map<CustodyGroupId, Arc<custody::CustodyGroup>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_custody_revocation: Option<Basis>,
+    #[serde(default, skip_serializing_if = "imbl::OrdSet::is_empty")]
+    used_custody_placements: imbl::OrdSet<CustodyPlacementId>,
     changed_catalog: Option<Basis>,
     erased: Option<Basis>,
     #[serde(skip)]
@@ -203,7 +212,7 @@ impl BranchIndex {
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
             catalog: Map::new(), custody: Map::new(), latest_custody_revocation: None,
             changed_catalog: None, erased: None, writes: Arc::default(),
-            visibility_projection: false,
+            visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
         }
     }
 
@@ -489,6 +498,9 @@ impl BranchIndex {
             }
             BranchEffect::CreateCustodyGroup { group } => self.create_custody_group(group)?,
             BranchEffect::RevokeCustodyGroup { group } => self.revoke_custody_group(group)?,
+            BranchEffect::ReserveCustodyPlacement { group, reservation } => self.reserve_custody_placement(group, reservation)?,
+            BranchEffect::ActivateCustodyOccurrence { group, occurrence } => self.activate_custody_occurrence(group, occurrence)?,
+            BranchEffect::CustodyRelease(release) => self.apply_custody_release(release)?,
         }
         Ok(())
     }
@@ -518,6 +530,10 @@ impl<'a> BranchView<'a> {
     pub fn lineage(&self) -> Vec<BranchLineage> { self.index.lineage(self.cut.basis) }
     pub fn custody_inventories(&self) -> impl Iterator<Item = CustodyInventory> + '_ {
         self.index.custody_inventories(self.cut.basis).filter(move |_| !self.index.visibility_projection)
+    }
+
+    pub fn custody_placements(&self) -> impl Iterator<Item = CustodyPlacementEntry<'_>> + '_ {
+        self.index.custody_placements(self.cut.basis).filter(move |_| !self.index.visibility_projection)
     }
 
     pub fn tables(&self) -> impl Iterator<Item = (&TableRef, &BranchTable)> {

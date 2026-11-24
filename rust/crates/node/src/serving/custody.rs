@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::CustodyVault;
 use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView}};
-use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, Op, Transact};
+use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, CustodyPlacementCommitments, Op, Transact};
 use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
@@ -14,12 +14,44 @@ pub(crate) async fn prepare(request: &mut Transact, vault: &CustodyVault) -> Res
     request.custody_request_digest = Some(fingerprint);
     for action in request.ops.iter().chain(&request.otherwise) {
         if let Op::CreateCustodyGroup { group } = action {
-            vault.create(*group).await?;
+            if let Err(error) = vault.create(*group).await
+                && error.code != "rtdb/erased-under-view"
+            {
+                return Err(error);
+            }
         }
     }
     for (arm, actions) in [&mut request.ops, &mut request.otherwise].into_iter().enumerate() {
         for (action, op) in actions.iter_mut().enumerate() {
-            let Op::Put { rows, .. } = op else { continue };
+            let rows = match op {
+                Op::Put { rows, .. } => rows.as_mut_slice(),
+                Op::PlaceCustodyRow { row, placement, .. } => {
+                    let expected = 1 + usize::from(placement.link_column.is_some());
+                    if placement.reservation.is_some() != placement.link_column.is_some()
+                        || row.protected_columns.len() != expected
+                        || placement.link_column.as_ref() == Some(&placement.carrier_column)
+                    {
+                        return Err(invalid_carrier());
+                    }
+                    let digest = |column: &str| {
+                        if !row.protected_columns.iter().any(|protected| protected == column) {
+                            return Err(invalid_carrier());
+                        }
+                        match row.cells.get(column) {
+                            Some(Cell::Value(Value::Binary(bytes) | Value::FixedSizeBinary(bytes))) if !bytes.is_empty() => {
+                                Ok(Sha256::digest(bytes).into())
+                            }
+                            _ => Err(invalid_carrier()),
+                        }
+                    };
+                    placement.commitments = Some(CustodyPlacementCommitments {
+                        carrier_sha256: digest(&placement.carrier_column)?,
+                        link_sha256: placement.link_column.as_deref().map(digest).transpose()?,
+                    });
+                    std::slice::from_mut(row)
+                }
+                _ => continue,
+            };
             for (index, row) in rows.iter_mut().enumerate() {
                 if row.protected_columns.is_empty() { continue; }
                 let group = row.custody_group.ok_or_else(missing_group)?;
@@ -32,7 +64,12 @@ pub(crate) async fn prepare(request: &mut Transact, vault: &CustodyVault) -> Res
                 }
                 let clear = serde_json::to_vec(&protected).map_err(payload_error)?;
                 let binding = binding(fingerprint, arm, action, index);
-                let envelope = vault.seal(group, binding, &clear).await?;
+                let envelope = match vault.seal(group, binding, &clear).await {
+                    Ok(envelope) => envelope,
+                    // The fold can still recover the exact receipt from the logical digest.
+                    Err(error) if error.code == "rtdb/erased-under-view" => return Ok(()),
+                    Err(error) => return Err(error),
+                };
                 row.custody_payload = Some(CustodyPayload { binding, envelope });
             }
         }
@@ -109,7 +146,7 @@ pub(crate) async fn reconcile_revocations(index: &BranchIndex, vault: &CustodyVa
     for (group, basis) in index.custody_revocations() {
         let deadline = index.exact(basis)?.system_time;
         vault.retire(group, deadline.0).await?;
-        if now >= deadline {
+        if now >= deadline && index.custody_releases_drained(group) {
             vault.destroy(group).await?;
         }
     }
@@ -126,6 +163,10 @@ fn binding(fingerprint: [u8; 32], arm: usize, operation: usize, row: usize) -> [
     hash.finalize().into()
 }
 
+fn invalid_carrier() -> Anomaly {
+    Anomaly::incorrect("rtdb/custody-placement", "Placement requires exact protected binary carrier and reserved link columns")
+}
+
 fn missing_group() -> Anomaly {
     Anomaly::incorrect("rtdb/custody-payload", "A protected payload requires a custody group")
 }
@@ -137,12 +178,51 @@ fn payload_error(error: serde_json::Error) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use rtdb_crypt::LocalKms;
-    use rtdb_tx::transact::{Outcome, ROW_CUSTODY, Resolution, Row, TransactState, TransactionRecord, Window};
+    use rtdb_tx::transact::{CustodyPlacement, Outcome, ROW_CUSTODY, Resolution, Row, TransactState, TransactionRecord, Window};
     use rtdb_types::{EntityId, TableRef, rtdb_v1::{At, ClaimSealer, Layer, MAIN_BRANCH}};
     use uuid::Uuid;
 
     use super::*;
     use crate::serving::{ChangeGroup, ChangeKind, ChangeRow};
+
+    #[tokio::test]
+    async fn placement_preparation_commits_the_exact_binary_carrier_and_link() {
+        let group = [5; 16];
+        let vault = CustodyVault::new(Uuid::from_bytes([4; 16]), Arc::new(LocalKms::new(|| 11)));
+        vault.create(group).await.unwrap();
+        let carrier = b"independently sealed destination";
+        let link = b"independently sealed link";
+        let mut request = Transact {
+            key: vec![1; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(),
+            ops: vec![Op::PlaceCustodyRow {
+                branch: MAIN_BRANCH.into(), table: TableRef::new("public", "documents"),
+                row: Row {
+                    id: EntityId::Integer(1), valid: None, custody_group: Some(group), custody_payload: None,
+                    cells: StructFields::from([
+                        ("carrier".into(), Cell::Value(Value::Binary(carrier.to_vec()))),
+                        ("link".into(), Cell::Value(Value::Binary(link.to_vec()))),
+                    ]),
+                    protected_columns: vec!["carrier".into(), "link".into()],
+                },
+                placement: CustodyPlacement {
+                    placement_id: [6; 16], reservation: Some([7; 32]), carrier_column: "carrier".into(),
+                    link_column: Some("link".into()), commitments: None,
+                },
+            }],
+            otherwise: Vec::new(), requires: Vec::new(), custody_request_digest: None, request_memory: None,
+        };
+        let logical = request.logical_sha256().unwrap();
+        prepare(&mut request, &vault).await.unwrap();
+        assert_eq!(request.custody_request_digest, Some(logical));
+        let Op::PlaceCustodyRow { row, placement, .. } = &request.ops[0] else { unreachable!() };
+        let commitments = placement.commitments.unwrap();
+        assert_eq!(commitments.carrier_sha256, <[u8; 32]>::from(Sha256::digest(carrier)));
+        assert_eq!(commitments.link_sha256, Some(Sha256::digest(link).into()));
+        assert!(row.cells.is_empty());
+        let payload = open(&vault, group, row.custody_payload.as_ref().unwrap()).await.unwrap();
+        assert_eq!(payload.get("carrier"), Some(&Value::Binary(carrier.to_vec())));
+        assert_eq!(payload.get("link"), Some(&Value::Binary(link.to_vec())));
+    }
 
     #[tokio::test]
     async fn protected_cells_are_sealed_before_append_and_revocation_blocks_delivery() {
@@ -171,6 +251,7 @@ mod tests {
         let unsealed = state.resolve(&first, 1, Timestamp(10), &[ROW_CUSTODY], &claims);
         assert!(matches!(unsealed, Err(error) if error.code == "rtdb/custody-payload"));
         let mut retry = request(1, first.ops.clone());
+        let mut retry_after_destruction = retry.clone();
         prepare(&mut first, &vault).await.unwrap();
         let Resolution::Append(append) = state.resolve(&first, 1, Timestamp(10), &[ROW_CUSTODY], &claims).unwrap()
             else { panic!("a protected write must append"); };
@@ -223,5 +304,8 @@ mod tests {
         let reopened = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
         reconcile_revocations(reopened.index(), &vault, Timestamp(11)).await.unwrap();
         assert_eq!(vault.check_readable(group).await.unwrap_err(), rtdb_crypt::erased_under_view());
+        prepare(&mut retry_after_destruction, &vault).await.unwrap();
+        assert!(matches!(reopened.resolve(&retry_after_destruction, 3, Timestamp(12), &[ROW_CUSTODY], &claims).unwrap(),
+            Resolution::Answer(receipt) if receipt.replayed && receipt.outcome == Outcome::Then));
     }
 }
