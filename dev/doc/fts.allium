@@ -573,7 +573,7 @@ contract SearchCorrectness {
 contract SealedDerivedSearchSegments {
     -- Search runs, term directories and vector columns built from a relation whose rows carry a protection label are sealed derived segments.
     -- A derived segment can be partially inverted back to its source text, so it carries its source's protection and is erased with it.
-    -- This contract runs ahead of the implementation for labelled relations: Bijection does not yet write protected text into a searchable relation, and the term-directory building outcome after an erase is not yet served.
+    -- Bijection writes the protected text of a labelled partition into its own derived search relation (`<partition>_search`), in the same commit as the sealed source row, and erases its rows with the source.
 
     @invariant OneLabelSetPerSegment
         -- A caller that labels rows places each label set in its own relation, and a search path is declared per relation.
@@ -601,6 +601,7 @@ contract SealedDerivedSearchSegments {
         -- A term directory and an approximate vector generation cannot retract one entity's contribution.
         -- After an erase that affects them they serve nothing until rebuilt from the replacement runs, and a reader that needs them receives a building outcome, never an earlier generation.
         -- Exact ranking never needs them: its scores come from the held corpus or from explicit statistics.
+        -- A term directory records the digest of the exact runs it covers; a reader whose active runs differ reports it for rebuild and ranks without its bounds.
 
     @invariant StatisticsFromTheAdmittedCorpus
         -- Corpus statistics come from the relations the reader admitted at its held cut, or from the five-argument SEARCH_SCORE with statistics the caller aggregated over its admitted rows.

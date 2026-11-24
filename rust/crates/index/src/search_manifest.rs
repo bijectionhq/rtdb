@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn directory_publication_compares_the_root_and_active_inputs_and_survives_checkpoint_recovery() {
         let empty_root = |runs| TermDirectoryRoot { definition_id: Some("searchf16".into()), definition_version: Some(20),
-            root: Some(Vec::new()), runs: Some(runs) };
+            root: Some(Vec::new()), runs: Some(runs), run_set: None };
         let update = |run: SearchRun, replaces, root, basis: [u8; 32]| SearchRunChange {
             run: Some(run), replaces, term_directory: Some(root), replaces_directory: Some(basis.to_vec()), ..Default::default()
         };

@@ -115,6 +115,13 @@ impl LogicalCoverage<'_> {
             runtime.report_term_directory(request.database, &definition.table, &id, definition.version);
             return Ok(None);
         };
+        let active = self.runs.iter().map(|run| run.identity()).collect::<Result<Vec<_>>>()?;
+        if !directory.covers(active) {
+            // Building: an erase or merge replaced a run the directory still
+            // names. Rank exactly without its bounds while the lane rebuilds.
+            runtime.report_term_directory(request.database, &definition.table, &id, definition.version);
+            return Ok(None);
+        }
         let read = async {
             if directory.runs() != self.runs.len() as i64 {
                 return Err(Anomaly::fault("rtdb.search/term-directory", "Directory run count differs from its snapshot"));

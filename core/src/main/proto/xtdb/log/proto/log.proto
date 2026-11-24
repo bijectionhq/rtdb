@@ -223,6 +223,10 @@ message TermDirectoryRoot {
     int64 definition_version = 2;
     bytes root = 3;
     int64 runs = 4;
+    // Digest of the exact run identities the pages cover. A reader whose
+    // active runs differ, as after an erase replaced a run, treats the
+    // directory as building and ranks without its bounds.
+    bytes run_set = 5;
 }
 
 message RetiredSearchRun {

@@ -2999,6 +2999,7 @@ mod tests {
         assert!(written.len() > 1);
         let table = TableBlock::decode(&[])?.with_term_directories(vec![TermDirectoryRoot {
             definition_id: Some("body".into()), definition_version: Some(1), root: Some(root.encode()), runs: Some(1),
+            run_set: None,
         }]);
         let mut closure = BTreeMap::new();
         retain_term_directory_pages(store.as_ref(), &table, &slug, &mut closure).await?;

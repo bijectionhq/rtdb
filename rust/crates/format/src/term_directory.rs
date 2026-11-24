@@ -24,6 +24,24 @@ impl TermDirectoryRoot {
         }
         Ok(Some(root))
     }
+
+    /// Whether the pages cover exactly these active runs. A directory is a
+    /// rebuild-only structure: after an erase replaces a run it serves no
+    /// bounds until the lane publishes it again over the replacement.
+    pub fn covers(&self, runs: impl IntoIterator<Item = [u8; 32]>) -> bool {
+        self.run_set.as_deref() == Some(run_set(runs).as_slice())
+    }
+}
+
+/// The digest of a directory's exact run identities, in any order.
+pub fn run_set(runs: impl IntoIterator<Item = [u8; 32]>) -> [u8; 32] {
+    let mut runs: Vec<_> = runs.into_iter().collect();
+    runs.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb/search/term-directory/run-set");
+    digest.update((runs.len() as u64).to_be_bytes());
+    for run in runs { digest.update(run); }
+    digest.finalize().into()
 }
 
 pub fn publication_basis(root: Option<&TermDirectoryRoot>, runs: impl IntoIterator<Item = [u8; 32]>) -> [u8; 32] {

@@ -516,8 +516,12 @@ impl SearchBuilder {
             }
         };
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+        let mut covered = before.iter().copied().filter(|run| !is_replaced(run))
+            .map(|run| run.identity()).collect::<Result<Vec<_>>>()?;
+        if let Some((run, _)) = added { covered.push(run.identity()?); }
         Ok((TermDirectoryRoot { definition_id: Some(index.id.clone()), definition_version: Some(index.version),
-            root: Some(root.as_ref().map_or_else(Vec::new, |root| root.encode())), runs: Some(runs as i64) }, basis))
+            root: Some(root.as_ref().map_or_else(Vec::new, |root| root.encode())), runs: Some(runs as i64),
+            run_set: Some(term_directory::run_set(covered).to_vec()) }, basis))
     }
 
     async fn collect_term_edits(&self, slug: &TableSlug, columns: &[String], run: &SearchRun, edits: &mut TermEdits,
