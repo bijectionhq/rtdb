@@ -542,8 +542,6 @@ fn io_error(error: io::Error) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use rtdb_node::serving::TransactSubmission;
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
 
@@ -608,34 +606,30 @@ mod tests {
                 runtime.tick().await.unwrap();
                 let receipt = driver
                     .transact(
-                        TransactSubmission {
-                            transaction: Transact {
-                                custody_request_digest: None,
-                                key: key.clone(),
-                                require: vec![],
-                                window: Default::default(),
-                                guards: vec![],
-                                requires: vec![],
-                                otherwise: vec![],
-                                ops: vec![Op::Put {
-                                    branch: "main".into(),
-                                    table: TableRef::new("public", "docs"),
-                                    if_absent: false,
-                                    rows: vec![Row {
-                                        id: EntityId::Integer(1),
-                                        valid: None,
-                                        custody_group: None,
-                                        protected_columns: Vec::new(),
-                                        custody_payload: None,
-                                        cells: [("value".into(), Cell::Value(Value::I64(42)))]
-                                            .into_iter()
-                                            .collect(),
-                                    }],
+                        Transact {
+                            custody_request_digest: None,
+                            request_memory: None,
+                            key: key.clone(),
+                            require: vec![],
+                            window: Default::default(),
+                            guards: vec![],
+                            requires: vec![],
+                            otherwise: vec![],
+                            ops: vec![Op::Put {
+                                branch: "main".into(),
+                                table: TableRef::new("public", "docs"),
+                                if_absent: false,
+                                rows: vec![Row {
+                                    id: EntityId::Integer(1),
+                                    valid: None,
+                                    custody_group: None,
+                                    protected_columns: Vec::new(),
+                                    custody_payload: None,
+                                    cells: [("value".into(), Cell::Value(Value::I64(42)))]
+                                        .into_iter()
+                                        .collect(),
                                 }],
-                            },
-                            attempt: Uuid::new_v4(),
-                            submitted_at: SystemClock.now(),
-                            source: Bytes::new(),
+                            }],
                         },
                         &stop,
                     )

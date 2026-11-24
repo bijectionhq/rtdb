@@ -12,8 +12,6 @@ use super::*;
 
 pub const ROW_VISIBILITY: &str = "row-visibility";
 
-pub type ScopedSubmission = TransactSubmission;
-
 #[derive(Clone)]
 pub struct ServingScope {
     pub labels: LabelScope,

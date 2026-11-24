@@ -188,7 +188,7 @@ impl TransactPipeline {
         let next = position.checked_add(if timed { 2 } else { 1 }).ok_or_else(exhausted)?;
         let entry = if timed {
             // Kept to derive the terminal record; the in-flight copy is folded on acknowledgement.
-            let entry = Entry::TimedTx { record: TransactionRecord::decode(&bytes)? };
+            let entry = Entry::TimedTx { record: TransactionRecord::Tx(tx.clone()) };
             self.timed.insert(position, (prepared, after.clone()));
             entry
         } else {
@@ -379,6 +379,7 @@ mod tests {
         let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("{n}"))))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None };
         Transact {
             custody_request_digest: None,
+            request_memory: None,
             key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
             ops: vec![Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent }],
             otherwise: Vec::new(),
@@ -647,5 +648,50 @@ mod tests {
         };
         assert_eq!(receipt.basis.position(), position);
         assert!(receipt.replayed);
+    }
+
+    #[test]
+    fn canonical_admission_sorts_named_cells_and_required_features() {
+        let mut request = put(1, 1, false);
+        request.require = vec![TRANSACT_REQUIRES.into(), LINEARIZABLE.into(), LINEARIZABLE.into()];
+        let Op::Put { rows, .. } = &mut request.ops[0] else { panic!("expected a Put"); };
+        rows[0].cells.insert("first".into(), Cell::Value(Value::I64(17)));
+
+        let mut equivalent = request.clone();
+        equivalent.require = vec![LINEARIZABLE.into(), TRANSACT_REQUIRES.into()];
+        let Op::Put { rows, .. } = &mut equivalent.ops[0] else { panic!("expected a Put"); };
+        rows[0].cells.sort_keys();
+
+        let (_, first) = append(&mut pipeline(), &request, 42);
+        let (_, second) = append(&mut pipeline(), &equivalent, 42);
+        assert_eq!(first, second);
+        let mut follower = TransactState::new(INCARNATION);
+        follower.apply(1, TransactionRecord::decode(&first).unwrap()).unwrap();
+        let checkpoint = follower.encode_checkpoint().unwrap();
+        let follower = TransactState::decode_checkpoint(&checkpoint, follower.index().head()).unwrap();
+        let receipt = follower.tx_status(&request.key).unwrap();
+        assert!(matches!(follower.resolve(&equivalent, 2, Timestamp(99), FEATURES, &claims()).unwrap(),
+            Resolution::Answer(replay) if replay == receipt));
+    }
+
+    #[test]
+    fn canonical_admission_checks_the_request_key_and_replays_existing_v2_records() {
+        let request = put(1, 1, false);
+        let (_, record) = append(&mut pipeline(), &request, 42);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&record).unwrap();
+        legacy[1]["Tx"]["request"]["key"] = serde_json::json!(key(2));
+        let mismatched = TransactionRecord::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap_err();
+        assert_eq!(mismatched.code, "rtdb/invalid-resolved-transaction");
+
+        let tx = legacy[1]["Tx"].as_object_mut().unwrap();
+        tx.remove("request");
+        let admitted_at = tx.remove("admitted_at").unwrap();
+        tx.insert("submitted_at".into(), admitted_at);
+        let record = TransactionRecord::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(record.encode().is_err());
+        let mut follower = TransactState::new(INCARNATION);
+        follower.apply(1, record).unwrap();
+        assert!(matches!(follower.resolve(&request, 2, Timestamp(99), FEATURES, &claims()).unwrap(),
+            Resolution::Answer(receipt) if receipt.replayed));
     }
 }

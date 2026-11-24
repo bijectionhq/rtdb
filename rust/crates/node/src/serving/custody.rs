@@ -3,21 +3,21 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::CustodyVault;
 use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView}};
-use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, Op};
+use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, Op, Transact};
 use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
-use super::{ChangePage, TransactSubmission};
+use super::ChangePage;
 
-pub(crate) async fn prepare(submission: &mut TransactSubmission, vault: &CustodyVault) -> Result<()> {
-    let fingerprint = submission.transaction.logical_sha256()?;
-    submission.transaction.custody_request_digest = Some(fingerprint);
-    for action in submission.transaction.ops.iter().chain(&submission.transaction.otherwise) {
+pub(crate) async fn prepare(request: &mut Transact, vault: &CustodyVault) -> Result<()> {
+    let fingerprint = request.logical_sha256()?;
+    request.custody_request_digest = Some(fingerprint);
+    for action in request.ops.iter().chain(&request.otherwise) {
         if let Op::CreateCustodyGroup { group } = action {
             vault.create(*group).await?;
         }
     }
-    for (arm, actions) in [&mut submission.transaction.ops, &mut submission.transaction.otherwise].into_iter().enumerate() {
+    for (arm, actions) in [&mut request.ops, &mut request.otherwise].into_iter().enumerate() {
         for (action, op) in actions.iter_mut().enumerate() {
             let Op::Put { rows, .. } = op else { continue };
             for (index, row) in rows.iter_mut().enumerate() {
@@ -137,7 +137,7 @@ fn payload_error(error: serde_json::Error) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use rtdb_crypt::LocalKms;
-    use rtdb_tx::transact::{Outcome, ROW_CUSTODY, Resolution, Row, Transact, TransactState, TransactionRecord, Window};
+    use rtdb_tx::transact::{Outcome, ROW_CUSTODY, Resolution, Row, TransactState, TransactionRecord, Window};
     use rtdb_types::{EntityId, TableRef, rtdb_v1::{At, ClaimSealer, Layer, MAIN_BRANCH}};
     use uuid::Uuid;
 
@@ -151,12 +151,10 @@ mod tests {
         let table = TableRef::new("public", "documents");
         let claims = ClaimSealer::new(incarnation, [6; 32]);
         let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 11)));
-        let request = |key, ops| TransactSubmission {
-            transaction: Transact {
-                key: vec![key; 16], require: Vec::new(), window: Window::default(),
-                guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new(), custody_request_digest: None,
-            },
-            attempt: Uuid::from_u128(key.into()), submitted_at: Timestamp(10), source: Default::default(),
+        let request = |key, ops| Transact {
+            key: vec![key; 16], require: Vec::new(), window: Window::default(),
+            guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new(),
+            custody_request_digest: None, request_memory: None,
         };
         let mut first = request(1, vec![
             Op::CreateCustodyGroup { group },
@@ -170,17 +168,17 @@ mod tests {
             },
         ]);
         let mut state = TransactState::new(incarnation);
-        let unsealed = state.resolve(&first.transaction, 1, Timestamp(10), &[ROW_CUSTODY], &claims);
+        let unsealed = state.resolve(&first, 1, Timestamp(10), &[ROW_CUSTODY], &claims);
         assert!(matches!(unsealed, Err(error) if error.code == "rtdb/custody-payload"));
-        let mut retry = request(1, first.transaction.ops.clone());
+        let mut retry = request(1, first.ops.clone());
         prepare(&mut first, &vault).await.unwrap();
-        let Resolution::Append(append) = state.resolve(&first.transaction, 1, Timestamp(10), &[ROW_CUSTODY], &claims).unwrap()
+        let Resolution::Append(append) = state.resolve(&first, 1, Timestamp(10), &[ROW_CUSTODY], &claims).unwrap()
             else { panic!("a protected write must append"); };
         let bytes = append.record().encode().unwrap();
         assert!(!bytes.windows(b"protected-string".len()).any(|bytes| bytes == b"protected-string"));
         assert_eq!(state.apply(1, TransactionRecord::decode(&bytes).unwrap()).unwrap().unwrap().outcome, Outcome::Then);
         prepare(&mut retry, &vault).await.unwrap();
-        assert!(matches!(state.resolve(&retry.transaction, 2, Timestamp(11), &[ROW_CUSTODY], &claims).unwrap(), Resolution::Answer(receipt) if receipt.replayed));
+        assert!(matches!(state.resolve(&retry, 2, Timestamp(11), &[ROW_CUSTODY], &claims).unwrap(), Resolution::Answer(receipt) if receipt.replayed));
 
         let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(10)).unwrap();
         let row = view.row(&table, &EntityId::Integer(1), Timestamp(10)).unwrap();
@@ -214,7 +212,7 @@ mod tests {
 
         let inventory_sha256 = state.index().custody_inventory(group).unwrap().sha256;
         let revoke = request(2, vec![Op::RevokeCustodyGroup { group, inventory_sha256 }]);
-        let Resolution::Append(append) = state.resolve(&revoke.transaction, 2, Timestamp(11), &[ROW_CUSTODY], &claims).unwrap()
+        let Resolution::Append(append) = state.resolve(&revoke, 2, Timestamp(11), &[ROW_CUSTODY], &claims).unwrap()
             else { panic!("a revocation must append"); };
         state.apply(2, append.into_record()).unwrap();
         assert_eq!(check_delivery(state.index(), &vault, &groups).await.unwrap_err(), rtdb_crypt::erased_under_view());

@@ -10,7 +10,7 @@ use rtdb_types::{
     TimeUnit, Timestamp, Value,
     rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::{RawValue, to_raw_value};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +28,7 @@ pub struct Window {
 #[derive(Clone, Debug, Serialize)]
 pub struct Transact {
     pub key: Vec<u8>,
+    #[serde(serialize_with = "serialize_features")]
     pub require: Vec<String>,
     pub window: Window,
     pub guards: Vec<Guard>,
@@ -37,6 +38,8 @@ pub struct Transact {
     pub requires: Vec<Guard>,
     #[serde(skip)]
     pub custody_request_digest: Option<[u8; 32]>,
+    #[serde(skip)]
+    pub request_memory: Option<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
 impl Transact {
@@ -51,7 +54,7 @@ impl Transact {
         Ok(Sha256::digest(self.canonical_request()?.get().as_bytes()).into())
     }
 
-    fn canonical_request(&self) -> Result<Box<RawValue>> {
+    pub fn canonical_request(&self) -> Result<Box<RawValue>> {
         to_raw_value(self).map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
     }
 
@@ -66,6 +69,21 @@ impl Transact {
             })
         })
     }
+}
+
+fn serialize_features<S: Serializer>(features: &[String], serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    // Flight already orders and deduplicates its feature list.
+    if features.windows(2).all(|pair| pair[0] < pair[1]) {
+        return features.serialize(serializer);
+    }
+    features.iter().collect::<BTreeSet<_>>().serialize(serializer)
+}
+
+fn serialize_cells<S: Serializer>(cells: &StructFields<Cell>, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    if cells.keys().is_sorted() {
+        return cells.serialize(serializer);
+    }
+    cells.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -106,10 +124,12 @@ impl Cell {
 pub struct Row {
     pub id: EntityId,
     pub valid: Option<ValidTime>,
+    #[serde(serialize_with = "serialize_cells")]
     pub cells: StructFields<Cell>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_group: Option<CustodyGroupId>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(serialize_with = "serialize_features")]
     pub protected_columns: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_payload: Option<CustodyPayload>,
@@ -263,6 +283,9 @@ pub enum TransactionRecord {
 
 impl TransactionRecord {
     pub fn encode(&self) -> Result<Bytes> {
+        if matches!(self, Self::Tx(tx) if tx.request.is_none()) {
+            return Err(Anomaly::fault("rtdb/transaction-encoding", "An admitted transaction needs its canonical request"));
+        }
         serde_json::to_vec(&(RECORD_VERSION, self)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-encoding", error.to_string()))
     }
@@ -272,6 +295,9 @@ impl TransactionRecord {
             .map_err(|error| Anomaly::fault("rtdb/transaction-decoding", error.to_string()))?;
         if version != RECORD_VERSION {
             return Err(Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version"));
+        }
+        if let Self::Tx(tx) = &record {
+            tx.validate_admission()?;
         }
         Ok(record)
     }
@@ -300,6 +326,29 @@ impl ResolvedTransact {
     pub fn canonical_request(&self) -> Option<&RawValue> { self.request.as_deref() }
 
     pub fn effects(&self) -> &[BranchEffect] { &self.effects }
+
+    fn validate_admission(&self) -> Result<()> {
+        #[derive(Deserialize)]
+        struct AdmissionFields {
+            key: Vec<u8>,
+            window: AdmissionWindow,
+        }
+        #[derive(Deserialize)]
+        struct AdmissionWindow {
+            before: Option<Timestamp>,
+        }
+
+        // Older v2 records are replayable using their stored effects and digest.
+        if let Some(request) = &self.request {
+            let fields: AdmissionFields = serde_json::from_str(request.get()).map_err(|_| invalid_record())?;
+            if fields.key != self.receipt.key || fields.window.before != self.before
+                || self.admitted_at > self.receipt.system_time
+            {
+                return Err(invalid_record());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -513,7 +562,7 @@ impl TransactState {
         request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
         features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>, durable: &BranchIndex,
     ) -> Result<(Outcome, Vec<BranchEffect>, BranchIndex)> {
-        if let Some(feature) = request.require.iter().find(|feature| !features.contains(&feature.as_str())) {
+        if let Some(feature) = request.require.iter().filter(|feature| !features.contains(&feature.as_str())).min() {
             return Err(feature_required(feature));
         }
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {

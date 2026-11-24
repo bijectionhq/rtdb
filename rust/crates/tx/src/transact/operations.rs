@@ -41,8 +41,12 @@ impl Candidate<'_> {
                             return Err(labelled_time_error());
                         }
                         let valid = effective_valid(row.valid, cut.system_time)?;
-                        let mut cells = row.cells.iter().map(|(name, value)| (name.clone(), value.resolve(cut)))
-                            .collect::<StructFields<_>>();
+                        let resolve = |(name, value): (&String, &Cell)| (name.clone(), value.resolve(cut));
+                        let mut cells = if row.cells.keys().is_sorted() {
+                            row.cells.iter().map(resolve).collect::<StructFields<_>>()
+                        } else {
+                            row.cells.sorted().into_iter().map(resolve).collect()
+                        };
                         if cells.contains_key("_id") {
                             return Err(Anomaly::incorrect("rtdb/reserved-field", "The put supplies its ID separately"));
                         }

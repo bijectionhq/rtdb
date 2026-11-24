@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
-use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ROW_VISIBILITY, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission,
+    QuerySource, QueryView, ROW_VISIBILITY, ServingDriver, ServingScope,
 };
 
 pub struct MultiServing {
@@ -92,10 +92,10 @@ impl ServingDriver for MultiServing {
         }).await.ok_or_else(interrupted)?
     }
 
-    async fn transact_scoped(&self, request: ScopedSubmission, scope: ServingScope,
+    async fn transact_scoped(&self, request: Transact, scope: ServingScope,
                              cancellation: &CancellationToken) -> Result<Receipt> {
         cancellation.run_until_cancelled(self.writes.transact_scoped(
-            request.transaction, scope.labels, scope.receipt_namespace,
+            request, scope.labels, scope.receipt_namespace,
         )).await.ok_or_else(interrupted)?
     }
 
@@ -172,15 +172,15 @@ impl ServingDriver for MultiServing {
 
     async fn transact(
         &self,
-        mut request: TransactSubmission,
+        mut request: Transact,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         cancellation
             .run_until_cancelled(async {
-                if request.transaction.uses_custody() && self.features().contains(&ROW_CUSTODY) {
+                if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
                     crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
                 }
-                self.writes.transact(request.transaction).await
+                self.writes.transact(request).await
             })
             .await
             .ok_or_else(interrupted)?
@@ -449,7 +449,7 @@ mod tests {
     };
     use rtdb_storage::cache::BufferPool;
     use rtdb_store::MemoryStore;
-    use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact, Window};
+    use rtdb_tx::transact::{Cell, Op, Outcome, Row, Window};
     use rtdb_types::{
         EntityId, StructFields, Value,
         rtdb_v1::MAIN_BRANCH,
@@ -458,9 +458,10 @@ mod tests {
 
     use super::*;
 
-    fn write(key: u8, title: &str, before: Option<Timestamp>) -> TransactSubmission {
-        let transaction = Transact {
+    fn write(key: u8, title: &str, before: Option<Timestamp>) -> Transact {
+        Transact {
             custody_request_digest: None,
+            request_memory: None,
             key: vec![key; 16],
             require: vec![],
             window: Window {
@@ -486,8 +487,7 @@ mod tests {
                 if_absent: false,
             }],
             otherwise: vec![],
-        };
-        TransactSubmission { transaction, attempt: Uuid::from_u128(u128::from(key)), submitted_at: Timestamp(10), source: Default::default() }
+        }
     }
 
     #[tokio::test]
@@ -636,13 +636,13 @@ mod tests {
         assert!(driver.features().contains(&TRANSACT_REQUIRES));
         let cancel = CancellationToken::new();
         let mut declared = write(1, "declaration", None);
-        declared.transaction.ops = vec![Op::Declare {
+        declared.ops = vec![Op::Declare {
             table: TableRef::new("public", "notes"), change: Declaration::Visibility(Visibility { column: "label".into() }),
         }];
         assert_eq!(driver.transact(declared, &cancel).await.unwrap().outcome, Outcome::Then);
         let labelled = |key, label, id| {
             let mut submission = write(key, "row", None);
-            let Op::Put { rows, .. } = &mut submission.transaction.ops[0] else { unreachable!() };
+            let Op::Put { rows, .. } = &mut submission.ops[0] else { unreachable!() };
             rows[0].id = EntityId::Integer(id);
             rows[0].valid = Some(Interval::ALL.into());
             rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![label])));
@@ -652,8 +652,7 @@ mod tests {
             labels: LabelScope { read: BTreeSet::from([vec![1]]), write: BTreeSet::from([vec![1]]) },
             receipt_namespace: [7; 32],
         };
-        let TransactSubmission { transaction, attempt, submitted_at, source } = labelled(2, 1, 1);
-        let receipt = driver.transact_scoped(ScopedSubmission { transaction, attempt, submitted_at, source }, scope.clone(), &cancel).await.unwrap();
+        let receipt = driver.transact_scoped(labelled(2, 1, 1), scope.clone(), &cancel).await.unwrap();
         assert_eq!(receipt.outcome, Outcome::Then);
         let raw = driver.transact(labelled(3, 2, 2), &cancel).await.unwrap();
         let source = QuerySource { branch: MAIN_BRANCH.into(), at: At::Linearizable, layer: Layer::Merged };
@@ -677,7 +676,7 @@ mod tests {
             branch: MAIN_BRANCH.into(), table: TableRef::new("public", "notes"),
             id: EntityId::Integer(id), valid_at: None, expect,
         };
-        let TransactSubmission { mut transaction, attempt, submitted_at, source } = labelled(4, 1, 3);
+        let mut transaction = labelled(4, 1, 3);
         transaction.require.push(TRANSACT_REQUIRES.into());
         transaction.requires = vec![
             Guard::Unchanged(claim),
@@ -685,12 +684,9 @@ mod tests {
             version(2, Version::Absent),
         ];
         transaction.guards = vec![version(3, Version::Present)];
-        transaction.otherwise = labelled(5, 1, 4).transaction.ops;
-        let submission = |transaction| ScopedSubmission {
-            transaction, attempt, submitted_at, source: source.clone(),
-        };
+        transaction.otherwise = labelled(5, 1, 4).ops;
 
-        let refused = driver.transact_scoped(submission(transaction.clone()), scope.clone(), &cancel).await.unwrap();
+        let refused = driver.transact_scoped(transaction.clone(), scope.clone(), &cancel).await.unwrap();
         assert_eq!(refused.outcome, Outcome::Refused {
             error: Anomaly::new(AnomalyCategory::Conflict, REQUIREMENT_FAILED, "Requirement 2 failed"),
         });
@@ -698,14 +694,14 @@ mod tests {
         assert_eq!(refused.system_time, receipt.system_time);
         assert!(driver.changes_scoped(changes(), &scope, &cancel).await.unwrap().groups.is_empty());
         let replayed = Receipt { replayed: true, ..refused };
-        let retry = driver.transact_scoped(submission(transaction.clone()), scope.clone(), &cancel).await.unwrap();
+        let retry = driver.transact_scoped(transaction.clone(), scope.clone(), &cancel).await.unwrap();
         assert_eq!(retry, replayed);
         assert_eq!(driver.tx_status_scoped(&transaction.key, &scope, &cancel).await.unwrap(), replayed);
         assert_eq!(driver.tx_status(&transaction.key, &cancel).await.unwrap_err().code, "rtdb/unknown-transaction");
 
         transaction.key = vec![5; 16];
         transaction.requires.truncate(2);
-        let selected = driver.transact_scoped(submission(transaction), scope.clone(), &cancel).await.unwrap();
+        let selected = driver.transact_scoped(transaction, scope.clone(), &cancel).await.unwrap();
         assert_eq!(selected.outcome, Outcome::Otherwise { failed: vec![0] });
         let page = driver.changes_scoped(changes(), &scope, &cancel).await.unwrap();
         assert_eq!(page.through, selected.basis);

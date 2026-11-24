@@ -6,8 +6,8 @@ use rtdb_index::{
     Snapshot,
     branches::{BranchCut, RowImage},
 };
-use rtdb_tx::transact::{CustodyGroupId, Receipt};
-pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority, TransactSubmission};
+use rtdb_tx::transact::{CustodyGroupId, Receipt, Transact};
+pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
     EntityId, Interval, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, Branch, Claim, Layer},
@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) mod custody;
 pub(crate) mod default;
 mod visibility;
-pub use visibility::{ScopedSubmission, ServingScope, ROW_VISIBILITY};
+pub use visibility::{ServingScope, ROW_VISIBILITY};
 
 #[derive(Clone)]
 pub struct QuerySource {
@@ -118,7 +118,7 @@ pub trait ServingDriver: Send + Sync {
         Err(visibility::unsupported())
     }
 
-    async fn transact_scoped(&self, _request: ScopedSubmission, _scope: ServingScope,
+    async fn transact_scoped(&self, _request: Transact, _scope: ServingScope,
                              _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(visibility::unsupported())
     }
@@ -143,7 +143,7 @@ pub trait ServingDriver: Send + Sync {
 
     async fn transact(
         &self,
-        request: TransactSubmission,
+        request: Transact,
         cancellation: &CancellationToken,
     ) -> Result<Receipt>;
 

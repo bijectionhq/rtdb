@@ -30,6 +30,7 @@ fn put(n: u64) -> Transact {
     };
     Transact {
         custody_request_digest: None,
+        request_memory: None,
         key: key(n),
         require: Vec::new(),
         window: Window::default(),

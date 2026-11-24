@@ -5,12 +5,12 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_index::branches::{BranchView, BranchWrite};
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
-use rtdb_tx::transact::{CustodyGroupId, ROW_CUSTODY, Receipt};
+use rtdb_tx::transact::{CustodyGroupId, ROW_CUSTODY, Receipt, Transact};
 use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
 
 use super::{ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission};
+    QuerySource, QueryView, ServingDriver, ServingScope};
 use crate::Clock;
 
 pub(crate) struct DefaultServing {
@@ -64,16 +64,16 @@ impl ServingDriver for DefaultServing {
         Ok(QueryView { snapshot, cut, claim, custody_groups })
     }
 
-    async fn transact(&self, mut request: TransactSubmission, cancellation: &CancellationToken) -> Result<Receipt> {
+    async fn transact(&self, mut request: Transact, cancellation: &CancellationToken) -> Result<Receipt> {
         if !self.writable {
             return Err(Anomaly::unsupported("rtdb/default-serving-read-only", "The default serving attachment is read-only"));
         }
-        if request.transaction.uses_custody() && self.features().contains(&ROW_CUSTODY) {
+        if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::prepare(&mut request, &vault).await?;
         }
-        let claims = if request.transaction.claims().next().is_some() {
-            self.tokens.authority().await?.verify_claims(request.transaction.claims()).await
+        let claims = if request.claims().next().is_some() {
+            self.tokens.authority().await?.verify_claims(request.claims()).await
         } else {
             VerifiedClaims::default()
         };
@@ -131,14 +131,14 @@ impl ServingDriver for DefaultServing {
     }
 
     async fn transact_scoped(
-        &self, request: ScopedSubmission, scope: ServingScope, cancellation: &CancellationToken,
+        &self, request: Transact, scope: ServingScope, cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         if !self.writable {
             return Err(Anomaly::unsupported("rtdb/default-serving-read-only", "The default serving attachment is read-only"));
         }
-        let claims = if request.transaction.claims().next().is_some() {
+        let claims = if request.claims().next().is_some() {
             self.tokens.authority().await?
-                .verify_claims_in(request.transaction.claims(), Some(&scope.labels)).await
+                .verify_claims_in(request.claims(), Some(&scope.labels)).await
         } else {
             VerifiedClaims::default()
         };

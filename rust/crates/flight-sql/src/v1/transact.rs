@@ -23,6 +23,7 @@ pub(super) fn request(
     require.dedup();
     Ok(Transact {
         custody_request_digest: None,
+        request_memory: None,
         key: request.key,
         require,
         window: request

@@ -116,6 +116,7 @@ fn table() -> TableRef {
 fn request(key: u8, op: Op) -> Transact {
     Transact {
         custody_request_digest: None,
+        request_memory: None,
         key: vec![key; 16],
         require: vec![],
         window: Window::default(),
@@ -203,13 +204,27 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
     let mut writer = cluster.node(1, Arc::new(journal.handle(Identity(1))));
     writer.create().await.unwrap();
     assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    let before = writer.transact(&put(2, 2, "earlier transaction")).await.unwrap();
     let mut timed = put(1, 1, "published");
     timed.window.before = Some(Timestamp(30));
     let receipt = writer.transact(&timed).await.unwrap();
     assert_eq!(receipt.outcome, Outcome::Then);
-    assert_eq!(receipt.basis.position(), 3);
+    assert_eq!(receipt.basis.position(), 4);
+    assert!(receipt.system_time > before.system_time);
+    let original = Lsn(receipt.basis.position() - 1);
+    let page = writer.stream.read(original).await.unwrap();
+    let (position, bytes) = &page.records[0];
+    assert_eq!(*position, original);
+    let entry = writer.stream.decode(*position, bytes).await.unwrap();
+    let Record::Tx { payload, .. } = entry.record else { panic!("expected the original Tx"); };
+    let TransactionRecord::Tx(record) = TransactionRecord::decode(&payload).unwrap()
+        else { panic!("expected a resolved Tx"); };
+    assert_eq!(record.admission(), (timed.key.as_slice(), Timestamp(10), timed.logical_sha256().unwrap()));
+    assert_eq!(record.canonical_request().unwrap().get(), timed.canonical_request().unwrap().get());
+    assert!(record.admission().1 < receipt.system_time);
+    assert_eq!(record.effects().len(), 1);
     writer.checkpoint(vec![]).await.unwrap();
-    assert_eq!(writer.retained_floor(), Some(Lsn(4)));
+    assert_eq!(writer.retained_floor(), Some(Lsn(5)));
     drop(writer);
     drop(journal);
 
@@ -230,6 +245,8 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
         Role::Writer(Epoch(2))
     );
     assert!(successor.transact(&timed).await.unwrap().replayed);
+    timed.window.before = Some(Timestamp(31));
+    assert_eq!(successor.transact(&timed).await.unwrap_err().code, "rtdb/idempotency-key");
 }
 
 #[tokio::test]

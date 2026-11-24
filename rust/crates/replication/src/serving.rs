@@ -43,16 +43,9 @@ impl NativeServingScope {
 }
 
 pub(crate) struct NativeRequest {
-    submission: TransactSubmission,
+    transaction: Transact,
     claims: VerifiedClaims,
     scope: Option<NativeServingScope>,
-}
-
-pub struct TransactSubmission {
-    pub transaction: Transact,
-    pub attempt: Uuid,
-    pub submitted_at: Timestamp,
-    pub source: Bytes,
 }
 
 #[derive(Clone)]
@@ -128,11 +121,11 @@ impl NativeServingHandle {
         Ok(())
     }
 
-    pub async fn transact(&self, request: TransactSubmission, claims: VerifiedClaims, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
-        if request.transaction.ops.is_empty() && request.transaction.otherwise.is_empty() {
+    pub async fn transact(&self, transaction: Transact, claims: VerifiedClaims, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
+        if transaction.ops.is_empty() && transaction.otherwise.is_empty() {
             self.replication.serving_barrier(cancellation).await?;
         }
-        self.replication.serving_transact(NativeRequest { submission: request, claims, scope }, cancellation).await
+        self.replication.serving_transact(NativeRequest { transaction, claims, scope }, cancellation).await
     }
 
     pub async fn tx_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
@@ -161,7 +154,7 @@ struct Pending {
     frame: Bytes,
     completion: Completion,
     scope: Option<NativeServingScope>,
-    reconsider: Option<(TransactSubmission, VerifiedClaims)>,
+    reconsider: Option<(Transact, VerifiedClaims)>,
 }
 
 pub(crate) struct ServingCheckpoint {
@@ -275,7 +268,7 @@ impl NativeServing {
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
         let decisions = requests.iter().map(|(request, _)| {
-            let transaction = &request.submission.transaction;
+            let transaction = &request.transaction;
             match &request.scope {
                 Some(scope) => pipeline.decide_scoped(transaction, now, SCOPED_FEATURES, &request.claims, scope.authority()),
                 None => pipeline.decide(transaction, now, NATIVE_WRITE_FEATURES, &request.claims),
@@ -292,7 +285,7 @@ impl NativeServing {
                     let frame = frame(position, &record);
                     self.pending.insert(position, Pending {
                         frame, completion, scope: request.scope,
-                        reconsider: Some((request.submission, request.claims)),
+                        reconsider: Some((request.transaction, request.claims)),
                     });
                 }
             }
@@ -335,8 +328,8 @@ impl NativeServing {
                     let dropped = self.pending.split_off(&position);
                     if dropped.len() != terminal.redecide.len() { return Err(invalid()); }
                     for pending in dropped.into_values() {
-                        let (submission, claims) = pending.reconsider.ok_or_else(invalid)?;
-                        reconsider.push((NativeRequest { submission, claims, scope: pending.scope }, pending.completion));
+                        let (transaction, claims) = pending.reconsider.ok_or_else(invalid)?;
+                        reconsider.push((NativeRequest { transaction, claims, scope: pending.scope }, pending.completion));
                     }
                 }
                 terminal.record
@@ -503,23 +496,19 @@ mod tests {
         NativeServingAuthority { incarnation: INCARNATION, checkpoints: None }
     }
 
-    fn put(key: u8) -> TransactSubmission {
+    fn put(key: u8) -> Transact {
         let id = EntityId::Integer(i64::from(key));
-        TransactSubmission {
-            attempt: Uuid::from_u128(key.into()), submitted_at: Timestamp(31),
-            source: Bytes::from_static(b"\x0a\x02\x03\x04\xf8\x07\x01"),
-            transaction: Transact {
-                custody_request_digest: None,
-                key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
-                requires: Vec::new(),
-                ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
-                    rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None }] }],
-            },
+        Transact {
+            custody_request_digest: None, request_memory: None,
+            key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
+            requires: Vec::new(),
+            ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
+                rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None }] }],
         }
     }
 
-    fn unscoped(submission: TransactSubmission) -> NativeRequest {
-        NativeRequest { submission, claims: VerifiedClaims::default(), scope: None }
+    fn unscoped(transaction: Transact) -> NativeRequest {
+        NativeRequest { transaction, claims: VerifiedClaims::default(), scope: None }
     }
 
     #[tokio::test]
@@ -528,7 +517,7 @@ mod tests {
             let (mut leader, view) = NativeServing::open(authority(), None, false).unwrap();
             let (mut follower, _) = NativeServing::open(authority(), None, false).unwrap();
             let mut request = put(1);
-            request.transaction.window.before = Some(Timestamp(80));
+            request.window.before = Some(Timestamp(80));
             let (done, mut result) = oneshot::channel();
             let (later_done, mut later_result) = oneshot::channel();
             let mut messages = leader.decide_batch(Timestamp(50), vec![
@@ -568,7 +557,7 @@ mod tests {
     async fn takeover_refuses_the_replayed_original_even_inside_the_window() {
         let (mut serving, _) = NativeServing::open(authority(), None, false).unwrap();
         let mut request = put(1);
-        request.transaction.window.before = Some(Timestamp(80));
+        request.window.before = Some(Timestamp(80));
         let (done, result) = oneshot::channel();
         let message = serving.decide_batch(Timestamp(50), vec![(unscoped(request), done)])
             .unwrap().remove(0).serving_record.unwrap();
@@ -602,7 +591,7 @@ mod tests {
         assert_eq!(position, 1);
         assert_eq!(record.admission().0, &[1; 16]);
         assert_eq!(record.admission().1, Timestamp(41));
-        assert!(record.canonical_request().is_some());
+        assert_eq!(record.canonical_request().unwrap().get(), put(1).canonical_request().unwrap().get());
         assert!(first_result.try_recv().is_err());
         assert!(second_result.try_recv().is_err());
         assert_eq!(serving.status(&[1; 16], None).unwrap_err().code, "rtdb/transaction-pending");
@@ -664,7 +653,7 @@ mod tests {
 
         let (mut serving, _) = NativeServing::open(authority(), None, false).unwrap();
         let mut declaration = put(1);
-        declaration.transaction.ops = vec![Op::Declare {
+        declaration.ops = vec![Op::Declare {
             table: TableRef::new("public", "items"),
             change: Declaration::Visibility(Visibility { column: "label".into() }),
         }];
@@ -678,7 +667,7 @@ mod tests {
             receipt_namespace: [7; 32],
         };
         let mut submission = put(2);
-        let Op::Put { rows, .. } = &mut submission.transaction.ops[0] else { unreachable!() };
+        let Op::Put { rows, .. } = &mut submission.ops[0] else { unreachable!() };
         rows[0].valid = Some(rtdb_types::Interval::ALL.into());
         rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![7])));
         let request = NativeRequest { submission, claims: VerifiedClaims::default(), scope: Some(scope()) };

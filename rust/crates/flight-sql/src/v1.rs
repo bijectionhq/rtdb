@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::{self as flight, FlightData, sql::Any};
 use bytes::Bytes;
 use prost::{Message, Name};
-use rtdb_node::serving::{ROW_VISIBILITY, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission};
+use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_tx::transact::{TIMED_TRANSACT, TRANSACT_REQUIRES};
@@ -150,8 +150,7 @@ impl Service {
     }
 
     async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
-        let submitted_at = self.0.node.now();
-        let request: proto::TransactRequest = decode(source.clone())?;
+        let request: proto::TransactRequest = decode(source)?;
         check_key(&request.key)?;
         let access = if request.ops.is_empty() && request.otherwise.is_empty() {
             DatabaseAccess::Read
@@ -162,12 +161,11 @@ impl Service {
         let driver = database.serving_driver().ok_or_else(|| {
             error::unsupported(request.require.first().map_or("transact", String::as_str))
         })?;
-        let transaction = transact::request(request, call.memory())?;
-        let attempt = uuid::Uuid::new_v4();
-        let source = call.retain_request(source);
+        let mut transaction = transact::request(request, call.memory())?;
+        transaction.request_memory = Some(call.request_reservation());
         let receipt = match self.serving_scope(call, driver)? {
-            Some(scope) => driver.transact_scoped(ScopedSubmission { transaction, attempt, submitted_at, source }, scope, &call.cancellation).await,
-            None => driver.transact(TransactSubmission { transaction, attempt, submitted_at, source }, &call.cancellation).await,
+            Some(scope) => driver.transact_scoped(transaction, scope, &call.cancellation).await,
+            None => driver.transact(transaction, &call.cancellation).await,
         }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         Ok(transact::receipt(receipt).encode_to_vec())

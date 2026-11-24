@@ -983,7 +983,8 @@ struct AppliedFixture {
     state: std::sync::Mutex<rtdb_tx::transact::TransactState>,
     tokens: rtdb_crypt::tokens::TokenAuthority,
     memory: Arc<MemoryBudget>,
-    admission: std::sync::Mutex<Option<(uuid::Uuid, Timestamp, Bytes)>>,
+    admission: std::sync::Mutex<Option<rtdb_tx::transact::ResolvedTransact>>,
+    hold_first: std::sync::atomic::AtomicBool,
     waiting: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -1044,17 +1045,15 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
 
     async fn transact(
         &self,
-        request: rtdb_node::serving::TransactSubmission,
+        request: rtdb_tx::transact::Transact,
         _: &tokio_util::sync::CancellationToken,
     ) -> Result<rtdb_tx::transact::Receipt> {
         use rtdb_tx::transact::{Resolution, TransactionRecord};
-        if request.source.ends_with(&[0xf8, 0x07, 0x01]) {
-            *self.admission.lock().unwrap() =
-                Some((request.attempt, request.submitted_at, request.source));
+        if request.key == [1; 16] && self.hold_first.swap(false, std::sync::atomic::Ordering::AcqRel) {
             self.waiting.notify_one();
             self.release.notified().await;
         }
-        let claims = self.tokens.verify_claims(request.transaction.claims()).await;
+        let claims = self.tokens.verify_claims(request.claims()).await;
         let mut state = self.state.lock().unwrap();
         let cut = state.index().head();
         let now = if cut.basis.position() == 0 {
@@ -1063,7 +1062,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             cut.system_time.next()?
         };
         match state.resolve(
-            &request.transaction,
+            &request,
             cut.basis.position() + 1,
             now,
             self.features(),
@@ -1072,6 +1071,10 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             Resolution::Answer(receipt) => Ok(receipt),
             Resolution::Append(append) => {
                 let record = TransactionRecord::decode(&append.record().encode()?)?;
+                if request.key == [1; 16] {
+                    let TransactionRecord::Tx(admitted) = &record else { unreachable!("an admission produces a Tx record"); };
+                    *self.admission.lock().unwrap() = Some(admitted.clone());
+                }
                 Ok(state.apply(append.position(), record)?.unwrap())
             }
         }
@@ -1260,6 +1263,7 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
         tokens,
         memory: MemoryBudget::new(1 << 27),
         admission: Default::default(),
+        hold_first: std::sync::atomic::AtomicBool::new(true),
         waiting: Default::default(),
         release: Default::default(),
     });
@@ -1319,10 +1323,7 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
     tokio::time::timeout(Duration::from_secs(3), driver.waiting.notified())
         .await
         .unwrap();
-    let (attempt, submitted, admitted) = driver.admission.lock().unwrap().clone().unwrap();
-    assert!(!attempt.is_nil());
-    assert!(submitted > Timestamp::MIN);
-    assert_eq!(admitted, original);
+    assert!(driver.admission.lock().unwrap().is_none());
     let independent = tokio::time::timeout(
         Duration::from_secs(3),
         transact_wire(
@@ -1339,6 +1340,16 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
     assert_eq!(independent.outcome, Some(v1::receipt::Outcome::Then(())));
     driver.release.notify_one();
     let first = v1::Receipt::decode(held.await.unwrap()[0].body.clone()).unwrap();
+    {
+        let admission = driver.admission.lock().unwrap();
+        let record = admission.as_ref().unwrap();
+        assert_eq!(record.admission().0, key.as_slice());
+        assert_eq!(record.admission().1, Timestamp(1));
+        let request: serde_json::Value = serde_json::from_str(record.canonical_request().unwrap().get()).unwrap();
+        assert_eq!(request["key"], serde_json::json!(key));
+        assert_eq!(request["ops"][0]["Put"]["table"]["table"], "wire_applied");
+        assert_eq!(record.effects().len(), 1);
+    }
     let replay = transact_wire(
         &mut client,
         v1::TransactRequest {
