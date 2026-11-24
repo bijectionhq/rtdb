@@ -1,5 +1,6 @@
 import Logkeeper.Protocol
 import OrderedJournal
+import InstalledRead
 
 set_option warningAsError true
 
@@ -9,8 +10,7 @@ open Logkeeper
 
 abbrev Ledger (Voter : Type) := PrefixAgreement.Ledger Voter Protocol.Decision
 
-def projectCut (cut : Protocol.DataCut) : OrderedJournal.Cut :=
-  ⟨cut.next, cut.digest⟩
+abbrev projectCut := InstalledRead.projectCut
 
 /-- Project one shared decision into the RTDB receipt table. Placement and
 request identity are explicit inputs to the worker's interpretation. -/
@@ -75,19 +75,30 @@ theorem recovery_reissues_append_after_cohort_repair
   rw [← agrees] at live ⊢
   exact recorded_append_reissues_while_live initial path live
 
-/-- All the native semantics live in this function. An applied position can
-justify readiness while fidelity still requires a value at the exact cut. -/
-structure ReadProjection (Meaning : Type) (state : OrderedJournal.State) where
-  placement : Protocol.Placement
-  cut : Protocol.DataCut
-  belongs : cut.placement = placement
-  hold : OrderedJournal.Hold
-  bound : hold.through = projectCut cut
+structure ReadProjection (Meaning : Type) (history : List Protocol.Decision)
+    (state : OrderedJournal.State) where
+  seed : Protocol.DataCut
+  ordered : InstalledRead.OrderedDataHistory seed history
+  barrier : InstalledRead.FreshBarrier seed history
   actual : OrderedJournal.Cut
-  admitted : OrderedJournal.CanServe state hold actual
+  admitted : OrderedJournal.CanServe state barrier.hold actual
   stateMeaning : Protocol.DataCut → Meaning
-  result : Meaning
-  usesSelectedCut : result = stateMeaning cut
+  published : InstalledRead.PublishedCatalog Meaning
+  publicationMeaning : published.meaning = stateMeaning published.cut
+  capture : InstalledRead.PublishedCatalog Meaning
+  captured : InstalledRead.captureAt barrier.cut published = some capture
+
+def ReadProjection.cut (read : ReadProjection Meaning history state) : Protocol.DataCut := read.barrier.cut
+
+def ReadProjection.hold (read : ReadProjection Meaning history state) : OrderedJournal.Hold := read.barrier.hold
+
+def ReadProjection.result (read : ReadProjection Meaning history state) : Meaning := read.capture.meaning
+
+theorem ReadProjection.usesSelectedCut (read : ReadProjection Meaning history state) :
+    read.result = read.stateMeaning read.cut := by
+  obtain ⟨same, exactCut⟩ := InstalledRead.capture_at_selects_exact_catalog read.captured
+  rw [same] at exactCut
+  rw [ReadProjection.result, same, read.publicationMeaning, exactCut, ReadProjection.cut]
 
 theorem prepared_checkpoint_and_trim_need_no_writer
     (s : OrderedJournal.State) (base target : OrderedJournal.Checkpoint)
@@ -112,6 +123,7 @@ theorem prepared_checkpoint_and_trim_need_no_writer
 #print axioms recorded_append_reissues_while_live
 #print axioms recovery_reissues_exact_chosen_append
 #print axioms recovery_reissues_append_after_cohort_repair
+#print axioms ReadProjection.usesSelectedCut
 #print axioms prepared_checkpoint_and_trim_need_no_writer
 
 end RTDB.Recovery.Composition

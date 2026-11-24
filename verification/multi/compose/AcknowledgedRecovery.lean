@@ -1,4 +1,5 @@
 import RecoveryComposition
+import NativeAppend
 import ReplayCertificate
 import CheckpointReplay
 import Logkeeper.ObjectWithdrawal
@@ -170,19 +171,20 @@ theorem replay_reads_have_unwithdrawn_survivors
       zoneOf inventory grants scope selected _ ready reached key demanded lost trivial)
 
 structure ReplaySemantics (Tx : Type) where
-  decodeTx : Protocol.Append → Option Tx
+  frameFor : Protocol.Append → Option (NativeAppend.Frame Tx)
   committedTargets : Nat → Tx → Bool
-  dataCut : List Protocol.Decision → Protocol.DataCut
   authenticatesPlan : Scope → OrderedJournal.Checkpoint → Protocol.DataCut → Selection → Prop
   checkpointEvents : ReplayClosure.Checkpoint → List Tx
   replayEvents : Selection → List Tx → List Tx
 
+def ReplaySemantics.decodeTx (semantics : ReplaySemantics Tx) : Protocol.Append → Option Tx :=
+  NativeAppend.decodeAppend semantics.frameFor
+
 /-- The decision count is a logical coordinate and can advance on control commands without advancing the data LSN. -/
 structure RecoveryProjection (semantics : ReplaySemantics Tx) (history : List Protocol.Decision)
-    (selected : Selection) (scope : Scope) (read : ReadProjection (List Tx) state) where
+    (selected : Selection) (scope : Scope) (read : ReadProjection (List Tx) history state) where
   checkpointDecisionCount : Nat
   checkpointInHistory : checkpointDecisionCount ≤ history.length
-  exactReadCut : read.cut = semantics.dataCut history
   journalAgreesAtReadCut : state.chosen read.cut.next = some (projectCut read.cut)
   exactScopeCut : scope.orderedCut = read.cut.next
   selectedRoot : (selected.checkpoint.map (·.root)).getD 0 = read.hold.base.root
@@ -202,7 +204,7 @@ structure RecoveryProjection (semantics : ReplaySemantics Tx) (history : List Pr
     semantics.replayEvents selected (((selected.checkpoint.map semantics.checkpointEvents).getD []))
 
 theorem recovery_read_is_exact_history
-    {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) state}
+    {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) history state}
     (projection : RecoveryProjection semantics history selected scope read) :
     read.result = history.foldl (applyDecision semantics.decodeTx semantics.committedTargets) [] := by
   rw [read.usesSelectedCut, projection.readUsesReplay, projection.suffixFidelity,
@@ -212,11 +214,13 @@ theorem recovery_read_is_exact_history
     projection.checkpointDecisionCount history.length projection.checkpointInHistory
 
 theorem recovered_query_observes_exact_history
-    {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) state}
+    {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) history state}
     (projection : RecoveryProjection semantics history selected scope read)
-    (query : List Tx → Result) (queryUsesRead : answer = query read.result) :
-    answer = query (history.foldl (applyDecision semantics.decodeTx semantics.committedTargets) []) :=
-  queryUsesRead.trans (congrArg query (recovery_read_is_exact_history projection))
+    (query : List Tx → Result) (current : InstalledRead.PublishedCatalog (List Tx)) :
+    query (InstalledRead.querySnapshot (some read.capture) current).meaning =
+      query (history.foldl (applyDecision semantics.decodeTx semantics.committedTargets) []) :=
+  (InstalledRead.queryUsesRead read.capture current query).trans
+    (congrArg query (recovery_read_is_exact_history projection))
 
 theorem acknowledged_transaction_survives_recovery
     {ledger : Ledger Voter} {zoneOf : PhysicalVersion → Zone} {semantics : ReplaySemantics Tx}
@@ -224,11 +228,10 @@ theorem acknowledged_transaction_survives_recovery
     (chosenPath : Continuation ⟨Voter, ledger, initial.certifiedPrefix⟩ recovered)
     (journalPath : OrderedJournal.Trace readers activations before after)
     (journalInvariant : OrderedJournal.Invariant before)
-    (read : ReadProjection (List Tx) after)
+    (read : ReadProjection (List Tx) recovered.decisions after)
     (projection : RecoveryProjection semantics recovered.decisions selected scope read)
     (sameInstallation : read.cut.placement = initial.record.receipt.attempt.placement)
-    (readCoversAcknowledgement : initial.record.receipt.cut.next ≤ read.cut.next)
-    (decodedAcknowledgement : semantics.decodeTx initial.record = some tx)
+    (nativeAcknowledgement : NativeAppend.Binding semantics.frameFor initial.record tx)
     (ready : ZoneReady Certificate.dependencies zoneOf inventory grants scope selected (fun _ => True))
     (withdrawalTrace : ∀ physical, ObjectWithdrawal.Trace ObjectWithdrawal.empty (objects physical))
     (registered : ∀ key physical grant, inventory key physical → grants grant →
@@ -241,7 +244,7 @@ theorem acknowledged_transaction_survives_recovery
     (read.hold.first = read.hold.through.next ∨ after.floor ≤ read.hold.first) ∧
     read.hold.through.next ≤ read.actual.next ∧
     (read.actual.next = read.cut.next → read.actual = projectCut read.cut) ∧
-    (read.cut = semantics.dataCut recovered.decisions ∧
+    (read.cut = InstalledRead.dataCut read.seed recovered.decisions ∧
       read.cut.placement = initial.record.receipt.attempt.placement ∧
       initial.record.receipt.cut.next ≤ read.cut.next) ∧
     ((recovered.decisions.drop (position + 1)).any
@@ -254,11 +257,12 @@ theorem acknowledged_transaction_survives_recovery
     invariant.2.2.2 _ read.admitted.1, OrderedJournal.read_cannot_serve_an_unapplied_barrier read.admitted,
     fun same => OrderedJournal.read_cannot_serve_same_position_with_alien_digest
       read.admitted projection.journalAgreesAtReadCut same,
-    ⟨projection.exactReadCut, sameInstallation, readCoversAcknowledgement⟩, ?_, ?_⟩
+    ⟨InstalledRead.exactReadCut read.barrier read.ordered, sameInstallation,
+      InstalledRead.readCoversAcknowledgement read.barrier read.ordered selectedAppend⟩, ?_, ?_⟩
   · intro survives
     rw [recovery_read_is_exact_history projection]
     exact survivor_of_chosen_append semantics.decodeTx semantics.committedTargets
-      selectedAppend decodedAcknowledgement survives []
+      selectedAppend (NativeAppend.decodedAcknowledgement nativeAcknowledgement) survives []
   · obtain ⟨baseAvailable, tailAvailable⟩ :=
       replay_reads_have_unwithdrawn_survivors ready withdrawalTrace registered lost
     intro key readKey

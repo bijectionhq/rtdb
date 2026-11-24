@@ -244,6 +244,8 @@ Run `lake build` from `verification/multi` to check the composition against that
 It also models publication and trim under custody authority.
 Concrete wire decoding, durable media steps, provider evidence, and semantic fidelity of the database cut are separate refinement obligations.
 The [X1 composition](../../verification/multi/compose/README.md) checks acknowledged transaction recovery and visibility under its named Lean hypotheses and records the corresponding production evidence and open refinements.
+The fresh-read proofs cover the signed hold selection, exact catalog cut gate and captured query input.
+The logical history ends at the chosen Barrier decision, and a catalog publication that has advanced past that cut requires a fresh admission.
 
 The standalone Logkeeper Verus harness includes the admission functions used by the production command reducer and compact-image decoder. It covers the checked debits, the trim gate, and the expiry and fingerprint decisions that govern exact reissue. The full codec round trip and the disk and network boundaries also need their own evidence.
 

@@ -106,28 +106,47 @@ private theorem chosen_cut : serving.chosen receipt.cut.next = some receipt.cut 
     some receipt.cut
   simp [OrderedJournal.update]
 
-private def read : ReadProjection (List Nat) serving where
-  placement := (record 11).receipt.cut.placement
-  cut := (record 11).receipt.cut
-  belongs := rfl
-  hold := replayHold
-  bound := rfl
+private def readSeed : Protocol.DataCut := ⟨(record 11).receipt.cut.placement, 0, 0⟩
+
+private def invocation : InstalledRead.Invocation := ⟨6, 9⟩
+
+private def admission : InstalledRead.FreshBarrier readSeed last.decisions :=
+  ⟨promoted, 1, invocation, invocation, [⟨5, 9⟩], by decide, rfl, 2, 3, by decide, rfl⟩
+
+private def published : InstalledRead.PublishedCatalog (List Nat) := ⟨admission.cut, [11]⟩
+
+private def read : ReadProjection (List Nat) last.decisions serving where
+  seed := readSeed
+  ordered := .append rfl rfl .empty
+  barrier := admission
   actual := receipt.cut
-  admitted := ⟨by simp [serving], chosen_cut, Nat.le_refl _⟩
+  admitted := ⟨by simp [serving, admission, InstalledRead.FreshBarrier.hold, replayHold, invocation], chosen_cut, Nat.le_refl _⟩
   stateMeaning := fun _ => [11]
-  result := [11]
-  usesSelectedCut := rfl
+  published := published
+  publicationMeaning := rfl
+  capture := published
+  captured := by simp [InstalledRead.captureAt, published]
 
 private def base : ReplayClosure.Checkpoint := ⟨0, []⟩
 private def plan : Selection := ⟨some base, ⟨1, 1⟩, [], [.oversized 9 .resolvedTx]⟩
 private def scope : Scope := ⟨1, 1, 2⟩
-private def decodeTx (append : Protocol.Append) : Option Nat := some append.receipt.outcomeDigest
+private def frameFor (append : Protocol.Append) : Option (NativeAppend.Frame Nat) :=
+  if append = record 11 then some (NativeAppend.decodeFrame (some 1) (some 0) (some (.resolvedTx 11)))
+  else none
+
+private def nativeAcknowledgement : NativeAppend.Binding frameFor (record 11) 11 where
+  record := ⟨⟨⟨1, 1⟩, 0, 7⟩, 5, 11, ⟨⟨1, 1⟩, 1, 8⟩, ⟨⟨1, 1⟩, 9, 9⟩, .ordinary, 1⟩
+  chosen := rfl
+  frame := NativeAppend.decodeFrame (some 1) (some 0) (some (.resolvedTx 11))
+  opened := by decide
+  resolved := rfl
+private def decodeTx := NativeAppend.decodeAppend frameFor
+
 private def noErasure (_ _ : Nat) : Bool := false
 
 private def semantics : ReplaySemantics Nat :=
-  { decodeTx := decodeTx
+  { frameFor := frameFor
     committedTargets := noErasure
-    dataCut := fun _ => (record 11).receipt.cut
     authenticatesPlan := fun atScope checkpoint cut selected =>
       atScope = scope ∧ checkpoint = OrderedJournal.seed.published ∧
         cut = (record 11).receipt.cut ∧ selected = plan
@@ -137,7 +156,6 @@ private def semantics : ReplaySemantics Nat :=
 private def projection : RecoveryProjection semantics last.decisions plan scope read where
   checkpointDecisionCount := 0
   checkpointInHistory := by decide
-  exactReadCut := rfl
   journalAgreesAtReadCut := chosen_cut
   exactScopeCut := rfl
   selectedRoot := rfl
@@ -200,7 +218,7 @@ theorem a_served_transaction_is_reachable_after_replacement_and_two_repairs (los
   have recovered := acknowledged_transaction_survives_recovery acknowledged last two_repairs
     (.cons grant (.cons barrier (.nil _)))
     (OrderedJournal.step_preserves_checkpoint_and_holds initialInvariant append_step)
-    read projection rfl (Nat.le_refl _) rfl ready (objects := fun _ => ObjectWithdrawal.held)
+    read projection rfl nativeAcknowledgement ready (objects := fun _ => ObjectWithdrawal.held)
     (fun _ => .next (.empty _) ObjectWithdrawal.reachable_hold)
     (fun _ _ _ _ _ _ => ⟨.hold, .inl rfl⟩) lost
   obtain ⟨_, _, _, _, _, _, visible, covered⟩ := recovered
@@ -359,5 +377,45 @@ theorem skipping_io_margin_allows_completion_at_reclamation :
     ReaderRetention.leaseAdmits 8 0 0 10 ∧ (8 : Int) + 2 = 10 := by unfold ReaderRetention.leaseAdmits; decide
 
 #print axioms a_served_transaction_is_reachable_after_replacement_and_two_repairs
+
+theorem a_repaired_choice_and_fresh_barrier_supply_the_query_input :
+    (InstalledRead.querySnapshot (some read.capture) ⟨readSeed, [99]⟩).meaning = [11] := by
+  exact (recovered_query_observes_exact_history projection id ⟨readSeed, [99]⟩).trans (by decide)
+
+theorem using_a_cached_route_head_loses_a_chosen_acknowledgement :
+    last.decisions[0]? = some (.append (record 11)) ∧
+      ¬ (record 11).receipt.cut.next ≤ readSeed.next := by decide
+
+theorem the_same_lsn_with_an_alien_digest_is_not_the_barrier_cut :
+    let foreign : Protocol.DataCut := { admission.cut with digest := 10 }
+    foreign.next = admission.cut.next ∧ foreign ≠ admission.cut ∧
+      InstalledRead.captureAt admission.cut ⟨foreign, [99]⟩ = none := by decide
+
+theorem using_the_applied_watermark_instead_of_the_selected_cut_changes_the_read :
+    let ahead : InstalledRead.PublishedCatalog (List Nat) :=
+      ⟨{ admission.cut with next := 2 }, [11, 12]⟩
+    InstalledRead.captureAt admission.cut ahead = none ∧ ahead.meaning ≠ read.result := by decide
+
+theorem resampling_instead_of_using_the_capture_changes_the_query :
+    let current : InstalledRead.PublishedCatalog (List Nat) := ⟨readSeed, [99]⟩
+    (InstalledRead.querySnapshot none current).meaning ≠ read.result := by decide
+
+theorem a_published_or_transaction_catalog_cannot_fill_the_empty_cut :
+    InstalledRead.emptyCatalogMatchesCut none (none : Option Nat) = true ∧
+    InstalledRead.emptyCatalogMatchesCut (some admission.cut) (none : Option Nat) = false ∧
+    InstalledRead.emptyCatalogMatchesCut none (some 11) = false := by decide
+
+theorem a_lost_read_keeps_its_identity_until_the_horizon :
+    ¬ InstalledRead.readReleaseSettled 8 invocation ∧
+    InstalledRead.readReleaseSettled 9 invocation ∧
+    ¬ InstalledRead.barrierMatchesInvocation { invocation with expiresAt := 8 } invocation ∧
+    ¬ InstalledRead.leaseAdmits 3 3 := by decide
+
+theorem a_control_or_an_unopened_offload_has_no_decoded_acknowledgement :
+    NativeAppend.decodedEvent (NativeAppend.decodeFrame (some 1) (some 0)
+      (some (.control : NativeAppend.Body Nat))) = none ∧
+    NativeAppend.decodedEvent (NativeAppend.decodeFrame (some 1) (some 0)
+      (some (.oversized (some 17) : NativeAppend.Body Nat))) = none ∧
+    NativeAppend.decodeAppend frameFor (record 12) = none := by decide
 
 end RTDB.Recovery.X1.Controls

@@ -1,0 +1,206 @@
+{
+  "summary": "Protect the fresh journal cut, capture the matching publication, and pass the captured snapshot to the query.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "catalog",
+    "--verify-module",
+    "query",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 16,
+  "controls": {
+    "select_checkpoint_instead_of_barrier": {
+      "defect": "The read selects the held checkpoint even when its chosen suffix includes another acknowledged append.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    ensures out == hold.through,",
+          "replace": "    ensures out == hold.start,"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    hold.through\n",
+          "replace": "    hold.start\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "read_covers_acknowledgement",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "exact_read_cut",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 14
+    },
+    "use_exclusive_frontier_as_offset": {
+      "defect": "The inclusive native offset points past the selected journal record.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    ensures out == if next_lsn as int - 1 <= i64::MAX {\n        Some((next_lsn as int - 1) as i64)",
+          "replace": "    ensures out == if next_lsn <= i64::MAX {\n        Some(next_lsn as i64)"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    if next_lsn == 0 {\n        return Some(-1);\n    }\n    let offset = next_lsn - 1;",
+          "replace": "    let offset = next_lsn;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "exact_read_cut",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "capture_ahead_of_barrier": {
+      "defect": "The partition can supply a catalog published after the authorized cut.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/partition/read_selection.rs",
+          "find": "    ensures out == (published == requested),",
+          "replace": "    ensures out == (published.storage_version == requested.storage_version\n        && published.storage_epoch == requested.storage_epoch && published.replica_epoch == requested.replica_epoch\n        && published.through.0 >= requested.through.0),"
+        },
+        {
+          "file": "rust/crates/index/src/partition/read_selection.rs",
+          "find": "published.through.0 == requested.through.0",
+          "replace": "published.through.0 >= requested.through.0"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "uses_selected_cut",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "resample_after_capture": {
+      "defect": "The query obtains current state even when the barrier supplied a retained snapshot.",
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/read_selection.rs",
+          "find": "    ensures match capture {\n        Some(snapshot) => out == snapshot,\n        None => current.ensures((), out),\n    },",
+          "replace": "    ensures current.ensures((), out),"
+        },
+        {
+          "file": "rust/crates/node/src/read_selection.rs",
+          "find": "        Some(snapshot) => snapshot,",
+          "replace": "        Some(_) => current(),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "query_uses_read",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "accept_another_retry_horizon": {
+      "defect": "A barrier claim with the same nonce but a different retry horizon satisfies the invocation.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    ensures out == (actual == requested),",
+          "replace": "    ensures out == (actual.nonce == requested.nonce),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "actual.nonce == requested.nonce && actual.expires_at == requested.expires_at",
+          "replace": "actual.nonce == requested.nonce"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "fresh_barrier_matches_invocation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "settle_before_horizon": {
+      "defect": "An early release discards an identity even though a delayed barrier can still admit it.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    ensures out == (expires_at <= position),",
+          "replace": "    ensures out,"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    position >= expires_at",
+          "replace": "    true"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "release_preserves_the_retry_horizon",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "accept_expired_serving_lease": {
+      "defect": "A serving lease still admits a read at the deadline.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    ensures out == (now < deadline),",
+          "replace": "    ensures out == (now <= deadline),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/read_selection.rs",
+          "find": "    now < deadline",
+          "replace": "    now <= deadline"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "read_lease_expires_at_its_deadline",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "empty_cut_ignores_publish": {
+      "defect": "An empty cut captures a catalog that already has a published replica position.",
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/read_selection.rs",
+          "find": "    ensures out == (catalog_cut is None && tx_basis is None),",
+          "replace": "    ensures out == (tx_basis is None),"
+        },
+        {
+          "file": "rust/crates/node/src/read_selection.rs",
+          "find": "    catalog_cut.is_none() && tx_basis.is_none()",
+          "replace": "    tx_basis.is_none()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_read_selection/laws.rs",
+          "function": "empty_cut_requires_an_untracked_catalog",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    }
+  }
+}

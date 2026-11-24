@@ -1,0 +1,74 @@
+{
+  "summary": "Project opened chosen append bytes through the shipped replica decoder, preserving native term, sequence, and the complete decoded body.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "wire",
+    "--verify-module",
+    "laws"
+  ],
+  "foreign_contracts": [
+    "prost-log-message"
+  ],
+  "min_verified_functions": 23,
+  "controls": {
+    "discard_frame_sequence": {
+      "defect": "A decoded frame discards its assigned sequence.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "            && frame.term_sequence == (match sequence { Some(value) => Some(TermSequence(value)), None => None })",
+          "replace": "            && frame.term_sequence == None"
+        },
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "    Ok(ReplicaFrame { term: Term(term), term_sequence, message })",
+          "replace": "    Ok(ReplicaFrame { term: Term(term), term_sequence: None, message })"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/native_append_projection/laws.rs",
+          "function": "decode_chosen_frame",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "decode_replica_envelope",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "drop_recognized_body": {
+      "defect": "Forming an envelope erases the decoded event even when the replica body is present.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "            (out is None) == (self.message is None),",
+          "replace": "            out is None,"
+        },
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "find": "            Some(message) => Some(ReplicaEnvelope { term: self.term, term_sequence: self.term_sequence, message }),",
+          "replace": "            Some(_) => None,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/native_append_projection/laws.rs",
+          "function": "decoded_acknowledgement_preserves_body",
+          "category": "assertion failed"
+        },
+        {
+          "file": "rust/crates/format/src/envelope/decoder.rs",
+          "function": "decode_replica_envelope",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    }
+  }
+}
