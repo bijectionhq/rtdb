@@ -64,6 +64,8 @@ pub struct NodeConfiguration {
     pub playground: bool,
     pub server: Option<PgwireSettings>,
     pub flight_sql: Option<FlightSettings>,
+    #[cfg(feature = "multi")]
+    pub(crate) deployment_admin: Option<std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>>,
     pub health: Option<HealthSettings>,
     pub remotes: BTreeMap<String, RemoteConfig>,
     pub primary: DatabaseConfig,
@@ -98,6 +100,13 @@ impl std::fmt::Debug for NodeConfiguration {
 }
 
 impl NodeConfiguration {
+    /// Mounts the host's deployment authority on the ordinary Flight listener.
+    #[cfg(feature = "multi")]
+    pub fn with_deployment_admin(mut self, authority: std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>) -> Self {
+        self.deployment_admin = Some(authority);
+        self
+    }
+
     pub fn from_yaml(text: &str) -> Result<Self> { Self::from_yaml_with_environment(text, &|name| std::env::var(name).ok(), false) }
     pub fn from_ingest_yaml(text: &str) -> Result<Self> { Self::from_yaml_with_environment(text, &|name| std::env::var(name).ok(), true) }
     pub fn from_yaml_with_environment(text: &str, environment: &impl Fn(&str) -> Option<String>, ingest: bool) -> Result<Self> {
@@ -140,7 +149,10 @@ impl NodeConfiguration {
                 Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
                 None => BTreeMap::new(),
             };
-            Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
+            Self { playground: false, server: None, flight_sql: None,
+                #[cfg(feature = "multi")]
+                deployment_admin: None,
+                health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
                 tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
@@ -159,7 +171,10 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+            Self { playground: false, server, flight_sql,
+                #[cfg(feature = "multi")]
+                deployment_admin: None,
+                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)

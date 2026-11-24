@@ -227,11 +227,15 @@ impl ServerDriver {
                 session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
                 forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
                 hosted_controls: settings.hosted_controls.clone(), custody_providers,
+                #[cfg(feature = "multi")]
+                deployment_admin: config.deployment_admin.clone(),
                 reserved_applied_source: settings.audience.map(|(_, audience)| audience.source()),
                 ..Default::default() };
             if let Some((address, audience)) = settings.audience {
                 let reserved = rtdb_flight_sql::FlightConfig {
                     address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None, custody_providers: Default::default(),
+                    #[cfg(feature = "multi")]
+                    deployment_admin: None,
                     ..ordinary.clone()
                 };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(reserved, node.clone(), auth.clone()).await?;
