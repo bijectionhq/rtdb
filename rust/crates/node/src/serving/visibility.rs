@@ -84,8 +84,12 @@ impl ServingScope {
                 table: row.table.clone(),
                 id: row.id.clone(),
                 valid: Some(row.valid),
-                kind: if row.after.is_some() { ChangeKind::Opened } else { ChangeKind::Closed },
-                erased_written_basis: None,
+                kind: match (row.erased_written_basis, &row.after) {
+                    (Some(_), _) => ChangeKind::Erased,
+                    (None, Some(_)) => ChangeKind::Opened,
+                    (None, None) => ChangeKind::Closed,
+                },
+                erased_written_basis: row.erased_written_basis,
                 before: row.before.as_ref().filter(|_| matches!(request.images, ChangeImages::Before | ChangeImages::Both))
                     .map(|image| image.as_ref().clone()),
                 after: row.after.as_ref().filter(|_| matches!(request.images, ChangeImages::After | ChangeImages::Both))

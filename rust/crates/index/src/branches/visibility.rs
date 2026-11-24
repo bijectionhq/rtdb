@@ -20,6 +20,7 @@ pub struct VisibleChange {
     pub valid: Interval,
     pub before: Option<Arc<RowImage>>,
     pub after: Option<Arc<RowImage>>,
+    pub erased_written_basis: Option<Basis>,
 }
 
 #[derive(Default)]
@@ -79,7 +80,7 @@ impl BranchIndex {
             self.main_visibility_view(main, Basis::new(self.head.basis.incarnation(), 0))?;
         for (basis, touched) in touched {
             let current = self.main_visibility_view(main, basis)?;
-            let rows = touched
+            let mut rows = touched
                 .rows
                 .into_iter()
                 .map(|(table, id)| visible_changes(&previous, &current, table, id, &scope.read))
@@ -157,6 +158,15 @@ impl BranchIndex {
             }
             for group in revocations {
                 index.revoke_custody_group(group)?;
+                for notice in index.custody_revocation_writes(group, cut)? {
+                    let valid = notice.valid.ok_or_else(|| {
+                        Anomaly::fault("rtdb/visibility-erasure", "A custody erasure needs its written validity")
+                    })?;
+                    rows.push(VisibleChange {
+                        table: notice.table, id: notice.id, valid, before: None, after: None,
+                        erased_written_basis: notice.erased_written_basis,
+                    });
+                }
             }
             source_bases.insert(cut.basis, basis);
             changes.push(VisibleChangeGroup { cut, rows });
@@ -291,6 +301,7 @@ fn visible_changes(
                 valid: Interval::new(bounds[0], bounds[1])?,
                 before: prior.map(project),
                 after: next.map(project),
+                erased_written_basis: None,
             });
         }
         last_pair = (prior, next);
@@ -318,7 +329,7 @@ fn visibility_images<'a>(
 }
 
 fn visible_version<'a>(
-    images: &[(&'a BranchEvent, Option<&'a Arc<RowImage>>)>,
+    images: &[(&'a BranchEvent, Option<&'a Arc<RowImage>>)],
     at: Timestamp, visibility: Option<&Visibility>, labels: &BTreeSet<Vec<u8>>,
 ) -> Option<VisibleVersion<'a>> {
     let (event, image) = images.iter().rev().find(|(event, _)| event.valid.contains(at))?;

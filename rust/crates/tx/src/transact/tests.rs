@@ -179,6 +179,9 @@ fn projected_custody_keeps_issued_bases_and_masks_the_revoked_versions() {
     assert!(old.row(&table(), &EntityId::Integer(3), Timestamp(0)).is_some());
     assert!(old.custody_inventories().next().is_none());
     assert_eq!(projected.changes().last().unwrap().rows[0].id, EntityId::Integer(1));
+    assert!(projected.changes().last().unwrap().rows.iter().any(|row| {
+        row.id == EntityId::Integer(1) && row.erased_written_basis == Some(first.basis)
+    }));
 }
 
 #[test]
