@@ -218,6 +218,39 @@ impl BranchIndex {
 
     pub fn head(&self) -> BranchCut { self.head }
 
+    /// Select an exact settled prefix for checkpoint export. Erasure fences
+    /// constrain export even when a historical cut is still queryable.
+    pub fn checkpoint_at(&self, at: Basis) -> Result<Self> {
+        let head = self.exact(at)?;
+        if [self.erased, self.latest_custody_revocation].into_iter().flatten().any(|fence| fence > at) {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The export cut precedes an erasure fence"));
+        }
+        if self.has_custody_groups() {
+            return Err(Anomaly::unsupported("rtdb/export-custody", "A protected export needs an admitted destination custody binding"));
+        }
+        if head == self.head {
+            return Ok(self.clone());
+        }
+
+        let mut retained = self.clone();
+        retained.head = head;
+        retained.writes = Arc::default();
+        retained.times = self.times.range(..=at.position()).map(|(&position, &time)| (position, time)).collect();
+        retained.catalog = self.catalog.iter().filter_map(|(table, definitions)| {
+            let count = definitions.partition_point(|(written, _)| *written <= at);
+            (count != 0).then(|| (table.clone(), Arc::new(definitions[..count].to_vec())))
+        }).collect();
+        retained.branches = self.branches.iter().filter(|(_, branch)| branch.created <= at)
+            .map(|(name, branch)| (name.clone(), Arc::new(branch.checkpoint_at(at)))).collect();
+        retained.changed_catalog = retained.catalog.values().filter_map(|history| history.last().map(|(basis, _)| *basis))
+            .chain(retained.branches.iter().flat_map(|(name, branch)| {
+                (name != MAIN_BRANCH).then_some(branch.created).into_iter()
+                    .chain(branch.dropped)
+                    .chain(branch.expiries.iter().skip(1).map(|(at, _)| *at))
+            })).max();
+        Ok(retained)
+    }
+
     pub fn writes_at(&self, basis: Basis) -> Vec<BranchWrite> {
         if basis == self.head.basis { self.writes.as_ref().clone() } else { Vec::new() }
     }
@@ -511,6 +544,42 @@ impl BranchIndex {
             .ok_or_else(|| Anomaly::fault("rtdb/branch-fold", "Resolved write names an unknown branch"))?);
         data.changed = Some(basis);
         Ok(data)
+    }
+}
+
+impl BranchData {
+    fn checkpoint_at(&self, at: Basis) -> Self {
+        let dropped = self.dropped.filter(|dropped| *dropped <= at);
+        let expiries = self.expiries.iter().copied().take_while(|(written, _)| *written <= at).collect::<Vec<_>>();
+        let tables: Map<_, _> = self.tables.iter().filter_map(|(table, rows)| {
+            let rows = rows.checkpoint_at(at);
+            (!rows.events.is_empty() || !rows.erased.is_empty()).then(|| (table.clone(), Arc::new(rows)))
+        }).collect();
+        let changed = self.changed.filter(|changed| *changed <= at).or_else(|| {
+            tables.values().flat_map(|rows| {
+                rows.events.values().filter_map(|events| events.last().map(|(_, event)| event.cut.basis))
+                    .chain(rows.erased.values().copied())
+                    .chain(rows.retired_labels.values().flat_map(|labels| labels.values().map(|label| label.revoked)))
+            }).chain(expiries.iter().skip(1).map(|(basis, _)| *basis))
+                .chain(self.base.as_ref().map(|_| self.created))
+                .chain(dropped).max()
+        });
+        Self { base: self.base.clone(), created: self.created, writable: self.writable, dropped, expiries, changed, tables }
+    }
+}
+
+impl BranchRows {
+    fn checkpoint_at(&self, at: Basis) -> Self {
+        let events = self.events.iter().filter_map(|(id, events)| {
+            let count = events.partition_point(|(_, event)| event.cut.basis <= at);
+            (count != 0).then(|| (id.clone(), Arc::new(events[..count].to_vec())))
+        }).collect();
+        Self {
+            events,
+            // The export admission already excluded cuts preceding an erasure.
+            erased: self.erased.clone(),
+            retired_labels: self.retired_labels.clone(),
+        }
     }
 }
 

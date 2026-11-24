@@ -211,9 +211,10 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
     }
     view.index.view(&request.branch, At::Latest, Layer::Merged, now)?;
     let upper = request.until.unwrap_or(head).min(head);
+    let requested = |table| request.tables.is_empty() || request.tables.contains(table);
     let entries = view.changes.iter().filter(|(cut, writes)| {
         cut.basis > after && cut.basis <= upper &&
-            writes.iter().any(|write| write.branch == request.branch && request.tables.contains(&write.table))
+            writes.iter().any(|write| write.branch == request.branch && requested(&write.table))
     });
     let fetch = request.limit.saturating_add(1);
     let mut entries = match request.order {
@@ -234,7 +235,7 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
         });
         let after = view.index.view(&request.branch, At::Exactly(cut.basis), Layer::Merged, cut.system_time).ok();
         let mut rows = Vec::new();
-        for write in writes.iter().filter(|write| write.branch == request.branch && request.tables.contains(&write.table)) {
+        for write in writes.iter().filter(|write| write.branch == request.branch && requested(&write.table)) {
             append_change_rows(&mut rows, write, before.as_ref(), after.as_ref(), request.images)?;
         }
         Ok(ChangeGroup { cut: *cut, rows })
