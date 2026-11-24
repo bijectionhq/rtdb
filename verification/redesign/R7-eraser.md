@@ -102,7 +102,7 @@ The fixed commitment binds both inventories and the deadline to the authenticate
 The original authority signs the drain of the same roster, with an observation for every working plaintext, egress and copy participant after admission closes.
 Separate destruction evidence binds that drain to the provider disposition.
 A late disposition is recorded as a missed fixed deadline. A pending provider result does not furnish a disposition.
-The checkpoint custodian durably records the roster bound to the certified switch. Each duty binds its registered worker’s verification key and records a separately signed observation after closure. Destruction confirmation reopens that journal and requires every observation before accepting the authority’s signed disposition. The SQL custody adapter still has to register every affected worker and copy and obtain terminal observations from those owners.
+The checkpoint custodian durably records the roster bound to the certified switch. Each duty binds its registered worker’s verification key and records a separately signed observation after closure. Destruction confirmation reopens that journal and requires every observation before withdrawing the incumbent journal key through its original provider. The durable provider observation binds the aggregate receipt, which is retained for later readback. The SQL custody adapter still has to register every affected worker and copy and obtain terminal observations from those owners.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

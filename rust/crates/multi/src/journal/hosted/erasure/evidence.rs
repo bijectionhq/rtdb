@@ -30,11 +30,14 @@ impl ErasureDeadline {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DestructionEvidence {
     pub drain: CustodyDrain,
     pub destroyed_at_ms: u64,
     pub disposition: [u8; 32],
+    pub journal_key_disposition: [u8; 32],
+    #[serde(with = "signature_bytes")]
     pub signature: [u8; 64],
 }
 
@@ -68,10 +71,12 @@ pub struct DrainedWork {
     pub observation: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustodyDrain {
     pub closed_at_ms: u64,
     pub joined: Vec<DrainedWork>,
+    #[serde(with = "signature_bytes")]
     pub signature: [u8; 64],
 }
 
@@ -184,12 +189,13 @@ impl ErasureCommit {
 
 impl DestructionEvidence {
     pub fn signing_bytes(&self, commit: &ErasureCommit) -> Vec<u8> {
-        let mut bytes = b"rtdb.multi/erasure-destruction/v2\0".to_vec();
+        let mut bytes = b"rtdb.multi/erasure-destruction/v3\0".to_vec();
         bytes.extend_from_slice(digest(&SHA256, &commit.signing_bytes()).as_ref());
         bytes.extend_from_slice(digest(&SHA256, &self.drain.signing_bytes(commit)).as_ref());
         bytes.extend_from_slice(&self.drain.signature);
         bytes.extend_from_slice(&self.destroyed_at_ms.to_be_bytes());
         bytes.extend_from_slice(&self.disposition);
+        bytes.extend_from_slice(&self.journal_key_disposition);
         bytes
     }
 
@@ -238,6 +244,7 @@ impl CustodyEvidence {
         if drain.closed_at_ms < commit.committed_at_ms
             || receipt.destroyed_at_ms < drain.closed_at_ms
             || receipt.disposition == [0; 32]
+            || receipt.journal_key_disposition == [0; 32]
             || drain.joined.iter().any(|work| {
                 work.observed_at_ms < drain.closed_at_ms
                     || work.observed_at_ms > receipt.destroyed_at_ms
@@ -266,4 +273,17 @@ pub(super) fn authority_unavailable() -> Anomaly {
         "rtdb.multi/fixed-erasure-authority",
         "The installation has no authenticated enforcing erasure authority",
     )
+}
+
+mod signature_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_slice().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        bytes.try_into().map_err(|_| serde::de::Error::custom("Invalid erasure signature width"))
+    }
 }

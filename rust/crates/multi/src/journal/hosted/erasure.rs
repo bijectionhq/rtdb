@@ -115,11 +115,15 @@ impl CleanRecoverySlots {
 pub struct JoinedCustody {
     closed_at_ms: u64,
     joined: Vec<DrainedWork>,
+    journal_key_disposition: [u8; 32],
+    journal_key_observed_at_ms: u64,
 }
 
 impl JoinedCustody {
     pub fn closed_at_ms(&self) -> u64 { self.closed_at_ms }
     pub fn observations(&self) -> &[DrainedWork] { &self.joined }
+    pub fn journal_key_disposition(&self) -> [u8; 32] { self.journal_key_disposition }
+    pub fn journal_key_observed_at_ms(&self) -> u64 { self.journal_key_observed_at_ms }
 }
 
 #[async_trait]
@@ -345,14 +349,29 @@ impl<'a> ErasureCoordinator<'a> {
             .ok_or_else(evidence::authority_unavailable)?;
         let Some(journal) = self.resume_drain(commit).await? else { return Ok(None); };
         let Some(joined) = journal.joined().await? else { return Ok(None); };
-        let drained = JoinedCustody { closed_at_ms: journal.closed_at_ms(), joined };
-        let Some(receipt) = custody.destruction(commit, &drained).await? else {
-            return Ok(None);
+        let closed_at_ms = journal.closed_at_ms();
+        let latest_join = joined.iter().map(|work| work.observed_at_ms).max().unwrap_or(closed_at_ms);
+        let (journal_key_disposition, journal_key_observed_at_ms) =
+            journal.settle_journal_key(self.keys, latest_join).await?;
+        let drained = JoinedCustody {
+            closed_at_ms, joined, journal_key_disposition, journal_key_observed_at_ms,
+        };
+        let already = journal.destruction().await?;
+        let receipt = match already {
+            Some(ref receipt) => receipt.clone(),
+            None => {
+                let Some(receipt) = custody.destruction(commit, &drained).await? else { return Ok(None); };
+                receipt
+            }
         };
         authority.verify_destruction(commit, &receipt)?;
-        if receipt.drain.closed_at_ms != drained.closed_at_ms || receipt.drain.joined != drained.joined {
-            return Err(invalid("The destruction receipt differs from the durable drain observations"));
+        if receipt.drain.closed_at_ms != drained.closed_at_ms || receipt.drain.joined != drained.joined
+            || receipt.journal_key_disposition != drained.journal_key_disposition
+            || receipt.destroyed_at_ms < drained.journal_key_observed_at_ms
+        {
+            return Err(invalid("The destruction receipt differs from the durable custody observations"));
         }
+        if already.is_none() { journal.record_destruction(&receipt).await?; }
         Ok(Some(receipt))
     }
 }

@@ -88,6 +88,15 @@ impl Closure {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalKeyWithdrawal {
+    namespace: [u8; 32],
+    key: String,
+    operation_authority: bool,
+    observed_at_ms: u64,
+}
+
 pub struct ErasureDrainJournal<'a> {
     commit: ErasureCommit,
     records: ErasureRecords<'a>,
@@ -175,6 +184,82 @@ impl<'a> ErasureDrainJournal<'a> {
             joined.push(join.work);
         }
         Ok(Some(joined))
+    }
+
+    /// Settle only the incumbent journal key selected by this switch.
+    /// Provider success is retained before any aggregate destruction can be attested.
+    pub(super) async fn settle_journal_key(
+        &self,
+        keys: &dyn crate::keys::KeyService,
+        latest_join: u64,
+    ) -> Result<([u8; 32], u64)> {
+        use crate::keys::{ArchiveKeyWithdrawal, JournalKey};
+
+        let erasure = self.commit.prepared.erasure;
+        let namespace = keys.namespace_id().await?;
+        let key = JournalKey::new(erasure.placement, erasure.incumbent.key_generation).id();
+        let record = match self.records.get("journal-key").await? {
+            Some(bytes) => {
+                serde_json::from_slice::<JournalKeyWithdrawal>(&bytes).map_err(serialization)?
+            }
+            None => {
+                let before = u64::try_from(rtdb_directory::now_ms())
+                    .map_err(|_| invalid("The custody clock is invalid"))?;
+                if before < latest_join {
+                    return Err(invalid(
+                        "The custody clock has not reached the joined observation",
+                    ));
+                }
+                let operation_authority = match keys.withdraw_archive_key(&key).await? {
+                    ArchiveKeyWithdrawal::Vault => false,
+                    ArchiveKeyWithdrawal::OperationAuthority => true,
+                };
+                let observed_at_ms = u64::try_from(rtdb_directory::now_ms())
+                    .map_err(|_| invalid("The custody clock is invalid"))?;
+                if observed_at_ms < before {
+                    return Err(invalid(
+                        "The custody clock regressed during provider settlement",
+                    ));
+                }
+                let record = JournalKeyWithdrawal {
+                    namespace,
+                    key: key.clone(),
+                    operation_authority,
+                    observed_at_ms,
+                };
+                self.records.put("journal-key", encode(&record)?).await?;
+                record
+            }
+        };
+        if record.namespace != namespace || record.key != key || record.observed_at_ms < latest_join
+        {
+            return Err(invalid(
+                "The journal key disposition belongs to different custody",
+            ));
+        }
+        let mut hash = Context::new(&SHA256);
+        hash.update(b"rtdb.multi/erasure-journal-disposition/v1\0");
+        hash.update(&self.closure.commit);
+        hash.update(&encode(&record)?);
+        Ok((
+            hash.finish().as_ref().try_into().expect("SHA-256 width"),
+            record.observed_at_ms,
+        ))
+    }
+
+    pub(super) async fn destruction(&self) -> Result<Option<super::DestructionEvidence>> {
+        self.records
+            .get("destroyed")
+            .await?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(serialization))
+            .transpose()
+    }
+
+    pub(super) async fn record_destruction(
+        &self,
+        receipt: &super::DestructionEvidence,
+    ) -> Result<()> {
+        self.records.put("destroyed", encode(receipt)?).await
     }
 
     fn verify(&self, index: usize, join: &SignedDrainJoin) -> Result<()> {
