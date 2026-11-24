@@ -21,7 +21,10 @@ use crate::keys::{JournalKey, KeyService};
 mod drain;
 mod evidence;
 pub use drain::{DrainRegistration, ErasureDrainJournal, SignedDrainJoin};
-pub(super) use drain::retirement_admitted;
+pub(super) use drain::{
+    record_checkpoint_disposition, record_serving_disposition, retirement_admitted,
+    serving_disposition, serving_retirement_epoch,
+};
 use evidence::CustodyEvidence;
 pub use evidence::{
     CustodyDrain, CustodyWork, DeadlineReservation, DestructionEvidence, DrainParticipant,
@@ -118,6 +121,10 @@ pub struct JoinedCustody {
     joined: Vec<DrainedWork>,
     journal_key_disposition: [u8; 32],
     journal_key_observed_at_ms: u64,
+    checkpoint_disposition: [u8; 32],
+    checkpoint_observed_at_ms: u64,
+    serving_disposition: [u8; 32],
+    serving_observed_at_ms: u64,
 }
 
 impl JoinedCustody {
@@ -125,6 +132,10 @@ impl JoinedCustody {
     pub fn observations(&self) -> &[DrainedWork] { &self.joined }
     pub fn journal_key_disposition(&self) -> [u8; 32] { self.journal_key_disposition }
     pub fn journal_key_observed_at_ms(&self) -> u64 { self.journal_key_observed_at_ms }
+    pub fn checkpoint_disposition(&self) -> [u8; 32] { self.checkpoint_disposition }
+    pub fn checkpoint_observed_at_ms(&self) -> u64 { self.checkpoint_observed_at_ms }
+    pub fn serving_disposition(&self) -> [u8; 32] { self.serving_disposition }
+    pub fn serving_observed_at_ms(&self) -> u64 { self.serving_observed_at_ms }
 }
 
 #[async_trait]
@@ -219,8 +230,8 @@ impl<'a> ErasureCoordinator<'a> {
     ) -> Result<PreparedErasure> {
         self.require_incumbent(erasure)?;
         let route = self.custodian.route().await?;
-        if !retirement_admitted(self.provider, route.placement, route.erasure_floor).await? {
-            return Err(invalid("The previous erasure is still draining its closed custody"));
+        if !drain::retirement_completed(self.provider, route.placement, route.erasure_floor).await? {
+            return Err(invalid("The previous erasure still has unconfirmed destruction"));
         }
         let epoch = self.worker.log_epoch();
         let base_matches = match selection.checkpoint() {
@@ -374,15 +385,33 @@ impl<'a> ErasureCoordinator<'a> {
             .ok_or_else(evidence::authority_unavailable)?;
         let Some(journal) = self.resume_drain(commit).await? else { return Ok(None); };
         let Some(joined) = journal.joined().await? else { return Ok(None); };
-        drain::admit_retirement(self.provider, commit).await?;
+        let already = journal.destruction().await?;
+        if already.is_none() {
+            let route = self.custodian.route().await?;
+            if route.erasure_floor != commit.prepared.checkpoint.cut.next_lsn {
+                return Err(invalid("The destruction receipt has a different ordered erasure cut"));
+            }
+            let Some(retiring) = route.erasure_retirement else {
+                return Err(invalid("The custodian cannot read the ordered erasure drain"));
+            };
+            if retiring.outstanding_holds != 0 { return Ok(None); }
+            drain::record_cut(self.provider, commit, "joined-custody").await?;
+            if retiring.unsettled_checkpoints != 0 { return Ok(None); }
+        }
+        let erasure = commit.prepared.erasure;
+        let Some(serving) = serving_disposition(
+            self.provider, erasure.placement, commit.prepared.checkpoint.cut.next_lsn, erasure.incumbent.epoch,
+        ).await? else { return Ok(None); };
         let closed_at_ms = journal.closed_at_ms();
         let latest_join = joined.iter().map(|work| work.observed_at_ms).max().unwrap_or(closed_at_ms);
         let (journal_key_disposition, journal_key_observed_at_ms) =
             journal.settle_journal_key(self.keys, latest_join).await?;
+        let (checkpoint_disposition, checkpoint_observed_at_ms) = drain::checkpoint_dispositions(self.provider, commit).await?;
         let drained = JoinedCustody {
             closed_at_ms, joined, journal_key_disposition, journal_key_observed_at_ms,
+            checkpoint_disposition, checkpoint_observed_at_ms,
+            serving_disposition: serving.disposition, serving_observed_at_ms: serving.observed_at_ms,
         };
-        let already = journal.destruction().await?;
         let receipt = match already {
             Some(ref receipt) => receipt.clone(),
             None => {
@@ -393,11 +422,15 @@ impl<'a> ErasureCoordinator<'a> {
         authority.verify_destruction(commit, &receipt)?;
         if receipt.drain.closed_at_ms != drained.closed_at_ms || receipt.drain.joined != drained.joined
             || receipt.journal_key_disposition != drained.journal_key_disposition
-            || receipt.destroyed_at_ms < drained.journal_key_observed_at_ms
+            || receipt.checkpoint_disposition != drained.checkpoint_disposition
+            || receipt.serving_disposition != drained.serving_disposition
+            || receipt.destroyed_at_ms < drained.serving_observed_at_ms
+            || receipt.destroyed_at_ms < drained.journal_key_observed_at_ms.max(drained.checkpoint_observed_at_ms)
         {
             return Err(invalid("The destruction receipt differs from the durable custody observations"));
         }
         if already.is_none() { journal.record_destruction(&receipt).await?; }
+        drain::record_cut(self.provider, commit, "destruction-confirmed").await?;
         Ok(Some(receipt))
     }
 }

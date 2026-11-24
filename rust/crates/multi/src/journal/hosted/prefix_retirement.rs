@@ -94,6 +94,7 @@ struct Receipt {
     inspected_through_lsn: u64,
     settled_at_ms: i64,
     key_scope_withdrawn: bool,
+    key_vault_namespace: [u8; 32],
 }
 
 /// What one pass established for one superseded epoch.
@@ -239,7 +240,10 @@ async fn superseded_prefixes(provider: &Provider, placement: &Placement, route: 
     let root = generation_root(placement);
     let children: Vec<String> = match provider {
         Provider::Local(local) => match fs::read_dir(local.join(ObjectKey::new(root.as_str())?.as_str())) {
-            Ok(entries) => entries.filter_map(|entry| entry.ok()?.file_name().into_string().ok()).collect(),
+            Ok(entries) => entries.map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|error| local_error(local, error))?
+                .into_iter().filter_map(|name| name.into_string().ok()).collect(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(local_error(local, error)),
         },
@@ -257,25 +261,21 @@ async fn superseded_prefixes(provider: &Provider, placement: &Placement, route: 
 pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &Arc<dyn KeyService>) -> Result<Vec<(u64, Outcome)>> {
     let Some(custodian) = placement.custodian.as_ref() else { return Ok(Vec::new()); };
     let route = custodian.route().await?;
-    if route.erasure_floor != 0 {
+    let erasure = if route.erasure_floor != 0 {
         let custody = placement.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
-        if !super::erasure::retirement_admitted(&custody, route.placement, route.erasure_floor).await? {
+        let Some(through) = super::erasure::serving_retirement_epoch(&custody, route.placement, route.erasure_floor).await? else {
             return Ok(Vec::new());
+        };
+        if route.writer.epoch <= through {
+            return Err(unavailable("The erasure does not fence its original serving grant"));
         }
-    }
+        Some((custody, through))
+    } else {
+        None
+    };
     let Some(provider) = Provider::qualify(storage).await? else { return Ok(Vec::new()); };
     let bucket = storage.bucket(IoRegion::new()).await?;
-    let mut epochs = superseded_prefixes(&provider, placement, &route).await?;
-    // An intent whose provider effects removed the prefix before its receipt
-    // was written is found from the intent itself.
-    let retired_root = key(format!("{}/{RETIRED}", generation_root(placement)))?;
-    let current = route.writer.grant.map(|grant| grant.epoch);
-    for object in bucket.list(Some(&retired_root)).await? {
-        let name = object.key.as_str().rsplit('/').next().unwrap_or_default();
-        if let Ok(epoch) = name.parse::<u64>() && superseded(epoch, route.writer.epoch, current) {
-            epochs.insert(epoch);
-        }
-    }
+    let (epochs, receipts) = serving_retirement_inventory(&provider, placement, bucket.as_ref(), &route).await?;
     let mut candidates = Vec::new();
     for epoch in epochs {
         let settled = key(format!("{}/{RETIRED}/{epoch}.settled", generation_root(placement)))?;
@@ -283,11 +283,11 @@ pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &
             candidates.push((epoch, settled));
         }
     }
-    if candidates.is_empty() { return Ok(Vec::new()); }
+    if candidates.is_empty() && erasure.is_none() { return Ok(Vec::new()); }
     let identity = storage.custody_namespace()?;
     let independent = !genesis(route.checkpoint);
     let trimmed = route.floor == route.checkpoint.cut;
-    let retained = if independent && trimmed { Some(retained_epochs(custodian, &route).await?) } else { None };
+    let retained = if !candidates.is_empty() && independent && trimmed { Some(retained_epochs(custodian, &route).await?) } else { None };
     let storage_root = crate::archive::checkpoint_storage_root()?;
     let mut outcomes = Vec::new();
     for (epoch, settled) in candidates {
@@ -303,7 +303,59 @@ pub(crate) async fn retire(placement: &Placement, storage: &CellStorage, keys: &
         }).await;
         outcomes.push((epoch, outcome.unwrap_or_else(Outcome::Failed)));
     }
+    if let Some((custody, through)) = erasure
+        && super::erasure::serving_disposition(&custody, route.placement, route.erasure_floor, through).await?.is_none()
+    {
+        // Re-observe the physical census after settlement. The closed
+        // grants cannot admit new writes or serving reads.
+        let (mut epochs, latest_receipts) = serving_retirement_inventory(&provider, placement, bucket.as_ref(), &route).await?;
+        epochs.extend(receipts);
+        epochs.extend(latest_receipts);
+        epochs.insert(through);
+        let namespace = keys.namespace_id().await?;
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(b"rtdb.multi/erasure-serving-dispositions/v1\0");
+        hash.update(&through.to_be_bytes());
+        hash.update(&namespace);
+        for epoch in epochs.range(..=through) {
+            let settled = key(format!("{}/{RETIRED}/{epoch}.settled", generation_root(placement)))?;
+            let Some(receipt) = read_json::<Receipt>(bucket.as_ref(), &settled).await? else { return Ok(outcomes); };
+            if !receipt.intent.grant.binds(placement, *epoch)
+                || receipt.intent.token != token(&receipt.intent.grant)?
+                || receipt.intent.provider != identity || receipt.intent.inventory != provider.inventory()
+                || receipt.key_vault_namespace != namespace || !receipt.key_scope_withdrawn
+            {
+                return Err(unavailable("The serving retirement receipt names different custody"));
+            }
+            let frame = serde_json::to_vec(&receipt).map_err(|error| unavailable(&error.to_string()))?;
+            hash.update(ring::digest::digest(&ring::digest::SHA256, &frame).as_ref());
+        }
+        let disposition = hash.finish().as_ref().try_into().expect("SHA-256 width");
+        super::erasure::record_serving_disposition(
+            &custody, route.placement, route.erasure_floor, through, disposition,
+        ).await?;
+    }
     Ok(outcomes)
+}
+
+async fn serving_retirement_inventory(
+    provider: &Provider, placement: &Placement, bucket: &dyn ObjectStore, route: &Route,
+) -> Result<(BTreeSet<u64>, BTreeSet<u64>)> {
+    let mut epochs = superseded_prefixes(provider, placement, route).await?;
+    let retired_root = key(format!("{}/{RETIRED}", generation_root(placement)))?;
+    let current = route.writer.grant.map(|grant| grant.epoch);
+    let mut receipts = BTreeSet::new();
+    // A durable intent survives removal of its physical prefix.
+    for object in bucket.list(Some(&retired_root)).await? {
+        let name = object.key.as_str().rsplit('/').next().unwrap_or_default();
+        if let Ok(epoch) = name.parse::<u64>() && superseded(epoch, route.writer.epoch, current) {
+            epochs.insert(epoch);
+        }
+        if let Some(epoch) = name.strip_suffix(".settled").and_then(|epoch| epoch.parse::<u64>().ok()) {
+            receipts.insert(epoch);
+        }
+    }
+    Ok((epochs, receipts))
 }
 
 struct RetireOne<'a> {
@@ -443,6 +495,7 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
             }
         }
     }
+    let key_vault_namespace = keys.namespace_id().await?;
     put_json(bucket, settled, &Receipt {
         intent,
         checkpoint_lsn: route.checkpoint.cut.next_lsn,
@@ -451,6 +504,7 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
         inspected_through_lsn: route.head.next_lsn,
         settled_at_ms: rtdb_directory::now_ms(),
         key_scope_withdrawn: true,
+        key_vault_namespace,
     }).await?;
     Ok(Outcome::Retired)
 }

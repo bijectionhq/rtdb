@@ -37,6 +37,8 @@ pub struct DestructionEvidence {
     pub destroyed_at_ms: u64,
     pub disposition: [u8; 32],
     pub journal_key_disposition: [u8; 32],
+    pub checkpoint_disposition: [u8; 32],
+    pub serving_disposition: [u8; 32],
     #[serde(with = "signature_bytes")]
     pub signature: [u8; 64],
 }
@@ -189,13 +191,15 @@ impl ErasureCommit {
 
 impl DestructionEvidence {
     pub fn signing_bytes(&self, commit: &ErasureCommit) -> Vec<u8> {
-        let mut bytes = b"rtdb.multi/erasure-destruction/v3\0".to_vec();
+        let mut bytes = b"rtdb.multi/erasure-destruction/v4\0".to_vec();
         bytes.extend_from_slice(digest(&SHA256, &commit.signing_bytes()).as_ref());
         bytes.extend_from_slice(digest(&SHA256, &self.drain.signing_bytes(commit)).as_ref());
         bytes.extend_from_slice(&self.drain.signature);
         bytes.extend_from_slice(&self.destroyed_at_ms.to_be_bytes());
         bytes.extend_from_slice(&self.disposition);
         bytes.extend_from_slice(&self.journal_key_disposition);
+        bytes.extend_from_slice(&self.checkpoint_disposition);
+        bytes.extend_from_slice(&self.serving_disposition);
         bytes
     }
 
@@ -245,6 +249,8 @@ impl CustodyEvidence {
             || receipt.destroyed_at_ms < drain.closed_at_ms
             || receipt.disposition == [0; 32]
             || receipt.journal_key_disposition == [0; 32]
+            || receipt.checkpoint_disposition == [0; 32]
+            || receipt.serving_disposition == [0; 32]
             || drain.joined.iter().any(|work| {
                 work.observed_at_ms < drain.closed_at_ms
                     || work.observed_at_ms > receipt.destroyed_at_ms

@@ -14,7 +14,7 @@ use super::{
     CleanRecoverySlots, CustodyWork, DrainParticipant, DrainedWork, ErasureCommit, drain_inventory,
     invalid,
 };
-use ordered_logkeeper::ordered::Placement;
+use ordered_logkeeper::ordered::{Checkpoint, Placement};
 
 /// Binds one named duty to the credential that can attest its terminal drain.
 /// A worker can register multiple independently tracked duties.
@@ -174,6 +174,7 @@ impl Closure {
 struct RetirementAdmission {
     operation: uuid::Uuid,
     switch: [u8; 32],
+    through_epoch: u64,
 }
 
 pub(in crate::journal::hosted) async fn retirement_admitted(
@@ -181,25 +182,138 @@ pub(in crate::journal::hosted) async fn retirement_admitted(
     placement: Placement,
     erasure_floor: u64,
 ) -> Result<bool> {
-    if erasure_floor == 0 {
-        return Ok(true);
-    }
-    let cut = provider.erasure_cut_records(placement, erasure_floor)?;
-    let Some(bytes) = cut.get("joined-custody").await? else { return Ok(false); };
-    let admission: RetirementAdmission = serde_json::from_slice(&bytes).map_err(serialization)?;
-    Ok(!admission.operation.is_nil() && admission.switch != [0; 32])
+    recorded_cut(provider, placement, erasure_floor, "joined-custody").await
 }
 
-pub(super) async fn admit_retirement(
+pub(super) async fn retirement_completed(
     provider: &CheckpointCustody,
-    commit: ErasureCommit,
-) -> Result<()> {
+    placement: Placement,
+    erasure_floor: u64,
+) -> Result<bool> {
+    recorded_cut(provider, placement, erasure_floor, "destruction-confirmed").await
+}
+
+async fn recorded_cut(provider: &CheckpointCustody, placement: Placement, floor: u64, name: &str) -> Result<bool> {
+    Ok(floor == 0 || cut_record(provider, placement, floor, name).await?.is_some())
+}
+
+async fn cut_record(provider: &CheckpointCustody, placement: Placement, floor: u64, name: &str) -> Result<Option<RetirementAdmission>> {
+    let cut = provider.erasure_cut_records(placement, floor)?;
+    let Some(bytes) = cut.get(name).await? else { return Ok(None); };
+    let admission: RetirementAdmission = serde_json::from_slice(&bytes).map_err(serialization)?;
+    if admission.operation.is_nil() || admission.switch == [0; 32] || admission.through_epoch == 0 {
+        return Err(invalid("The recorded custody decision has no exact identity"));
+    }
+    Ok(Some(admission))
+}
+
+pub(in crate::journal::hosted) async fn serving_retirement_epoch(
+    provider: &CheckpointCustody, placement: Placement, floor: u64,
+) -> Result<Option<u64>> {
+    Ok(cut_record(provider, placement, floor, "joined-custody").await?.map(|admission| admission.through_epoch))
+}
+
+pub(super) async fn record_cut(provider: &CheckpointCustody, commit: ErasureCommit, name: &str) -> Result<()> {
     let erasure = commit.prepared.erasure;
     provider.erasure_cut_records(erasure.placement, commit.prepared.checkpoint.cut.next_lsn)?
-        .put("joined-custody", encode(&RetirementAdmission {
+        .put(name, encode(&RetirementAdmission {
             operation: erasure.operation,
             switch: commit.switch_evidence,
+            through_epoch: erasure.incumbent.epoch,
         })?).await
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::journal::hosted) struct ServingDisposition {
+    through_epoch: u64,
+    pub(in crate::journal::hosted) disposition: [u8; 32],
+    pub(in crate::journal::hosted) observed_at_ms: u64,
+}
+
+fn read_serving(bytes: Bytes, through_epoch: u64) -> Result<ServingDisposition> {
+    let evidence: ServingDisposition = serde_json::from_slice(&bytes).map_err(serialization)?;
+    if evidence.through_epoch != through_epoch || evidence.disposition == [0; 32] {
+        return Err(invalid("The serving disposition belongs to different writer grants"));
+    }
+    Ok(evidence)
+}
+
+pub(in crate::journal::hosted) async fn serving_disposition(
+    provider: &CheckpointCustody, placement: Placement, floor: u64, through_epoch: u64,
+) -> Result<Option<ServingDisposition>> {
+    provider.erasure_cut_records(placement, floor)?.get("serving").await?
+        .map(|bytes| read_serving(bytes, through_epoch)).transpose()
+}
+
+pub(in crate::journal::hosted) async fn record_serving_disposition(
+    provider: &CheckpointCustody, placement: Placement, floor: u64, through_epoch: u64, disposition: [u8; 32],
+) -> Result<()> {
+    let observed_at_ms = u64::try_from(rtdb_directory::now_ms()).map_err(|_| invalid("The custody clock is invalid"))?;
+    provider.erasure_cut_records(placement, floor)?
+        .put("serving", encode(&ServingDisposition { through_epoch, disposition, observed_at_ms })?).await
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointDisposition {
+    checkpoint: Checkpoint,
+    disposition: [u8; 32],
+    observed_at_ms: u64,
+}
+
+fn checkpoint_record(checkpoint: Checkpoint) -> String {
+    format!("checkpoints/{}", checkpoint.custody.allocation)
+}
+
+pub(in crate::journal::hosted) async fn record_checkpoint_disposition(
+    provider: &CheckpointCustody,
+    placement: Placement,
+    erasure_floor: u64,
+    checkpoint: Checkpoint,
+    disposition: [u8; 32],
+) -> Result<()> {
+    let records = provider.erasure_cut_records(placement, erasure_floor)?;
+    let name = checkpoint_record(checkpoint);
+    if checkpoint.cut.next_lsn >= erasure_floor || disposition == [0; 32] {
+        return Err(invalid("The checkpoint is outside the retiring key inventory"));
+    }
+    if let Some(existing) = records.get(&name).await? {
+        let prior: CheckpointDisposition = serde_json::from_slice(&existing).map_err(serialization)?;
+        return if prior.checkpoint == checkpoint && prior.disposition == disposition {
+            Ok(())
+        } else {
+            Err(invalid("The checkpoint already has a different provider disposition"))
+        };
+    }
+    let observed_at_ms = u64::try_from(rtdb_directory::now_ms()).map_err(|_| invalid("The custody clock is invalid"))?;
+    records.put(&name, encode(&CheckpointDisposition { checkpoint, disposition, observed_at_ms })?).await
+}
+
+pub(super) async fn checkpoint_dispositions(
+    provider: &CheckpointCustody,
+    commit: ErasureCommit,
+) -> Result<([u8; 32], u64)> {
+    let floor = commit.prepared.checkpoint.cut.next_lsn;
+    let records = provider.erasure_cut_records(commit.prepared.erasure.placement, floor)?;
+    let mut names = records.names("checkpoints").await?;
+    names.sort_unstable();
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"rtdb.multi/erasure-checkpoint-dispositions/v1\0");
+    hash.update(&commit.switch_evidence);
+    let mut observed_at_ms = commit.committed_at_ms;
+    for name in names {
+        let bytes = records.get(&name).await?.ok_or_else(|| invalid("The checkpoint disposition disappeared"))?;
+        let evidence: CheckpointDisposition = serde_json::from_slice(&bytes).map_err(serialization)?;
+        if checkpoint_record(evidence.checkpoint) != name || evidence.checkpoint.cut.next_lsn >= floor
+            || evidence.disposition == [0; 32] || evidence.observed_at_ms < commit.committed_at_ms
+        {
+            return Err(invalid("The checkpoint disposition does not belong to the erasure cut"));
+        }
+        hash.update(digest(&SHA256, &bytes).as_ref());
+        observed_at_ms = observed_at_ms.max(evidence.observed_at_ms);
+    }
+    Ok((hash.finish().as_ref().try_into().expect("SHA-256 width"), observed_at_ms))
 }
 
 #[derive(Serialize, Deserialize)]

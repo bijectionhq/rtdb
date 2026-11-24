@@ -98,7 +98,13 @@ The provider operation cutoff and the catalog cutoff keep their own clock coordi
 Query computation holding a catalog lease stops on cancellation or its local lease cutoff. Provider tasks retain their original I/O owner until they join.
 The live installed SQL path includes the ordered serving lease even when the catalog yields only in-memory rows. Egress is bounded by the same lease. Expired PostgreSQL portals and Flight SQL tickets release their retained catalog holds.
 Installed checkpoint discovery and staging acquire a durable ordered hold on the exact source root before reading. The lease bounds copy admission and provider tasks retain that hold through completion, including after cancellation.
-The retirement loop requires the authenticated joined-custody record for the erasure cut before withdrawing old checkpoint or serving slots.
+The ordered switch closes renewal for every old-root lease.
+Logkeeper reports old holds and unsettled checkpoints to the authenticated placement custodian.
+The retirement loop requires both the joined-custody journal and ordered readback that old-root holds have ended before withdrawing old checkpoint or serving slots.
+Checkpoint dispositions are retained before Logkeeper settles those allocations, and the settlement command binds the erasure floor.
+The serving census requires original-vault receipts through the closing writer epoch, including outstanding retirement intents.
+Destruction evidence binds both readbacks and the incumbent journal disposition.
+The next erasure of this placement requires confirmed destruction for the prior cut.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
 The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring key inventory, custody work roster and latest destruction time.
 The fixed commitment binds both inventories and the deadline to the authenticated switch.

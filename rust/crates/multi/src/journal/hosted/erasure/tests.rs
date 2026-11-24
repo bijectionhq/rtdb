@@ -691,6 +691,8 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
         destroyed_at_ms: by_ms + 1,
         disposition: [12; 32],
         journal_key_disposition: [22; 32],
+        checkpoint_disposition: [9; 32],
+        serving_disposition: [10; 32],
         signature: [0; 64],
     };
     let sign_drain = |receipt: &mut DestructionEvidence| {

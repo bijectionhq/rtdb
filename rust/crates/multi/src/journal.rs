@@ -486,6 +486,7 @@ impl InstalledJournal {
             Command::SettleCheckpoint {
                 checkpoint,
                 disposition,
+                erasure_floor: route.erasure_floor,
             },
         )?;
         let decision = self.execute(&request).await?;

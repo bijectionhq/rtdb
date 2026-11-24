@@ -569,11 +569,20 @@ impl Placement {
         if held.scope().checkpoint != checkpoint {
             return Err(invalid("The ordered copy hold selected a different checkpoint"));
         }
-        let start = std::time::Instant::now();
-        let length = self.worker.read_lease(held.scope(), route.writer.epoch).await?;
-        let deadline = start.checked_add(std::time::Duration::from_millis(length))
-            .ok_or_else(|| invalid("The checkpoint copy lease overflows the custody clock"))?;
-        storage::with_read_lease(deadline, |_| IoRegion::retaining(held, work)).await
+        let mut work = std::pin::pin!(IoRegion::retaining(Arc::clone(&held), work));
+        loop {
+            let sent = std::time::Instant::now();
+            let length = self.worker.read_lease(held.scope(), route.writer.epoch).await?;
+            let length = std::time::Duration::from_millis(length);
+            let renew = sent.checked_add(length / 2)
+                .filter(|renew| *renew > std::time::Instant::now())
+                .ok_or_else(|| invalid("The checkpoint copy lease arrived expired"))?;
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(renew.into()) => (),
+                result = &mut work => return result,
+            }
+        }
     }
 
     async fn validate_checkpoint_boundary(
@@ -748,6 +757,14 @@ impl Placement {
             }
         };
         let current = custodian.route().await?;
+        if retired.checkpoint.cut.next_lsn < current.erasure_floor {
+            if !erasure::retirement_admitted(&provider, current.placement, current.erasure_floor).await? {
+                return Ok(());
+            }
+            erasure::record_checkpoint_disposition(
+                &provider, current.placement, current.erasure_floor, retired.checkpoint, disposition,
+            ).await?;
+        }
         custodian
             .settle_checkpoint(&current, retired.checkpoint, disposition)
             .await?;
