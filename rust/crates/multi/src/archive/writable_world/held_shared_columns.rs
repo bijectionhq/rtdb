@@ -33,7 +33,7 @@ impl HeldCheckpointWorld {
             WorldClockMode::Held { .. } => self.application_publication().map_or(self.initial_clock(), |(clock, _)| clock),
             _ => return Err(unavailable()),
         };
-        if self.ancestor().is_some() || valid != expected_valid
+        if valid != expected_valid
             || root_prefix.len() != ROOT_PREFIX_BYTES
             || !root_prefix.starts_with("4246435032")
             || !lower_hex(root_prefix.as_bytes())
@@ -62,7 +62,13 @@ impl HeldCheckpointWorld {
                 } else {
                     self.archive_identity_candidates(&relation, valid, after, PAGE_ROWS + 1, None, Some(prefix)).await?
                 };
-                let page = self.finish_overlay_identities(&relation, candidates, PAGE_ROWS)?;
+                let page = if overlay {
+                    self.merge_overlay_identities(
+                        &relation, valid, after, PAGE_ROWS, candidates, Some(prefix),
+                    ).await?
+                } else {
+                    self.finish_overlay_identities(&relation, candidates, PAGE_ROWS)?
+                };
                 for key in page.keys {
                     let suffix = key.strip_prefix(prefix).ok_or_else(unavailable)?;
                     if suffix.len() != width || !lower_hex(suffix.as_bytes())

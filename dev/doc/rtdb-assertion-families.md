@@ -311,12 +311,14 @@ Hosted protocol 224 advertises `rtdb.owned.ReadHeldWorldSharedColumnCensus.v1` t
 The request is the existing held world handle (16 bytes), signed big-endian valid instant (8 bytes), u16 byte length and lowercase hexadecimal Root BFCP2 prefix, then the ASCII world-column prefix.
 The valid instant must be the held data clock.
 The response has one Arrow `_id` Utf8 column in strictly increasing ID order and the original world range witness.
-One completion covers the installed Root carrier prefix at the direct archived parent and the opaque shared column prefix in the selected local overlay.
+One completion covers the installed Root carrier prefix at the archived Root parent and the opaque shared column prefix in the selected overlay.
+When the pin has frozen ancestors, the overlay scan joins their exact retained carrier identities with the selected local overlay.
 Root selectors used for point reads sit outside the Root census and never count as overlay carriers.
 The response contains at most 512 identities.
 The witness binds the parent pin, original writer placement, Root purge frontier and selected overlay frontier, and the installer co-orders it with its exact carrier point and current Root unit condition.
-The scope is a writable direct child of Root in the same placement.
-There is no ancestor or restored-source scan in this action.
+The scope is a writable world in the same placement.
+Every retained ancestor requires exact opaque schema and purge coverage.
+A restored destination cannot use a local census to substitute for an unavailable original source.
 The world carrier and Root point selector both use the scoped world-column key, with no fallback to an earlier key shape.
 
 ### Fence plan reply
