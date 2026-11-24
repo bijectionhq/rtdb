@@ -577,6 +577,11 @@ contract LogService {
         -- The placed Original carrier route withholds plaintext when its current order contains the archive source fence.
         -- Retired Original evidence binds the source and target installations, custody binding and archive handoff to the transaction that records the closed writer.
         -- Pre-fence carrier creator evidence uses the exact registry transaction and the original installation visible at that transaction.
+        -- The current Original order binds a cell-endorsed custody grant and its exact held replay approval in one transaction after the retired frontier.
+        -- The grant authenticates the exact Root activation and distinct reader and Original control credentials.
+        -- The reader can open the exact carrier only through a promoted response hold whose registration and disposition use the Original order.
+        -- The Original controller can order a family fence on the retired history with the same live member and exact inventory predicates.
+        -- A retired family release rechecks its current grant and marker through plaintext handoff.
         -- The private Root landing link binds the enrolled member and the reviewed source winner.
         -- The release owner authenticates the prepared switch receipt and recovers an interrupted activation from the original ordered position.
         -- The private deadline journal requires the exact stage inventory and all enrolled release drains before retiring the family capabilities.

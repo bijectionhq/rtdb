@@ -1,9 +1,9 @@
 use std::{fmt::Write, num::NonZeroU64};
 
-use rtdb_columnar::ArrowCell;
+use rtdb_columnar::{ArrowCell, OwnedBatch};
 use rtdb_flight_sql::{FamilyReleaseInputWire, FamilyReleaseRegistrationWire, FamilyReleaseRequest};
 use rtdb_node::{AppliedReadFloor, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader};
-use rtdb_types::Value;
+use rtdb_types::{Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::keys::{
@@ -27,18 +27,7 @@ impl<'a> CarrierJournal<'a> {
         let applied = current.applied_source().ok_or_else(OwnedWorld::unavailable)?;
         let floor = AppliedReadFloor::new(deployment, vec![applied])?;
         let (installation, writer) = Self::installation(&current).await?;
-        let source_history = original.history_fingerprint();
-        let commitment = |domain: &[u8], fields: &[&[u8]]| {
-            let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-            hash.update(domain);
-            for field in fields { hash.update(field); }
-            hash.finish().as_ref().try_into().expect("SHA-256 commitment")
-        };
-        let identity = CarrierJournalIdentity {
-            deployment, source_history, installation,
-            registry: commitment(b"rtdb.multi/carrier-registry/v1\0", &[&source_history, &installation, b"public.bj_external_key_recovery"]),
-            original_writer: commitment(b"rtdb.multi/carrier-writer/v1\0", &[&installation, writer.as_bytes()]),
-        };
+        let identity = carrier_identity(deployment, original.history_fingerprint(), installation, &writer);
         Ok(Self { original, cancellation, floor, identity, writer })
     }
 
@@ -58,7 +47,17 @@ impl<'a> CarrierJournal<'a> {
     }
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+pub(super) fn carrier_identity(deployment: Uuid, source_history: [u8; 32], installation: [u8; 16], writer: &str) -> CarrierJournalIdentity {
+    use crate::family_custody::framed_digest;
+
+    CarrierJournalIdentity {
+        deployment, source_history, installation,
+        registry: framed_digest(b"rtdb.multi/carrier-registry/v1\0", &[&source_history, &installation, b"public.bj_external_key_recovery"]),
+        original_writer: framed_digest(b"rtdb.multi/carrier-writer/v1\0", &[&installation, writer.as_bytes()]),
+    }
+}
+
+pub(super) fn lower_hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes { write!(text, "{byte:02x}").expect("writing to a string"); }
     text
@@ -74,38 +73,45 @@ impl FamilyReleaseAuthority for CarrierJournal<'_> {
         let current = self.original.current_covering(&self.floor, self.cancellation).await?;
         let (installation, writer) = Self::installation(&current).await?;
         if installation != self.identity.installation || writer != self.writer { return Err(unavailable()); }
-        let part = registration.part();
-        let cell_history = lower_hex(&part.cell_history);
-        let part_key = [cell_history.clone(), lower_hex(&part.usher), lower_hex(&part.conductor),
-            lower_hex(&part.response), lower_hex(&part.ordinal.get().to_be_bytes())].join("/");
-        let origin = lower_hex(&registration.origin());
-        let key = format!("{origin}/{}/{part_key}", lower_hex(&registration.attempt()));
-        let point = current.carrier_journal_registration(&key).await?;
-        let (row, _) = point.row.ok_or_else(unavailable)?;
-        let row = row.batch();
-        let cell = |name| ArrowCell::named(row, name, 0).ok_or_else(unavailable);
-        let value = |name| {
-            let cell = cell(name)?;
-            rtdb_columnar::read_value(cell.field, cell.array, cell.row)
-        };
-        if cell("creator")?.utf8() != Some(self.writer.as_str())
-            || cell("origin")?.utf8() != Some(origin.as_str())
-            || cell("cell_history")?.utf8() != Some(cell_history.as_str())
-            || cell("part")?.utf8() != Some(part_key.as_str())
-            || cell("address")?.binary() != Some(registration.address().as_slice())
-            || !matches!(value("managed_until")?, Value::Null | Value::Undefined)
-        {
-            return Err(unavailable());
-        }
-        match value("disposed")? {
-            Value::Bool(false) if value("producer_done")? == Value::Bool(false) => Ok(FamilyReleaseObservation::Live),
-            Value::Bool(true) => Ok(FamilyReleaseObservation::Disposed),
-            _ => Err(unavailable()),
-        }
+        Ok(observe_registry(&current, &self.writer, registration).await?.0)
     }
 }
 
-fn part(bytes: [u8; 72]) -> Result<FamilyResponsePart> {
+pub(super) async fn observe_registry(
+    current: &CurrentAssertionFamilyRead, creator: &str, registration: FamilyReleaseRegistration,
+) -> Result<(FamilyReleaseObservation, (OwnedBatch, Timestamp))> {
+    let unavailable = OwnedWorld::unavailable;
+    let part = registration.part();
+    let cell_history = lower_hex(&part.cell_history);
+    let part_key = [cell_history.clone(), lower_hex(&part.usher), lower_hex(&part.conductor),
+        lower_hex(&part.response), lower_hex(&part.ordinal.get().to_be_bytes())].join("/");
+    let origin = lower_hex(&registration.origin());
+    let key = format!("{origin}/{}/{part_key}", lower_hex(&registration.attempt()));
+    let point = current.carrier_journal_registration(&key).await?;
+    let (row, revision) = point.row.ok_or_else(unavailable)?;
+    let cell = |name| ArrowCell::named(row.batch(), name, 0).ok_or_else(unavailable);
+    let value = |name| {
+        let cell = cell(name)?;
+        rtdb_columnar::read_value(cell.field, cell.array, cell.row)
+    };
+    if cell("creator")?.utf8() != Some(creator)
+        || cell("origin")?.utf8() != Some(origin.as_str())
+        || cell("cell_history")?.utf8() != Some(cell_history.as_str())
+        || cell("part")?.utf8() != Some(part_key.as_str())
+        || cell("address")?.binary() != Some(registration.address().as_slice())
+        || !matches!(value("managed_until")?, Value::Null | Value::Undefined)
+    {
+        return Err(unavailable());
+    }
+    let observation = match value("disposed")? {
+        Value::Bool(false) if value("producer_done")? == Value::Bool(false) => FamilyReleaseObservation::Live,
+        Value::Bool(true) => FamilyReleaseObservation::Disposed,
+        _ => return Err(unavailable()),
+    };
+    Ok((observation, (row, revision)))
+}
+
+pub(super) fn part(bytes: [u8; 72]) -> Result<FamilyResponsePart> {
     let field = |start| bytes[start..start + 16].try_into().expect("response field width");
     let ordinal = NonZeroU64::new(u64::from_be_bytes(bytes[64..].try_into().expect("ordinal width")))
         .ok_or_else(OwnedWorld::unavailable)?;
@@ -138,7 +144,7 @@ fn input<'a>(scope: &Scope, family: Uuid, wire: &'a FamilyReleaseInputWire) -> R
     })
 }
 
-fn registration(wire: FamilyReleaseRegistrationWire) -> Result<FamilyReleaseRegistration> {
+pub(super) fn registration(wire: FamilyReleaseRegistrationWire) -> Result<FamilyReleaseRegistration> {
     FamilyReleaseRegistration::from_address(wire.origin, wire.attempt, part(wire.part)?, &wire.address)
 }
 

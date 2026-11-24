@@ -2762,7 +2762,7 @@ impl SourceOperationReader<'_> {
                 } else {
                     let Value::Struct(document) = value("document")? else { return Err(invalid("Hosted control document is not a struct")); };
                     if name == "rtdb-hosted-control-check-v1" {
-                        crate::HostedControlWrite::check(relation, scope, expected, document)?
+                        crate::HostedControlWrite::source_check(relation, scope, expected, document)?
                     } else {
                         crate::HostedControlWrite::new(relation, scope, expected, document)?
                     }

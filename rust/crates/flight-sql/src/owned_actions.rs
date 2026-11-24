@@ -1527,17 +1527,25 @@ impl Service {
     pub(crate) async fn decide_hosted_action(
         &self, call: &Call, envelope: &Bytes, wire: HostedDecisionWire, ipc_stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
-        self.decide_hosted_reply(call, envelope, HostedDecisionInput::Inline(wire), ipc_stream).await
+        self.decide_hosted_reply(call, envelope, HostedDecisionInput::Inline(wire), ipc_stream, None).await
     }
 
     async fn decide_hosted(
         &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>,
     ) -> Result<ActionResult, Status> {
-        self.decide_hosted_reply(call, envelope, input, false).await.map(OwnedIpcReply::into_unary)
+        self.decide_hosted_reply(call, envelope, input, false, None).await.map(OwnedIpcReply::into_unary)
+    }
+
+    pub(crate) async fn decide_retired_family(
+        &self, call: &Call, envelope: &Bytes, enrollment: &[u8],
+    ) -> Result<ActionResult, Status> {
+        self.decide_hosted_reply(call, envelope, HostedDecisionInput::Inline(HostedDecisionWire::Original), false, Some(enrollment))
+            .await.map(OwnedIpcReply::into_unary)
     }
 
     async fn decide_hosted_reply(
         &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>, ipc_stream: bool,
+        retired_enrollment: Option<&[u8]>,
     ) -> Result<OwnedIpcReply, Status> {
         self.hosted_control_policy(call)?;
         let (authority, body) = Self::installed_authority(envelope)?;
@@ -1545,6 +1553,9 @@ impl Service {
             .ok_or_else(|| invalid("Missing hosted decision flags"))?;
         if *flags & !0b11_1111 != 0 || *flags & 48 == 48 {
             return Err(invalid("Invalid hosted decision flags"));
+        }
+        if retired_enrollment.is_some() && *flags != 0 {
+            return Err(invalid("Retired family custody requires a Root retirement decision"));
         }
         if matches!(input, HostedDecisionInput::Inline(HostedDecisionWire::ImportPage)) && *flags != 0 {
             return Err(invalid("A hosted import page requires an ordinary Root decision"));
@@ -1587,7 +1598,7 @@ impl Service {
             (Vec::new(), primary)
         };
         self.commit_hosted_with_reads(
-            call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input, ipc_stream,
+            call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input, ipc_stream, retired_enrollment,
         ).await
     }
 
@@ -1595,7 +1606,7 @@ impl Service {
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
         funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, input: HostedDecisionInput<'_>,
-        ipc_stream: bool,
+        ipc_stream: bool, retired_enrollment: Option<&[u8]>,
     ) -> Result<OwnedIpcReply, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1604,6 +1615,9 @@ impl Service {
             (Vec::new(), body, Vec::new())
         };
         let (tokens, body) = self.durable_hosted_ranges(body)?;
+        if retired_enrollment.is_some() && !tokens.is_empty() {
+            return Err(invalid("Retired family custody uses exact Root point checks"));
+        }
         let token_bytes = tokens.iter().map(|token| token.len()).sum();
         let _witness_charge = call.reserve(wire::add(4096, wire::mul(token_bytes, 4)?)?)?;
         let witnesses = self.open_durable_hosted_ranges(call, tokens).await?;
@@ -1672,7 +1686,11 @@ impl Service {
         writes.extend(slot.map(|slot| TxOp::OwnedClockSlot { slot }));
         writes.extend(conditions);
         let (mut controls, _held) = self.decode_hosted_control_groups(call, &control_frame, controls, scope, &mut rows_left, false)?;
-        rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
+        if let Some(enrollment) = retired_enrollment {
+            rtdb_tx::bind_retired_family_authority(&mut controls, authority, enrollment).map_err(status)?;
+        } else {
+            rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
+        }
         if let Some(offer) = funded {
             let reading = offer.slot.reading;
             let end = reading.0.checked_add(1_000_000).ok_or_else(Self::clock_slot_missed)?;

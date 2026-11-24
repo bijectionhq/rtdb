@@ -177,6 +177,11 @@ impl FamilyReleaseRegistration {
     pub fn origin(self) -> [u8; 32] { self.origin }
     pub fn attempt(self) -> [u8; 32] { self.attempt }
 
+    pub(crate) fn require_input(self, family: Uuid, input: FamilyReleaseInput<'_>) -> Result<()> {
+        if self.client_family != family || self.input != input.commitment()? { return Err(conflict()); }
+        Ok(())
+    }
+
     fn new(owner: CarrierJournalIdentity, client_family: Uuid, part: FamilyResponsePart, input: [u8; 32], expires_at_ms: u64) -> Self {
         let mut origin = Context::new(&SHA256);
         origin.update(b"rtdb.multi/family-release-provider/v1\0");

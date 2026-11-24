@@ -41,6 +41,12 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn assertion_family<'a>(
         &'a self, call: WorldCall<'a>, request: crate::FamilyRequest,
     ) -> BoxFuture<'a, Result<crate::FamilyReply>>;
+
+    fn retired_family_fence<'a>(
+        &'a self, _call: WorldCall<'a>, _request: &'a crate::RetiredFamilyRequest,
+    ) -> BoxFuture<'a, Result<bytes::Bytes>> {
+        Box::pin(async { Err(rtdb_types::OwnedWorld::unavailable()) })
+    }
 }
 
 /// The independently archived overlay position and its bounded preparation lease.

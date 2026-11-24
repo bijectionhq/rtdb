@@ -28,6 +28,7 @@ pub(crate) const SEAL_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.SealWorldOverlayR
 pub(crate) const OPEN_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.OpenWorldOverlayRow.v1";
 pub(crate) const PLAN_ASSERTION_FAMILY_FENCE_V1: &str = "rtdb.owned.PlanAssertionFamilyFence.v1";
 pub(crate) const FAMILY_RESPONSE_RELEASE_V2: &str = "rtdb.owned.FamilyResponseRelease.v2";
+pub(crate) const RETIRED_ORIGINAL_FAMILY_V1: &str = "rtdb.owned.RetiredOriginalFamily.v1";
 pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionFamily.v1";
 
 pub(crate) fn is_family_action(action: &str) -> bool {
@@ -36,7 +37,8 @@ pub(crate) fn is_family_action(action: &str) -> bool {
         | SEAL_FAMILY_LANDING_LINK_V2 | SEAL_FAMILY_LANDING_PAYLOAD_V1 | OPEN_FAMILY_LANDING_PAYLOAD_V1
         | RESOLVE_FAMILY_MEMBER_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
-        | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1 | FAMILY_RESPONSE_RELEASE_V2)
+        | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1 | FAMILY_RESPONSE_RELEASE_V2
+        | RETIRED_ORIGINAL_FAMILY_V1)
 }
 
 const MAX_DERIVED_PER_REQUEST: usize = 256;
@@ -118,6 +120,37 @@ pub enum FamilyReleaseRequest {
     Dispose(FamilyReleaseRegistrationWire),
 }
 
+pub struct RetiredFamilyRequest {
+    pub grant: [u8; 32],
+    pub signature: [u8; 64],
+    pub signed_body: Bytes,
+}
+
+pub enum RetiredFamilyOperation {
+    Probe,
+    Release(FamilyReleaseRequest),
+    Open { registration: FamilyReleaseRegistrationWire, envelope: Bytes },
+    PlanFence(Uuid),
+}
+
+impl RetiredFamilyRequest {
+    pub fn operation(&self) -> Result<RetiredFamilyOperation, Status> {
+        let mut frame = Frame(&self.signed_body);
+        let operation = match frame.u8("retired family operation")? {
+            0 => RetiredFamilyOperation::Probe,
+            1 => RetiredFamilyOperation::Release(frame.family_release()?),
+            2 => RetiredFamilyOperation::Open {
+                registration: frame.release_registration()?,
+                envelope: frame.tail(&self.signed_body, MAX_ROW_BYTES)?,
+            },
+            4 => RetiredFamilyOperation::PlanFence(frame.uuid("retired family order")?),
+            _ => return Err(invalid("Invalid retired family operation")),
+        };
+        frame.finish()?;
+        Ok(operation)
+    }
+}
+
 pub enum FamilyRequest {
     Scope,
     EnrollOriginal(WorldRowAuthoring),
@@ -151,6 +184,7 @@ pub enum FamilyRequest {
     PlanFence { family: Uuid, selected: Position, order: Uuid },
     Settle { family: Uuid },
     Release(FamilyReleaseRequest),
+    Retired(RetiredFamilyRequest),
 }
 
 pub struct FamilyFenceReply {
@@ -303,6 +337,21 @@ impl<'a> Frame<'a> {
         })
     }
 
+    fn family_release(&mut self) -> Result<FamilyReleaseRequest, Status> {
+        Ok(match self.u8("release operation")? {
+            0 => FamilyReleaseRequest::Prepare {
+                family: self.uuid("family")?, part: self.take("response part")?,
+                cutoff: self.u64("release cutoff")?, input: self.release_input()?,
+            },
+            1 => FamilyReleaseRequest::Stage { registration: self.release_registration()?, input: self.release_input()? },
+            2 => FamilyReleaseRequest::Promote(self.release_registration()?),
+            3 => FamilyReleaseRequest::Check(self.release_registration()?),
+            4 => FamilyReleaseRequest::Cancel(self.release_registration()?),
+            5 => FamilyReleaseRequest::Dispose(self.release_registration()?),
+            _ => return Err(invalid("Invalid family release operation")),
+        })
+    }
+
     fn root_target(&mut self) -> Result<RootLandingTarget, Status> {
         RootLandingTarget::from_bytes(self.take("Root landing target")?)
             .map_err(|_| invalid("Invalid Root landing target"))
@@ -400,17 +449,11 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
         PLAN_ASSERTION_FAMILY_FENCE_V1 => FamilyRequest::PlanFence {
             family: frame.uuid("family")?, selected: frame.position()?, order: frame.uuid("order")?,
         },
-        FAMILY_RESPONSE_RELEASE_V2 => FamilyRequest::Release(match frame.u8("release operation")? {
-            0 => FamilyReleaseRequest::Prepare {
-                family: frame.uuid("family")?, part: frame.take("response part")?,
-                cutoff: frame.u64("release cutoff")?, input: frame.release_input()?,
-            },
-            1 => FamilyReleaseRequest::Stage { registration: frame.release_registration()?, input: frame.release_input()? },
-            2 => FamilyReleaseRequest::Promote(frame.release_registration()?),
-            3 => FamilyReleaseRequest::Check(frame.release_registration()?),
-            4 => FamilyReleaseRequest::Cancel(frame.release_registration()?),
-            5 => FamilyReleaseRequest::Dispose(frame.release_registration()?),
-            _ => return Err(invalid("Invalid family release operation")),
+        FAMILY_RESPONSE_RELEASE_V2 => FamilyRequest::Release(frame.family_release()?),
+        RETIRED_ORIGINAL_FAMILY_V1 => FamilyRequest::Retired(RetiredFamilyRequest {
+            grant: frame.take("custody grant")?,
+            signature: frame.take("custody reader signature")?,
+            signed_body: frame.tail(body, 325 + MAX_ROW_BYTES)?,
         }),
         SETTLE_ASSERTION_FAMILY_V1 => FamilyRequest::Settle { family: frame.uuid("family")? },
         _ => return Err(unsupported()),
@@ -468,7 +511,7 @@ impl Service {
     pub(crate) async fn assertion_family_action(&self, call: &Call, action: &str, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || call.session.audience_source().is_some() { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        if action == FAMILY_RESPONSE_RELEASE_V2 && !self.supports_hosted_upload(call) {
+        if matches!(action, FAMILY_RESPONSE_RELEASE_V2 | RETIRED_ORIGINAL_FAMILY_V1) && !self.supports_hosted_upload(call) {
             return Err(unsupported());
         }
         let request = decode(action, body)?;
@@ -477,6 +520,15 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         crate::owned_actions::require_idle(&session)?;
+        if let FamilyRequest::Retired(request) = &request && request.signed_body.first() == Some(&3) {
+            let enrollment = host.retired_family_fence(
+                crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+                request,
+            ).await.map_err(status)?;
+            drop(session);
+            let reply = self.decide_retired_family(call, &request.signed_body.slice(1..), &enrollment).await?;
+            return Ok(reply);
+        }
         let reply = host.assertion_family(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             request,
@@ -514,6 +566,21 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_family_frames_keep_the_signed_operation_and_exact_payload() {
+        let mut body = vec![6; 96];
+        body.push(0);
+        let decoded = decode(RETIRED_ORIGINAL_FAMILY_V1, &Bytes::from(body.clone())).unwrap();
+        let FamilyRequest::Retired(request) = decoded else { panic!("a retired family frame") };
+        assert_eq!(request.grant, [6; 32]);
+        assert_eq!(request.signature, [6; 64]);
+        assert!(matches!(request.operation().unwrap(), RetiredFamilyOperation::Probe));
+        body.push(0);
+        let decoded = decode(RETIRED_ORIGINAL_FAMILY_V1, &Bytes::from(body)).unwrap();
+        let FamilyRequest::Retired(request) = decoded else { panic!("a retired family frame") };
+        assert!(request.operation().is_err());
+    }
 
     #[test]
     fn release_prepare_decodes_an_exact_root_landing_binding() {

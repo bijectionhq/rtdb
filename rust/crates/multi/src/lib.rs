@@ -7,6 +7,7 @@ pub mod admin;
 pub mod agent;
 pub mod archive;
 pub mod capability;
+pub mod family_custody;
 mod catalog_readers;
 mod cell_attempt;
 pub mod cells;
