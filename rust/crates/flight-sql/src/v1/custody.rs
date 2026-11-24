@@ -9,13 +9,14 @@ use rtdb_node::{
         CustodyResponseAdmission, CustodyResponseOwner,
     },
 };
+use rtdb_tx::transact::Outcome;
 use rtdb_types::{Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tonic::Status;
 
-use super::error;
+use super::{error, proto};
 use crate::service::{Call, Service};
 
 pub(crate) const RELEASE: &str = "rtdb.custody.v1.Release";
@@ -224,7 +225,7 @@ impl Service {
         basis: Basis,
         generation: Option<u64>,
         contributors: CustodyContributors,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<(Vec<u8>, proto::CustodyReadInventory), Status> {
         if !contributors.is_empty() && generation.is_none() {
             return Err(unavailable());
         }
@@ -237,6 +238,40 @@ impl Service {
             .require_original_writer()
             .await
             .map_err(error::anomaly)?;
+        let mut inventory = proto::CustodyReadInventory::default();
+        if !contributors.is_empty() {
+            let driver = database.serving_driver().ok_or_else(unavailable)?;
+            let index = driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+            inventory.contributors.reserve(contributors.len());
+            for &(group, commitment) in &contributors {
+                let (original, occurrence) = index
+                    .custody_read_occurrence(basis, group, commitment)
+                    .map_err(error::anomaly)?;
+                let receipt = driver
+                    .original_custody_receipt(&occurrence.receipt_key, occurrence.written, &call.cancellation)
+                    .await
+                    .map_err(error::anomaly)?;
+                if receipt.key != occurrence.receipt_key || receipt.basis != occurrence.written
+                    || matches!(receipt.outcome, Outcome::Refused { .. })
+                {
+                    return Err(unavailable());
+                }
+                let target = &occurrence.target;
+                inventory.contributors.push(proto::CustodyReadContributor {
+                    group: group.to_vec(),
+                    original: original.to_vec(),
+                    occurrence: commitment.to_vec(),
+                    receipt_key: receipt.key,
+                    written_basis: Some(receipt.basis.into()),
+                    system_time_micros: receipt.system_time.0,
+                    table: format!("{}.{}", target.table.schema, target.table.table),
+                    row_id: target.id.handle_bytes(),
+                    valid_from_micros: target.valid.lower().0,
+                    valid_to_micros: target.valid.upper().0,
+                    carrier_sha256: occurrence.carrier_sha256.to_vec(),
+                });
+            }
+        }
         let expires_at = self
             .0
             .node
@@ -251,10 +286,11 @@ impl Service {
             expires_at,
             contributors: contributors.into_iter().collect(),
         };
-        issuer
+        let sealed = issuer
             .seal_custody_read(&proof, route.proof_owner(&owner), session_binding(call))
             .await
-            .map_err(error::anomaly)
+            .map_err(error::anomaly)?;
+        Ok((sealed, inventory))
     }
 
     pub(super) async fn custody_release_action(

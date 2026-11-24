@@ -212,13 +212,13 @@ fn row_visibility_checks_incoming_and_affected_labels() {
     for op in [labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL), labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL),
         delete(1), delete(2), erase] {
         let mut candidate = Candidate::new(state.index().clone(), Some(&write));
-        let error = candidate.execute(&[op]).unwrap_err();
+        let error = candidate.execute(&[op], &[1; 16]).unwrap_err();
         assert_eq!(error.code, "rtdb/write-scope");
         assert_eq!(error.category, AnomalyCategory::Forbidden);
         assert!(candidate.effects.is_empty());
     }
     let mut candidate = Candidate::new(state.index().clone(), Some(&write));
-    candidate.execute(&[labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL), delete(2)]).unwrap();
+    candidate.execute(&[labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL), delete(2)], &[1; 16]).unwrap();
     assert_eq!(candidate.effects.len(), 2);
 }
 

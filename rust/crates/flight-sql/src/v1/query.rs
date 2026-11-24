@@ -363,11 +363,12 @@ impl Service {
             }).await.map_err(error::anomaly)?;
             Some(proto::ReceiverClockObservation { observed_at_micros: observed_at.0, proof })
         } else { None };
-        let custody_release_proof = if request.custody_release_evidence {
+        let (custody_release_proof, custody_release_inventory) = if request.custody_release_evidence {
             let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("custody release proof"))?;
             let contributors = custody_contributors.ok_or_else(|| error::unsupported("complete custody release inventory"))?;
-            Some(self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors).await?)
-        } else { None };
+            let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors).await?;
+            (Some(proof), Some(inventory))
+        } else { (None, None) };
         let trailer = proto::QueryTrailer {
             basis: Some(page.basis.into()),
             system_time_micros: cut.0,
@@ -375,6 +376,7 @@ impl Service {
             next: None,
             receiver_clock,
             custody_release_proof,
+            custody_release_inventory,
         };
         Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }

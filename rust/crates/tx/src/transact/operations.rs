@@ -3,7 +3,7 @@ use rtdb_index::branches::BranchEvent;
 use super::*;
 
 impl Candidate<'_> {
-    pub(super) fn execute(&mut self, ops: &[Op]) -> Result<()> {
+    pub(super) fn execute(&mut self, ops: &[Op], request_key: &[u8]) -> Result<()> {
         let cut = self.index.head();
         for op in ops {
             match op {
@@ -31,6 +31,7 @@ impl Candidate<'_> {
                         placement_id: placement.placement_id,
                         target: CustodyTarget { branch: branch.clone(), table: table.clone(), id: row.id.clone(), valid },
                         written: cut.basis,
+                        receipt_key: request_key.to_vec(),
                         ordinal: self.index.next_custody_ordinal(),
                         carrier_sha256: commitments.carrier_sha256,
                         envelope_sha256: Sha256::digest(&payload.envelope).into(),

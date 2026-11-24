@@ -885,7 +885,7 @@ impl TransactState {
         }
         if failed.is_empty() {
             let mut then = Candidate::new(base.clone(), scope);
-            then.execute(&request.ops)?;
+            then.execute(&request.ops, &request.key)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
                 if !evaluate(guard, &then.index)? { failed.push(i); }
             }
@@ -895,7 +895,7 @@ impl TransactState {
             }
         }
         let mut otherwise = Candidate::new(base, scope);
-        otherwise.execute(&request.otherwise)?;
+        otherwise.execute(&request.otherwise, &request.key)?;
         if !request.otherwise.is_empty() { otherwise.check_constraints()?; }
         Ok((Outcome::Otherwise { failed }, otherwise.effects, otherwise.index))
     }

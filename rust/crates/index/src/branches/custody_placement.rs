@@ -63,6 +63,10 @@ pub struct CustodyOccurrence {
     pub placement_id: CustodyPlacementId,
     pub target: CustodyTarget,
     pub written: Basis,
+    /// Locator for the applied carrier receipt. Earlier records retain the
+    /// occurrence identity but have no independently recoverable locator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_key: Vec<u8>,
     pub ordinal: u64,
     pub carrier_sha256: [u8; 32],
     pub envelope_sha256: [u8; 32],
@@ -152,6 +156,7 @@ impl BranchIndex {
             || occurrence.placement_id == [0; 16]
             || occurrence.carrier_sha256 == [0; 32]
             || occurrence.envelope_sha256 == [0; 32]
+            || !occurrence.receipt_key.is_empty() && !(16..=64).contains(&occurrence.receipt_key.len())
         {
             return Err(placement_conflict());
         }
@@ -187,6 +192,21 @@ impl BranchIndex {
 
     pub fn next_custody_ordinal(&self) -> u64 {
         self.writes.len() as u64 + 1
+    }
+
+    /// Resolve one exact commitment from a captured Query inventory. The
+    /// caller must still confirm the selected occurrence's applied receipt.
+    pub fn custody_read_occurrence(
+        &self, selected: Basis, group: CustodyGroupId, commitment: [u8; 32],
+    ) -> Result<([u8; 32], &CustodyOccurrence)> {
+        self.exact(selected)?;
+        let record = self.live_custody(group)?;
+        let original = record.original.as_ref().ok_or_else(placement_conflict)?;
+        let occurrence = record.occurrence(group, commitment).ok_or_else(placement_conflict)?;
+        if original.written > selected || occurrence.written > selected || occurrence.receipt_key.is_empty() {
+            return Err(placement_conflict());
+        }
+        Ok((original.commitment(group), occurrence))
     }
 
     pub(super) fn reserve_custody_placement(
