@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::{self as flight, FlightData, sql::Any};
 use bytes::Bytes;
 use prost::{Message, Name};
+use rtdb_node::serving::TransactSubmission;
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::QueryContext;
 use rtdb_types::Timestamp;
@@ -108,10 +109,7 @@ impl Service {
                 }
                 .encode_to_vec()
             }),
-            "rtdb.v1.Transact" => match decode(action.body) {
-                Ok(request) => self.v1_transact(&call, request).await,
-                Err(status) => Err(status),
-            },
+            "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
             "rtdb.v1.TxStatus" => match decode(action.body) {
                 Ok(request) => self.v1_tx_status(&call, request).await,
                 Err(status) => Err(status),
@@ -131,11 +129,9 @@ impl Service {
         .map_err(error::map_status)
     }
 
-    async fn v1_transact(
-        &self,
-        call: &Call,
-        request: proto::TransactRequest,
-    ) -> Result<Vec<u8>, Status> {
+    async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
+        let submitted_at = self.0.node.now();
+        let request: proto::TransactRequest = decode(source.clone())?;
         check_key(&request.key)?;
         let access = if request.ops.is_empty() && request.otherwise.is_empty() {
             DatabaseAccess::Read
@@ -146,7 +142,13 @@ impl Service {
         let driver = database.serving_driver().ok_or_else(|| {
             error::unsupported(request.require.first().map_or("transact", String::as_str))
         })?;
-        let request = transact::request(request, call.memory())?;
+        let transaction = transact::request(request, call.memory())?;
+        let request = TransactSubmission {
+            transaction,
+            attempt: uuid::Uuid::new_v4(),
+            submitted_at,
+            source: call.retain_request(source),
+        };
         let receipt = driver
             .transact(request, &call.cancellation)
             .await

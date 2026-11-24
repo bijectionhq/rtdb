@@ -148,6 +148,7 @@ impl Call {
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
+    pub(crate) fn retain_request(&self, bytes: Bytes) -> Bytes { wire::retain(bytes, Arc::clone(&self._reservation)) }
     pub fn close_session(&self) {
         self.service.retire_session(&self.session);
     }

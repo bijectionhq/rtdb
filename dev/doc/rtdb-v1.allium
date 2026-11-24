@@ -53,6 +53,7 @@ surface StatelessDatabase {
     @guarantee TransactionReceipt
         -- A route that advertises writes returns its selected outcome with the applied basis and system time.
         -- A matching committed request returns the stored receipt for its key.
+        -- The carrier passes the attempt identity, its submission time, and the exact admitted request bytes to the selected driver.
         -- Validation evaluates the guards at a fresh basis and leaves the applied position unchanged.
 
     @guarantee ChangesCoverage
