@@ -309,6 +309,11 @@ pub(super) struct PageRef {
     pub digest: [u8; 32],
 }
 
+pub(super) struct AuthenticatedPage {
+    page: PageRef,
+    bytes: Buffer,
+}
+
 impl PageRef {
     pub fn range(self) -> Result<Range<u64>> {
         let end = self.offset.checked_add(u64::from(self.metadata))
@@ -318,15 +323,25 @@ impl PageRef {
         Ok(self.offset..end)
     }
 
-    pub fn decode(self, bytes: Buffer, decoder: &FileDecoder) -> Result<RecordBatch> {
+    pub fn authenticate(self, bytes: Buffer) -> Result<AuthenticatedPage> {
         let range = self.range()?;
-        let digest: [u8; 32] = Sha256::digest(bytes.as_slice()).into();
-        if range.end - range.start != bytes.len() as u64 || digest != self.digest {
+        if range.end - range.start != bytes.len() as u64 || <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) != self.digest {
             return Err(corrupt("Search page does not match its authenticated locator"));
         }
-        let block = Block::new(i64::try_from(self.offset).map_err(fault)?,
-            i32::try_from(self.metadata).map_err(fault)?, i64::try_from(self.body).map_err(fault)?);
-        let batch = decoder.read_record_batch(&block, &bytes).map_err(fault)?
+        Ok(AuthenticatedPage { page: self, bytes })
+    }
+
+    pub fn decode(self, bytes: Buffer, decoder: &FileDecoder) -> Result<RecordBatch> {
+        self.authenticate(bytes)?.decode(decoder)
+    }
+}
+
+impl AuthenticatedPage {
+    pub fn decode(self, decoder: &FileDecoder) -> Result<RecordBatch> {
+        let page = self.page;
+        let block = Block::new(i64::try_from(page.offset).map_err(fault)?,
+            i32::try_from(page.metadata).map_err(fault)?, i64::try_from(page.body).map_err(fault)?);
+        let batch = decoder.read_record_batch(&block, &self.bytes).map_err(fault)?
             .filter(|batch| batch.num_rows() == 1)
             .ok_or_else(|| corrupt("Search page has an invalid row count"))?;
         if batch.columns().iter().any(|column| column.is_null(0)) {

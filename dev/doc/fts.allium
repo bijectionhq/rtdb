@@ -248,6 +248,11 @@ rule SearchJobRuns {
     -- A store that requires immutable provider evidence admits a new run only with a physical version or an enrolled terminal publication.
     -- Native local Classic admits runs under the terminal-name contract of its recovery-locked store.
     -- A captured catalog routes each required term using the authenticated locator of each eligible run.
+    -- A logical run open resolves the root locator and checks the decoded tree cache before expanding any inline root.
+    -- A cached tree must match the requested root location and index identity.
+    -- On a cache miss, the reader admits inline expansion before allocating its buffers and authenticates the result before Arrow decode.
+    -- An unusable inline root falls back to the persisted root.
+    -- Fresh verification authenticates the persisted root directly.
     -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
     -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.
     -- Its immutable pages authenticate rows and carry the maximum unit term score of each subtree.

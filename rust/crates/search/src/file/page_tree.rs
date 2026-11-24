@@ -12,7 +12,7 @@ use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
 use rtdb_types::Result;
 use tokio::sync::OnceCell;
 
-use super::{corrupt, fault, layout::{PageRef, Table, Writer, schema, table}};
+use super::{corrupt, fault, layout::{AuthenticatedPage, PageRef, Table, Writer, schema, table}};
 
 const FANOUT: usize = 128;
 const MAX_HEIGHT: u8 = 8;
@@ -307,6 +307,10 @@ impl TreeReader {
     pub fn inline_page(&self, page: PageRef, bytes: bytes::Bytes) -> Result<RecordBatch> {
         audience_work::decode_bytes(bytes.len())?;
         page.decode(Buffer::from(bytes), &self.decoder)
+    }
+
+    pub fn authenticated_page(&self, page: AuthenticatedPage) -> Result<RecordBatch> {
+        page.decode(&self.decoder)
     }
 
     pub async fn page(&self, page: PageRef, kind: PageKind) -> Result<RecordBatch> {
