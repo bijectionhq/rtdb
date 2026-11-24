@@ -3078,7 +3078,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 schema.validate_types(&types)?;
                 for (field, column) in fields.iter().zip(&columns) {
-                    if matches!(types.get(field.name()), Some(LogicalType::Scalar(ScalarType::Decimal { .. }))) {
+                    if schema.is_v2() || matches!(types.get(field.name()), Some(LogicalType::Scalar(ScalarType::Decimal { .. }))) {
                         rtdb_columnar::validate_projected_decimals(field, column.as_ref())?;
                     }
                 }
@@ -3520,8 +3520,19 @@ fn replay_period_unavailable() -> Anomaly {
 
 fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Value>) -> Result<()> {
     schema.validate_row(row)?;
-    for value in row.values().filter(|value| matches!(value, Value::Decimal(_))) {
-        rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?;
+    row.values().try_for_each(validate_owned_decimals)
+}
+
+fn validate_owned_decimals(value: &Value) -> Result<()> {
+    match value {
+        Value::Decimal(_) => { rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?; }
+        Value::Struct(fields) => fields.values().try_for_each(validate_owned_decimals)?,
+        Value::List(list) => match list.view() {
+            rtdb_types::ListView::Values(values) => values.iter().try_for_each(validate_owned_decimals)?,
+            rtdb_types::ListView::Numeric(values) => rtdb_columnar::validate_projected_decimals(values.field(), values.array().as_ref())?,
+            _ => {}
+        },
+        _ => {}
     }
     Ok(())
 }

@@ -1113,6 +1113,36 @@ async fn owned_v2_layout_reads_both_legs_after_redeclaration() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn owned_v2_layout_checks_nested_decimal_precision() {
+    use arrow_array::{ArrayRef, Decimal128Array, StructArray};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let relation = b"\0\x08balances";
+    let mut declaration = relation.to_vec();
+    declaration.extend_from_slice(br#"{"version":2,"fields":[{"name":"balance","type":{"kind":"struct","fields":[{"name":"amount","type":{"kind":"decimal","precision":2,"scale":1,"bitWidth":128},"optional":false,"nullable":false}]},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v2", declaration.into()).await.unwrap();
+    let request = |coefficient| {
+        let amount = Decimal128Array::from(vec![coefficient]).with_precision_and_scale(2, 1).unwrap();
+        let balance = Arc::new(StructArray::from(vec![
+            (Arc::new(Field::new("amount", DataType::Decimal128(2, 1), false)), Arc::new(amount) as ArrayRef),
+        ])) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([
+            ("_id", Arc::new(Int64Array::from(vec![1])) as ArrayRef), ("balance", balance),
+        ]).unwrap();
+        let mut body = relation.to_vec();
+        body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+        Bytes::from(body)
+    };
+    let refused = client.action("rtdb.owned.Create.v1", request(100)).await.unwrap_err();
+    assert_eq!(refused.message(), "Decimal coefficient exceeds its declared precision");
+    client.action("rtdb.owned.Create.v1", request(99)).await.unwrap();
+    running.stop().await;
+}
+
 #[test]
 fn owned_spatial_flight_pages_share_the_original_cut() {
     std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {

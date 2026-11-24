@@ -95,6 +95,7 @@
 -- The owned Flight capability action advertises version 2 and a separate declaration action admits that version.
 -- The layout lookup returns the selected Root relation's declaration version at an authenticated live cut.
 -- Version 2 admits bounded clear scalar, dense-union, list and struct shapes.
+-- Each admitted Decimal128 coefficient fits the precision of its selected leaf, including inside lists and structs.
 -- An ordered version 2 redeclaration joins the new clear shapes with the stored declaration and preserves earlier admissions.
 -- A field whose joined shape exceeds its bound admits canonical Binary alongside its retained shape.
 -- Installed path columns keep their original types and presence obligations.
