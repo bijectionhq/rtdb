@@ -107,10 +107,10 @@ theorem step_does_not_rewind_the_anchor {before after : State} (step : Step befo
   | confirm new _ _ =>
     change anchorTime before.anchor ≤ anchorTime (keepLaterTime before.anchor new)
     cases h : before.anchor with
-    | none => simp [keepLaterTime, anchorTime, h]
+    | none => simp [keepLaterTime, anchorTime]
     | some old =>
       by_cases earlier : new.sampledAt < old.sampledAt
-      · simp [keepLaterTime, anchorTime, h, earlier]
+      · simp [keepLaterTime, anchorTime, earlier]
       · simpa [keepLaterTime, anchorTime, h, earlier] using Nat.le_of_not_gt earlier
 
 theorem a_read_anchor_never_rewinds_over_a_history {before after : State} (history : History before after) :

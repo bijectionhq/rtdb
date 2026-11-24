@@ -59,7 +59,7 @@ inductive Handoff : Cut → Cut → Prop
 theorem handoff_preserves_installed_prefix {old new : Cut} (handoff : Handoff old new) :
     Extends new old := by
   induction handoff with
-  | same cut => exact ⟨rfl, [], by simp⟩
+  | same => exact ⟨rfl, [], by simp⟩
   | activate _ installed ancestor => exact extension_transitive installed ancestor
 
 def readFrom (replicas : List Nat) : Nat := replicas.foldl max 0

@@ -15,14 +15,34 @@ mkdir -p build/proof-runs/multi
 run="$(mktemp -d "$PWD/build/proof-runs/multi/run.XXXXXXXX")"
 export LEAN_PATH="$run${LEAN_PATH:+:$LEAN_PATH}"
 
-for proof in verification/multi/lean/*.lean; do
-    file="${proof##*/}"
-    log="$run/$file.log"
-    if ! "$lean" -DwarningAsError=true --root=verification/multi/lean -o "$run/${file%.lean}.olean" "$proof" > "$log" 2>&1; then
-        cat "$log" >&2
+# Check each proof after the local modules it imports.
+pending=(verification/multi/lean/*.lean)
+while ((${#pending[@]})); do
+    deferred=()
+    for proof in "${pending[@]}"; do
+        ready=1
+        for module in $(sed -nE 's/^import ([A-Za-z]+)$/\1/p' "$proof"); do
+            if [[ -f "verification/multi/lean/$module.lean" && ! -f "$run/$module.olean" ]]; then
+                ready=0
+            fi
+        done
+        if ((!ready)); then
+            deferred+=("$proof")
+            continue
+        fi
+        file="${proof##*/}"
+        log="$run/$file.log"
+        if ! "$lean" -DwarningAsError=true --root=verification/multi/lean -o "$run/${file%.lean}.olean" "$proof" > "$log" 2>&1; then
+            cat "$log" >&2
+            exit 1
+        fi
+        printf '%s checked\n' "$proof"
+    done
+    if ((${#deferred[@]} == ${#pending[@]})); then
+        printf 'unresolved local imports: %s\n' "${deferred[*]}" >&2
         exit 1
     fi
-    printf '%s checked\n' "$proof"
+    pending=(${deferred[@]+"${deferred[@]}"})
 done
 
 while IFS='|' read -r module config expected_status expected_message; do

@@ -29,9 +29,9 @@ theorem suffix_outside_cut (later : List Event) (cut : Nat) (cap : Int)
     have tail := ih (fun other member => outside other (by simp [member]))
     simpa [eligible, first] using tail
 
-theorem exact_cut_suffix_invariance (prefix suffix : List Event) (cut : Nat) (cap : Int)
+theorem exact_cut_suffix_invariance (earlier suffix : List Event) (cut : Nat) (cap : Int)
     (outside : ∀ event ∈ suffix, cut < event.position) :
-    eligible (prefix ++ suffix) cut cap = eligible prefix cut cap := by
+    eligible (earlier ++ suffix) cut cap = eligible earlier cut cap := by
   have tail := suffix_outside_cut suffix cut cap outside
   change suffix.filter (admitted cut cap) = [] at tail
   simp [eligible, List.filter_append, tail]

@@ -128,7 +128,8 @@ SignedFor(handoff) == {j \in Old : handoff \in s.handoffVotes[j]}
 Prepare ==
     /\ HandoffReady
     /\ LET proposal == Handoff(s.stable, New)
-       IN /\ Quorum(SignedFor(proposal), Old) \/ Mutation = "one_handoff_vote" /\ SignedFor(proposal) # {}
+       IN /\ \/ Quorum(SignedFor(proposal), Old)
+             \/ Mutation = "one_handoff_vote" /\ SignedFor(proposal) # {}
           /\ s' = [s EXCEPT !.phase = "prepared", !.prepared = s.stable,
                          !.handoff = IF Mutation = "swap_activation_roster" THEN Handoff(s.stable, Old)
                                       ELSE IF Mutation = "swap_handoff_checkpoint"
