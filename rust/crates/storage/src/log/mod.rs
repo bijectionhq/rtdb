@@ -4,7 +4,7 @@ pub(crate) mod local;
 mod memory;
 mod read_only;
 
-pub use local::{LocalLog, LocalLogDriver, LocalLogOptions, LocalLogRetirement};
+pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
@@ -281,10 +281,26 @@ impl AppendBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointPrefix {
+    /// The inclusive position covered by the selected checkpoint in this provider's coordinates.
+    pub through: i64,
+    pub checkpoint_sha256: [u8; 32],
+    pub unreadable_by: Timestamp,
+}
+
+#[async_trait]
+pub trait CheckpointKeyRetirement: Send + Sync {
+    /// Checks the provider's exact prefix before key admission changes.
+    async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<()>;
+    /// Closes key admission and settles a batch after the caller has closed older recovery cuts.
+    async fn settle_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<bool>;
+}
+
 #[async_trait]
 pub trait Log: Send + Sync {
-    /// Supplies the opened sealed local log that can retire its own checkpoint-covered prefix.
-    fn local_erasure_log(&self) -> Option<&LocalLog> { None }
+    /// Supplies the opened provider's authority to retire its own checkpoint-covered keys.
+    fn checkpoint_key_retirement(&self) -> Option<&dyn CheckpointKeyRetirement> { None }
     /// The identity stored in the opened native replica journal, if it has a lineage header.
     fn journal_lineage(&self) -> Option<uuid::Uuid> { None }
     fn shared(&self) -> Option<&dyn SharedLog> { None }

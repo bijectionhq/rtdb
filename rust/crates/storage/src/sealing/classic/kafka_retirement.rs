@@ -77,49 +77,39 @@ impl KafkaFrameKeys {
         self.0
             .region
             .run_blocking(move || {
-                let classic_floor = path.join("retired-before");
-                let _gate = lock(&classic_floor)?;
-                let classic_floor = kafka_retired_before(&classic_floor)?;
-                let intent_path = path.join(INTENT);
-                let mut settled_before = classic_floor;
-                if let Some(prior) = Intent::read(&intent_path)? {
-                    if prior.retirement == retirement {
-                        return sync_directory(&path).map_err(io(&path));
-                    }
-                    if prior.retirement.before >= retirement.before
-                        || prior.settled_before < prior.retirement.before
-                    {
-                        return Err(invalid_intent());
-                    }
-                    settled_before = settled_before.max(prior.settled_before);
-                }
-                if retirement.before <= 0
-                    || retirement.before > broker_end
-                    || settled_before > retirement.before
-                {
-                    return Err(invalid_intent());
-                }
-                let census = path.join("positions");
-                for offset in settled_before..retirement.before {
-                    let marker = retirement_slot(&census, publication_at(&census, offset)?);
-                    match retirement_offset(&marker)? {
-                        Some(prior) if prior == offset => (),
-                        Some(_) => return Err(aliased_publication()),
-                        None => write_kafka_marker(&marker, &offset.to_be_bytes(), false)?,
-                    }
-                }
-                for offset in retirement.before..broker_end {
-                    let marker = retirement_slot(&census, publication_at(&census, offset)?);
-                    if retirement_offset(&marker)?.is_some_and(|prior| prior < retirement.before) {
-                        return Err(aliased_publication());
-                    }
-                }
-                // Slot markers constrain opens only once this floor is published.
-                Intent {
+                let classic = path.join("retired-before");
+                let _gate = lock(&classic)?;
+                let intent = prepare(
+                    &path,
+                    kafka_retired_before(&classic)?,
                     retirement,
-                    settled_before,
-                }
-                .write(&intent_path)
+                    broker_end,
+                )?;
+                intent.write(&path.join(INTENT))
+            })
+            .await
+    }
+
+    /// Validates every retiring slot and its placement relative to the observed suffix.
+    /// Staging slot identities does not close decryptions before the floor is armed.
+    pub async fn validate_kafka_prefix_retirement(
+        &self,
+        retirement: KafkaPrefixRetirement,
+        broker_end: i64,
+    ) -> crate::Result<()> {
+        let path = Arc::clone(&self.0.path);
+        self.0
+            .region
+            .run_blocking(move || {
+                let classic = path.join("retired-before");
+                let _gate = lock(&classic)?;
+                prepare(
+                    &path,
+                    kafka_retired_before(&classic)?,
+                    retirement,
+                    broker_end,
+                )?;
+                Ok(())
             })
             .await
     }
@@ -172,6 +162,51 @@ impl KafkaFrameKeys {
         }
         Ok(())
     }
+}
+
+fn prepare(
+    path: &Path,
+    classic_floor: i64,
+    retirement: KafkaPrefixRetirement,
+    broker_end: i64,
+) -> crate::Result<Intent> {
+    if retirement.before <= 0 || retirement.before > broker_end {
+        return Err(invalid_intent());
+    }
+    let mut settled_before = classic_floor;
+    if let Some(prior) = Intent::read(&path.join(INTENT))? {
+        if prior.retirement == retirement {
+            return Ok(prior);
+        }
+        if prior.retirement.before >= retirement.before
+            || prior.settled_before < prior.retirement.before
+        {
+            return Err(invalid_intent());
+        }
+        settled_before = settled_before.max(prior.settled_before);
+    }
+    if settled_before > retirement.before {
+        return Err(invalid_intent());
+    }
+    let census = path.join("positions");
+    for offset in settled_before..retirement.before {
+        let marker = retirement_slot(&census, publication_at(&census, offset)?);
+        match retirement_offset(&marker)? {
+            Some(prior) if prior == offset => (),
+            Some(_) => return Err(aliased_publication()),
+            None => write_kafka_marker(&marker, &offset.to_be_bytes(), false)?,
+        }
+    }
+    for offset in retirement.before..broker_end {
+        let marker = retirement_slot(&census, publication_at(&census, offset)?);
+        if retirement_offset(&marker)?.is_some_and(|prior| prior < retirement.before) {
+            return Err(aliased_publication());
+        }
+    }
+    Ok(Intent {
+        retirement,
+        settled_before,
+    })
 }
 
 fn retirement_slot(census: &Path, publication: Uuid) -> PathBuf {
@@ -243,6 +278,12 @@ mod tests {
         assert!(keys.arm_kafka_prefix_retirement(cut(1), 2).await.is_err());
         assert_eq!(keys.kafka_erasure_floor()?, 0);
         keys.record_kafka_publication(1, &later)?;
+        keys.validate_kafka_prefix_retirement(cut(1), 2).await?;
+        assert_eq!(keys.kafka_erasure_floor()?, 0);
+        assert_eq!(
+            keys.open_kafka_publication(0, earlier.clone()).await?,
+            Bytes::from_static(b"old")
+        );
         keys.arm_kafka_prefix_retirement(cut(1), 2).await?;
         let keys = vault.kafka_log_keys(topic, false, IoRegion::new())?;
         assert_eq!(keys.kafka_erasure_floor()?, 1);

@@ -283,6 +283,9 @@ impl rtdb_storage::log::SharedLog for KafkaLog {
 
 #[async_trait]
 impl Log for KafkaLog {
+    fn checkpoint_key_retirement(&self) -> Option<&dyn rtdb_storage::log::CheckpointKeyRetirement> {
+        self.native_prefix_custody().ok().map(|_| self as &dyn rtdb_storage::log::CheckpointKeyRetirement)
+    }
     fn shared(&self) -> Option<&dyn rtdb_storage::log::SharedLog> { Some(self) }
     async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn rtdb_storage::log::LogRange>> {
         if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }

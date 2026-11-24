@@ -50,13 +50,13 @@ impl ReplicationDriver {
             }
             Some(DefaultErasure::Retiring {
                 intent,
-                local_logs_settled: false,
+                log_prefixes_settled: false,
             }) => {
                 let intent = *intent;
-                let local_logs_settled = intent.settle_local_logs(&self.logs).await?;
+                let log_prefixes_settled = intent.settle_log_prefixes(&self.logs).await?;
                 self.default_erasure = Some(DefaultErasure::Retiring {
                     intent,
-                    local_logs_settled,
+                    log_prefixes_settled,
                 });
                 Ok(())
             }
@@ -69,7 +69,7 @@ impl ReplicationDriver {
             && matches!(
                 self.default_erasure,
                 Some(DefaultErasure::Retiring {
-                    local_logs_settled: false,
+                    log_prefixes_settled: false,
                     ..
                 })
             )
@@ -118,7 +118,7 @@ impl ReplicationDriver {
         intent.require_selected(*selected, position)?;
         self.default_erasure = Some(DefaultErasure::Retiring {
             intent,
-            local_logs_settled: false,
+            log_prefixes_settled: false,
         });
         Ok(true)
     }

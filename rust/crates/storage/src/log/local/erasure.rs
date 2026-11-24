@@ -1,35 +1,27 @@
-use rtdb_types::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::*;
+use crate::log::{CheckpointKeyRetirement, CheckpointPrefix};
 
 const BATCH: usize = 128;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LocalLogRetirement {
-    /// Last record covered by the replacement checkpoint, inclusive.
-    pub through: i64,
-    pub checkpoint_sha256: [u8; 32],
-    pub unreadable_by: Timestamp,
-}
-
 #[derive(Clone, Copy, Serialize, Deserialize)]
 struct Intent {
-    retirement: LocalLogRetirement,
+    retirement: CheckpointPrefix,
     before: u64,
     settled: u64,
 }
 
 impl LocalLog {
     /// Checks the exact durable boundary while leaving all existing keys readable.
-    pub async fn validate_erasure_prefix(&self, retirement: LocalLogRetirement) -> Result<()> {
+    pub async fn validate_erasure_prefix(&self, retirement: CheckpointPrefix) -> Result<()> {
         self.with_retirement_file(retirement, |_, _, _| Ok(()))
             .await
     }
 
     /// Closes key admission through the exact ordered checkpoint cut and settles one batch.
     /// The caller retains independent recovery and has durably closed prior recovery admission.
-    pub async fn settle_erasure_prefix(&self, retirement: LocalLogRetirement) -> Result<bool> {
+    pub async fn settle_erasure_prefix(&self, retirement: CheckpointPrefix) -> Result<bool> {
         let maximum = physical_maximum(self.maximum_message_bytes, true)?;
         self.with_retirement_file(retirement, move |path, keys, (mut file, before)| {
             keys.with_local_prefix_retirement(|intent_path| {
@@ -71,7 +63,7 @@ impl LocalLog {
 
     async fn with_retirement_file<T: Send + 'static>(
         &self,
-        retirement: LocalLogRetirement,
+        retirement: CheckpointPrefix,
         work: impl FnOnce(&Path, &ClassicObjectKeys, (JournalFile, u64)) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let latest = self.progress.latest()?;
@@ -97,11 +89,22 @@ impl LocalLog {
     }
 }
 
+#[async_trait]
+impl CheckpointKeyRetirement for LocalLog {
+    async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<()> {
+        Ok(self.validate_erasure_prefix(cut).await?)
+    }
+
+    async fn settle_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<bool> {
+        Ok(self.settle_erasure_prefix(cut).await?)
+    }
+}
+
 pub(crate) fn read_floor(path: &Path) -> Result<i64> {
     Ok(read_intent(path)?.map_or(0, |intent| intent.before as i64))
 }
 
-fn prepare(path: &Path, retirement: LocalLogRetirement, before: u64) -> Result<Intent> {
+fn prepare(path: &Path, retirement: CheckpointPrefix, before: u64) -> Result<Intent> {
     let settled = match read_intent(path)? {
         Some(prior) if prior.retirement == retirement && prior.before == before => {
             crate::sync_directory(path.parent().ok_or_else(invalid)?)
@@ -195,7 +198,7 @@ mod tests {
             .await?
             .offset;
         let mut stale = log.tail(LogOffset(-1)).await?;
-        let cut = LocalLogRetirement {
+        let cut = CheckpointPrefix {
             through: through.0,
             checkpoint_sha256: [3; 32],
             unreadable_by: Timestamp(8),
@@ -219,7 +222,7 @@ mod tests {
         assert_eq!(rows[0].payload, live);
         assert!(
             reopened
-                .settle_erasure_prefix(LocalLogRetirement {
+                .settle_erasure_prefix(CheckpointPrefix {
                     unreadable_by: Timestamp(9),
                     ..cut
                 })

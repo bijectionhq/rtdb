@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(crate) mod erasure;
-pub use erasure::LocalLogRetirement;
+
 
 const HEADER_BYTES: u64 = 13;
 const TRAILER_BYTES: u64 = 8;
@@ -525,7 +525,9 @@ impl super::SharedLog for LocalLog {
 
 #[async_trait]
 impl Log for LocalLog {
-    fn local_erasure_log(&self) -> Option<&LocalLog> { self.keys.as_ref().map(|_| self) }
+    fn checkpoint_key_retirement(&self) -> Option<&dyn super::CheckpointKeyRetirement> {
+        self.keys.as_ref().map(|_| self as &dyn super::CheckpointKeyRetirement)
+    }
     fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
     fn shared(&self) -> Option<&dyn super::SharedLog> { Some(self) }
     fn retains_synced_history(&self) -> bool { true }

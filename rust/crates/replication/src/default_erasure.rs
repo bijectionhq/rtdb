@@ -66,7 +66,7 @@ pub(crate) enum DefaultErasure {
     Selected(SelectedRewrite),
     Retiring {
         intent: ErasureRetirement,
-        local_logs_settled: bool,
+        log_prefixes_settled: bool,
     },
 }
 
@@ -103,10 +103,10 @@ impl AppliedErasure {
         {
             return Err(invalid());
         }
-        logs.local_erasure_logs().ok_or_else(unsupported)?;
-        let local = logs.local_recovery_store().ok_or_else(unsupported)?;
-        let custody = local.hold_recovery_open().await?;
+        logs.checkpoint_log_keys().ok_or_else(unsupported)?;
         let store = blocks.object_store();
+        let local = store.local_maintenance_store().ok_or_else(unsupported)?;
+        let custody = local.hold_recovery_open().await?;
         store.local_classic_key_slots().ok_or_else(unsupported)?;
         let root_key = ObjectKey::new(block_key(prepared.block_index())?)?;
         match store.head_fresh(&root_key).await {
@@ -240,8 +240,7 @@ pub(crate) async fn recover_rewrite(
     let Some(evidence) = serving::checkpoint_rewrite(image.bytes())? else {
         return Ok(None);
     };
-    if blocks.object_store().local_classic_key_slots().is_none()
-    {
+    if blocks.object_store().local_classic_key_slots().is_none() {
         return Err(unsupported());
     }
     let NativeCheckpointImage::Sealed(opened) = image else {
@@ -336,19 +335,22 @@ impl SelectedRewrite {
 }
 
 impl ErasureRetirement {
-    pub async fn settle_local_logs(self, logs: &PartitionLogs) -> Result<bool> {
-        use rtdb_storage::{LocalErasureRecovery, log::LocalLogRetirement};
-        let (source, replica) = logs.local_erasure_logs().ok_or_else(unsupported)?;
-        let local = logs.local_recovery_store().ok_or_else(unsupported)?;
-        let plan = |through| LocalLogRetirement {
+    pub async fn settle_log_prefixes(self, logs: &PartitionLogs) -> Result<bool> {
+        use rtdb_storage::{LocalErasureRecovery, log::CheckpointPrefix};
+        let (source, replica) = logs.checkpoint_log_keys().ok_or_else(unsupported)?;
+        let local = logs
+            .storage()
+            .local_maintenance_store()
+            .ok_or_else(unsupported)?;
+        let plan = |through| CheckpointPrefix {
             through,
             checkpoint_sha256: self.root_sha256,
             unreadable_by: self.unreadable_by,
         };
         let source_plan = plan(self.evidence.cut.source.after_offset(logs.source_epoch));
         let replica_plan = plan(self.evidence.boundary.after_offset(logs.replica_epoch));
-        source.validate_erasure_prefix(source_plan).await?;
-        replica.validate_erasure_prefix(replica_plan).await?;
+        source.validate_checkpoint_prefix(source_plan).await?;
+        replica.validate_checkpoint_prefix(replica_plan).await?;
         if !local
             .close_erasure_recovery(LocalErasureRecovery {
                 block: self.block,
@@ -361,8 +363,8 @@ impl ErasureRetirement {
         {
             return Ok(false);
         }
-        let source_done = source.settle_erasure_prefix(source_plan).await?;
-        let replica_done = replica.settle_erasure_prefix(replica_plan).await?;
+        let source_done = source.settle_checkpoint_prefix(source_plan).await?;
+        let replica_done = replica.settle_checkpoint_prefix(replica_plan).await?;
         Ok(source_done && replica_done)
     }
 
