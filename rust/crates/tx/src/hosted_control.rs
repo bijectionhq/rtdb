@@ -75,8 +75,7 @@ pub struct HostedReplay {
     logical_at: u64,
     fingerprint: [u8; 32],
     commit_positions: Vec<u32>,
-    #[serde(default)]
-    assertion_lines: Option<ArchivedAssertionLines>,
+    assertion_lines: ArchivedAssertionLines,
     #[serde(skip)]
     lifetimes: Vec<ReplayLifetime>,
     #[serde(skip)]
@@ -86,7 +85,7 @@ pub struct HostedReplay {
     #[serde(skip)]
     worlds: Vec<u8>,
     #[serde(skip)]
-    direct_effects: Option<VecDeque<u32>>,
+    direct_effects: VecDeque<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -174,7 +173,7 @@ pub fn hosted_replay_controls<'a>(
     let expiry_id = format!("native-expiries/{}", source.tx_id.0);
     let expiries = selected(RESTORE, &expiry_id);
     let effects_id = format!("native-effects/{}", source.tx_id.0);
-    let effects = selected(RESTORE, &effects_id);
+    let effects = selected(RESTORE, &effects_id).ok_or_else(replay_invalid)?;
     let prefix = format!("native-worlds/{}/", source.tx_id.0);
     let mut chunks = std::collections::BTreeMap::new();
     let mut bytes = 0usize;
@@ -192,7 +191,7 @@ pub fn hosted_replay_controls<'a>(
         }
     }
     if controls.clone().filter(|control| control.name() == RESTORE).count()
-        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + usize::from(effects.is_some()) + chunks.len()
+        != 6 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + chunks.len()
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -209,15 +208,13 @@ pub fn hosted_replay_controls<'a>(
     {
         return Err(replay_invalid());
     }
-    if let Some(effects) = effects {
-        let body = control_body(effects, MAX_REPLAY_POSITIONS * 4)
-            .filter(|_| effects.expected().is_none()).ok_or_else(replay_invalid)?;
-        let positions = decode_direct_effects(body, &replay.commit_positions)?;
-        for &position in positions.iter().filter(|&&position| position != 0) {
-            replay.require_assertion_line(position, [0; 16])?;
-        }
-        replay.direct_effects = Some(positions);
+    let body = control_body(effects, MAX_REPLAY_POSITIONS * 4)
+        .filter(|_| effects.expected().is_none()).ok_or_else(replay_invalid)?;
+    let positions = decode_direct_effects(body, &replay.commit_positions)?;
+    for &position in positions.iter().filter(|&&position| position != 0) {
+        replay.require_assertion_line(position, [0; 16])?;
     }
+    replay.direct_effects = positions;
     if let Some(lifetimes) = lifetimes {
         let encoded = control_body(lifetimes, MAX_REPLAY_LIFETIME_BYTES)
             .filter(|_| lifetimes.expected().is_none()).ok_or_else(replay_invalid)?;
@@ -400,20 +397,18 @@ impl HostedReplay {
     pub(crate) fn commit_positions(&self) -> &[u32] { &self.commit_positions }
 
     pub(crate) fn require_assertion_line(&self, position: u32, line: [u8; 16]) -> Result<()> {
-        if let Some(lines) = &self.assertion_lines
-            && self.commit_positions.binary_search(&position).ok().and_then(|index| lines.get(index)) != Some(line)
+        if self.commit_positions.binary_search(&position).ok()
+            .and_then(|index| self.assertion_lines.get(index)) != Some(line)
         {
             return Err(replay_invalid());
         }
         Ok(())
     }
 
-    pub(crate) fn direct_effect_count(&self) -> Option<usize> {
-        self.direct_effects.as_ref().map(VecDeque::len)
-    }
+    pub(crate) fn direct_effect_count(&self) -> usize { self.direct_effects.len() }
 
-    pub(crate) fn take_direct_effect(&mut self) -> Result<Option<u32>> {
-        self.direct_effects.as_mut().map(|effects| effects.pop_front().ok_or_else(replay_invalid)).transpose()
+    pub(crate) fn take_direct_effect(&mut self) -> Result<u32> {
+        self.direct_effects.pop_front().ok_or_else(replay_invalid)
     }
 
     pub(crate) fn decode_resolved(body: &[u8], ordered: Timestamp) -> Result<Self> {
@@ -443,7 +438,7 @@ impl HostedReplay {
         self.commit_positions.len() <= MAX_REPLAY_POSITIONS
             && self.commit_positions.first().is_none_or(|first| *first != 0)
             && self.commit_positions.windows(2).all(|pair| pair[0] < pair[1])
-            && self.assertion_lines.as_ref().is_none_or(|lines| lines.matches_inventory(self.commit_positions.len()))
+            && self.assertion_lines.matches_inventory(self.commit_positions.len())
     }
 
     fn has_original_prefix(&self) -> bool {
@@ -580,7 +575,7 @@ impl HostedReplay {
     /// Bulk replay input stays in its destination relations.
     pub(crate) fn is_transient_replay_control(&self, control: &HostedControlWrite) -> bool {
         control.name() == RESTORE && matches!(control.id(), EntityId::String(id) if
-            (self.direct_effects.is_some() && id.starts_with("native-effects/"))
+            id.starts_with("native-effects/")
                 || (!self.worlds.is_empty() && id.starts_with("native-worlds/")))
     }
 
@@ -1039,7 +1034,8 @@ mod replay_tests {
             "handoff": {"handoff": ([5u8; 32]), "fence": {"tx_id": 1, "system_time": 2},
                 "through": {"tx_id": 2, "system_time": 3}},
             "previous": null, "source": {"tx_id": 3, "system_time": 4}, "logical_at": 3000,
-            "fingerprint": fingerprint, "commit_positions": [1, 3]});
+            "fingerprint": fingerprint, "commit_positions": [1, 3],
+            "assertion_lines": {"lines": [vec![0u8; 16]], "by_position": [0, 0]}});
         let body = receipt.to_string().into_bytes();
         let replace = |id: &str, expected, body: &[u8]| {
             let mut document = fields(id);
@@ -1064,6 +1060,7 @@ mod replay_tests {
             replace("native-transaction/3", None, &body)?,
             projection(3)?,
             HostedControlWrite::check(hold.clone(), scope, Some(Timestamp(9)), fields("restore"))?,
+            replace("native-effects/3", None, &[])?,
         ];
         let replay = hosted_replay_controls(controls.iter())?.unwrap();
         assert_eq!(replay.commit_positions(), &[1, 3]);
@@ -1073,6 +1070,7 @@ mod replay_tests {
         let positions = (u32::MAX - 1023..=u32::MAX).collect::<Vec<_>>();
         let mut large = receipt.clone();
         large["commit_positions"] = serde_json::json!(&positions);
+        large["assertion_lines"]["by_position"] = serde_json::json!(vec![0u8; positions.len()]);
         let large = large.to_string().into_bytes();
         controls[3] = replace(NATIVE_FRONTIER, None, &large)?;
         controls[4] = replace("native-transaction/3", None, &large)?;
@@ -1081,7 +1079,7 @@ mod replay_tests {
         let pin = [archive.as_slice(), 4000u64.to_be_bytes().as_slice()].concat();
         assert_eq!(decode_accepted_replay(&large, binding, &pin)?.commit_positions(), positions.as_slice());
         for (field, value) in [
-            ("captured", serde_json::json!({"tx_id": 4, "system_time": 4})),
+            ("captured", serde_json::json!({"tx_id": 2, "system_time": 4})),
             ("original_authority", serde_json::json!(([0u8; 16]))),
             ("handoff", serde_json::json!({"handoff": ([5u8; 32]),
                 "fence": {"tx_id": 3, "system_time": 4}, "through": {"tx_id": 2, "system_time": 3}})),

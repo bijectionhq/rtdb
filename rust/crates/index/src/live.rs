@@ -801,7 +801,6 @@ enum OwnedCommitPositions {
     Archive {
         remaining: std::collections::BTreeSet<u32>,
         direct: Option<DirectArchiveEffect>,
-        explicit: bool,
     },
 }
 
@@ -832,14 +831,6 @@ impl TransactionBuffer {
         self.select_owned_positions(OwnedCommitPositions::Landing(0))
     }
     pub fn retain_archived_owned_positions(&mut self, positions: Vec<u32>) -> Result<()> {
-        self.select_archived_owned_positions(positions, false)
-    }
-
-    pub fn retain_explicit_archive_positions(&mut self, positions: Vec<u32>) -> Result<()> {
-        self.select_archived_owned_positions(positions, true)
-    }
-
-    fn select_archived_owned_positions(&mut self, positions: Vec<u32>, explicit: bool) -> Result<()> {
         if positions.first().is_some_and(|first| *first == 0)
             || !positions.windows(2).all(|pair| pair[0] < pair[1])
         {
@@ -848,12 +839,11 @@ impl TransactionBuffer {
         self.select_owned_positions(OwnedCommitPositions::Archive {
             remaining: positions.into_iter().collect(),
             direct: None,
-            explicit,
         })
     }
 
     pub fn begin_direct_archive_effect(&mut self, table: TableRef, position: u32) -> Result<()> {
-        let Some(OwnedCommitPositions::Archive { remaining, direct, explicit: true }) = &mut self.owned_positions
+        let Some(OwnedCommitPositions::Archive { remaining, direct }) = &mut self.owned_positions
         else { return Err(invalid("A direct archive effect requires an explicit replay plan")); };
         if !table.is_owned_event_data() || direct.is_some()
             || (position != 0 && !remaining.contains(&position))
@@ -865,7 +855,7 @@ impl TransactionBuffer {
     }
 
     pub fn finish_direct_archive_effect(&mut self) -> Result<()> {
-        let Some(OwnedCommitPositions::Archive { direct, explicit: true, .. }) = &mut self.owned_positions
+        let Some(OwnedCommitPositions::Archive { direct, .. }) = &mut self.owned_positions
         else { return Err(invalid("A direct archive effect requires an explicit replay plan")); };
         if !direct.take().is_some_and(|effect| effect.staged) {
             return Err(invalid("A direct archive operation must stage exactly one owned event"));
@@ -1041,13 +1031,10 @@ impl TransactionBuffer {
                 Some(OwnedCommitPositions::Landing(previous)) => {
                     Some(previous.checked_add(1).ok_or_else(|| invalid("Owned commit position overflow"))?)
                 },
-                Some(OwnedCommitPositions::Archive { direct, explicit: true, .. }) => {
+                Some(OwnedCommitPositions::Archive { direct, .. }) => {
                     let effect = direct.as_ref().filter(|effect| &effect.table == table && !effect.staged)
                         .ok_or_else(|| invalid("An owned event differs from its direct archive effect"))?;
                     Some(effect.position)
-                },
-                Some(OwnedCommitPositions::Archive { remaining, .. }) => {
-                    Some(*remaining.first().ok_or_else(|| invalid("The archive contains an extra owned effect"))?)
                 },
                 None => None,
             }
@@ -1406,7 +1393,7 @@ mod chunk_tests {
         let state = crate::PartitionState::empty(Default::default()).unwrap();
         let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(1) };
         let mut transaction = TransactionBuffer::new(state.snapshot(), key, MemoryBudget::new(1 << 24)).unwrap();
-        transaction.retain_explicit_archive_positions(vec![1, 3]).unwrap();
+        transaction.retain_archived_owned_positions(vec![1, 3]).unwrap();
         let facts = rtdb_types::OwnedRelation::new("facts").unwrap().table("owner");
         let support = rtdb_types::OwnedRelation::new("support").unwrap().table("owner");
         let id = EntityId::String("one".into());
@@ -1473,15 +1460,19 @@ mod chunk_tests {
         transaction.omit_archived_world_effect(omitted).unwrap();
         assert!(transaction.omit_archived_world_effect(omitted).is_err());
         transaction.append_unpositioned_replay(&overlay, shadow()).unwrap();
+        transaction.begin_direct_archive_effect(table.clone(), 3).unwrap();
         let put = transaction.append_owned_put(
             &table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None,
         ).unwrap();
+        transaction.finish_direct_archive_effect().unwrap();
+        transaction.begin_direct_archive_effect(table.clone(), 7).unwrap();
         let delete = transaction.append_to(&table, StoredEvent { position: None,
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: key.system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Delete, recency: None,
         }).unwrap();
+        transaction.finish_direct_archive_effect().unwrap();
         assert_eq!(put, NonZeroU32::new(3));
         assert_eq!(delete, NonZeroU32::new(7));
         let staged = transaction.stage().unwrap();

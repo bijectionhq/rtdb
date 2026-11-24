@@ -115,13 +115,11 @@ impl OpenTransaction<'_> {
             ) {
                 return Err(unavailable());
             }
-            if let Some(count) = replay.direct_effect_count() {
-                let direct = operations.iter().filter(|operation| operation.direct_archive_relation().is_some());
-                if direct.clone().count() != count
-                    || direct.filter_map(Operation::owned_documents).any(|(_, rows)| rows != 1)
-                {
-                    return Err(unavailable());
-                }
+            let direct = operations.iter().filter(|operation| operation.direct_archive_relation().is_some());
+            if direct.clone().count() != replay.direct_effect_count()
+                || direct.filter_map(Operation::owned_documents).any(|(_, rows)| rows != 1)
+            {
+                return Err(unavailable());
             }
         }
         let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));

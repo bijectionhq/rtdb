@@ -1080,8 +1080,8 @@ impl<'a> OpenTransaction<'a> {
     async fn apply(&mut self, operation: &Operation) -> Result<()> {
         let direct = if let (Some(replay), Some(relation)) =
             (&mut self.hosted_replay, operation.direct_archive_relation())
-            && let Some(position) = replay.take_direct_effect()?
         {
+            let position = replay.take_direct_effect()?;
             if position == 0 && matches!(operation, Operation::Public(TxOp::OwnedReplayResidue { .. })) {
                 return Err(replay_period_unavailable());
             }
@@ -1759,11 +1759,7 @@ impl<'a> OpenTransaction<'a> {
             self.buffer.retain_owned_positions()?;
         }
         if let Some(replay) = &replay {
-            if replay.direct_effect_count().is_some() {
-                self.buffer.retain_explicit_archive_positions(replay.commit_positions().to_vec())?;
-            } else if !replay.commit_positions().is_empty() {
-                self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
-            }
+            self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
         }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
@@ -2514,7 +2510,7 @@ impl<'a> OpenTransaction<'a> {
         origin: rtdb_types::EventOrigin, valid: Interval,
     ) -> Result<()> {
         let replay = self.hosted_replay.as_ref()
-            .filter(|replay| replay.direct_effect_count().is_some() && relation.is_root_data())
+            .filter(|_| relation.is_root_data())
             .ok_or_else(replay_period_unavailable)?;
         let original_time = replay.source_time();
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
