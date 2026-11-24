@@ -6,7 +6,7 @@ use rtdb_format::{catalog::{BlockCatalog, CheckpointContents}, envelope::Replica
 use rtdb_node::{NodeOptions, ReadFence};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, read_owned_schema_catalog};
 use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint, RecoveredPartition, TermFence};
-use rtdb_storage::{ObjectKey, ObjectStore, cache::{BufferPool, CacheBudget}};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_types::{BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Timestamp, TransactionKey};
 use serde::Serialize;
 use ring::digest::Context;

@@ -504,7 +504,7 @@ impl KeyService for LocalKeyService {
         let vault = self.clone();
         let scope = UnitScope::archive(id);
         let id = id.to_owned();
-        let withdrawal = tokio::task::spawn_blocking(move || {
+        let withdrawal = tokio::task::spawn_blocking(move || -> Result<ArchiveKeyWithdrawal> {
             vault.require_service_root()?;
             let raw_path = vault.path(&id)?;
             let _raw_lock = vault.lock_key(&raw_path)?;
