@@ -185,7 +185,7 @@ impl ObjectStore for RemoteStore {
         ledger.retain(cut, None, &self.io).await.map(Some)
     }
 
-    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
         -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let Some(ledger) = &self.catalog else { return Ok(None); };
         ledger.retain(cut, self.classic_versions.as_ref().map(|_| paths), &self.io).await.map(Some)

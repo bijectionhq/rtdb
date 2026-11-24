@@ -226,7 +226,7 @@ impl CycleWorker for OrderedIndexMaintenance {
         let partition = self.snapshots.snapshot();
         let snapshot = partition.snapshot();
         let cut = snapshot.catalog_cut();
-        let paths = cut.and_then(|_| snapshot.compacted_primary_paths());
+        let paths = cut.and_then(|_| snapshot.catalog_file_paths());
         let view = HeldView::catalog(self.storage.object_store().as_ref(), partition, cut, paths).await?;
         IoRegion::reading(view, self.refresh(&snapshot, cancellation)).await
     }

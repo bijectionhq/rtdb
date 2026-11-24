@@ -171,8 +171,8 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
-    /// Registers complete paths for the compacted primary files in this captured catalog.
-    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)
+    /// Registers the complete compacted primary and published search paths of the captured catalog.
+    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)
         -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.retain_catalog(cut).await
     }
@@ -207,6 +207,8 @@ pub trait ObjectStore: Send + Sync {
         self.delete(key).await?;
         Ok(())
     }
+    /// Whether installed search-run retirement uses the exact publication grant.
+    fn releases_exact_search_runs(&self) -> bool { false }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() {

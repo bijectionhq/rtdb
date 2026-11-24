@@ -123,6 +123,11 @@ pub fn is_compacted_primary_file(key: &str) -> bool {
         .is_some_and(|trie| trie.level() > 0)
 }
 
+/// Serving catalog paths covered by the bounded exact reader inventory.
+pub fn is_catalog_retirement_file(key: &str) -> bool {
+    is_compacted_primary_file(key) || crate::search_manifest::is_run_key(key)
+}
+
 /// The data and metadata objects of an engine receipt table.
 pub fn is_receipt_trie_file(key: &str) -> bool { receipt_trie_key(key).is_some() }
 

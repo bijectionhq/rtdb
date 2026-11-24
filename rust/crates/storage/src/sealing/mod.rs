@@ -282,12 +282,12 @@ impl ObjectStore for EncryptingStore {
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog(cut).await
     }
-    async fn retain_catalog_with_primary(
+    async fn retain_catalog_with_paths(
         &self,
         cut: Option<rtdb_types::CatalogCut>,
         paths: Arc<[String]>,
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.inner.retain_catalog_with_primary(cut, paths).await
+        self.inner.retain_catalog_with_paths(cut, paths).await
     }
     fn defers_trie_releases(&self) -> bool {
         self.inner.defers_trie_releases()
@@ -336,6 +336,7 @@ impl ObjectStore for EncryptingStore {
         self.inner.settle_classic_trie(key, version).await
     }
 
+    fn releases_exact_search_runs(&self) -> bool { self.inner.releases_exact_search_runs() }
     async fn release_search_run(
         &self,
         key: &ObjectKey,

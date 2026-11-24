@@ -413,15 +413,16 @@ pub struct CatalogAdmissionFloor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogReader {
     pub owner: uuid::Uuid,
     pub storage_root: String,
     pub replica_epoch: i32,
     /// Exact and restored captures can have no installed replica cut.
     pub cut: Option<rtdb_types::CatalogCut>,
-    /// Complete for compacted primary paths within this captured catalog.
+    /// Complete for compacted primaries and published search runs in this captured catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub compacted_primary_paths: Option<Vec<String>>,
+    pub catalog_file_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

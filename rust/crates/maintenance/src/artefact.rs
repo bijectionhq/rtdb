@@ -231,7 +231,7 @@ async fn build_stored(
         snapshot.trie_catalog().trie(&job.definition.table, key).is_some_and(|trie| trie.state == TrieState::Live)
     });
     // The compacted inventory names live inputs. A retry with an older selection needs the conservative hold.
-    let paths = live.then(|| captured.compacted_primary_paths()).flatten();
+    let paths = live.then(|| captured.catalog_file_paths()).flatten();
     let view = HeldView::catalog(store, snapshot.clone(), captured.catalog_cut(), paths).await?;
     IoRegion::reading(view, builder.build(job, ArtefactSource::Stored, snapshot, cancellation)).await
 }

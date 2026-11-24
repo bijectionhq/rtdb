@@ -55,10 +55,10 @@ impl CatalogReaders {
     }
 
     pub async fn retain(&self, cut: Option<CatalogCut>) -> Result<Arc<dyn Send + Sync>> {
-        self.retain_with_primary(cut, None).await
+        self.retain_with_paths(cut, None).await
     }
 
-    pub async fn retain_with_primary(&self, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>) -> Result<Arc<dyn Send + Sync>> {
+    pub async fn retain_with_paths(&self, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>) -> Result<Arc<dyn Send + Sync>> {
         let matches_cut = match cut {
             Some(cut) => self.matches_cut(cut)?,
             None => true,
@@ -119,11 +119,6 @@ impl CatalogReaders {
 
     pub async fn advance(&self, installed: CatalogCut) -> Result<bool> {
         Ok(self.close_admission(installed, &[None]).await?.1[0])
-    }
-
-    pub async fn admit_trie_release(&self, installed: CatalogCut) -> Result<Option<CatalogAdmissionFloor>> {
-        let (floor, allowed) = self.close_admission(installed, &[None]).await?;
-        Ok(allowed[0].then_some(floor))
     }
 
     /// Serializes closing old admissions with testing the current holders for each file.
@@ -247,8 +242,8 @@ impl CatalogReaders {
                             "lineage": stored.lineage, "installation": self.deployment, "residence": self.residence,
                             "namespace": self.namespaces.objects, "root": self.storage_root, "revision": stored.version,
                             "epoch": self.replica_epoch, "hold": hold, "through": cut.map(|cut| cut.through),
-                            "primary_paths": stored.catalog_readers.get(hold)
-                                .and_then(|registration| registration.compacted_primary_paths.as_deref()),
+                            "paths": stored.catalog_readers.get(hold)
+                                .and_then(|registration| registration.catalog_file_paths.as_deref()),
                         }));
                     }
                     return Ok(answers);
@@ -267,14 +262,14 @@ impl CatalogReaders {
         }
         let paths = paths.filter(|paths| cut.is_some()
             && paths.windows(2).all(|window| window[0] < window[1])
-            && paths.iter().all(|path| rtdb_format::keys::is_compacted_primary_file(path))
-            && primary_path_charge(paths) <= rtdb_types::CATALOG_PRIMARY_PATH_BYTES
-            && record.catalog_readers.values().filter_map(|reader| reader.compacted_primary_paths.as_deref())
+            && paths.iter().all(|path| rtdb_format::keys::is_catalog_retirement_file(path))
+            && primary_path_charge(paths) <= rtdb_types::CATALOG_FILE_PATH_BYTES
+            && record.catalog_readers.values().filter_map(|reader| reader.catalog_file_paths.as_deref())
                 .map(primary_path_charge).fold(primary_path_charge(paths), usize::saturating_add) <= PRIMARY_PATH_LEDGER_BYTES);
         let store = format!("{}/{}/", self.residence, self.storage_root);
         if record.storage_regions.values().any(|region| match region {
             StorageRegion::ExactRetirement { object, .. } => object.strip_prefix(&store)
-                .is_some_and(|path| rtdb_format::keys::is_compacted_primary_file(path)
+                .is_some_and(|path| rtdb_format::keys::is_catalog_retirement_file(path)
                     && paths.is_none_or(|paths| contains_path(paths, path))),
             _ => false,
         }) {
@@ -283,7 +278,7 @@ impl CatalogReaders {
         }
         record.catalog_readers.insert(reader, CatalogReader {
             owner: self.owner, storage_root: self.storage_root.clone(), replica_epoch: self.replica_epoch.0, cut,
-            compacted_primary_paths: paths.map(<[String]>::to_vec),
+            catalog_file_paths: paths.map(<[String]>::to_vec),
         });
         Ok(())
     }
@@ -294,7 +289,7 @@ pub(crate) fn readers_allow(record: &DeploymentRecord, storage_root: &str, insta
     record.catalog_readers.values().filter(|reader| {
         reader.storage_root == storage_root && reader.replica_epoch == installed.replica_epoch.0
     }).all(|reader| match path {
-        Some(path) => reader.compacted_primary_paths.as_ref().is_some_and(|paths| !contains_path(paths, path)),
+        Some(path) => reader.catalog_file_paths.as_ref().is_some_and(|paths| !contains_path(paths, path)),
         None => admits_after_floor(reader.cut.map(|cut| cut.through.0), Some(installed.through.0)),
     })
 }
@@ -455,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_old_catalog_holds_only_the_compacted_files_it_can_open() {
+    async fn an_old_catalog_holds_only_the_files_it_can_open() {
         let (readers, directory, origin) = serving().await;
         let old = CatalogCut {
             storage_version: CURRENT_STORAGE_VERSION, storage_epoch: StorageEpoch(0), replica_epoch: readers.replica_epoch,
@@ -469,13 +464,20 @@ mod tests {
             .data_key(&"l01-rc-b00".parse().unwrap());
         let unrelated_path = rtdb_format::keys::TableSlug::recorded("public$unrelated").unwrap()
             .data_key(&"l01-rc-b00".parse().unwrap());
-        let hold = readers.retain_with_primary(Some(old), Some(vec![held_path.clone()].into())).await.unwrap();
+        let search_prefix = rtdb_format::search_manifest::run_prefix(&rtdb_format::keys::TableSlug::recorded("public$held").unwrap());
+        let held_run = format!("{search_prefix}/{}.f16.arrow", "aa".repeat(32));
+        let unrelated_run = format!("{search_prefix}/{}.f16.arrow", "bb".repeat(32));
+        let mut paths = vec![held_path.clone(), held_run.clone()];
+        paths.sort_unstable();
+        let hold = readers.retain_with_paths(Some(old), Some(paths.into())).await.unwrap();
 
         let (_, allowed) = readers.close_admission(installed, &[Some(&held_path)]).await.unwrap();
         assert_eq!(allowed, [false]);
         assert_eq!(readers.retain(Some(old)).await.err().unwrap().code, CATALOG_NOT_CURRENT);
-        let (_, allowed) = readers.close_admission(installed, &[Some(&held_path), Some(&unrelated_path), None]).await.unwrap();
-        assert_eq!(allowed, [false, true, false]);
+        let (_, allowed) = readers.close_admission(installed,
+            &[Some(&held_path), Some(&unrelated_path), Some(&held_run), Some(&unrelated_run), None],
+        ).await.unwrap();
+        assert_eq!(allowed, [false, true, false, true, false]);
         assert!(!readers.advance(installed).await.unwrap());
 
         let current = directory.deployment(&origin.id).await.unwrap().unwrap();

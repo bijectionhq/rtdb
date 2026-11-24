@@ -137,6 +137,10 @@ A provider request retains its ticket through cancellation and releases it on dr
 An abandoned ticket without drain evidence remains in the ledger.
 Independent maintenance and complete recovery-root retention still require custody and settlement integration.
 
+A bounded serving catalog claim records live compacted primaries and the immutable files selected by its active search runs.
+Hosted search retirement submits an installed retired run directly to the exact storage owner.
+An opaque or oversized claim keeps the conservative scope. Search staging and uncoordinated readers still need their separate retirement paths.
+
 ### Generic fork admission
 
 The source lineage reservation precedes checkpoint inventory reads and orders them against the collector.

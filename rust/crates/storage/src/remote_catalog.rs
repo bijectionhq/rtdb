@@ -12,15 +12,16 @@ const MAX_LEDGER_BYTES: usize = 1024 * 1024;
 type CatalogHolds = BTreeMap<Uuid, CatalogHold>;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogHold {
     cut: Option<CatalogCut>,
-    compacted_primary_paths: Option<Vec<String>>,
+    catalog_file_paths: Option<Vec<String>>,
 }
 
 impl CatalogHold {
     fn retains(&self, cut: CatalogCut, path: Option<&str>) -> bool {
         match path {
-            Some(path) => self.compacted_primary_paths.as_ref().is_none_or(|paths| {
+            Some(path) => self.catalog_file_paths.as_ref().is_none_or(|paths| {
                 paths.binary_search_by(|held| held.as_str().cmp(path)).is_ok()
             }),
             None => self.cut.is_none_or(|held| !covers(held, cut)),
@@ -49,11 +50,11 @@ impl CatalogLedger {
 
     pub async fn retain(self: &Arc<Self>, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>, io: &IoRegion)
         -> Result<Arc<dyn Send + Sync>> {
-        let claim = CatalogHold { cut, compacted_primary_paths: paths.as_deref().filter(|paths| {
+        let claim = CatalogHold { cut, catalog_file_paths: paths.as_deref().filter(|paths| {
             cut.is_some() && paths.windows(2).all(|pair| pair[0] < pair[1])
-                && paths.iter().all(|path| rtdb_format::keys::is_compacted_primary_file(path))
+                && paths.iter().all(|path| rtdb_format::keys::is_catalog_retirement_file(path))
                 && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
-                    <= rtdb_types::CATALOG_PRIMARY_PATH_BYTES
+                    <= rtdb_types::CATALOG_FILE_PATH_BYTES
         }).map(<[String]>::to_vec) };
         let admission: IoAdmission = io.admit_read(self.clone(), self.key.clone())?;
         let ledger = Arc::clone(self);

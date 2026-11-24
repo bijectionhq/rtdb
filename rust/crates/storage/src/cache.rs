@@ -229,7 +229,7 @@ pub struct HeldCatalogRead {
     residence: Arc<()>,
     cut: Option<rtdb_types::CatalogCut>,
     registration: Option<Arc<dyn Send + Sync>>,
-    compacted_primary_paths: Option<Arc<[String]>>,
+    catalog_file_paths: Option<Arc<[String]>>,
 }
 
 impl HeldCatalogRead {
@@ -323,29 +323,29 @@ impl BufferPool {
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
 
     pub async fn hold_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
-        self.hold_catalog_with_primary(cut, None).await
+        self.hold_catalog_with_paths(cut, None).await
     }
 
-    pub async fn hold_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>)
+    pub async fn hold_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>)
         -> rtdb_types::Result<Arc<HeldCatalogRead>> {
         let registration = match &paths {
-            Some(paths) => self.store.retain_catalog_with_primary(cut, Arc::clone(paths)).await?,
+            Some(paths) => self.store.retain_catalog_with_paths(cut, Arc::clone(paths)).await?,
             None => self.store.retain_catalog(cut).await?,
         };
         if self.store.defers_trie_releases() && registration.is_none() {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-not-held",
                 "The coordinated storage provider returned no catalog hold"));
         }
-        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, compacted_primary_paths: paths }))
+        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths }))
     }
 
     pub fn holds_catalog(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>) -> bool {
-        self.holds_catalog_with_primary(held, cut, None)
+        self.holds_catalog_with_paths(held, cut, None)
     }
 
-    pub fn holds_catalog_with_primary(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>, paths: Option<&[String]>) -> bool {
+    pub fn holds_catalog_with_paths(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>, paths: Option<&[String]>) -> bool {
         Arc::ptr_eq(&self.residence, &held.residence) && held.covers(cut)
-            && held.compacted_primary_paths.as_deref().is_none_or(|held_paths| held.cut == cut && paths == Some(held_paths))
+            && held.catalog_file_paths.as_deref().is_none_or(|held_paths| held.cut == cut && paths == Some(held_paths))
     }
 
     fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {

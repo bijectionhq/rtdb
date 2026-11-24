@@ -62,21 +62,25 @@ impl Snapshot {
     /// Returns the conservative installed prefix captured with this physical catalog.
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
-    /// Complete paths for compacted primary tries in this captured catalog.
-    /// An oversized inventory must retain the conservative scope.
-    pub fn compacted_primary_paths(&self) -> Option<Arc<[String]>> {
+    /// Complete paths for live compacted primaries and published search runs.
+    /// A claim exceeding the bound retains the conservative scope.
+    pub fn catalog_file_paths(&self) -> Option<Arc<[String]>> {
         let mut paths = Vec::new();
         let mut bytes = 0usize;
+        let mut retain = |path: String| {
+            bytes = bytes.checked_add(path.len().checked_mul(6)?.checked_add(16)?)?;
+            if bytes > rtdb_types::CATALOG_FILE_PATH_BYTES { return None; }
+            paths.push(path);
+            Some(())
+        };
         for table in self.trie_catalog.tables() {
             let entry = self.table_catalog.entry(table)?;
             for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0 && trie.state == TrieState::Live) {
-                for path in [entry.slug.data_key(&trie.key), entry.slug.metadata_key(&trie.key)] {
-                    bytes = bytes.checked_add(path.len().checked_mul(6)?.checked_add(16)?)?;
-                    if bytes > rtdb_types::CATALOG_PRIMARY_PATH_BYTES {
-                        return None;
-                    }
-                    paths.push(path);
-                }
+                retain(entry.slug.data_key(&trie.key))?;
+                retain(entry.slug.metadata_key(&trie.key))?;
+            }
+            for run in self.trie_catalog.search_runs(table) {
+                retain(run.object_key(&entry.slug).ok()?)?;
             }
         }
         paths.sort_unstable();

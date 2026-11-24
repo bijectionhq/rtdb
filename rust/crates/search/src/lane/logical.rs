@@ -130,7 +130,9 @@ fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], incl
 
 impl SearchBuilder {
     async fn hold_logical_input(&self, snapshot: &Snapshot) -> Result<Arc<HeldView>> {
-        HeldView::catalog(self.store.as_ref(), Arc::new(snapshot.clone()), snapshot.catalog_cut(), None).await
+        let cut = snapshot.catalog_cut();
+        let paths = cut.and_then(|_| snapshot.catalog_file_paths());
+        HeldView::catalog(self.store.as_ref(), Arc::new(snapshot.clone()), cut, paths).await
     }
 
     pub(super) async fn seal_logical(&self, index: &LogicalIndex, snapshot: &Arc<PartitionValue>, trie: &TrieKey, path: &Path, size: u64,

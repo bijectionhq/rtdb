@@ -317,9 +317,9 @@ impl ObjectStore for DiskCachedStore {
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.remote.retain_catalog(cut).await
     }
-    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
         -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.remote.retain_catalog_with_primary(cut, paths).await
+        self.remote.retain_catalog_with_paths(cut, paths).await
     }
     fn defers_trie_releases(&self) -> bool { self.remote.defers_trie_releases() }
     fn releases_receipt_l0(&self) -> bool { self.remote.releases_receipt_l0() }
@@ -329,6 +329,7 @@ impl ObjectStore for DiskCachedStore {
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         self.remote.release_trie_files(receipt, contents).await
     }
+    fn releases_exact_search_runs(&self) -> bool { self.remote.releases_exact_search_runs() }
     async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         let _scope = self.io.admit()?;

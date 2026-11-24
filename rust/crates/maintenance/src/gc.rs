@@ -286,20 +286,22 @@ impl TrieCollector {
     async fn collect_search_runs(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection, as_of: Timestamp,
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
-        let lease = self.config.reader_lease_micros()?;
-        let now = (self.clock)();
         let eligible: BTreeMap<_, _> = collection.eligible_search_runs(&entry.table, as_of)
             .filter_map(|run| run.identity().ok().map(|id| (id, run))).collect();
-        let waiting = {
+        let ready: Vec<_> = if self.store.releases_exact_search_runs() {
+            eligible.into_values().collect()
+        } else {
+            let lease = self.config.reader_lease_micros()?;
+            let now = (self.clock)();
             let mut first = self.first_search_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             first.retain(|(table, digest), _| table != &entry.table || eligible.contains_key(digest));
             eligible.into_iter().filter_map(|(digest, run)| {
                 let first = *first.entry((entry.table.clone(), digest)).or_insert(now);
                 rtdb_storage::read_lease::collection_waited(first, lease, now).then_some(run)
-            }).collect::<Vec<_>>()
+            }).collect()
         };
         let mut entries = Vec::new();
-        for run in waiting {
+        for run in ready {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let key = ObjectKey::new(run.object_key(&entry.slug)?)?;
             if !self.store.release_search_run(&key, run.publication.as_ref(), cut).await? { continue; }

@@ -32,10 +32,10 @@ impl HeldView {
     /// Acquires the serving hold before reading files selected from the captured catalog.
     pub async fn catalog(
         store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
-        compacted_primary: Option<Arc<[String]>>,
+        paths: Option<Arc<[String]>>,
     ) -> rtdb_types::Result<Arc<Self>> {
-        let registration = match compacted_primary {
-            Some(paths) => store.retain_catalog_with_primary(cut, paths).await?,
+        let registration = match paths {
+            Some(paths) => store.retain_catalog_with_paths(cut, paths).await?,
             None => store.retain_catalog(cut).await?,
         };
         if store.defers_trie_releases() && registration.is_none() {

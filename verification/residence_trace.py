@@ -41,7 +41,7 @@ def verify_catalogs(catalogs):
             elif kind == "catalog-hold":
                 require(floor is None or (event["through"] is not None and event["through"] >= floor),
                         "catalog hold precedes the admission floor")
-                holds[event["hold"]] = event["primary_paths"]
+                holds[event["hold"]] = event["paths"]
             else:
                 require(floor is None or event["through"] >= floor, "catalog admission floor rewound")
                 floor = event["through"]
@@ -258,7 +258,7 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
                 catalogs.setdefault(key, []).append(event)
                 if kind == "catalog-hold":
                     require(holds.setdefault(event["hold"], key) == key, "reader identity changed catalog scope")
-                    paths = event["primary_paths"]
+                    paths = event["paths"]
                     require(paths is None or paths == sorted(set(paths)), "catalog claim has a noncanonical reachability census")
                 if kind == "catalog-release" and event["hold"] in holds:
                     require(holds[event["hold"]] == key, "release names another reader scope")

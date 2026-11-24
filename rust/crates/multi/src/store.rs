@@ -1225,7 +1225,7 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
         && record.storage_namespaces.is_some_and(|value| value.objects == required.object_namespace)
         && cut.replica_epoch.0 == record.log_epoch
         && crate::catalog_readers::readers_allow(record, &root, cut,
-            (exact && rtdb_format::keys::is_compacted_primary_file(&release.key)).then_some(release.key.as_str()))
+            (exact && rtdb_format::keys::is_catalog_retirement_file(&release.key)).then_some(release.key.as_str()))
         && record.catalog_admission_floors.get(&root).is_some_and(|floor| {
             floor.residence == required.residence && floor.object_namespace == required.object_namespace
                 && floor.cut.storage_version == cut.storage_version && floor.cut.storage_epoch == cut.storage_epoch
@@ -1258,10 +1258,10 @@ impl ObjectStore for GarbageStore {
         let Some(readers) = &self.catalog_readers else { return Ok(None); };
         readers.retain(cut).await.map(Some)
     }
-    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
         -> Result<Option<Arc<dyn Send + Sync>>> {
         let Some(readers) = &self.catalog_readers else { return Ok(None); };
-        readers.retain_with_primary(cut, Some(paths)).await.map(Some)
+        readers.retain_with_paths(cut, Some(paths)).await.map(Some)
     }
     fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
     fn releases_receipt_l0(&self) -> bool { self.catalog_readers.is_some() }
@@ -1287,11 +1287,11 @@ impl ObjectStore for GarbageStore {
         }
         Ok(allowed.into_iter().all(|allowed| allowed))
     }
+    fn releases_exact_search_runs(&self) -> bool { self.catalog_readers.is_some() }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
         let Some(cut) = cut else { return Ok(false); };
-        let Some(floor) = readers.admit_trie_release(cut).await? else { return Ok(false); };
         let terminal = published.and_then(rtdb_format::log::proto::PublishedObjectVersion::terminal_publication);
         let version = self.retirement_version(key).await?.filter(|version| published.is_some_and(|published| {
             *published == rtdb_format::log::proto::PublishedObjectVersion::from(version.clone())
@@ -1299,6 +1299,9 @@ impl ObjectStore for GarbageStore {
         if version.is_none() && terminal.is_none() {
             return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
         }
+        let path = rtdb_format::search_manifest::is_run_key(key.as_str()).then_some(key.as_str());
+        let (floor, allowed) = readers.close_admission(cut, &[path]).await?;
+        if !allowed[0] { return Ok(false); }
         self.write_release_record(key, Some(floor), version.as_ref(), None, terminal.as_ref()).await?;
         Ok(true)
     }
