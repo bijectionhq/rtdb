@@ -86,6 +86,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
     let windows = take(&mut fields, Table::Windows);
     let pages = take(&mut fields, Table::Pages);
     let mut routing = BTreeMap::<u8, Vec<Child>>::new();
+    let positions = positions.map(arrow_array::UInt32Array::from);
     let packed = positions.is_some();
     let mut directory = |writer: &mut _, kind, children: Vec<Child>| {
         if packed && children.len() <= 48 && children.iter().all(|child| child.lower.len() + child.upper.len() <= 256) {
@@ -184,7 +185,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
                 local_rows.push(row - page_starts.value(page));
             }
             fields.push((Table::Versions, Table::Versions.array(vec![
-                Arc::new(arrow_array::UInt32Array::from(positions[start..end].to_vec())),
+                Arc::new(positions.slice(start, end - start)),
                 Arc::new(arrow_array::UInt32Array::from(members)), Arc::new(arrow_array::UInt32Array::from(pages)),
                 Arc::new(arrow_array::UInt32Array::from(local_rows)),
             ])?));

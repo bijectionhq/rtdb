@@ -48,6 +48,7 @@ entity Checkpoint {
 -- Zoned microsecond timestamp keys compare by their instant for bounds, seeks, and page order.
 -- Floating-point ordering distinguishes signed zeros and ties every NaN last. Zero and NaN bounds are left to the row predicate, and NaNs match no indexed comparison.
 -- A covered point read streams typed batches of the requested columns from those postings after applying every predicate.
+-- A negotiated standalone held range reply emits complete Arrow IPC messages under the original witness and lifetime release checks.
 -- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
 -- A seek evaluates each bound expression once for its comparison keys.
 -- A candidate scope has one sorted Arrow IID column for membership and range intersection.

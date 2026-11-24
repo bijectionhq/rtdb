@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use arrow_array::{BooleanArray, cast::AsArray};
+use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, read_execution_value};
 use rtdb_format::data::{EncodedEvent, EventRef, PutColumn};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, ListView, Result, Value};
@@ -20,32 +22,82 @@ impl Partition {
     pub fn of<'a>(parts: impl IntoIterator<Item = Option<Cow<'a, Value>>>) -> Result<Self> {
         let mut hasher = Sha256::new();
         for part in parts {
-            let (tag, bytes): (u8, Cow<'_, [u8]>) = match part.as_deref() {
-                None | Some(Value::Null | Value::Undefined) => (0, Cow::Borrowed(&[])),
-                Some(Value::Bool(value)) => (1, Cow::Owned(vec![u8::from(*value)])),
-                Some(Value::I8(value)) => (2, Cow::Owned(i64::from(*value).to_be_bytes().to_vec())),
-                Some(Value::I16(value)) => (2, Cow::Owned(i64::from(*value).to_be_bytes().to_vec())),
-                Some(Value::I32(value)) => (2, Cow::Owned(i64::from(*value).to_be_bytes().to_vec())),
-                Some(Value::I64(value)) => (2, Cow::Owned(value.to_be_bytes().to_vec())),
-                Some(Value::U8(value)) => (2, Cow::Owned(i64::from(*value).to_be_bytes().to_vec())),
-                Some(Value::U16(value)) => (2, Cow::Owned(i64::from(*value).to_be_bytes().to_vec())),
-                Some(Value::U32(value)) => (2, Cow::Owned(i64::from(*value).to_be_bytes().to_vec())),
+            match part.as_deref() {
+                None | Some(Value::Null | Value::Undefined) => hash_part(&mut hasher, 0, &[]),
+                Some(Value::Bool(value)) => hash_part(&mut hasher, 1, &[u8::from(*value)]),
+                Some(Value::I8(value)) => hash_integer(&mut hasher, i64::from(*value)),
+                Some(Value::I16(value)) => hash_integer(&mut hasher, i64::from(*value)),
+                Some(Value::I32(value)) => hash_integer(&mut hasher, i64::from(*value)),
+                Some(Value::I64(value)) => hash_integer(&mut hasher, *value),
+                Some(Value::U8(value)) => hash_integer(&mut hasher, i64::from(*value)),
+                Some(Value::U16(value)) => hash_integer(&mut hasher, i64::from(*value)),
+                Some(Value::U32(value)) => hash_integer(&mut hasher, i64::from(*value)),
                 Some(Value::U64(value)) => match i64::try_from(*value) {
-                    Ok(value) => (2, Cow::Owned(value.to_be_bytes().to_vec())),
-                    Err(_) => (3, Cow::Owned(value.to_be_bytes().to_vec())),
+                    Ok(value) => hash_integer(&mut hasher, value),
+                    Err(_) => hash_part(&mut hasher, 3, &value.to_be_bytes()),
                 },
-                Some(Value::Utf8(text)) => (4, Cow::Borrowed(text.as_bytes())),
-                Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => (5, Cow::Borrowed(bytes.as_slice())),
-                Some(Value::Uuid(bytes)) => (6, Cow::Borrowed(bytes.as_slice())),
+                Some(Value::Utf8(text)) => hash_part(&mut hasher, 4, text.as_bytes()),
+                Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => hash_part(&mut hasher, 5, bytes),
+                Some(Value::Uuid(bytes)) => hash_part(&mut hasher, 6, bytes),
                 Some(_) => return Err(Anomaly::incorrect("rtdb.vector/partition-type",
                     "A vector index partition column holds booleans, integers, text, binary or UUIDs")),
-            };
-            hasher.update([tag]);
-            hasher.update((bytes.len() as u64).to_be_bytes());
-            hasher.update(&bytes);
+            }
         }
         Ok(Self(hasher.finalize().into()))
     }
+}
+
+fn hash_part(hasher: &mut Sha256, tag: u8, bytes: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_integer(hasher: &mut Sha256, value: i64) {
+    hash_part(hasher, 2, &value.to_be_bytes());
+}
+
+fn arrow_partition(event: &EventRef<'_>, columns: &[String]) -> Option<Partition> {
+    let mut hasher = Sha256::new();
+    for column in columns {
+        match event.put_column(column) {
+            Some(PutColumn::Stored(field, array, row)) => {
+                hash_arrow_part(&mut hasher, ArrowCell { field, array, row })?;
+            }
+            Some(PutColumn::Absent) | None => hash_part(&mut hasher, 0, &[]),
+        }
+    }
+    Some(Partition(hasher.finalize().into()))
+}
+
+fn hash_arrow_part(hasher: &mut Sha256, cell: ArrowCell<'_>) -> Option<()> {
+    if !cell.field.metadata().is_empty() || cell.field.data_type() != cell.array.data_type()
+        || cell.row >= cell.array.len()
+    {
+        return None;
+    }
+    let data_type = cell.field.data_type();
+    match data_type {
+        DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
+        | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32
+        | DataType::UInt64 | DataType::Utf8 | DataType::Binary => {}
+        _ => return None,
+    }
+    if cell.array.is_null(cell.row) {
+        hash_part(hasher, 0, &[]);
+    } else {
+        match data_type {
+            DataType::Null => hash_part(hasher, 0, &[]),
+            DataType::Boolean => {
+                let array = cell.array.as_any().downcast_ref::<BooleanArray>()?;
+                hash_part(hasher, 1, &[u8::from(array.value(cell.row))]);
+            }
+            DataType::Utf8 => hash_part(hasher, 4, cell.array.as_string::<i32>().value(cell.row).as_bytes()),
+            DataType::Binary => hash_part(hasher, 5, cell.array.as_binary::<i32>().value(cell.row)),
+            _ => hash_integer(hasher, cell.signed_integer()?),
+        }
+    }
+    Some(())
 }
 
 /// One indexable put and the position of its unit vector in the staged components.
@@ -80,8 +132,11 @@ impl IndexedRows {
         if header.op != EventOp::Put { return Ok(()); }
         let unit_offset = self.units.len();
         if !append_event_unit(event, &definition.column, self.dimensions, &mut self.units)? { return Ok(()); }
-        let partition = definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
-            .and_then(Partition::of).inspect_err(|_| self.units.truncate(unit_offset))?;
+        let partition = match arrow_partition(event, &definition.partition) {
+            Some(partition) => partition,
+            None => definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
+                .and_then(Partition::of).inspect_err(|_| self.units.truncate(unit_offset))?,
+        };
         self.push_row(header, partition, unit_offset);
         Ok(())
     }
@@ -166,6 +221,28 @@ pub(crate) fn unit_distance(left: &[f32], right: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_partition_uses_the_execution_value_digest() -> Result<()> {
+        use arrow_array::{Array, BinaryArray, StringArray, UInt8Array};
+
+        let text = StringArray::from(vec![None, Some("key")]);
+        let binary = BinaryArray::from(vec![Some(&b"\0a"[..]), None]);
+        let integer = UInt8Array::from(vec![255, 128]);
+        let flag = BooleanArray::from(vec![true, false]);
+        for row in 0..2 {
+            let mut hasher = Sha256::new();
+            let arrays: [&dyn Array; 4] = [&text, &binary, &integer, &flag];
+            let mut parts = Vec::new();
+            for array in arrays {
+                let field = arrow_schema::Field::new("key", array.data_type().clone(), true);
+                hash_arrow_part(&mut hasher, ArrowCell { field: &field, array, row }).unwrap();
+                parts.push(Some(Cow::Owned(read_execution_value(&field, array, row)?)));
+            }
+            assert_eq!(Partition(hasher.finalize().into()), Partition::of(parts)?);
+        }
+        Ok(())
+    }
 
     #[test]
     fn normalization_keeps_f64_precision_until_the_final_components() {

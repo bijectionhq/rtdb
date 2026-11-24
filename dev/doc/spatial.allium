@@ -50,6 +50,7 @@ entity SpatialPostings {
 -- Exact refinement reuses the prepared region topology and its ordered metric segments across candidates.
 -- A prepared filter belongs to its authenticated held read and retains its request projection and range or ranked matches.
 -- A continuation sends the filter capability, complete typed identity, bound, and observation flag.
+-- A negotiated ordinary Flight reply emits spatial page IPC as complete messages under the original hold and release checks.
 -- Repeating a continuation evaluates the same filter and held cut.
 -- Closing a filter or its held read releases the retained filter.
 -- A missing or invalid posting file is covered by reading the IID projection through the native Arrow page reader within the read budget.

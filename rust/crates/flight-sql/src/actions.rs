@@ -179,7 +179,7 @@ impl Service {
                 _ => None,
             };
             if let Some(wire) = spatial_wire {
-                return Ok(ActionReplies::Results(vec![Ok(self.spatial_held_owned_action(&call, &action.body, wire).await?)]));
+                return self.spatial_held_owned_action(&call, &action.body, wire, ipc_stream).await.map(ActionReplies::Owned);
             }
             if crate::owned_family::is_family_action(action_type) {
                 return Ok(ActionReplies::Results(vec![Ok(self.assertion_family_action(&call, action_type, &action.body).await?)]));
@@ -242,10 +242,10 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SPATIAL_GATHER_OWNED =>
-                    Ok(vec![Ok(Box::pin(self.gather_spatial_owned_action(&call, &action.body)).await?)]),
+                    return Box::pin(self.gather_spatial_owned_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
                     let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
-                    Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body, ranked).await?)])
+                    return self.next_spatial_owned_action(&call, &action.body, ranked, ipc_stream).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::SPATIAL_CLOSE_OWNED => {
                     self.close_spatial_owned_action(&call, &action.body)?;
@@ -277,17 +277,28 @@ impl Service {
                     return self.nearest_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::NEAREST_HELD_WORLD_V2 =>
                     return self.nearest_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_WORLD_PARENT_RANGE_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt).await?)]),
-                crate::owned_actions::HELD_WORLD_PARENT_COUNT_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt).await?)]),
-                crate::owned_actions::HELD_WORLD_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange).await?)]),
-                crate::owned_actions::HELD_WORLD_COUNT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCount).await?)]),
-                crate::owned_actions::HELD_WORLD_MEASURE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentMeasure).await?)]),
-                crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRangeAt).await?)]),
-                crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRange).await?)]),
-                crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading).await?)]),
-                crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full).await?)]),
-                crate::owned_actions::HELD_OWNED_RANGE_V3 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid).await?)]),
-                crate::owned_actions::HELD_OWNED_RANGE_V4 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_RANGE_AT_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_PARENT_COUNT_AT_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_RANGE_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_COUNT_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCount, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_MEASURE_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentMeasure, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_AT_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRangeAt, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_V1 =>
+                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRange, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_RANGE_V1 =>
+                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_RANGE_V2 =>
+                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_RANGE_V3 =>
+                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_RANGE_V4 =>
+                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_COUNT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, false).await?)]),
                 crate::owned_actions::HELD_OWNED_COUNT_V2 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, false).await?)]),
                 crate::owned_actions::HELD_OWNED_MEASURE_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, true).await?)]),
