@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 
 use arrow_array::{BooleanArray, cast::AsArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, UnionMode};
 use rtdb_columnar::{ArrowCell, read_execution_value};
 use rtdb_format::data::{EncodedEvent, EventRef, PutColumn};
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, ListView, Result, Value};
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, ListValue, ListView, NumericSpan, Result, Value};
 use sha2::{Digest, Sha256};
 
 use crate::definition::VectorDefinition;
@@ -166,13 +166,46 @@ fn event_value<'a>(event: &'a EventRef<'_>, column: &str) -> Result<Option<Cow<'
 
 fn append_event_unit(event: &EventRef<'_>, column: &str, dimensions: usize, output: &mut Vec<f32>) -> Result<bool> {
     let Some(PutColumn::Stored(field, array, row)) = event.put_column(column) else { return Ok(false) };
-    let cell = ArrowCell { field, array, row };
+    append_cell_unit(ArrowCell { field, array, row }, dimensions, output)
+}
+
+fn append_cell_unit(cell: ArrowCell<'_>, dimensions: usize, output: &mut Vec<f32>) -> Result<bool> {
     if cell.is_null()? { return Ok(false); }
     if let Some((values, range)) = cell.float_list_span() {
         return Ok(range.len() == dimensions && append_unit(output, range.map(|index| values.float_component(index))));
     }
-    let value = read_execution_value(field, array, row)?;
+    if let Some(span) = numeric_training_span(cell) {
+        return Ok(span.len() == dimensions && append_unit(output,
+            (0..span.len()).map(|index| span.get(index)?.signed().as_f64())));
+    }
+    let value = read_execution_value(cell.field, cell.array, cell.row)?;
     Ok(append_value_unit(output, &value, dimensions))
+}
+
+fn numeric_training_span(cell: ArrowCell<'_>) -> Option<NumericSpan<'_>> {
+    if !cell.field.metadata().is_empty() { return None; }
+    let element = match cell.field.data_type() {
+        DataType::List(element) => element,
+        DataType::FixedSizeList(element, width) => {
+            i32::try_from(cell.row.checked_mul(usize::try_from(*width).ok()?)?).ok()?;
+            element
+        }
+        _ => return None,
+    };
+    let component = |ty: &DataType| matches!(ty,
+        DataType::Null | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        | DataType::Float32 | DataType::Float64);
+    let supported = match element.data_type() {
+        DataType::Union(fields, UnionMode::Dense) =>
+            fields.iter().all(|(_, field)| component(field.data_type())),
+        ty => component(ty),
+    };
+    if supported && ListValue::supports_numeric_arrow(element) {
+        cell.numeric_list_span()
+    } else {
+        None
+    }
 }
 
 /// The unit vector of a SQL list value, or none where its cosine distance is undefined.
@@ -240,6 +273,26 @@ mod tests {
                 parts.push(Some(Cow::Owned(read_execution_value(&field, array, row)?)));
             }
             assert_eq!(Partition(hasher.finalize().into()), Partition::of(parts)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_training_keeps_the_signed_execution_values() -> Result<()> {
+        use arrow_array::{Array, ListArray, types::UInt64Type};
+
+        let list = ListArray::from_iter_primitive::<UInt64Type, _, _>([
+            Some(vec![Some(u64::MAX), Some(3)]),
+            Some(vec![None, Some(5)]),
+        ]);
+        let field = arrow_schema::Field::new("embedding", list.data_type().clone(), true);
+        for row in 0..list.len() {
+            let cell = ArrowCell { field: &field, array: &list, row };
+            assert!(numeric_training_span(cell).is_some());
+            let expected = value_unit(&read_execution_value(&field, &list, row)?, 2);
+            let mut output = vec![42.0];
+            assert_eq!(append_cell_unit(cell, 2, &mut output)?, expected.is_some());
+            assert_eq!(&output[1..], expected.as_deref().unwrap_or_default());
         }
         Ok(())
     }

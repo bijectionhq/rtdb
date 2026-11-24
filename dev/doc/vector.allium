@@ -41,6 +41,7 @@ entity ProbePlan {
 -- A generation covers one live current trie and is a deterministic function of that trie's puts and the definition.
 -- A put contributes its IID, valid interval, system-from, partition digest and unit vector.
 -- Supported plain Arrow partition cells contribute the same digest as their SQL execution values, including signed-width interpretation.
+-- Training normalizes supported Arrow numeric spans in execution order and interprets unsigned components at their signed execution width.
 -- Deletes, erases and puts whose vector has no defined cosine distance contribute nothing.
 -- Rows sort by partition, IID and temporal coordinates before training, so their input order does not reach the bytes.
 -- Each partition trains its own clusters with spherical k-means: evenly spaced seeds, a fixed number of rounds, f64 sums in row order and ties to the lower cluster.
