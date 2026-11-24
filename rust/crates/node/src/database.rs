@@ -605,7 +605,8 @@ impl DatabaseFactory {
             if let Some(authority) = native_authority {
                 let handle = replica_driver.attach_native_serving(replication.clone(), authority, self.options.automatic_gc).await?;
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
-                    handle, memory: Arc::clone(&self.memory), clock: Arc::clone(&self.clock), tokens: Arc::clone(&tokens),
+                    handle, memory: Arc::clone(&self.memory), storage: Arc::clone(&storage),
+                    clock: Arc::clone(&self.clock), tokens: Arc::clone(&tokens),
                     writable: !read_only && self.options.replication.may_lead,
                 }));
             }

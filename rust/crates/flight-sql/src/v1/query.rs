@@ -187,7 +187,7 @@ impl Service {
         let driver = database.serving_driver();
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
         let authority = if request.track || request.page.is_some() {
-            if !database.wire_tokens_supported() {
+            if !database.wire_tokens_supported() || driver.is_some_and(|driver| !driver.supports_query_tokens()) {
                 return Err(error::unsupported(if request.track { "query.track" } else { "query.page" }));
             }
             Some(database.token_authority().await.map_err(error::anomaly)?)

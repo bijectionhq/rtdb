@@ -95,7 +95,9 @@ impl Service {
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
                         }
-                        if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported() {
+                        if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported()
+                            && database.serving_driver().is_none_or(|driver| driver.supports_query_tokens())
+                        {
                             for feature in ["query.track", "query.page"] {
                                 if !features.iter().any(|existing| existing == feature) {
                                     features.push(feature.into());

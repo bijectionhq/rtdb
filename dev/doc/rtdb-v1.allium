@@ -20,7 +20,7 @@ surface StatelessDatabase {
     @guarantee CapabilityDiscovery
         -- A caller learns which operations and optional features the selected route can serve.
         -- An unavailable optional feature returns its name for comparison with Capabilities.
-        -- The default applied-position route withdraws its capabilities when Classic resolved history renders its branch fold unavailable.
+        -- A default attachment with Classic data and an empty branch fold advertises queries on merged main at its published replica cut.
 
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
@@ -28,7 +28,9 @@ surface StatelessDatabase {
         -- A basis orders cuts within the selected database incarnation.
         -- The shared v1 encoding places the 16 incarnation bytes first, then the unsigned position as eight big-endian bytes.
         -- Applied-position drivers supply their applied position in this field.
-        -- On these routes the query selects the requested branch and layer in the same fold that supplies transaction receipts.
+        -- A branch query selects the requested branch and layer in the same fold that supplies transaction receipts.
+        -- A Classic catalog query selects the installed replica cut as its basis.
+        -- Exactly can reopen that Classic cut while it is the current published catalog.
         -- A local-layer read uses the branch's own writes at the selected cut.
         -- The temporal read driver supplies a system-time boundary as the basis position.
         -- Exactly selects its named cut.
@@ -78,7 +80,7 @@ surface StatelessDatabase {
     @guarantee TransactionReceipt
         -- A route that advertises writes returns its selected outcome with the applied basis and system time.
         -- A matching committed request returns the stored receipt for its key.
-        -- The carrier passes the attempt identity, its submission time, and the exact admitted request bytes to the selected driver.
+        -- The writer stamps the admission time and records the canonical transaction request and its scoped idempotency key.
         -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
 
     @guarantee TransactionRequirements

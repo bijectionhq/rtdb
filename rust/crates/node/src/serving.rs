@@ -104,6 +104,8 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb/token-rotation", "This driver does not own token key rotation"))
     }
 
+    fn supports_query_tokens(&self) -> bool { true }
+
     fn supports_row_visibility(&self) -> bool { false }
 
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, _cancellation: &CancellationToken) -> Result<()> {
