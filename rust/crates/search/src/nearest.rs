@@ -173,6 +173,20 @@ impl HeldVectorOverlay {
         Ok(())
     }
 
+    pub fn shadow_opened_projection(
+        &mut self, partition: usize, id: EntityId, vector: &[f32], filters: &[Option<Vec<u8>>], query: &NearestQuery,
+    ) -> Result<()> {
+        self.reserve_shadow(&id, vector.len(), filters.iter().flatten().map(Vec::len).sum())?;
+        self.register_shadow(partition, &id)?;
+        let distance = if query.admits(filters.iter().map(Option::as_deref)) {
+            query.distance(vector.iter().copied().map(f64::from))
+        } else {
+            Ok(None)
+        };
+        self.rows.push((partition, id, ShadowVector::World(distance)));
+        Ok(())
+    }
+
     fn reserve_shadow(&mut self, id: &EntityId, components: usize, filter_bytes: usize) -> Result<()> {
         // These charges also govern admission for shadows backed by an already charged batch.
         let bytes = identity_charge(id)

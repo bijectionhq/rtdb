@@ -500,6 +500,11 @@ impl OwnedSchema {
         self.0.fields.iter().any(|field| field.kind.is_opaque())
     }
 
+    pub(crate) fn has_only_opaque_column(&self, name: &str) -> bool {
+        let mut opaque = self.0.fields.iter().filter(|field| field.kind.is_opaque());
+        opaque.next().is_some_and(|field| field.name == name) && opaque.next().is_none()
+    }
+
     pub fn path_column_type(&self, name: &str) -> Option<ScalarType> {
         match self.path_field(name)?.kind.path_logical()? {
             LogicalType::Scalar(ty) => Some(ty),

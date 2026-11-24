@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::keys::{
     AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, EnrolledWorldRow, FamilyOccurrence, KeyService, LandingLink,
-    LandingReservation, WorldRowSlot,
+    LandingReservation, WorldRowSlot, family_vault_address, world_row_scope,
 };
 
 struct Scope {
@@ -100,13 +100,7 @@ impl Scope {
     }
 
     fn family(&self, family: Uuid) -> Uuid {
-        let mut address = Context::new(&SHA256);
-        address.update(b"rtdb.owned/assertion-family/v1\0");
-        address.update(self.deployment.as_bytes());
-        address.update(family.as_bytes());
-        let mut bytes = [0; 16];
-        bytes.copy_from_slice(&address.finish().as_ref()[..16]);
-        Uuid::from_bytes(bytes)
+        family_vault_address(self.deployment, family)
     }
 
     fn stage(&self, stage: FamilyStage) -> Result<AssertionStage> {
@@ -119,7 +113,7 @@ impl Scope {
     fn enrolled_row(&self, row: &WorldRowAuthoring) -> Result<EnrolledWorldRow> {
         Ok(EnrolledWorldRow {
             world: row.world, assertion: row.assertion, capability: self.stage(row.stage)?,
-            scope_commitment: row_scope(row), codec: row.codec,
+            scope_commitment: world_row_scope(row_slot(row), &row.disclosure), codec: row.codec,
         })
     }
 
@@ -162,19 +156,8 @@ fn wire_derived(row: DerivedRow) -> FamilyDerivedRow {
     }
 }
 
-/// Binds a sealed body to exactly one world overlay row and disclosure scope.
-fn row_scope(row: &WorldRowAuthoring) -> [u8; 32] {
-    let mut scope = Context::new(&SHA256);
-    scope.update(b"rtdb.owned/world-overlay-row/v1\0");
-    scope.update(row.world.as_bytes());
-    for field in [row.relation.as_bytes(), row.key.as_slice()] {
-        scope.update(&(field.len() as u16).to_be_bytes());
-        scope.update(field);
-    }
-    scope.update(&row.disclosure);
-    let mut commitment = [0; 32];
-    commitment.copy_from_slice(scope.finish().as_ref());
-    commitment
+fn row_slot(row: &WorldRowAuthoring) -> WorldRowSlot<'_> {
+    WorldRowSlot { world: row.world, relation: &row.relation, key: &row.key }
 }
 
 pub(super) async fn serve(
@@ -291,8 +274,7 @@ async fn admit_row(
     scope: &Scope, families: &crate::keys::AssertionFamilies<'_>, row: &WorldRowAuthoring,
 ) -> Result<(AssertionStage, AssertionAuthoring)> {
     let enrolled = scope.enrolled_row(row)?;
-    let slot = WorldRowSlot { world: row.world, relation: &row.relation, key: &row.key };
-    families.require_row_capability(scope.family(row.family), enrolled, slot).await?;
+    families.require_row_capability(scope.family(row.family), enrolled, row_slot(row)).await?;
     Ok((enrolled.capability, AssertionAuthoring {
         assertion_id: enrolled.assertion, scope_commitment: enrolled.scope_commitment, codec: enrolled.codec,
     }))

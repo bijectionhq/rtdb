@@ -3,7 +3,7 @@
 This is the Flight contract a placed writer's client uses to keep per-copy custody of a protected row.
 The vault owner is `AssertionFamilies` in `rust/crates/multi/src/keys/assertion/family.rs`.
 The Flight decoding lives in `rust/crates/flight-sql/src/owned_family.rs` and the placed host in `rust/crates/multi/src/process/owned_worlds/assertion_families.rs`.
-Hosted protocol 215 adds the scope and enrolment actions and position admission.
+Hosted protocol 215 adds the scope and enrolment actions, position admission, and ranking of sealed world projections.
 
 ## Model
 
@@ -236,6 +236,18 @@ Its authoring scope binds the private family identity and the Root target.
 * `rtdb.owned.OpenFamilyLandingPayload.v1` takes family, destination `stage`, `root-binding`, then the destination envelope. It verifies the active binding and exact envelope digest and returns the inner carrier. Opening requires the current family both before and after the broker unwrap.
 * `rtdb.owned.SealFamilyLandingLink.v2` takes a binding-kind byte. Kind 0 is followed by the placed request fields above. Kind 1 is followed by family, reservation, `root-target`, the reviewed source `position`, then the destination envelope digest. It returns the separately sealed link envelope.
 * `rtdb.owned.ActivateFamilyLanding.v2` takes a binding-kind byte. Kind 0 is followed by the placed request fields above. Kind 1 is followed by family, `root-binding`, reservation, then the link envelope. The vault authenticates the exact link before first activation, and accepts an exact activation retry independently of link retirement.
+
+## World search
+
+A derived overlay row stores its projection in the declared opaque binary field `sealed_world_projection`.
+The carrier is ASCII `BJWP1`, family `uuid`, `stage`, `assertion`, member `assertion`, disclosure scope (32), and the `RTAS` envelope.
+The codec is the u32 representation of ASCII `BJWR`.
+Ranking takes the authoring world, relation and row key from the winning overlay layer and performs the current family and stage check before opening the envelope.
+The opened body is the JSON pair of text paths and vector paths, used only as transient ranking input.
+A fenced or retired derived winner continues to shadow a parent row and contributes no ranking input.
+Protected-row payload carriers retain their `BJWC1` framing.
+Current and accepted-cut point reads can return the opaque carrier with the resolver's authoring line and ordinal.
+Resolution uses that original authoring line for a winner inherited from a parent world.
 
 ## Fence semantics across dependent forks
 

@@ -123,6 +123,30 @@ pub struct WorldRowSlot<'a> {
     pub key: &'a [u8],
 }
 
+pub(crate) fn family_vault_address(deployment: Uuid, family: Uuid) -> Uuid {
+    let mut address = Context::new(&SHA256);
+    address.update(b"rtdb.owned/assertion-family/v1\0");
+    address.update(deployment.as_bytes());
+    address.update(family.as_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&address.finish().as_ref()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+pub(crate) fn world_row_scope(slot: WorldRowSlot<'_>, disclosure: &[u8; 32]) -> [u8; 32] {
+    let mut scope = Context::new(&SHA256);
+    scope.update(b"rtdb.owned/world-overlay-row/v1\0");
+    scope.update(slot.world.as_bytes());
+    for field in [slot.relation.as_bytes(), slot.key] {
+        scope.update(&(field.len() as u16).to_be_bytes());
+        scope.update(field);
+    }
+    scope.update(disclosure);
+    let mut commitment = [0; 32];
+    commitment.copy_from_slice(scope.finish().as_ref());
+    commitment
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FamilyFence {
     pub order: Uuid,

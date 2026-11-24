@@ -2042,7 +2042,8 @@ impl OwnedReadSession {
         self.admit_read().await?;
         if !(1..=32).contains(&relations.len()) || !world.mode.is_writable() || world.dropped
             || relations.iter().any(|relation| !relation.is_root_data() || world.schemas.relation(relation)
-                .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+                .is_none_or(|schema| schema.lifetime_micros().is_some()
+                    || (schema.has_opaque_columns() && !relation.admits_world_ciphertext_points(schema))))
             || system < world.inherited_system() || system > self.present.system_time
         {
             return Err(unavailable());
