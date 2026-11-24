@@ -11,7 +11,7 @@ fn object(kind: ObjectKind) -> ObjectId {
 }
 
 #[test]
-fn all_eight_record_kinds_round_trip_with_fixed_tags() {
+fn record_kinds_round_trip_with_fixed_tags() {
     let manifest = object(ObjectKind::Manifest);
     let pin = Pin {
         id: Uuid::from_u128(42),
@@ -37,6 +37,11 @@ fn all_eight_record_kinds_round_trip_with_fixed_tags() {
         },
         Record::Settle { tx_lsn: 1 },
         Record::Refuse { tx_lsn: u64::MAX },
+        Record::KeyRetirement {
+            generation: 3,
+            rotation_lsn: u64::MAX,
+            observed_at: i64::MIN,
+        },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();

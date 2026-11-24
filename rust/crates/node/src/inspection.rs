@@ -217,6 +217,7 @@ fn source_message(message: Option<&SourceMessage>) -> Result<(&'static str, Stri
         Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(artefacts))) => ("artefacts-added", artefacts_message(&ArtefactsMessage::Added(artefacts), false)),
         Some(SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(artefacts))) => ("artefacts-removed", artefacts_message(&ArtefactsMessage::Removed(artefacts), false)),
         Some(SourceMessage::Protobuf(SourceBody::DetachDatabase(detach))) => ("detach-database", edn::map([("type", ":detach-database".into()), ("db-name", edn::quoted(detach.db_name.as_deref().unwrap_or_default()))])),
+        Some(SourceMessage::Protobuf(SourceBody::ServingTransact(_))) => ("serving-transact", edn::map([("type", ":serving-transact".into())])),
         None => ("unknown", edn::map([("type", ":unknown".into())])),
     })
 }

@@ -15,8 +15,16 @@
 -- Replicas use the incarnation published in that database's object store.
 -- A classic resolved transaction outside that fold makes the branch route unavailable for the attachment.
 -- The classic partition continues to apply transactions from its source log.
--- Each ordinary branch Transact appends one resolved record carrying its admission identifier, submission time and commitment to the admitted bytes.
--- The matching record's ordered read-back advances the fold, releases the receipt and publishes settled effect keys with the applied basis.
+-- Branch Transact submissions with operations append the canonical request and its authenticated admission context to the source log.
+-- The admission context preserves the receipt namespace, label scope, verified claims and any sealed custody request digest.
+-- Nodes that submit or resolve branch requests share the database's source admission key through its private object store.
+-- The confirmed writer resolves source requests in source order and stamps the replica transaction decision with its own admission time.
+-- Each replica transaction decision carries the scoped key, canonical request and decided outcome with its effects.
+-- A deduplicated request or a request rejected before decision consumes its source position through a replica reply record.
+-- The matching term-admitted read-back advances the applied branch fold and source position, releases the receipt and publishes settled effect keys with the applied basis.
+-- A timed original retains its source position for recovery, and read-back of Settle or Refuse installs that source position and the final receipt.
+-- A writer recovering a timed original orders Refuse before it resumes the source after that position.
+-- Read-only validation answers at a linearizable applied cut.
 -- A block produced for the branch attachment carries its fold and receipt checkpoint at the block boundary.
 -- An append receipt reports the durable position and timestamp of the record.
 -- Native client submissions and replica writes use this port to append.
@@ -536,6 +544,10 @@ variant TxMessage : SourceMessage {
     user_metadata: Bytes?
 }
 
+variant ServingTransactMessage : SourceMessage {
+    authenticated_request: Bytes
+}
+
 variant LegacyTxMessage : SourceMessage {
     -- A transaction written by an older node: the whole message is one opaque payload rather than a structured envelope.
     -- Still resolvable, so that a log written by an older node replays.
@@ -711,12 +723,13 @@ variant TriesDeletedMessage : ReplicaMessage {
 }
 
 variant NoOpMessage : ReplicaMessage {
-    -- Carries no effect of its own, and is used for three things.
+    -- Carries leadership controls, source progress and applied branch records.
     --   1. A leadership claim. A node appends one stamped with a term above the highest it has read, at position 0 in that term; whether that claim confers leadership is settled by where the log put it (see log-processor-lifecycle.allium).
     --   2. A leader's assertion that it is still there, on a database with no traffic to write. A leader with work needs none, its own writes carrying the same term.
     --   3. Carrying the leader's source watermark forward where no other record would — a flush whose CAS fails, and which therefore finishes no block.
-    src_msg_id: MessageId?   -- null on a claim and on an assertion
-    serving_record: Bytes?   -- advances the applied branch fold without consuming a source position
+    --   4. Installing a serving decision or completing a source occurrence with an already decided result.
+    src_msg_id: MessageId?   -- set on records that complete a source occurrence
+    serving_record: Bytes?   -- branch transaction decision, timed terminal or source reply
 }
 
 variant OversizedMessage : ReplicaMessage {

@@ -80,6 +80,7 @@ impl Reachability {
                 }
                 Record::Lease { .. }
                 | Record::KeyRotate { .. }
+                | Record::KeyRetirement { .. }
                 | Record::Settle { .. }
                 | Record::Refuse { .. } => {}
             }

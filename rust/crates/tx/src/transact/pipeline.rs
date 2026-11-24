@@ -117,6 +117,10 @@ impl TransactPipeline {
     /// Original positions of timed writes still waiting for their terminal record.
     pub fn awaiting_terminal(&self) -> impl Iterator<Item = u64> + '_ { self.timed.keys().copied() }
 
+    pub fn is_deciding(&self, key: &[u8], namespace: Option<[u8; 32]>) -> bool {
+        self.deciding.contains_key(&TxKey { namespace, key: key.to_vec() })
+    }
+
     /// `TxStatus`: a key still in flight reports `rtdb/transaction-pending`.
     pub fn tx_status(&self, key: &[u8]) -> Result<Receipt> {
         if self.deciding.contains_key(&TxKey { namespace: None, key: key.to_vec() }) { return Err(pending_error()); }

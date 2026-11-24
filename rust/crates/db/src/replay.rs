@@ -28,6 +28,7 @@ pub(crate) struct Rotation {
     pub(crate) cut: Lsn,
     pub(crate) generation: u64,
     pub(crate) committed: bool,
+    pub(crate) retirement_observed_at: Option<i64>,
 }
 
 pub(crate) struct Committed {
@@ -207,6 +208,7 @@ impl Committed {
                         cut: lsn,
                         generation: checkpoint.key_generation,
                         committed: false,
+                        retirement_observed_at: None,
                     });
                 }
                 checkpoint.key_generation
@@ -229,6 +231,16 @@ impl Committed {
                     .ok_or_else(|| invalid("Key rotation has no staged checkpoint"))?;
                 rotation.committed = true;
                 *generation
+            }
+            Record::KeyRetirement { generation, rotation_lsn, observed_at } => {
+                let rotation = self.rotation.as_mut().filter(|rotation| {
+                    rotation.committed
+                        && rotation.generation == *generation
+                        && rotation.cut.0.checked_add(1) == Some(*rotation_lsn)
+                        && rotation.retirement_observed_at.is_none()
+                }).ok_or_else(|| invalid("Key retirement does not match an unfenced rotation"))?;
+                rotation.retirement_observed_at = Some(*observed_at);
+                self.generation
             }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
         };
@@ -286,6 +298,7 @@ impl Committed {
                 cut: lsn,
                 generation: checkpoint.key_generation,
                 committed: false,
+                retirement_observed_at: None,
             });
         } else if header[24] != 0 {
             return Err(invalid("The checkpoint has an unknown generation marker"));

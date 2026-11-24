@@ -32,9 +32,9 @@ impl SourceMessage {
         let mut cursor = 0;
         while cursor < payload.len() {
             let (field, wire, body) = wire_key(payload, cursor).map_err(invalid)?;
-            if matches!(field, 1..=4 | 6 | 7) {
+            if matches!(field, 1..=4 | 6..=9) {
                 if wire != 2 { return Err(invalid("Source message body must be length-delimited")); }
-                transaction = field == 6;
+                transaction = matches!(field, 6 | 9);
             }
             cursor = skip_wire(payload, field, wire, body, 0).map_err(invalid)?;
         }

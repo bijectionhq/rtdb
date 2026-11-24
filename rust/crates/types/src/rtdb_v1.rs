@@ -11,7 +11,7 @@ pub const MAX_BRANCH_BYTES: usize = 255;
 pub const WRITTEN_BASIS_COLUMN: &str = "_rtdb_written_basis";
 pub const QUERY_WRITTEN_BASIS: &str = "query.written-basis";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelScope {
     pub read: BTreeSet<Vec<u8>>,
     pub write: BTreeSet<Vec<u8>>,
