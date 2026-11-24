@@ -557,7 +557,11 @@ mod tests {
             keys(&tree, after.clone(), Timestamp(4)).await,
             [(-1, events[1].iid), (9, events[4].iid)],
         );
-        let address = Address { iid: events[4].iid, key: events[4].entity_key.as_deref().unwrap().to_vec() };
+        let address = AddressRef {
+            iid: events[4].iid,
+            key: events[4].entity_key.as_deref().unwrap(),
+        }
+        .owned();
         let spans = tree.spans(&after, &address).await?;
         assert_eq!(spans[0].tuple.view().cell(1), AtomRef::Binary(&[1, 2]));
         assert_eq!(spans[0].tuple.view().cell(2), AtomRef::Null);

@@ -43,6 +43,7 @@ entity Checkpoint {
 -- A legacy checkpoint checksum binds the canonical JSON layout published by the writer.
 -- A newly published page can keep a reference to a page originally written in JSON.
 -- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.
+-- An Arrow posting fence can share its address bytes under the reservation already held by its key tuple.
 -- Every immutable page reference binds its exact subtree entry count and full fences.
 -- A covered held count subtracts the full-key boundary ranks in each bucket containing the requested valid instant.
 -- The bucket cover makes the counts disjoint across the visible postings for that instant.

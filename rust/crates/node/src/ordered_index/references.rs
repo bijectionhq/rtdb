@@ -1,11 +1,13 @@
-use std::sync::Arc;
+use std::{cell::OnceCell, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
     UInt8Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
 };
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field};
+use bytes::Bytes;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Result, Timestamp};
 
@@ -13,10 +15,21 @@ use super::{
     format_error,
     key::{AtomRef, Bucket, arrow},
     postings::{KeyBatch, ProjectedKeys, Tuple},
-    tree::{Address, IndexRevision, Key, KeyRef, Measure, MeasureDomain, Pointer},
+    tree::{Address, AddressRef, IndexRevision, Key, KeyRef, Measure, MeasureDomain, Pointer},
 };
 
 type Reference = (Option<IndexRevision>, Option<Arc<Pointer>>);
+
+struct FenceAddressBuffer {
+    values: Buffer,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl AsRef<[u8]> for FenceAddressBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.values.as_slice()
+    }
+}
 
 fn fields() -> Vec<Field> {
     vec![
@@ -163,6 +176,7 @@ pub(super) fn decode(
     let starts = arrow::<UInt64Array>(columns[7].as_ref())?;
     let iids = arrow::<FixedSizeBinaryArray>(columns[8].as_ref())?;
     let addresses = arrow::<BinaryArray>(columns[9].as_ref())?;
+    let retained_addresses = OnceCell::new();
     let times = arrow::<Int64Array>(columns[10].as_ref())?;
     let measure_counts = arrow::<UInt64Array>(columns[11].as_ref())?;
     let measure_domains = arrow::<FixedSizeBinaryArray>(columns[12].as_ref())?;
@@ -224,9 +238,9 @@ pub(super) fn decode(
             .then(|| Iid::from_slice(iids.value(row)))
             .transpose()?;
         let address = match (iid, addresses.is_null(row)) {
-            (Some(iid), false) => Some(Address {
+            (Some(iid), false) => Some(AddressRef {
                 iid,
-                key: addresses.value(row).to_vec(),
+                key: addresses.value(row),
             }),
             (None, true) => None,
             _ => return Err(invalid()),
@@ -235,13 +249,26 @@ pub(super) fn decode(
         let empty = || tuple.view().iter().all(|cell| cell == AtomRef::Null);
         match (kinds.value(row), bucket, address, time) {
             (0, Some(bucket), Some(address), None) if tuple.view().len() != 0 => {
+                // A posting fence already retains this batch through its tuple.
+                let key = if address.key.is_empty() {
+                    Bytes::new()
+                } else {
+                    retained_addresses
+                        .get_or_init(|| {
+                            Bytes::from_owner(FenceAddressBuffer {
+                                values: addresses.values().clone(),
+                                _memory: memory.clone(),
+                            })
+                        })
+                        .slice_ref(address.key)
+                };
                 Ok(Some(Key::Posting {
                     bucket,
                     tuple,
-                    address,
+                    address: Address::new(address.iid, key),
                 }))
             }
-            (1, None, Some(address), None) if empty() => Ok(Some(Key::Row(address))),
+            (1, None, Some(address), None) if empty() => Ok(Some(Key::Row(address.owned()))),
             (2, None, None, Some(time)) if empty() => Ok(Some(Key::Revision(time))),
             (3, None, None, None) if empty() => Ok(None),
             _ => Err(invalid()),
@@ -322,17 +349,16 @@ mod tests {
     use crate::ordered_index::{ipc, key::Atom, postings::KeyRow};
 
     #[test]
-    fn arrow_reference_fences_keep_complete_identities_in_the_same_iid() {
+    fn arrow_posting_fences_share_reserved_bytes_without_changing_full_identities() {
         let first = EntityId::String("entity".into());
         let iid = first.iid();
         let last = EntityId::Uuid(iid.0);
-        let fence = |identity: EntityId| Key::Posting {
+        let first = Address::new(iid, first.handle_bytes().into());
+        let last = Address::new(iid, last.handle_bytes().into());
+        let fence = |address| Key::Posting {
             bucket: Bucket { level: 0, start: 0 },
             tuple: KeyRow::Fence(vec![Atom::Text("value".into())].into()),
-            address: Address {
-                iid,
-                key: identity.handle_bytes(),
-            },
+            address,
         };
         let pointer = Pointer {
             digest: "01".repeat(32),
@@ -344,13 +370,49 @@ mod tests {
                 domain: MeasureDomain::Decimal128(25, -3),
                 sum: arrow_buffer::i256::from_i128(-123_456).to_be_bytes(),
             },
-            first: fence(first),
-            last: fence(last),
+            first: fence(first.clone()),
+            last: fence(last.clone()),
         };
-        let encoded = ipc::encode(&encode(&[(None, Some(&pointer))]).unwrap()).unwrap();
-        let reservation = MemoryBudget::new(1 << 20).reserve(64 << 10).unwrap();
-        let batch = ipc::decode(encoded.into(), 2).unwrap();
-        let decoded = decode(batch, 1, &reservation).unwrap();
-        assert_eq!(decoded[0].1.as_deref(), Some(&pointer));
+        let rows = Pointer {
+            digest: "02".repeat(32),
+            measure: Measure::default(),
+            first: Key::Row(first),
+            last: Key::Row(last),
+            ..pointer.clone()
+        };
+        let encode_both = |posting: &Pointer, rows: &Pointer| {
+            ipc::encode(&encode(&[(None, Some(posting)), (None, Some(rows))]).unwrap()).unwrap()
+        };
+        let encoded = Bytes::from(encode_both(&pointer, &rows));
+        let batch = ipc::decode(encoded.clone(), 4).unwrap();
+        let addresses = arrow::<BinaryArray>(batch.column(9).as_ref()).unwrap().clone();
+        let budget = MemoryBudget::new(1 << 20);
+        let reservation = budget.reserve(64 << 10).unwrap();
+        let mut decoded = decode(batch, 2, &reservation).unwrap();
+        let posting = decoded[0].1.as_deref().unwrap();
+        let row = decoded[1].1.as_deref().unwrap();
+        assert_eq!(posting, &pointer);
+        assert_eq!(row, &rows);
+        for (offset, key) in [&posting.first, &posting.last].into_iter().enumerate() {
+            let KeyRef::Posting(_, _, address) = key.view() else {
+                panic!("Expected a posting fence");
+            };
+            assert_eq!(address.iid, iid);
+            assert_eq!(address.key.as_ptr(), addresses.value(offset).as_ptr());
+        }
+        let KeyRef::Row(address) = row.first.view() else {
+            panic!("Expected a row fence");
+        };
+        assert_ne!(address.key.as_ptr(), addresses.value(2).as_ptr());
+        assert_eq!(encode_both(posting, row).as_slice(), encoded.as_ref());
+        let legacy = serde_json::to_vec(&pointer).unwrap();
+        assert_eq!(serde_json::to_vec(posting).unwrap(), legacy);
+        assert_eq!(&serde_json::from_slice::<Pointer>(&legacy).unwrap(), posting);
+
+        drop(addresses);
+        drop(reservation);
+        assert_eq!(budget.used_bytes(), 64 << 10);
+        drop(decoded.remove(0));
+        assert_eq!(budget.used_bytes(), 0);
     }
 }

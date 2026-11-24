@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_storage::{IoRegion, ObjectKey, cache::BufferPool, object_store::IndexPageScope};
 use rtdb_types::{EventHeader, Iid, Interval, Result, Timestamp};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +30,11 @@ type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Address {
     pub iid: Iid,
-    pub key: Vec<u8>,
+    #[serde(
+        serialize_with = "Address::serialize_key",
+        deserialize_with = "Address::deserialize_key"
+    )]
+    key: Bytes,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,19 +54,33 @@ impl AddressRef<'_> {
         })
     }
     pub fn owned(self) -> Address {
-        Address {
-            iid: self.iid,
-            key: self.key.to_vec(),
-        }
+        Address::new(self.iid, Bytes::copy_from_slice(self.key))
     }
 }
 
 impl Address {
+    pub fn new(iid: Iid, key: Bytes) -> Self {
+        Self { iid, key }
+    }
+
     pub fn view(&self) -> AddressRef<'_> {
         AddressRef {
             iid: self.iid,
-            key: &self.key,
+            key: self.key.as_ref(),
         }
+    }
+
+    fn serialize_key<S: Serializer>(
+        key: &Bytes,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        key.as_ref().serialize(serializer)
+    }
+
+    fn deserialize_key<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Bytes, D::Error> {
+        Vec::<u8>::deserialize(deserializer).map(Bytes::from)
     }
 }
 
