@@ -6,12 +6,13 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::logs::PartitionReplay;
 use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
 
 pub struct RecoveredPartition {
@@ -29,7 +30,7 @@ pub struct RecoveredPartition {
 struct PreparedReplay {
     logs: Arc<PartitionLogs>,
     after: ReplicaPosition,
-    tail: Box<dyn LogTail>,
+    tail: PartitionReplay,
 }
 
 impl RecoveredPartition {
@@ -72,7 +73,7 @@ impl RecoveredPartition {
         Ok(())
     }
 
-    pub(crate) fn take_replay_tail(&mut self, logs: &Arc<PartitionLogs>, after: ReplicaPosition) -> Result<Option<Box<dyn LogTail>>> {
+    pub(crate) fn take_replay_tail(&mut self, logs: &Arc<PartitionLogs>, after: ReplicaPosition) -> Result<Option<PartitionReplay>> {
         let Some(prepared) = self.replay_tail.take() else { return Ok(None); };
         if !Arc::ptr_eq(&prepared.logs, logs) || prepared.after != after {
             return Err(invalid("The prepared replica cursor belongs to a different log or checkpoint boundary"));

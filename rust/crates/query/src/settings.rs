@@ -162,6 +162,20 @@ impl QueryContext {
         Ok(self)
     }
 
+    pub fn with_wire_snapshot(
+        mut self: Arc<Self>, snapshot: rtdb_index::Snapshot, system_time: Timestamp, current_time: Instant,
+    ) -> Result<Arc<Self>> {
+        let context = Arc::make_mut(&mut self);
+        let catalog = &mut context.catalog;
+        let database = Arc::make_mut(&mut catalog.databases).get_mut(&catalog.default_database)
+            .ok_or_else(|| invalid("wire-cut", "The read requires its captured database"))?;
+        database.partitions = vec![snapshot];
+        catalog.reset_sql_snapshot_view(None, None);
+        catalog.runtime = None;
+        catalog.ordered_indexes = None;
+        self.with_wire_cut(system_time, current_time)
+    }
+
     /// Reuses the captured store generation and lease while lowering one owned read's system cap.
     pub fn with_owned_system_cut(
         &self, system_time: Timestamp, cancellation: &tokio_util::sync::CancellationToken,

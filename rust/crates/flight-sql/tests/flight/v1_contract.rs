@@ -36,8 +36,8 @@ async fn get<M: Message + Name, R: Message + Default>(
     let last = frames.pop().expect("typed trailer");
     assert!(last.data_header.is_empty() && last.data_body.is_empty());
     let trailer = R::decode(last.app_metadata).expect("protobuf stream trailer");
-    let schema = arrow_ipc::root_as_message(&frames.first().expect("Arrow schema").data_header)
-        .unwrap();
+    let schema =
+        arrow_ipc::root_as_message(&frames.first().expect("Arrow schema").data_header).unwrap();
     assert!(schema.header_as_schema().is_some());
     let stream = futures::stream::iter(frames.into_iter().map(Ok));
     let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream)
@@ -83,7 +83,11 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let caps = v1::CapabilitiesResponse::decode(reply[0].body.clone()).unwrap();
     assert_eq!(caps.api, "rtdb.v1");
     assert!(caps.features.iter().any(|feature| feature == "query.track"));
-    assert!(caps.features.iter().any(|feature| feature == "changes.progress-only"));
+    assert!(
+        caps.features
+            .iter()
+            .any(|feature| feature == "changes.progress-only")
+    );
     assert_eq!(caps.limits.unwrap().min_key_bytes, 16);
     client
         .update(
@@ -325,10 +329,16 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
 
     let tx = client.begin().await;
     client
-        .update("INSERT INTO wire_a (_id, n) VALUES (1, 10), (2, 20)", Some(tx.clone()))
+        .update(
+            "INSERT INTO wire_a (_id, n) VALUES (1, 10), (2, 20)",
+            Some(tx.clone()),
+        )
         .await;
     client
-        .update("INSERT INTO wire_z (_id, n) VALUES (1, 30)", Some(tx.clone()))
+        .update(
+            "INSERT INTO wire_z (_id, n) VALUES (1, 30)",
+            Some(tx.clone()),
+        )
         .await;
     client.end(tx, true).await.unwrap();
     let (_, earlier) = query(&mut client, input("SELECT 1 LIMIT 0")).await;
@@ -378,11 +388,22 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
                 assert_eq!(times.value(row), expected_time);
                 assert!(batch.column(2).as_boolean().value(row));
                 assert!(keys.is_valid(row) && after.is_valid(row) && before.is_null(row));
-                let key = StreamReader::try_new(keys.value(row), None).unwrap().next().unwrap().unwrap();
-                let after = StreamReader::try_new(after.value(row), None).unwrap().next().unwrap().unwrap();
+                let key = StreamReader::try_new(keys.value(row), None)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                let after = StreamReader::try_new(after.value(row), None)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(key.num_rows(), 1);
                 assert_eq!(after.num_rows(), 1);
-                assert_eq!(key.column(0).as_ref(), after.column_by_name("_id").unwrap().as_ref());
+                assert_eq!(
+                    key.column(0).as_ref(),
+                    after.column_by_name("_id").unwrap().as_ref()
+                );
             }
         }
         assert!(!images.complete);
@@ -412,8 +433,14 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
         assert_eq!(progress, ordinary);
 
         request.images = v1::Images::Keys as i32;
-        let status = get::<_, v1::ChangesTrailer>(&mut client, request).await.unwrap_err();
-        error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        let status = get::<_, v1::ChangesTrailer>(&mut client, request)
+            .await
+            .unwrap_err();
+        error(
+            status,
+            v1::AnomalyCategory::Incorrect,
+            "rtdb/invalid-request",
+        );
     }
 
     let mut request = v1::ChangesRequest {
@@ -438,7 +465,9 @@ async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
 
     request.after = later.basis.clone();
     request.wait_millis = Some(10);
-    let (rows, timeout) = get::<_, v1::ChangesTrailer>(&mut client, request).await.unwrap();
+    let (rows, timeout) = get::<_, v1::ChangesTrailer>(&mut client, request)
+        .await
+        .unwrap();
     assert!(rows.is_empty());
     assert_eq!(timeout.through, later.basis);
     assert!(timeout.complete);
@@ -745,5 +774,411 @@ async fn rtdb_v1_bench_point_and_range_against_held_reads() {
         .action("rtdb.owned.CloseRead.v1", held)
         .await
         .unwrap();
+    running.stop().await;
+}
+
+const FIXTURE_INCARNATION: [u8; 16] = [41; 16];
+
+struct AppliedFixture {
+    state: std::sync::Mutex<rtdb_tx::transact::TransactState>,
+    claims: rtdb_types::rtdb_v1::ClaimSealer,
+    memory: Arc<MemoryBudget>,
+    admission: std::sync::Mutex<Option<(uuid::Uuid, Timestamp, Bytes)>>,
+    waiting: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl rtdb_node::serving::ServingDriver for AppliedFixture {
+    fn incarnation(&self) -> [u8; 16] {
+        FIXTURE_INCARNATION
+    }
+
+    fn features(&self) -> &[&str] {
+        &[
+            "query",
+            "query.track",
+            "query.page",
+            "linearizable",
+            "transact",
+            "tx-status",
+            "branches",
+        ]
+    }
+
+    async fn query(
+        &self,
+        source: rtdb_node::serving::QuerySource,
+        track: bool,
+        now: Timestamp,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_node::serving::QueryView> {
+        use rtdb_types::rtdb_v1::At;
+        let state = self.state.lock().unwrap();
+        let at = if source.at == At::Linearizable {
+            At::Latest
+        } else {
+            source.at
+        };
+        let view = state.index().view(&source.branch, at, source.layer, now)?;
+        Ok(rtdb_node::serving::QueryView {
+            snapshot: rtdb_query::branch_snapshot(&view, &self.memory)?,
+            cut: view.cut(),
+            claim: track
+                .then(|| rtdb_query::seal_branch_claim(&view, &self.claims))
+                .transpose()?,
+        })
+    }
+
+    async fn transact(
+        &self,
+        request: rtdb_node::serving::TransactSubmission,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_tx::transact::Receipt> {
+        use rtdb_tx::transact::{Resolution, TransactionRecord};
+        if request.source.ends_with(&[0xf8, 0x07, 0x01]) {
+            *self.admission.lock().unwrap() =
+                Some((request.attempt, request.submitted_at, request.source));
+            self.waiting.notify_one();
+            self.release.notified().await;
+        }
+        let mut state = self.state.lock().unwrap();
+        let cut = state.index().head();
+        let now = if cut.basis.position() == 0 {
+            Timestamp(1)
+        } else {
+            cut.system_time.next()?
+        };
+        match state.resolve(
+            &request.transaction,
+            cut.basis.position() + 1,
+            now,
+            self.features(),
+            &self.claims,
+        )? {
+            Resolution::Answer(receipt) => Ok(receipt),
+            Resolution::Append(append) => {
+                let record = TransactionRecord::decode(&append.record().encode()?)?;
+                Ok(state.apply(append.position(), record)?.unwrap())
+            }
+        }
+    }
+
+    async fn tx_status(
+        &self,
+        key: &[u8],
+        _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_tx::transact::Receipt> {
+        self.state.lock().unwrap().tx_status(key)
+    }
+
+    async fn changes(
+        &self,
+        request: rtdb_node::serving::Changes,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_node::serving::ChangePage> {
+        use rtdb_node::serving::{ChangeGroup, ChangeKind, ChangePage, ChangeRow};
+        use rtdb_types::{AnomalyCategory, EntityId, TableRef};
+        let cut = self.state.lock().unwrap().index().head();
+        if request.after.is_none() {
+            return Err(Anomaly::new(
+                AnomalyCategory::NotFound,
+                "rtdb/cursor-expired",
+                "History was trimmed",
+            ));
+        }
+        Ok(ChangePage {
+            groups: vec![ChangeGroup {
+                cut,
+                rows: vec![ChangeRow {
+                    table: TableRef::new("public", "wire_applied"),
+                    id: EntityId::Integer(2),
+                    valid: None,
+                    kind: ChangeKind::Erased,
+                    before: None,
+                    after: None,
+                }],
+            }],
+            through: cut.basis,
+            complete: true,
+        })
+    }
+}
+
+struct AppliedFixtureResources {
+    native: rtdb_node::NativeResources,
+    driver: Arc<AppliedFixture>,
+}
+
+#[async_trait]
+impl rtdb_node::ResourceFactory for AppliedFixtureResources {
+    fn serving_driver(
+        &self,
+        _: &str,
+        _: &rtdb_format::database::proto::DatabaseConfig,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Arc<dyn rtdb_node::serving::ServingDriver>>> {
+        Ok(Some(self.driver.clone()))
+    }
+
+    fn validate(
+        &self,
+        name: &str,
+        config: &rtdb_format::database::proto::DatabaseConfig,
+    ) -> Result<()> {
+        self.native.validate(name, config)
+    }
+
+    async fn open_storage(
+        &self,
+        name: &str,
+        config: &rtdb_format::database::proto::DatabaseConfig,
+    ) -> Result<rtdb_node::DatabaseStorage> {
+        self.native.open_storage(name, config).await
+    }
+
+    async fn open_logs(
+        &self,
+        name: &str,
+        config: &rtdb_format::database::proto::DatabaseConfig,
+        access: rtdb_node::LogAccess,
+        cancellation: tokio_util::sync::CancellationToken,
+        storage: &rtdb_node::DatabaseStorage,
+    ) -> Result<rtdb_node::OpenedLogs> {
+        self.native
+            .open_logs(name, config, access, cancellation, storage)
+            .await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.native.close().await
+    }
+}
+
+fn integer_cell(value: i64) -> v1::Cell {
+    let batch = RecordBatch::try_from_iter([(
+        "value",
+        Arc::new(Int64Array::from(vec![value])) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    v1::Cell {
+        value: Some(v1::cell::Value::ArrowIpc(
+            rtdb_format::ipc::write_stream(batch.schema_ref(), &[batch.clone()]).unwrap(),
+        )),
+    }
+}
+
+async fn transact_wire(
+    client: &mut Client,
+    request: v1::TransactRequest,
+) -> std::result::Result<v1::Receipt, Status> {
+    let result = client
+        .action("rtdb.v1.Transact", request.encode_to_vec().into())
+        .await?;
+    Ok(v1::Receipt::decode(result[0].body.clone()).unwrap())
+}
+
+#[tokio::test]
+async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and_changes() {
+    let driver = Arc::new(AppliedFixture {
+        state: std::sync::Mutex::new(rtdb_tx::transact::TransactState::new(FIXTURE_INCARNATION)),
+        claims: rtdb_types::rtdb_v1::ClaimSealer::new(FIXTURE_INCARNATION, [9; 32]),
+        memory: MemoryBudget::new(1 << 27),
+        admission: Default::default(),
+        waiting: Default::default(),
+        release: Default::default(),
+    });
+    let resources = Arc::new(AppliedFixtureResources {
+        native: Default::default(),
+        driver: driver.clone(),
+    });
+    let running = Running::start_with_resources(
+        None,
+        FlightConfig::default(),
+        &[],
+        None,
+        Default::default(),
+        None,
+        Some(resources),
+    )
+    .await;
+    let mut client = Client::connect(&running.server, None).await;
+    let put = |branch: &str, id, reversed| {
+        let mut cells = vec![
+            ("_id".to_owned(), integer_cell(id)),
+            ("n".to_owned(), integer_cell(id * 10)),
+            ("m".to_owned(), integer_cell(id * 100)),
+        ];
+        if reversed {
+            cells.reverse();
+        }
+        v1::Op {
+            op: Some(v1::op::Op::Put(v1::Put {
+                branch: branch.into(),
+                table: "wire_applied".into(),
+                if_absent: true,
+                rows: vec![v1::Row {
+                    cells: cells.into_iter().collect(),
+                }],
+            })),
+        }
+    };
+    let key = vec![1; 16];
+    let mut original = v1::TransactRequest {
+        key: key.clone(),
+        ops: vec![put("main", 1, false)],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    original.extend([0xf8, 0x07, 0x01]);
+    let original: Bytes = original.into();
+    let mut same_session = Client {
+        client: client.client.clone(),
+        headers: client.headers.clone(),
+    };
+    let raw = original.clone();
+    let held =
+        tokio::spawn(async move { same_session.action("rtdb.v1.Transact", raw).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(3), driver.waiting.notified())
+        .await
+        .unwrap();
+    let (attempt, submitted, admitted) = driver.admission.lock().unwrap().clone().unwrap();
+    assert!(!attempt.is_nil());
+    assert!(submitted > Timestamp::MIN);
+    assert_eq!(admitted, original);
+    let independent = tokio::time::timeout(
+        Duration::from_secs(3),
+        transact_wire(
+            &mut client,
+            v1::TransactRequest {
+                key: vec![9; 16],
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(independent.outcome, Some(v1::receipt::Outcome::Then(())));
+    driver.release.notify_one();
+    let first = v1::Receipt::decode(held.await.unwrap()[0].body.clone()).unwrap();
+    let replay = transact_wire(
+        &mut client,
+        v1::TransactRequest {
+            key: key.clone(),
+            ops: vec![put("main", 1, true)],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.basis, replay.basis);
+    assert!(replay.replayed);
+    let status = client
+        .action(
+            "rtdb.v1.TxStatus",
+            v1::TxStatusRequest { key }.encode_to_vec().into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        v1::Receipt::decode(status[0].body.clone()).unwrap().basis,
+        first.basis
+    );
+
+    let mut read = input("SELECT n FROM wire_applied ORDER BY n");
+    read.track = true;
+    read.source.as_mut().unwrap().at = Some(v1::At {
+        selection: first.basis.clone().map(Selection::AtLeast),
+    });
+    let (rows, main) = query(&mut client, read.clone()).await;
+    assert_eq!(ints(&rows), [10]);
+    assert_eq!(main.basis, first.basis);
+    let basis =
+        rtdb_types::rtdb_v1::Basis::from_bytes(&main.basis.as_ref().unwrap().value).unwrap();
+    assert_eq!(basis.position(), 1);
+    assert_eq!(basis.incarnation(), FIXTURE_INCARNATION);
+
+    let validate_key = vec![2; 16];
+    let validated = transact_wire(
+        &mut client,
+        v1::TransactRequest {
+            key: validate_key.clone(),
+            guards: vec![v1::Guard {
+                guard: Some(v1::guard::Guard::Unchanged(main.claim.unwrap())),
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(validated.outcome, Some(v1::receipt::Outcome::Then(())));
+    assert_eq!(validated.basis, main.basis);
+    let absent = client
+        .action(
+            "rtdb.v1.TxStatus",
+            v1::TxStatusRequest { key: validate_key }
+                .encode_to_vec()
+                .into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(absent.code(), tonic::Code::NotFound);
+
+    let fork = v1::Op {
+        op: Some(v1::op::Op::Fork(v1::Fork {
+            child: "trial".into(),
+            writable: true,
+            expires_at_micros: None,
+            from: Some(v1::BranchBasis {
+                branch: "main".into(),
+                basis: main.basis.clone(),
+            }),
+        })),
+    };
+    let second = transact_wire(
+        &mut client,
+        v1::TransactRequest {
+            key: vec![3; 16],
+            ops: vec![fork, put("trial", 2, false)],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    read.source.as_mut().unwrap().branch = "trial".into();
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [10, 20]);
+    read.source.as_mut().unwrap().layer = v1::Layer::Local as i32;
+    let (rows, trial) = query(&mut client, read).await;
+    assert_eq!(ints(&rows), [20]);
+    assert_eq!(trial.basis, second.basis);
+
+    let mut changes = v1::ChangesRequest {
+        branch: "trial".into(),
+        tables: vec!["wire_applied".into()],
+        limit: 1,
+        images: v1::Images::Both as i32,
+        ..Default::default()
+    };
+    let expired = get::<_, v1::ChangesTrailer>(&mut client, changes.clone())
+        .await
+        .unwrap_err();
+    error(
+        expired,
+        v1::AnomalyCategory::NotFound,
+        "rtdb/cursor-expired",
+    );
+    changes.after = first.basis;
+    let (rows, trailer) = get::<_, v1::ChangesTrailer>(&mut client, changes)
+        .await
+        .unwrap();
+    assert_eq!(trailer.through, second.basis);
+    let erased = rows[0]
+        .column_by_name("erased")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .unwrap();
+    assert!(erased.value(0));
     running.stop().await;
 }

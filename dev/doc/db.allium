@@ -11,6 +11,8 @@
 -- Source and replica are always separate logs — an invariant, not a convention.
 -- The default source and replica logs share the `SharedLog` port for ordered append, latest position, and replay from a prior position.
 -- An append receipt reports the durable position and timestamp of the record.
+-- Native client submissions and replica writes use this port to append.
+-- The source reader and replica reader each start prepared replay after their own persisted position.
 -- The serving driver supplies the applied cut and snapshot behind a query, the resolved receipt behind a write or status lookup, and the retained effect history behind Changes.
 -- The default and Multi drivers establish the barriers their own logs require before they serve these results.
 -- One node holds one role per database at a time, leading or following, and one live index shared between them.

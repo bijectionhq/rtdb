@@ -493,7 +493,7 @@ impl QueryContext {
         PlaintextView::track_protected_cut(view, lease)
     }
 
-    pub(crate) fn with_plaintext(mut self: Arc<Self>) -> Arc<Self> {
+    pub fn with_plaintext(mut self: Arc<Self>) -> Arc<Self> {
         if self.plaintext.is_none() {
             let view = PlaintextView::new(Arc::clone(&self.memory));
             Arc::make_mut(&mut self).plaintext = Some(view);
@@ -501,7 +501,7 @@ impl QueryContext {
         self
     }
 
-    pub(crate) async fn delivery_grant(self: &Arc<Self>) -> Result<PlaintextDelivery> {
+    pub async fn delivery_grant(self: &Arc<Self>) -> Result<PlaintextDelivery> {
         let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
         let view = self.catalog.held_view().await?;
         let lease = self.catalog.read_lease();

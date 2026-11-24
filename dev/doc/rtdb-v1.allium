@@ -26,6 +26,8 @@ surface StatelessDatabase {
         -- A basis orders cuts within the selected database incarnation.
         -- The shared v1 encoding places the 16 incarnation bytes first, then the unsigned position as eight big-endian bytes.
         -- Applied-position drivers supply their applied position in this field.
+        -- On these routes the query selects the requested branch and layer in the same fold that supplies transaction receipts.
+        -- A local-layer read uses the branch's own writes at the selected cut.
         -- The temporal read driver supplies a system-time boundary as the basis position.
         -- Exactly selects its named cut.
         -- AtLeast returns a cut at or beyond its requested basis.
@@ -44,11 +46,20 @@ surface StatelessDatabase {
 
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
+        -- An applied-position driver issues the query claim using its transaction verification authority.
         -- The region may cover the entire database.
         -- The serving process issues claims with its attachment's current authority.
 
+    @guarantee TransactionReceipt
+        -- A route that advertises writes returns its selected outcome with the applied basis and system time.
+        -- A matching committed request returns the stored receipt for its key.
+        -- The carrier passes the attempt identity, its submission time, and the exact admitted request bytes to the selected driver.
+        -- Validation evaluates the guards at a fresh basis and leaves the applied position unchanged.
+
     @guarantee ChangesCoverage
         -- Changes reports its covered interval even when there are no changes for the selected tables.
+        -- An applied-position route takes its coverage from the driver's retained effect history.
+        -- A reported erasure has a key when keys are requested and omits both row images.
         -- A returned page carries whole system-time groups.
         -- An expired starting cut returns the cursor-expired code.
         -- A waiting call returns after a relevant change, complete coverage of its requested interval or expiry of its wait.

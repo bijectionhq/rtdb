@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use rtdb_index::{Snapshot, branches::BranchCut};
 use rtdb_tx::transact::{Receipt, Transact};
 use rtdb_types::{
@@ -8,6 +9,7 @@ use rtdb_types::{
     rtdb_v1::{At, Basis, Branch, Claim, Layer},
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 mod visibility;
 pub use visibility::{ScopedSubmission, ServingScope, ROW_VISIBILITY};
@@ -22,6 +24,13 @@ pub struct QueryView {
     pub snapshot: Snapshot,
     pub cut: BranchCut,
     pub claim: Option<Claim>,
+}
+
+pub struct TransactSubmission {
+    pub transaction: Transact,
+    pub attempt: Uuid,
+    pub submitted_at: Timestamp,
+    pub source: Bytes,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,7 +124,7 @@ pub trait ServingDriver: Send + Sync {
 
     async fn transact(
         &self,
-        request: Transact,
+        request: TransactSubmission,
         cancellation: &CancellationToken,
     ) -> Result<Receipt>;
 
