@@ -7,13 +7,16 @@ pub(crate) mod search;
 
 use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray, builder::Float64Builder};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, PrimitiveArray, StructArray, UnionArray,
+    builder::{Float64Builder, Int64Builder}, types::ArrowPrimitiveType,
+};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
-use rtdb_plan::Field;
+use rtdb_plan::{CastTarget, Expr, Field};
 use rtdb_temporal::ResolvedRow;
-use rtdb_types::{ListKind, LogicalType, Result, Timestamp, Value};
+use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Timestamp, Value};
 
 use crate::{invalid, pages::OwnedPage};
 #[cfg(test)]
@@ -2786,6 +2789,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixed_numeric_cases_preserve_bits_nulls_and_branch_demand() {
+        let len = 192;
+        let memory = MemoryBudget::new(1 << 24);
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        })].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+            &tokio_util::sync::CancellationToken::new()).unwrap();
+        let execution = crate::context::Execution {
+            context: Arc::clone(&context),
+            parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: crate::context::OuterRows::empty(&memory).unwrap(),
+            bindings: None,
+            analysis: None,
+        };
+        let baseline = memory.used_bytes();
+        let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
+        let selector = schema.fields()[0].expression();
+        let input = |rows: usize| {
+            let array = Int64Array::from_iter_values((0..rows).map(|row| (row % 3) as i64));
+            let batch = ColumnBatch::settled(
+                vec![arrow(Arc::new(array), ScalarType::I64)],
+                rows,
+                memory.reserve(0).unwrap(),
+            ).unwrap();
+            single_batch(Some(batch), Arc::clone(&context))
+        };
+        let case = |branches: Vec<(i64, Expr)>, otherwise| Expr::SimpleCase {
+            operand: Box::new(selector.clone()),
+            branches: branches.into_iter().map(|(value, result)| (Expr::Literal(Value::I64(value)), result)).collect(),
+            otherwise: Box::new(otherwise),
+        };
+        let cast = |text: &str, scalar| Expr::Cast {
+            expr: Box::new(Expr::Literal(Value::Utf8(text.into()))),
+            target: CastTarget::Fixed(LogicalType::Scalar(scalar)),
+        };
+        let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        let doubles = case(vec![
+            (0, cast("-0.0", ScalarType::F64)),
+            (1, Expr::Literal(Value::F64(nan))),
+            (1, cast("unreached double", ScalarType::F64)),
+        ], Expr::Literal(Value::Null));
+        let integers = Expr::Case {
+            branches: vec![(
+                Expr::binary(BinaryOp::Eq, selector.clone(), Expr::Literal(Value::I64(0))),
+                Expr::Literal(Value::I64(i64::MIN)),
+            )],
+            otherwise: Box::new(cast("9223372036854775807", ScalarType::I64)),
+        };
+        let nulls = case(vec![(3, cast("unreached integer", ScalarType::I64))], Expr::Literal(Value::Null));
+        let mixed = case(vec![(0, Expr::Literal(Value::I64(5)))], Expr::Literal(Value::F64(0.5)));
+
+        let mut cursor = BatchExpressions::new(input(len), schema.clone(), vec![doubles, integers, nulls, mixed], execution.clone());
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [
+            Column::Arrow { array: doubles, field: double_field, logical: Some(double) },
+            Column::Arrow { array: integers, field: integer_field, logical: Some(integer) },
+            Column::Arrow { array: nulls, logical: Some(LogicalType::Null), .. },
+            mixed,
+        ] = page.columns.as_slice() else { panic!("Expected Arrow columns with observed nullability"); };
+        assert_eq!(*double, LogicalType::Scalar(ScalarType::F64).maybe());
+        assert!(double_field.is_nullable());
+        assert_eq!(*integer, LogicalType::Scalar(ScalarType::I64));
+        assert!(!integer_field.is_nullable());
+        assert_eq!(nulls.data_type(), &DataType::Null);
+        assert_eq!(nulls.len(), len);
+        let doubles = doubles.as_any().downcast_ref::<Float64Array>().unwrap();
+        let integers = integers.as_any().downcast_ref::<Int64Array>().unwrap();
+        for row in 0..len {
+            match row % 3 {
+                0 => {
+                    assert!(!doubles.is_null(row));
+                    assert_eq!(doubles.value(row).to_bits(), (-0.0f64).to_bits());
+                    assert_eq!(integers.value(row), i64::MIN);
+                }
+                1 => {
+                    assert!(!doubles.is_null(row));
+                    assert_eq!(doubles.value(row).to_bits(), nan.to_bits());
+                    assert_eq!(integers.value(row), i64::MAX);
+                }
+                _ => {
+                    assert!(doubles.is_null(row));
+                    assert_eq!(integers.value(row), i64::MAX);
+                }
+            }
+        }
+        assert_eq!(mixed.value(0).unwrap(), Value::I64(5));
+        assert_eq!(mixed.value(1).unwrap(), Value::F64(0.5));
+        drop(page);
+        drop(cursor);
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let later_row = case(vec![(1, cast("first projection, second row", ScalarType::I64))], Expr::Literal(Value::I64(0)));
+        let later_column = case(vec![(0, cast("second projection, first row", ScalarType::I64))], Expr::Literal(Value::I64(0)));
+        let projections = vec![later_row, later_column];
+        let mut cursor = BatchExpressions::new(input(0), schema.clone(), projections.clone(), execution.clone());
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().len, 0);
+        drop(cursor);
+
+        let mut cursor = BatchExpressions::new(input(len), schema, projections, execution);
+        let error = cursor.next_batch().await.err().expect("The first projection fails");
+        assert!(error.message.contains("first projection, second row"));
+        drop(cursor);
+    }
+
+    #[tokio::test]
     async fn residual_predicates_borrow_selected_struct_fields_and_list_cells() {
         let source = MemoryBudget::new(1 << 25);
         let large = "x".repeat(1 << 21);
@@ -3472,26 +3582,38 @@ impl BatchCursor for BatchExpressions {
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
             let value_slots = batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
-            let score_bound = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+            let primitive_bound = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
             // Extra CASE shapes must leave at least as much room for row evaluation as the value buffer would.
-            if crate::cosine::has_score_output(expression, score_bound <= value_slots)
-                && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease, score_bound).await?
+            if crate::cosine::has_score_output(expression, primitive_bound <= value_slots)
+                && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease, primitive_bound).await?
             {
                 columns.push(column);
                 continue;
             }
             lease.grow_to(retained.checked_add(value_slots).ok_or_else(size_error)?)?;
-            let mut values = Vec::with_capacity(batch.len);
+            let mut values = if primitive_bound <= value_slots {
+                ProjectionValues::new(expression, invocation.data_type(), batch.len)
+            } else {
+                ProjectionValues::Dynamic(Vec::with_capacity(batch.len))
+            };
             for row in 0..batch.len {
                 let input = BatchRow { batch: &batch, row, admit_dates: false };
                 let value = self.execution.evaluate_invocation_row(
                     &scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
                 ).await?;
-                // The value is charged before the evaluator's scope releases what it allocated it under.
+                // Keep the same per-row admission for typed CASEs so a tight budget fails at the same row.
                 lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
-                values.push(value);
+                values.push(value)?;
                 scope.reset()?;
             }
+            let values = match values.finish()? {
+                Column::Values(values) => values,
+                column => {
+                    settle_primitive_column(&column, lease, retained)?;
+                    columns.push(column);
+                    continue;
+                }
+            };
             if let Some((column, scratch)) = scalar_result(&values, &self.execution.context.memory)? {
                 let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
                 let admission = if bytes <= lease.bytes() { Ok(()) } else { lease.grow_to(bytes) };
@@ -3519,6 +3641,65 @@ impl BatchCursor for BatchExpressions {
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
+enum ProjectionValues {
+    Dynamic(Vec<Value>),
+    I64(Int64Builder),
+    F64(Float64Builder),
+}
+
+impl ProjectionValues {
+    fn new(expression: &Expr, output: &LogicalType, len: usize) -> Self {
+        let fixed = plain_scalar(output).filter(|scalar| {
+            matches!(scalar, ScalarType::I64 | ScalarType::F64)
+                && matches!(expression, Expr::Case { .. } | Expr::SimpleCase { .. })
+                && fixed_case_result(expression, scalar)
+        });
+        match fixed {
+            Some(ScalarType::I64) => Self::I64(Int64Builder::with_capacity(len)),
+            Some(ScalarType::F64) => Self::F64(Float64Builder::with_capacity(len)),
+            _ => Self::Dynamic(Vec::with_capacity(len)),
+        }
+    }
+
+    fn push(&mut self, value: Value) -> Result<()> {
+        match (self, value) {
+            (Self::Dynamic(values), value) => values.push(value),
+            (Self::I64(values), Value::I64(value)) => values.append_value(value),
+            (Self::I64(values), Value::Null) => values.append_null(),
+            (Self::F64(values), Value::F64(value)) => values.append_value(value),
+            (Self::F64(values), Value::Null) => values.append_null(),
+            _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/case-result", "CASE returned a value outside its fixed result type")),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Column> {
+        match self {
+            Self::Dynamic(values) => Ok(Column::Values(values)),
+            Self::I64(mut values) => primitive_column(values.finish()),
+            Self::F64(mut values) => primitive_column(values.finish()),
+        }
+    }
+}
+
+fn fixed_case_result(expression: &Expr, scalar: &ScalarType) -> bool {
+    match expression {
+        Expr::Case { branches, otherwise } | Expr::SimpleCase { branches, otherwise, .. } => {
+            branches.iter().map(|(_, value)| value).chain([otherwise.as_ref()]).all(|value| {
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || fixed_case_result(value, scalar))
+            })
+        }
+        Expr::Literal(Value::Null) => true,
+        Expr::Literal(Value::I64(_)) => *scalar == ScalarType::I64,
+        Expr::Literal(Value::F64(_)) => *scalar == ScalarType::F64,
+        // A cast of an arbitrary expression can forward an undefined input.
+        Expr::Cast { expr, target: CastTarget::Fixed(LogicalType::Scalar(target)) } => {
+            target == scalar && matches!(expr.as_ref(), Expr::Literal(Value::I64(_) | Value::F64(_) | Value::Utf8(_) | Value::Null))
+        }
+        _ => false,
+    }
+}
+
 async fn evaluate_score_column(
     batch: &ColumnBatch, execution: &crate::context::Execution, invocation: &rtdb_expr::ExpressionInvocation<'_>,
     scope: &rtdb_expr::EvaluationScope, lease: &mut MemoryReservation, bound: usize,
@@ -3541,20 +3722,28 @@ async fn evaluate_score_column(
         scope.reset()?;
     }
 
-    let scores = scores.finish();
-    let nulls = scores.null_count();
-    let (array, ty): (ArrayRef, LogicalType) = if nulls == batch.len {
-        drop(scores);
-        (Arc::new(NullArray::new(batch.len)), LogicalType::Null)
-    } else {
-        let ty = LogicalType::Scalar(rtdb_types::ScalarType::F64);
-        (Arc::new(scores), if nulls == 0 { ty } else { ty.maybe() })
-    };
-    let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
-    let column = Column::Arrow { array, field, logical: Some(ty) };
-    let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
-    if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+    let column = primitive_column(scores.finish())?;
+    settle_primitive_column(&column, lease, retained)?;
     Ok(Some(column))
+}
+
+fn primitive_column<T: ArrowPrimitiveType>(values: PrimitiveArray<T>) -> Result<Column> {
+    let len = values.len();
+    let nulls = values.null_count();
+    let (array, nullable): (ArrayRef, bool) = if nulls == len {
+        drop(values);
+        (Arc::new(NullArray::new(len)), true)
+    } else {
+        (Arc::new(values), nulls != 0)
+    };
+    let field = Arc::new(ArrowField::new("value", array.data_type().clone(), nullable));
+    let logical = rtdb_columnar::from_field(&field)?;
+    Ok(Column::Arrow { array, field, logical: Some(logical) })
+}
+
+fn settle_primitive_column(column: &Column, lease: &mut MemoryReservation, retained: usize) -> Result<()> {
+    let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
+    if bytes <= lease.bytes() { lease.shrink_to(bytes) } else { lease.grow_to(bytes) }
 }
 
 /// Packs scalar results whose Arrow cells read back as the same values and exact execution types.
