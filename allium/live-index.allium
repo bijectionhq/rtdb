@@ -39,6 +39,7 @@
 -- The resolver drains earlier writes and admits the generation only at that predecessor, clock and placed witness scope.
 -- The normal replica read-back installs the generation, Proposal drop, receipt and admitted task controls in a single live value.
 -- The selected refusal has only its attempt and receipt effects and leaves the Root publication and Proposal in place.
+-- The application and refusal each carry the original attempt marker in the selected generation at its assigned event position and system revision.
 
 -- Pipelining — resolve, append, read back, apply:
 --   A LEADER applies its own writes to the durable live tables only once it has read them BACK off its own replica log, at its own term.

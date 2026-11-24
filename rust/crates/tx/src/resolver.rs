@@ -458,7 +458,10 @@ impl TxResolver {
             )) {
                 Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"))
             } else {
-                generation.choose(&base, key, slot, primary, refusal, attempt.map(PlacedAttempt::scope), context)
+                generation.choose(
+                    &base, key, slot, primary, refusal, attempt.map(PlacedAttempt::scope),
+                    request.options.user.as_deref(), context,
+                )
                 .map(|(writes, refused)| {
                     prepared_writes = Some(writes);
                     settled = refused;

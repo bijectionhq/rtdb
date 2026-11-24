@@ -1,6 +1,6 @@
 use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
-use arrow_array::TimestampMicrosecondArray;
+use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
 use rtdb_storage::cache::{BufferPool, HeldCatalogRead};
 use rtdb_tx::HostedControlWrite;
@@ -8,6 +8,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, Logic
 
 use crate::Database;
 use super::{AppliedCatalogAdmission, CatalogReadCut, DurableRange, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
+use super::transaction_evidence::exact_transaction_row;
 use rtdb_query::QueryContext;
 
 /// One storage registration for a lower bound on the physical catalogs read by a prepared session.
@@ -132,18 +133,14 @@ impl AppliedReadFloor {
             generate_series_end_exclusive: context.options.generate_series_end_exclusive,
             ..Default::default()
         };
-        let query = prepare_query("SELECT system_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", context, &options)?;
+        let query = prepare_query("SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", context, &options)?;
         for expected in needed {
             let mut cursor = query.execute(Arc::clone(context), vec![Value::I64(expected.tx_id.0)]).await?;
             let mut seen = false;
             while let Some(batch) = cursor.next_batch().await? {
                 let batch = batch.batch();
                 if batch.num_rows() == 0 { continue; }
-                if seen || batch.num_rows() != 1 { return Err(unavailable()); }
-                let time = selected_cell(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?
-                    .and_then(|(_, column, row)| column.as_any().downcast_ref::<TimestampMicrosecondArray>()
-                        .map(|column| column.value(row)));
-                if time != Some(expected.system_time.0) {
+                if !matches_transaction_result(batch, seen, expected)? {
                     return Err(unavailable());
                 }
                 seen = true;
@@ -152,6 +149,22 @@ impl AppliedReadFloor {
         }
         Ok(())
     }
+}
+
+pub(super) fn matches_transaction_result(batch: &RecordBatch, seen: bool, expected: TransactionKey) -> Result<bool> {
+    let rows = batch.num_rows();
+    let (position, revision) = if rows == 1 && batch.num_columns() >= 2 {
+        let position = selected_cell(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?
+            .and_then(|(_, column, row)| column.as_any().downcast_ref::<Int64Array>()
+                .map(|column| column.value(row)));
+        let revision = selected_cell(batch.schema_ref().field(1), batch.column(1).as_ref(), 0)?
+            .and_then(|(_, column, row)| column.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                .map(|column| column.value(row)));
+        (position, revision)
+    } else {
+        (None, None)
+    };
+    Ok(exact_transaction_row(rows, seen, position, revision, expected.tx_id.0, expected.system_time.0))
 }
 
 impl NativeSession {

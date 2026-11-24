@@ -1,7 +1,8 @@
 use crate::control_order::{SourceOrder, fingerprint_bytes, fingerprint_matches, hosted_check_for_refusal, revision_matches, source_order, staging_clock_upper};
+use crate::control_order::{HostedStamp, LandingMarker, hosted_stamps_current, landing_marker_matches};
 use crate::event_revision::matches_transaction;
 use crate::prepared_landing;
-use crate::system_time::advances;
+use crate::system_time::{advances, owned_deadline_is_live};
 use vstd::prelude::*;
 
 verus! {
@@ -14,6 +15,23 @@ pub fn kind_six_requires_the_prepared_action_and_clock_slot(prepared_action: boo
 pub fn ordered_writer_stamp_is_exact(predecessor: Option<i64>, submitted: i64) {
     let admitted = revision_matches(predecessor, Some(submitted));
     assert(admitted == (predecessor == Some(submitted)));
+}
+
+pub(crate) fn ordered_hosted_inventory_is_current(stamps: &[HostedStamp], ordered_at: i64, until: i64)
+    -> (admitted: bool)
+    ensures admitted == (ordered_at < until && forall|i: int| 0 <= i < stamps@.len() ==>
+        (#[trigger] stamps@[i]).observed == stamps@[i].expected),
+{
+    owned_deadline_is_live(ordered_at, until) && hosted_stamps_current(stamps)
+}
+
+pub(crate) fn chosen_landing_marker_has_original_identity(
+    marker: LandingMarker<'_>, context: &str, submitted: &[u8; 32], source: i64, revision: i64,
+) -> (admitted: bool)
+    ensures admitted == (marker.context@ == context@ && marker.fingerprint@ == submitted@
+        && marker.source == Some(source) && marker.revision == revision),
+{
+    landing_marker_matches(marker, context, submitted, source, revision)
 }
 
 pub fn hosted_staging_cannot_repair_a_stale_writer(
