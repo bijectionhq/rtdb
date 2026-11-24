@@ -113,10 +113,11 @@ impl Service {
         let service = self.clone();
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
+            let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
+            check_custody(&call, &database, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
-            check_custody(&call, &database, &custody_groups).await?;
-            yield wire::schema_data(&schema, &memory).map_err(error::map_status)?;
+            yield schema_frame;
             let mut skip = page.offset;
             let mut remaining = limit;
             let mut sent = 0_u64;
@@ -139,10 +140,11 @@ impl Service {
                 }).await.map_err(error::anomaly)?.transpose()?;
                 let Some((data, more)) = encoded else { break; };
                 for item in data {
-                    service.check_attachment(&call, &database)?;
                     if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
-                    call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
+                    let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
                     check_custody(&call, &database, &custody_groups).await?;
+                    service.check_attachment(&call, &database)?;
+                    call.handoff(grant, cutoff).map_err(error::map_status)?;
                     yield item;
                 }
                 if more {
@@ -154,9 +156,10 @@ impl Service {
             }
             if skip != 0 { Err(cursor_expired())?; }
             if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
-            service.check_attachment(&call, &database)?;
-            call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
+            let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
             check_custody(&call, &database, &custody_groups).await?;
+            service.check_attachment(&call, &database)?;
+            call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
         });
         let mut response = Response::new(stream);

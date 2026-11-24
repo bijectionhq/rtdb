@@ -453,10 +453,11 @@ impl Service {
         let memory = Arc::clone(call.memory());
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
-            service.check_attachment(&call, &database)?;
+            let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
             check_custody(&call, &database, &page.custody_groups).await?;
+            service.check_attachment(&call, &database)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
-            yield wire::schema_data(&schema, &memory).map_err(error::map_status)?;
+            yield schema_frame;
             for group in page.groups.into_iter().filter(|_| !progress_only) {
                 for row in group.rows {
                     service.check_attachment(&call, &database)?;
@@ -486,15 +487,18 @@ impl Service {
                         Arc::new(BooleanArray::from(vec![erased])),
                     ]).map_err(|error| error::map_status(Status::internal(error.to_string())))?;
                     for frame in encoder.batch(&batch, &memory).map_err(error::map_status)? {
+                        let grant = context.delivery_grant().await.map_err(error::anomaly)?;
                         check_custody(&call, &database, &page.custody_groups).await?;
-                        call.handoff(context.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
+                        service.check_attachment(&call, &database)?;
+                        call.handoff(grant, cutoff).map_err(error::map_status)?;
                         yield frame;
                     }
                 }
             }
-            service.check_attachment(&call, &database)?;
+            let grant = context.delivery_grant().await.map_err(error::anomaly)?;
             check_custody(&call, &database, &page.custody_groups).await?;
-            call.handoff(context.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
+            service.check_attachment(&call, &database)?;
+            call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete });
         });
         let mut response = Response::new(stream);
