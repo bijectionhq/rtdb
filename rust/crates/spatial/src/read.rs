@@ -25,6 +25,7 @@ const MAX_REFINED_ROWS: usize = 65_536;
 const MAX_UNINDEXED_BYTES: u64 = 64 << 20;
 const MAX_UNINDEXED_ROWS: usize = 65_536;
 const MAX_INDEXED_BYTES: u64 = 256 << 20;
+const MAX_UNUSED_SLICE_BYTES: usize = 16 << 10;
 
 pub struct Request<'a> {
     pub partition: Vec<Cow<'a, [u8]>>,
@@ -92,6 +93,19 @@ pub(super) fn gather_selected(
 ) -> Result<Option<OwnedBatch>> {
     let Some(first) = hits.first() else { return Ok(None); };
     let schema = first.source.batch().schema_ref();
+    let mut output = BatchBuilder::new(4096 + hits.len() * 64 + indices.len() * 128, memory)?;
+    let projection_error = |error: arrow_schema::ArrowError| {
+        Anomaly::fault("rtdb.spatial/projection", error.to_string())
+    };
+    let projected = if indices.iter().copied().eq(0..schema.fields().len()) {
+        Arc::clone(schema)
+    } else {
+        Arc::new(schema.project(indices).map_err(projection_error)?)
+    };
+    if let Some(batch) = slice_selected(hits, indices, &projected) {
+        return Ok(Some(batch));
+    }
+
     let mut sources: Vec<&OwnedBatch> = Vec::new();
     let mut positions = Vec::with_capacity(hits.len());
     for hit in hits {
@@ -112,7 +126,6 @@ pub(super) fn gather_selected(
             });
         positions.push((index, hit.row));
     }
-    let mut output = BatchBuilder::new(4096 + hits.len() * 64 + indices.len() * 128, memory)?;
     let columns = indices
         .iter()
         .map(|&index| {
@@ -132,16 +145,53 @@ pub(super) fn gather_selected(
             output.column(bytes, || copy_selected_cells(&arrays, &positions))
         })
         .collect::<Result<Vec<_>>>()?;
-    let projection_error = |error: arrow_schema::ArrowError| {
-        Anomaly::fault("rtdb.spatial/projection", error.to_string())
-    };
-    let schema = if indices.iter().copied().eq(0..schema.fields().len()) {
-        Arc::clone(schema)
-    } else {
-        Arc::new(schema.project(indices).map_err(projection_error)?)
-    };
-    let batch = RecordBatch::try_new(schema, columns).map_err(projection_error)?;
+    let batch = RecordBatch::try_new(projected, columns).map_err(projection_error)?;
     output.finish(batch).map(Some)
+}
+
+fn slice_selected(
+    hits: &[SelectedHit],
+    indices: &[usize],
+    schema: &Arc<Schema>,
+) -> Option<OwnedBatch> {
+    let first = hits.first()?;
+    let source = first.source.batch();
+    let end = first.row.checked_add(hits.len())?;
+    if end > source.num_rows()
+        || !hits.iter().zip(first.row..end).all(|(hit, row)| {
+            Arc::ptr_eq(&hit.source, &first.source) && hit.row == row
+        })
+    {
+        return None;
+    }
+
+    let columns = indices
+        .iter()
+        .map(|&index| source.column(index).slice(first.row, hits.len()))
+        .collect::<Vec<_>>();
+    let reservation = first.source.reservation();
+    if reservation.bytes() > MAX_UNUSED_SLICE_BYTES {
+        // Arrow's slice size includes unselected children of lists and dense unions.
+        let visible = columns.iter().try_fold(0usize, |bytes, column| {
+            let ty = column.data_type();
+            let flat = ty.primitive_width().is_some() || match ty {
+                DataType::Boolean | DataType::FixedSizeBinary(_) => true,
+                DataType::Binary | DataType::Utf8 => column.null_count() == 0,
+                _ => false,
+            };
+            let size = if flat {
+                column.to_data().get_slice_memory_size().ok()?
+            } else {
+                0
+            };
+            bytes.checked_add(size)
+        })?;
+        if reservation.bytes().saturating_sub(visible) > MAX_UNUSED_SLICE_BYTES {
+            return None;
+        }
+    }
+    let batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
+    OwnedBatch::with_reservation(batch, Arc::clone(reservation)).ok()
 }
 
 pub(super) fn empty_projected_documents(
@@ -870,6 +920,7 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{BinaryArray, StringArray};
     use rtdb_columnar::{entity_id_array, entity_id_type, to_field};
 
     #[test]
@@ -887,6 +938,89 @@ mod tests {
         assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(1.0))?, 0);
         assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(2.0))?, 2);
         assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(4.0))?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_gather_slices_contiguous_projected_rows_under_the_original_charge() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let ids = entity_id_array([
+            EntityIdRef::Integer(0),
+            EntityIdRef::Keyword("first"),
+            EntityIdRef::String("second"),
+            EntityIdRef::Integer(3),
+        ])?;
+        let winner = vec![42; 32 << 10];
+        let payloads = BinaryArray::from(vec![&b"before"[..], winner.as_slice(), b"next", b"after"]);
+        let winner_ptr = payloads.value(1).as_ptr();
+        let schema = Arc::new(Schema::new(vec![
+            to_field("_id", &entity_id_type())?,
+            Field::new("geometry", DataType::Utf8, false),
+            Field::new("_system_from", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("payload", DataType::Binary, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            ids,
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(TimestampMicrosecondArray::from(vec![100, 200, 300, 400]).with_timezone("UTC")),
+            Arc::new(payloads),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("present"), Some("d")])),
+        ]).unwrap();
+        let source = Arc::new(OwnedBatch::new(batch, &memory)?);
+        let hit = |row| SelectedHit { source: Arc::clone(&source), row, distance_m: None };
+        let projection = [0, 3, 4, 2];
+        let output = gather_selected(&[hit(1), hit(2)], &projection, &memory)?.unwrap();
+        assert!(Arc::ptr_eq(output.reservation(), source.reservation()));
+        let batch = output.batch();
+        let ids = batch.column(0).as_ref();
+        let id_field = batch.schema_ref().field(0);
+        assert_eq!(read_entity_id(id_field, ids, 0)?, EntityIdRef::Keyword("first"));
+        assert_eq!(read_entity_id(id_field, ids, 1)?, EntityIdRef::String("second"));
+        assert!(batch.column_by_name("geometry").is_none());
+        let payloads = batch.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(payloads.value(0).as_ptr(), winner_ptr);
+        assert_eq!(payloads.value(1), b"next");
+        let notes = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(notes.iter().collect::<Vec<_>>(), [None, Some("present")]);
+        let revisions = batch.column(3).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert_eq!(revisions.values().as_ref(), &[200, 300]);
+
+        let copied = gather_selected(&[hit(3), hit(1)], &projection, &memory)?.unwrap();
+        assert!(!Arc::ptr_eq(copied.reservation(), source.reservation()));
+        let payloads = copied.batch().column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(payloads.value(0), b"after");
+        assert_eq!(payloads.value(1), winner.as_slice());
+        drop(copied);
+
+        let retained = Arc::clone(batch.column(1));
+        let charged = source.reservation().bytes();
+        drop(source);
+        drop(output);
+        assert_eq!(memory.used_bytes(), charged);
+        drop(retained);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_gather_copies_a_contiguous_slice_that_would_pin_a_large_unselected_value() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let unused = vec![42; 256 << 10];
+        let schema = Arc::new(Schema::new(vec![Field::new("payload", DataType::Binary, false)]));
+        let payloads = BinaryArray::from(vec![unused.as_slice(), b"a", b"b"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payloads)]).unwrap();
+        let source = Arc::new(OwnedBatch::new(batch, &memory)?);
+        let hits = [1, 2].map(|row| SelectedHit { source: Arc::clone(&source), row, distance_m: None });
+        let output = gather_selected(&hits, &[0], &memory)?.unwrap();
+        assert!(!Arc::ptr_eq(output.reservation(), source.reservation()));
+        drop(hits);
+        drop(source);
+        assert_eq!(memory.used_bytes(), output.reservation().bytes());
+        assert!(memory.used_bytes() < unused.len());
+        let payloads = output.batch().column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(payloads.value(0), b"a");
+        assert_eq!(payloads.value(1), b"b");
         Ok(())
     }
 }
