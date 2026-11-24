@@ -100,6 +100,11 @@ fn custody_revocation_masks_prior_and_inherited_members_after_checkpoint() {
     let revoke = request(4, vec![Op::RevokeCustodyGroup { group, inventory_sha256: inventory.sha256 }]);
     let prepared = plan(&state, &revoke, 4, 40, &features);
     let first = apply(&mut state, 4, prepared.record()).unwrap();
+    let notices = state.index().custody_revocation_writes(group, state.index().head()).unwrap();
+    assert_eq!(notices.iter().filter(|write| write.branch == "child")
+        .map(|write| (&write.id, write.erased_written_basis)).collect::<Vec<_>>(),
+        [(&EntityId::Integer(2), Some(basis(2))), (&EntityId::Integer(1), Some(basis(1)))]);
+    assert!(notices.iter().all(|write| write.valid.is_some()));
     let checkpoint = state.encode_checkpoint().unwrap();
     let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
     assert_eq!(state.index().custody_revocation(group), Some(basis(4)));

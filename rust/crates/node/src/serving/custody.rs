@@ -197,6 +197,7 @@ mod tests {
                     id: row.id.clone(),
                     valid: Some(row.valid),
                     kind: ChangeKind::Opened,
+                    erased_written_basis: None,
                     before: None,
                     after: Some(image.as_ref().clone()),
                 }],

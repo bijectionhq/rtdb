@@ -315,9 +315,23 @@ fn changes_page(
                         id: id.clone(),
                         valid: None,
                         kind: ChangeKind::Erased,
+                        erased_written_basis: None,
                         before: None,
                         after: None,
                     });
+                }
+                BranchEffect::RevokeCustodyGroup { group: id } => {
+                    rows.extend(index.custody_revocation_writes(*id, group.cut)?.into_iter().filter(|write| {
+                        write.branch == request.branch && matches_table(request, &write.table)
+                    }).map(|write| ChangeRow {
+                        table: write.table,
+                        id: write.id,
+                        valid: write.valid,
+                        kind: ChangeKind::Erased,
+                        erased_written_basis: write.erased_written_basis,
+                        before: None,
+                        after: None,
+                    }));
                 }
                 _ => {}
             }
@@ -407,6 +421,7 @@ fn change_rows(
                 },
                 before: prior,
                 after,
+                erased_written_basis: None,
             })
         })
         .collect()

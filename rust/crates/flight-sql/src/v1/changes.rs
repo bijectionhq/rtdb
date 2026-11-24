@@ -462,7 +462,16 @@ impl Service {
                     service.check_attachment(&call, &database)?;
                     let erased = row.kind == ChangeKind::Erased;
                     let id = row.id.as_value();
-                    let key = (images != ChangeImages::None).then(|| write_values([("_id", &id)], &memory)).transpose()?;
+                    let key = match (images, row.erased_written_basis, row.valid) {
+                        (ChangeImages::None, _, _) => None,
+                        (_, Some(basis), Some(valid)) => Some(write_values([
+                            ("_id", &id),
+                            ("_valid_from", &time_value(valid.lower())),
+                            ("_valid_to", &time_value(valid.upper())),
+                            (rtdb_types::rtdb_v1::WRITTEN_BASIS_COLUMN, &Value::Binary(basis.to_bytes().to_vec())),
+                        ], &memory)?),
+                        _ => Some(write_values([("_id", &id)], &memory)?),
+                    };
                     let before = if erased || !matches!(images, ChangeImages::Before | ChangeImages::Both) { None }
                         else { row.before.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
                     let after = if erased || !matches!(images, ChangeImages::After | ChangeImages::Both) { None }

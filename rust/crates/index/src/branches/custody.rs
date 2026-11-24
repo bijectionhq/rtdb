@@ -90,6 +90,36 @@ impl BranchIndex {
         self.custody.iter().filter_map(move |(&id, group)| group.inventory(id, at))
     }
 
+    pub fn custody_revocation_writes(&self, id: CustodyGroupId, cut: BranchCut) -> Result<Vec<BranchWrite>> {
+        let Some(group) = self.custody.get(&id).filter(|group| group.revoked == Some(cut.basis)) else {
+            return Ok(Vec::new());
+        };
+        let previous = self.before(cut.basis)?.ok_or_else(|| {
+            Anomaly::fault("rtdb/custody-fold", "Revocation has no preceding cut")
+        })?;
+        let mut writes = Vec::new();
+        for (branch, data) in self.branches.iter().filter(|(_, branch)| branch.active(previous, cut.system_time)) {
+            let mut bounds = BTreeMap::new();
+            let mut layer = Some((branch.as_str(), data.as_ref(), cut.basis));
+            while let Some((name, data, basis)) = layer {
+                bounds.insert(name, basis);
+                layer = data.base.as_ref().and_then(|(parent, basis)| {
+                    self.branches.get(parent).map(|data| (parent.as_str(), data.as_ref(), *basis))
+                });
+            }
+            writes.extend(group.members.iter().filter(|member| {
+                bounds.get(member.branch.as_str()).is_some_and(|basis| member.written <= *basis)
+            }).map(|member| BranchWrite {
+                branch: branch.clone(),
+                table: member.table.clone(),
+                id: member.id.clone(),
+                valid: Some(member.valid),
+                erased_written_basis: Some(member.written),
+            }));
+        }
+        Ok(writes)
+    }
+
     pub(super) fn create_custody_group(&mut self, id: CustodyGroupId) -> Result<()> {
         if id == [0; 16] || self.custody.contains_key(&id) {
             return Err(Anomaly::fault("rtdb/custody-fold", "Invalid resolved custody group creation"));
@@ -130,13 +160,9 @@ impl BranchIndex {
                 }
             }
             branch.changed = Some(basis);
-            Arc::make_mut(&mut self.writes).push(BranchWrite {
-                branch: member.branch.clone(),
-                table: member.table.clone(),
-                id: member.id.clone(),
-                valid: None,
-            });
         }
+        let notices = self.custody_revocation_writes(id, self.head)?;
+        Arc::make_mut(&mut self.writes).extend(notices);
         self.latest_custody_revocation = Some(basis);
         Ok(())
     }

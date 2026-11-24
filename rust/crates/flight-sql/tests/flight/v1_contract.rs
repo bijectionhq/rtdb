@@ -1108,6 +1108,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
                     id: EntityId::Integer(2),
                     valid: None,
                     kind: ChangeKind::Erased,
+                    erased_written_basis: None,
                     before: None,
                     after: None,
                 }],

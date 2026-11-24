@@ -77,6 +77,7 @@ impl ServingScope {
                 id: row.id.clone(),
                 valid: Some(row.valid),
                 kind: if row.after.is_some() { ChangeKind::Opened } else { ChangeKind::Closed },
+                erased_written_basis: None,
                 before: row.before.as_ref().filter(|_| matches!(request.images, ChangeImages::Before | ChangeImages::Both))
                     .map(|image| image.as_ref().clone()),
                 after: row.after.as_ref().filter(|_| matches!(request.images, ChangeImages::After | ChangeImages::Both))

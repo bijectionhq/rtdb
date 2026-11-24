@@ -129,6 +129,7 @@ pub struct BranchWrite {
     pub table: TableRef,
     pub id: EntityId,
     pub valid: Option<Interval>,
+    pub erased_written_basis: Option<Basis>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -433,7 +434,10 @@ impl BranchIndex {
                     self.changed_catalog = Some(basis);
                 }
                 let generation = definitions.last().expect("table definition").1.generation;
-                let write = BranchWrite { branch: branch.clone(), table: table.clone(), id: event.id.clone(), valid: Some(event.valid) };
+                let write = BranchWrite {
+                    branch: branch.clone(), table: table.clone(), id: event.id.clone(),
+                    valid: Some(event.valid), erased_written_basis: None,
+                };
                 let branch = self.changed_branch(&branch)?;
                 let rows = Arc::make_mut(branch.tables.entry(table).or_default());
                 Arc::make_mut(rows.events.entry(event.id.clone()).or_default()).push((generation, event));
@@ -470,7 +474,10 @@ impl BranchIndex {
                     let rows = Arc::make_mut(data.tables.entry(table.clone()).or_default());
                     rows.events.remove(&id);
                     rows.erased.insert(id.clone(), basis);
-                    Arc::make_mut(&mut self.writes).push(BranchWrite { branch: name.clone(), table: table.clone(), id: id.clone(), valid: None });
+                    Arc::make_mut(&mut self.writes).push(BranchWrite {
+                        branch: name.clone(), table: table.clone(), id: id.clone(),
+                        valid: None, erased_written_basis: None,
+                    });
                 }
                 self.erased = Some(basis);
             }

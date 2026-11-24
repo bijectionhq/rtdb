@@ -83,6 +83,7 @@ pub struct ChangeRow {
     pub id: EntityId,
     pub valid: Option<Interval>,
     pub kind: ChangeKind,
+    pub erased_written_basis: Option<Basis>,
     pub before: Option<RowImage>,
     pub after: Option<RowImage>,
 }

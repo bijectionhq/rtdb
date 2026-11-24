@@ -239,7 +239,12 @@ fn append_images(
 ) -> Result<()> {
     let make_row = |valid, kind, before, after| ChangeRow {
         table: write.table.clone(), id: write.id.clone(), valid, kind, before, after,
+        erased_written_basis: write.erased_written_basis,
     };
+    if write.erased_written_basis.is_some() {
+        output.push(make_row(write.valid, ChangeKind::Erased, None, None));
+        return Ok(());
+    }
     let Some(valid) = write.valid else {
         output.push(make_row(None, ChangeKind::Erased, None, None));
         return Ok(());
