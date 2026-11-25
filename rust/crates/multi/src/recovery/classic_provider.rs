@@ -67,14 +67,36 @@ pub(super) fn ordinary_flight_fence_reply(
     {
         return Err(mismatch());
     }
-    let fence_sha256 = archive::sha256(&archive::encode(&(
-        "rtdb.multi/classic-ordinary-flight-fence/v1", fence,
-    ))?);
     Ok(Reply::ClassicMigrationOrdinaryFlightFence {
         authority: intent.source, capture: intent.capture, destination: migration.destination,
         stage_operation: intent.operation, source: migration.source,
-        fenced_writer_epoch: fence.fenced_writer_epoch, fence_sha256,
+        fenced_writer_epoch: fence.fenced_writer_epoch, fence_sha256: flight_fence_digest(fence)?,
     })
+}
+
+fn flight_fence_digest(fence: &CheckpointTransferFence) -> Result<[u8; 32]> {
+    Ok(archive::sha256(&archive::encode(&("rtdb.multi/classic-ordinary-flight-fence/v1", fence))?))
+}
+
+pub(super) fn ordinary_flight_terminal(
+    source: &DeploymentRecord, fence: &CheckpointTransferFence, begin_sha256: [u8; 32],
+) -> Result<Option<Terminal>> {
+    let Some(terminal) = rtdb_directory::classic_flight::terminal(source, fence) else { return Ok(None); };
+    if terminal.commission.begin_sha256 != begin_sha256 { return Err(mismatch()); }
+    let fence_sha256 = flight_fence_digest(fence)?;
+    let terminal_sha256 = archive::sha256(&archive::encode(&(
+        "rtdb.multi/classic-ordinary-flight-terminal/v1", fence_sha256, &terminal,
+    ))?);
+    Ok(Some(Terminal::OrdinaryFreshFlight(FlightDrain {
+        fence_sha256,
+        coverage_sha256: terminal.commission.coverage_sha256,
+        original_catalog_sha256: terminal.commission.original_catalog_sha256,
+        fenced_at: terminal.fenced_at,
+        drained_at: terminal.drained_at,
+        gateway_generations: terminal.gateway_generations,
+        receiver_generations: terminal.receiver_generations,
+        terminal_sha256,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -139,6 +161,19 @@ pub(super) enum Terminal {
     LocalCatalog(CatalogDrain),
     HostedCatalog(CatalogDrain),
     FamilyRelease(ReleaseDrain),
+    OrdinaryFreshFlight(FlightDrain),
+}
+
+#[derive(Serialize)]
+pub(super) struct FlightDrain {
+    fence_sha256: [u8; 32],
+    coverage_sha256: [u8; 32],
+    original_catalog_sha256: [u8; 32],
+    fenced_at: Version,
+    drained_at: Version,
+    gateway_generations: usize,
+    receiver_generations: usize,
+    terminal_sha256: [u8; 32],
 }
 
 #[derive(Serialize)]

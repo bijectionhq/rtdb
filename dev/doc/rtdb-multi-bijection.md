@@ -562,8 +562,18 @@ A matching capture with no ordered fence returns `deferred`.
 The outcome identifies the transfer fence for the owner join and carries no reader disposition.
 
 The post-seal `classic_migration_provider_drain_status` accepts `{"population":"ordinary_fresh_flight"}` under the same candidate and application cut checks as the other populations.
-Stock admission and shutdown provide no authoritative ordinary-only cohort or restart-safe per-owner join, so this selector returns `deferred` for a matching cut.
-The fence observer and provider selector leave admission, source sealing and publication decisions under their current owners.
+The selector returns `deferred` until the Original directory retains the complete terminal for that exact fence.
+The positive `terminal` has `population: "ordinary_fresh_flight"`, `fence_sha256`, `coverage_sha256`, `original_catalog_sha256`, `fenced_at`, `drained_at`, `gateway_generations`, `receiver_generations` and `terminal_sha256`.
+Each digest is a 32-byte array, and the two counts cover at most 128 enrolled generations in total.
+The terminal digest commits to the compact JSON array `["rtdb.multi/classic-ordinary-flight-terminal/v1", fence_sha256, terminal]` with the private ordered generation roster, each join and the full commission.
+The source verifies the commissioned Begin against the candidate binding before returning the terminal.
+CUT independently matches the Original catalog commitment, exact fence digest, held Begin, application cut, SQL cutoff, placement and custody.
+
+The directory stores the commission, generation enrollments, exact fence revision and immutable per-generation joins on the Original.
+Enrollment uses the same conditional source revision as the transfer fence, so it either appears in the roster or refuses.
+The last join records the terminal revision, or the fence revision supplies it if all generations joined earlier.
+The ordinary selector requires a joined gateway generation and a joined receiver generation even for an unused ingress.
+An old installation or one without commissioned coverage can fence and seal the source while ordinary status stays deferred.
 
 The positive owner contract requires all of the following.
 

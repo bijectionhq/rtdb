@@ -46,6 +46,7 @@ const HOLDER: &str = "holder";
 const RECORD: &str = "record";
 const LINEAGE_VERSION: &str = "lineage_version";
 const CHECKPOINT_TRANSFER_FENCE: &str = "checkpoint_transfer_fence";
+const CLASSIC_FLIGHT: &str = "classic_flight";
 const FORK_STAGE: &str = "fork_stage";
 const WRITER_HANDOFF: &str = "writer_handoff";
 /// The index on the deployments table answering `deployments_held_by`; it projects only keys, since every hit is re-read strongly.
@@ -200,6 +201,7 @@ impl DynamoDirectory {
         let staged = item.contains_key(FORK_STAGE);
         let transfer = item.contains_key(CHECKPOINT_TRANSFER_FENCE);
         let writer_handoff = item.contains_key(WRITER_HANDOFF);
+        let classic_flight = item.contains_key(CLASSIC_FLIGHT);
         let mut request = self.client.put_item().table_name(table).set_item(Some(item))
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected))
@@ -215,12 +217,16 @@ impl DynamoDirectory {
                 request = request.expression_attribute_names("#n", NAME).expression_attribute_names("#stage", FORK_STAGE)
                     .expression_attribute_names("#transfer", CHECKPOINT_TRANSFER_FENCE)
                     .expression_attribute_values(":name", AttributeValue::S(name.to_owned()));
-                if writer_handoff {
-                    request.condition_expression(condition)
-                } else {
-                    request.condition_expression(format!("{condition} AND attribute_not_exists(#handoff)"))
-                        .expression_attribute_names("#handoff", WRITER_HANDOFF)
+                let mut condition = condition.to_owned();
+                if !writer_handoff {
+                    condition.push_str(" AND attribute_not_exists(#handoff)");
+                    request = request.expression_attribute_names("#handoff", WRITER_HANDOFF);
                 }
+                if !classic_flight {
+                    condition.push_str(" AND attribute_not_exists(#classicFlight)");
+                    request = request.expression_attribute_names("#classicFlight", CLASSIC_FLIGHT);
+                }
+                request.condition_expression(condition)
             }
             None => request.condition_expression(EXACT_VERSION),
         };
@@ -426,6 +432,7 @@ fn deployment_item(record: &DeploymentRecord, pack_parked: bool) -> Result<Item>
     if record.checkpoint_transfer_fence.is_some() {
         item.insert(CHECKPOINT_TRANSFER_FENCE.to_owned(), AttributeValue::Bool(true));
     }
+    if record.classic_flight.is_some() { item.insert(CLASSIC_FLIGHT.to_owned(), AttributeValue::Bool(true)); }
     Ok(item)
 }
 
@@ -474,7 +481,7 @@ impl DynamoDirectory {
     async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>,
         stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
+        if record.classic_flight.is_some() || record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
         record.version = stage_version.unwrap_or(0) + 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?));
         let deployment = match stage_version {
@@ -972,7 +979,7 @@ impl Directory for DynamoDirectory {
     }
 
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        if !record.writer_handoffs.is_empty() || record.fork_stage.is_some() || record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() {
+        if !record.writer_handoffs.is_empty() || record.fork_stage.is_some() || record.classic_flight.is_some() || record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() {
             let Some(current) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
             if current.version != expected { return Ok(Cas::Conflict(Some(current))); }
             require_fork_stage_update(&current, &record)?;

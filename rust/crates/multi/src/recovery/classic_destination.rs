@@ -329,7 +329,12 @@ impl RecoveryService {
                     return Err(conflict());
                 }
                 let provider_terminal = match provider {
-                    classic_provider::Population::OrdinaryFreshFlight {} => return Ok(Reply::Deferred),
+                    classic_provider::Population::OrdinaryFreshFlight {} => {
+                        let Some(flight) = classic_provider::ordinary_flight_terminal(
+                            &source, &terminal.fence, candidate_binding.begin_sha256,
+                        )? else { return Ok(Reply::Deferred); };
+                        flight
+                    }
                     classic_provider::Population::LocalCatalog | classic_provider::Population::HostedCatalog => {
                         let (cohort, drained_at) = catalog_drain.ok_or_else(conflict)?;
                         if source.version < drained_at || drained_at <= cohort.fenced_at

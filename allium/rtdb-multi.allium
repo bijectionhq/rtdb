@@ -650,7 +650,10 @@ contract LogService {
 
     @invariant ClassicMigrationOrdinaryFlightDrain
         -- The Original can reobserve the exact ordered transfer fence from its capture and private scratch before the keeper seal completes.
-        -- Ordinary fresh Flight drain requires a complete admission roster and a positive join of each enrolled receiver and transport owner at that fence.
+        -- The Original directory orders admission of each ordinary gateway and receiver generation against the same source revision as the transfer fence.
+        -- The exact transfer fence freezes the bounded roster and its independently commissioned ingress coverage.
+        -- An immutable generation join records positive disposal after that owner's ordinary admission closes and its work and transport output join.
+        -- The final join and the stored order of all earlier joins form the Original terminal for that exact fence.
         -- The retained Bijection continuation has independent admission and custody.
         -- Status defers while the Original lacks a retained terminal for the complete ordinary fresh Flight population.
 

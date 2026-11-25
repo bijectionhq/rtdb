@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 mod state_file;
 mod installed_reservation;
+pub mod classic_flight;
 pub mod feed;
 pub mod policy;
 pub mod ordered_index;
@@ -266,6 +267,8 @@ pub struct DeploymentRecord {
     /// The source-side catalog cohort and drain ordered under a Classic transfer fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classic_catalog_drain: Option<Box<ClassicCatalogDrain>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    classic_flight: Option<Box<classic_flight::Admission>>,
     /// Installed catalog admission floors, keyed by storage root.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalog_admission_floors: BTreeMap<String, CatalogAdmissionFloor>,
@@ -1261,7 +1264,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), classic_catalog_drain: None, catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), classic_catalog_drain: None, classic_flight: None, catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
             cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
@@ -1756,6 +1759,7 @@ fn prepare_checkpoint_transfer(
         fenced_writer_epoch: source.epoch.checked_add(1).ok_or_else(transfer_changed)?,
         drained_source_through: selection.drained_source_through,
     };
+    classic_flight::freeze(&mut source, &fence, fenced_at);
     source.lifecycle = Lifecycle::Restoring;
     source.epoch = fence.fenced_writer_epoch;
     source.holder = None;
@@ -1898,6 +1902,7 @@ fn prepare_checkpoint_transfer_activation(
 }
 
 fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
+    classic_flight::require_update(current, next)?;
     if !current.local_publications.is_empty() && current.storage_prefix() != next.storage_prefix() {
         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/local-publications",
             "The original residence must settle its local serving attempts before switching"));
@@ -2088,7 +2093,7 @@ impl MemoryDirectory {
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord,
         lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
+        if record.classic_flight.is_some() || record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
         if !installed_reservation::memory_allows_insert(
             state.installed_journals.contains(&record.id), stage_version.is_some(), state.deployments.contains_key(&record.id),
         ) {
@@ -2390,6 +2395,7 @@ mod tests {
         selection.drained_source_through = Some(7);
         assert!(prepare_checkpoint_transfer(&source, &target, &selection).is_err());
         selection.drained_source_through = Some(11);
+        classic_flight::check_transfer_order(&source, &target, &selection);
         let mut replaced = source.clone();
         replaced.epoch += 1;
         assert!(prepare_checkpoint_transfer(&replaced, &target, &selection).is_err());
