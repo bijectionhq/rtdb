@@ -4,6 +4,7 @@ use arrow_array::{
     Array, ArrayRef, Float64Array, Int64Array, LargeListArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     builder::FixedSizeBinaryBuilder, cast::AsArray, types::{Float64Type, Int64Type, UInt8Type, UInt32Type, UInt64Type},
 };
+use futures::{Stream, TryStreamExt};
 use rtdb_types::{MemoryBudget, MemoryReservation, Result};
 
 use super::{
@@ -114,57 +115,80 @@ pub(super) struct RankBlock {
 pub(super) struct RankLeaf {
     pub blocks: Vec<RankBlock>,
     pub windows: Vec<RankWindow>,
-    _reservation: Option<Arc<MemoryReservation>>,
+    _reservation: Arc<MemoryReservation>,
 }
 
-impl RankLeaf {
-    pub fn read(blocks: &LargeListArray, ids: &LargeListArray, row: usize, memory: Option<&Arc<MemoryBudget>>) -> Result<Self> {
+struct RankColumns {
+    blocks: ArrayRef,
+    ids: ArrayRef,
+}
+
+impl RankColumns {
+    fn read(blocks: &LargeListArray, ids: &LargeListArray, row: usize) -> Result<Self> {
         if row >= blocks.len() || row >= ids.len() { return Err(corrupt("Search rank page is incomplete")); }
-        let blocks = blocks.value(row);
-        let blocks = blocks.as_struct();
-        let impacts = blocks.column(3).as_list::<i64>();
-        let offsets = impacts.value_offsets();
-        let base = offsets[0] as usize;
-        let range = base..offsets[blocks.len()] as usize;
-        let impacts = impacts.values().as_struct();
-        let uint = |column| impacts.column(column).as_primitive::<UInt32Type>().values();
+        let columns = Self { blocks: blocks.value(row), ids: ids.value(row) };
+        let offsets = columns.offsets();
+        let range = offsets[0] as usize..offsets[offsets.len() - 1] as usize;
+        let impacts = columns.impacts();
+        let windows = columns.ids.as_struct().column(0).as_primitive::<UInt32Type>().values();
         let scores = impacts.column(5).as_primitive::<Float64Type>().values();
-        let ids = ids.value(row);
-        let ids = ids.as_struct();
-        let window_ids = ids.column(0).as_primitive::<UInt32Type>();
-        let minimum = ids.column(1).as_primitive::<Int64Type>();
-        let peak = ids.column(2).as_primitive::<Int64Type>();
-        if range.is_empty() || &uint(0)[range.clone()] != window_ids.values().as_ref()
-            || window_ids.values().windows(2).any(|pair| pair[0] >= pair[1])
-            || scores[range.clone()].iter().any(|score| !score.is_finite() || *score <= 0.0) {
+        if range.is_empty() || &impacts.column(0).as_primitive::<UInt32Type>().values()[range.clone()] != windows.as_ref()
+            || windows.windows(2).any(|pair| pair[0] >= pair[1])
+            || scores[range].iter().any(|score| !score.is_finite() || *score <= 0.0) {
             return Err(corrupt("Search term impacts disagree with their ordering proof"));
         }
-        let bytes = 256usize.saturating_add(blocks.len().saturating_mul(size_of::<RankBlock>()))
-            .saturating_add(range.len().saturating_mul(size_of::<RankWindow>()));
-        let reservation = memory.map(|memory| memory.reserve(bytes)).transpose()?;
-        let mut block_descriptors = Vec::with_capacity(blocks.len());
-        let mut windows = Vec::with_capacity(range.len());
-        let frequencies = uint(1);
-        let lengths = uint(2);
-        for (block, offsets) in offsets.windows(2).enumerate() {
-            let start = windows.len();
-            for impact in offsets[0] as usize..offsets[1] as usize {
-                let row = impact - base;
-                windows.push(RankWindow { window: window_ids.value(row), block, frequency: frequencies[impact], length: lengths[impact],
-                    unit_score: scores[impact], minimum: minimum.is_valid(row).then(|| minimum.value(row)),
-                    peak: peak.is_valid(row).then(|| peak.value(row)) });
-            }
-            block_descriptors.push(RankBlock { posting: PostingBlock::at(blocks, block), windows: start..windows.len() });
+        Ok(columns)
+    }
+
+    fn offsets(&self) -> &[i64] { self.blocks.as_struct().column(3).as_list::<i64>().value_offsets() }
+
+    fn impacts(&self) -> &StructArray {
+        self.blocks.as_struct().column(3).as_list::<i64>().values().as_struct()
+    }
+
+    fn window(&self, row: usize) -> RankNode {
+        let impact = self.offsets()[0] as usize + row;
+        let impacts = self.impacts();
+        let ids = self.ids.as_struct();
+        let window = ids.column(0).as_primitive::<UInt32Type>().value(row);
+        let optional_id = |column| {
+            let values = ids.column(column).as_primitive::<Int64Type>();
+            values.is_valid(row).then(|| values.value(row))
+        };
+        RankNode {
+            first: window, last: window, height: 0, page: None,
+            frequency: impacts.column(1).as_primitive::<UInt32Type>().value(impact),
+            length: impacts.column(2).as_primitive::<UInt32Type>().value(impact),
+            unit_score: impacts.column(5).as_primitive::<Float64Type>().value(impact),
+            minimum: optional_id(1), peak: optional_id(2),
         }
-        Ok(Self { blocks: block_descriptors, windows, _reservation: reservation })
     }
 
     fn summary(&self, range: Range<usize>) -> RankNode {
-        self.windows[range].iter().map(|window| RankNode {
-            first: window.window, last: window.window, height: 0, page: None,
-            frequency: window.frequency, length: window.length, unit_score: window.unit_score,
-            minimum: window.minimum, peak: window.peak,
-        }).reduce(RankNode::combine).expect("a rank leaf contains a window")
+        range.map(|row| self.window(row)).reduce(RankNode::combine).expect("a rank leaf contains a window")
+    }
+}
+
+impl RankLeaf {
+    pub fn read(blocks: &LargeListArray, ids: &LargeListArray, row: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let columns = RankColumns::read(blocks, ids, row)?;
+        let bytes = 256usize.saturating_add(columns.blocks.len().saturating_mul(size_of::<RankBlock>()))
+            .saturating_add(columns.ids.len().saturating_mul(size_of::<RankWindow>()));
+        let reservation = memory.reserve(bytes)?;
+        let mut blocks = Vec::with_capacity(columns.blocks.len());
+        let mut windows = Vec::with_capacity(columns.ids.len());
+        let offsets = columns.offsets();
+        let base = offsets[0] as usize;
+        for (block, offsets) in offsets.windows(2).enumerate() {
+            let start = windows.len();
+            for impact in offsets[0] as usize..offsets[1] as usize {
+                let node = columns.window(impact - base);
+                windows.push(RankWindow { window: node.first, block, frequency: node.frequency, length: node.length,
+                    unit_score: node.unit_score, minimum: node.minimum, peak: node.peak });
+            }
+            blocks.push(RankBlock { posting: PostingBlock::at(columns.blocks.as_struct(), block), windows: start..windows.len() });
+        }
+        Ok(Self { blocks, windows, _reservation: reservation })
     }
 }
 
@@ -191,15 +215,24 @@ pub(super) async fn leaf_arrays(reader: &TreeReader, node: RankNode) -> Result<(
     Ok((table(&page, Table::Blocks), table(&page, Table::ImpactIds)))
 }
 
+const TRAVERSAL_NODES: usize = 1 + MAX_HEIGHT as usize * FANOUT;
+pub(super) const TRAVERSAL_BYTES: usize = (TRAVERSAL_NODES + FANOUT) * size_of::<RankNode>();
+
+pub(super) fn leaf_stream(reader: &TreeReader, root: RankNode, first: u32, last: u32) -> impl Stream<Item = Result<RankNode>> + '_ {
+    let mut nodes = Vec::with_capacity(1 + root.height as usize * FANOUT);
+    nodes.push(root);
+    futures::stream::try_unfold(nodes, move |mut nodes| async move {
+        while let Some(node) = nodes.pop() {
+            if node.first > last || node.last < first { continue; }
+            if node.height == 0 { return Ok(Some((node, nodes))); }
+            nodes.extend(children(reader, node).await?.into_iter().rev());
+        }
+        Ok(None)
+    })
+}
+
 pub(super) async fn leaves(reader: &TreeReader, root: RankNode, first: u32, last: u32) -> Result<Vec<RankNode>> {
-    let mut nodes = vec![root];
-    let mut leaves = Vec::new();
-    while let Some(node) = nodes.pop() {
-        if node.first > last || node.last < first { continue; }
-        if node.height == 0 { leaves.push(node); }
-        else { nodes.extend(children(reader, node).await?.into_iter().rev()); }
-    }
-    Ok(leaves)
+    leaf_stream(reader, root, first, last).try_collect().await
 }
 
 fn slices(rows: &ArrayRef, range: Range<usize>, table: Table) -> Result<StructArray> {
@@ -208,34 +241,30 @@ fn slices(rows: &ArrayRef, range: Range<usize>, table: Table) -> Result<StructAr
 }
 
 pub(super) fn write_term(writer: &mut Writer<impl Write>, blocks: &LargeListArray, ids: &LargeListArray, row: usize) -> Result<RankNode> {
-    let decoded = RankLeaf::read(blocks, ids, row, None)?;
-    let window_count = decoded.windows.len();
-    if window_count <= INLINE_WINDOWS { return Ok(decoded.summary(0..window_count)); }
-    let blocks = blocks.value(row);
-    let ids = ids.value(row);
-    let mut level = Vec::new();
-    let mut remaining = decoded.blocks.iter().enumerate().peekable();
-    let mut first_window = 0;
-    while let Some((first_block, block)) = remaining.next() {
-        let mut window_count = block.windows.len();
-        let mut last_block = first_block;
-        while let Some((_, next)) = remaining.peek() {
-            if window_count + next.windows.len() > WINDOWS_PER_LEAF { break; }
-            let (index, next) = remaining.next().expect("peeked rank block");
-            last_block = index;
-            window_count += next.windows.len();
+    let columns = RankColumns::read(blocks, ids, row)?;
+    let window_count = columns.ids.len();
+    if window_count <= INLINE_WINDOWS { return Ok(columns.summary(0..window_count)); }
+    let offsets = columns.offsets();
+    let base = offsets[0] as usize;
+    let mut level = Vec::with_capacity(columns.blocks.len());
+    let mut first = 0;
+    while first < columns.blocks.len() {
+        let first_window = offsets[first] as usize - base;
+        let mut end = first + 1;
+        while end < columns.blocks.len() && offsets[end + 1] as usize - offsets[first] as usize <= WINDOWS_PER_LEAF {
+            end += 1;
         }
-        let end_window = first_window + window_count;
-        let node = decoded.summary(first_window..end_window);
+        let end_window = offsets[end] as usize - base;
+        let node = columns.summary(first_window..end_window);
         let page = writer.page([
-            (Table::Blocks, slices(&blocks, first_block..last_block + 1, Table::Blocks)?),
-            (Table::ImpactIds, slices(&ids, first_window..end_window, Table::ImpactIds)?),
+            (Table::Blocks, slices(&columns.blocks, first..end, Table::Blocks)?),
+            (Table::ImpactIds, slices(&columns.ids, first_window..end_window, Table::ImpactIds)?),
         ])?;
         level.push(RankNode { page: Some(page), ..node });
-        first_window = end_window;
+        first = end;
     }
     while level.len() > 1 {
-        let mut parents = Vec::new();
+        let mut parents = Vec::with_capacity(level.len().div_ceil(FANOUT));
         for nodes in level.chunks(FANOUT) {
             let mut parent = nodes.iter().copied().reduce(RankNode::combine).expect("a rank branch has children");
             parent.height += 1;

@@ -106,6 +106,11 @@ impl PostingPlan {
         Self { terms }
     }
 
+    pub(super) fn rank_workspace_bytes(&self) -> usize {
+        let blocks = self.terms.iter().map(|term| term.blocks.len()).max().unwrap_or(0);
+        blocks.saturating_mul(2 * size_of::<super::rank_tree::RankNode>())
+    }
+
     pub fn directory(&self) -> Result<StructArray> {
         let block_item = item_of(&Table::Blocks.fields()[0]);
         let arrow_schema::DataType::Struct(block_fields) = block_item.data_type() else { unreachable!() };

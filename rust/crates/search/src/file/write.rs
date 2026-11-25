@@ -381,6 +381,10 @@ impl Builder {
         if self.format >= FORMAT_VERSION {
             let plan = PostingPlan::new(postings);
             if self.format >= TREE_FORMAT_VERSION {
+                if let Some(reservation) = &mut self.reservation {
+                    let reservation = Arc::get_mut(reservation).expect("Search builder owns its allocation");
+                    reservation.grow_to(reservation.bytes().max(self.estimated.saturating_add(plan.rank_workspace_bytes())))?;
+                }
                 directory.push((Table::ImpactIds, plan.ids(&self.window_ids)?));
             }
             directory.push((Table::Windows, Table::Windows.array(vec![Arc::new(Int64Array::from(self.window_ids))])?));
