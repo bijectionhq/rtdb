@@ -1,6 +1,6 @@
 use rtdb_node::serving::custody_release::CustodyCarrierAuthority;
 use rtdb_types::{Anomaly, Result, Timestamp, rtdb_v1::{Basis, MAIN_BRANCH, valid_branch_name}};
-use rtdb_tx::transact::workload::{Applied, Authority, Fence, Point};
+use rtdb_tx::transact::workload::{Applied, Authority, Fence, FundedAppointmentScope, ManagedAppointment, Point};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -15,6 +15,7 @@ pub struct WorkloadGrantConfig {
     client_id_prefix: String,
     assignment: Option<Point>,
     original_family: bool,
+    funded_appointment_client_prefix: Option<String>,
 }
 
 impl WorkloadGrantConfig {
@@ -30,6 +31,7 @@ impl WorkloadGrantConfig {
             client_id_prefix,
             assignment: None,
             original_family: false,
+            funded_appointment_client_prefix: None,
         })
     }
 
@@ -39,6 +41,21 @@ impl WorkloadGrantConfig {
     }
 
     pub fn assignment(&self) -> Option<&Point> { self.assignment.as_ref() }
+
+    pub fn with_funded_appointment_client_prefix(mut self, prefix: String) -> Result<Self> {
+        if self.assignment.is_none() || !valid_client_id_prefix(&prefix)
+            || !prefix.starts_with(self.client_id_prefix.as_str()) || prefix == self.client_id_prefix
+        {
+            return Err(Anomaly::incorrect("rtdb.auth/workload-grant-config",
+                "Funded appointments require a dedicated client ID sub-prefix of the assignment issuer"));
+        }
+        self.funded_appointment_client_prefix = Some(prefix);
+        Ok(self)
+    }
+
+    pub(crate) fn funded_appointment_client(&self, client_id: &str) -> bool {
+        self.funded_appointment_client_prefix.as_deref().is_some_and(|prefix| client_id.starts_with(prefix))
+    }
 
     pub(crate) fn for_original_family(mut self, point: Point) -> Self {
         self.assignment = Some(point);
@@ -143,6 +160,7 @@ enum Permission {
     Assignment { authority: Box<Authority>, point: Point },
     OriginalCustody(OriginalCustodyControl),
     OriginalFamily { scope: Box<OriginalFamilyGrant>, point: Point },
+    FundedAppointment { scope: Box<FundedAppointmentScope>, point: Point },
 }
 
 impl VerifiedWorkloadGrant {
@@ -182,9 +200,15 @@ impl VerifiedWorkloadGrant {
             match (claim.version, claim.operations, claim.authority, claim.original_custody, config.assignment()) {
             (1, Some([operation]), None, None, _) if claim_field_absent(raw, "authority")
                 && claim_field_absent(raw, "original_custody") => Permission::Create(operation),
+            (2, None, Some(Authority::FundedAppointment(scope)), None, Some(point))
+                if config.funded_appointment_client_prefix.is_some()
+                    && claim_field_absent(raw, "operations") && claim_field_absent(raw, "original_custody")
+                    && point.table != scope.receipt.table
+                    && Authority::FundedAppointment(scope.clone()).valid(claim.incarnation) =>
+                Permission::FundedAppointment { scope: Box::new(scope), point: point.clone() },
             (2, None, Some(authority), None, Some(point)) if claim_field_absent(raw, "operations")
                 && claim_field_absent(raw, "original_custody") && authority.valid(claim.incarnation)
-                && !matches!(authority, Authority::OriginalFamilyWrite { .. }) =>
+                && !matches!(authority, Authority::OriginalFamilyWrite { .. } | Authority::FundedAppointment(_)) =>
                 Permission::Assignment { authority: Box::new(authority), point: point.clone() },
             (3, None, None, Some(control), Some(_)) if claim_field_absent(raw, "operations")
                 && claim_field_absent(raw, "authority") && control.authority.incarnation == claim.incarnation
@@ -206,6 +230,10 @@ impl VerifiedWorkloadGrant {
             hash.update(b"rtdb.v1/original-family\0");
             hash.update(serde_json::to_vec(scope.as_ref()).map_err(|_| invalid_grant())?);
         }
+        if let Permission::FundedAppointment { scope, point } = &permission {
+            hash.update(b"rtdb.v1/managed-funded-appointment\0");
+            hash.update(serde_json::to_vec(&(scope, point)).map_err(|_| invalid_grant())?);
+        }
         Ok(Self {
             database: claim.database.into(),
             incarnation: claim.incarnation,
@@ -222,7 +250,7 @@ impl VerifiedWorkloadGrant {
     pub fn is_assignment(&self) -> bool { matches!(self.permission, Permission::Assignment { .. }) }
 
     pub(super) fn is_assignment_issued(&self) -> bool {
-        self.is_assignment() || self.is_original_custody_control()
+        self.is_assignment() || self.is_original_custody_control() || self.is_funded_appointment()
     }
 
     pub fn is_original_custody_control(&self) -> bool {
@@ -231,6 +259,19 @@ impl VerifiedWorkloadGrant {
 
     pub fn is_original_family(&self) -> bool {
         matches!(self.permission, Permission::OriginalFamily { .. })
+    }
+
+    pub fn is_funded_appointment(&self) -> bool {
+        matches!(self.permission, Permission::FundedAppointment { .. })
+    }
+
+    pub fn funded_appointment(&self, database: &str, incarnation: [u8; 16], now: Timestamp) -> Result<ManagedAppointment> {
+        self.revalidate(now)?;
+        match &self.permission {
+            Permission::FundedAppointment { scope, point } if self.database == database && self.incarnation == incarnation =>
+                ManagedAppointment::new(point.clone(), scope.as_ref().clone(), self.receipt_namespace, self.expires_at),
+            _ => Err(invalid_grant()),
+        }
     }
 
     pub fn original_family(
@@ -316,7 +357,7 @@ impl VerifiedWorkloadGrant {
     pub(super) fn memory_bytes(&self) -> usize {
         self.database.capacity() + match &self.permission {
             Permission::Create(_) | Permission::OriginalCustody(_) => 0,
-            Permission::Assignment { .. } | Permission::OriginalFamily { .. } => 8192,
+            Permission::Assignment { .. } | Permission::OriginalFamily { .. } | Permission::FundedAppointment { .. } => 8192,
         }
     }
 }
@@ -338,6 +379,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn funded_appointment_v2_requires_enrollment_and_preserves_the_exact_scope_on_renewal() {
+        let incarnation = [1; 16];
+        let point = Point::new("public.writer", "authority".into(), Timestamp(0)).unwrap();
+        let assignment = WorkloadGrantConfig::new("assignment".into(), "assignment-".into())
+            .unwrap().with_assignment(point);
+        let enrolled = assignment.clone().with_funded_appointment_client_prefix("assignment-funded-".into()).unwrap();
+        assert!(enrolled.funded_appointment_client("assignment-funded-booking"));
+        assert!(!enrolled.funded_appointment_client("assignment-writer"));
+        let applied = |namespace, position| Applied {
+            namespace, key: vec![position as u8; 16], basis: Basis::new(incarnation, position).to_bytes(),
+            system_time_micros: position as i64,
+        };
+        let scope = FundedAppointmentScope {
+            fence: Fence { applied: applied([2; 32], 1), placement: Placement { epoch: 1,
+                assignment: Some(Holder { assignment_id: [3; 16], holder: "holder".into() }),
+            } },
+            writer: applied([4; 32], 2), key: [5; 32],
+            receipt: Point::new("public.receipts", "receipt".into(), Timestamp(0)).unwrap(),
+            intent_sha256: [6; 32], funding_policy_sha256: [7; 32],
+        };
+        let authority = json!(Authority::FundedAppointment(scope));
+        assert_eq!(authority["role"], "funded-appointment");
+        let raw = |expires_at_micros| json!({
+            "version": 2, "audience": "assignment", "database": "exact", "incarnation": incarnation,
+            "grant_id": [8; 16], "expires_at_micros": expires_at_micros, "authority": authority,
+        });
+        let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
+            raw, "https://assignment.example.invalid/", config, "funded", Timestamp(100), Timestamp(0),
+        );
+        assert!(verify(&raw(80), &assignment).is_err());
+        let first = verify(&raw(80), &enrolled).unwrap();
+        let renewed = verify(&raw(90), &enrolled).unwrap();
+        assert_eq!(first.receipt_namespace(), renewed.receipt_namespace());
+        assert!(first.assignment("exact", incarnation, Timestamp(0)).is_err());
+        assert!(first.funded_appointment("other", incarnation, Timestamp(0)).is_err());
+        assert!(first.funded_appointment("exact", [9; 16], Timestamp(0)).is_err());
+        assert!(first.funded_appointment("exact", incarnation, Timestamp(80)).is_err());
+        let context = first.funded_appointment("exact", incarnation, Timestamp(0)).unwrap();
+        assert!(context.check_key(&[5; 32]).is_ok());
+        assert!(context.check_key(&[6; 32]).is_err());
+        let mut changed = raw(90);
+        changed["authority"]["writer"]["namespace"] = json!([9; 32]);
+        assert_ne!(first.receipt_namespace(), verify(&changed, &enrolled).unwrap().receipt_namespace());
+    }
 
     #[test]
     fn original_family_grant_requires_its_issuer_and_binds_line_and_epoch() {

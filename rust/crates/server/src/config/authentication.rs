@@ -109,6 +109,9 @@ fn workload_issuer(value: Yaml, path: &str, assignment: bool) -> Result<Workload
     )?;
     if assignment {
         grants = grants.with_assignment(authority_point(fields.require("authorityPoint")?, "authn.assignment.authorityPoint")?);
+        if let Some(prefix) = fields.string("fundedAppointmentClientIdPrefix")? {
+            grants = grants.with_funded_appointment_client_prefix(prefix)?;
+        }
     }
     fields.finish()?;
     WorkloadIssuerConfig::new(issuer, ca, grants)

@@ -45,6 +45,16 @@ fn append(pipeline: &mut TransactPipeline, decision: Decision) -> (Receipt, Opti
 
 #[test]
 fn appointment_orders_before_guest_and_binds_only_one_terminal() -> Result<()> {
+    check_appointment_order(None)
+}
+
+#[test]
+fn managed_appointment_retains_private_stage_retries_and_terminal_through_checkpoint() -> Result<()> {
+    check_appointment_order(Some(Timestamp(3_000_000)))
+}
+
+fn check_appointment_order(managed_until: Option<Timestamp>) -> Result<()> {
+    let namespace = managed_until.map(|_| OWNER);
     let incarnation = [1; 16];
     let claims = ClaimSealer::new(incarnation, [9; 32]);
     let state = TransactState::new(incarnation);
@@ -56,18 +66,25 @@ fn appointment_orders_before_guest_and_binds_only_one_terminal() -> Result<()> {
     let seat_id = EntityId::Integer(2);
     let claim_id = EntityId::Integer(3);
     let prepare = Transact::prepare_funded_appointment(
-        vec![1; 16], absent(&receipts, receipt_id.clone()), Timestamp(1_950_000),
+        vec![1; if namespace.is_some() { 32 } else { 16 }], absent(&receipts, receipt_id.clone()), Timestamp(1_950_000),
     )?;
     let prepare_command = AppointmentCommand::Prepare { predecessor, booking: BOOKING, intent: INTENT };
     let decide = |pipeline: &mut TransactPipeline, request: &Transact, command, sample| {
-        let input = FundingInput::Appointment { owner: OWNER, command, sample };
-        pipeline.decide_funded(request, Timestamp(2_000_000), &[TRANSACT_REQUIRES], &claims, None, None, input, usize::MAX)
+        let input = FundingInput::Appointment { owner: OWNER, command, sample, managed_until };
+        let now = if managed_until.is_some() { Timestamp(0) } else { Timestamp(2_000_000) };
+        pipeline.decide_funded(request, now, &[TRANSACT_REQUIRES], &claims, None, None, input, usize::MAX)
+    };
+    let status = |pipeline: &TransactPipeline, key: &[u8]| {
+        if pipeline.is_deciding(key, namespace) { return Err(pending_error()); }
+        pipeline.durable().tx_status_with_namespace(key, namespace)
     };
     let prepared = decide(&mut pipeline, &prepare, prepare_command, sample(1, 100_000, 1_800_000, 1_900_000))?;
+    let Decision::Append { record, .. } = &prepared else { panic!("expected preparation record"); };
+    assert_eq!(record[1], if namespace.is_some() { b'5' } else { b'4' });
     let (prepared, proof) = append(&mut pipeline, prepared);
     assert!(proof.is_none());
     assert_eq!(prepared.decision_clock.unwrap().reading(), READING);
-    assert_eq!(pipeline.tx_status(&prepare.key).unwrap_err().code, "rtdb/transaction-pending");
+    assert_eq!(status(&pipeline, &prepare.key).unwrap_err().code, "rtdb/transaction-pending");
 
     let mut foreign = prepare.clone();
     foreign.key = vec![5; 16];
@@ -89,18 +106,22 @@ fn appointment_orders_before_guest_and_binds_only_one_terminal() -> Result<()> {
     let (activated, proof) = append(&mut pipeline, activation);
     assert_eq!(proof.unwrap().before(), Timestamp(900_000));
     assert_eq!(activated.decision_clock.unwrap().booking(), BOOKING);
-    assert_eq!(pipeline.tx_status(&prepare.key).unwrap_err().code, "rtdb/transaction-pending");
+    assert_eq!(status(&pipeline, &prepare.key).unwrap_err().code, "rtdb/transaction-pending");
     consume.requires.extend([written(&controls, seat_id, activated.basis), written(&controls, claim_id, activated.basis)]);
 
     let expired = decide(&mut pipeline, &consume, consume_command, sample(3, 1_800_000, 1_800_000, 1_900_000));
     assert!(expired.is_err());
-    assert_eq!(pipeline.tx_status(&prepare.key).unwrap_err().code, "rtdb/transaction-pending");
+    assert_eq!(status(&pipeline, &prepare.key).unwrap_err().code, "rtdb/transaction-pending");
     let mut wrong_row = consume.clone();
     wrong_row.ops = vec![put(&receipts, EntityId::String("1".into()))];
     assert!(decide(&mut pipeline, &wrong_row, consume_command, sample(3, 1_200_000, 1_800_000, 1_900_000)).is_err());
     let accepted = decide(&mut pipeline, &consume, consume_command, sample(3, 1_200_000, 1_800_000, 1_900_000))?;
-    assert_eq!(pipeline.tx_status(&prepare.key).unwrap_err().code, "rtdb/transaction-pending");
+    assert_eq!(status(&pipeline, &prepare.key).unwrap_err().code, "rtdb/transaction-pending");
     let (terminal, proof) = append(&mut pipeline, accepted);
+    if namespace.is_some() {
+        assert!(activated.system_time < READING);
+        assert_eq!(terminal.system_time, Timestamp(1_200_000));
+    }
     assert_eq!(proof.unwrap(), TimedJournalCutoff::new(Timestamp(1_900_000), [8; 32])?);
     assert_eq!(terminal.decision_clock.unwrap().appointment_cut().unwrap().basis, activated.basis);
     let state = pipeline.durable();
@@ -111,8 +132,13 @@ fn appointment_orders_before_guest_and_binds_only_one_terminal() -> Result<()> {
 
     let prior_cut = state.index().exact(activated.basis)?;
     let prior = TransactState::decode_checkpoint(&state.encode_checkpoint_at(activated.basis)?, prior_cut)?;
-    assert_eq!(prior.tx_status(&prepare.key).unwrap_err().code, "rtdb/transaction-pending");
+    assert_eq!(prior.tx_status_with_namespace(&prepare.key, namespace).unwrap_err().code, "rtdb/transaction-pending");
     let state = TransactState::decode_checkpoint(&state.encode_checkpoint()?, state.index().head())?;
+    assert_eq!(state.tx_status_with_namespace(&prepare.key, namespace)?, replay(&terminal));
+    if namespace.is_some() {
+        assert_eq!(state.tx_status(&prepare.key).unwrap_err().code, "rtdb/unknown-transaction");
+        assert_eq!(state.tx_status_with_namespace(&prepare.key, Some([21; 32])).unwrap_err().code, "rtdb/unknown-transaction");
+    }
     let mut recovered = TransactPipeline::new(state, 4, 4)?;
     for (request, command, expected) in [
         (&prepare, prepare_command, prepared),
@@ -144,7 +170,7 @@ fn an_ordered_exclusion_blocks_a_later_consume_without_binding_a_terminal() -> R
     )?;
     let decide = |pipeline: &mut TransactPipeline, request: &Transact, command, sample| {
         pipeline.decide_funded(request, Timestamp(2_000_000), &[TRANSACT_REQUIRES], &claims, None, None,
-            FundingInput::Appointment { owner: OWNER, command, sample }, usize::MAX)
+            FundingInput::Appointment { owner: OWNER, command, sample, managed_until: None }, usize::MAX)
     };
     let ordered = decide(&mut pipeline, &prepare, AppointmentCommand::Prepare { predecessor, booking: BOOKING, intent: INTENT },
         sample(1, 100_000, 1_800_000, 1_900_000))?;

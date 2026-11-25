@@ -201,6 +201,13 @@ pub enum MultiWriteAdmission<'a> {
 }
 
 impl MultiServing {
+    fn check_appointment_origin(&self, appointment: &workload::ManagedAppointment) -> Result<()> {
+        if self.classic_workload_fence.as_ref().is_some_and(|imported| !appointment.fence().at_or_after_import(imported)) {
+            return Err(workload::denied());
+        }
+        Ok(())
+    }
+
     pub async fn assign_follower(self: &Arc<Self>) -> Result<MultiFollower> {
         let owner = Arc::new(());
         let mut database = self.database.lock().await;
@@ -587,6 +594,30 @@ impl ServingDriver for MultiServing {
 
     async fn supports_funded_appointment(&self) -> bool {
         self.classic_workload_fence.is_none() && self.database.lock().await.supports_funded_appointment()
+    }
+
+    async fn managed_appointment_ready(&self, appointment: &workload::ManagedAppointment) -> Result<bool> {
+        self.check_appointment_origin(appointment)?;
+        self.database.lock().await.managed_appointment_ready(appointment).await
+    }
+
+    async fn transact_managed_appointment(
+        &self, request: Transact, appointment: workload::ManagedAppointment,
+        command: rtdb_tx::transact::AppointmentCommand, clock: Arc<dyn rtdb_tx::DecisionClock>,
+        cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        self.check_appointment_origin(&appointment)?;
+        cancellation.run_until_cancelled(self.writes.transact_managed_appointment(request, appointment, command, clock))
+            .await.ok_or_else(interrupted)?
+    }
+
+    async fn managed_appointment_status(
+        &self, appointment: &workload::ManagedAppointment, key: &[u8], cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        self.check_appointment_origin(appointment)?;
+        cancellation.run_until_cancelled(async {
+            self.database.lock().await.managed_appointment_status(appointment, key).await
+        }).await.ok_or_else(interrupted)?
     }
 
     async fn transact_funded(

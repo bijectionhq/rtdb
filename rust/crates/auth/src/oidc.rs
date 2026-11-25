@@ -175,15 +175,19 @@ impl Provider {
         let user = string(&response.body, "sub")?;
         let labels = response.body.get(visibility_scope::CLAIM);
         let workload = match &grant {
-            RefreshGrant::ClientCredentials { id, .. } => self.workload_config(id),
+            RefreshGrant::ClientCredentials { id, .. } => self.workload_config(id).map(|config| (id, config)),
             RefreshGrant::Password => None,
         };
         let scope = match (workload, response.body.get(workload_grant::CLAIM), labels) {
-            (Some(config), Some(claim), None) => {
+            (Some((id, config)), Some(claim), None) => {
                 let expiry = token.expires_at.ok_or_else(workload_grant::invalid_grant)?;
-                Some(Scope::Workload(VerifiedWorkloadGrant::from_userinfo(
+                let grant = VerifiedWorkloadGrant::from_userinfo(
                     claim, self.issuer.as_str(), config, user, expiry, self.clock.now(),
-                )?))
+                )?;
+                if config.funded_appointment_client(id) != grant.is_funded_appointment() {
+                    return Err(workload_grant::invalid_grant());
+                }
+                Some(Scope::Workload(grant))
             }
             (Some(_), _, _) | (None, Some(_), _) => return Err(workload_grant::invalid_grant()),
             (None, None, Some(claim)) => {

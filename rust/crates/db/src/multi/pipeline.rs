@@ -34,6 +34,7 @@ const CUSTODY_FEATURES: &[&str] = &[
     rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS, ROW_CUSTODY,
 ];
 const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, "row-visibility"];
+const MANAGED_APPOINTMENT_FEATURES: &[&str] = &[TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME];
 type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
@@ -44,6 +45,7 @@ enum Command {
         owner: [u8; 32],
         command: rtdb_tx::transact::FundingCommand,
         clock: Arc<dyn rtdb_tx::DecisionClock>,
+        managed: Option<Box<workload::ManagedAppointment>>,
         reply: Reply<Receipt>,
     },
     Workload(workload::Request, Reply<workload::Reply>),
@@ -171,7 +173,18 @@ impl WritePipeline {
         command: rtdb_tx::transact::FundingCommand, clock: Arc<dyn rtdb_tx::DecisionClock>,
     ) -> Result<Receipt> {
         let scope = scope.map(|(labels, namespace)| Scope { labels, namespace });
-        self.request(|reply| Command::Funded { transaction, scope, owner, command, clock, reply }).await
+        self.request(|reply| Command::Funded { transaction, scope, owner, command, clock, managed: None, reply }).await
+    }
+
+    pub async fn transact_managed_appointment(
+        &self, transaction: Transact, appointment: workload::ManagedAppointment,
+        command: rtdb_tx::transact::AppointmentCommand, clock: Arc<dyn rtdb_tx::DecisionClock>,
+    ) -> Result<Receipt> {
+        self.request(|reply| Command::Funded {
+            transaction, scope: None, owner: appointment.namespace(),
+            command: rtdb_tx::transact::FundingCommand::Appointment(command), clock,
+            managed: Some(Box::new(appointment)), reply,
+        }).await
     }
 
     pub async fn tick(&self, live: BTreeSet<IpAddr>) -> Result<Role> {
@@ -234,12 +247,19 @@ pub(super) struct Authority {
 impl Authority {
     async fn append_funded(
         &self, write: &Append, decision_before: Timestamp, cutoff: rtdb_types::TimedJournalCutoff,
+        managed: Option<(&workload::ManagedAppointment, &TransactState)>,
     ) -> std::result::Result<(), AttemptError> {
         let batch = self.stream.batch.as_ref().filter(|batch| batch.maximum_timed_original_bytes().is_some())
             .ok_or_else(|| AttemptError::Local(rtdb_tx::transact::funding_unsupported()))?;
         if self.next != write.at { return Err(AttemptError::Local(order_error("The funded append must follow the acknowledged prefix"))); }
         let bytes = self.stream.encode(write.at, &write.entry).await.map_err(AttemptError::Local)?;
         let upper = self.upper();
+        if let Some((appointment, state)) = managed {
+            appointment.check_current(state, upper).map_err(AttemptError::Local)?;
+        }
+        if write.admit_before.is_some_and(|expiry| upper >= expiry || cutoff.before() > expiry) {
+            return Err(AttemptError::Local(workload::denied()));
+        }
         if upper >= decision_before || cutoff.before().0 > self.lease.until {
             return Err(AttemptError::Local(Anomaly::new(AnomalyCategory::Conflict,
                 "rtdb/window-expired", "The original timed append missed its admission bounds")));
@@ -334,9 +354,9 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
                 let result = database.lock().await.managed_workload(request).await;
                 let _ = reply.send(result);
             }
-            Command::Funded { transaction, scope, owner, command, clock, reply } => {
+            Command::Funded { transaction, scope, owner, command, clock, managed, reply } => {
                 let result = database.lock().await.transact_funded_serial(
-                    &transaction, scope.as_ref().map(Scope::authority), owner, command, clock.as_ref(),
+                    &transaction, scope.as_ref().map(Scope::authority), owner, command, clock.as_ref(), managed.as_deref(),
                 ).await;
                 let _ = reply.send(result);
             }
@@ -627,9 +647,33 @@ impl MultiDatabase {
             && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some_and(|limit| limit > 1024)
     }
 
+    pub async fn managed_appointment_ready(&mut self, appointment: &workload::ManagedAppointment) -> Result<bool> {
+        self.refresh().await?;
+        self.require_active()?;
+        let lease = self.authority()?;
+        self.check_managed_appointment(lease.epoch, appointment, Timestamp::MIN)?;
+        Ok(self.supports_funded_appointment())
+    }
+
+    pub async fn managed_appointment_status(&mut self, appointment: &workload::ManagedAppointment, key: &[u8]) -> Result<Receipt> {
+        appointment.check_key(key)?;
+        self.refresh().await?;
+        self.require_active()?;
+        let lease = self.authority()?;
+        self.check_managed_appointment(lease.epoch, appointment, Timestamp::MIN)?;
+        appointment.status(self.durable_transactions(), key)
+    }
+
+    fn check_managed_appointment(&self, epoch: Epoch, appointment: &workload::ManagedAppointment, at: Timestamp) -> Result<()> {
+        let state = self.durable_transactions();
+        let now = self.append_authority(epoch)?.upper().max(state.index().head().system_time.next()?).max(at);
+        appointment.check_current(state, now)
+    }
+
     async fn transact_funded_serial(
         &mut self, request: &Transact, scope: Option<ScopedTransact<'_>>, owner: [u8; 32],
         command: rtdb_tx::transact::FundingCommand, clock: &dyn rtdb_tx::DecisionClock,
+        managed: Option<&workload::ManagedAppointment>,
     ) -> Result<Receipt> {
         self.refresh().await?;
         self.require_active()?;
@@ -642,20 +686,35 @@ impl MultiDatabase {
         self.require_armed_rotation()?;
         let record_limit = self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes())
             .ok_or_else(rtdb_tx::transact::funding_unsupported)?.saturating_sub(1024);
-        let claims = self.tokens.verify_claims_in(request.claims(), scope.map(|scope| scope.labels)).await;
-        let mut funding = rtdb_tx::transact::FundingInput::new(command, owner);
+        let (mut funding, claims) = if let Some(appointment) = managed {
+            let rtdb_tx::transact::FundingCommand::Appointment(command) = command else { return Err(workload::denied()); };
+            let lease = self.authority()?;
+            self.check_managed_appointment(lease.epoch, appointment, Timestamp::MIN)?;
+            appointment.check_request(self.durable_transactions(), request, command)?;
+            (rtdb_tx::transact::FundingInput::managed_appointment(command, appointment),
+                self.tokens.verify_workload_claims(request.claims(), appointment.claim_binding()?).await)
+        } else {
+            (rtdb_tx::transact::FundingInput::new(command, owner),
+                self.tokens.verify_claims_in(request.claims(), scope.map(|scope| scope.labels)).await)
+        };
         funding.verify(request, self.durable_transactions(), scope, clock).await;
         let lease = self.authority()?;
+        if let Some(appointment) = managed {
+            self.check_managed_appointment(lease.epoch, appointment, funding.appointment_observed_at().unwrap_or(Timestamp::MIN))?;
+        }
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;
         let now = (self.clock)();
-        let features = if scope.is_some() { SCOPED_FEATURES } else { self.write_features() };
+        let features = if managed.is_some() { MANAGED_APPOINTMENT_FEATURES }
+            else if scope.is_some() { SCOPED_FEATURES }
+            else { self.write_features() };
         let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
             .decide_funded(request, now, features, &claims, scope, None, funding, record_limit)?;
-        let write = match plan(decision, lease, generation, coordinates)? {
+        let mut write = match plan(decision, lease, generation, coordinates)? {
             Planned::Answer(receipt) => return self.project_receipt(receipt, scope),
             Planned::Append(write) => write,
         };
+        write.admit_before = managed.map(workload::ManagedAppointment::expires_at);
         let at = write.at;
         let funded = match &write.entry.record {
             Record::Tx { payload, .. } => match TransactionRecord::decode(payload)? {
@@ -666,7 +725,8 @@ impl MultiDatabase {
         };
         let receipts = if let Some((_, decision_before, cutoff)) = funded {
             let authority = self.append_authority(lease.epoch)?;
-            let result = authority.append_funded(&write, decision_before, cutoff).await;
+            let admission = managed.map(|appointment| (appointment, self.durable_transactions()));
+            let result = authority.append_funded(&write, decision_before, cutoff, admission).await;
             if let Err(error) = result {
                 let error = self.begin_write_recovery(error);
                 let _ = self.recover_writer().await;

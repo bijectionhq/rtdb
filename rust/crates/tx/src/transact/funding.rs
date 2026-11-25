@@ -37,6 +37,7 @@ pub enum FundingInput {
         owner: [u8; 32],
         command: AppointmentCommand,
         sample: Option<AppointmentSample>,
+        managed_until: Option<Timestamp>,
     },
 }
 
@@ -71,7 +72,20 @@ impl FundingInput {
         match command {
             FundingCommand::Book { predecessor, booking } => Self::Book { owner, predecessor, booking, issued: None },
             FundingCommand::Consume { booking } => Self::Consume { owner, booking, observed: None, certificate: None },
-            FundingCommand::Appointment(command) => Self::Appointment { owner, command, sample: None },
+            FundingCommand::Appointment(command) => Self::Appointment { owner, command, sample: None, managed_until: None },
+        }
+    }
+
+    pub fn managed_appointment(command: AppointmentCommand, context: &workload::ManagedAppointment) -> Self {
+        Self::Appointment {
+            owner: context.namespace(), command, sample: None, managed_until: Some(context.expires_at()),
+        }
+    }
+
+    pub(super) fn managed_appointment_namespace(self) -> Option<[u8; 32]> {
+        match self {
+            Self::Appointment { owner, managed_until: Some(_), .. } => Some(owner),
+            _ => None,
         }
     }
 
@@ -99,8 +113,8 @@ impl FundingInput {
                     *certificate = clock.funded_certificate(offer.original, sample);
                 }
             }
-            Self::Appointment { owner, command, sample } => {
-                *sample = if scope.is_none() { command.verify(*owner, request, state, clock).await } else { None };
+            Self::Appointment { owner, command, sample, managed_until } => {
+                *sample = if scope.is_none() { command.verify(*owner, request, state, clock, *managed_until).await } else { None };
             }
         }
     }

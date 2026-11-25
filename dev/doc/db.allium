@@ -104,6 +104,7 @@
 -- An Original appointment preparation reserves its receipt point without row effects, and the subsequent activation and terminal decision each use the timed original quorum.
 -- The canonical activation records the guarded control writes, and the canonical terminal records the selected effects and exact create-only Original receipt together.
 -- The ordered fold and its checkpoint preserve the appointment's stage, original reading, bounds and exact retry fingerprints.
+-- Managed Multi appointment records and checkpoints also retain the appointment's private receipt namespace.
 -- Read-only validation answers at a linearizable applied cut.
 -- A block produced for the branch attachment carries its fold and receipt checkpoint at the block boundary.
 -- An append receipt reports the durable position and timestamp of the record.

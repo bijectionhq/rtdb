@@ -175,7 +175,8 @@ impl TransactPipeline {
         authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>, workload: Option<&workload::Admission>,
         funding: Option<(FundingInput, usize)>,
     ) -> Result<Decision> {
-        let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace));
+        let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
+            .or(funding.and_then(|(input, _)| input.managed_appointment_namespace()));
         let identity = TxKey { namespace: request.receipt_namespace(namespace), key: request.key.clone() };
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
         if funding.is_some_and(|(input, _)| input.is_appointment()) && !self.in_flight.is_empty() {

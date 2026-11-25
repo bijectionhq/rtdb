@@ -178,6 +178,24 @@ pub trait ServingDriver: Send + Sync {
 
     async fn supports_funded_appointment(&self) -> bool { false }
 
+    async fn managed_appointment_ready(&self, _appointment: &workload::ManagedAppointment) -> Result<bool> {
+        Err(workload::denied())
+    }
+
+    async fn transact_managed_appointment(
+        &self, _request: Transact, _appointment: workload::ManagedAppointment,
+        _command: rtdb_tx::transact::AppointmentCommand, _clock: Arc<dyn rtdb_tx::DecisionClock>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        Err(workload::denied())
+    }
+
+    async fn managed_appointment_status(
+        &self, _appointment: &workload::ManagedAppointment, _key: &[u8], _cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        Err(workload::denied())
+    }
+
     async fn transact_funded(
         &self, _request: Transact, _scope: Option<ServingScope>, _funding: FundingSubmission,
         _cancellation: &CancellationToken,

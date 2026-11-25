@@ -22,7 +22,7 @@ pub(crate) mod error;
 mod query;
 mod scoped_hold;
 mod tokens;
-mod appointment;
+pub(crate) mod appointment;
 mod transact;
 mod workload;
 
@@ -100,6 +100,10 @@ impl Service {
         action: flight::Action,
     ) -> Result<Response<Output<flight::Result>>, Status> {
         let outcome = match action.r#type.as_str() {
+            CAPABILITIES if appointment::is_managed(&call) => async {
+                decode::<proto::CapabilitiesRequest>(action.body)?;
+                self.managed_appointment_capabilities(&call).await
+            }.await,
             CAPABILITIES if original_family_landing::is_managed_family(&call) => async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 self.managed_family(&call).await?;
@@ -328,6 +332,7 @@ impl Service {
             }
             return self.consume_funded_appointment(call, request, appointment).await;
         }
+        if appointment::is_managed(call) { return Err(appointment::denied()); }
         if let Some(booking) = request.decision_clock_offer.take() {
             let booking = booking.as_slice().try_into().map_err(|_| error::incorrect("Invalid DecisionClock booking"))?;
             let receipt = self.funded_transact(call, request, FundingCommand::Consume { booking }).await?;
@@ -402,6 +407,9 @@ impl Service {
         request: proto::TxStatusRequest,
     ) -> Result<Vec<u8>, Status> {
         check_key(&request.key)?;
+        if appointment::is_managed(call) {
+            return self.managed_appointment_status(call, &request.key).await;
+        }
         if call.session.caller.principal.workload_grant().is_some() {
             return self.managed_workload_status(call, request.key).await;
         }

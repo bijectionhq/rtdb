@@ -1,6 +1,8 @@
 use super::*;
 
+mod appointment;
 mod provision;
+pub use appointment::{FundedAppointmentScope, ManagedAppointment};
 pub use provision::LineProvision;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +183,7 @@ pub enum Authority {
         session: [u8; 32],
         request_digest: [u8; 32],
     },
+    FundedAppointment(FundedAppointmentScope),
     CloseWriter {
         fence: Fence,
         writer: Applied,
@@ -288,6 +291,7 @@ impl Authority {
                     && rtdb_types::rtdb_v1::valid_branch_name(branch)
                     && created.incarnation() == incarnation && created.position() > 0
                     && *group != [0; 16] && *session != [0; 32] && *request_digest != [0; 32],
+            Self::FundedAppointment(scope) => scope.valid(incarnation),
             Self::CloseWriter {
                 fence,
                 writer,

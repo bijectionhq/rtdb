@@ -17,6 +17,15 @@ pub struct AppointmentSample {
     certificate: [u8; 32],
 }
 
+impl FundingInput {
+    pub fn appointment_observed_at(self) -> Option<Timestamp> {
+        match self {
+            Self::Appointment { sample: Some(sample), .. } => Some(sample.observation.instant),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StageOrder {
     cut: BranchCut,
@@ -113,6 +122,11 @@ impl<'a> ReceiptPoint<'a> {
 }
 
 impl Transact {
+    pub(in crate::transact) fn check_appointment_address(&self, point: &workload::Point) -> Result<()> {
+        self.appointment_point(ReceiptPoint { table: &point.table, id: &point.id, at: point.valid_at }.address()?)?;
+        Ok(())
+    }
+
     pub fn prepare_funded_appointment(key: Vec<u8>, absent: Guard, before: Timestamp) -> Result<Self> {
         validate_key(&key)?;
         if ReceiptPoint::decode(&absent).is_none() || before.0 <= 0 { return Err(appointment_invalid()); }
@@ -204,16 +218,18 @@ impl AppointmentCommand {
 
     pub(super) async fn verify(
         self, owner: [u8; 32], request: &Transact, state: &TransactState, clock: &dyn DecisionClock,
+        managed_until: Option<Timestamp>,
     ) -> Option<AppointmentSample> {
         if request.check_appointment_shape(self).is_err() { return None; }
-        let previous = state.receipts.get(&None).and_then(|receipts| receipts.get(&request.key));
+        let namespace = managed_until.map(|_| owner);
+        let previous = state.receipts.get(&namespace).and_then(|receipts| receipts.get(&request.key));
         match self {
             Self::Prepare { predecessor, .. } if previous.is_none() => {
                 let original = state.index().exact(predecessor).ok()?.basis;
                 let observation = clock.observe().await.ok()?;
                 let reading = clock_slot_reading(observation.instant)?;
                 let end = Timestamp(reading.0.checked_add(1_000_000)?);
-                let before = request.window.before?.min(end);
+                let before = request.window.before?.min(end).min(managed_until.unwrap_or(Timestamp::MAX));
                 authorize(clock, original, observation, before).await
             }
             Self::Activate { .. } | Self::Consume { .. } => {
@@ -231,7 +247,7 @@ impl AppointmentCommand {
                 {
                     return None;
                 }
-                if matches!(self, Self::Consume { .. }) && (
+                if matches!(self, Self::Consume { .. }) && managed_until.is_none_or(|until| until >= before) && (
                     request.window.before.is_none_or(|limit| limit >= before)
                         || observation.instant >= offer.before().min(request.window.before.unwrap_or(before))
                 ) {
@@ -240,7 +256,8 @@ impl AppointmentCommand {
                         journal_before: before, certificate: offer.clock.certificate,
                     });
                 }
-                let bound = request.window.before.map_or(before, |limit| limit.min(before));
+                let bound = before.min(request.window.before.unwrap_or(Timestamp::MAX))
+                    .min(managed_until.unwrap_or(Timestamp::MAX));
                 authorize(clock, offer.original, observation, bound).await
             }
             _ => None,
@@ -284,6 +301,14 @@ impl AppointmentSample {
 
 impl FundedReceipt {
     pub fn is_appointment(self) -> bool { matches!(self.phase, Phase::Appointment(_)) }
+
+    pub(in crate::transact) fn check_managed_appointment(self, scope: &workload::FundedAppointmentScope) -> Result<()> {
+        let Phase::Appointment(appointment) = self.phase else { return Err(unknown_receipt()); };
+        let receipt = &scope.receipt;
+        let address = ReceiptPoint { table: &receipt.table, id: &receipt.id, at: receipt.valid_at }.address()?;
+        if appointment.address != address || appointment.intent != scope.intent_sha256 { return Err(unknown_receipt()); }
+        Ok(())
+    }
 
     pub(super) fn is_pending_appointment(self) -> bool {
         matches!(self.phase, Phase::Appointment(Appointment { stage: AppointmentStage::Prepared | AppointmentStage::Activated(_), .. }))
@@ -336,9 +361,11 @@ impl FundedReceipt {
             AppointmentStage::Activated(activation) => (AppointmentCommand::Activate { booking: self.booking }, activation.order),
             AppointmentStage::Consumed { .. } => (AppointmentCommand::Consume { booking: self.booking, intent: state.intent }, current),
         };
-        if tx.receipt_namespace.is_some() || tx.before.is_some() || tx.workload.is_some() || receipt.erasure.is_some()
+        if tx.receipt_namespace.is_some_and(|namespace| namespace != self.owner)
+            || tx.before.is_some() || tx.workload.is_some() || receipt.erasure.is_some()
             || receipt.key != request.key || request.logical_sha256()? != tx.fingerprint || order != current
             || !self.appointment_valid(cut) || matches!(receipt.outcome, Outcome::Refused { .. })
+            || tx.receipt_namespace.is_some() && !self.managed_appointment_time_valid(cut)
         {
             return Err(invalid_record());
         }
@@ -399,6 +426,24 @@ impl FundedReceipt {
                 && sample.observation.covers(activation.sample.observation)
                 && sample.observation.instant >= clock.reading
                 && sample.valid(self, clock.before, clock.journal_before),
+        }
+    }
+
+    pub(in crate::transact) fn managed_appointment_time_valid(self, cut: BranchCut) -> bool {
+        let Phase::Appointment(state) = self.phase else { return false; };
+        let reading = self.reading();
+        if !(self.clock.issued.instant..reading).contains(&state.prepared.cut.system_time) { return false; }
+        let activation = match state.stage {
+            AppointmentStage::Prepared => return true,
+            AppointmentStage::Activated(activation) | AppointmentStage::Consumed { activation, .. } => activation,
+        };
+        if !(activation.sample.observation.instant..activation.sample.decision_before).contains(&activation.order.cut.system_time) {
+            return false;
+        }
+        match state.stage {
+            AppointmentStage::Consumed { sample, .. } =>
+                (sample.observation.instant..sample.decision_before).contains(&cut.system_time),
+            _ => true,
         }
     }
 

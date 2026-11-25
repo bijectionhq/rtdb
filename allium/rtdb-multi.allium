@@ -798,6 +798,8 @@ contract LogService {
         -- A funded DecisionClock acceptance commits the exact canonical admission and original certificate under the active writer's timed quorum.
         -- An Original funded appointment activation and each accepting terminal use the original timed quorum under the same retained receiver certificate.
         -- The activation uses a cutoff at or before the advertised reading, and the terminal intersects the retained bounds with any shorter final request and writer bounds.
+        -- The managed appointment writer verifies the exact live placement and namespaced ClaimWriter against the durable prefix before admission and again before the effect-bearing append.
+        -- The managed timed original journal cutoff is bounded by the appointment credential's exclusive expiry.
         -- The native stream verifies the proof against the stream, writer epoch, position, sealed payload digest and exclusive signed cutoff on append and replay.
         -- A writer-local staging sample carries only staging authority.
 

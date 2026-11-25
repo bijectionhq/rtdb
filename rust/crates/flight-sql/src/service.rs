@@ -59,11 +59,11 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::TxStatus)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::V1Appointment | Self::TxStatus)
     }
 
     fn serves_assigned_follower(self) -> bool {
@@ -84,6 +84,10 @@ impl CallKind {
 
     fn allows_workload_grant(self) -> bool {
         matches!(self, Self::Handshake | Self::ManagedCreate | Self::ManagedWorkload | Self::TxStatus)
+    }
+
+    fn allows_funded_appointment(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1Capabilities | Self::V1Appointment | Self::TxStatus)
     }
 
     fn action(audience: bool, name: &str) -> Self {
@@ -123,6 +127,11 @@ impl Call {
         let Some(driver) = database.serving_driver() else { return Ok(()); };
         let Some(fence) = driver.classic_workload_fence() else { return Ok(()); };
         let caller = &self.session.caller;
+        let appointment = caller.verified_credential && self.kind.allows_funded_appointment()
+            && caller.principal.workload_grant()
+                .and_then(|grant| grant.funded_appointment(&self.database, driver.incarnation(), self.service.0.node.now()).ok())
+                .is_some_and(|appointment| appointment.fence().at_or_after_import(fence));
+        if appointment { return Ok(()); }
         let allowed = caller.verified_credential && caller.principal.workload_grant()
             .and_then(|grant| grant.assignment(&self.database, driver.incarnation(), self.service.0.node.now()).ok())
             .is_some_and(|(authority, _, _)| authority.permits_imported_workload(fence)
@@ -346,6 +355,8 @@ impl Service {
                     kind.allows_original_custody_control()
                 } else if grant.is_original_family() {
                     kind.allows_original_family()
+                } else if grant.is_funded_appointment() {
+                    kind.allows_funded_appointment()
                 } else if grant.is_custody_reader() {
                     matches!(kind, CallKind::Handshake | CallKind::V1Query | CallKind::V1Capabilities)
                 } else if grant.is_root_reader() {
@@ -355,7 +366,8 @@ impl Service {
                 };
                 if !allowed
                     || matches!(kind, CallKind::ManagedCreate) && grant.is_assignment()
-                    || matches!(kind, CallKind::ManagedWorkload | CallKind::TxStatus) && !grant.is_assignment()
+                    || matches!(kind, CallKind::ManagedWorkload | CallKind::TxStatus)
+                        && !grant.is_assignment() && !grant.is_funded_appointment()
                     || audience.is_some()
                     || self.follower_only()
                     || fresh_replica
@@ -385,11 +397,11 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::TxStatus) {
+            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::TxStatus | CallKind::AudienceCleanup)
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus | CallKind::AudienceCleanup)
             {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
@@ -789,6 +801,7 @@ impl FlightService for Service {
                 crate::v1::TX_STATUS => CallKind::TxStatus,
                 crate::v1::custody::RELEASE => CallKind::V1CustodyRelease,
                 crate::v1::original_family_landing::ACTION => CallKind::V1OriginalFamily,
+                crate::v1::appointment::PREPARE | crate::v1::appointment::ACTIVATE | "rtdb.v1.Transact" => CallKind::V1Appointment,
                 _ => CallKind::V1Action,
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
@@ -857,6 +870,19 @@ mod tests {
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
             assert!(!kind.allows_workload_grant());
         }
+    }
+
+    #[test]
+    fn funded_appointment_calls_have_a_separate_positive_allowlist() {
+        for kind in [CallKind::Handshake, CallKind::V1Capabilities, CallKind::V1Appointment, CallKind::TxStatus] {
+            assert!(kind.allows_funded_appointment());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query,
+            CallKind::V1Changes, CallKind::V1Action, CallKind::V1CustodyRelease, CallKind::V1OriginalFamily,
+            CallKind::ManagedCreate, CallKind::ManagedWorkload] {
+            assert!(!kind.allows_funded_appointment());
+        }
+        assert!(!CallKind::V1Appointment.allows_workload_grant());
     }
 
     #[test]

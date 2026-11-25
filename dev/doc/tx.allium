@@ -1889,6 +1889,9 @@ invariant TimedEffectsFollowSettle {
 -- Its selected arm creates the exact receipt point alongside the business effects and settlement.
 -- Exact stage retries recover the retained order, and one appointment can retain a single final request digest and outcome.
 -- Before a terminal order, a closed window or lost response leaves keyed status pending for recovery through the Original receipt point.
+-- A managed appointment keeps its authenticated scope in a stable private receipt namespace across credential renewal.
+-- The managed writer verifies the current placement and the exact namespaced ClaimWriter before deciding an appointment stage.
+-- The ordered receipt and checkpoint preserve the managed namespace and exact stage fingerprints.
 
 ---- Open Questions
 

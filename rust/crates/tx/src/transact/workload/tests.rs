@@ -179,6 +179,39 @@ fn begin(writer: &mut Writer) -> (Fence, Applied) {
 }
 
 #[test]
+fn funded_appointment_checks_the_live_namespaced_claim_and_exact_receipt_point() -> Result<()> {
+    let mut journal = Writer::new();
+    let (fence, writer) = begin(&mut journal);
+    let receipt = Point::new("public.receipts", "receipt".into(), Timestamp(0))?;
+    let scope = FundedAppointmentScope {
+        fence: fence.clone(), writer: writer.clone(), key: [6; 32], receipt: receipt.clone(),
+        intent_sha256: [7; 32], funding_policy_sha256: [8; 32],
+    };
+    let context = ManagedAppointment::new(journal.point.clone(), scope.clone(), [9; 32], Timestamp(100))?;
+    let state = journal.pipeline.durable();
+    context.check_current(state, journal.now)?;
+    assert!(context.check_current(state, Timestamp(100)).is_err());
+
+    let mut other = scope;
+    other.writer.namespace = WRITE;
+    let wrong_claim = ManagedAppointment::new(journal.point.clone(), other, [10; 32], Timestamp(100))?;
+    assert!(wrong_claim.check_current(state, journal.now).is_err());
+    let absent = |id| Guard::Version {
+        branch: MAIN_BRANCH.into(), table: receipt.table.clone(), id,
+        valid_at: Some(receipt.valid_at), expect: Version::Absent,
+    };
+    let command = AppointmentCommand::Prepare { predecessor: state.index().head().basis, booking: [11; 16], intent: [7; 32] };
+    let prepare = Transact::prepare_funded_appointment(vec![6; 32], absent(receipt.id.clone()), Timestamp(90))?;
+    context.check_request(state, &prepare, command)?;
+    let wrong_receipt = Transact::prepare_funded_appointment(vec![6; 32], absent(EntityId::Binary(b"receipt".to_vec())), Timestamp(90))?;
+    assert!(context.check_request(state, &wrong_receipt, command).is_err());
+
+    journal.turn(CLOSE, submit(Authority::CloseWriter { fence, writer, closure: [12; 16] }, 12, None))?;
+    assert!(context.check_current(journal.pipeline.durable(), journal.now).is_err());
+    Ok(())
+}
+
+#[test]
 fn imported_settlement_preserves_receipts_at_the_import_floor() {
     let mut journal = Writer::new();
     let (_, claim) = begin(&mut journal);

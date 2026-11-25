@@ -406,6 +406,7 @@ impl PreparedAppend {
 const RECORD_VERSION: u8 = 2;
 const FUNDED_RECORD_VERSION: u8 = 3;
 const APPOINTMENT_RECORD_VERSION: u8 = 4;
+const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -438,7 +439,7 @@ impl TransactionRecord {
 
     fn version(&self) -> u8 {
         match self {
-            Self::Tx(tx) => tx.receipt.record_version(),
+            Self::Tx(tx) => tx.receipt.record_version(tx.receipt_namespace),
             _ => RECORD_VERSION,
         }
     }
@@ -452,12 +453,13 @@ impl TransactionRecord {
 
 fn funded_record(bytes: &[u8]) -> bool {
     // The admitted encoder emits this exact version prefix. A funded decode rejects alternate framing.
-    bytes.starts_with(b"[3,") || bytes.starts_with(b"[4,")
+    bytes.starts_with(b"[3,") || bytes.starts_with(b"[4,") || bytes.starts_with(b"[5,")
 }
 
 impl Receipt {
-    fn record_version(&self) -> u8 {
+    fn record_version(&self, namespace: Option<[u8; 32]>) -> u8 {
         match self.decision_clock {
+            Some(offer) if offer.is_appointment() && namespace.is_some() => MANAGED_APPOINTMENT_RECORD_VERSION,
             Some(offer) if offer.is_appointment() => APPOINTMENT_RECORD_VERSION,
             Some(_) => FUNDED_RECORD_VERSION,
             None => RECORD_VERSION,
@@ -818,7 +820,7 @@ impl TransactState {
             if stored.receipt.basis <= cut { return Some(Cow::Borrowed(stored)); }
             stored.receipt.decision_clock?.appointment_checkpoint(stored, cut).map(Cow::Owned)
         }).collect::<Vec<_>>();
-        let version = receipts.iter().map(|stored| stored.receipt.record_version()).max().unwrap_or(RECORD_VERSION);
+        let version = receipts.iter().map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION);
         serde_json::to_vec(&(version, index, receipts)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
     }
@@ -827,7 +829,7 @@ impl TransactState {
         let invalid = || Anomaly::fault("rtdb/transaction-checkpoint", "Checkpoint does not match the expected cut");
         let (version, index, receipts): (u8, BranchIndex, Vec<StoredReceipt>) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
-        if version != receipts.iter().map(|stored| stored.receipt.record_version()).max().unwrap_or(RECORD_VERSION)
+        if version != receipts.iter().map(|stored| stored.receipt.record_version(stored.receipt_namespace)).max().unwrap_or(RECORD_VERSION)
             || index.head() != expected || index.exact(expected.basis)? != expected
         {
             return Err(invalid());
@@ -848,8 +850,12 @@ impl TransactState {
             }
             if let Some(offer) = receipt.decision_clock
                 && let Some(address) = offer.appointment_address()
-                && (stored.receipt_namespace.is_some() || stored.workload.is_some() || receipt.erasure.is_some()
+                && (stored.receipt_namespace.is_some_and(|namespace| !offer.belongs_to(namespace))
+                    || stored.workload.is_some() || receipt.erasure.is_some()
                     || !offer.appointment_valid(BranchCut { basis: receipt.basis, system_time: receipt.system_time })
+                    || stored.receipt_namespace.is_some() && !offer.managed_appointment_time_valid(BranchCut {
+                        basis: receipt.basis, system_time: receipt.system_time,
+                    })
                     || state.appointment_addresses.contains(&address))
             {
                 return Err(invalid());
@@ -995,6 +1001,7 @@ impl TransactState {
         } else { None };
         let receipt_namespace = request.receipt_namespace(
             workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
+                .or(appointment.and_then(FundingInput::managed_appointment_namespace))
         );
         let family = workload.map(workload::Admission::family);
         let workload_digest = workload.map(workload::Admission::authorization_digest);
@@ -1067,13 +1074,15 @@ impl TransactState {
             } else {
                 position
             };
+            let receiver_time = appointment.filter(|input| input.managed_appointment_namespace().is_some())
+                .and_then(FundingInput::appointment_observed_at).unwrap_or(Timestamp::MIN);
             BranchCut {
                 basis: Basis::new(head.basis.incarnation(), receipt_position),
-                system_time: now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN)),
+                system_time: now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN)).max(receiver_time),
             }
         };
         let appointment = match appointment {
-            Some(FundingInput::Appointment { owner, command, sample }) => {
+            Some(FundingInput::Appointment { owner, command, sample, .. }) => {
                 match resolve_appointment(&view, request, owner, command, sample, stored, cut, fingerprint)? {
                     AppointmentDecision::Replay(receipt) => return Ok((Resolution::Answer(receipt), None)),
                     decision => Some(decision),
@@ -1081,6 +1090,9 @@ impl TransactState {
             }
             _ => None,
         };
+        if appointment.is_some() && receipt_namespace.is_some() {
+            for claim in request.claims() { claims.verify(claim)?; }
+        }
         let mut base = view.index.clone();
         if !validation { base.advance(cut)?; }
         let decision_time = now.max(cut.system_time);
@@ -1102,6 +1114,9 @@ impl TransactState {
                 }
                 AppointmentDecision::Replay(_) => unreachable!("replay answered above"),
             };
+            if receipt_namespace.is_some() && !offer.managed_appointment_time_valid(cut) {
+                return Err(appointment_unavailable());
+            }
             check_appointment_effects(request, offer, &decision.0, &decision.1)?;
             decision_clock = Some(offer);
             Ok(decision)
