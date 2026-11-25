@@ -1853,6 +1853,10 @@ async fn check_spatial_pages_at_the_original_cut() {
                     assert!(document.column_by_name("location").is_none());
                     assert!(document.column_by_name("never_written").is_none());
                 } else {
+                    let field = &document.fields()[0];
+                    assert_eq!(field.name(), "_id");
+                    assert_eq!(rtdb_columnar::read_owned_entity_id(field, document.column(0).as_ref(), 0).unwrap(),
+                        rtdb_columnar::EntityIdRef::String(expected));
                     let location = document.column_by_name("location").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
                     assert_eq!(location.value(0), point(longitude));
                 }
@@ -1981,8 +1985,13 @@ async fn check_spatial_pages_at_the_original_cut() {
         assert_eq!(schema.metadata()["rtdb.owned.present_micros"], valid.to_string());
         assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], if more { "1" } else { "0" });
         let batch = stream.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
         let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
         assert_eq!(ids.value(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), expected);
+        let document = batch.column(2).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(document.column_names(), ["borough", "_system_from"]);
+        let borough = document.column_by_name("borough").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(borough.value(0), b"montrouge");
         let distance = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
         if expected == "a" { tied_distance = Some(distance); }
         if let Some(bound) = schema.metadata().get("rtdb.owned.spatial_next_distance_m") {
