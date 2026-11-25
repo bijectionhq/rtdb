@@ -2124,6 +2124,8 @@ surface QueryAccess {
         -- Mixed Float32 and Float64 components retain their respective widths in a dense Arrow union.
         -- A scan reads compatible leaf counts, bounds, and Bloom bytes at cached Arrow positions.
         -- Metadata read from a cache-owned immutable object retains its Arrow buffers from that object.
+        -- An ordinary persisted scan can decode only the needed put children when a full page lacks cache admission and its IPC layout supports projection.
+        -- The scan retains the event headers and exact entity keys required for temporal resolution.
         -- A spatial fallback read projects IIDs from persisted pages.
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
