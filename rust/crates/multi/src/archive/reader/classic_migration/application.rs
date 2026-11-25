@@ -722,7 +722,7 @@ mod tests {
                 ),
             ],
         )?;
-        let marker = StructFields::from([("binding".into(), Value::Binary(body.clone()))]);
+        let marker = StructFields::from([("binding".into(), Value::Binary(body.to_vec()))]);
         let response = StructFields::from([
             ("cell_history".into(), Value::Utf8("01".repeat(16))),
             ("usher".into(), Value::Utf8("02".repeat(16))),
