@@ -1,0 +1,67 @@
+{
+  "summary": "An exact provisional held-world pin can settle only from the original attempt's terminal outcome.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "release_without_confirmation": {
+      "defect": "Treat an ordered observation without certified confirmation as a terminal refusal.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "find": "ForkDisposition::Ordered { certified: false, .. } => None,",
+          "replace": "ForkDisposition::Ordered { certified: false, .. } => Some(ForkPinWrite::Release(original.pin)),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "function": "select_pin_write",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_reservation_replacement": {
+      "defect": "Allow a different reservation at the same directory pin to receive a delayed settlement.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "find": "        || original.reservation != current.reservation\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "function": "select_pin_write",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "drop_certified_refusal": {
+      "defect": "Keep the provisional pin after obtaining the exact certified refusal.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "find": "ForkDisposition::Ordered { registered: false, certified: true } => Some(ForkPinWrite::Release(original.pin)),",
+          "replace": "ForkDisposition::Ordered { registered: false, certified: true } => None,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/archive/writable_world/fork_pin.rs",
+          "function": "select_pin_write",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

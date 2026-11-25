@@ -66,8 +66,12 @@ The other checked controls cannot authorize a request for a replaced writer.
 Generic placed Flight fact writes are limited to private layout readiness in this hosted gateway.
 
 The directory precedes fork registration with a provisional pin claimed by one attempt.
-A definitive local or ordered refusal releases that claim by an exact directory comparison.
-A committed constraint alternative keeps its receipt and releases the provisional pin when the ordered cut has no corresponding registration.
+A local refusal before submission can release that claim by an exact directory comparison.
+An ordered result used to settle the pin requires the original durable source coordinate under the same hosted history.
+A committed constraint alternative keeps its receipt and releases the provisional pin when the held catalog covers the original decision and its exact revision added no registration.
+A conflicting row at the same revision leaves the pin unsettled.
 A registered pin survives a competing refusal, and refusal preserves the predecessor.
-An indeterminate submission keeps custody for recovery or expiry.
-The async and directory correspondence still needs proof that native disposition and the compared directory reservation refer to the same attempt, including cancellation, recovery and a racing update.
+[The pin decision](../verus/held_world_fork_pin/laws.rs) checks the command's original pin, reservation, incarnation and log epoch.
+The caller also compares the entire retained binding and retries the directory version compare-and-set.
+An indeterminate submission or unsuccessful directory update keeps custody.
+Replacement recovery still needs an owner that can rediscover the original disposition from a retained reservation and finish its release.
