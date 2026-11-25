@@ -25,6 +25,7 @@ use arrow_array::{
     cast::AsArray, types::{Int64Type, UInt8Type},
 };
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
+use arrow_ipc::reader::StreamReader;
 use arrow_schema::Schema;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, shared_allocation_size, shared_batches_allocation_size};
 use rtdb_text::{Corpus, Query, RankScorer, Scorer, stored_length};
@@ -247,25 +248,39 @@ fn encode_sections_with(sections: &[Section], metadata: std::collections::HashMa
     rtdb_format::ipc::write_arrow_stream(&schema, &[batch], arrow_ipc::writer::IpcWriteOptions::default())
 }
 
+pub(crate) struct CatalogStatsReader<'a>(StreamReader<Cursor<&'a [u8]>>);
+
+impl<'a> CatalogStatsReader<'a> {
+    pub fn open(bytes: &'a [u8]) -> Option<Self> {
+        StreamReader::try_new(Cursor::new(bytes), None).ok().map(Self)
+    }
+
+    pub fn tree_locator(&self) -> Option<TreeLocator> {
+        TreeLocator::decode(self.0.schema().metadata().get(ROOT_LOCATOR)?)
+    }
+
+    pub fn sections(mut self) -> Option<Vec<Section>> {
+        if self.0.schema().fields() != &layout::section_fields() { return None; }
+        let batch = self.0.next()?.ok()?;
+        if self.0.next().is_some() { return None; }
+        sections_of(&StructArray::from(batch)).ok()
+    }
+}
+
 pub(crate) fn decode_tree_locator(bytes: &[u8]) -> Option<TreeLocator> {
-    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None).ok()?;
-    TreeLocator::decode(reader.schema().metadata().get(ROOT_LOCATOR)?)
+    CatalogStatsReader::open(bytes)?.tree_locator()
 }
 
 pub(crate) fn decode_footer_locator(bytes: &[u8]) -> Option<FooterLocator> {
-    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None).ok()?;
+    let reader = StreamReader::try_new(Cursor::new(bytes), None).ok()?;
     FooterLocator::decode(reader.schema().metadata().get(FOOTER_LOCATOR)?)
 }
 
 pub fn decode_sections(bytes: &[u8]) -> Option<Vec<Section>> {
-    let mut reader = match arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None) {
-        Ok(reader) => reader,
-        Err(_) => return legacy11::decode_sections(bytes).map(|sections| sections.into_iter().map(legacy11::Section::into_arrow).collect()),
-    };
-    if reader.schema().fields() != &layout::section_fields() { return None; }
-    let batch = reader.next()?.ok()?;
-    if reader.next().is_some() { return None; }
-    sections_of(&StructArray::from(batch)).ok()
+    match CatalogStatsReader::open(bytes) {
+        Some(stats) => stats.sections(),
+        None => legacy11::decode_sections(bytes).map(|sections| sections.into_iter().map(legacy11::Section::into_arrow).collect()),
+    }
 }
 
 pub(crate) fn artefact_identity(table_slug: &str, owner: &rtdb_format::keys::ArtefactOwner, id: &str, version: i64) -> String {
@@ -1690,6 +1705,7 @@ mod tests {
         assert!(short.meets(later_valid), "visible at a far later valid time, as known during its one day");
         assert!(!open.meets(at(1000 * day, 1000 * day)), "the ceiling ends every version");
         assert_eq!(decode_sections(&encode_sections(&sections).unwrap()), Some(sections.clone()));
+        assert_eq!(decode_sections(&encode_tantivy_stats(&sections)), Some(sections));
         assert_eq!(decode_sections(&[1, 2, 3]), None);
     }
 }
