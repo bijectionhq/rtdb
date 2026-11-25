@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+// Versioned ordered bytes: the whole store contract.
+// The store knows no labels, worlds, indexes or schemas. Its callers encode
+// them as keys and decide what a read covers; the store only orders bytes,
+// versions commits and checks range intersection.
+//
+// Every request is a Flight DoAction on an unscoped database route; each reply
+// is one Flight result holding the encoded reply message.
+//   rtdb.store.v1.Read   ReadRequest   -> ReadReply
+//   rtdb.store.v1.Append AppendRequest -> AppendReply
+//   rtdb.store.v1.Watch  WatchRequest  -> WatchReply
+//
+// A version is a commit position within one store incarnation. A restore or a
+// reset starts a new incarnation; a request naming another incarnation fails
+// with FAILED_PRECONDITION and the caller starts again from a fresh read.
+package rtdb.store.v1;
+
+// A half-open key range [start, end). An absent end is unbounded.
+message KeyRange {
+  bytes start = 1;
+  optional bytes end = 2;
+}
+
+message Entry {
+  bytes key = 1;
+  // Absent when the request asked for keys only.
+  optional bytes value = 2;
+  // The version that wrote this value.
+  uint64 written = 3;
+}
+
+message ReadRequest {
+  repeated KeyRange ranges = 1;
+  // Absent reads the latest committed version.
+  optional uint64 at = 2;
+  // Required whenever at is present.
+  bytes incarnation = 3;
+  // Resume strictly after this key, within the range it falls in.
+  optional bytes after = 4;
+  // Maximum entries per range; the server caps it.
+  uint32 limit = 5;
+  bool keys_only = 6;
+}
+
+message RangePage {
+  repeated Entry entries = 1;
+  // Present when the limit stopped this range: resume after this key.
+  optional bytes resume = 2;
+}
+
+message ReadReply {
+  bytes incarnation = 1;
+  // The version every page was read at.
+  uint64 at = 2;
+  // One page per requested range, in request order.
+  repeated RangePage pages = 3;
+}
+
+message Write {
+  bytes key = 1;
+  // Absent deletes the key.
+  optional bytes value = 2;
+}
+
+message AppendRequest {
+  // Idempotency key, 16 to 64 bytes. A retried append returns its first reply.
+  bytes key = 1;
+  bytes incarnation = 2;
+  // The version the reads were taken at.
+  uint64 since = 3;
+  // Fails when a write committed after since intersects any of these.
+  repeated KeyRange reads = 4;
+  repeated Write writes = 5;
+}
+
+message AppendReply {
+  bytes incarnation = 1;
+  oneof outcome {
+    // The new version. An append with no writes validates only, and returns
+    // the version it validated through.
+    uint64 committed = 2;
+    // The index of the first read range a later write intersected.
+    uint32 conflict = 3;
+  }
+}
+
+message WatchRequest {
+  repeated KeyRange ranges = 1;
+  uint64 after = 2;
+  bytes incarnation = 3;
+  // Maximum wait; the server caps it.
+  uint64 wait_millis = 4;
+}
+
+message WatchReply {
+  bytes incarnation = 1;
+  // The first version after `after` that wrote into a range, if one exists.
+  optional uint64 touched = 2;
+  // Every version through this one was inspected.
+  uint64 through = 3;
+}

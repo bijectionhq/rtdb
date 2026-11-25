@@ -49,6 +49,11 @@ pub mod rtdb {
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/rtdb.v1.rs"));
     }
+    pub mod store {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/rtdb.store.v1.rs"));
+        }
+    }
     pub mod admin {
         pub mod v1 {
             include!(concat!(env!("OUT_DIR"), "/rtdb.admin.v1.rs"));

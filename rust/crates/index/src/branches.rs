@@ -17,6 +17,7 @@ mod custody_placement;
 mod custody_release;
 mod custody_transfer;
 mod scoped_hold;
+pub mod store;
 mod visibility;
 pub use scoped_hold::{ScopedHold, ScopedHoldCommand};
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};

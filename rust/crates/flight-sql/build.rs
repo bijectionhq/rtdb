@@ -3,6 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schemas = [
         "../../proto/rtdb.v1.proto",
         "../../proto/rtdb.admin.v1.proto",
+        "../../proto/rtdb.store.v1.proto",
     ];
     for schema in schemas {
         println!("cargo:rerun-if-changed={schema}");

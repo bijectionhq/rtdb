@@ -779,6 +779,21 @@ impl ServingDriver for MultiServing {
             .ok_or_else(interrupted)?
     }
 
+    async fn read_store(
+        &self, read: rtdb_index::branches::store::StoreRead, at: At, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<rtdb_index::branches::store::StorePage> {
+        cancellation.run_until_cancelled(async {
+            let (index, generation) = self.database.lock().await.fresh_view().await?;
+            if index.has_custody_groups() || index.has_visibility_history() {
+                return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
+            }
+            let at = if at == At::Linearizable { At::Latest } else { at };
+            let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
+            self.database.lock().await.check_generation(generation).await?;
+            Ok(page)
+        }).await.ok_or_else(interrupted)?
+    }
+
     async fn query_workload_root(
         &self, source: QuerySource, cut: WorkloadReadCut, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {

@@ -813,8 +813,11 @@ impl FlightService for Service {
         #[cfg(feature = "multi")]
         let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|name| self.supports_admin_action(&call, name)))
             .collect::<Vec<_>>();
+        let store_enabled = !call.session.fresh_replica && call.session.audience_source().is_none()
+            && call.session.caller.principal.label_scope().is_none();
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS.into_iter()
             .filter(|name| *name != crate::v1::MANAGED_WORKLOAD))
+            .chain(crate::v1::STORE_ACTIONS.into_iter().filter(|_| store_enabled))
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(hosted_carrier_actions.into_iter().filter(|_| hosted_upload.is_some()))
             .chain(crate::owned_actions::ROOT_RANK_ACTIONS.into_iter().filter(|_| root_rank))

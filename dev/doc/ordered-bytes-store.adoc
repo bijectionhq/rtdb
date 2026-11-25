@@ -1,0 +1,43 @@
+= The ordered-bytes store
+
+RTDB serves one generic contract to its embedding host: versioned ordered bytes.
+The host keeps every meaning above it: labels, worlds, indexes, catalogs and decisions are keys the host writes.
+This is the layering FoundationDB uses, an ordered key-value store with conflict ranges and every data model above it.
+The `rtdb.owned.*` and Bijection-specific `rtdb.v1.*` actions are retired onto this contract one family at a time.
+
+== Operations
+
+The wire is `rust/proto/rtdb.store.v1.proto`, served as Flight `DoAction` calls on an unscoped database route.
+
+`rtdb.store.v1.Read`:: Returns the live entries of each requested range, ascending by key, at one version.
+All ranges of one request read the same version.
+A page stops at its limit and names the key to resume after.
+`keys_only` omits values, so key scans cost no value bytes.
+
+`rtdb.store.v1.Append`:: Commits its writes at a new version, unless a write committed after `since` intersects one of its read ranges.
+A refused append names the first such range and writes nothing.
+An append with no writes only validates.
+Its idempotency key makes a retry return the first outcome.
+
+`rtdb.store.v1.Watch`:: Reports the first version after `after` that wrote into one of its ranges, waiting up to a bounded time.
+It always reports how far it inspected, so a caller resumes from there.
+
+== Invariants
+
+* Keys are compared bytewise and ranges are half-open.
+* A version is a commit position within one incarnation of the database.
+  A restore or reset starts a new incarnation, and a request naming another one is refused.
+* The conflict condition is range intersection only.
+  A write outside every read range never refuses an append.
+  The host makes labels key partitions, so a write the reader's label does not admit lies outside the reader's ranges and never refuses it.
+* Validation and invalidation are the same matching: `Watch` reports exactly the versions that would refuse an `Append` reading the same ranges.
+
+== Mechanism
+
+The store is one relation, `store.entries`, on the main branch of the v1 branch index.
+An entry's id is its key bytes and its `v` cell holds the value.
+`Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }`, judged by the resolver over the same branch index every other guard reads.
+`Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.
+
+Scan pushdown, columnar projection and batching are mechanism under this contract.
+Each must return what an unpushed read followed by host-side filtering returns.

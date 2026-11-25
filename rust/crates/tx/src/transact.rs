@@ -9,6 +9,7 @@ pub use rtdb_index::branches::{
     CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition,
     ReviewedCustodyReservation, Visibility,
     RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind, ScopedHoldCommand,
+    store::KeyRange,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
@@ -194,6 +195,9 @@ pub enum Guard {
         expect: Version,
     },
     CountAtMost { branch: Branch, range: CountRange, when: When },
+    /// The store contract's read validation: nothing in `range` of the main
+    /// branch's store relation was written or erased after `since`.
+    Unwritten { range: KeyRange, since: Basis },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1565,6 +1569,7 @@ impl Guard {
             }
             Self::Version { branch, .. } | Self::CountAtMost { branch, .. } if branch != MAIN_BRANCH =>
                 Err(funding_invalid()),
+            Self::Unwritten { .. } => Err(funding_invalid()),
             _ => self.evaluate(history.index(), reading, claims, None),
         }
     }
@@ -1604,6 +1609,7 @@ impl Guard {
                 })
             }
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),
+            Self::Unwritten { range, since } => Ok(view(MAIN_BRANCH)?.store_written_since(range, *since)?.is_none()),
         }
     }
 }

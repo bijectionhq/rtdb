@@ -22,6 +22,7 @@ pub(crate) mod original_family_readback;
 pub(crate) mod error;
 mod query;
 mod scoped_hold;
+mod store;
 mod tokens;
 pub(crate) mod appointment;
 mod transact;
@@ -42,6 +43,7 @@ pub(crate) const MANAGED_CREATE: &str = "rtdb.admin.v1.CreateDeployment";
 pub(crate) const MANAGED_WORKLOAD: &str = "rtdb.v1.ManagedWorkload";
 pub(crate) const TX_STATUS: &str = "rtdb.v1.TxStatus";
 pub(crate) const OFFER_DECISION_CLOCK: &str = "rtdb.v1.OfferDecisionClock";
+pub(crate) use store::ACTIONS as STORE_ACTIONS;
 pub(crate) const ACTIONS: [&str; 7] = [
     CAPABILITIES,
     "rtdb.v1.Transact",
@@ -73,7 +75,7 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
 }
 
 pub(crate) fn is_action(name: &str) -> bool {
-    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
+    ACTIONS.contains(&name) || store::ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -317,6 +319,7 @@ impl Service {
                 Ok(request) => self.activate_funded_appointment(&call, request).await,
                 Err(status) => Err(status),
             },
+            name if store::ACTIONS.contains(&name) => self.store_action(&call, name, action.body).await,
             "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
             MANAGED_WORKLOAD => self.managed_workload_action(&call, action.body).await,
             TX_STATUS => match decode(action.body) {

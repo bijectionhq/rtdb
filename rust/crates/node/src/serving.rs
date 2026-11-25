@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage},
+    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{StorePage, StoreRead}},
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
@@ -355,6 +355,13 @@ pub trait ServingDriver: Send + Sync {
     ) -> Result<Receipt>;
 
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt>;
+
+    /// One page of the ordered-bytes store at `at` (`rtdb.store.v1.Read`).
+    async fn read_store(
+        &self, _read: StoreRead, _at: At, _now: Timestamp, _cancellation: &CancellationToken,
+    ) -> Result<StorePage> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
+    }
 
     /// A cursor below the retained effect floor reports `rtdb/cursor-expired`.
     async fn changes(

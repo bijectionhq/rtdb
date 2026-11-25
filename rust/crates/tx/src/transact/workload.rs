@@ -813,6 +813,7 @@ impl Point {
                             || match guard {
                                 Guard::Version { branch, .. }
                                 | Guard::CountAtMost { branch, .. } => branch != MAIN_BRANCH,
+                                Guard::Unwritten { .. } => true,
                                 Guard::Unchanged(_) => false,
                             }
                     })
@@ -1025,6 +1026,7 @@ impl Point {
                 Guard::CountAtMost { branch, range, .. } => {
                     branch != MAIN_BRANCH || !custody && index.has_custody_relation(&range.table)
                 }
+                Guard::Unwritten { .. } => true,
                 Guard::Unchanged(_) => false,
             })
         {
