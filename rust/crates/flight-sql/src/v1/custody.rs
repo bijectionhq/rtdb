@@ -256,7 +256,7 @@ impl CustodyProviderRoute {
         Ok(owner)
     }
 
-    fn proof_owner(&self, owner: &CustodyResponseOwner) -> [u8; 32] {
+    pub(super) fn proof_owner(&self, owner: &CustodyResponseOwner) -> [u8; 32] {
         let authority = self.installation.authority;
         let mut hash = Sha256::new();
         hash.update(b"rtdb/v1/custody-read-owner\0");
@@ -404,7 +404,7 @@ pub(super) fn session_binding(call: &Call) -> [u8; 32] {
     Sha256::digest(call.session.id.as_bytes()).into()
 }
 
-fn family_review_commitment(source: [u8; 32], claim: &[u8]) -> [u8; 32] {
+pub(super) fn family_review_commitment(source: [u8; 32], claim: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"rtdb/v1/original-family-review\0");
     hash.update(source);

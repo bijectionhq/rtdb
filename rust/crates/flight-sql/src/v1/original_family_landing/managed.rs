@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use rtdb_auth::{OriginalFamilyGrant, VerifiedWorkloadGrant};
-use rtdb_crypt::tokens::TokenIssuer;
+use rtdb_crypt::tokens::{CustodyReadProof, TokenIssuer};
 use rtdb_node::{
     Clock, Database,
     serving::{
@@ -10,19 +10,29 @@ use rtdb_node::{
     },
 };
 use rtdb_tx::transact::{
-    Cell, CustodyPlacement, Op, Row, Transact,
+    Cell, CustodyPlacement, Guard, Op, Row, Transact,
     workload::{self, Authority, Family as ReceiptFamily, Operation, Point, Reply},
 };
 use rtdb_types::{
-    Timestamp, Value as CellValue,
-    rtdb_v1::{At, Claim, ClaimEvidence, ClaimRegion},
+    EntityId, Timestamp, Value as CellValue,
+    rtdb_v1::{At, Claim, ClaimEvidence, ClaimRegion, ClaimVerifier, Layer},
 };
 
 use super::*;
-use crate::v1::custody::{CustodyProviderRoute, session_binding};
+use crate::v1::custody::{CustodyProviderRoute, family_review_commitment, session_binding};
+use vault::RetainedReviewQuery;
+use wire::AuthorReceipt;
 
 pub(in crate::v1) const MANAGED_FEATURE: &str = "row-custody.managed-original-family-placement";
 pub(in crate::v1) const REGISTERED_AUTHORING: &str = "row-custody.managed-registered-authoring";
+pub(in crate::v1) const RETAINED_AUTHORING_REVIEW: &str = "row-custody.managed-retained-authoring-review";
+
+struct RetainedAuthoring {
+    original: AuthorReceipt,
+    selected: AuthorReceipt,
+    read_proof: String,
+    claim: String,
+}
 
 pub(in crate::v1) struct ManagedFamily<'a> {
     pub route: &'a CustodyProviderRoute,
@@ -384,6 +394,23 @@ impl Service {
                     .retained_placement(&managed, call, key(&request_key)?)
                     .await?,
             ),
+            Request::ReserveRetainedAuthoring {
+                member, winner, reservation, target, reviewed_source_b64,
+                original_author, selected_author, custody_read_proof_b64, claim_b64,
+                native_target_b64, reserve_key, accept_key, request_sha256, receipt, proof, ..
+            } => {
+                let (landing, source) = Reservation {
+                    member, winner, reservation, target, reviewed_source_b64,
+                    native_target_b64, reserve_key, accept_key, request_sha256, receipt, proof,
+                }.decode(call, operation.authority)?;
+                let authors = RetainedAuthoring {
+                    original: original_author,
+                    selected: selected_author,
+                    read_proof: custody_read_proof_b64,
+                    claim: claim_b64,
+                };
+                operation.reserve_retained_authoring(&managed, call, landing, &source, authors).await?
+            }
             request @ (Request::ConfirmAuthoring { .. } | Request::Activate { .. }) => {
                 let exact_key = match &request {
                     Request::ConfirmAuthoring { write_key, .. } => key(write_key)?,
@@ -404,6 +431,164 @@ impl Service {
 }
 
 impl FamilyCall<'_> {
+    async fn reserve_retained_authoring(
+        &self,
+        managed: &ManagedFamily<'_>,
+        call: &Call,
+        mut landing: Landing,
+        evidence: &proto::CustodyReviewedSource,
+        authors: RetainedAuthoring,
+    ) -> Result<Value, Status> {
+        let lock = self.vault.lock(self.authority, self.family).await.map_err(error::anomaly)?;
+        let record = lock.family().map_err(error::anomaly)?.clone();
+        record.live().map_err(error::anomaly)?;
+        let review = &landing.order.review;
+        if !matches_landing(managed.scope, &landing) || review.cut.basis > managed.head
+            || record.group != review.group
+        {
+            return Err(denied());
+        }
+        let (first, _) = authored_at(&record, review.original).map_err(error::anomaly)?;
+        let (winner, _) = authored_at(&record, review.selected).map_err(error::anomaly)?;
+        if !matches_author(managed.scope, first) || !matches_author(managed.scope, winner)
+            || first.order.rewrite.is_some()
+            || first.order.line.is_none() || first.order.line != winner.order.line
+            || !matches!(first.order.target.id, EntityId::String(_))
+            || first.order.target.id != winner.order.target.id
+            || first.order.target.table != winner.order.target.table
+        {
+            return Err(denied());
+        }
+        let original = evidence.original.as_ref().ok_or_else(invalid)?;
+        let selected = evidence.selected.as_ref().ok_or_else(invalid)?;
+        if review.original == review.selected {
+            if authors.original != authors.selected || original != selected {
+                return Err(denied());
+            }
+        } else if winner.order.rewrite.as_ref().is_none_or(|rewrite| rewrite.original != review.original)
+            || authors.original.key == authors.selected.key
+            || authors.original.system_time_micros >= authors.selected.system_time_micros
+        {
+            return Err(denied());
+        }
+
+        let read_proof = blob(&authors.read_proof, 8192)?;
+        let claim: proto::Claim = decode_proto(&authors.claim)?;
+        let claim = Claim::from_bytes(claim.value);
+        let tokens = managed.database.token_authority().await.map_err(error::anomaly)?;
+        let proof = tokens.open_custody_read(
+            &read_proof, managed.route.proof_owner(&managed.owner), session_binding(call),
+        ).await.map_err(error::anomaly)?;
+        let commitment = review.cut.commitment(review.group, review.original, review.selected);
+        if proof.basis != review.cut.basis || proof.expires_at.0 != evidence.proof_expires_at_micros
+            || proof.expires_at > managed.expires_at
+            || proof.contributors.as_slice() != [(review.group, review.selected)]
+            || proof.reviewed_source_sha256 != Some(family_review_commitment(commitment, claim.as_bytes()))
+        {
+            return Err(denied());
+        }
+        let authority = managed.write_authority(call, [0; 32])?;
+        let scope = authority.original_family_claim_scope(managed.namespace).map_err(error::anomaly)?;
+        let claim_evidence = tokens.verify_original_family_claims([&claim], &scope).await
+            .verify(&claim).map_err(error::anomaly)?;
+        let region = ClaimRegion::Row { table: winner.order.target.table.clone(), iid: winner.order.target.id.iid() };
+        if claim_evidence.scope.basis != proof.basis || claim_evidence.scope.branch != review.cut.branch
+            || claim_evidence.scope.layer != Layer::Merged
+            || !claim_evidence.footprint.regions().is_some_and(|regions| regions.len() == 1 && regions.contains(&region))
+        {
+            return Err(denied());
+        }
+        self.check_retained_review_delivery(managed, call, &proof).await?;
+        self.mounted.verify_native_retained_authoring_line(&first.order).await.map_err(error::anomaly)?;
+
+        let original_frame = self.retained_authoring_frame(managed, call, &record, &authors.original, original).await?;
+        let selected_frame = if review.original == review.selected {
+            None
+        } else {
+            Some(self.retained_authoring_frame(managed, call, &record, &authors.selected, selected).await?)
+        };
+        landing.retained_query = Some(RetainedReviewQuery { proof: hash(&read_proof), claim: hash(claim.as_bytes()) });
+        self.reserve(
+            lock, record, landing, evidence, &original_frame, selected_frame.as_deref().unwrap_or(&original_frame),
+        ).await.map_err(error::anomaly)?;
+        self.check_retained_review_delivery(managed, call, &proof).await?;
+        Ok(ok())
+    }
+
+    async fn check_retained_review_delivery(
+        &self, managed: &ManagedFamily<'_>, call: &Call, proof: &CustodyReadProof,
+    ) -> Result<(), Status> {
+        if proof.expires_at <= SystemClock.now() {
+            return Err(denied());
+        }
+        let driver = managed.database.serving_driver().ok_or_else(denied)?;
+        let index = driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+        workload::require_family_branch(&index, &managed.scope.branch, managed.created()?, SystemClock.now())
+            .map_err(error::anomaly)?;
+        let writer = self.mounted.original_writer_fence().await.map_err(error::anomaly)?;
+        driver.check_custody_release_delivery(
+            &BTreeSet::from([managed.scope.group]),
+            &writer, Some(proof.key_generation.ok_or_else(denied)?), &call.cancellation,
+        ).await.map_err(error::anomaly)?;
+        if proof.expires_at <= SystemClock.now() {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    async fn retained_authoring_frame(
+        &self,
+        managed: &ManagedFamily<'_>,
+        call: &Call,
+        record: &Family,
+        selector: &AuthorReceipt,
+        evidence: &proto::CustodyReadContributor,
+    ) -> Result<Vec<u8>, Status> {
+        let commitment = evidence.occurrence.as_slice().try_into().map_err(|_| invalid())?;
+        let (author, authored) = authored_at(record, commitment).map_err(error::anomaly)?;
+        let key = nonzero::<32>(&selector.key)?;
+        let written = basis(&selector.basis)?;
+        if author.order.write_key.as_slice() != key || written <= managed.created()?
+            || written > managed.head || selector.system_time_micros <= 0
+        {
+            return Err(denied());
+        }
+        let receipt = self.retained_placement_in(managed, call, record, key.to_vec()).await?;
+        if receipt.key.as_slice() != key || receipt.basis != written || receipt.erasure.is_some()
+            || receipt.system_time.0 != selector.system_time_micros
+        {
+            return Err(unknown_receipt());
+        }
+        if let Some(rewrite) = &author.order.rewrite {
+            let reserve = self.retained_placement_in(managed, call, record, rewrite.reserve_key.clone()).await?;
+            if reserve.key != rewrite.reserve_key || reserve.erasure.is_some()
+                || reserve.basis <= author.order.branch_created || reserve.basis >= receipt.basis
+            {
+                return Err(unknown_receipt());
+            }
+        }
+
+        let payload = author.payload.as_ref().ok_or_else(denied)?;
+        let (occurrence, clock, original) = self.mounted.confirm_native_authoring(
+            &author.order, payload.digest, author.link.as_ref().map(|link| link.digest),
+        ).await.map_err(error::anomaly)?;
+        let line = author.order.line.as_ref().ok_or_else(denied)?;
+        if occurrence.written != receipt.basis || clock != receipt.system_time
+            || original != authored.original
+            || position(line.generation, clock, occurrence.ordinal).map_err(error::anomaly)?.to_bytes() != authored.position
+            || contributor(record.group, original, &occurrence, clock) != *evidence
+            || decode_proto::<proto::CustodyReadContributor>(&authored.evidence)? != *evidence
+        {
+            return Err(denied());
+        }
+        self.vault.check_readable(self.authority, self.family, author.order.placement).await.map_err(error::anomaly)?;
+        let frame = blob(&payload.envelope, MAX_CARRIER_BYTES + 4096)?;
+        if hash(&frame) != occurrence.carrier_sha256 {
+            return Err(denied());
+        }
+        Ok(frame)
+    }
+
     async fn retained_placement(
         &self,
         managed: &ManagedFamily<'_>,
@@ -551,7 +736,7 @@ impl FamilyCall<'_> {
                     group,
                     reservation,
                     source,
-                    ..
+                    read_proof,
                 } if *group == scope.group => family.landings.iter().any(|landing| {
                     matches_landing(scope, landing)
                         && landing.order.reserve_key == tx.key
@@ -563,6 +748,11 @@ impl FamilyCall<'_> {
                         && landing.order.link == reservation.link
                         && landing.order.target == reservation.target
                         && landing.order.review_sha256 == reservation.review_sha256
+                        && landing.retained_query.as_ref().is_none_or(|query| {
+                            query.proof == hash(read_proof)
+                                && tx.requires.iter().any(|guard| matches!(guard,
+                                    Guard::Unchanged(claim) if query.claim == hash(claim.as_bytes())))
+                        })
                         && landing
                             .payload
                             .as_ref()

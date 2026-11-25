@@ -24,7 +24,7 @@ use super::{error, proto, transact};
 mod vault;
 mod wire;
 mod managed;
-pub(super) use managed::{MANAGED_FEATURE, REGISTERED_AUTHORING, is_managed_family};
+pub(super) use managed::{MANAGED_FEATURE, REGISTERED_AUTHORING, RETAINED_AUTHORING_REVIEW, is_managed_family};
 pub(super) use vault::NativeFamilyVault;
 use vault::{
     Accepted, Author, Authored, Close, Family, Hold, Landing, MAX_HOLDS, Sealed, conflict, full, hash, invalid_record,
@@ -62,6 +62,9 @@ impl Service {
         mounted.require_original_writer().await.map_err(error::anomaly)?;
         let authority = mounted.native_landing_authority();
         let request: Request = serde_json::from_slice(body).map_err(|_| invalid())?;
+        if matches!(request, Request::ReserveRetainedAuthoring { .. }) {
+            return Err(error::unsupported(RETAINED_AUTHORING_REVIEW));
+        }
         let result = if let Some(family) = request.family()? {
             let operation = FamilyCall {
                 vault,
@@ -95,6 +98,114 @@ struct FamilyCall<'a> {
     family: [u8; 16],
     line_registry: Option<&'a TableRef>,
     managed: Option<&'a rtdb_auth::OriginalFamilyGrant>,
+}
+
+struct Reservation {
+    member: String,
+    winner: String,
+    reservation: String,
+    target: String,
+    reviewed_source_b64: String,
+    native_target_b64: String,
+    reserve_key: String,
+    accept_key: String,
+    request_sha256: String,
+    receipt: wire::Witness,
+    proof: wire::Witness,
+}
+
+impl Reservation {
+    fn decode(self, call: &Call, scope: CustodyCarrierAuthority) -> Result<(Landing, proto::CustodyReviewedSource), Status> {
+        let Self {
+            member,
+            winner,
+            reservation,
+            target,
+            reviewed_source_b64,
+            native_target_b64,
+            reserve_key,
+            accept_key,
+            request_sha256,
+            receipt,
+            proof,
+        } = self;
+        let reservation = fixed::<176>(&reservation)?;
+        let member = fixed::<104>(&member)?;
+        let winner = fixed::<32>(&winner)?;
+        Position::from_bytes(winner).map_err(|_| invalid())?;
+        let target = fixed::<104>(&target)?;
+        let root = RootLandingTarget::from_bytes(target).map_err(|_| invalid())?;
+        let request_sha256 = nonzero(&request_sha256)?;
+        if request_sha256 != root.receipt || reservation[..32] != member[..32] {
+            return Err(invalid());
+        }
+        let destination = stage(&reservation[64..104], scope)?;
+        let link = stage(&reservation[104..144], scope)?;
+        let assertion: [u8; 32] = reservation[32..64].try_into().expect("assertion width");
+        let review_sha256: [u8; 32] = reservation[144..].try_into().expect("commitment width");
+        let reserve_key = key(&reserve_key)?;
+        let accept_key = key(&accept_key)?;
+        let target_slot = transact::custody_target(decode_proto(&native_target_b64)?, call.memory())?;
+        let receipt = receipt.decode()?;
+        let proof = proof.decode()?;
+        if destination == link
+            || reserve_key == accept_key
+            || assertion == [0; 32]
+            || review_sha256 == [0; 32]
+            || target_slot.branch != MAIN_BRANCH
+            || receipt.same_cell(&proof)
+        {
+            return Err(invalid());
+        }
+        let source: proto::CustodyReviewedSource = decode_proto(&reviewed_source_b64)?;
+        let cut = source.cut.as_ref().ok_or_else(invalid)?;
+        let original = source.original.as_ref().ok_or_else(invalid)?;
+        let selected = source.selected.as_ref().ok_or_else(invalid)?;
+        let group = original.group.as_slice().try_into().map_err(|_| invalid())?;
+        let original_commitment = original.occurrence.as_slice().try_into().map_err(|_| invalid())?;
+        let selected_commitment = selected.occurrence.as_slice().try_into().map_err(|_| invalid())?;
+        let order = NativeLandingOrder {
+            review: NativeLandingReview {
+                group,
+                original: original_commitment,
+                selected: selected_commitment,
+                cut: CustodyReview {
+                    branch: cut.branch.clone(),
+                    basis: Basis::from_bytes(&cut.basis.as_ref().ok_or_else(invalid)?.value)
+                        .map_err(error::anomaly)?,
+                    valid_at: rtdb_types::Timestamp(cut.valid_at_micros),
+                    inventory_sha256: cut.inventory_sha256.as_slice().try_into().map_err(|_| invalid())?,
+                },
+            },
+            reserve_key,
+            accept_key,
+            destination,
+            link,
+            target: target_slot,
+            review_sha256,
+            request_sha256,
+            receipt,
+            proof,
+        };
+        let landing = Landing {
+            assertion,
+            order,
+            target: target.to_vec(),
+            member: member.to_vec(),
+            winner,
+            source_carriers: [
+                original.carrier_sha256.as_slice().try_into().map_err(|_| invalid())?,
+                selected.carrier_sha256.as_slice().try_into().map_err(|_| invalid())?,
+            ],
+            retained_query: None,
+            review_evidence: hash(&source.encode_to_vec()),
+            body: None,
+            payload: None,
+            link: None,
+            accepted: None,
+        };
+        Ok((landing, source))
+    }
 }
 
 impl FamilyCall<'_> {
@@ -217,79 +328,21 @@ impl FamilyCall<'_> {
                 proof,
                 ..
             } => {
-                let reservation = fixed::<176>(&reservation)?;
-                let member = fixed::<104>(&member)?;
-                let winner = fixed::<32>(&winner)?;
-                Position::from_bytes(winner).map_err(|_| invalid())?;
-                let target = fixed::<104>(&target)?;
-                let root = RootLandingTarget::from_bytes(target).map_err(|_| invalid())?;
-                let request_sha256 = nonzero(&request_sha256)?;
-                if request_sha256 != root.receipt || reservation[..32] != member[..32] {
-                    return Err(invalid());
-                }
-                let destination = stage(&reservation[64..104], scope)?;
-                let link = stage(&reservation[104..144], scope)?;
-                let assertion: [u8; 32] = reservation[32..64].try_into().expect("assertion width");
-                let review_sha256: [u8; 32] = reservation[144..].try_into().expect("commitment width");
-                let reserve_key = key(&reserve_key)?;
-                let accept_key = key(&accept_key)?;
-                let target_slot = transact::custody_target(decode_proto(&native_target_b64)?, call.memory())?;
-                let receipt = receipt.decode()?;
-                let proof = proof.decode()?;
-                if destination == link
-                    || reserve_key == accept_key
-                    || assertion == [0; 32]
-                    || review_sha256 == [0; 32]
-                    || target_slot.branch != MAIN_BRANCH
-                    || receipt.same_cell(&proof)
-                {
-                    return Err(invalid());
-                }
-                let source: proto::CustodyReviewedSource = decode_proto(&reviewed_source_b64)?;
-                let cut = source.cut.as_ref().ok_or_else(invalid)?;
-                let original = source.original.as_ref().ok_or_else(invalid)?;
-                let selected = source.selected.as_ref().ok_or_else(invalid)?;
-                let group = original.group.as_slice().try_into().map_err(|_| invalid())?;
-                let original_commitment = original.occurrence.as_slice().try_into().map_err(|_| invalid())?;
-                let selected_commitment = selected.occurrence.as_slice().try_into().map_err(|_| invalid())?;
-                let original_carrier = blob(&original_carrier_b64, MAX_CARRIER_BYTES + 4096)?;
-                let selected_carrier = blob(&selected_carrier_b64, MAX_CARRIER_BYTES + 4096)?;
-                let order = NativeLandingOrder {
-                    review: NativeLandingReview {
-                        group,
-                        original: original_commitment,
-                        selected: selected_commitment,
-                        cut: CustodyReview {
-                            branch: cut.branch.clone(),
-                            basis: Basis::from_bytes(&cut.basis.as_ref().ok_or_else(invalid)?.value)
-                                .map_err(error::anomaly)?,
-                            valid_at: rtdb_types::Timestamp(cut.valid_at_micros),
-                            inventory_sha256: cut.inventory_sha256.as_slice().try_into().map_err(|_| invalid())?,
-                        },
-                    },
+                let (landing, source) = Reservation {
+                    member,
+                    winner,
+                    reservation,
+                    target,
+                    reviewed_source_b64,
+                    native_target_b64,
                     reserve_key,
                     accept_key,
-                    destination,
-                    link,
-                    target: target_slot,
-                    review_sha256,
                     request_sha256,
                     receipt,
                     proof,
-                };
-                let landing = Landing {
-                    assertion,
-                    order,
-                    target: target.to_vec(),
-                    member: member.to_vec(),
-                    winner,
-                    source_carriers: [hash(&original_carrier), hash(&selected_carrier)],
-                    review_evidence: hash(&source.encode_to_vec()),
-                    body: None,
-                    payload: None,
-                    link: None,
-                    accepted: None,
-                };
+                }.decode(call, scope)?;
+                let original_carrier = blob(&original_carrier_b64, MAX_CARRIER_BYTES + 4096)?;
+                let selected_carrier = blob(&selected_carrier_b64, MAX_CARRIER_BYTES + 4096)?;
                 self.reserve(lock, record, landing, &source, &original_carrier, &selected_carrier).await
             }
             Request::SealPayload { destination, carrier_b64, .. } => {
@@ -349,7 +402,7 @@ impl FamilyCall<'_> {
             Request::RecordDrain { revoked_at, inventory_sha256, .. } => {
                 self.drain(lock, record, basis(&revoked_at)?, nonzero(&inventory_sha256)?).await
             }
-            Request::Scope {} | Request::EnrollAuthoring { .. }
+            Request::Scope {} | Request::EnrollAuthoring { .. } | Request::ReserveRetainedAuthoring { .. }
             | Request::SubmitPlacement { .. } | Request::PlacementReceipt { .. } => return Err(invalid()),
         };
         result.map_err(error::anomaly)
@@ -495,7 +548,9 @@ impl FamilyCall<'_> {
     ) -> rtdb_types::Result<Value> {
         family.live()?;
         let review = &landing.order.review;
-        if family.group != review.group || review.cut.branch == MAIN_BRANCH {
+        if family.group != review.group || review.cut.branch == MAIN_BRANCH
+            || landing.source_carriers != [hash(original_bytes), hash(selected_bytes)]
+        {
             return Err(conflict());
         }
         if self.managed.is_some_and(|scope| review.cut.branch != scope.branch || review.group != scope.group
@@ -509,17 +564,21 @@ impl FamilyCall<'_> {
         if !member.order.has_bound_line() || !winner.order.has_bound_line() {
             return Err(conflict());
         }
-        if let Some(prior) = family.landings.iter().find(|prior| prior.assertion == landing.assertion) {
+        let prior = family.landings.iter().find(|prior| prior.assertion == landing.assertion);
+        if let Some(prior) = prior {
             if !prior.same_reservation(&landing) {
                 return Err(conflict());
             }
-            self.mounted.verify_native_landing_live(family.group).await?;
-            return Ok(ok());
+            if landing.retained_query.is_none() {
+                self.mounted.verify_native_landing_live(family.group).await?;
+                return Ok(ok());
+            }
+        } else {
+            if family.authors.iter().any(|author| author.assertion == landing.assertion) {
+                return Err(conflict());
+            }
+            family.check_new_stages(&[landing.order.destination, landing.order.link])?;
         }
-        if family.authors.iter().any(|author| author.assertion == landing.assertion) {
-            return Err(conflict());
-        }
-        family.check_new_stages(&[landing.order.destination, landing.order.link])?;
         if member.order.rewrite.is_some()
             || selected.original != original.occurrence
             || member_bytes(self.authority, member, original) != landing.member
@@ -536,8 +595,10 @@ impl FamilyCall<'_> {
         {
             return Err(conflict());
         }
-        family.landings.push(landing);
-        lock.save(family, false).await?;
+        if prior.is_none() {
+            family.landings.push(landing);
+            lock.save(family, false).await?;
+        }
         Ok(ok())
     }
 

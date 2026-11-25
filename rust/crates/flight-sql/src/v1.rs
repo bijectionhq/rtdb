@@ -115,6 +115,7 @@ impl Service {
                 let family = self.managed_family(&call).await?;
                 let mut features = [
                     original_family_landing::FEATURE, original_family_landing::MANAGED_FEATURE,
+                    original_family_landing::RETAINED_AUTHORING_REVIEW,
                     ROW_CUSTODY, REVIEWED_CUSTODY_PLACEMENT, "query", "query.track",
                 ].map(str::to_owned).to_vec();
                 if !family.route.family_authoring_controls.is_empty() {

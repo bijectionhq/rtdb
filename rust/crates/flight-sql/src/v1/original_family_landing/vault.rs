@@ -380,6 +380,8 @@ pub(super) struct Landing {
     pub(super) member: Vec<u8>,
     pub(super) winner: [u8; 32],
     pub(super) source_carriers: [[u8; 32]; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) retained_query: Option<RetainedReviewQuery>,
     pub(super) review_evidence: [u8; 32],
     pub(super) body: Option<[u8; 32]>,
     pub(super) payload: Option<Sealed>,
@@ -395,8 +397,16 @@ impl Landing {
             && self.member == other.member
             && self.winner == other.winner
             && self.source_carriers == other.source_carriers
+            && self.retained_query == other.retained_query
             && self.review_evidence == other.review_evidence
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetainedReviewQuery {
+    pub(super) proof: [u8; 32],
+    pub(super) claim: [u8; 32],
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

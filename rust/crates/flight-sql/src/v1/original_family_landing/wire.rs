@@ -63,6 +63,24 @@ pub(super) enum Request {
         receipt: Witness,
         proof: Witness,
     },
+    ReserveRetainedAuthoring {
+        family: String,
+        member: String,
+        winner: String,
+        reservation: String,
+        target: String,
+        reviewed_source_b64: String,
+        original_author: AuthorReceipt,
+        selected_author: AuthorReceipt,
+        custody_read_proof_b64: String,
+        claim_b64: String,
+        native_target_b64: String,
+        reserve_key: String,
+        accept_key: String,
+        request_sha256: String,
+        receipt: Witness,
+        proof: Witness,
+    },
     SealPayload {
         family: String,
         destination: String,
@@ -128,6 +146,7 @@ impl Request {
             | Self::SealAuthoring { family, .. }
             | Self::ConfirmAuthoring { family, .. }
             | Self::Reserve { family, .. }
+            | Self::ReserveRetainedAuthoring { family, .. }
             | Self::SealPayload { family, .. }
             | Self::SealLink { family, .. }
             | Self::BindAcceptanceBody { family, .. }
@@ -141,6 +160,14 @@ impl Request {
         };
         Ok(Some(nonzero(family)?))
     }
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthorReceipt {
+    pub(super) key: String,
+    pub(super) basis: String,
+    pub(super) system_time_micros: i64,
 }
 
 #[derive(Deserialize)]

@@ -53,18 +53,7 @@ impl MountedResponseRelease<'_> {
                 return Err(release_unavailable());
             }
             if let Some(line) = &authoring.line {
-                require_line_registration(&index, authoring, line, index.exact(authoring.branch_created)?.system_time)?;
-                let receipt = release.driver.original_line_creation_receipt(
-                    &line.creation_key, authoring.branch_created, self.cancellation,
-                ).await?;
-                if receipt.outcome != Outcome::Then
-                    || receipt.key != line.creation_key
-                    || receipt.basis != authoring.branch_created
-                    || index.exact(receipt.basis)?.system_time != receipt.system_time
-                {
-                    return Err(release_unavailable());
-                }
-                require_writer_at(&index, &writer, receipt.basis, receipt.system_time)?;
+                self.confirm_native_authoring_line(&index, &writer, authoring, line).await?;
             }
             if let Some(rewrite) = &authoring.rewrite {
                 let (original, source) =
@@ -84,6 +73,42 @@ impl MountedResponseRelease<'_> {
         })
         .await?;
         self.owner.with_live_mount(|| release.require_authority(authority))
+    }
+
+    pub async fn verify_native_retained_authoring_line(&self, authoring: &NativeAuthoring) -> Result<()> {
+        let release = self.release();
+        let authority = self.native_landing_authority();
+        self.while_mounted(async {
+            let line = authoring.line.as_ref().ok_or_else(release_unavailable)?;
+            let (index, writer) = release.current_with_writer(authority).await?;
+            rtdb_tx::transact::workload::require_family_branch(
+                &index, &authoring.target.branch, authoring.branch_created, self.clock.now(),
+            )?;
+            self.confirm_native_authoring_line(&index, &writer, authoring, line).await
+        }).await?;
+        self.owner.with_live_mount(|| release.require_authority(authority))
+    }
+
+    async fn confirm_native_authoring_line(
+        &self,
+        index: &BranchIndex,
+        writer: &CustodyWriterFence,
+        authoring: &NativeAuthoring,
+        line: &NativeAuthoringLine,
+    ) -> Result<()> {
+        let clock = index.exact(authoring.branch_created)?.system_time;
+        require_line_registration(index, authoring, line, clock)?;
+        let receipt = self.release().driver.original_line_creation_receipt(
+            &line.creation_key, authoring.branch_created, self.cancellation,
+        ).await?;
+        if receipt.outcome != Outcome::Then
+            || receipt.key != line.creation_key
+            || receipt.basis != authoring.branch_created
+            || receipt.system_time != clock
+        {
+            return Err(release_unavailable());
+        }
+        require_writer_at(index, writer, receipt.basis, receipt.system_time)
     }
 
     pub async fn confirm_native_authoring(

@@ -169,7 +169,6 @@ A dropped named line serves historical main checks and the receipt-bound mapping
 Use the typed actions above for independent point and catalog readback.
 The separate version 2 receipt-recovery bearer owns creation `TxStatus` with family 7.
 The version 4 authoring bearer owns the family receipt, activation, and tracked exact Query with fields 7 and 13 on the same bearer as the signed reserve.
-Fetch any required opaque authoring envelopes through the custody owner or the client's retained authoring evidence.
 
 #### Provisioning the named line
 
@@ -234,10 +233,20 @@ Every operation except `scope` names the family UUID.
 
 #### Reservation and acceptance
 
+For a fresh managed review, require `row-custody.managed-retained-authoring-review` on the version 4 bearer before capturing the unpaged tracked `Exactly` merged Query.
+Call `rtdb.v1.OriginalFamilyLanding` with `operation` set to `reserve_retained_authoring` and keep the existing `reserve` fields except `original_carrier_b64` and `selected_carrier_b64`.
+Send `original_author` and `selected_author` as objects with `key` (32 lowercase-hex bytes), `basis` (24 lowercase-hex bytes) and integer `system_time_micros` from the exact namespaced authoring Then receipts.
+Use the same receipt for both selectors when the founding occurrence wins.
+Send `custody_read_proof_b64` and `claim_b64` as the unpadded base64url opaque proof and encoded Claim protobuf from that Query.
+The existing `proof` field identifies the application proof cell.
+The Original vault verifies the author enrollments, named line and reviewed source, including the actual carrier digests of the retained envelopes.
+The response is `{"ok":true}`.
+Use the same proof and Claim in the signed single-operation native reserve after sealing the destination and binding the acceptance body.
+
 1. Reserve the Original family member and the winning native occurrence through the bridge before sealing either stage.
    Use the destination and link stage UUIDs for the native placement and link IDs.
    The reservation pins the review and its physical occurrence commitments, both native request keys, the target, the canonical application request digest and the exact receipt and proof cell locators.
-   Supply the same Original and winning carrier bytes observed by the native review.
+   For the ordinary `reserve` operation, supply the same Original and winning carrier bytes observed by the native review.
 2. Seal the destination payload and link.
    Bind the SHA-256 of the byte-identical application receipt and proof cells with `bind_acceptance_body` before submitting the native reservation.
    The application body may contain the sealed link.
