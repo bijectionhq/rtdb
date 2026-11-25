@@ -26,7 +26,7 @@
 --
 -- A native hosted Proposal source record carries the ordered operations for preparation by the installed writer at the authenticated durable predecessor.
 -- Preparation normalizes the operation batch in Arrow, preserving the source reader's operation order, field presence and typed values.
--- A batch containing run-end encoding uses the stream codec to rebase sliced runs and preserve native batch validity.
+-- A batch containing run-end encoding rebases sliced runs in memory and preserves native batch validity.
 -- Source resolution admits the prepared table batches at the same durable predecessor and offered clock and adds order-assigned metadata.
 -- Replica read-back remains the visibility fence for the one selected success or refusal transaction.
 -- The installed writer reports the first admitted committed erase together with its replica position.
