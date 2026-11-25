@@ -73,6 +73,26 @@ pub async fn read_checkpoint_owned_point(
     ).await
 }
 
+pub(crate) async fn reopen_checkpoint_world_archive(
+    directory: &dyn Directory,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: &HostedTask,
+    world: &CheckpointReadWorld,
+    resources: CheckpointReadResources<'_>,
+) -> Result<()> {
+    with_checkpoint_context(
+        directory,
+        archive,
+        keys,
+        Some(hosted_task),
+        world,
+        resources,
+        |_| async { Ok(()) },
+    )
+    .await
+}
+
 pub(super) fn require_relation_purge_history(context: &QueryContext, owner: &str) -> Result<()> {
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else {
