@@ -182,6 +182,8 @@ pub enum Authority {
         group: CustodyGroupId,
         session: [u8; 32],
         request_digest: [u8; 32],
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        authoring_controls: BTreeSet<TableRef>,
     },
     FundedAppointment(FundedAppointmentScope),
     CloseWriter {
@@ -286,11 +288,12 @@ impl Authority {
             } => held(fence) && applied(writer) && *request_digest != [0; 32],
             Self::ProvisionBranch { fence, writer, line, request_digest } =>
                 held(fence) && applied(writer) && line.valid() && *request_digest != [0; 32],
-            Self::OriginalFamilyWrite { fence, writer, branch, created, group, session, request_digest } =>
+            Self::OriginalFamilyWrite { fence, writer, branch, created, group, session, request_digest, authoring_controls } =>
                 held(fence) && applied(writer) && branch != MAIN_BRANCH
                     && rtdb_types::rtdb_v1::valid_branch_name(branch)
                     && created.incarnation() == incarnation && created.position() > 0
-                    && *group != [0; 16] && *session != [0; 32] && *request_digest != [0; 32],
+                    && *group != [0; 16] && *session != [0; 32] && *request_digest != [0; 32]
+                    && valid_family_authoring_controls(authoring_controls),
             Self::FundedAppointment(scope) => scope.valid(incarnation),
             Self::CloseWriter {
                 fence,
@@ -883,7 +886,7 @@ impl Point {
                 line.check(self, writer, state.index(), transaction, now)?;
                 return Ok(transaction.clone());
             }
-            Authority::OriginalFamilyWrite { branch, created, group, .. } => {
+            Authority::OriginalFamilyWrite { branch, created, group, authoring_controls, .. } => {
                 let transaction = transaction.filter(|tx| tx.key == key).ok_or_else(denied)?;
                 require_family_branch(state.index(), branch, *created, now)?;
                 let reviewed_reserve = transaction.ops.iter().any(|op| matches!(op, Op::ReserveReviewedCustodyPlacement { .. }));
@@ -892,12 +895,25 @@ impl Point {
                 {
                     return Err(denied());
                 }
-                let data_branch = if transaction.uses_reviewed_custody() { MAIN_BRANCH } else { branch };
+                let reviewed = transaction.uses_reviewed_custody();
+                let data_branch = if reviewed { MAIN_BRANCH } else { branch };
+                let named_placement = !reviewed && transaction.ops.iter()
+                    .filter(|op| matches!(op, Op::PlaceCustodyRow { .. })).count() == 1
+                    && transaction.ops.iter().all(|op| matches!(op,
+                        Op::Put { .. } | Op::Delete { .. } | Op::PlaceCustodyRow { .. } | Op::CreateCustodyGroup { .. }
+                    ));
+                let mut main_points = BTreeSet::new();
                 if !transaction.uses_custody() || !transaction.otherwise.is_empty()
                     || transaction.custody_request_digest.is_some() || state.index.has_visibility_history()
                     || transaction.ops.iter().any(|op| match op {
                         Op::Put { branch: target, table, rows, .. } =>
-                            target != data_branch || *table == self.table
+                            *table == self.table || (target != data_branch
+                                && !(named_placement && target == MAIN_BRANCH
+                                    && authoring_controls.contains(table)
+                                    && rows.iter().all(|row| {
+                                        main_points.insert((table, &row.id))
+                                            && ordered_authoring_control(transaction, table, row)
+                                    })))
                                 || rows.iter().any(|row| row.custody_group.is_some()
                                     || row.custody_payload.is_some() || !row.protected_columns.is_empty()
                                     || state.index.has_custody_address(table, &row.id)),
@@ -917,6 +933,7 @@ impl Point {
                         Op::CreateCustodyGroup { group: target } => target != group,
                         _ => true,
                     })
+                    || main_points.len() > 64
                 {
                     return Err(denied());
                 }
@@ -1281,6 +1298,23 @@ impl Point {
             predecessor_retirement_basis,
         })
     }
+}
+
+fn ordered_authoring_control(transaction: &Transact, table: &TableRef, row: &Row) -> bool {
+    let Some(ValidTime::Literal(valid)) = row.valid else { return false; };
+    if valid.lower() != Timestamp(0) || valid.upper() != Timestamp::MAX
+        || !matches!(&row.id, EntityId::String(id) if bounded(id))
+    {
+        return false;
+    }
+    transaction.requires.iter().any(|guard| matches!(guard, Guard::Version {
+        branch, table: guarded_table, id, valid_at: Some(Timestamp(0)),
+        expect: Version::Absent | Version::Written(_),
+    } if branch == MAIN_BRANCH && guarded_table == table && id == &row.id))
+}
+
+pub fn valid_family_authoring_controls(tables: &BTreeSet<TableRef>) -> bool {
+    tables.len() <= 16 && tables.iter().all(provision::application_table)
 }
 
 impl TransactState {

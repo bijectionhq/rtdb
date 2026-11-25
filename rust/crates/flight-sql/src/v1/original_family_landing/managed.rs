@@ -22,6 +22,7 @@ use super::*;
 use crate::v1::custody::{CustodyProviderRoute, session_binding};
 
 pub(in crate::v1) const MANAGED_FEATURE: &str = "row-custody.managed-original-family-placement";
+pub(in crate::v1) const REGISTERED_AUTHORING: &str = "row-custody.managed-registered-authoring";
 
 pub(in crate::v1) struct ManagedFamily<'a> {
     pub route: &'a CustodyProviderRoute,
@@ -52,6 +53,7 @@ impl ManagedFamily<'_> {
             group: self.scope.group,
             session: session_binding(call),
             request_digest,
+            authoring_controls: self.route.family_authoring_controls.clone(),
         })
     }
 

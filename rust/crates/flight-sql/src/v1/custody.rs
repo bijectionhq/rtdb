@@ -90,6 +90,7 @@ pub struct CustodyProviderRoute {
     pub(super) family_vault: Option<super::original_family_landing::NativeFamilyVault>,
     pub(super) family_line_registry: Option<rtdb_types::TableRef>,
     pub(super) family_authoring_key: Option<[u8; 32]>,
+    pub(super) family_authoring_controls: std::collections::BTreeSet<rtdb_types::TableRef>,
 }
 impl fmt::Debug for CustodyProviderRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -106,6 +107,7 @@ impl CustodyProviderRoute {
             family_vault: None,
             family_line_registry: None,
             family_authoring_key: None,
+            family_authoring_controls: Default::default(),
         }
     }
 
@@ -121,6 +123,24 @@ impl CustodyProviderRoute {
     pub fn with_original_family_authoring_key(mut self, key: [u8; 32]) -> Self {
         self.family_authoring_key = Some(key);
         self
+    }
+
+    pub fn with_original_family_authoring_controls(
+        mut self, tables: std::collections::BTreeSet<rtdb_types::TableRef>,
+    ) -> rtdb_types::Result<Self> {
+        if !rtdb_tx::transact::workload::valid_family_authoring_controls(&tables)
+            || !tables.is_empty() && (self.family_authoring_key.is_none()
+                || self.family_line_registry.is_none()
+                || tables.contains(&self.installation.writer.table)
+                || self.family_line_registry.as_ref().is_some_and(|table| tables.contains(table)))
+        {
+            return Err(rtdb_types::Anomaly::incorrect(
+                "rtdb/custody-provider-configuration",
+                "Registered family authoring requires distinct commissioned application tables",
+            ));
+        }
+        self.family_authoring_controls = tables;
+        Ok(self)
     }
 
     pub(crate) fn authority(&self) -> CustodyCarrierAuthority {

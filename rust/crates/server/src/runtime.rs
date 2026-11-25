@@ -351,6 +351,9 @@ impl ServerDriver {
                     Some(key) => route.with_original_family_authoring_key(key),
                     None => route,
                 };
+                let route = route.with_original_family_authoring_controls(
+                    provider.original_family_authoring_controls.clone(),
+                )?;
                 if custody_providers.insert(provider.database.clone(), Arc::new(route)).is_some() {
                     return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "A database accepts one configured original custody provider"));
                 }

@@ -106,13 +106,17 @@ impl Service {
             }.await,
             CAPABILITIES if original_family_landing::is_managed_family(&call) => async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
-                self.managed_family(&call).await?;
+                let family = self.managed_family(&call).await?;
+                let mut features = [
+                    original_family_landing::FEATURE, original_family_landing::MANAGED_FEATURE,
+                    ROW_CUSTODY, REVIEWED_CUSTODY_PLACEMENT, "query", "query.track",
+                ].map(str::to_owned).to_vec();
+                if !family.route.family_authoring_controls.is_empty() {
+                    features.push(original_family_landing::REGISTERED_AUTHORING.into());
+                }
                 Ok(proto::CapabilitiesResponse {
                     api: API.into(),
-                    features: [
-                        original_family_landing::FEATURE, original_family_landing::MANAGED_FEATURE,
-                        ROW_CUSTODY, REVIEWED_CUSTODY_PLACEMENT, "query", "query.track",
-                    ].map(str::to_owned).into(),
+                    features,
                     limits: Some(proto::Limits {
                         max_page_rows: 0, max_change_groups: 0, max_wait_millis: 0,
                         min_key_bytes: 16, max_key_bytes: 64,

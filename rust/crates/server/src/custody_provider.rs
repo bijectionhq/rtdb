@@ -23,6 +23,7 @@ pub struct Settings {
     pub(crate) original_family_vault: Option<std::path::PathBuf>,
     pub(crate) original_family_line_registry: Option<TableRef>,
     pub(crate) original_family_authoring_key: Option<[u8; 32]>,
+    pub(crate) original_family_authoring_controls: BTreeSet<TableRef>,
     endpoint: Url,
     ca_certificate: Option<String>,
     bearer: Secret,
@@ -92,6 +93,13 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         .transpose()?;
     let original_family_authoring_key = fields.string("originalFamilyAuthoringKey")?
         .map(|key| fixed_hex::<32>(&key)).transpose()?;
+    let mut original_family_authoring_controls = BTreeSet::new();
+    for value in fields.sequence("originalFamilyAuthoringControls")?.unwrap_or_default() {
+        let Yaml::String(name) = value else { return Err(invalid()); };
+        if !name.contains('.') || !original_family_authoring_controls.insert(TableRef::parse(&name)?) {
+            return Err(invalid());
+        }
+    }
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -99,6 +107,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         || authority.registry == [0; 32]
         || authority.original_writer == [0; 32]
         || public_key == [0; 32]
+        || !original_family_authoring_controls.is_empty() && original_family_authoring_key.is_none()
         || original_family_authoring_key.is_some_and(|key| key == [0; 32] || key == public_key
             || owner.is_none() || original_family_vault.is_none() || original_family_line_registry.is_none())
     {
@@ -110,6 +119,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         original_family_vault,
         original_family_line_registry,
         original_family_authoring_key,
+        original_family_authoring_controls,
         endpoint,
         ca_certificate,
         bearer: Secret::new(bearer),

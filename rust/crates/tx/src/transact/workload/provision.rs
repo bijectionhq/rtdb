@@ -164,7 +164,7 @@ impl LineProvision {
     }
 }
 
-fn application_table(table: &TableRef) -> bool {
+pub(super) fn application_table(table: &TableRef) -> bool {
     !matches!(
         table.schema.as_str(),
         "xt" | "information_schema" | "pg_catalog"

@@ -85,6 +85,14 @@ The managed credential is scoped to one family and one already created named lin
 For an imported attachment, the line creation follows the current ordered ClaimWriter and family receipts must follow the import fence.
 Original response release, disposal and family plaintext opening retain their existing authorization boundaries.
 
+For registered authoring, the Original custody provider may commission `originalFamilyAuthoringControls` as up to 16 distinct, schema-qualified application relations.
+The v4 family bearer advertises `row-custody.managed-registered-authoring` after checking the mounted writer and this configuration.
+The independently commissioned signer signs the canonical application decision and complete encoded submission for the existing native placement operation.
+An initial placement or rewrite can co-order its signed application settlement on main with exactly one placement on its scoped named line.
+Each additional main row has literal validity `[0, infinity)`, a matching `Version::Absent` or `Version::Written` requirement at valid time zero, and a distinct string identity.
+Main settlement cannot write the writer or line registry relation, modify protected addresses, execute a Delete, or accompany a reservation.
+The writer makes one decision for the protected occurrence and the application controls, using the same immutable keyed receipt.
+
 #### Provisioning the named line
 
 Commission a separate version 2 credential from the managed assignment issuer with `authority.role` set to `provision-branch`.

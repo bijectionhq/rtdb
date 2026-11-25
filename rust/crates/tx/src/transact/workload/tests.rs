@@ -340,12 +340,34 @@ fn commissioned_fork_co_orders_the_registry_and_owner_under_the_current_writer()
 }
 
 #[test]
+fn named_authoring_controls_require_exact_main_versions() {
+    let table = TableRef::new("public", "settlement");
+    let id = EntityId::String("receipt".into());
+    let mut transaction = write(13, table.clone(), id.clone());
+    let Op::Put { rows, .. } = &mut transaction.ops[0] else { panic!("expected settlement put") };
+    rows[0].valid = Some(Interval::new(Timestamp(0), Timestamp::MAX).unwrap().into());
+    let row = rows[0].clone();
+    assert!(!ordered_authoring_control(&transaction, &table, &row));
+
+    transaction.requires.push(Guard::Version {
+        branch: MAIN_BRANCH.into(), table: table.clone(), id,
+        valid_at: Some(Timestamp(0)), expect: Version::Absent,
+    });
+    assert!(ordered_authoring_control(&transaction, &table, &row));
+
+    let Guard::Version { expect, .. } = &mut transaction.requires[0] else { unreachable!() };
+    *expect = Version::Present;
+    assert!(!ordered_authoring_control(&transaction, &table, &row));
+}
+
+#[test]
 fn original_family_claim_scope_commits_to_the_session_grant_and_writer() {
     let mut journal = Writer::new();
     let (fence, writer) = begin(&mut journal);
     let mut authority = Authority::OriginalFamilyWrite {
         fence, writer, branch: "authored".into(), created: Basis::new(INCARNATION, 9),
         group: [4; 16], session: [5; 32], request_digest: [6; 32],
+        authoring_controls: BTreeSet::new(),
     };
     let namespace = [7; 32];
     let binding = authority.original_family_claim_scope(namespace).unwrap().binding;

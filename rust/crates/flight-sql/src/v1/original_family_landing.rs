@@ -24,7 +24,7 @@ use super::{error, proto, transact};
 mod vault;
 mod wire;
 mod managed;
-pub(super) use managed::{MANAGED_FEATURE, is_managed_family};
+pub(super) use managed::{MANAGED_FEATURE, REGISTERED_AUTHORING, is_managed_family};
 pub(super) use vault::NativeFamilyVault;
 use vault::{
     Accepted, Author, Authored, Close, Family, Hold, Landing, MAX_HOLDS, Sealed, conflict, full, hash, invalid_record,
