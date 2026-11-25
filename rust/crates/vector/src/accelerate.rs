@@ -7,7 +7,7 @@ use rtdb_query::{CandidateIids, CatalogSnapshot, DatabaseSnapshot, QueryContext,
 use rtdb_types::{Iid, Result, Value};
 
 use crate::{
-    definition::{self, VectorDefinition},
+    definition::{self, CatalogDefinition, VectorDefinition},
     rows::{Partition, UnitProbe},
     shortlist::{Budget, Cut, Round, Shortlist, declined},
 };
@@ -35,7 +35,7 @@ impl Default for VectorAccelerator {
 }
 
 /// What the scan asked of the approximate route.
-struct Asked { definition: VectorDefinition, probe: UnitProbe, limit: usize }
+struct Asked { definition: CatalogDefinition, probe: UnitProbe, limit: usize }
 
 #[async_trait]
 impl ScanAccelerator for VectorAccelerator {
@@ -96,9 +96,7 @@ impl VectorAccelerator {
             let context = QueryContext::new(catalog, Arc::clone(request.memory), request.current_time, "UTC", QueryOptions::default(), request.cancellation)?;
             definition::owned_definition(context, table, column).await?
         } else {
-            definition::definitions_in(request.database, request.partitions.to_vec(), Arc::clone(request.storage),
-                Arc::clone(request.memory), request.current_time, request.cancellation).await?
-                .into_iter().find(|definition| &definition.table == table && definition.column == column)
+            definition::sql_definition_for(request, table, column).await?
         };
         let Some(definition) = definition else { return Ok(None) };
         let Some(probe) = UnitProbe::from_value(&probe, definition.dimensions, request.memory)? else { return Ok(None) };

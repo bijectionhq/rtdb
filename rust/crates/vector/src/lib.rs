@@ -13,7 +13,7 @@ mod shortlist;
 mod rows;
 
 pub use accelerate::{PREDICATE, VectorAccelerator};
-pub use definition::{Approximate, DEFINITIONS, KIND, Method, VectorDefinition, definitions_in, owned_definition};
+pub use definition::{Approximate, CatalogDefinition, DEFINITIONS, Definitions, KIND, Method, VectorDefinition, definitions_in, owned_definition};
 pub use lane::VectorArtefacts;
 pub use rows::{Partition, UnitProbe};
 pub use shortlist::{Budget, Cut, Round, Shortlist, declined};

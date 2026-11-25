@@ -10,7 +10,7 @@ use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{definition::{self, VectorDefinition}, file, kmeans, rows::IndexedRows};
+use crate::{definition::{self, Definitions, VectorDefinition}, file, kmeans, rows::IndexedRows};
 
 /// Builds one immutable generation per current trie for each approximate vector index (vector.allium: BuildGeneration).
 /// The artefact lane publishes it with the trie, and the collector deletes it with the trie or its retired definition.
@@ -25,26 +25,30 @@ impl ArtefactKind for VectorArtefacts {
 struct Builder(ArtefactDatabase);
 
 impl Builder {
-    async fn read_definitions(&self, snapshot: &PartitionValue, cancellation: &CancellationToken) -> Result<Vec<VectorDefinition>> {
+    async fn read_definitions(&self, snapshot: &PartitionValue, cancellation: &CancellationToken) -> Result<(Definitions, Definitions)> {
         let database = &self.0;
-        let mut definitions = definition::definitions_in(&database.name, vec![snapshot.snapshot()], Arc::clone(&database.storage),
+        let sql = definition::definitions_in(&database.name, vec![snapshot.snapshot()], Arc::clone(&database.storage),
             Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
-        definitions.extend(definition::owned_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
-            Arc::clone(&database.memory), (database.clock)(), cancellation).await?);
-        Ok(definitions)
+        let owned = definition::owned_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
+            Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
+        Ok((sql, owned))
     }
 }
 
 #[async_trait]
 impl ArtefactBuilder for Builder {
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>> {
-        Ok(self.read_definitions(snapshot, cancellation).await?.iter().map(VectorDefinition::artefact).collect())
+        let (sql, owned) = self.read_definitions(snapshot, cancellation).await?;
+        Ok(sql.rows().iter().chain(owned.rows()).map(|definition| definition.artefact()).collect())
     }
 
     async fn build(&self, job: &ArtefactJob, source: ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
-        let definition = self.read_definitions(snapshot, cancellation).await?.into_iter()
-            .find(|definition| definition.artefact() == job.definition)
+        let (mut sql, mut owned) = self.read_definitions(snapshot, cancellation).await?;
+        let matches = |definition: &VectorDefinition| definition.artefact() == job.definition;
+        let definition = sql.take(matches).or_else(|| owned.take(matches))
             .ok_or_else(|| fault("Vector definition left force before its build"))?;
+        drop(sql);
+        drop(owned);
         let ArtefactOwner::Trie(trie) = &job.owner else { return Err(fault("A vector generation covers one trie")) };
         let table = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| fault("Unknown vector index relation"))?;
         let key = ObjectKey::new(table.slug.owner_artefact_key(&job.owner, definition::KIND, &job.definition.id, definition.generation)?)?;
