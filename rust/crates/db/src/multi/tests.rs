@@ -29,6 +29,91 @@ const NODE_1_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:1");
 const NODE_2_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:2");
 const NODE_3_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:3");
 
+/// The journal behind a test. `RTDB_MULTI_JOURNAL=consensus` runs the test on
+/// real keeper-hosted consensus streams: three voters and a catalog keeper on
+/// loopback with enrolled media and mutual TLS. The default is the in-memory
+/// reference journal.
+enum Journals {
+    Memory(MemoryJournal),
+    Consensus {
+        cluster: stream_logkeeper::stream::consensus::testing::LocalCluster,
+        config: stream_logkeeper::stream::consensus::JournalConfig,
+    },
+}
+
+/// Keepers accept only `urn:logkeeper:client:` principals. Multi treats a
+/// journal identity as opaque, so each test identity maps to one principal.
+fn keeper_principal(identity: &Identity) -> String {
+    format!("urn:logkeeper:client:{}", identity.as_str().replace(':', "-"))
+}
+
+/// A journal handle for one node identity, from either source.
+#[derive(Clone)]
+struct TestJournal(Arc<dyn Journal>);
+
+async fn journals() -> Journals {
+    match std::env::var("RTDB_MULTI_JOURNAL").as_deref() {
+        Ok("consensus") => {
+            let principals = [NODE_1_IDENTITY, NODE_2_IDENTITY, NODE_3_IDENTITY].map(|identity| keeper_principal(&identity));
+            let principals = principals.iter().map(String::as_str).collect::<Vec<_>>();
+            let cluster = stream_logkeeper::stream::consensus::testing::LocalCluster::start(&principals).await.unwrap();
+            let config = cluster.journal_config(8 << 30, 4 << 20);
+            Journals::Consensus { cluster, config }
+        }
+        Ok("memory") | Err(_) => Journals::Memory(MemoryJournal::default()),
+        Ok(other) => panic!("unknown RTDB_MULTI_JOURNAL {other}"),
+    }
+}
+
+impl Journals {
+    fn handle(&self, identity: Identity) -> TestJournal {
+        TestJournal(match self {
+            Self::Memory(journal) => Arc::new(journal.handle(identity)),
+            Self::Consensus { cluster, config } => Arc::new(cluster.journal(&keeper_principal(&identity), config).unwrap()),
+        })
+    }
+
+    /// Stops and restarts every keeper, keeping their media.
+    async fn restart_keepers(&mut self) {
+        if let Self::Consensus { cluster, .. } = self {
+            cluster.shutdown().await.unwrap();
+            for keeper in cluster.voters().into_iter().chain([cluster.catalog()]) {
+                cluster.restart(keeper).await.unwrap();
+            }
+        }
+    }
+}
+
+impl Journal for TestJournal {
+    fn create(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
+        self.0.create(stream)
+    }
+
+    fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.0.seal(stream, epoch)
+    }
+
+    fn append(&self, stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.0.append(stream, epoch, at, payload)
+    }
+
+    fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> BoxFuture<'_, journal_contract::Result<Page>> {
+        self.0.read(stream, from, max, wait)
+    }
+
+    fn head(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.0.head(stream)
+    }
+
+    fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, journal_contract::Result<()>> {
+        self.0.trim(stream, epoch, through)
+    }
+
+    fn delete(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
+        self.0.delete(stream)
+    }
+}
+
 struct Cluster {
     time: Arc<AtomicI64>,
     kms: Arc<LocalKms>,
@@ -93,7 +178,7 @@ fn an_ephemeral_key_vault_cannot_enable_multi_row_custody() {
 
 #[tokio::test]
 async fn ranked_catalog_replays_at_the_built_cut_after_later_writes() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
@@ -130,7 +215,7 @@ async fn ranked_catalog_replays_at_the_built_cut_after_later_writes() {
 
 #[tokio::test]
 async fn assigned_follower_observes_settled_writer_progress_without_admitting_writes() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
@@ -170,7 +255,7 @@ async fn multi_driver_tokens_reroute_and_verify_the_row_footprint() {
     use rtdb_crypt::tokens::PageToken;
     use rtdb_types::rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimRegion, ClaimScope};
 
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
@@ -249,7 +334,7 @@ async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Valu
 
 #[tokio::test]
 async fn multi_driver_requires_refuses_a_displaced_owner_and_recovers_the_receipt() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
@@ -343,7 +428,7 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
 
 #[tokio::test]
 async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     source.create().await.unwrap();
@@ -401,7 +486,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     };
     use sha2::{Digest, Sha256};
 
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     source.create().await.unwrap();
@@ -727,7 +812,7 @@ async fn append_custody_fixture(database: &mut MultiDatabase, request: &Transact
 
 #[tokio::test]
 async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
@@ -818,7 +903,7 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
 
 #[tokio::test]
 async fn multi_driver_replacement_refuses_a_timed_tx_after_its_reply_is_lost() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let gate = Arc::new(GateJournal::new(faults.clone()));
@@ -855,7 +940,7 @@ async fn multi_driver_replacement_refuses_a_timed_tx_after_its_reply_is_lost() {
 
 #[tokio::test]
 async fn multi_driver_dueling_dns_views_keep_one_epoch_until_the_winner_lapses() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let first = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut left = cluster.node(1, first.clone());
@@ -885,7 +970,7 @@ async fn multi_driver_dueling_dns_views_keep_one_epoch_until_the_winner_lapses()
 
 #[tokio::test]
 async fn multi_driver_hands_off_a_settled_writer_after_a_lost_release_reply() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut first = cluster.node(1, faults.clone());
@@ -904,7 +989,7 @@ async fn multi_driver_hands_off_a_settled_writer_after_a_lost_release_reply() {
 
 #[tokio::test]
 async fn multi_driver_shutdown_releases_the_writer_and_closes_the_pipeline() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
@@ -928,7 +1013,7 @@ async fn multi_driver_shutdown_releases_the_writer_and_closes_the_pipeline() {
 
 #[tokio::test]
 async fn deployment_retirement_closes_admission_after_a_lost_reply() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut writer = cluster.node(1, faults.clone());
@@ -950,7 +1035,7 @@ async fn deployment_retirement_closes_admission_after_a_lost_reply() {
 
 #[tokio::test]
 async fn multi_driver_abandoned_seal_allows_one_replacement_after_its_grace_period() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let abandoned = journal.handle(NODE_1_IDENTITY);
     let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
@@ -977,7 +1062,7 @@ async fn multi_driver_abandoned_seal_allows_one_replacement_after_its_grace_peri
 
 #[tokio::test]
 async fn multi_driver_storage_reclaims_only_unreachable_epochs_and_keeps_old_branch_bases() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut first = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     let mut second = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
@@ -1052,7 +1137,7 @@ async fn multi_driver_storage_reclaims_only_unreachable_epochs_and_keeps_old_bra
 
 #[tokio::test]
 async fn multi_driver_fences_an_append_delayed_until_after_the_next_seal() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut first = cluster.node(1, faults.clone());
@@ -1103,7 +1188,7 @@ async fn multi_driver_fences_an_append_delayed_until_after_the_next_seal() {
 
 #[tokio::test]
 async fn multi_driver_never_retargets_a_recovery_cut_overtaken_by_trim() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     let mut reader = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
@@ -1127,7 +1212,7 @@ async fn multi_driver_never_retargets_a_recovery_cut_overtaken_by_trim() {
 
 #[tokio::test]
 async fn multi_driver_late_upload_cannot_reenter_reachability() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut first = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     let mut second = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
@@ -1274,7 +1359,7 @@ enum PipelineOutcome {
 }
 
 async fn exercise_pipeline(outcome: PipelineOutcome) {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let gate = Arc::new(GateJournal::new(faults.clone()));
@@ -1389,7 +1474,7 @@ async fn exercise_pipeline(outcome: PipelineOutcome) {
 async fn managed_workload_expired_while_waiting_for_the_original_acknowledgement() {
     use rtdb_tx::transact::workload::{Applied, Authority, Family, Fence, Holder, Operation, Placement, Point, Previous, Reply, Request};
 
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut writer = cluster.node(1, gate.clone());
@@ -1454,7 +1539,7 @@ async fn multi_driver_redecides_the_unsent_suffix_after_timed_refusal() {
 }
 
 async fn exercise_timed_suffix(refuse: bool) {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut writer = cluster.node(1, gate.clone());
@@ -1558,7 +1643,7 @@ impl JournalBatchAppender for RecordingBatch {
 
 #[tokio::test]
 async fn multi_driver_dispatches_the_decided_batch_in_one_journal_request() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let journal: Arc<dyn Journal> = Arc::new(journal.handle(NODE_1_IDENTITY));
     let batch = Arc::new(RecordingBatch {
@@ -1588,7 +1673,7 @@ async fn multi_driver_dispatches_the_decided_batch_in_one_journal_request() {
 
 #[tokio::test]
 async fn multi_driver_routes_the_same_idempotency_key_in_two_receipt_namespaces() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut database = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     database.create().await.unwrap();
@@ -1653,7 +1738,7 @@ async fn multi_driver_routes_the_same_idempotency_key_in_two_receipt_namespaces(
 
 #[tokio::test]
 async fn interrupted_erase_recovers_the_retirement_proof_and_atomic_floor() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut writer = cluster.node(1, faults.clone());
@@ -1690,7 +1775,7 @@ async fn interrupted_erase_recovers_the_retirement_proof_and_atomic_floor() {
 
 #[tokio::test]
 async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut writer = cluster.node(1, gate.clone());
@@ -1753,7 +1838,7 @@ async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
 
 #[tokio::test]
 async fn multi_driver_releases_a_fork_pin_after_independent_destination_publication() {
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     source.create().await.unwrap();
@@ -1818,7 +1903,7 @@ async fn multi_driver_releases_a_fork_pin_after_independent_destination_publicat
 async fn checked_workload_custody_retains_its_namespaced_receipt_across_checkpoint() {
     use rtdb_tx::transact::{CustodyPlacement, workload::{Applied, Authority, Family, Fence, Holder, Operation, Placement, Point, Previous, Reply, Request}};
 
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
@@ -1894,7 +1979,7 @@ async fn classic_candidate_status_recovers_a_lost_checkpoint_append_after_reopen
     use rtdb_index::branches::BranchCut;
     use rtdb_types::{EventPosition, Interval, TransactionKey, TxId};
 
-    let journal = MemoryJournal::default();
+    let journal = journals().await;
     let cluster = Cluster::new();
     let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut writer = cluster.node(1, faults.clone());
@@ -1937,4 +2022,47 @@ async fn classic_candidate_status_recovers_a_lost_checkpoint_append_after_reopen
     let view = index.view(MAIN_BRANCH, At::Exactly(first_cut.basis), Layer::Merged, first_cut.system_time).unwrap();
     assert_eq!(view.row(&table(), &id, Timestamp(44)).unwrap().valid, valid);
     assert!(view.row(&table(), &id, Timestamp(48)).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_driver_resumes_after_every_keeper_restarts() {
+    let mut journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    let (first_request, second_request) = (put(1, 1, "before restart"), put(2, 2, "second write"));
+    let first = writer.transact(&first_request).await.unwrap();
+    let second = writer.transact(&second_request).await.unwrap();
+
+    // Reads run at the test clock, so move it past both system times.
+    cluster.at(50);
+    // Every keeper stops, keeps its media, and starts again.
+    journal.restart_keepers().await;
+    drop(writer);
+
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(follower.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_eq!(follower.tx_status(&first_request.key).await.unwrap().basis, first.basis);
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 1).await, Some(Value::Utf8("before restart".into())));
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, Some(Value::Utf8("second write".into())));
+
+    // A reopened node waits for the earlier lease to lapse, then takes over
+    // at a later epoch.
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    let mut role = writer.tick(&live(1)).await.unwrap();
+    for now in [120, 130, 140, 150] {
+        if matches!(role, Role::Writer(_)) {
+            break;
+        }
+        cluster.at(now);
+        role = writer.tick(&live(1)).await.unwrap();
+    }
+    assert!(matches!(role, Role::Writer(epoch) if epoch > Epoch(1)), "{role:?}");
+    assert_eq!(writer.tx_status(&second_request.key).await.unwrap().basis, second.basis);
+    let third = writer.transact(&put(3, 3, "after restart")).await.unwrap();
+    assert!(third.basis.position() > second.basis.position());
+    cluster.at(160);
+    follower.fresh_index().await.unwrap();
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 3).await, Some(Value::Utf8("after restart".into())));
 }

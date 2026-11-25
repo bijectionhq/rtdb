@@ -23,6 +23,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 rtdb-logkeeper = { workspace = true, features = ["simulation"] }
+stream-logkeeper = { workspace = true, features = ["consensus-testing"] }
 tempfile.workspace = true
 
 [lints]
