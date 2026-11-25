@@ -145,6 +145,7 @@ message QueryTrailer {
   // Compare positions only within the same database incarnation and branch.
   optional uint64 applied_position = 8;
   // Present for observe_applied_position on an assigned Multi follower.
+  // On exact-scope pages only the assignment fields are present.
   FollowerProgress follower_progress = 9;
   RankedIvfResult ranked_ivf = 10;
 }

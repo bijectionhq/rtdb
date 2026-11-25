@@ -28,7 +28,7 @@ pub(crate) struct ExactRead {
     pub(super) basis: Basis,
     pub(super) time: Timestamp,
     pub(super) generation: u64,
-    pub(super) progress: (u64, proto::FollowerProgress),
+    pub(super) assignment: proto::FollowerProgress,
     track: bool,
     context: Arc<QueryContext>,
     deadline: Instant,
@@ -117,70 +117,71 @@ impl Service {
         let cancellation = self.0.cancellation.child_token();
         let guard = cancellation.clone().drop_guard();
         let basis = Basis::from_bytes(&basis.value).map_err(error::anomaly)?;
-        let (database, view, progress, generation, context) =
-            tokio::time::timeout_at(deadline, async {
-                let database = route.current(&self.0.node).map_err(error::follower)?;
-                let (view, progress) = route
-                    .reader
-                    .query(
-                        At::Exactly(basis),
-                        self.0.node.now(),
-                        true,
-                        &call.cancellation,
-                    )
-                    .await
-                    .map_err(error::follower)?;
-                if view.cut.basis != basis {
-                    return Err(expired());
-                }
-                let snapshot =
-                    rtdb_query::retain_catalog_snapshot(view.snapshot, database.storage())
-                        .await
-                        .map_err(error::anomaly)?;
-                let time = view.cut.system_time;
-                let captured = DatabaseSnapshot {
-                    partitions: vec![snapshot],
-                    storage: Arc::clone(database.storage()),
-                };
-                let name = call.database.clone();
-                let catalog = CatalogSnapshot::new(
-                    name.clone(),
-                    std::collections::BTreeMap::from([(name, captured)]),
+        let (database, cut, generation, context) = tokio::time::timeout_at(deadline, async {
+            let database = route.current(&self.0.node).map_err(error::follower)?;
+            let (view, _) = route
+                .reader
+                .query(
+                    At::Exactly(basis),
+                    self.0.node.now(),
                     false,
+                    &call.cancellation,
                 )
+                .await
+                .map_err(error::follower)?;
+            if view.cut.basis != basis {
+                return Err(expired());
+            }
+            let snapshot = rtdb_query::retain_catalog_snapshot(view.snapshot, database.storage())
+                .await
                 .map_err(error::anomaly)?;
-                let context = QueryContext::new(
-                    catalog,
-                    Arc::clone(call.memory()),
-                    time,
-                    "UTC",
-                    QueryOptions::default(),
-                    &cancellation,
-                )
-                .map_err(error::anomaly)?
-                .with_wire_cut(time, time.into())
+            let time = view.cut.system_time;
+            let captured = DatabaseSnapshot {
+                partitions: vec![snapshot],
+                storage: Arc::clone(database.storage()),
+            };
+            let name = call.database.clone();
+            let catalog = CatalogSnapshot::new(
+                name.clone(),
+                std::collections::BTreeMap::from([(name, captured)]),
+                false,
+            )
+            .map_err(error::anomaly)?;
+            let context = QueryContext::new(
+                catalog,
+                Arc::clone(call.memory()),
+                time,
+                "UTC",
+                QueryOptions::default(),
+                &cancellation,
+            )
+            .map_err(error::anomaly)?
+            .with_wire_cut(time, time.into())
+            .map_err(error::anomaly)?;
+            context
+                .retain_wire_scope(deadline.into_std())
+                .await
                 .map_err(error::anomaly)?;
-                context
-                    .retain_wire_scope(deadline.into_std())
-                    .await
-                    .map_err(error::anomaly)?;
-                self.check_attachment(call, &database)?;
-                let progress =
-                    super::query::follower_progress(route, progress).ok_or_else(expired)?;
-                let generation = view.key_generation.ok_or_else(expired)?;
-                Ok((database, view.cut, progress, generation, context))
-            })
-            .await
-            .map_err(|_| expired())??;
+            self.check_attachment(call, &database)?;
+            let generation = view.key_generation.ok_or_else(expired)?;
+            route
+                .reader
+                .check_retained_delivery(generation, &call.cancellation)
+                .await
+                .map_err(error::follower)?;
+            Ok((database, view.cut, generation, context))
+        })
+        .await
+        .map_err(|_| expired())??;
 
         let scope = Uuid::new_v4();
         let read = Arc::new(ExactRead {
             session: call.session.id.clone(),
             database,
             basis,
-            time: view.system_time,
+            time: cut.system_time,
             generation,
-            progress,
+            assignment: super::query::follower_assignment(route),
             track: request.track,
             context,
             deadline,

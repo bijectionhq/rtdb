@@ -39,18 +39,26 @@ use super::{
 };
 
 #[cfg(feature = "multi")]
-pub(super) fn follower_progress(route: &crate::follower::FollowerRoute, progress: Option<rtdb_node::MultiFollowerProgress>)
-    -> Option<(u64, proto::FollowerProgress)> {
-    progress.map(|progress| (progress.applied_position, proto::FollowerProgress {
+pub(super) fn follower_assignment(route: &crate::follower::FollowerRoute) -> proto::FollowerProgress {
+    proto::FollowerProgress {
         database: route.assignment.database.clone(),
         incarnation: route.assignment.incarnation.as_bytes().to_vec(),
         placement_epoch: route.assignment.placement_epoch,
         assignment: route.assignment.assignment.as_bytes().to_vec(),
         endpoint: route.endpoint.to_string(),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "multi")]
+fn follower_progress(route: &crate::follower::FollowerRoute, progress: Option<rtdb_node::MultiFollowerProgress>)
+    -> Option<(u64, proto::FollowerProgress)> {
+    progress.map(|progress| (progress.applied_position, proto::FollowerProgress {
         writer_head: Some(progress.writer_head.into()),
         writer_head_position: progress.writer_head_position,
         retained_from: Some(progress.retained_from.into()),
         retained_from_position: progress.retained_from.position(),
+        ..follower_assignment(route)
     }))
 }
 
@@ -542,7 +550,7 @@ impl Service {
             };
             let context = read.page_context(basis, request.track, &call.cancellation)?;
             let page = PageToken { basis, clock: read.time, offset, request: request_hash };
-            let progress = request.observe_applied_position.then(|| read.progress.clone());
+            let progress = request.observe_applied_position.then(|| (basis.position(), read.assignment.clone()));
             (context, page, read.time, None, BTreeSet::new(), Some(read.generation), None, None, progress)
         } else if let Some(driver) = driver {
             let now = self.0.node.now();
