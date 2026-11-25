@@ -138,6 +138,7 @@ config {
 -- Each output segment consists of a data file and a meta file.
 -- The meta file aligns page statistics to the trie's joined Arrow schema and retains their persisted branch order and Bloom bytes.
 -- Optional statistics fields and union legs follow their first appearance across leaves.
+-- An absent statistic occupies a null slot in the corresponding leaf's row range.
 --
 -- Writing the data file has two stages.
 -- Intermediate results use bounded disk spill or admitted Arrow batches between stages.

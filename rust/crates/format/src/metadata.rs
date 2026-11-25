@@ -2,10 +2,14 @@ use rtdb_types::StructFields;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, Int32Array, ListArray, NullArray, RecordBatch, StructArray,
-    TimestampMicrosecondArray, UnionArray,
+    Array, ArrayRef, BooleanArray, Int32Array, ListArray, NullArray, RecordBatch, StructArray,
+    TimestampMicrosecondArray, UnionArray, builder::BooleanBuilder,
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
+use arrow_data::{
+    ArrayData,
+    transform::{Capacities, MutableArrayData},
+};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Interval, LogicalType, Result, TimeUnit, Timestamp, Value};
@@ -452,7 +456,6 @@ impl MetadataFile {
         let mut recency_times = Vec::new();
         let mut recency_indices = Vec::new();
         let mut leaf_pages = Vec::new();
-        let mut leaf_ends = vec![0i32];
         let mut leaf_columns = Vec::new();
         for node in &self.nodes {
             let name = match node {
@@ -471,12 +474,7 @@ impl MetadataFile {
                 }
                 MetadataNode::Leaf { data_page_index, columns } => {
                     leaf_pages.push(i32::try_from(*data_page_index).map_err(invalid)?);
-                    let (_, leaf) = fields.iter().find(|(_, field)| field.name() == "leaf")
-                        .ok_or_else(|| invalid("Metadata schema has no leaf leg"))?;
-                    let page = leaf_statistics_array(leaf, columns)?;
-                    let rows = i64::from(*leaf_ends.last().expect("leaf offsets start at zero")) + i64::try_from(page.len()).map_err(invalid)?;
-                    leaf_ends.push(i32::try_from(rows).map_err(invalid)?);
-                    leaf_columns.push(page);
+                    leaf_columns.push(columns);
                     "leaf"
                 }
             };
@@ -487,7 +485,7 @@ impl MetadataFile {
         }
         let mut iid = Some(iid);
         let mut recency = Some((recency_ends, recency_times, recency_indices));
-        let mut leaves = Some((leaf_pages, leaf_ends, leaf_columns));
+        let mut leaves = Some((leaf_pages, leaf_columns));
         let children = fields.iter().zip(leg_lengths).map(|((_, field), len)| match field.name().as_str() {
             "nil" => Ok(Arc::new(NullArray::new(len)) as ArrayRef),
             "branch-iid" => {
@@ -504,14 +502,10 @@ impl MetadataFile {
                 build_list(field, ends, records)
             }
             "leaf" => {
-                let (pages, ends, columns) = leaves.take().unwrap();
+                let (pages, columns) = leaves.take().unwrap();
                 let DataType::Struct(children) = field.data_type() else { return Err(invalid("Metadata leaf is not a struct")); };
                 let columns_field = children.find("columns").ok_or_else(|| invalid("Missing metadata field: columns"))?.1;
-                let statistics = if columns.is_empty() { arrow_array::new_empty_array(list_item(columns_field)?.data_type()) } else {
-                    let arrays = columns.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-                    arrow_select::concat::concat(&arrays).map_err(invalid)?
-                };
-                build_struct(field, vec![Arc::new(Int32Array::from(pages)), build_list(columns_field, ends, statistics)?], None, len)
+                build_struct(field, vec![Arc::new(Int32Array::from(pages)), build_leaf_columns(columns_field, &columns)?], None, len)
             }
             _ => build_field_values(field, &[]),
         }).collect::<Result<Vec<_>>>()?;
@@ -640,14 +634,161 @@ fn build_struct(field: &Field, arrays: Vec<ArrayRef>, nulls: Option<NullBuffer>,
     Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), arrays, nulls, len).map_err(invalid)?))
 }
 
-fn leaf_statistics_array(leaf: &Field, columns: &LeafColumns) -> Result<ArrayRef> {
-    let DataType::Struct(fields) = leaf.data_type() else { return Err(invalid("Metadata leaf is not a struct")); };
-    let columns_field = fields.find("columns").ok_or_else(|| invalid("Missing metadata field: columns"))?.1;
-    let field = list_item(columns_field)?;
-    match columns.0.as_ref() {
-        LeafSource::Page(page) => align_statistics(field, page),
-        _ => build_field_values(field, &columns.values()?),
+fn build_leaf_columns(field: &Field, leaves: &[&LeafColumns]) -> Result<ArrayRef> {
+    let item = list_item(field)?;
+    if leaves.is_empty() {
+        return build_list(field, vec![0], arrow_array::new_empty_array(item.data_type()));
     }
+    if supports_direct_statistics(item.data_type()) {
+        let spans: Option<Vec<_>> = leaves.iter().map(|columns| match columns.0.as_ref() {
+            LeafSource::Page(page) => Some(StatisticsSpan::Present(page)),
+            _ => None,
+        }).collect();
+        if let Some(spans) = spans {
+            let mut ends = vec![0];
+            for span in &spans {
+                push_statistics_offset(&mut ends, span.len())?;
+            }
+            let values = assemble_statistics(item, &spans, indices_len(&ends))?;
+            return build_list(field, ends, values);
+        }
+    }
+    let mut ends = vec![0];
+    let arrays = leaves.iter().map(|columns| {
+        let array = match columns.0.as_ref() {
+            LeafSource::Page(page) => align_statistics(item, page),
+            _ => build_field_values(item, &columns.values()?),
+        }?;
+        push_statistics_offset(&mut ends, array.len())?;
+        Ok(array)
+    }).collect::<Result<Vec<_>>>()?;
+    let arrays = arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+    let values = arrow_select::concat::concat(&arrays).map_err(invalid)?;
+    build_list(field, ends, values)
+}
+
+fn push_statistics_offset(ends: &mut Vec<i32>, len: usize) -> Result<()> {
+    let end = ends.last().expect("Statistics offsets start at zero");
+    let next = end.checked_add(i32::try_from(len).map_err(invalid)?)
+        .ok_or_else(|| invalid("Metadata statistics row offset overflow"))?;
+    ends.push(next);
+    Ok(())
+}
+
+fn supports_direct_statistics(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Struct(fields) => fields.iter().all(|field| supports_direct_statistics(field.data_type())),
+        DataType::List(item) => item.data_type() == &DataType::Int32,
+        DataType::Boolean | DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Binary => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StatisticsSpan<'a> {
+    Present(&'a dyn Array),
+    Absent(usize),
+}
+
+impl StatisticsSpan<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Present(array) => array.len(),
+            Self::Absent(len) => len,
+        }
+    }
+}
+
+fn assemble_statistics(field: &Field, spans: &[StatisticsSpan<'_>], len: usize) -> Result<ArrayRef> {
+    if let [StatisticsSpan::Present(array)] = spans
+        && array.data_type() == field.data_type()
+    {
+        return Ok(array.slice(0, len));
+    }
+    if let DataType::Struct(fields) = field.data_type() {
+        let mut nulls = NullBufferBuilder::new(len);
+        let structs = spans.iter().map(|span| match *span {
+            StatisticsSpan::Present(array) => {
+                let source = array.as_any().downcast_ref::<StructArray>()
+                    .ok_or_else(|| invalid("Column metadata must be a struct"))?;
+                match source.nulls() {
+                    Some(validity) => nulls.append_buffer(validity),
+                    None => nulls.append_n_non_nulls(source.len()),
+                }
+                Ok(Some(source))
+            }
+            StatisticsSpan::Absent(0) => Ok(None),
+            StatisticsSpan::Absent(len) => {
+                nulls.append_n_nulls(len);
+                Ok(None)
+            }
+        }).collect::<Result<Vec<_>>>()?;
+        let mut children = Vec::with_capacity(fields.len());
+        let mut child_spans = Vec::with_capacity(spans.len());
+        for child in fields {
+            child_spans.extend(structs.iter().zip(spans).map(|(source, span)| {
+                source.and_then(|source| source.column_by_name(child.name()))
+                    .map_or(StatisticsSpan::Absent(span.len()), |array| StatisticsSpan::Present(array.as_ref()))
+            }));
+            children.push(assemble_statistics(child, &child_spans, len)?);
+            child_spans.clear();
+        }
+        return build_struct(field, children, nulls.finish(), len);
+    }
+    if field.data_type() == &DataType::Boolean {
+        let mut values = BooleanBuilder::with_capacity(len);
+        for span in spans {
+            match *span {
+                StatisticsSpan::Present(array) => {
+                    let array = array.as_any().downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| invalid("Column statistics layouts differ"))?;
+                    values.append_array(array);
+                }
+                StatisticsSpan::Absent(0) => {}
+                StatisticsSpan::Absent(len) => values.append_nulls(len),
+            }
+        }
+        return Ok(Arc::new(values.finish()));
+    }
+
+    let sources = spans.iter().filter_map(|span| match *span {
+        StatisticsSpan::Present(array) => Some(array),
+        StatisticsSpan::Absent(_) => None,
+    }).map(|array| {
+        if array.data_type() != field.data_type() { return Err(invalid("Column statistics layouts differ")); }
+        Ok(array.to_data())
+    }).collect::<Result<Vec<_>>>()?;
+    if sources.is_empty() {
+        return Ok(arrow_array::new_null_array(field.data_type(), len));
+    }
+    let capacity = statistics_capacity(field.data_type(), &sources, len)?;
+    let has_absences = spans.iter().any(|span| matches!(span, StatisticsSpan::Absent(len) if *len != 0));
+    let mut output = MutableArrayData::with_capacities(sources.iter().collect(), has_absences, capacity);
+    let mut index = 0;
+    for span in spans {
+        match *span {
+            StatisticsSpan::Present(array) => {
+                output.extend(index, 0, array.len());
+                index += 1;
+            }
+            StatisticsSpan::Absent(0) => {}
+            StatisticsSpan::Absent(len) => output.extend_nulls(len),
+        }
+    }
+    Ok(arrow_array::make_array(output.freeze()))
+}
+
+fn statistics_capacity(data_type: &DataType, sources: &[ArrayData], len: usize) -> Result<Capacities> {
+    let extent = || sources.iter().try_fold(0i32, |total, source| {
+        let offsets = source.buffer::<i32>(0);
+        total.checked_add(offsets[source.len()] - offsets[0])
+            .ok_or_else(|| invalid("Metadata statistics child offset overflow"))
+    }).map(|size| size as usize);
+    Ok(match data_type {
+        DataType::Utf8 | DataType::Binary => Capacities::Binary(len, Some(extent()?)),
+        DataType::List(_) => Capacities::List(len, Some(Box::new(Capacities::Array(extent()?)))),
+        _ => Capacities::Array(len),
+    })
 }
 
 fn align_statistics(target: &Field, array: &dyn Array) -> Result<ArrayRef> {
@@ -815,10 +956,22 @@ mod metadata_wave_tests {
             for blooms in [false, true] {
                 let mut file = MetadataBuilder::new(recency, blooms);
                 file.write_nil().unwrap();
-                for (index, value) in [Value::F64(-0.0), Value::Utf8("s".repeat(2000)), Value::F64(f64::INFINITY), Value::Bool(true)].into_iter().enumerate() {
+                let values = [
+                    Value::F64(-0.0),
+                    Value::Utf8("s".repeat(2000)),
+                    Value::F64(f64::INFINITY),
+                    Value::Bool(true),
+                    Value::F64(-0.0),
+                ];
+                for (index, value) in values.into_iter().enumerate() {
+                    let value = if index == 3 {
+                        value
+                    } else {
+                        Value::Struct(StructFields::from([("n".into(), value)]))
+                    };
                     let row = StructFields::from([
                         ("a".to_owned(), Value::list(vec![Value::I32(9)])),
-                        ("b".to_owned(), Value::Struct(StructFields::from([("n".into(), value)]))),
+                        ("b".to_owned(), value),
                         ("c".to_owned(), Value::F64(f64::from_bits(0x7ff8_0000_0000_0013))),
                         ("d".to_owned(), Value::Null),
                     ]);
@@ -835,7 +988,8 @@ mod metadata_wave_tests {
                     assert!(matches!(columns.0.as_ref(), LeafSource::Page(_)));
                     assert_eq!(columns.statistics().unwrap().root_column("a").unwrap().count(), Some(1));
                 }
-                let branch = file.write_iid_branch([Some(1), Some(2), Some(3), Some(4)]).unwrap();
+                let first = file.write_iid_branch([Some(1), Some(2), Some(3), Some(4)]).unwrap();
+                let branch = file.write_iid_branch([Some(first), None, Some(5), None]).unwrap();
                 if recency { file.write_recency_branch(vec![(Timestamp(100), branch), (Timestamp::MAX, 0)]).unwrap(); }
                 let (file, _) = file.finish().unwrap();
                 let old_nodes = file.nodes.iter().map(|node| match node {
@@ -843,11 +997,16 @@ mod metadata_wave_tests {
                         data_page_index: *data_page_index, columns: LeafColumns::new(columns.values().unwrap().into_owned()),
                     },
                     node => node.clone(),
-                }).collect();
-                let legacy = MetadataFile::from_nodes(old_nodes, recency).unwrap();
+                }).collect::<Vec<_>>();
+                let legacy = MetadataFile::from_nodes(old_nodes.clone(), recency).unwrap();
                 assert_eq!(file.schema(), legacy.schema());
                 let bytes = file.write().unwrap();
                 assert_eq!(bytes, legacy.write_imported().unwrap());
+                let mut mixed = old_nodes;
+                mixed[1] = file.nodes[1].clone();
+                mixed[5] = file.nodes[5].clone();
+                let mixed = MetadataFile::from_nodes(mixed, recency).unwrap();
+                assert_eq!(mixed.write().unwrap(), bytes);
                 let loaded = MetadataFile::read(bytes.into()).unwrap();
                 assert_eq!(loaded.leaves(), file.leaves());
                 let MetadataNode::Leaf { columns, .. } = &loaded.nodes[2] else { panic!("expected leaf") };
@@ -859,6 +1018,59 @@ mod metadata_wave_tests {
             }
         }
 
+    }
+
+    #[test]
+    fn metadata_statistics_assembly_preserves_sliced_masks_and_nested_bound_bytes() {
+        use arrow_array::Float64Array;
+
+        let min = Field::new("min", DataType::Float64, false);
+        let max = Field::new("max", DataType::Float64, false);
+        let wide = StructArray::try_new(
+            vec![min.clone(), max.clone()].into(),
+            vec![
+                Arc::new(Float64Array::from(vec![5.0, f64::from_bits(0x7ff8_0000_0000_0013), -0.0])),
+                Arc::new(Float64Array::from(vec![9.0, 7.0, f64::INFINITY])),
+            ],
+            Some(NullBuffer::from(vec![true, false, true])),
+        ).unwrap();
+        let narrow = StructArray::try_new(
+            vec![max.clone()].into(),
+            vec![Arc::new(Float64Array::from(vec![f64::NEG_INFINITY]))],
+            None,
+        ).unwrap();
+        let page = |bounds: StructArray| {
+            let fields = vec![Field::new("numbers", bounds.data_type().clone(), true)].into();
+            StructArray::try_new(fields, vec![Arc::new(bounds)], None).unwrap()
+        };
+        let first = page(wide).slice(1, 2);
+        let empty = first.slice(0, 0);
+        let absent = StructArray::new_empty_fields(2, None);
+        let last = page(narrow);
+        let bounds = DataType::Struct(vec![min.with_nullable(true), max].into());
+        let field = Field::new("statistics", DataType::Struct(vec![Field::new("numbers", bounds, true)].into()), false);
+        let sources = [&first, &empty, &absent, &last];
+        let aligned = sources.iter().map(|&array| align_statistics(&field, array).unwrap()).collect::<Vec<_>>();
+        let aligned = aligned.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+        let spans = sources.into_iter().map(|array| StatisticsSpan::Present(array)).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let encode = |array: ArrayRef| {
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            crate::ipc::write_file(&schema, &[batch]).unwrap()
+        };
+
+        let actual = assemble_statistics(&field, &spans, 5).unwrap();
+        let expected = arrow_select::concat::concat(&aligned).unwrap();
+        assert_eq!(encode(actual), encode(expected));
+    }
+
+    #[test]
+    fn metadata_statistics_offsets_reject_overflow() {
+        let mut ends = vec![0];
+        push_statistics_offset(&mut ends, i32::MAX as usize).unwrap();
+        push_statistics_offset(&mut ends, 0).unwrap();
+        assert!(push_statistics_offset(&mut ends, 1).is_err());
+        assert_eq!(ends, [0, i32::MAX, i32::MAX]);
     }
 
     #[test]
