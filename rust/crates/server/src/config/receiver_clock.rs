@@ -1,4 +1,10 @@
-use std::{fs::File, io::Read, num::NonZeroU64, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    io::{self, Read},
+    num::NonZeroU64,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use rtdb_crypt::receiver_clock::{ReceiverCertificateBinding, VerifiedReceiverCertificate};
 use rtdb_format::config::{Yaml, YamlFields};
@@ -9,6 +15,9 @@ use uuid::Uuid;
 
 use super::NodeConfiguration;
 
+mod transport;
+use transport::Transport;
+
 const MAX_INSTALLATION_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone)]
@@ -17,6 +26,7 @@ pub(crate) struct Installation {
     domain: Uuid,
     placement_epoch: NonZeroU64,
     purpose: String,
+    transport: Option<Transport>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +55,10 @@ impl Installation {
             .parse()
             .map_err(|_| invalid())?;
         let purpose = fields.required_string("purpose")?;
+        let transport = fields
+            .take("transport")
+            .map(Transport::decode)
+            .transpose()?;
         fields.finish()?;
         if !file.is_absolute() || domain.is_nil() || purpose.is_empty() {
             return Err(invalid());
@@ -54,17 +68,25 @@ impl Installation {
             domain,
             placement_epoch,
             purpose,
+            transport,
         })
     }
 
-    fn verify(&self) -> Result<VerifiedReceiverCertificate> {
+    fn read_site(&self) -> Result<Option<SiteBinding>> {
+        match fs::metadata(&self.file) {
+            Ok(metadata) if metadata.is_file() => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            _ => return Err(invalid()),
+        }
         let mut bytes = Vec::new();
-        File::open(&self.file)
-            .and_then(|file| {
-                file.take(MAX_INSTALLATION_BYTES + 1)
-                    .read_to_end(&mut bytes)
-            })
-            .map_err(|_| invalid())?;
+        match fs::File::open(&self.file) {
+            Ok(file) => file
+                .take(MAX_INSTALLATION_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid())?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(invalid()),
+        };
         if bytes.len() as u64 > MAX_INSTALLATION_BYTES {
             return Err(invalid());
         }
@@ -72,11 +94,14 @@ impl Installation {
         if site.placement_epoch != self.placement_epoch {
             return Err(invalid());
         }
-        let issuer = issuer_key(&site.issuer).ok_or_else(invalid)?;
+        Ok(Some(site))
+    }
+
+    fn verify(&self, site: &SiteBinding, issuer: &[u8; 32]) -> Result<VerifiedReceiverCertificate> {
         VerifiedReceiverCertificate::verify(
             site.certificate.as_bytes(),
             ReceiverCertificateBinding {
-                issuer: &issuer,
+                issuer,
                 purpose: &self.purpose,
                 deployment: site.deployment,
                 source: site.source,
@@ -95,16 +120,46 @@ impl NodeConfiguration {
         receiver: Arc<dyn DecisionClock>,
     ) -> Result<(Self, Arc<CertifiedDecisionClock>)> {
         let installation = self.funded_receiver_clock.take().ok_or_else(invalid)?;
+        let site = installation.read_site()?.ok_or_else(invalid)?;
+        let issuer = nonzero_hex(&site.issuer).ok_or_else(invalid)?;
         let clock = CertifiedDecisionClock::new(
             receiver,
-            installation.verify()?,
+            installation.verify(&site, &issuer)?,
             *installation.domain.as_bytes(),
         )?;
         Ok((self, Arc::new(clock)))
     }
+
+    pub(crate) fn take_native_receiver_clock(
+        &mut self,
+        enabled: bool,
+    ) -> Result<Option<Arc<CertifiedDecisionClock>>> {
+        let Some(installation) = self.funded_receiver_clock.take() else {
+            return Ok(None);
+        };
+        let Some(transport) = installation.transport.as_ref() else {
+            return Ok(None);
+        };
+        if !enabled || self.read_only_databases || !cfg!(unix) {
+            return Ok(None);
+        }
+        let Some(site) = installation.read_site()? else {
+            return Ok(None);
+        };
+        let issuer = nonzero_hex(&site.issuer).ok_or_else(invalid)?;
+        let certificate = installation.verify(&site, &issuer)?;
+        let domain = *installation.domain.as_bytes();
+        let receiver =
+            transport.bind(&installation.purpose, domain, &site, &issuer, &certificate)?;
+        Ok(Some(Arc::new(CertifiedDecisionClock::new(
+            Arc::new(receiver),
+            certificate,
+            domain,
+        )?)))
+    }
 }
 
-fn issuer_key(hex: &str) -> Option<[u8; 32]> {
+fn nonzero_hex(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return None;
     }

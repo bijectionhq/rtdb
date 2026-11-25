@@ -378,7 +378,7 @@ require distinct attestation keys. Retain the keys for original proofs while
 the corresponding journal records are retained. A trust profile with no
 payload limit can verify retained records and provides no timed append capacity.
 
-Use the matching keeper's commissioned original-clock authority and mount the independently durable receiver on the same attachment using the [native receiver installation](rtdb-native-runtime.adoc#funded-decision-clock-receiver).
+Use the matching keeper's commissioned original-clock authority and configure the independent receiver on the same attachment using the [native receiver installation](rtdb-native-runtime.adoc#funded-decision-clock-receiver).
 The keeper trust file and the receiver installation are supplied independently.
 Confirm the original keeper signers cover the certificate's guarded journal clock scale and the configured payload limit.
 The RTDB adapter checks the original stream, epoch, LSN, sealed-payload digest, exclusive cutoff and certificate digest in the returned proof before the fold applies effects.
@@ -388,6 +388,8 @@ Qualify the exact installed route with the following cases.
 - Check that `transact.decision-clock-offer` appears for the matching authenticated, writable attachment with a live receiver and commissioned timed journal.
 - Remove the receiver, expire its certificate, change the domain or original source, and repeat with proof-only keeper trust, Multi FileJournal, and ordinary Default Local and Kafka profiles.
   Confirm the funded feature is absent in each case and literal `Window` remains available on the ordinary write routes.
+- Replay an earlier challenge reply, stall an exchange, and regress the receiver's durable lineage after authority replacement.
+  Confirm the capability closes until a fresh, signed observation advances the installed lineage.
 - Rebook after offer-reply loss using the same key, transaction and predecessor.
   Recover the original terminal and its offer with the same consume request and keyed `TxStatus` after terminal-reply loss, writer takeover, and checkpoint recovery.
 - Try a changed owner, key, request body, predecessor, receiver lineage and certificate digest.

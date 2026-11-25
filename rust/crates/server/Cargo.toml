@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:ring", "dep:tonic"]
+multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:tonic"]
 kafka = ["rtdb-node/kafka", "dep:rtdb-kafka", "rtdb-metrics/kafka"]
 kafka-connect = ["kafka", "rtdb-node/kafka-connect"]
 s3 = ["rtdb-node/s3", "dep:rtdb-s3"]
@@ -37,7 +37,7 @@ rtdb-db = { path = "../db", optional = true }
 rtdb-stream-journal = { package = "rtdb-journal-logkeeper", path = "../journal-logkeeper", optional = true }
 tempfile.workspace = true
 sha2 = { workspace = true, optional = true }
-ring = { version = "0.17", optional = true }
+ring = "0.17"
 rtdb-tx.workspace = true
 rtdb-query.workspace = true
 rtdb-auth.workspace = true

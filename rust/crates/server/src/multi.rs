@@ -111,6 +111,11 @@ pub struct MultiRuntime {
 }
 
 impl MultiRuntime {
+    pub(crate) fn timed_original_writes_configured(&self) -> bool {
+        self.backends.batch.as_ref()
+            .and_then(|batch| batch.maximum_timed_original_bytes()).is_some()
+    }
+
     /// Binds an existing local replica to a private listener for the lifetime of one cell assignment.
     /// The cell supplies an assignment-specific authenticator and TLS identity and owns listener shutdown.
     pub async fn bind_native_follower(

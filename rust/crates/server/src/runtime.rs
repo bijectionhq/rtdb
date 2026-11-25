@@ -116,6 +116,17 @@ impl ServerDriver {
         Self::open_installed_with_clock(config, limit, resources, tls.map(Arc::new), Some(clock)).await
     }
 
+    /// Supplies the configured receiver to the installed Default runtime.
+    /// Funded offers require `defaultV1Serving` and original-quorum proof on the attached replica log.
+    pub async fn open_with_installed_receiver_clock(
+        mut config: NodeConfiguration, limit: usize, resources: NativeResources,
+        tls: Option<tokio_rustls::rustls::ServerConfig>,
+    ) -> Result<(ServerHandle, Self)> {
+        let enabled = config.default_v1_serving;
+        let clock = config.take_native_receiver_clock(enabled)?;
+        Self::open_installed_with_clock(config, limit, resources, tls.map(Arc::new), clock).await
+    }
+
     /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
     /// Its holders claim as soon as they reach the tip and append nothing while idle.
     pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
@@ -145,12 +156,13 @@ impl ServerDriver {
 
     #[cfg(feature = "multi")]
     pub async fn open_with_multi(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime) -> Result<(ServerHandle, Self)> {
-        Self::open_with_multi_tls(config, limit, memory, multi, None).await
+        Self::open_with_multi_clock(config, limit, memory, multi, None, None).await
     }
 
     #[cfg(feature = "multi")]
-    pub async fn open_with_multi_tls(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime, tls: Option<tokio_rustls::rustls::ServerConfig>) -> Result<(ServerHandle, Self)> {
-        Self::open_with_multi_clock(config, limit, memory, multi, tls, None).await
+    pub async fn open_with_multi_tls(mut config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime, tls: Option<tokio_rustls::rustls::ServerConfig>) -> Result<(ServerHandle, Self)> {
+        let clock = config.take_native_receiver_clock(multi.timed_original_writes_configured())?;
+        Self::open_with_multi_clock(config, limit, memory, multi, tls, clock).await
     }
 
     #[cfg(feature = "multi")]

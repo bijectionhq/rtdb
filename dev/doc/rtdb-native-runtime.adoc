@@ -39,8 +39,7 @@ Native buffer owners survive statement closure until the foreign consumer releas
 [[funded-decision-clock-receiver]]
 == Funded DecisionClock receiver
 
-An installed native host can pair the existing signed site receiver certificate with an independently authenticated, durable `DecisionClock`.
-The native setting is optional.
+The optional native profile pairs the signed site receiver certificate with a private receiver authority.
 
 [source,yaml]
 ----
@@ -49,12 +48,18 @@ fundedReceiverClock:
   domain: 12345678-1234-4234-8234-123456789abc
   placementEpoch: 7
   purpose: bijection.rtdb.durable-acceptance-clock.v4
+  transport:
+    socket: /run/rtdb-receiver/clock.sock
+    verificationKey: "<64 hex digits for the receiver authority's Ed25519 public key>"
+    evidenceSha256: "<64 hex digits matching the certificate's evidenceSha256>"
+    timeoutMillis: 100
 ----
 
 The EDN spelling is `:funded-receiver-clock` with `:installation-file`, `:domain`, `:placement-epoch` and `:purpose`.
+It accepts `:transport` with `:socket`, `:verification-key`, `:evidence-sha256` and `:timeout-millis`.
 Use the commissioned receiver's nonzero domain UUID and the site's original nonzero placement epoch.
 The site placement epoch is independent of the receiver publisher epoch and the journal writer epoch.
-Set `purpose` to the exact purpose commissioned for the certificate.
+Use the v4 purpose shown above for the stock transport.
 
 `installationFile` is an absolute path to an operator-controlled JSON object of at most 16 KiB, with the existing site fields `deployment`, `source`, `placement_epoch`, `certificate`, `issuer`, `image`, `cell` and `service_scope`.
 Its `deployment` and `source` are UUIDs and `source` is the exact original RTDB incarnation.
@@ -63,17 +68,40 @@ Keep those values and the placement epoch under the host's deployment authority.
 Its `certificate` string holds the original signed JSON envelope of at most 4 KiB.
 Pass through the envelope bytes exactly so its digest agrees with the original keeper evidence.
 The verifier checks the signature and the exact purpose, deployment, source, cell, image and service scope against these installed settings.
+The envelope has exactly `statement` and `signature` string fields.
+The independent issuer signs the UTF-8 bytes of the decoded `statement` string, and the certificate identity hashes the original envelope bytes.
+Use lowercase hex for the certificate signature, evidence digest and service scope, as required by the keeper verifier.
 
-The host calls `NodeConfiguration::certify_receiver_clock` with its commissioned `Arc<dyn DecisionClock>` and passes the returned configuration and clock to `ServerDriver::open_with_multi_certified_clock`, or `ServerDriver::open_with_certified_clock` with the installed Default resources.
-The receiver must provide fresh, authenticated microsecond observations from the configured durable domain, with epoch, sequence and time lineage that survives publisher and writer replacement.
-The receiver and journal must satisfy the clock scale and timing margins commissioned by the same certificate.
-The existing directory-backed publisher uses a process wall-time anchor and is outside this commissioning contract.
-Native launchers still need a host integration that provisions the commissioned receiver and invokes the certified opener.
-A launcher handed an unresolved `fundedReceiverClock` setting rejects startup.
+Use an absolute, operator-controlled Unix socket path whose socket grants no permissions to other users.
+The receiver authority holds the signing key independently of the certificate issuer, keeper proof signers and TLS credentials.
+The timeout of 1 through 1000 milliseconds covers the entire observation, including admission, socket I/O and verification.
+Each observation uses a new challenge and returns an unavailable error on exchange failure.
+The launcher reads the certificate and trust pins at open, so replacing them requires reopening the node.
 
-Only an authenticated, writable attachment with the matching source, live receiver and a timed-original provider can advertise `transact.decision-clock-offer`.
-Default requires `defaultV1Serving` and a mounted provider such as the guarded `QuorumLog` that supplies recoverable original-quorum evidence on the same replica path.
-Ordinary Default Local and Kafka and native Multi FileJournal keep funded offers gated.
+The wire is one exchange per Unix stream connection.
+The request concatenates ASCII `rtdb/native/receiver-clock/v1` and NUL, ASCII `bijection.rtdb.durable-acceptance-clock.v4` and NUL, the 16-byte source UUID, the 16-byte receiver domain UUID, the 32-byte envelope digest, the 32-byte signed evidence digest and a fresh 32-byte nonce.
+UUIDs use standard byte order and digests use raw bytes.
+The receiver checks the commissioned binding and samples after receiving the complete request.
+It returns four big-endian unsigned 64-bit integers containing the publisher epoch, sequence, sampled Unix nanoseconds and conservative current error in nanoseconds.
+It appends the 64-byte Ed25519 signature over the complete request followed by those four integers, then closes its write side.
+It withholds a reply whenever it cannot attest the exact binding, current error or durable lineage.
+
+The authority durably advances the sequence before signing, starting with a positive epoch and sequence at least equal to that epoch.
+The epoch and conservative sample upper bound are nondecreasing, and the sequence strictly increases across samples, restarts and authority replacement within the same domain.
+RTDB verifies that lineage across its successful observations and relies on the authority to maintain it across RTDB restarts.
+RTDB rounds the signed sample plus error upward to microseconds in the commissioned scale.
+The error must be positive and within the signed certificate limit.
+Certificate expiry must follow the conservative upper bound plus the elapsed exchange time.
+The keeper's separate post-fsync exchange supplies the original-quorum proof.
+
+The stock Multi launcher selects the configured transport when its StreamJournal has a timed-original writer limit in `RTDB_TIMED_ORIGINAL_TRUST_FILE`.
+For Default, use `ServerDriver::open_with_installed_receiver_clock` with `defaultV1Serving: true` and the installed resources, including a provider such as guarded `QuorumLog` that supplies recoverable original-quorum evidence on the same replica path.
+The existing certified openers also accept a host-supplied receiver through `NodeConfiguration::certify_receiver_clock`.
+Only an authenticated writable attachment with the matching source, live receiver and timed-original provider advertises `transact.decision-clock-offer`.
+Missing mounts, stale exchanges and unsupported journals keep the capability closed.
+An invalid installed certificate or mismatched trust pin rejects the selected profile at open.
+Ordinary Default Local and Kafka and native Multi FileJournal remain outside the funded profile.
+CUT and the receiver owner supply the commissioned receiver service and the separate qualified keeper mounts before activation.
 See link:rtdb-multi-local-qualification.md[the local qualification checklist] for the paired StreamJournal and receiver cases.
 
 == Expression equality
