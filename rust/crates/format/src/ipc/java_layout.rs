@@ -47,9 +47,20 @@ impl<W: Write> Write for Output<'_, W> {
 enum State { Prefix, Metadata { length: usize, continuation: bool }, Body { remaining: usize }, Planned(BodyPlan), Ended }
 
 /// Where each of a batch body's buffers comes from in the arrow-rs body and how it is written.
-struct BodyPlan { segments: Vec<Segment>, index: usize, position: usize, length: usize }
+struct BodyPlan {
+    segments: Vec<Segment>,
+    index: usize,
+    position: usize,
+    length: usize,
+    output_length: i64,
+}
 struct Segment { start: usize, length: usize, emit: Emit, padding: usize }
-enum Emit { Copy, Drop, Fill(Vec<u8>) }
+
+enum Emit {
+    Copy,
+    Drop,
+    AllValid { length: usize, last_byte: u8 },
+}
 
 impl<W> JavaLayout<W> {
     fn new(inner: W, footer: Option<FileFooter>) -> Self {
@@ -117,7 +128,7 @@ impl<W: Write> Write for JavaLayout<W> {
                             MessageHeader::Schema => footer.schema = Some(encoded),
                             MessageHeader::RecordBatch => {
                                 let framed = footer.position - offset;
-                                let body = rewritten.plan.as_ref().map_or(rewritten.body as i64, BodyPlan::output_length);
+                                let body = rewritten.plan.as_ref().map_or(rewritten.body as i64, |plan| plan.output_length);
                                 footer.blocks.push(arrow_ipc::Block::new(offset as i64, framed as i32, body));
                             }
                             _ => {}
@@ -156,8 +167,7 @@ fn rewrite(layouts: &mut Option<Vec<FieldLayout>>, metadata: &[u8]) -> Result<Re
             let batch = message.header_as_record_batch().ok_or("Arrow batch message has no batch")?;
             match layouts.as_deref().and_then(|layouts| BodyPlan::new(&batch, layouts, body)) {
                 Some((plan, nodes, buffers)) => {
-                    let length = plan.output_length();
-                    (Some(record_batch_message(message.version().0, length, &batch, &nodes, &buffers)), Some(plan))
+                    (Some(record_batch_message(message.version().0, plan.output_length, &batch, &nodes, &buffers)), Some(plan))
                 }
                 None => (None, None),
             }
@@ -184,22 +194,30 @@ impl BodyPlan {
                 let (start, input_length) = (usize::try_from(buffer.offset()).ok()?, usize::try_from(buffer.length()).ok()?);
                 if start.checked_add(input_length)? > length { return None; }
                 let emit = if layout.validity && index == 0 {
-                    if !layout.nullable { Emit::Drop }
-                    else if input_length == 0 && node.length() > 0 { Emit::Fill(all_valid(usize::try_from(node.length()).ok()?)) }
-                    else { Emit::Copy }
+                    if !layout.nullable {
+                        Emit::Drop
+                    } else if input_length == 0 && node.length() > 0 {
+                        let rows = usize::try_from(node.length()).ok()?;
+                        let remainder = rows % 8;
+                        let last_byte = if remainder == 0 { 0xff } else { (1u8 << remainder) - 1 };
+                        Emit::AllValid { length: rows.div_ceil(8), last_byte }
+                    } else {
+                        Emit::Copy
+                    }
                 } else if layout.offsets && index == 1 && node.length() == 0 { Emit::Drop } else { Emit::Copy };
-                let written = match &emit { Emit::Copy => input_length, Emit::Drop => 0, Emit::Fill(bytes) => bytes.len() };
+                let written = match emit {
+                    Emit::Copy => input_length,
+                    Emit::Drop => 0,
+                    Emit::AllValid { length, .. } => length,
+                };
                 let padding = (8 - written % 8) % 8;
                 buffers.push(arrow_ipc::Buffer::new(output, i64::try_from(written).ok()?));
-                output = output.checked_add(i64::try_from(written + padding).ok()?)?;
+                output = output.checked_add(i64::try_from(written.checked_add(padding)?).ok()?)?;
                 segments.push(Segment { start, length: input_length, emit, padding });
             }
         }
         if segments.windows(2).any(|pair| pair[1].start < pair[0].start + pair[0].length) { return None; }
-        Some((Self { segments, index: 0, position: 0, length }, nodes, buffers))
-    }
-    fn output_length(&self) -> i64 {
-        self.segments.iter().map(|segment| (match &segment.emit { Emit::Copy => segment.length, Emit::Drop => 0, Emit::Fill(bytes) => bytes.len() } + segment.padding) as i64).sum()
+        Some((Self { segments, index: 0, position: 0, length, output_length: output }, nodes, buffers))
     }
     /// Consumes input body bytes, emitting each planned buffer once its source range has passed.
     fn write(&mut self, mut bytes: &[u8], out: &mut impl Write) -> io::Result<usize> {
@@ -218,7 +236,9 @@ impl BodyPlan {
                 self.position += count; bytes = &bytes[count..];
                 if self.position < end { break; }
             }
-            if let Emit::Fill(bitmap) = &segment.emit { out.write_all(bitmap)?; }
+            if let Emit::AllValid { length, last_byte } = segment.emit {
+                write_all_valid(out, length, last_byte)?;
+            }
             out.write_all(&[0; 8][..segment.padding])?;
             self.index += 1;
         }
@@ -231,10 +251,19 @@ impl BodyPlan {
     }
 }
 
-fn all_valid(rows: usize) -> Vec<u8> {
-    let mut bitmap = vec![0xff; rows.div_ceil(8)];
-    if rows % 8 != 0 { if let Some(last) = bitmap.last_mut() { *last = (1u8 << (rows % 8)) - 1; } }
-    bitmap
+fn write_all_valid(out: &mut impl Write, length: usize, last_byte: u8) -> io::Result<()> {
+    static FULL_BYTES: [u8; 4096] = [0xff; 4096];
+    let masked = last_byte != 0xff;
+    let mut remaining = if masked { length - 1 } else { length };
+    while remaining > 0 {
+        let count = remaining.min(FULL_BYTES.len());
+        out.write_all(&FULL_BYTES[..count])?;
+        remaining -= count;
+    }
+    if masked {
+        out.write_all(&[last_byte])?;
+    }
+    Ok(())
 }
 
 /// `MessageSerializer.writeMessageBuffer`: the length is padded so the prefix and metadata end on an 8-byte boundary.
