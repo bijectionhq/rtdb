@@ -329,6 +329,7 @@ impl RecoveryService {
                     return Err(conflict());
                 }
                 let provider_terminal = match provider {
+                    classic_provider::Population::OrdinaryFreshFlight {} => return Ok(Reply::Deferred),
                     classic_provider::Population::LocalCatalog | classic_provider::Population::HostedCatalog => {
                         let (cohort, drained_at) = catalog_drain.ok_or_else(conflict)?;
                         if source.version < drained_at || drained_at <= cohort.fenced_at
@@ -574,6 +575,7 @@ fn conflict() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use rtdb_directory::{
         CellMedia, Checkpoint, CheckpointStage, CheckpointStageIntent, CheckpointTransferBootstrap,
         CheckpointTransferFence, ClassicMigration, ClassicMigrationSource,
@@ -586,6 +588,7 @@ mod tests {
         let authority = source.id.parse().unwrap();
         let attempt = Uuid::new_v4();
         let capture = Uuid::new_v4();
+        let staged_manifest = URL_SAFE_NO_PAD.encode([7; 32]);
         source.lifecycle = Lifecycle::Restoring;
         source.epoch = 9;
         source.log_epoch = 2;
@@ -623,7 +626,7 @@ mod tests {
                 keys: "keys".into(),
             },
             transfer_only: true,
-            staged_manifest_sha256: Some("verified-stage".into()),
+            staged_manifest_sha256: Some(staged_manifest.clone()),
         };
         let fence = CheckpointTransferFence {
             destination: stage.clone(),
@@ -644,20 +647,37 @@ mod tests {
             lifetime_floors_sha256: [3; 32],
         };
         source.checkpoint_transfer_fence = Some(Box::new(fence.clone()));
-        source.checkpoint_transfer_terminal = Some(Box::new(terminal.clone()));
         let mut scratch =
             crate::admin::installation_record(attempt, &scratch_name(attempt), "cell").unwrap();
         scratch.lifecycle = Lifecycle::Restoring;
         scratch.checkpoint_stage = Some(Box::new(stage));
         scratch.checkpoint_transfer_fence = Some(Box::new(fence));
+        let observe_flight_fence = |source: &DeploymentRecord, scratch: &DeploymentRecord| {
+            let fence = classic_provider::observe_ordinary_flight_fence(source, &terminal.fence.destination.intent)
+                .unwrap().unwrap();
+            archive::encode(&classic_provider::ordinary_flight_fence_reply(scratch, fence).unwrap()).unwrap()
+        };
+        let before_seal = observe_flight_fence(&source, &scratch);
+        source.checkpoint_transfer_terminal = Some(Box::new(terminal.clone()));
         scratch.checkpoint_transfer_bootstrap = Some(Box::new(CheckpointTransferBootstrap {
             terminal: terminal.clone(),
             ciphertext_sha256: [4; 32],
         }));
+        assert_eq!(before_seal, observe_flight_fence(&source, &scratch));
+        let mut foreign = terminal.fence.destination.intent.clone();
+        foreign.capture = Uuid::new_v4();
+        assert!(classic_provider::observe_ordinary_flight_fence(&source, &foreign).is_err());
+        assert!(matches!(
+            serde_json::from_str::<classic_provider::Population>(r#"{"population":"ordinary_fresh_flight"}"#),
+            Ok(classic_provider::Population::OrdinaryFreshFlight {})
+        ));
+        assert!(serde_json::from_str::<classic_provider::Population>(
+            r#"{"population":"ordinary_fresh_flight","readers":[]}"#,
+        ).is_err());
         let selection = Selection {
             destination: authority,
             stage_operation: attempt,
-            staged_manifest_sha256: "verified-stage".into(),
+            staged_manifest_sha256: staged_manifest,
             ciphertext_sha256: [4; 32],
             command_id: [5; 16],
             command_digest: [6; 32],
@@ -678,6 +698,7 @@ mod tests {
         );
         scratch.name = source.name.clone();
         assert!(!selection.matches_scratch(&scratch, &terminal));
+        assert!(classic_provider::ordinary_flight_fence_reply(&scratch, &terminal.fence).is_err());
         let wrong = source.checkpoint_transfer_terminal.as_mut().unwrap();
         wrong.fence.destination.intent.name = source.name.clone();
         source.checkpoint_transfer_fence = Some(Box::new(wrong.fence.clone()));

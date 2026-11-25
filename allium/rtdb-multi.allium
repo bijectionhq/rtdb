@@ -643,6 +643,12 @@ contract LogService {
         -- Private release status joins one exact registered family response part, its ordered application settlement, and its immutable Original vault terminal.
         -- An exact status retry reopens the same provider terminal while the Original and scratch authorities retain its evidence.
 
+    @invariant ClassicMigrationOrdinaryFlightDrain
+        -- The Original can reobserve the exact ordered transfer fence from its capture and private scratch before the keeper seal completes.
+        -- Ordinary fresh Flight drain requires a complete admission roster and a positive join of each enrolled receiver and transport owner at that fence.
+        -- The retained Bijection continuation has independent admission and custody.
+        -- Status defers while the Original lacks a retained terminal for the complete ordinary fresh Flight population.
+
     @invariant ClassicMigrationNativeCandidate
         -- The authenticated recovery operator selects the exact fenced source name and authority, capture, scratch artifact and migration request.
         -- The recovery envelope authenticates the Original tenant name and the sealed stage binds its independently determined scratch name.

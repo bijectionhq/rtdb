@@ -537,10 +537,55 @@ The `family_release` terminal contains `locator`, `address_sha256`, `settled_at`
 Repeat the exact status after a lost reply to recover those coordinates from the retained scratch and vault.
 The action returns `deferred` for a missing provider terminal and refuses foreign registrations or mismatched evidence.
 
-These two selectors establish only the reported populations.
+Each terminal establishes only the reported population.
 The retained application SQL and mounted Owned evidence stay under their existing authorities.
 Flight handles and query streams, recovery export and replay delivery, separately registered response parts and external egress have their own owners.
 Retained Worlds, holds, and key disposition require their own evidence before route readiness.
+
+##### Ordinary fresh Owned Flight
+
+The first Flight population is ordinary, non-audience `rtdb.owned.OpenFreshRead.v2` and the handles, calls, work and delivery descended from those opens on one Classic source.
+The ordinary gateway validates the exact deployment and writer epoch and, for a subscriber, its replica epoch, stream and residence.
+The gateway can select a subscriber or the current holder.
+The receiver also admits the authenticated placed session and checks the attachment against the source UUID before capturing its replica snapshot.
+The Bijection continuation under held Begin applies its read-only restriction on the client and can use the same Flight action and gateway route.
+The owner needs an authenticated purpose at admission to distinguish the ordinary population from that continuation.
+
+Use `observe_classic_migration_ordinary_flight_fence` on the authenticated Original recovery envelope with its exact `name`, `authority` and `capture`.
+Its `selection` contains the same `destination`, `stage_operation`, `source_manifest_sha256` and `source` as `seal_classic_migration_source`.
+The newline-terminated request has a 2 KiB limit.
+The observer checks the current registered capture and the matching ordered fence on the Original and its private scratch stage.
+The `classic_migration_ordinary_flight_fence` outcome returns `authority`, `capture`, `destination`, `stage_operation`, `source`, `fenced_writer_epoch` and `fence_sha256`.
+The digest is SHA-256 of the compact RTDB JSON array `["rtdb.multi/classic-ordinary-flight-fence/v1", fence]` using the exact typed directory fence also returned by `seal_classic_migration_source`.
+An exact retry reads the same fence with or without a keeper seal or scratch bootstrap.
+A matching capture with no ordered fence returns `deferred`.
+The outcome identifies the transfer fence for the owner join and carries no reader disposition.
+
+The post-seal `classic_migration_provider_drain_status` accepts `{"population":"ordinary_fresh_flight"}` under the same candidate and application cut checks as the other populations.
+Stock admission and shutdown provide no authoritative ordinary-only cohort or restart-safe per-owner join, so this selector returns `deferred` for a matching cut.
+The fence observer and provider selector leave admission, source sealing and publication decisions under their current owners.
+
+The positive owner contract requires all of the following.
+
+1. Bind the population and purpose before any ordinary request can acquire a resource or dispatch to a receiver.
+   Enroll all gateway and direct ingress paths that can actually admit it, all eligible receivers including holder fallback, and all downstream delivery owners by installation and process generation.
+   Bind each admission to the exact Original, source incarnation, replica log epoch, writer epoch, owner and generation.
+   Preserve the authenticated retained Bijection continuation and give it independent custody and admission.
+2. Order admission exclusion and freeze the complete bounded roster against the exact Classic transfer fence.
+   Conserve admissions racing the fence, lost replies, and work already handed off to another owner.
+   An empty roster requires positive evidence of complete enrollment and admission exclusion.
+   Unknown, historical untracked, or excess coverage leaves the population unresolved.
+3. Join each enrolled owner after it closes admission for the selected generation.
+   The receiver joins the admitted call and its session/handle descendants, including snapshot, stream, spill and provider work.
+   Each gateway or transport owner joins forwarding and pending delivery, including retained HTTP/2 and socket output, or proves that the exact stopped generation can no longer deliver it.
+   A close request, directory catalog release, routing refusal, process lease, timeout or missing process leaves the corresponding stop or delivery obligation unresolved without that owner's positive witness.
+4. Retain each positive owner result and one immutable complete terminal under Original custody.
+   The terminal binds the unchanged roster and each owner result to the fence digest and exact Original identity and placement.
+   Restart and lost-reply recovery reopen those same records and require positive, generation-specific stop and delivery evidence for any owner lost before its join was recorded.
+   CUT joins the terminal to the independently held Begin and Original catalog commitment, the mounted application placement and custody, and the exact sealed scratch and Classic and SQL cuts.
+
+Ordinary fresh Flight remains pending along with the other ordinary Flight opens and SQL query deliveries, reserved audience Flight, PgWire, World readers, export and replay outputs, external response deliveries, retained Worlds and holds, and key dispositions beyond the selected `RFR1` release.
+Keep aggregate route readiness closed while any required population or retained continuation lacks its own evidence.
 
 ### Private native candidate
 

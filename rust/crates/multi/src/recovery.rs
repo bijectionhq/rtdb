@@ -184,6 +184,9 @@ enum Action {
         classic_cut: rtdb_types::TransactionKey,
         provider: classic_provider::Population,
     },
+    ObserveClassicMigrationOrdinaryFlightFence {
+        selection: classic_provider::FlightFenceSelection,
+    },
     ReadClassicMigrationPointHistories {
         selection: classic_destination::Selection,
         candidate_binding: CandidateBinding,
@@ -360,6 +363,15 @@ enum Reply {
         fenced_writer_epoch: u64,
         application: classic_provider::ApplicationClose,
         terminal: classic_provider::Terminal,
+    },
+    ClassicMigrationOrdinaryFlightFence {
+        authority: Uuid,
+        capture: Uuid,
+        destination: Uuid,
+        stage_operation: Uuid,
+        source: ClassicMigrationSource,
+        fenced_writer_epoch: u64,
+        fence_sha256: [u8; 32],
     },
     ClassicMigrationPointHistories {
         selection: classic_destination::Selection,
@@ -958,6 +970,23 @@ impl RecoveryService {
                 directory, installation, request.authority, request.capture, selection,
                 classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, provider: Some(provider) },
             )).await,
+            Action::ObserveClassicMigrationOrdinaryFlightFence { selection } => {
+                let intent = selection.intent(request.authority, request.capture, &self.org)?;
+                let fence = classic_provider::observe_ordinary_flight_fence(&installation, &intent)?;
+                archive::require_capture_open(&installation, request.capture)?;
+                let Some((point, _)) = archive::capture_receipt(
+                    &installation, &self.archive, request.authority, request.capture,
+                )?.filter(|(point, manifest)| {
+                    point.incarnation == installation.incarnation && point.log_epoch == installation.log_epoch
+                        && installation.checkpoint == Some(point.checkpoint)
+                        && manifest == &intent.source_manifest_sha256
+                }) else { return Ok(Reply::Refused); };
+                let Some(fence) = fence else { return Ok(Reply::Deferred); };
+                let Some(scratch) = directory.deployment(&intent.destination.to_string()).await? else {
+                    return Ok(Reply::Deferred);
+                };
+                classic_provider::ordinary_flight_fence_reply(&scratch, fence)
+            }
             Action::ReadClassicMigrationPointHistories { selection, candidate_binding, classic_cut, valid_at, points } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
                 classic_destination::Operation::Application {
@@ -1416,7 +1445,8 @@ mod tests {
 
     #[tokio::test]
     async fn classic_source_observation_and_overtaken_seal_bind_the_exact_capture() -> Result<()> {
-        use rtdb_directory::{Checkpoint, CheckpointCapture, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, now_ms};
+        use rtdb_directory::{CellMedia, Checkpoint, CheckpointCapture, CheckpointStage, CheckpointTransferSelection,
+            Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, now_ms};
 
         let temporary = tempfile::tempdir().unwrap();
         let directory = MemoryDirectory::new();
@@ -1439,6 +1469,7 @@ mod tests {
         let mut source = DeploymentRecord::new("tenant", "cell", vec![], now_ms());
         let authority: Uuid = source.id.parse().unwrap();
         let capture = Uuid::new_v4();
+        let current_capture = Uuid::new_v4();
         let attempt = Uuid::new_v4();
         let manifest = URL_SAFE_NO_PAD.encode([1; 32]);
         let checkpoint = Checkpoint { block: 1, source: 6, boundary: 8, system_time: 10, root_sha256: Some([2; 32]) };
@@ -1452,13 +1483,17 @@ mod tests {
             log_epoch: source.log_epoch, checkpoint, automatic_fork: false, world_replay: None,
             media_bound: true, manifest_sha256: Some(manifest.clone()), remote_disposal: None,
         });
+        let mut current_registration = source.checkpoint_captures[&capture].clone();
+        current_registration.checkpoint = current;
+        source.checkpoint_captures.insert(current_capture, current_registration);
         let source = directory.create_deployment(source).await?;
-        let send = |token: &str, action: serde_json::Value| {
+        let send_for = |capture: Uuid, token: &str, action: serde_json::Value| {
             let request = serde_json::from_value(serde_json::json!({
                 "token": token, "name": "tenant", "authority": authority, "capture": capture, "action": action,
             })).unwrap();
             service.handle(directory.clone(), request)
         };
+        let send = |token: &str, action| send_for(capture, token, action);
         let observe = serde_json::json!({
             "operation": "observe_classic_migration_source", "source_manifest_sha256": manifest,
         });
@@ -1479,10 +1514,44 @@ mod tests {
                 Reply::ClassicMigrationCaptureOvertaken { stage_operation, current_checkpoint, .. }
                 if stage_operation == attempt && current_checkpoint == current));
         }
-        assert_eq!(directory.deployment(&source.id).await?, Some(source));
+        assert_eq!(directory.deployment(&source.id).await?, Some(source.clone()));
         let scratch = directory.deployment(&attempt.to_string()).await?.unwrap();
         assert_eq!(scratch.lifecycle, Lifecycle::Deleting);
         assert!(scratch.checkpoint_transfer_fence.is_none());
+
+        let stage_operation = Uuid::new_v4();
+        let flight_selection = serde_json::json!({
+            "destination": authority, "stage_operation": stage_operation,
+            "source_manifest_sha256": manifest, "source": observed,
+        });
+        let inspect = serde_json::json!({
+            "operation": "observe_classic_migration_ordinary_flight_fence", "selection": flight_selection,
+        });
+        assert!(matches!(send(&token, inspect.clone()).await, Reply::Refused));
+        assert!(matches!(send_for(current_capture, "wrong", inspect.clone()).await, Reply::Refused));
+        assert!(matches!(send_for(current_capture, &token, inspect.clone()).await, Reply::Deferred));
+        let selection: classic_provider::FlightFenceSelection = serde_json::from_value(flight_selection).unwrap();
+        let intent = selection.intent(authority, current_capture, &service.org)?;
+        let mut scratch = crate::admin::installation_record(stage_operation, &intent.name, &intent.org)?;
+        scratch.lifecycle = Lifecycle::Restoring;
+        let stage = CheckpointStage { intent, source_incarnation: source.incarnation, source_log_epoch: source.log_epoch,
+            checkpoint: current, media: CellMedia { objects: [7; 32], keys: "scratch-key".into() },
+            transfer_only: true, staged_manifest_sha256: Some(URL_SAFE_NO_PAD.encode([8; 32])),
+        };
+        scratch.checkpoint_stage = Some(Box::new(stage.clone()));
+        let scratch = directory.create_deployment(scratch).await?;
+        let fence = directory.fence_checkpoint_transfer(&CheckpointTransferSelection {
+            stage, source_version: source.version, destination_version: scratch.version,
+            drained_source_through: Some(current.source),
+        }).await?;
+        let fenced_source = directory.deployment(&source.id).await?.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(send_for(current_capture, &token, inspect.clone()).await,
+                Reply::ClassicMigrationOrdinaryFlightFence { capture, fenced_writer_epoch, .. }
+                    if capture == current_capture && fenced_writer_epoch == fence.fenced_writer_epoch));
+        }
+        assert!(fenced_source.checkpoint_transfer_terminal.is_none());
+        assert_eq!(directory.deployment(&source.id).await?, Some(fenced_source));
         Ok(())
     }
 
