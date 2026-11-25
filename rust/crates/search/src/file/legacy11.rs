@@ -9,8 +9,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{Array, StringArray};
-use rtdb_columnar::EntityIdRef;
+use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt32Array, cast::AsArray, types::UInt32Type};
+use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, shared_allocation_size};
 use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp};
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes, WatchCallback, WatchHandle, WritePtr};
@@ -19,7 +19,7 @@ use tantivy::store::Compressor;
 use tantivy::tokenizer::{PreTokenizedString, Token};
 use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument};
 
-use super::SearchPage;
+use super::{SearchPage, LEGACY_FORMAT_VERSION, layout::{Table, item_of, list, record}, postings::{POSTING_TERMS, PostingBuilder, posting_table}, write::{Events, Runs}};
 
 use crate::member_bounds::{MemberStart, document_member};
 use crate::rank_windows::{extend_impact, window_of};
@@ -725,119 +725,162 @@ impl SearchFile {
 
 }
 
-pub(super) fn decode_batches(bytes: bytes::Bytes, columns: &[String]) -> Result<Vec<arrow_array::RecordBatch>> {
-    let mut pages = Vec::new();
-    transcode(bytes, columns, None, |batch| {
-        pages.push(batch);
-        Ok(())
-    })?;
-    Ok(pages)
+pub(super) fn decode_batches(bytes: bytes::Bytes, columns: &[String]) -> Result<Vec<RecordBatch>> {
+    let (catalog, _) = Catalog::open(bytes, columns, None)?;
+    (0..catalog.len()).map(|page| catalog.page(page, None)).collect()
 }
 
-pub(super) fn transcode(bytes: bytes::Bytes, columns: &[String], memory: Option<&Arc<rtdb_columnar::MemoryBudget>>,
-    mut write_batch: impl FnMut(arrow_array::RecordBatch) -> Result<()>) -> Result<()> {
-    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array, builder::StringBuilder};
-    use tantivy::{DocSet, postings::Postings as _};
-    use super::{LEGACY_FORMAT_VERSION, layout::{Table, item_of, list}, postings::{POSTING_TERMS, PostingBuilder, posting_table}, write::{Events, Runs}};
+pub(super) struct Catalog {
+    pub header: RecordBatch,
+    terms: StructArray,
+    lengths: UInt32Array,
+    inverted: Vec<Option<Arc<tantivy::InvertedIndexReader>>>,
+}
 
-    let file = SearchFile::open(bytes, columns)?;
-    let sidecar = &file.sidecar;
-    let segment = file.searcher.segment_readers().first();
-    let inverted = columns.iter().enumerate().map(|(column, _)| {
-        segment.map(|segment| segment.inverted_index(Field::from_field_id(column as u32)).map_err(fault)).transpose()
-    }).collect::<Result<Vec<_>>>()?;
-    let tokens = inverted.iter().flatten().map(|index| index.total_num_tokens()).fold(0u64, u64::saturating_add);
-    let bytes = sidecar.data().len().saturating_mul(4)
-        .saturating_add(usize::try_from(tokens).unwrap_or(usize::MAX).saturating_mul(20))
-        .saturating_add(4096);
-    let _scratch = memory.map(|memory| memory.reserve(bytes)).transpose()?;
-    let mut page = |tables| write_batch(super::layout::record(LEGACY_FORMAT_VERSION, tables)?);
-    let header = Table::Header.array(vec![
-        Arc::new(Int32Array::from(vec![LEGACY_FORMAT_VERSION])), Arc::new(Int32Array::from(vec![rtdb_text::ANALYZER_VERSION])),
-        Arc::new(Int64Array::from(vec![sidecar.version])), Arc::new(FixedSizeBinaryArray::try_from_iter([sidecar.identity].iter()).map_err(fault)?),
-    ])?;
-    let members = Table::Members.array(vec![
-        Arc::new(UInt32Array::from_iter_values(sidecar.member_starts.iter().map(|member| member.page))),
-        Arc::new(UInt32Array::from_iter_values(sidecar.member_starts.iter().map(|member| member.doc))),
-    ])?;
-    let pages = Table::Pages.array(vec![Arc::new(UInt32Array::from(sidecar.page_starts.clone()))])?;
-    let mut events = Events::new();
-    for row in 0..sidecar.rows {
-        let header = sidecar.key(row)?;
-        let iid = Iid(sidecar.row_iid(row).try_into().map_err(fault)?);
-        let key = sidecar.row_identity(row);
-        events.push(EventHeader { position: header.position, iid, system_from: Timestamp(header.system_from), commit_position: 0,
-            valid_time: Interval::new(Timestamp(header.valid_from), Timestamp(header.valid_to))?, op: header.op },
-            (!key.is_empty()).then_some(key))?;
-    }
-    let mut runs = Runs::new();
-    for doc in 0..sidecar.documents {
-        let position = sidecar.identity_starts + doc as usize * 4;
-        let first = sidecar.identities + sidecar.u32_at(position) as usize;
-        let last = sidecar.identities + sidecar.u32_at(position + 4) as usize;
-        let length = sidecar.u32_at(sidecar.token_lengths + doc as usize * 4);
-        runs.push(Iid(sidecar.doc_iid(doc)), (first != last).then(|| &sidecar.data()[first..last]), length,
-            sidecar.data()[sidecar.doc_classes + doc as usize], sidecar.rectangles(doc).collect())?;
-    }
-    let runs_for_rows = UInt32Array::from_iter_values((0..columns.len()).flat_map(|column| {
-        (0..sidecar.rows).map(move |row| match sidecar.row_doc(column, row) {
-            RowDoc::Invisible => NO_DOC,
-            RowDoc::Null => NULL_DOC,
-            RowDoc::Run(doc) => doc,
-        })
-    }));
-    let row_runs = Table::RowRuns.array(vec![list(Arc::new(runs_for_rows),
-        std::iter::repeat_n(sidecar.rows as usize, columns.len()), item_of(&Table::RowRuns.fields()[0]))?])?;
-    let mut terms = StringBuilder::new();
-    let mut term_columns = Vec::new();
-    let mut frequencies = Vec::new();
-    for (column, index) in inverted.iter().enumerate() {
-        let Some(index) = index else { continue; };
-        let mut stream = index.terms().stream().map_err(fault)?;
-        while stream.advance() {
-            terms.append_value(std::str::from_utf8(stream.key()).map_err(fault)?);
-            term_columns.push(column as u32);
-            frequencies.push(stream.value().doc_freq);
+impl Catalog {
+    pub fn open(bytes: bytes::Bytes, columns: &[String], memory: Option<&Arc<MemoryBudget>>)
+        -> Result<(Self, Option<Arc<MemoryReservation>>)> {
+        use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, UInt64Array, builder::StringBuilder};
+        let file = SearchFile::open(bytes, columns)?;
+        let sidecar = &file.sidecar;
+        let segment = file.searcher.segment_readers().first();
+        let inverted = columns.iter().enumerate().map(|(column, _)| {
+            segment.map(|segment| segment.inverted_index(Field::from_field_id(column as u32)).map_err(fault)).transpose()
+        }).collect::<Result<Vec<_>>>()?;
+        let tokens = inverted.iter().flatten().map(|index| index.total_num_tokens()).fold(0u64, u64::saturating_add);
+        let bytes = sidecar.data().len().saturating_mul(4)
+            .saturating_add(usize::try_from(tokens).unwrap_or(usize::MAX).saturating_mul(20))
+            .saturating_add(4096);
+        let scratch = memory.map(|memory| memory.reserve(bytes)).transpose()?;
+        let header = Table::Header.array(vec![
+            Arc::new(Int32Array::from(vec![LEGACY_FORMAT_VERSION])), Arc::new(Int32Array::from(vec![rtdb_text::ANALYZER_VERSION])),
+            Arc::new(Int64Array::from(vec![sidecar.version])), Arc::new(FixedSizeBinaryArray::try_from_iter([sidecar.identity].iter()).map_err(fault)?),
+        ])?;
+        let members = Table::Members.array(vec![
+            Arc::new(UInt32Array::from_iter_values(sidecar.member_starts.iter().map(|member| member.page))),
+            Arc::new(UInt32Array::from_iter_values(sidecar.member_starts.iter().map(|member| member.doc))),
+        ])?;
+        let pages = Table::Pages.array(vec![Arc::new(UInt32Array::from(sidecar.page_starts.clone()))])?;
+        let mut events = Events::new();
+        for row in 0..sidecar.rows {
+            let header = sidecar.key(row)?;
+            let iid = Iid(sidecar.row_iid(row).try_into().map_err(fault)?);
+            let key = sidecar.row_identity(row);
+            events.push(EventHeader { position: header.position, iid, system_from: Timestamp(header.system_from), commit_position: 0,
+                valid_time: Interval::new(Timestamp(header.valid_from), Timestamp(header.valid_to))?, op: header.op },
+                (!key.is_empty()).then_some(key))?;
         }
+        let mut runs = Runs::new();
+        for doc in 0..sidecar.documents {
+            let position = sidecar.identity_starts + doc as usize * 4;
+            let first = sidecar.identities + sidecar.u32_at(position) as usize;
+            let last = sidecar.identities + sidecar.u32_at(position + 4) as usize;
+            let length = sidecar.u32_at(sidecar.token_lengths + doc as usize * 4);
+            runs.push(Iid(sidecar.doc_iid(doc)), (first != last).then(|| &sidecar.data()[first..last]), length,
+                sidecar.data()[sidecar.doc_classes + doc as usize], sidecar.rectangles(doc).collect())?;
+        }
+        let runs_for_rows = UInt32Array::from_iter_values((0..columns.len()).flat_map(|column| {
+            (0..sidecar.rows).map(move |row| match sidecar.row_doc(column, row) {
+                RowDoc::Invisible => NO_DOC,
+                RowDoc::Null => NULL_DOC,
+                RowDoc::Run(doc) => doc,
+            })
+        }));
+        let row_runs = Table::RowRuns.array(vec![list(Arc::new(runs_for_rows),
+            std::iter::repeat_n(sidecar.rows as usize, columns.len()), item_of(&Table::RowRuns.fields()[0]))?])?;
+        let mut terms = StringBuilder::new();
+        let mut term_columns = Vec::new();
+        let mut frequencies = Vec::new();
+        for (column, index) in inverted.iter().enumerate() {
+            let Some(index) = index else { continue; };
+            let mut stream = index.terms().stream().map_err(fault)?;
+            while stream.advance() {
+                terms.append_value(std::str::from_utf8(stream.key()).map_err(fault)?);
+                term_columns.push(column as u32);
+                frequencies.push(stream.value().doc_freq);
+            }
+        }
+        let count = frequencies.len();
+        let term_table = Table::Terms.array(vec![
+            Arc::new(UInt32Array::from(term_columns)), Arc::new(terms.finish()),
+            Arc::new(UInt32Array::from_iter_values((0..count).map(|index| (index / POSTING_TERMS + 1) as u32))),
+            Arc::new(UInt32Array::from_iter_values((0..count).map(|index| (index % POSTING_TERMS) as u32))),
+            Arc::new(UInt32Array::from(frequencies)),
+        ])?;
+        let column_table = Table::Columns.array(vec![Arc::new(StringArray::from_iter_values(columns)) as ArrayRef,
+            Arc::new(UInt32Array::from(sidecar.column_docs.clone())), Arc::new(UInt64Array::from_iter_values(inverted.iter().map(|index| index.as_ref().map_or(0, |index| index.total_num_tokens()))))])?;
+        let sections = sidecar.sections.iter().copied().map(Section::into_arrow).collect::<Vec<_>>();
+        let runs = runs.finish()?;
+        let lengths = runs.column(1).as_primitive::<UInt32Type>().clone();
+        let header = record(LEGACY_FORMAT_VERSION, [(Table::Header, header), (Table::Members, members),
+            (Table::Pages, pages), (Table::Columns, column_table), (Table::Events, events.finish()?.0),
+            (Table::Runs, runs), (Table::RowRuns, row_runs), (Table::Terms, term_table.clone()),
+            (Table::Sections, super::sections_array(&sections)?)])?;
+        Ok((Self { header, terms: term_table, lengths, inverted }, scratch))
     }
-    let count = frequencies.len();
-    let term_table = Table::Terms.array(vec![
-        Arc::new(UInt32Array::from(term_columns)), Arc::new(terms.finish()),
-        Arc::new(UInt32Array::from_iter_values((0..count).map(|index| (index / POSTING_TERMS + 1) as u32))),
-        Arc::new(UInt32Array::from_iter_values((0..count).map(|index| (index % POSTING_TERMS) as u32))),
-        Arc::new(UInt32Array::from(frequencies)),
-    ])?;
-    let column_table = Table::Columns.array(vec![Arc::new(StringArray::from_iter_values(columns)) as ArrayRef,
-        Arc::new(UInt32Array::from(sidecar.column_docs.clone())), Arc::new(UInt64Array::from_iter_values(inverted.iter().map(|index| index.as_ref().map_or(0, |index| index.total_num_tokens()))))])?;
-    let sections = sidecar.sections.iter().copied().map(Section::into_arrow).collect::<Vec<_>>();
-    page(vec![(Table::Header, header), (Table::Members, members), (Table::Pages, pages), (Table::Columns, column_table),
-        (Table::Events, events.finish()?.0), (Table::Runs, runs.finish()?), (Table::RowRuns, row_runs),
-        (Table::Terms, term_table), (Table::Sections, super::sections_array(&sections)?)])?;
-    let mut groups = Vec::with_capacity(POSTING_TERMS);
-    for index in inverted.iter().flatten() {
-        let mut stream = index.terms().stream().map_err(fault)?;
-        while stream.advance() {
-            let mut postings = index.read_postings_from_terminfo(stream.value(), IndexRecordOption::WithFreqsAndPositions).map_err(fault)?;
+
+    pub fn len(&self) -> usize { 1 + self.terms.len().div_ceil(POSTING_TERMS) }
+
+    pub fn page(&self, page: usize, memory: Option<&Arc<MemoryBudget>>) -> Result<RecordBatch> {
+        if page == 0 { return Ok(self.header.clone()); }
+        self.read_postings(page, true, memory).map(|batch| batch.expect("a posting page was requested"))
+    }
+
+    pub fn validate_page(&self, page: usize) -> Result<()> {
+        self.read_postings(page, false, None).map(drop)
+    }
+
+    fn read_postings(&self, page: usize, build: bool, memory: Option<&Arc<MemoryBudget>>) -> Result<Option<RecordBatch>> {
+        use tantivy::{DocSet, postings::Postings as _};
+
+        if page == 0 || page >= self.len() { return Err(corrupt("Search file has no such record batch")); }
+        let first = (page - 1) * POSTING_TERMS;
+        let last = (first + POSTING_TERMS).min(self.terms.len());
+        let columns = self.terms.column(0).as_primitive::<UInt32Type>();
+        let names = self.terms.column(1).as_string::<i32>();
+        let mut bytes = 32_768usize;
+        let mut charge = memory.map(|memory| memory.reserve(bytes)).transpose()?;
+        let mut groups = if build { Vec::with_capacity(last - first) } else { Vec::new() };
+        let mut positions = Vec::new();
+        for row in first..last {
+            let index = self.inverted[columns.value(row) as usize].as_ref()
+                .ok_or_else(|| corrupt("Legacy search term has no inverted index"))?;
+            let info = index.terms().get(names.value(row)).map_err(fault)?
+                .ok_or_else(|| corrupt("Legacy search term is missing from its source"))?;
+            let mut postings = index.read_postings_from_terminfo(&info, IndexRecordOption::WithFreqsAndPositions).map_err(fault)?;
             let mut builder = PostingBuilder::default();
-            let mut positions = Vec::new();
             while postings.doc() != tantivy::TERMINATED {
                 let doc = postings.doc();
-                if doc >= sidecar.documents { return Err(corrupt("Legacy search posting exceeds its document count")); }
-                let length = rtdb_text::stored_length(sidecar.u32_at(sidecar.token_lengths + doc as usize * 4) as usize);
+                if doc as usize >= self.lengths.len() { return Err(corrupt("Legacy search posting exceeds its document count")); }
+                if let Some(charge) = &mut charge {
+                    bytes = bytes.saturating_add(256).saturating_add((postings.term_freq() as usize).saturating_mul(32));
+                    Arc::get_mut(charge).expect("unpublished legacy page owns its reservation").grow_to(bytes)?;
+                }
                 postings.positions(&mut positions);
-                builder.push(doc, length, std::mem::take(&mut positions), None);
+                if build {
+                    let length = rtdb_text::stored_length(self.lengths.value(doc as usize) as usize);
+                    builder.push(doc, length, std::mem::take(&mut positions), None);
+                }
                 postings.advance();
             }
-            groups.push(builder);
-            if groups.len() == POSTING_TERMS {
-                page(vec![(Table::Postings, posting_table(std::mem::take(&mut groups), STORED_IMPACTS as usize)?)])?;
-            }
+            if build { groups.push(builder); }
         }
+        if !build { return Ok(None); }
+        let batch = record(LEGACY_FORMAT_VERSION, [(Table::Postings, posting_table(groups, STORED_IMPACTS as usize)?)])?;
+        if let Some(mut charge) = charge {
+            let retained = shared_allocation_size(&batch)?;
+            let retained = Arc::get_mut(&mut charge).expect("unpublished legacy page owns its reservation").split_off(retained)?;
+            return Ok(Some(OwnedBatch::with_reservation(batch, retained)?.batch().clone()));
+        }
+        Ok(Some(batch))
     }
-    if !groups.is_empty() {
-        page(vec![(Table::Postings, posting_table(groups, STORED_IMPACTS as usize)?)])?;
+
+    pub fn retain_header(&mut self, reservation: Arc<MemoryReservation>) -> Result<()> {
+        self.header = OwnedBatch::with_reservation(self.header.clone(), reservation)?.batch().clone();
+        self.terms = super::layout::table(&self.header, Table::Terms);
+        self.lengths = super::layout::table(&self.header, Table::Runs).column(1).as_primitive::<UInt32Type>().clone();
+        Ok(())
     }
-    Ok(())
 }
 
 impl Section {

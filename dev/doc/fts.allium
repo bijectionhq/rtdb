@@ -216,6 +216,7 @@ rule SearchJobRuns {
     -- An on-demand build decodes page buffers from its retained data-file cache lease and serves the typed search pages it builds.
     -- Each build reserves the indexing heap up front in proportion to its input size.
     -- A durable build writes the segment on disk and streams it to the object store.
+    -- A historical bundle can serve bounded posting pages directly from its admitted original bytes when converted batches exceed the retained budget.
     -- An on-demand build retains its checked Arrow batches for the query.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.

@@ -547,6 +547,7 @@ enum ReadPages {
     Local(Box<dyn Fn(Range<usize>) -> Result<Buffer> + Send + Sync>),
     Remote { storage: Weak<BufferPool>, key: ObjectKey },
     Checked(BTreeMap<usize, RecordBatch>),
+    Legacy { catalog: Box<super::legacy11::Catalog>, scratch: Arc<rtdb_types::MemoryBudget> },
 }
 
 pub(super) struct Reader {
@@ -570,6 +571,12 @@ impl Reader {
         Self { read: ReadPages::Checked(batches),
             decoder: FileDecoder::new(Arc::clone(schema(format)), arrow_ipc::MetadataVersion::V5),
             blocks: Vec::new(), hashes: String::new(), pages: Vec::new(), format, length: 0 }
+    }
+
+    pub(super) fn from_legacy(catalog: super::legacy11::Catalog, scratch: Arc<rtdb_types::MemoryBudget>) -> Self {
+        Self { read: ReadPages::Legacy { catalog: Box::new(catalog), scratch },
+            decoder: FileDecoder::new(Arc::clone(schema(LEGACY_FORMAT_VERSION)), MetadataVersion::V5),
+            blocks: Vec::new(), hashes: String::new(), pages: Vec::new(), format: LEGACY_FORMAT_VERSION, length: 0 }
     }
 
     pub(super) fn from_source(source: Source) -> Result<Self> {
@@ -634,6 +641,7 @@ impl Reader {
     pub(super) fn len(&self) -> usize {
         match &self.read {
             ReadPages::Checked(pages) => pages.len(),
+            ReadPages::Legacy { catalog, .. } => catalog.len(),
             _ => self.pages.len(),
         }
     }
@@ -654,8 +662,10 @@ impl Reader {
     }
 
     pub(super) fn page(&self, page: usize) -> Result<RecordBatch> {
-        if let ReadPages::Checked(pages) = &self.read {
-            return pages.get(&page).cloned().ok_or_else(|| corrupt("Search page was not prepared"));
+        match &self.read {
+            ReadPages::Checked(pages) => return pages.get(&page).cloned().ok_or_else(|| corrupt("Search page was not prepared")),
+            ReadPages::Legacy { catalog, scratch } => return catalog.page(page, Some(scratch)),
+            _ => {}
         }
         let slot = self.pages.get(page).ok_or_else(|| corrupt("Search file has no such record batch"))?;
         if let Some(batch) = slot.get() { return Ok(batch.clone()); }

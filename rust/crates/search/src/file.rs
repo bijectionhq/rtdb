@@ -15,9 +15,8 @@ mod write;
 pub(crate) mod experiment;
 
 use std::borrow::Cow;
-use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufWriter, Cursor, Write};
+use std::io::{Cursor, Write};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -273,21 +272,6 @@ pub(crate) fn artefact_identity(table_slug: &str, owner: &rtdb_format::keys::Art
     format!("{table_slug}/{owner}/{id}/v{version}")
 }
 
-struct ConversionOutput<'a> {
-    writer: BufWriter<&'a std::fs::File>,
-    error: &'a Cell<Option<Anomaly>>,
-}
-
-impl Write for ConversionOutput<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.writer.write(bytes).inspect_err(|error| self.error.set(Some(transcode_io(error))))
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush().inspect_err(|error| self.error.set(Some(transcode_io(error))))
-    }
-}
-
 fn transcode_io(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.search/transcode-io", error.to_string())
 }
@@ -358,19 +342,9 @@ pub struct SearchFile {
     _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
-struct TranscodedSearchMap {
-    map: memmap2::Mmap,
-    _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
-}
-
-impl AsRef<[u8]> for TranscodedSearchMap {
-    fn as_ref(&self) -> &[u8] { &self.map }
-}
-
 pub(crate) enum CatalogBacking {
     Original,
     Batches(usize),
-    Map(usize),
 }
 
 impl SearchFile {
@@ -404,56 +378,40 @@ impl SearchFile {
 
     fn open_tantivy_catalog(source: Source, columns: &[String], scratch: &Arc<MemoryBudget>,
         retained: Option<&Arc<MemoryBudget>>) -> Result<(Self, CatalogBacking)> {
-        let output = OnceCell::new();
-        let io_error = Cell::new(None);
-        let spool = || {
-            let file = tempfile::tempfile().map_err(transcode_io)?;
-            let file = output.get_or_init(|| file);
-            layout::Writer::new(ConversionOutput { writer: BufWriter::new(file), error: &io_error }, LEGACY_FORMAT_VERSION)
-        };
+        let (mut catalog, working) = legacy11::Catalog::open(bytes::Bytes::from_owner(source), columns, Some(scratch))?;
+        let mut working = working.expect("catalog conversion uses its supplied budget");
         let mut pages = Vec::<(RecordBatch, Arc<MemoryReservation>)>::new();
-        let conversion = (|| {
-            let mut writer = retained.is_none().then(&spool).transpose()?;
-            legacy11::transcode(bytes::Bytes::from_owner(source), columns, Some(scratch), |batch| {
-                if let Some(writer) = &mut writer {
-                    return writer.write_batch(&batch).map(|_| ());
-                }
-                let memory = retained.expect("in-memory conversion has a budget");
-                let size = shared_allocation_size(&batch)?;
-                match memory.reserve(size) {
-                    Ok(charge) => {
-                        pages.push((batch, charge));
-                        return Ok(());
-                    }
-                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+        let mut first_unchecked = 1;
+        if let Some(retained) = retained {
+            for ordinal in 0..catalog.len() {
+                let page = catalog.page(ordinal, None)?;
+                first_unchecked = ordinal + 1;
+                let size = shared_allocation_size(&page)?;
+                match retained.reserve(size) {
+                    Ok(charge) => pages.push((page, charge)),
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => break,
                     Err(error) => return Err(error),
                 }
-                let writer = writer.insert(spool()?);
-                for (page, _charge) in pages.drain(..) {
-                    writer.write_batch(&page)?;
-                }
-                writer.write_batch(&batch).map(|_| ())
-            })?;
-            writer.map(|writer| writer.finish()).transpose()
-        })();
-        if let Some(error) = io_error.take() { return Err(error); }
-        conversion?;
-
-        if let Some(output) = output.into_inner() {
-            let bytes = usize::try_from(output.metadata().map_err(transcode_io)?.len()).map_err(transcode_io)?;
-            let reservation = scratch.is_prepaid().then(|| scratch.reserve(bytes)).transpose()?;
-            // SAFETY: the anonymous file has no other handle and all writes have finished.
-            let map = unsafe { memmap2::Mmap::map(&output) }.map_err(transcode_io)?;
-            let mapped = TranscodedSearchMap { map, _reservation: reservation };
-            return Self::open_located(bytes::Bytes::from_owner(mapped).into(), columns, None)
-                .map(|file| (file, CatalogBacking::Map(bytes)));
+            }
+            if pages.len() == catalog.len() {
+                let bytes = pages.iter().map(|(_, charge)| charge.bytes()).sum();
+                let pages = pages.into_iter().map(|(batch, charge)| Ok(OwnedBatch::with_reservation(batch, charge)?.batch().clone()))
+                    .collect::<Result<Vec<_>>>()?;
+                let file = Self::open_reader(Reader::from_checked_batches(pages, LEGACY_FORMAT_VERSION), columns)?;
+                return Ok((file, CatalogBacking::Batches(bytes)));
+            }
         }
-
-        let bytes = pages.iter().map(|(_, charge)| charge.bytes()).sum();
-        let pages = pages.into_iter().map(|(batch, charge)| Ok(OwnedBatch::with_reservation(batch, charge)?.batch().clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let file = Self::open_reader(Reader::from_checked_batches(pages, LEGACY_FORMAT_VERSION), columns)?;
-        Ok((file, CatalogBacking::Batches(bytes)))
+        drop(pages);
+        for page in first_unchecked..catalog.len() { catalog.validate_page(page)?; }
+        let bytes = shared_allocation_size(&catalog.header)?
+            .saturating_add(4096).saturating_add(columns.len().saturating_mul(1024));
+        let work = Arc::get_mut(&mut working).expect("unpublished legacy catalog owns its reservation");
+        work.grow_to(work.bytes().max(bytes))?;
+        let retained = work.split_off(bytes)?;
+        catalog.retain_header(Arc::clone(&retained))?;
+        let reader = Reader::from_legacy(catalog, Arc::clone(scratch));
+        let file = Self::open_reader(reader, columns)?.with_reservation(retained);
+        Ok((file, CatalogBacking::Original))
     }
 
     pub(crate) fn open_located(source: Source, columns: &[String], locator: Option<&FooterLocator>) -> Result<Self> {
@@ -1070,23 +1028,37 @@ mod tests {
         let first_page = shared_allocation_size(&uncharged.reader.page(0)?)?;
         let limited = MemoryBudget::new(first_page);
         let prepaid = memory.prepay(4 << 20)?;
-        let (spooled, backing) = SearchFile::open_catalog(bundle.clone().into(), &columns, None, &prepaid, Some(&limited)).await?;
-        let CatalogBacking::Map(mapped_bytes) = backing else { panic!("the first posting page should spill to disk"); };
+        let (bounded, backing) = SearchFile::open_catalog(bundle.clone().into(), &columns, None, &prepaid, Some(&limited)).await?;
+        assert!(matches!(backing, CatalogBacking::Original));
         assert_eq!(limited.peak_bytes(), first_page);
         assert_eq!(limited.used_bytes(), 0);
-        assert_eq!(prepaid.used_bytes(), mapped_bytes);
+        let admitted = prepaid.used_bytes();
+        assert!(admitted > 0);
         let (direct, backing) = SearchFile::open_catalog(bundle.into(), &columns, None, &memory, Some(&memory)).await?;
         assert!(matches!(backing, CatalogBacking::Batches(_)));
         assert!(direct.matches_artefact("legacy", 1));
         direct.verify()?;
-        compare(&uncharged, &spooled)?;
-        compare(&direct, &spooled)?;
+        for page in 0..bounded.reader.len() {
+            assert_eq!(bounded.reader.page(page)?, uncharged.reader.page(page)?);
+            assert_eq!(bounded.reader.page(page)?, direct.reader.page(page)?);
+        }
+        let matching = Query::parse(r#""invoice is overdue""#);
+        let scoring = Query::parse("invoice overdue");
+        let scores = |file: &SearchFile| -> Result<Vec<_>> {
+            Ok(file.scored("body", &matching, &scoring, None, all())?.into_iter()
+                .map(|(doc, score)| (doc, score.to_bits())).collect())
+        };
+        assert_eq!(scores(&direct)?, scores(&bounded)?);
         let query = Query::parse("invoice overdue");
         let corpus = direct.corpus("body", &query)?;
-        let from_disk = spooled.corpus("body", &query)?;
+        let selected = bounded.corpus("body", &query)?;
         assert_eq!((corpus.documents, corpus.tokens, corpus.frequencies),
-            (from_disk.documents, from_disk.tokens, from_disk.frequencies));
-        drop(spooled);
+            (selected.documents, selected.tokens, selected.frequencies));
+        let page = bounded.reader.page(1)?;
+        assert!(prepaid.used_bytes() > admitted);
+        drop(bounded);
+        assert!(prepaid.used_bytes() > 0);
+        drop(page);
         assert_eq!(prepaid.used_bytes(), 0);
         Ok(())
     }

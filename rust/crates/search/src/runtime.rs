@@ -831,7 +831,7 @@ impl SearchRuntime {
             if share {
                 let weight = match backing {
                     CatalogBacking::Original => size,
-                    CatalogBacking::Batches(bytes) | CatalogBacking::Map(bytes) => bytes,
+                    CatalogBacking::Batches(bytes) => bytes,
                 };
                 self.mapped.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), weight);
             }
@@ -866,7 +866,7 @@ impl SearchRuntime {
         if share {
             let (cache, weight) = match backing {
                 CatalogBacking::Original => (&self.files, size),
-                CatalogBacking::Batches(bytes) | CatalogBacking::Map(bytes) => (&self.mapped, bytes),
+                CatalogBacking::Batches(bytes) => (&self.mapped, bytes),
             };
             cache.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), weight);
         }
