@@ -788,7 +788,8 @@ pub(super) async fn owned_page(
     projection: OwnedProjection,
     bounds: RowBounds<'_>,
     valid_at: Option<Timestamp>,
-) -> Result<super::OwnedRangePage> {
+    cover_until: Option<Timestamp>,
+) -> Result<(super::OwnedRangePage, Option<Timestamp>)> {
     let OwnedProjection { fields, empty } = projection;
     let positions: Vec<_> = (0..fields.len()).collect();
     let covered =
@@ -804,10 +805,19 @@ pub(super) async fn owned_page(
     let present = context.current_time.as_micros()?;
     let valid_at = valid_at.unwrap_or(present);
     valid_at.next()?;
+    if cover_until.is_some_and(|until| until <= valid_at) {
+        return Err(super::uncovered_owned_range());
+    }
     if empty {
-        return Ok(super::OwnedRangePage { schema: covered.schema, batch: None });
+        return Ok((super::OwnedRangePage { schema: covered.schema, batch: None }, cover_until));
     }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
+    let covered_until = match cover_until {
+        Some(until) => Some(range_clock_cutoff(
+            &tree, &root, &range, valid_at, until, &context.cancellation,
+        ).await?),
+        None => None,
+    };
     let scan = PostingScan::open(
         tree, root, valid_at, range, reverse, definition.columns.len(), &context.cancellation,
     ).await?;
@@ -830,7 +840,59 @@ pub(super) async fn owned_page(
         gathered_rows: 0,
     };
     let batch = seek.next_batch().await?;
-    Ok(super::OwnedRangePage { schema, batch })
+    Ok((super::OwnedRangePage { schema, batch }, covered_until))
+}
+
+async fn range_clock_cutoff(
+    tree: &Tree,
+    root: &Root,
+    range: &Range<impl BoundAtom + Sync>,
+    valid_at: Timestamp,
+    until: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<Timestamp> {
+    use super::domain::offset;
+
+    let mut end = offset(until.0);
+    for bucket in Bucket::at(valid_at) {
+        if cancellation.is_cancelled() { return Err(cancelled()); }
+        let next_start = u128::from(bucket.start) + (1u128 << bucket.level);
+        if next_start >= end {
+            continue;
+        }
+        let mut current = Cursor::new(root.clone(), false);
+        if next(&mut current, tree, range, bucket, 0, false).await?.is_some() {
+            end = next_start;
+            continue;
+        }
+
+        // Jump over keys outside the range within each occupied bucket.
+        // Starting with every level's next bucket covers future insertions,
+        // including those invisible at the sampled instant.
+        let mut start = next_start;
+        while start < end {
+            if cancellation.is_cancelled() { return Err(cancelled()); }
+            let mut cursor = Cursor::new(root.clone(), false);
+            let first = cursor.next(tree, |key| match key {
+                KeyRef::Posting(found, ..) if found.level < bucket.level
+                    || (found.level == bucket.level && u128::from(found.start) < start) => Ordering::Less,
+                KeyRef::Posting(found, ..) if found.level == bucket.level
+                    && u128::from(found.start) < end => Ordering::Equal,
+                _ => Ordering::Greater,
+            }).await?;
+            let Some(first) = first else { break; };
+            let KeyRef::Posting(found, _, _) = first.key() else {
+                return Err(super::uncovered_owned_range());
+            };
+            let mut candidate = Cursor::new(root.clone(), false);
+            if next(&mut candidate, tree, range, found, 0, false).await?.is_some() {
+                end = u128::from(found.start);
+                break;
+            }
+            start = u128::from(found.start) + (1u128 << found.level);
+        }
+    }
+    Ok(Timestamp((end as i128 + i64::MIN as i128) as i64))
 }
 
 pub(super) async fn owned_count(
@@ -1902,6 +1964,40 @@ mod tests {
         assert_eq!(memory.used_bytes(), 32 << 10);
         drop(slice);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn vacant_range_covers_future_matching_activation_and_expiry() -> Result<()> {
+        use rtdb_storage::{MemoryStore, ObjectKey, cache::BufferPool};
+
+        use super::super::tree::{Address, Item, Key, KeyRow};
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let memory = MemoryBudget::new(16 << 20);
+        let tree = Tree::new(&storage, &ObjectKey::new("range-clock-test")?, &memory, 0).await?;
+        let mut edits = Vec::new();
+        for (key, from, to) in [(1, 0, 16), (2, 16, 24), (3, 8, 16)] {
+            for bucket in Bucket::cover(rtdb_types::Interval::new(Timestamp(from), Timestamp(to))?) {
+                edits.push((Key::Posting {
+                    bucket,
+                    tuple: KeyRow::Fence(Arc::from([Atom::Integer(key)])),
+                    address: Address::new(Iid([key as u8; 16]), bytes::Bytes::new()),
+                }, Some(Item::Posting)));
+            }
+        }
+        edits.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let root = tree.edit(None, edits).await?;
+        let range = Range {
+            prefix: vec![Atom::Integer(2)],
+            ..Range::default()
+        };
+        let cancellation = CancellationToken::new();
+        for (reading, expected) in [(0, 16), (16, 24), (24, 32)] {
+            assert_eq!(range_clock_cutoff(
+                &tree, &root, &range, Timestamp(reading), Timestamp(32), &cancellation,
+            ).await?, Timestamp(expected));
+        }
+        Ok(())
     }
 
     fn path_field(name: &str, data_type: LogicalType) -> Field {

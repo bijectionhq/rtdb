@@ -474,6 +474,19 @@ pub(crate) async fn owned_range(
     bounds: RowBounds<'_>,
     valid_at: Option<rtdb_types::Timestamp>,
 ) -> Result<OwnedRangePage> {
+    owned_range_in(context, owner, relation, path, bounds, valid_at, None)
+        .await.map(|(page, _)| page)
+}
+
+pub(crate) async fn owned_range_in(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+    bounds: RowBounds<'_>,
+    valid_at: Option<rtdb_types::Timestamp>,
+    cover_until: Option<rtdb_types::Timestamp>,
+) -> Result<(OwnedRangePage, Option<rtdb_types::Timestamp>)> {
     let definition = owned_definition(&context, owner, relation, path).await?;
     let database = context
         .catalog
@@ -491,7 +504,7 @@ pub(crate) async fn owned_range(
     )
     .await?;
     let work = accelerate::owned_page(
-        &context, snapshot, &database.storage, &definition, projection, bounds, valid_at,
+        &context, snapshot, &database.storage, &definition, projection, bounds, valid_at, cover_until,
     );
     context.reading(work).await
 }
