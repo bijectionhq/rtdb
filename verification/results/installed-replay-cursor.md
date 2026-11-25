@@ -26,3 +26,24 @@ The post-restart read-and-write witness was reached.
 The cursor theorem assumes that the authenticated hold and replay page identify the original journal values.
 The Lean fold assumes that the installed partition application realizes the supplied event interpretation.
 Native runtime compilation, authenticated provider qualification, and complete application-to-promotion correspondence remain unverified.
+
+## Replacement writer activation
+
+An empty poll with the writer grant can start a recovery term.
+The term needs permission to produce an inherited checkpoint before it can install that checkpoint and resume ordinary source work.
+Publishing leadership at the durable append reply leaves an interval during which the source resolver and public role can observe different stages of recovery.
+Requiring a fully installed prefix before starting the term would strand the inherited block when the old writer dies before its upload.
+
+Use the installed prefix to activate the recovery term.
+With a valid grant, read a predecessor's block boundary, inherit it, append the block upload, and delay its read-back.
+The public role remains following and source polling remains closed.
+Read the upload back and apply the records held behind the checkpoint.
+After the driver updates its installed prefix and verifies that live state and progress name the same transaction, it exposes leadership and opens source admission.
+The Verus control that allows activation after append before apply fails at the activation contract.
+The runtime regression case stages the same append and read-back schedule on the fenced in-memory log.
+
+Verus 0.2026.11.22.1ce6a59 checked 27 items in `ordered_recovery_cursor` and rejected all nine controls at the expected laws.
+Lean 4.35.0 checked `activated_writer_uses_replayed_image` over a complete finite replay with retry.
+The Lean law takes the complete installed value as a premise.
+Proving that premise requires the original catalog and suffix decoders, row installation, and receipt preservation through the actual driver.
+The native runtime regression is unexecuted.
