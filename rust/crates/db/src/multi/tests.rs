@@ -821,6 +821,30 @@ async fn multi_driver_hands_off_a_settled_writer_after_a_lost_release_reply() {
 }
 
 #[tokio::test]
+async fn multi_driver_shutdown_releases_the_writer_and_closes_the_pipeline() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    let writes = WritePipeline::start(Arc::new(Mutex::new(writer)));
+    let before_shutdown = writes.transact(put(1, 1, "before shutdown")).await.unwrap();
+
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Follower);
+    writes.shutdown().await.unwrap();
+    assert_eq!(
+        writes.tick(live(1)).await.unwrap_err().code,
+        "rtdb/write-pipeline-closed"
+    );
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert_eq!(
+        successor.tx_status(&before_shutdown.key).await.unwrap().basis,
+        before_shutdown.basis
+    );
+}
+
+#[tokio::test]
 async fn deployment_retirement_closes_admission_after_a_lost_reply() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();

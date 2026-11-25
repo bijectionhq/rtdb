@@ -467,6 +467,10 @@ impl MultiServing {
         self.writes.tick(live_nodes.clone()).await
     }
 
+    pub async fn shutdown_writer(&self) -> Result<()> {
+        self.writes.shutdown().await
+    }
+
     pub async fn local_writer_epoch(&self) -> Option<u64> {
         match self.database.lock().await.role() {
             Role::Follower => None,

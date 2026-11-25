@@ -50,6 +50,7 @@ enum Command {
     },
     Workload(workload::Request, Reply<workload::Reply>),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
+    Shutdown(Reply<()>),
     PublishRanked {
         build: super::RankedBuild,
         inventory: Vec<u8>,
@@ -189,6 +190,10 @@ impl WritePipeline {
 
     pub async fn tick(&self, live: BTreeSet<IpAddr>) -> Result<Role> {
         self.request(|reply| Command::Tick(live, reply)).await
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.request(Command::Shutdown).await
     }
 
     pub async fn export(&self, pin: Uuid, basis: Basis, until: Option<Timestamp>) -> Result<Vec<u8>> {
@@ -363,6 +368,12 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             Command::Tick(live, reply) => {
                 let result = database.lock().await.tick(&live).await;
                 let _ = reply.send(result);
+            }
+            Command::Shutdown(reply) => {
+                input.close();
+                let result = database.lock().await.shutdown_writer().await;
+                let _ = reply.send(result);
+                return;
             }
             Command::PublishRanked { build, inventory, files, memory, reply } => {
                 let result = database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await;

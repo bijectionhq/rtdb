@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use futures::StreamExt;
 use journal_contract::{
     Identity, Journal, JournalError, StreamId,
     reference::{FileJournal, Limits},
@@ -1161,6 +1162,20 @@ impl MultiRuntime {
     pub async fn close(self) {
         self.managed_operations.close();
         self.managed_operations.wait().await;
+        let drivers: Vec<_> = self
+            .databases
+            .read()
+            .expect("Multi serving catalog")
+            .values()
+            .cloned()
+            .collect();
+        futures::stream::iter(drivers)
+            .for_each_concurrent(32, |driver| async move {
+                if let Err(error) = driver.shutdown_writer().await {
+                    eprintln!("Multi writer release deferred at shutdown: {}", error.code);
+                }
+            })
+            .await;
         drop(self.databases);
         self.backends.io.close_and_wait().await;
     }

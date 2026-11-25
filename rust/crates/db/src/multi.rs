@@ -185,7 +185,7 @@ impl MultiDatabase {
             self.refuse_pending(lease).await?;
             self.finish_pending_erasure().await?;
             if !selected && !live_nodes.is_empty() {
-                self.append_control(lease, Record::WriterRelease { lease_until: lease.until }).await?;
+                self.append_writer_release(lease).await?;
                 self.withdraw_writer();
                 return Ok(Role::Follower);
             }
@@ -752,6 +752,25 @@ impl MultiDatabase {
         self.committed = Some(state);
         self.require_authority(lease)?;
         Ok(receipt)
+    }
+
+    pub(super) async fn shutdown_writer(&mut self) -> Result<()> {
+        let result = async {
+            let Ok(lease) = self.authority() else {
+                return Ok(());
+            };
+            self.refuse_pending(lease).await?;
+            self.finish_pending_erasure().await?;
+            self.append_writer_release(lease).await
+        }
+        .await;
+        self.candidate = None;
+        self.withdraw_writer();
+        result
+    }
+
+    async fn append_writer_release(&mut self, lease: Lease) -> Result<()> {
+        self.append_control(lease, Record::WriterRelease { lease_until: lease.until }).await
     }
 
     async fn append_control(&mut self, lease: Lease, record: Record) -> Result<()> {

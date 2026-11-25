@@ -16,6 +16,9 @@ Every bind completes before a driver starts.
 Ordinary listener-setup failures close the unstarted node and drain its resource region.
 Inspection-only callers use `ServerDriver::close_without_run` to release bound listeners and drain resources without starting database workers.
 The active server owner requests listener shutdown and joins their connection work before stopping and joining the node.
+In Multi mode, shutdown then joins managed operations and closes each local write pipeline.
+An active writer settles pending work and orders a lease release before storage closes.
+A successor recovers through the sealed end and uses the durable release or lease expiry to establish authority.
 Configured tracing starts a bounded OTLP HTTP exporter under the server owner.
 Shutdown closes trace admission after joining database work, drains admitted exports within thirty seconds and joins the exporter before returning.
 Trace exporter failures report diagnostics without failing user queries or transactions.
