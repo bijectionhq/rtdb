@@ -198,12 +198,17 @@ mod tests {
             until,
         };
         assert_eq!(current_pin(&record, deployment, cut)?, &record.checkpoint_worlds[&pin]);
+        let substitute = |change: fn(&mut DeploymentRecord)| {
+            let mut substituted = record.clone();
+            change(&mut substituted);
+            substituted
+        };
         for substituted in [
-            DeploymentRecord { holder: None, ..record.clone() },
-            DeploymentRecord { epoch: 6, ..record.clone() },
-            DeploymentRecord { log_epoch: record.log_epoch + 1, ..record.clone() },
-            DeploymentRecord { incarnation: record.incarnation + 1, ..record.clone() },
-            DeploymentRecord { storage_generation: Some(Uuid::from_bytes([6; 16])), ..record.clone() },
+            substitute(|record| record.holder = None),
+            substitute(|record| record.epoch = 6),
+            substitute(|record| record.log_epoch += 1),
+            substitute(|record| record.incarnation += 1),
+            substitute(|record| record.storage_generation = Some(Uuid::from_bytes([6; 16]))),
         ] {
             assert!(current_pin(&substituted, deployment, cut).is_err());
         }

@@ -59,7 +59,7 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agen
         advertise_host: None,
         configuration, allocation_limit_bytes: 1 << 30,
         control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), engine_version, agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
-        keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
+        keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()), classic_retained_flight_key: None,
     }).await.unwrap()
 }
 
