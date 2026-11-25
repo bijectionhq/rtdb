@@ -265,12 +265,19 @@ fn decode_columns<'a>(
     let mut output = BatchBuilder::new(metadata(columns.iter().map(|column| column.name.as_str()))?, memory)?;
     let mut arrays = Vec::with_capacity(columns.len());
     let mut fields = Vec::with_capacity(columns.len());
-    let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
     for (index, Column { name, oid, typmod, format }) in columns.iter().enumerate() {
         let vector = vector(*oid);
         let oid = match vector { Some(VectorType::FloatArray(base)) => base, _ => *oid };
+        if vector.is_none() && *format == Format::Binary
+            && let Some((field, array)) = read_source_binary_column(name, oid, count, |row| cell(row, index), &mut output)?
+        {
+            arrays.push(array);
+            fields.push(field);
+            continue;
+        }
         let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
         let text = |row| cell(row, index)?.map(|bytes| std::str::from_utf8(bytes).map_err(protocol)).transpose();
+        let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
         let temporary = (0..count).try_fold(base, |bytes, row| {
             let size = match format {
                 Format::Text => text(row)?.map(|text| text_bound(bound_oid, text)).transpose()?,
@@ -285,19 +292,9 @@ fn decode_columns<'a>(
             fields.push(field);
             continue;
         }
-        let typed = match format {
-            Format::Text => read_source_text_column(name, oid, count, text, &mut output)?,
-            Format::Binary => {
-                match read_source_binary_column(name, oid, count, |row| cell(row, index))? {
-                    Some((field, array)) => {
-                        let bound = array.get_array_memory_size().checked_add(512).ok_or_else(overflow)?;
-                        Some((field, output.column(bound, || Ok(array))?))
-                    }
-                    None => None,
-                }
-            }
-        };
-        if let Some((field, array)) = typed {
+        if *format == Format::Text
+            && let Some((field, array)) = read_source_text_column(name, oid, count, text, &mut output)?
+        {
             arrays.push(array);
             fields.push(field);
             continue;
@@ -455,6 +452,53 @@ pub(crate) mod tests {
         let ipc = |batch: &OwnedBatch| rtdb_format::ipc::write_stream(batch.batch().schema_ref(), std::slice::from_ref(batch.batch())).unwrap();
         assert_eq!(actual.batch().schema(), expected.batch().schema());
         assert!(ipc(&actual) == ipc(&expected));
+    }
+
+    #[test]
+    fn snapshot_binary_text_fits_the_arrow_budget_and_keeps_the_batch_charge() {
+        use arrow_array::StringArray;
+
+        let memory = MemoryBudget::new(48 << 10);
+        let columns = [Column { format: Format::Binary, ..column("name", 1043) }];
+        let text = b"0123456789abcdef0123456789abcdef";
+        let batch = decode_columns(&columns, 1000, &memory, |_| None, |row, _| {
+            Ok((row != 499).then_some(text.as_slice()))
+        }).unwrap();
+        let values = Arc::clone(batch.batch().column(0));
+        drop(batch);
+        let strings = values.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.value(0).as_bytes(), text);
+        assert!(strings.is_null(499));
+        assert_eq!(strings.value(999).as_bytes(), text);
+        assert!(memory.used_bytes() > text.len() * 999);
+        drop(values);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn direct_binary_snapshot_columns_preserve_null_layouts_and_payload_errors() {
+        let memory = MemoryBudget::new(1 << 20);
+        for (oid, payload) in [
+            (16, b"\x02".as_slice()),
+            (21, b"\x00"),
+            (23, b"\x00\x00\x00\x00\x00"),
+            (20, b"\x00"),
+            (25, b"\xff"),
+            (2950, b"\x00"),
+        ] {
+            let columns = [Column { format: Format::Binary, ..column("value", oid) }];
+            let expected = read_source_binary(oid, payload).unwrap_err();
+            let actual = decode_columns(&columns, 1, &memory, |_| None, |_, _| Ok(Some(payload))).unwrap_err();
+            assert_eq!(actual, expected, "OID {oid}");
+            for count in [0, 2] {
+                let batch = decode_columns(&columns, count, &memory, |_| None, |_, _| Ok(None)).unwrap();
+                let field = batch.batch().schema_ref().field(0);
+                assert_eq!(field.data_type(), &arrow_schema::DataType::Null);
+                assert_eq!(field.is_nullable(), count != 0);
+                assert_eq!(batch.batch().num_rows(), count);
+            }
+        }
+        assert_eq!(memory.used_bytes(), 0);
     }
 }
 
