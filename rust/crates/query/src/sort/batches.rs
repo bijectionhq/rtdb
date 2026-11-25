@@ -273,7 +273,7 @@ impl BatchSort {
             if positions.is_empty() {
                 break;
             }
-            let batch = gather(&positions, projection, &context.memory, |lane| {
+            let batch = gather(positions.iter().copied(), projection, &context.memory, |lane| {
                 runs[lane]
                     .batch
                     .as_ref()
@@ -486,15 +486,12 @@ impl MemoryRun {
         let context = &plan.execution.context;
         let count = self.order.len().min(maximum);
         let _scratch = context.memory.reserve(256 + count.saturating_mul(128))?;
-        let positions: Vec<_> = self
-            .order
-            .by_ref()
-            .take(count)
-            .map(|index| self.positions[index])
-            .collect();
-        let batch = gather(&positions, columns, &context.memory, |batch| {
+        let positions = self.order.as_slice()[..count].iter().map(|&index| self.positions[index]);
+        let batch = gather(positions, columns, &context.memory, |batch| {
             &self.batches[batch]
-        })?;
+        });
+        self.order.by_ref().take(count).for_each(drop);
+        let batch = batch?;
         if self.order.len() == 0 {
             self.batches.clear();
         }
@@ -502,19 +499,24 @@ impl MemoryRun {
     }
 }
 
-/// Compacts the source list for this output batch, so unrelated Arrow layouts
-/// do not force the gather through decoded values.
 fn gather<'a>(
-    positions: &[(usize, usize)],
+    positions: impl ExactSizeIterator<Item = (usize, usize)> + Clone,
     columns: &[usize],
     memory: &Arc<MemoryBudget>,
     batch: impl Fn(usize) -> &'a ColumnBatch,
 ) -> Result<ColumnBatch> {
+    if let Some((source, start)) = positions.clone().next()
+        && let Some(end) = start.checked_add(positions.len())
+        && positions.clone().zip(start..end).all(|(position, row)| position == (source, row))
+        && let Some(page) = batch(source).take_sorted_span(start..end, columns, memory)?
+    {
+        return Ok(page);
+    }
+    // Exclude unselected sources so their layouts cannot force a gather through decoded values.
     let mut slots = std::collections::BTreeMap::new();
     let mut sources = Vec::new();
     let rows = positions
-        .iter()
-        .map(|&(source, row)| {
+        .map(|(source, row)| {
             let slot = *slots.entry(source).or_insert_with(|| {
                 let slot = sources.len();
                 sources.push(batch(source));
@@ -769,6 +771,64 @@ fn read_semantic_page(
         rows += count;
     }
     ColumnBatch::take_ranges(sources, &spans, rows, &context.memory)
+}
+
+#[test]
+fn sorted_span_shares_one_source_charge_and_preserves_projection_layout() {
+    use crate::columnar::Column;
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let logical = LogicalType::Scalar(ScalarType::I64).maybe();
+    let key = Int64Array::from_iter_values(0..1024);
+    let value = Int64Array::from_iter_values(2000..3024);
+    let first = value.values()[256..].as_ptr();
+    let second = key.values()[256..].as_ptr();
+    let field = |name: &str| Arc::new(Field::new(name, DataType::Int64, true)
+        .with_metadata(std::collections::HashMap::from([("origin".into(), name.to_owned())])));
+    let columns = [key, value].into_iter().zip(["key", "value"]).map(|(array, name)| {
+        Column::Arrow { array: Arc::new(array), field: field(name), logical: Some(logical.clone()) }
+    }).collect();
+    let source = ColumnBatch::settled(columns, 1024, memory.reserve(1 << 16).unwrap()).unwrap();
+    let original = memory.used_bytes();
+    let page = gather((256..768).map(|row| (0, row)), &[1, 0, 1], &memory, |_| &source).unwrap();
+    assert_eq!(page.len, 512);
+    assert!(memory.used_bytes() < 2 * original);
+    drop(source);
+    assert!(memory.used_bytes() > original);
+    assert_eq!(page.working_set_bytes(&memory).unwrap(), memory.used_bytes());
+    for (column, (name, pointer)) in page.columns.iter().zip([("value", first), ("key", second), ("value", first)]) {
+        let Column::Arrow { array, field: actual, logical: ty } = column else { panic!("Expected a projected Arrow view") };
+        assert_eq!(actual, &field(name));
+        assert_eq!(ty.as_ref(), Some(&logical));
+        let values = array.as_any().downcast_ref::<Int64Array>().unwrap().values();
+        assert_eq!(values.as_ptr(), pointer);
+    }
+    drop(page);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn sparse_sorted_span_releases_large_variable_width_backing() {
+    use crate::columnar::Column;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let memory = MemoryBudget::new(1 << 22);
+    let unused = "x".repeat(1 << 18);
+    let array = StringArray::from(vec![unused.as_str(), "kept"]);
+    let logical = LogicalType::Scalar(ScalarType::Utf8);
+    let column = Column::Arrow { array: Arc::new(array), field: Arc::new(Field::new("payload", DataType::Utf8, false)), logical: Some(logical) };
+    let source = ColumnBatch::settled(vec![column], 2, memory.reserve(1 << 19).unwrap()).unwrap();
+    let page = gather(std::iter::once((0, 1)), &[0], &memory, |_| &source).unwrap();
+    drop(source);
+    assert!(memory.used_bytes() < 8192);
+    assert_eq!(page.columns[0].value(0).unwrap(), Value::Utf8("kept".into()));
+    drop(page);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]
