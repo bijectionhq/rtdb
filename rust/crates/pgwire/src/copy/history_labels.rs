@@ -150,23 +150,38 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn replacement_pages_match_fresh_writer_frames() {
-        use super::super::{CopyArrowEncoder, CopyChunks};
+    #[tokio::test]
+    async fn replacement_and_carried_dictionary_pages_match_writer_frames() {
+        use arrow_ipc::writer::StreamWriter;
+
+        use super::super::{
+            COPY_CHUNK_BYTES, CopyArrowEncoder, Writer, send_copy_arrow, tests::assert_copy_data_frames,
+        };
 
         let first = text_batch(&["[]", "top"]);
         let labels = HistoryLabels::for_schema(first.schema_ref()).unwrap();
         let memory = MemoryBudget::new(1 << 20);
-        let mut encoder = CopyArrowEncoder::new(&labels.schema).unwrap();
-        let header = encoder.chunks.take_header();
-        for input in [first, text_batch(&["top", "[]"]), text_batch(&["top", "[]"])] {
-            let (batch, _charge) = labels.encode(&input, &memory).unwrap();
-            let mut previous = arrow_ipc::writer::StreamWriter::try_new(
-                CopyChunks::new(), &labels.schema,
-            ).unwrap();
-            assert_eq!(previous.get_mut().take_header(), header);
-            previous.write(&batch).unwrap();
-            assert_eq!(encoder.write(&batch, true).unwrap(), previous.get_mut().take_batch());
+        for replace in [true, false] {
+            let (mut encoder, header) = CopyArrowEncoder::new(&labels.schema).unwrap();
+            let mut reference = StreamWriter::try_new(Vec::new(), &labels.schema).unwrap();
+            let mut wire = Writer::new(Vec::new(), Arc::clone(&memory));
+            send_copy_arrow(&mut wire, std::slice::from_ref(&header), usize::MAX).await.unwrap();
+            let expected_header = std::mem::take(reference.get_mut());
+            assert_copy_data_frames(&wire.into_inner(), [expected_header.as_slice()]);
+
+            for input in [first.clone(), text_batch(&["top", "[]"]), text_batch(&["top", "[]"])] {
+                if replace {
+                    reference = StreamWriter::try_new(Vec::new(), &labels.schema).unwrap();
+                    assert_eq!(std::mem::take(reference.get_mut()), expected_header);
+                }
+                let (batch, _charge) = labels.encode(&input, &memory).unwrap();
+                reference.write(&batch).unwrap();
+                let page = encoder.write(&batch, replace, memory.reserve(64 * 1024).unwrap()).unwrap();
+                let mut wire = Writer::new(Vec::new(), Arc::clone(&memory));
+                send_copy_arrow(&mut wire, &page.messages, COPY_CHUNK_BYTES).await.unwrap();
+                let expected = std::mem::take(reference.get_mut());
+                assert_copy_data_frames(&wire.into_inner(), expected.chunks(COPY_CHUNK_BYTES));
+            }
         }
     }
 
