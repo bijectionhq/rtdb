@@ -715,11 +715,23 @@ impl TransactState {
     }
 
     pub fn original_custody_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        self.exact_original_receipt(key, basis, |family| matches!(family,
+            WorkloadFamily::CustodyWrite | WorkloadFamily::OriginalFamilyWrite))
+    }
+
+    pub fn original_writer_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        self.exact_original_receipt(key, basis, |family| matches!(family,
+            WorkloadFamily::CustodyWrite | WorkloadFamily::ClaimWriter))
+    }
+
+    fn exact_original_receipt(
+        &self, key: &[u8], basis: Basis, allows_family: impl Fn(WorkloadFamily) -> bool,
+    ) -> Result<Receipt> {
         validate_key(key)?;
         let mut matches = self.receipts.iter().filter_map(|(namespace, receipts)| {
             let stored = receipts.get(key)?;
             (stored.receipt.basis == basis
-                && (namespace.is_none() || stored.workload == Some(WorkloadFamily::CustodyWrite))
+                && (namespace.is_none() || stored.workload.is_some_and(&allows_family))
                 && !stored.receipt.decision_clock.is_some_and(|offer| offer.booked())
                 && stored.receipt.erasure != Some(Erasure::Pending)
                 && !matches!(stored.receipt.outcome, Outcome::Refused { .. }))
@@ -1266,13 +1278,14 @@ impl TransactState {
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
             if let BranchEffect::ReserveReviewedCustodyPlacement { reviewed, .. } = &effect
-                && (receipt_namespace.is_some() || reviewed.receipt_key != receipt.key)
+                && (receipt_namespace.is_some() && workload != Some(WorkloadFamily::OriginalFamilyWrite)
+                    || reviewed.receipt_key != receipt.key)
             {
                 return Err(invalid_record());
             }
             if let BranchEffect::ActivateCustodyOccurrence { occurrence, .. }
                 | BranchEffect::ActivateDerivedCustodyOccurrence { occurrence, .. } = &effect
-                && (receipt_namespace.is_some() && workload != Some(WorkloadFamily::CustodyWrite)
+                && (receipt_namespace.is_some() && !matches!(workload, Some(WorkloadFamily::CustodyWrite | WorkloadFamily::OriginalFamilyWrite))
                     || !occurrence.receipt_key.is_empty() && occurrence.receipt_key != receipt.key)
             {
                 return Err(invalid_record());

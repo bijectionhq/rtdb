@@ -89,6 +89,7 @@ pub struct CustodyProviderRoute {
     mount: Mutex<Option<CustodyProviderMount>>,
     pub(super) family_vault: Option<super::original_family_landing::NativeFamilyVault>,
     pub(super) family_line_registry: Option<rtdb_types::TableRef>,
+    pub(super) family_authoring_key: Option<[u8; 32]>,
 }
 impl fmt::Debug for CustodyProviderRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -104,6 +105,7 @@ impl CustodyProviderRoute {
             mount: Mutex::new(None),
             family_vault: None,
             family_line_registry: None,
+            family_authoring_key: None,
         }
     }
 
@@ -114,6 +116,15 @@ impl CustodyProviderRoute {
 
     pub(crate) fn owner(&self) -> Option<&str> {
         self.owner.as_deref().filter(|owner| !owner.is_empty())
+    }
+
+    pub fn with_original_family_authoring_key(mut self, key: [u8; 32]) -> Self {
+        self.family_authoring_key = Some(key);
+        self
+    }
+
+    pub(super) fn authority(&self) -> CustodyCarrierAuthority {
+        self.installation.authority
     }
 
     pub fn with_original_family_vault(mut self, path: &std::path::Path) -> rtdb_types::Result<Self> {
@@ -320,6 +331,14 @@ fn session_binding(call: &Call) -> [u8; 32] {
     Sha256::digest(call.session.id.as_bytes()).into()
 }
 
+fn family_review_commitment(source: [u8; 32], claim: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"rtdb/v1/original-family-review\0");
+    hash.update(source);
+    hash.update(Sha256::digest(claim));
+    hash.finalize().into()
+}
+
 fn read_proofs_commitment(proofs: &[Vec<u8>]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"rtdb/v1/custody-read-proofs\0");
@@ -370,12 +389,25 @@ impl Service {
         generation: Option<u64>,
         contributors: CustodyContributors,
         review: Option<(&str, &proto::CustodyReviewSelection)>,
+        claim: Option<&proto::Claim>,
     ) -> Result<(Vec<u8>, proto::CustodyReadInventory), Status> {
         if !contributors.is_empty() && generation.is_none() {
             return Err(unavailable());
         }
-        let route = self.custody_route(call)?;
-        let owner = route.acquire(self, call, database).await?;
+        let (route, owner, deadline) = if super::original_family_landing::is_managed_family(call) {
+            let family = self.managed_family(call).await?;
+            if !Arc::ptr_eq(database, &family.database)
+                || !review.is_some_and(|(branch, selection)| branch == family.scope.branch
+                    && selection.group.as_slice() == family.scope.group)
+                || basis > family.head || basis.incarnation() != family.head.incarnation()
+            {
+                return Err(unavailable());
+            }
+            (family.route, family.owner, family.expires_at)
+        } else {
+            let route = self.custody_route(call)?;
+            (route, route.acquire(self, call, database).await?, Timestamp::MAX)
+        };
         let release = owner
             .response_release(&SystemClock, &call.cancellation)
             .map_err(error::anomaly)?;
@@ -384,7 +416,7 @@ impl Service {
             .await
             .map_err(error::anomaly)?;
         let expires_at = self.0.node.now().0.checked_add(120_000_000)
-            .map(Timestamp).ok_or_else(unavailable)?;
+            .map(Timestamp).ok_or_else(unavailable)?.min(deadline);
         let mut inventory = proto::CustodyReadInventory::default();
         let mut reviewed_source_sha256 = None;
         if !contributors.is_empty() || review.is_some() {
@@ -413,7 +445,12 @@ impl Service {
                     let written_at = index.exact(original.written).map_err(error::anomaly)?.system_time;
                     confirmed_occurrence(call, driver, group, original_commitment, original, written_at).await?
                 };
-                reviewed_source_sha256 = Some(review.commitment(group, original_commitment, selected));
+                let source = review.commitment(group, original_commitment, selected);
+                reviewed_source_sha256 = Some(if super::original_family_landing::is_managed_family(call) {
+                    family_review_commitment(source, &claim.ok_or_else(unavailable)?.value)
+                } else {
+                    source
+                });
                 inventory.reviewed_source = Some(proto::CustodyReviewedSource {
                     cut: Some(proto::CustodyReviewCut {
                         branch: review.branch, basis: Some(review.basis.into()), valid_at_micros: review.valid_at.0,
@@ -451,6 +488,13 @@ impl Service {
         &self, call: &Call, database: &Arc<Database>, request: &Transact,
     ) -> Result<(), Status> {
         let (route, owner, writer) = self.reviewed_custody_writer(call, database).await?;
+        self.authenticate_reviewed_custody_as(call, database, route, &owner, &writer, request).await
+    }
+
+    pub(super) async fn authenticate_reviewed_custody_as(
+        &self, call: &Call, database: &Arc<Database>, route: &CustodyProviderRoute, owner: &CustodyResponseOwner,
+        writer: &rtdb_tx::transact::CustodyWriterFence, request: &Transact,
+    ) -> Result<(), Status> {
         if !request.requires.first().is_some_and(|guard| writer.authenticates(guard)) {
             return Err(unavailable());
         }
@@ -459,16 +503,24 @@ impl Service {
             let cutoff = request.window.before.ok_or_else(|| error::incorrect("A reviewed reservation needs the read proof cutoff"))?;
             let driver = database.serving_driver().ok_or_else(unavailable)?;
             let tokens = database.token_authority().await.map_err(error::anomaly)?;
-            let proof = tokens.open_custody_read(read_proof, route.proof_owner(&owner), session_binding(call)).await.map_err(error::anomaly)?;
+            let proof = tokens.open_custody_read(read_proof, route.proof_owner(owner), session_binding(call)).await.map_err(error::anomaly)?;
+            let reviewed_source = source.commitment(*group, reservation.original, reservation.source);
+            let matches_query = if super::original_family_landing::is_managed_family(call) {
+                request.requires.iter().any(|guard| matches!(guard,
+                    rtdb_tx::transact::Guard::Unchanged(claim)
+                        if proof.reviewed_source_sha256 == Some(family_review_commitment(reviewed_source, claim.as_bytes()))))
+            } else {
+                proof.reviewed_source_sha256 == Some(reviewed_source)
+            };
             if proof.basis != source.basis || proof.expires_at < cutoff || cutoff <= self.0.node.now()
-                || proof.reviewed_source_sha256 != Some(source.commitment(*group, reservation.original, reservation.source))
+                || !matches_query
                 || !proof.contributors.contains(&(*group, reservation.source))
             {
                 return Err(unavailable());
             }
             let groups = proof.contributors.iter().map(|(group, _)| *group).collect();
             let generation = proof.key_generation.ok_or_else(unavailable)?;
-            driver.check_custody_release_delivery(&groups, &writer, Some(generation), &call.cancellation).await.map_err(error::anomaly)?;
+            driver.check_custody_release_delivery(&groups, writer, Some(generation), &call.cancellation).await.map_err(error::anomaly)?;
         }
         self.check_attachment(call, database)
     }

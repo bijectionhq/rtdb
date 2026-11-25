@@ -159,18 +159,29 @@ impl MountedResponseRelease<'_> {
                     return Err(release_unavailable());
                 }
                 let (index, writer) = release.current_with_writer(authority).await?;
+                let current = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, self.clock.now())?;
+                let placement = current.custody_placements()
+                    .find(|entry| entry.group == order.review.group && entry.placement_id == order.destination)
+                    .ok_or_else(release_unavailable)?;
+                let written = placement.occurrence
+                    .filter(|occurrence| occurrence.receipt_key == order.accept_key)
+                    .ok_or_else(release_unavailable)?.written;
+                if !placement.reviewed.is_some_and(|(reviewed, _)| reviewed.receipt_key == order.reserve_key) {
+                    return Err(release_unavailable());
+                }
                 let reserved = release
                     .driver
-                    .tx_status(&order.reserve_key, self.cancellation)
+                    .original_custody_receipt(&order.reserve_key, placement.enrolled, self.cancellation)
                     .await?;
                 let accepted = release
                     .driver
-                    .tx_status(&order.accept_key, self.cancellation)
+                    .original_custody_receipt(&order.accept_key, written, self.cancellation)
                     .await?;
                 if reserved.outcome != Outcome::Then
                     || accepted.outcome != Outcome::Then
                     || reserved.key != order.reserve_key
                     || accepted.key != order.accept_key
+                    || accepted.basis != written
                     || reserved.basis >= accepted.basis
                     || order.review.cut.basis >= reserved.basis
                     || index.exact(reserved.basis)?.system_time != reserved.system_time

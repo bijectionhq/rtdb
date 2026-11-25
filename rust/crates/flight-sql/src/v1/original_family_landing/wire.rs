@@ -15,6 +15,15 @@ pub(super) const MAX_CARRIER_BYTES: usize = 2 * 1024 * 1024;
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
     Scope {},
+    SubmitPlacement {
+        family: String,
+        transaction_b64: String,
+        signature: String,
+    },
+    PlacementReceipt {
+        family: String,
+        key: String,
+    },
     EnrollAuthoring {
         family: String,
         assertion: String,
@@ -113,7 +122,9 @@ impl Request {
     pub(super) fn family(&self) -> Result<Option<[u8; 16]>, Status> {
         let family = match self {
             Self::Scope {} => return Ok(None),
-            Self::EnrollAuthoring { family, .. }
+            Self::SubmitPlacement { family, .. }
+            | Self::PlacementReceipt { family, .. }
+            | Self::EnrollAuthoring { family, .. }
             | Self::SealAuthoring { family, .. }
             | Self::ConfirmAuthoring { family, .. }
             | Self::Reserve { family, .. }

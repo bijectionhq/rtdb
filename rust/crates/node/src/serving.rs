@@ -29,6 +29,13 @@ pub struct QuerySource {
     pub layer: Layer,
 }
 
+pub struct FamilyReviewSelection {
+    pub created: Basis,
+    pub group: CustodyGroupId,
+    pub selected: [u8; 32],
+    pub valid_at: Timestamp,
+}
+
 pub struct WorkloadReadCut {
     pub basis: Basis,
     pub custody_groups: Option<BTreeSet<CustodyGroupId>>,
@@ -233,6 +240,10 @@ pub trait ServingDriver: Send + Sync {
         Err(custody_release::release_unavailable())
     }
 
+    async fn original_writer_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        self.original_custody_receipt(key, basis, cancellation).await
+    }
+
     async fn submit_custody_release(&self, _command: TrustedCustodyCommand, _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no trusted release submission"))
     }
@@ -252,6 +263,16 @@ pub trait ServingDriver: Send + Sync {
     async fn managed_workload(&self, _request: workload::Request,
                               _cancellation: &CancellationToken) -> Result<workload::Reply> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/managed-workload", "The attachment has no managed workload writer"))
+    }
+
+    async fn managed_original_family(&self, _request: workload::Request,
+                                     _cancellation: &CancellationToken) -> Result<workload::Reply> {
+        Err(workload::denied())
+    }
+
+    async fn query_original_family_review(&self, _source: QuerySource, _review: FamilyReviewSelection,
+        _now: Timestamp, _cancellation: &CancellationToken) -> Result<QueryView> {
+        Err(workload::denied())
     }
 
     async fn query_workload_root(

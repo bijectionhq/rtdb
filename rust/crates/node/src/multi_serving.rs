@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
-    ChangeGroup, ChangeOrder, ChangePage, Changes, FundingSubmission, QuerySource, QueryView, ROW_VISIBILITY,
+    ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, FundingSubmission, QuerySource, QueryView, ROW_VISIBILITY,
     ServingDriver, ServingScope, WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
@@ -356,6 +356,14 @@ impl MultiServing {
 
     /// Accepts only the narrow ordered response-release command from an admitted peer.
     pub async fn managed_workload_local(&self, mut request: workload::Request) -> Result<workload::Reply> {
+        if matches!(&request.operation, workload::Operation::Submit {
+            authority: workload::Authority::OriginalFamilyWrite { .. }, ..
+        } | workload::Operation::Status { family: workload::Family::OriginalFamilyWrite, .. }
+            | workload::Operation::ImportedStatus { family: workload::Family::OriginalFamilyWrite, .. }
+            | workload::Operation::Settle { family: workload::Family::OriginalFamilyWrite, .. }
+            | workload::Operation::ImportedSettle { family: workload::Family::OriginalFamilyWrite, .. }) {
+            return Err(workload::denied());
+        }
         if let Some(expected) = &self.classic_workload_fence {
             if let workload::Operation::Status { key, family } = &request.operation {
                 request.operation = workload::Operation::ImportedStatus {
@@ -507,6 +515,46 @@ impl ServingDriver for MultiServing {
                 return route.forward_workload(self.incarnation, request).await;
             }
             local
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn managed_original_family(&self, request: workload::Request,
+                                     cancellation: &CancellationToken) -> Result<workload::Reply> {
+        if self.classic_workload_fence.is_some()
+            || !matches!(&request.operation, workload::Operation::ReadRoot { .. }
+                | workload::Operation::Status { family: workload::Family::OriginalFamilyWrite, .. }
+                | workload::Operation::Submit { authority: workload::Authority::OriginalFamilyWrite { .. }, .. })
+        {
+            return Err(workload::denied());
+        }
+        cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)?
+    }
+
+    async fn query_original_family_review(&self, source: QuerySource, review: FamilyReviewSelection,
+        now: Timestamp, cancellation: &CancellationToken) -> Result<QueryView> {
+        let At::Exactly(basis) = source.at else { return Err(workload::denied()); };
+        if self.classic_workload_fence.is_some() || source.layer != Layer::Merged || basis < review.created {
+            return Err(workload::denied());
+        }
+        cancellation.run_until_cancelled(async {
+            let (index, generation) = self.database.lock().await.fresh_view().await?;
+            index.require_local_custody()?;
+            if index.has_visibility_history() { return Err(workload::denied()); }
+            workload::require_family_branch(&index, &source.branch, review.created, now)?;
+            let view = index.view(&source.branch, At::Exactly(basis), Layer::Merged, now)?;
+            let (_, _, selected) = index.custody_review_at(&source.branch, basis, review.valid_at, review.group, review.selected)?;
+            let target = &selected.target;
+            let event = view.row(&target.table, &target.id, review.valid_at).ok_or_else(workload::denied)?;
+            if view.custody_event_contributor(&target.table, event) != Some((review.group, review.selected)) {
+                return Err(workload::denied());
+            }
+            let snapshot = rtdb_query::branch_family_review_snapshot(&view, &self.memory, &target.table, event)?;
+            self.database.lock().await.check_generation(generation).await?;
+            Ok(QueryView {
+                snapshot, cut: view.cut(), claim: None, scoped_source_basis: None,
+                custody_groups: BTreeSet::from([review.group]), key_generation: Some(generation),
+                custody_contributors: Some(BTreeSet::from([(review.group, review.selected)])),
+            })
         }).await.ok_or_else(interrupted)?
     }
 
@@ -761,6 +809,12 @@ impl ServingDriver for MultiServing {
     async fn original_custody_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
         cancellation.run_until_cancelled(async {
             self.database.lock().await.original_custody_receipt(key, basis).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn original_writer_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        cancellation.run_until_cancelled(async {
+            self.database.lock().await.original_writer_receipt(key, basis).await
         }).await.ok_or_else(interrupted)?
     }
 

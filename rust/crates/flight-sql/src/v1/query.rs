@@ -32,6 +32,7 @@ use crate::{
 
 use super::{
     MAX_PAGE_ROWS, MAX_WAIT, error, head,
+    original_family_landing::{MANAGED_FEATURE, is_managed_family},
     proto::{self, at::Selection},
     tokens::{self, cursor_expired},
     trailer,
@@ -262,7 +263,19 @@ impl Service {
             let generation = generation.ok_or_else(|| error::unavailable("The follower cut has no readable generation"))?;
             return route.reader.check_delivery(_basis, generation, self.0.node.now(), &call.cancellation).await.map_err(error::follower);
         }
-        if call.session.caller.principal.workload_grant().is_some() {
+        if is_managed_family(call) {
+            let family = self.managed_family(call).await?;
+            if !std::ptr::eq(family.database.as_ref(), database) || _basis > family.head
+                || _basis.incarnation() != family.head.incarnation()
+                || groups.len() != 1 || !groups.contains(&family.scope.group)
+            {
+                return Err(error::unsupported(MANAGED_FEATURE));
+            }
+            let driver = database.serving_driver().ok_or_else(|| error::unsupported(MANAGED_FEATURE))?;
+            let index = driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+            rtdb_tx::transact::workload::require_family_branch(&index, &family.scope.branch,
+                family.created()?, self.0.node.now()).map_err(error::anomaly)?;
+        } else if call.session.caller.principal.workload_grant().is_some() {
             let (admitted, cut) = self.workload_root_cut(call).await?;
             if !std::ptr::eq(admitted.as_ref(), database) || !groups.is_empty()
                 || _basis.incarnation() != cut.basis.incarnation() || _basis > cut.basis
@@ -290,7 +303,17 @@ impl Service {
             return Err(error::incorrect("Empty At selector"));
         }
         let workload = call.session.caller.principal.workload_grant();
-        if workload.is_some() && (
+        let managed_family = is_managed_family(call);
+        if managed_family && (
+            !matches!(selection, Some(Selection::Exactly(_))) || !request.track
+                || request.custody_review.is_none() || !request.custody_release_evidence
+                || request.page.is_some() || request.scoped_hold.is_some() || request.observe_receiver_clock
+                || request.observe_applied_position || request.require_clear_rank_input
+                || request.verify_ranked_artefacts || request.ranked_ivf.is_some()
+        ) {
+            return Err(error::unsupported(MANAGED_FEATURE));
+        }
+        if workload.is_some() && !managed_family && (
             !matches!(selection, Some(Selection::Exactly(_) | Selection::Linearizable(_) | Selection::AtLeast(_)))
                 || request.custody_release_evidence
                 || request.require_clear_rank_input
@@ -313,7 +336,19 @@ impl Service {
                 return Err(error::unsupported("query.follower-authority"));
             }
         }
-        let database = self.wire_database(call, &source.branch, layer).await?;
+        let family = if managed_family {
+            let family = self.managed_family(call).await?;
+            if source.branch != family.scope.branch || layer != proto::Layer::Merged {
+                return Err(error::unsupported(MANAGED_FEATURE));
+            }
+            Some(family)
+        } else {
+            None
+        };
+        let database = match &family {
+            Some(family) => Arc::clone(&family.database),
+            None => self.wire_database(call, &source.branch, layer).await?,
+        };
         let driver = database.serving_driver();
         let mut visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
         let scoped_hold = match request.scoped_hold.as_deref() {
@@ -381,7 +416,7 @@ impl Service {
             if visibility.is_some() {
                 self.authorize_scoped_custody(call)?;
             } else {
-                self.custody_route(call)?;
+                if !managed_family { self.custody_route(call)?; }
                 if driver.is_none_or(|driver| !driver.supports_query_tokens()) || !database.wire_tokens_supported() {
                     return Err(error::unsupported("custody release proof"));
                 }
@@ -401,16 +436,23 @@ impl Service {
             Some(driver) => uuid::Uuid::from_bytes(driver.incarnation()),
             None => database.wire_incarnation().await.map_err(error::anomaly)?,
         };
-        let scope = visibility.as_ref().map_or(raw_scope, |scope| {
-            uuid::Uuid::from_bytes(scope.labels.main_read_incarnation(*raw_scope.as_bytes()))
-        });
-        let workload_binding = workload.map(|grant| {
-            let driver = driver.ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
-            let (authority, _, _) = grant.assignment(&call.database, driver.incarnation(), self.0.node.now())
-                .map_err(error::anomaly)?;
-            authority.assignment_binding().map_err(error::anomaly)?
-                .ok_or_else(|| error::unsupported("managed-workload.read-root"))
-        }).transpose()?;
+        let scope = if let Some(grant) = workload.filter(|_| managed_family) {
+            uuid::Uuid::from_bytes(*grant.receipt_namespace().first_chunk::<16>().expect("receipt namespace width"))
+        } else {
+            visibility.as_ref().map_or(raw_scope, |scope| {
+                uuid::Uuid::from_bytes(scope.labels.main_read_incarnation(*raw_scope.as_bytes()))
+            })
+        };
+        let workload_binding = match &family {
+            Some(family) => Some(family.claim_binding()?),
+            None => workload.map(|grant| {
+                let driver = driver.ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
+                let (authority, _, _) = grant.assignment(&call.database, driver.incarnation(), self.0.node.now())
+                    .map_err(error::anomaly)?;
+                authority.assignment_binding().map_err(error::anomaly)?
+                    .ok_or_else(|| error::unsupported("managed-workload.read-root"))
+            }).transpose()?,
+        };
         let request_hash = {
             let _encoding = request.ranked_ivf.as_ref().map(|ranked| call.reserve(ranked.encoded_len())).transpose()?;
             let request_hash = fingerprint(&request);
@@ -453,7 +495,10 @@ impl Service {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
-            let (view, follower_evidence) = if let Some(ranked) = &ranked_ivf {
+            let (view, follower_evidence) = if let Some(family) = &family {
+                let selection = request.custody_review.as_ref().ok_or_else(|| error::unsupported(MANAGED_FEATURE))?;
+                (self.managed_family_review(call, family, query_source, selection).await?, None)
+            } else if let Some(ranked) = &ranked_ivf {
                 let (view, catalog, progress) = self.ranked_view(call, driver, query_source, &ranked.target, now, request.observe_applied_position).await?;
                 ranked_catalog = Some(catalog);
                 (view, progress)
@@ -595,7 +640,8 @@ impl Service {
             } else {
                 let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("custody release proof"))?;
                 let review = request.custody_review.as_ref().map(|review| (source.branch.as_str(), review));
-                let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors, review).await?;
+                let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation,
+                    contributors, review, claim.as_ref()).await?;
                 (Some(proof), Some(inventory))
             }
         } else { (None, None) };

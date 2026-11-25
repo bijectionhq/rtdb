@@ -47,6 +47,40 @@ Authoritative writer identity changes require a custody handoff before the repla
 The configured line registry is a qualified table on the native Original attachment.
 The family vault pins that table for the database incarnation.
 
+#### Managed Multi authoring
+
+Commission `authn.originalFamily` under `!ManagedWorkloadOidc` with `issuerUrl`, `issuerCaCertificate`, `audience` and `clientIdPrefix`.
+Use a distinct HTTPS origin, private root and disjoint client prefix.
+Configure the matching custody provider with its exact `owner`, the existing vault and line registry, and `originalFamilyAuthoringKey`, the independent Ed25519 placement verifier in lowercase hex.
+The provider's signed writer observation must name the exact namespaced ClaimWriter receipt and use the same relation, row and valid instant as the assignment authority point.
+
+The family issuer's UserInfo returns `sub` equal to that `owner` and `rtdb_workload_grant` version 4 with `audience`, `database`, `incarnation`, `grant_id`, `expires_at_micros` and `original_family`.
+The `original_family` object contains `authority` (the installed Original carrier authority), `fence` and `writer` (the existing typed assignment fence and applied ClaimWriter receipt), `branch`, `created` (the 24-byte branch creation Basis), `family` and `group` (nonzero UUID bytes).
+OIDC byte arrays are JSON number arrays with their exact widths.
+Use a bounded Client handshake and keep its bearer for the entire review and reserve exchange.
+Renew with the same issuer subject, grant ID and scope to keep the same receipt namespace.
+
+Require `row-custody.managed-original-family-placement` in the bearer session.
+Call `scope` on `rtdb.v1.OriginalFamilyLanding` to obtain the stage scope, receipt namespace and effective credential expiry.
+Use the existing authoring and landing staging operations for the granted family and an exact tracked merged Query with fields 7 and 13 for its reviewed point.
+This Query exposes the selected row identity, its written coordinate and the reviewed trailer.
+Use the same session's proof and claim in the reviewed reserve, and put the exact signed writer's `Version::Written` first in every placement transaction's `requires`.
+
+Use `submit_placement` with `family`, `transaction_b64` (the exact v1 `TransactRequest` bytes) and a lowercase hexadecimal `signature`.
+The independent placement signer authorizes those exact bytes for that family after validating the application effects.
+The Ed25519 message is the ASCII domain `rtdb/v1/original-family-placement` followed by a NUL, the raw 32-byte receipt namespace and SHA-256 of the raw transaction bytes.
+The first authoring placement and rewrite write may carry signed clear effects on the named branch.
+Each reserve is a single operation.
+The accepting transaction may carry signed clear effects on main, including the two distinct body witnesses at their literal valid instants, and ends with the exact family landing.
+Supply a fresh exclusive window that fits the reviewed proof and ordered branch lifetime.
+
+`submit_placement` returns `receipt_b64`, the v1 `Receipt` protobuf.
+Use `placement_receipt` with `family` and the exact key to recover a positive result from its independently confirmed placement position and credential namespace.
+Recover activation with `activate` on the same current epoch after branch drop or a lost reply.
+The managed credential is scoped to one family and one already created named line.
+Use the independently provisioned Fork and co-ordered registry row for line creation, and the existing independently authorized readback routes for wider application and catalog reads.
+Original response release, disposal and family plaintext opening retain their existing authorization boundaries.
+
 The action takes JSON and returns one JSON object.
 Unless a field ends in `_b64`, byte fields use lowercase hex.
 Fields ending in `_b64` use unpadded base64url.

@@ -17,7 +17,7 @@ use crate::{
 
 mod changes;
 pub(crate) mod custody;
-mod original_family_landing;
+pub(crate) mod original_family_landing;
 pub(crate) mod error;
 mod query;
 mod scoped_hold;
@@ -97,6 +97,22 @@ impl Service {
         action: flight::Action,
     ) -> Result<Response<Output<flight::Result>>, Status> {
         let outcome = match action.r#type.as_str() {
+            CAPABILITIES if original_family_landing::is_managed_family(&call) => async {
+                decode::<proto::CapabilitiesRequest>(action.body)?;
+                self.managed_family(&call).await?;
+                Ok(proto::CapabilitiesResponse {
+                    api: API.into(),
+                    features: [
+                        original_family_landing::FEATURE, original_family_landing::MANAGED_FEATURE,
+                        ROW_CUSTODY, REVIEWED_CUSTODY_PLACEMENT, "query", "query.track",
+                    ].map(str::to_owned).into(),
+                    limits: Some(proto::Limits {
+                        max_page_rows: 0, max_change_groups: 0, max_wait_millis: 0,
+                        min_key_bytes: 16, max_key_bytes: 64,
+                    }),
+                    server_time_micros: self.0.node.now().0,
+                }.encode_to_vec())
+            }.await,
             CAPABILITIES if call.session.caller.principal.workload_grant().is_some() => async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 let database = self.require_workload_root_read(&call).await?;

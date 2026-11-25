@@ -53,7 +53,10 @@ impl MountedResponseRelease<'_> {
                 return Err(release_unavailable());
             }
             if let Some(line) = &authoring.line {
-                let receipt = release.driver.tx_status(&line.creation_key, self.cancellation).await?;
+                require_line_registration(&index, authoring, line, index.exact(authoring.branch_created)?.system_time)?;
+                let receipt = release.driver.original_custody_receipt(
+                    &line.creation_key, authoring.branch_created, self.cancellation,
+                ).await?;
                 if receipt.outcome != Outcome::Then
                     || receipt.key != line.creation_key
                     || receipt.basis != authoring.branch_created
@@ -62,7 +65,6 @@ impl MountedResponseRelease<'_> {
                     return Err(release_unavailable());
                 }
                 require_writer_at(&index, &writer, receipt.basis, receipt.system_time)?;
-                require_line_registration(&index, authoring, line, receipt.system_time)?;
             }
             if let Some(rewrite) = &authoring.rewrite {
                 let (original, source) =
@@ -98,11 +100,19 @@ impl MountedResponseRelease<'_> {
                     return Err(release_unavailable());
                 }
                 let (index, writer) = release.current_with_writer(authority).await?;
-                let receipt = release.driver.tx_status(&authoring.write_key, self.cancellation).await?;
-                if receipt.outcome != Outcome::Then || receipt.key != authoring.write_key {
+                let current = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, self.clock.now())?;
+                let written = current.custody_placements()
+                    .find(|entry| entry.group == authoring.group && entry.placement_id == authoring.placement)
+                    .and_then(|entry| entry.occurrence)
+                    .filter(|occurrence| occurrence.receipt_key == authoring.write_key)
+                    .ok_or_else(release_unavailable)?.written;
+                let receipt = release.driver.original_custody_receipt(
+                    &authoring.write_key, written, self.cancellation,
+                ).await?;
+                if receipt.outcome != Outcome::Then || receipt.key != authoring.write_key || receipt.basis != written {
                     return Err(release_unavailable());
                 }
-                let view = index.view(MAIN_BRANCH, At::Exactly(receipt.basis), Layer::Merged, self.clock.now())?;
+                let view = index.view(MAIN_BRANCH, At::Exactly(written), Layer::Merged, self.clock.now())?;
                 if !view.lineage().iter().any(|branch| {
                     branch.branch == authoring.target.branch
                         && branch.created == authoring.branch_created
@@ -134,7 +144,9 @@ impl MountedResponseRelease<'_> {
                     Some(rewrite) => {
                         let (reserved, at) =
                             index.custody_reservation_at(authoring.group, authoring.placement, receipt.basis)?;
-                        let reserve = release.driver.tx_status(&rewrite.reserve_key, self.cancellation).await?;
+                        let reserve = release.driver.original_custody_receipt(
+                            &rewrite.reserve_key, at, self.cancellation,
+                        ).await?;
                         if reserve.outcome != Outcome::Then
                             || reserve.key != rewrite.reserve_key
                             || reserve.basis != at

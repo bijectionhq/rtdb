@@ -1605,6 +1605,8 @@ async fn checked_workload_custody_retains_its_namespaced_receipt_across_checkpoi
     let fence = Fence { placement, applied: applied(placed, [1; 32]) };
     let claim = Authority::ClaimWriter { fence: fence.clone() };
     let original = receipt(writes.workload(command([2; 32], submit(2, claim, None))).await.unwrap());
+    let writer_key = original.key.clone();
+    let writer_basis = original.basis;
     let writer = applied(original, [2; 32]);
     let group = [4; 16];
     let mut transaction = request(3, Op::CreateCustodyGroup { group });
@@ -1635,6 +1637,9 @@ async fn checked_workload_custody_retains_its_namespaced_receipt_across_checkpoi
     assert!(matches!(successor.tick(&live(2)).await.unwrap(), Role::Writer(_)));
     let recovered = successor.original_custody_receipt(&retained.key, retained.basis).await.unwrap();
     assert_eq!(recovered, Receipt { replayed: true, ..retained.clone() });
+    assert!(successor.original_custody_receipt(&writer_key, writer_basis).await.is_err());
+    assert_eq!(successor.original_writer_receipt(&writer_key, writer_basis).await.unwrap().basis, writer_basis);
+    assert!(successor.original_writer_receipt(&writer_key, retained.basis).await.is_err());
     let writes = WritePipeline::start(Arc::new(Mutex::new(successor)));
     let status = |family| Operation::Status { key: retained.key.clone(), family };
     assert_eq!(writes.workload(command([3; 32], status(Family::Write))).await.err().unwrap().code, "rtdb/unknown-transaction");

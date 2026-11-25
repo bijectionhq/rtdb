@@ -27,6 +27,17 @@ impl Point {
     }
 }
 
+pub fn require_family_branch(index: &BranchIndex, branch: &str, created: Basis, now: Timestamp) -> Result<()> {
+    let view = index.view(branch, At::Latest, Layer::Merged, now)?;
+    if view.lineage().iter().any(|line| line.branch == branch && line.created == created
+        && line.writable && line.dropped.is_none() && line.expires_at.is_none_or(|until| now < until))
+    {
+        Ok(())
+    } else {
+        Err(stale())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Holder {
@@ -110,6 +121,7 @@ pub enum Family {
     CloseWriter,
     CloseEmptyAssignment,
     CustodyWrite,
+    OriginalFamilyWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +151,14 @@ pub enum Authority {
     CustodyWrite {
         fence: Fence,
         writer: Applied,
+        request_digest: [u8; 32],
+    },
+    OriginalFamilyWrite {
+        fence: Fence,
+        writer: Applied,
+        branch: String,
+        created: Basis,
+        group: CustodyGroupId,
         request_digest: [u8; 32],
     },
     CloseWriter {
@@ -241,6 +261,11 @@ impl Authority {
                 writer,
                 request_digest,
             } => held(fence) && applied(writer) && *request_digest != [0; 32],
+            Self::OriginalFamilyWrite { fence, writer, branch, created, group, request_digest } =>
+                held(fence) && applied(writer) && branch != MAIN_BRANCH
+                    && rtdb_types::rtdb_v1::valid_branch_name(branch)
+                    && created.incarnation() == incarnation && created.position() > 0
+                    && *group != [0; 16] && *request_digest != [0; 32],
             Self::CloseWriter {
                 fence,
                 writer,
@@ -262,18 +287,26 @@ impl Authority {
             Self::ObservePlacement { fence: value } => fence(value),
             Self::PredecessorEvidence { predecessor: value } => predecessor(value),
             Self::ReceiptRecovery {
-                original_namespace, ..
-            } => *original_namespace != [0; 32],
+                original_namespace, family,
+            } => *original_namespace != [0; 32] && *family != Family::OriginalFamilyWrite,
             Self::AttemptSettlement {
                 original_namespace,
+                family,
                 key,
                 request_digest,
                 ..
-            } => *original_namespace != [0; 32] && valid_key(key) && *request_digest != [0; 32],
+            } => *original_namespace != [0; 32] && *family != Family::OriginalFamilyWrite
+                && valid_key(key) && *request_digest != [0; 32],
         }
     }
 
     pub fn assignment_binding(&self) -> Result<Option<[u8; 32]>> {
+        if let Self::OriginalFamilyWrite { fence, writer, branch, created, group, .. } = self {
+            let mut hash = Sha256::new();
+            hash.update(b"rtdb.v1/original-family-claim\0");
+            hash.update(serde_json::to_vec(&(fence, writer, branch, created, group)).map_err(|_| denied())?);
+            return Ok(Some(hash.finalize().into()));
+        }
         let (fence, writer) = match self {
             Self::ReadRoot { fence, writer }
             | Self::ReadCustody { fence, writer, .. }
@@ -295,6 +328,7 @@ impl Authority {
             Self::ClaimWriter { .. } => Family::ClaimWriter,
             Self::Write { .. } => Family::Write,
             Self::CustodyWrite { .. } => Family::CustodyWrite,
+            Self::OriginalFamilyWrite { .. } => Family::OriginalFamilyWrite,
             Self::CloseWriter { .. } | Self::CloseWriterGuarded { .. } => Family::CloseWriter,
             Self::CloseEmptyAssignment { .. } => Family::CloseEmptyAssignment,
             _ => return None,
@@ -588,6 +622,7 @@ impl Request {
                     return Err(denied());
                 }
                 if matches!(authority, Authority::CustodyWrite { request_digest, .. }
+                    | Authority::OriginalFamilyWrite { request_digest, .. }
                     | Authority::CloseWriterGuarded { request_digest, .. } if request_digest != digest)
                 {
                     return Err(denied());
@@ -598,6 +633,19 @@ impl Request {
                 };
                 if let Some(receipt) = state.recover_workload(self.namespace, key, commitment)? {
                     return Ok(Prepared::Answer(Reply::Receipt(receipt)));
+                }
+                if let Authority::OriginalFamilyWrite { .. } = authority {
+                    for place in transaction.iter().flat_map(|tx| &tx.ops).filter_map(|op| match op {
+                        Op::LandCustodyBranch { placements, .. } => Some(placements),
+                        _ => None,
+                    }).flatten() {
+                        let stored = state.workload_receipt(self.namespace, &place.reserve_key)?;
+                        if stored.workload != Some(Family::OriginalFamilyWrite)
+                            || stored.receipt.basis != place.reserved_at || stored.receipt.outcome != Outcome::Then
+                        {
+                            return Err(denied());
+                        }
+                    }
                 }
                 let transaction =
                     self.point
@@ -626,6 +674,9 @@ impl Request {
         digest: [u8; 32],
         after: Option<Basis>,
     ) -> Result<Prepared> {
+        if family == Family::OriginalFamilyWrite {
+            return Err(denied());
+        }
         let head = state.index.head().basis;
         if after.is_some_and(|after| head.incarnation() != after.incarnation() || head < after) {
             return Err(stale());
@@ -688,7 +739,11 @@ impl Request {
         let Operation::Submit { authority, .. } = &self.operation else {
             return Err(denied());
         };
-        self.point.check_current(state, now, authority)
+        self.point.check_current(state, now, authority)?;
+        if let Authority::OriginalFamilyWrite { branch, created, .. } = authority {
+            require_family_branch(state.index(), branch, *created, now)?;
+        }
+        Ok(())
     }
 }
 
@@ -781,6 +836,39 @@ impl Point {
                     transaction,
                     matches!(authority, Authority::CustodyWrite { .. }),
                 )?;
+                return Ok(transaction.clone());
+            }
+            Authority::OriginalFamilyWrite { branch, created, group, .. } => {
+                let transaction = transaction.filter(|tx| tx.key == key).ok_or_else(denied)?;
+                require_family_branch(state.index(), branch, *created, now)?;
+                let data_branch = if transaction.uses_reviewed_custody() { MAIN_BRANCH } else { branch };
+                if !transaction.uses_custody() || !transaction.otherwise.is_empty()
+                    || transaction.custody_request_digest.is_some() || state.index.has_visibility_history()
+                    || transaction.ops.iter().any(|op| match op {
+                        Op::Put { branch: target, table, rows, .. } =>
+                            target != data_branch || *table == self.table
+                                || rows.iter().any(|row| row.custody_group.is_some()
+                                    || row.custody_payload.is_some() || !row.protected_columns.is_empty()
+                                    || state.index.has_custody_address(table, &row.id)),
+                        Op::Delete { branch: target, table, ids, .. } =>
+                            target != data_branch || *table == self.table
+                                || ids.iter().any(|id| state.index.has_custody_address(table, id)),
+                        Op::PlaceCustodyRow { branch: target, table, row, .. } =>
+                            target != branch || *table == self.table || row.custody_group != Some(*group),
+                        Op::ReserveCustodyPlacement { group: target, reservation } =>
+                            target != group || reservation.target.branch != *branch || reservation.target.table == self.table,
+                        Op::ReserveReviewedCustodyPlacement { group: target, source, reservation, .. } =>
+                            target != group || source.branch != *branch || reservation.target.branch != MAIN_BRANCH
+                                || reservation.target.table == self.table,
+                        Op::LandCustodyBranch { branch: source, placements } =>
+                            source != branch || placements.len() != 1 || placements[0].table == self.table
+                                || placements[0].row.custody_group != Some(*group),
+                        Op::CreateCustodyGroup { group: target } => target != group,
+                        _ => true,
+                    })
+                {
+                    return Err(denied());
+                }
                 return Ok(transaction.clone());
             }
             _ => return Err(denied()),
@@ -982,6 +1070,7 @@ impl Point {
             | Authority::ReadCustody { fence, writer, .. }
             | Authority::Write { fence, writer }
             | Authority::CustodyWrite { fence, writer, .. }
+            | Authority::OriginalFamilyWrite { fence, writer, .. }
             | Authority::CloseWriter { fence, writer, .. }
             | Authority::CloseWriterGuarded { fence, writer, .. } => {
                 self.fence(state, fence, now)?;

@@ -351,6 +351,18 @@ surface StatelessDatabase {
         -- A separate disposal credential confirms positive transport disposition and the exact revoked group drain.
         -- Original writer identity and delivery fences remain current when the writer admits the response.
 
+    @guarantee ManagedOriginalFamilyPlacement
+        -- An independently commissioned issuer and placement signer authorize one Original owner, database incarnation, named writable branch creation, custody family, group and assignment epoch.
+        -- The active local writer verifies the mounted Original's signed writer observation against the exact ordered assignment and writer receipts.
+        -- The family credential serves capabilities, the private family action and an exact tracked merged Query selecting a confirmed occurrence.
+        -- The Query exposes the selected point identity and binds its claim, reviewed evidence and delivery to that session, mount and credential lifetime.
+        -- The family action enrolls and seals stages before it accepts a signed exact placement request for those stages.
+        -- A reviewed reservation consumes the claim and proof from the same Query.
+        -- The accepting arm settles the retained namespaced reservation, protected placement, paired application witnesses and source drop together under the current assignment and deadline.
+        -- Family receipt recovery derives the position from the enrolled placement and reads the credential's retained namespace at that position.
+        -- Branch creation is confirmed at the registered creation Basis and authoring is confirmed at the physical occurrence's Written Basis.
+        -- The active epoch can recover its exact landing after the source branch drops.
+
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.
         -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.

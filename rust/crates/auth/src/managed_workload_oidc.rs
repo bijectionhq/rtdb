@@ -75,6 +75,7 @@ pub struct ManagedWorkloadOidcConfig {
     create: WorkloadIssuerConfig,
     assignment: WorkloadIssuerConfig,
     scoped_audience: Option<ScopedAudienceIssuerConfig>,
+    original_family: Option<WorkloadIssuerConfig>,
 }
 
 impl ManagedWorkloadOidcConfig {
@@ -100,11 +101,12 @@ impl ManagedWorkloadOidcConfig {
             create,
             assignment,
             scoped_audience: None,
+            original_family: None,
         })
     }
 
     pub fn with_scoped_audience(mut self, scope: ScopedAudienceIssuerConfig) -> Result<Self> {
-        for workload in [&self.create, &self.assignment] {
+        for workload in [&self.create, &self.assignment].into_iter().chain(self.original_family.as_ref()) {
             if scope.issuer_url.origin() == workload.issuer_url.origin() {
                 return Err(invalid(
                     "The scoped audience issuer requires a distinct HTTPS origin",
@@ -120,6 +122,24 @@ impl ManagedWorkloadOidcConfig {
         Ok(self)
     }
 
+    pub fn with_original_family(mut self, mut issuer: WorkloadIssuerConfig) -> Result<Self> {
+        let conflicts = |url: &Url, prefix: &str| issuer.issuer_url.origin() == url.origin()
+            || prefixes_overlap(issuer.grants.client_id_prefix(), prefix);
+        if issuer.grants.assignment().is_some()
+            || [&self.create, &self.assignment].iter().any(|other|
+                conflicts(&other.issuer_url, other.grants.client_id_prefix()))
+            || self.scoped_audience.as_ref().is_some_and(|scope|
+                conflicts(&scope.issuer_url, &scope.client_id_prefix))
+        {
+            return Err(invalid("Original family authoring requires a distinct issuer origin and client ID prefix"));
+        }
+        issuer.grants = issuer.grants.for_original_family(
+            self.assignment.grants.assignment().ok_or_else(|| invalid("Missing Original authority point"))?.clone(),
+        );
+        self.original_family = Some(issuer);
+        Ok(self)
+    }
+
     pub fn create(&self) -> &WorkloadIssuerConfig {
         &self.create
     }
@@ -129,12 +149,17 @@ impl ManagedWorkloadOidcConfig {
     pub fn scoped_audience(&self) -> Option<&ScopedAudienceIssuerConfig> {
         self.scoped_audience.as_ref()
     }
+
+    pub fn original_family(&self) -> Option<&WorkloadIssuerConfig> {
+        self.original_family.as_ref()
+    }
 }
 
 pub(crate) struct ManagedWorkloadOidc {
     create: Arc<oidc::Provider>,
     assignment: Arc<oidc::Provider>,
     scoped_audience: Option<Arc<oidc::Provider>>,
+    original_family: Option<Arc<oidc::Provider>>,
 }
 
 impl ManagedWorkloadOidc {
@@ -190,6 +215,15 @@ impl ManagedWorkloadOidc {
             assignment_http,
         )
         .await?;
+        let original_family = match config.original_family {
+            Some(issuer) => {
+                let http = transport(&issuer.issuer_url, &issuer.issuer_ca_pem)?;
+                Some(oidc::Provider::open_workload(
+                    issuer.issuer_url, issuer.grants, Arc::clone(memory), Arc::clone(&clock), http,
+                ).await?)
+            }
+            None => None,
+        };
         let scoped_audience = match scoped {
             Some((scope, http)) => Some(
                 oidc::Provider::open_scoped_audience(
@@ -207,6 +241,7 @@ impl ManagedWorkloadOidc {
             create,
             assignment,
             scoped_audience,
+            original_family,
         })
     }
 
@@ -217,10 +252,12 @@ impl ManagedWorkloadOidc {
             self.scoped_audience
                 .as_ref()
                 .filter(|provider| provider.accepts_scoped_audience(id)),
+            self.original_family.as_ref().filter(|provider| provider.workload_config(id).is_some()),
         ) {
-            (Some(_), None, None) => (&self.create, VerifiedWorkloadGrant::is_create),
-            (None, Some(_), None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment_issued),
-            (None, None, Some(provider)) => return provider.client_credentials(id, secret).await,
+            (Some(_), None, None, None) => (&self.create, VerifiedWorkloadGrant::is_create),
+            (None, Some(_), None, None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment_issued),
+            (None, None, Some(provider), None) => return provider.client_credentials(id, secret).await,
+            (None, None, None, Some(provider)) => (provider, VerifiedWorkloadGrant::is_original_family),
             _ => return Err(workload_grant::invalid_grant()),
         };
         let principal = provider.client_credentials(id, secret).await?;

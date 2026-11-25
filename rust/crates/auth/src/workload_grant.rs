@@ -1,7 +1,7 @@
 use rtdb_node::serving::custody_release::CustodyCarrierAuthority;
-use rtdb_types::{Anomaly, Result, Timestamp};
-use rtdb_tx::transact::workload::{Authority, Point};
-use serde::Deserialize;
+use rtdb_types::{Anomaly, Result, Timestamp, rtdb_v1::{Basis, MAIN_BRANCH, valid_branch_name}};
+use rtdb_tx::transact::workload::{Applied, Authority, Fence, Point};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{Method, MethodRule, forbidden};
@@ -14,6 +14,7 @@ pub struct WorkloadGrantConfig {
     audience: String,
     client_id_prefix: String,
     assignment: Option<Point>,
+    original_family: bool,
 }
 
 impl WorkloadGrantConfig {
@@ -28,6 +29,7 @@ impl WorkloadGrantConfig {
             audience,
             client_id_prefix,
             assignment: None,
+            original_family: false,
         })
     }
 
@@ -37,6 +39,12 @@ impl WorkloadGrantConfig {
     }
 
     pub fn assignment(&self) -> Option<&Point> { self.assignment.as_ref() }
+
+    pub(crate) fn for_original_family(mut self, point: Point) -> Self {
+        self.assignment = Some(point);
+        self.original_family = true;
+        self
+    }
 
     pub fn validate_rules(&self, rules: &[MethodRule]) -> Result<()> {
         if self.assignment.is_some()
@@ -81,6 +89,32 @@ struct OriginalCustodyControl {
     authority: CustodyCarrierAuthority,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFamilyGrant {
+    pub authority: CustodyCarrierAuthority,
+    pub fence: Fence,
+    pub writer: Applied,
+    pub branch: String,
+    pub created: [u8; Basis::WIDTH],
+    pub family: [u8; 16],
+    pub group: [u8; 16],
+}
+
+impl OriginalFamilyGrant {
+    fn valid(&self, incarnation: [u8; 16]) -> bool {
+        self.authority.incarnation == incarnation
+            && self.authority.installation != [0; 16]
+            && self.authority.source_history != [0; 32]
+            && self.authority.registry != [0; 32]
+            && self.authority.original_writer != [0; 32]
+            && self.family != [0; 16] && self.group != [0; 16]
+            && self.branch != MAIN_BRANCH && valid_branch_name(&self.branch)
+            && Basis::from_bytes(&self.created).is_ok_and(|basis| basis.incarnation() == incarnation && basis.position() > 0)
+            && Authority::ReadRoot { fence: self.fence.clone(), writer: self.writer.clone() }.valid(incarnation)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Claim<'a> {
@@ -93,6 +127,7 @@ struct Claim<'a> {
     operations: Option<[WorkloadOperation; 1]>,
     authority: Option<Authority>,
     original_custody: Option<OriginalCustodyControl>,
+    original_family: Option<OriginalFamilyGrant>,
 }
 
 pub struct VerifiedWorkloadGrant {
@@ -107,6 +142,7 @@ enum Permission {
     Create(WorkloadOperation),
     Assignment { authority: Box<Authority>, point: Point },
     OriginalCustody(OriginalCustodyControl),
+    OriginalFamily { scope: Box<OriginalFamilyGrant>, point: Point },
 }
 
 impl VerifiedWorkloadGrant {
@@ -132,11 +168,23 @@ impl VerifiedWorkloadGrant {
         {
             return Err(invalid_grant());
         }
-        let permission = match (claim.version, claim.operations, claim.authority, claim.original_custody, config.assignment()) {
+        let permission = if config.original_family {
+            match (claim.version, claim.original_family, config.assignment()) {
+                (4, Some(scope), Some(point)) if ["operations", "authority", "original_custody"].iter()
+                    .all(|field| claim_field_absent(raw, field)) && scope.valid(claim.incarnation) =>
+                    Permission::OriginalFamily { scope: Box::new(scope), point: point.clone() },
+                _ => return Err(invalid_grant()),
+            }
+        } else {
+            if !claim_field_absent(raw, "original_family") {
+                return Err(invalid_grant());
+            }
+            match (claim.version, claim.operations, claim.authority, claim.original_custody, config.assignment()) {
             (1, Some([operation]), None, None, _) if claim_field_absent(raw, "authority")
                 && claim_field_absent(raw, "original_custody") => Permission::Create(operation),
             (2, None, Some(authority), None, Some(point)) if claim_field_absent(raw, "operations")
-                && claim_field_absent(raw, "original_custody") && authority.valid(claim.incarnation) =>
+                && claim_field_absent(raw, "original_custody") && authority.valid(claim.incarnation)
+                && !matches!(authority, Authority::OriginalFamilyWrite { .. }) =>
                 Permission::Assignment { authority: Box::new(authority), point: point.clone() },
             (3, None, None, Some(control), Some(_)) if claim_field_absent(raw, "operations")
                 && claim_field_absent(raw, "authority") && control.authority.incarnation == claim.incarnation
@@ -144,6 +192,7 @@ impl VerifiedWorkloadGrant {
                 && control.authority.registry != [0; 32] && control.authority.original_writer != [0; 32] =>
                 Permission::OriginalCustody(control),
             _ => return Err(invalid_grant()),
+            }
         };
         let mut hash = Sha256::new();
         hash.update(b"rtdb.v1/workload-receipt\0");
@@ -152,6 +201,10 @@ impl VerifiedWorkloadGrant {
         for identity in [issuer, audience, subject, claim.database] {
             hash.update((identity.len() as u64).to_be_bytes());
             hash.update(identity.as_bytes());
+        }
+        if let Permission::OriginalFamily { scope, .. } = &permission {
+            hash.update(b"rtdb.v1/original-family\0");
+            hash.update(serde_json::to_vec(scope.as_ref()).map_err(|_| invalid_grant())?);
         }
         Ok(Self {
             database: claim.database.into(),
@@ -174,6 +227,22 @@ impl VerifiedWorkloadGrant {
 
     pub fn is_original_custody_control(&self) -> bool {
         matches!(self.permission, Permission::OriginalCustody(_))
+    }
+
+    pub fn is_original_family(&self) -> bool {
+        matches!(self.permission, Permission::OriginalFamily { .. })
+    }
+
+    pub fn original_family(
+        &self, database: &str, authority: CustodyCarrierAuthority, now: Timestamp,
+    ) -> Result<(&OriginalFamilyGrant, &Point, Timestamp)> {
+        self.revalidate(now)?;
+        match &self.permission {
+            Permission::OriginalFamily { scope, point }
+                if self.database == database && scope.authority == authority =>
+                Ok((scope, point, self.expires_at)),
+            _ => Err(invalid_grant()),
+        }
     }
 
     pub fn admit_original_custody(
@@ -233,7 +302,7 @@ impl VerifiedWorkloadGrant {
         self.revalidate(now)?;
         match &self.permission {
             Permission::Assignment { authority, point } => Ok((authority, point, self.expires_at)),
-            Permission::Create(_) | Permission::OriginalCustody(_) => Err(invalid_grant()),
+            _ => Err(invalid_grant()),
         }
     }
 
@@ -247,7 +316,7 @@ impl VerifiedWorkloadGrant {
     pub(super) fn memory_bytes(&self) -> usize {
         self.database.capacity() + match &self.permission {
             Permission::Create(_) | Permission::OriginalCustody(_) => 0,
-            Permission::Assignment { .. } => 8192,
+            Permission::Assignment { .. } | Permission::OriginalFamily { .. } => 8192,
         }
     }
 }
@@ -261,4 +330,59 @@ pub(super) fn invalid_grant() -> Anomaly {
         "rtdb.auth/workload-grant",
         "The credential cannot be admitted for managed workload access",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use rtdb_tx::transact::workload::{Holder, Placement};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn original_family_grant_requires_its_issuer_and_binds_line_and_epoch() {
+        let incarnation = [1; 16];
+        let authority = CustodyCarrierAuthority {
+            incarnation, installation: [2; 16], source_history: [3; 32], registry: [4; 32], original_writer: [5; 32],
+        };
+        let applied = |position| Applied {
+            namespace: [6; 32], key: vec![7; 16], basis: Basis::new(incarnation, position).to_bytes(), system_time_micros: 10,
+        };
+        let mut scope = OriginalFamilyGrant {
+            authority, branch: "draft".into(), created: Basis::new(incarnation, 3).to_bytes(),
+            family: [8; 16], group: [9; 16], writer: applied(2),
+            fence: Fence { applied: applied(1), placement: Placement { epoch: 1,
+                assignment: Some(Holder { assignment_id: [10; 16], holder: "holder".into() }),
+            }},
+        };
+        let raw = |scope: &OriginalFamilyGrant| json!({
+            "version": 4, "audience": "families", "database": "exact", "incarnation": incarnation,
+            "grant_id": [11; 16], "expires_at_micros": 100, "original_family": scope,
+        });
+        let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
+            raw, "https://family.example.invalid/", config, "owner", Timestamp(90), Timestamp(0),
+        );
+        let point = Point::new("public.writer", "owner".into(), Timestamp(0)).unwrap();
+        let assignment = WorkloadGrantConfig::new("families".into(), "assignment-".into()).unwrap().with_assignment(point.clone());
+        let family = WorkloadGrantConfig::new("families".into(), "family-".into()).unwrap().for_original_family(point);
+        assert!(verify(&raw(&scope), &assignment).is_err());
+        let first = verify(&raw(&scope), &family).unwrap();
+        assert!(first.is_original_family());
+        assert!(first.assignment("exact", incarnation, Timestamp(0)).is_err());
+        assert!(first.original_family("other", authority, Timestamp(0)).is_err());
+        assert!(first.original_family("exact", authority, Timestamp(90)).is_err());
+        assert!(verify(&json!({
+            "version": 2, "audience": "families", "database": "exact", "incarnation": incarnation,
+            "grant_id": [11; 16], "expires_at_micros": 100,
+            "authority": { "role": "receipt-recovery", "original_namespace": first.receipt_namespace(),
+                "family": "original-family-write" },
+        }), &assignment).is_err());
+        scope.fence.placement.epoch = 2;
+        let successor = verify(&raw(&scope), &family).unwrap();
+        assert_ne!(first.receipt_namespace(), successor.receipt_namespace());
+        scope.created = Basis::new(incarnation, 4).to_bytes();
+        assert_ne!(successor.receipt_namespace(), verify(&raw(&scope), &family).unwrap().receipt_namespace());
+        scope.branch = MAIN_BRANCH.into();
+        assert!(verify(&raw(&scope), &family).is_err());
+    }
 }

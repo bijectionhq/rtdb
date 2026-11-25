@@ -36,6 +36,9 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
                     "client_id_prefix": scope.client_id_prefix(),
                 });
             }
+            if let Some(issuer) = config.original_family() {
+                authentication["original_family"] = describe_workload_issuer(issuer, "authn.originalFamily.issuerUrl", report);
+            }
             authentication
         }
     });

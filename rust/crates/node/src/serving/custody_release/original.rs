@@ -103,26 +103,16 @@ impl<'a> AttachedCustodyCarrierJournal<'a> {
         self.attachment
     }
 
-    async fn confirm_receipt(
-        &self,
-        expected: &OriginalReceipt,
-        cancellation: &CancellationToken,
-    ) -> Result<Receipt> {
-        if expected.basis.incarnation() != self.authority.incarnation {
-            return Err(release_unavailable());
-        }
-        let receipt = self
-            .attachment
-            .original_custody_receipt(&expected.key, expected.basis, cancellation)
-            .await?;
-        if receipt.key != expected.key
+    fn confirm_receipt(&self, expected: &OriginalReceipt, receipt: &Receipt) -> Result<()> {
+        if expected.basis.incarnation() != self.authority.incarnation
+            || receipt.key != expected.key
             || receipt.basis != expected.basis
             || receipt.system_time != expected.system_time
             || matches!(receipt.outcome, Outcome::Refused { .. })
         {
             return Err(release_unavailable());
         }
-        Ok(receipt)
+        Ok(())
     }
 }
 
@@ -152,10 +142,12 @@ impl CustodyCarrierJournal for AttachedCustodyCarrierJournal<'_> {
             .await?;
         if original_writer_commitment(self.authority.installation, &observed.key)
             != self.authority.original_writer
-            || self.confirm_receipt(&observed, cancellation).await?.outcome != Outcome::Then
         {
             return Err(release_unavailable());
         }
+        let receipt = self.attachment.original_writer_receipt(&observed.key, observed.basis, cancellation).await?;
+        self.confirm_receipt(&observed, &receipt)?;
+        if receipt.outcome != Outcome::Then { return Err(release_unavailable()); }
         Ok(CustodyWriterFence {
             table: self.writer.table.clone(),
             id: self.writer.id.clone(),
@@ -181,8 +173,10 @@ impl CustodyCarrierJournal for AttachedCustodyCarrierJournal<'_> {
         {
             return Err(release_unavailable());
         }
-        self.confirm_receipt(&observed.receipt, cancellation)
-            .await?;
+        let receipt = self.attachment.original_custody_receipt(
+            &observed.receipt.key, observed.receipt.basis, cancellation,
+        ).await?;
+        self.confirm_receipt(&observed.receipt, &receipt)?;
         let index = self.attachment.current_custody(cancellation).await?;
         index.check_custody_carrier_receipt(registration, observed.receipt.basis, &observed.receipt.key)?;
         Ok(observed.observation)

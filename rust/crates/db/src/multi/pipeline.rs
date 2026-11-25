@@ -805,7 +805,9 @@ impl MultiDatabase {
         };
         self.require_armed_rotation()?;
         let mut features = FEATURES.to_vec();
-        let now = if admission.family() == workload::Family::CustodyWrite && admission.cutoff().is_some() {
+        let now = if matches!(admission.family(), workload::Family::CustodyWrite | workload::Family::OriginalFamilyWrite)
+            && admission.cutoff().is_some()
+        {
             let cutoff = admission.cutoff().filter(|cutoff| decision_time < *cutoff)
                 .ok_or_else(workload::denied)?;
             if upper >= cutoff { return Err(workload::denied()); }

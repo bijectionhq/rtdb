@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::{
     LiveIndex, Snapshot, StoredEvent, StoredOperation, TableCatalog, TransactionBuffer, TrieCatalog,
-    branches::{BranchCut, BranchView, RankedIndexKind, RowImage},
+    branches::{BranchCut, BranchEvent, BranchView, RankedIndexKind, RowImage},
 };
 use rtdb_trie::TrieConfig;
 use rtdb_types::{
@@ -40,6 +40,14 @@ pub fn branch_workload_custody_snapshot(
     snapshot(view, memory, &BTreeSet::new(), Contents::WorkloadCustody(groups), clear_image)
 }
 
+pub fn branch_family_review_snapshot(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, table: &TableRef, event: &BranchEvent,
+) -> Result<Snapshot> {
+    snapshot(view, memory, &BTreeSet::new(), Contents::FamilyReview(table, event), |image| {
+        Ok(image.cells.get("_id").cloned().map(|id| ("_id".into(), id)).into_iter().collect())
+    })
+}
+
 fn clear_image(image: &RowImage) -> Result<StructFields<Value>> {
     if image.custody_payload.is_some() {
         return Err(Anomaly::unsupported("rtdb/row-custody", "The query route has no protected value reader"));
@@ -60,6 +68,7 @@ enum Contents<'a> {
     Primary(&'a BTreeSet<TableRef>),
     WorkloadClear(&'a BTreeSet<TableRef>),
     WorkloadCustody(&'a BTreeSet<[u8; 16]>),
+    FamilyReview(&'a TableRef, &'a BranchEvent),
 }
 
 fn snapshot(
@@ -70,6 +79,7 @@ fn snapshot(
         Contents::All => true,
         Contents::Primary(tables) | Contents::WorkloadClear(tables) => tables.contains(table),
         Contents::WorkloadCustody(_) => false,
+        Contents::FamilyReview(selected, _) => selected == table,
     };
     let tables = Arc::new(TableCatalog::default());
     let tries = Arc::new(TrieCatalog::default());
@@ -78,7 +88,9 @@ fn snapshot(
     for (table, _) in view.tables() {
         if !includes(table) { continue; }
         for id in view.ids(table) {
+            if matches!(contents, Contents::FamilyReview(_, selected) if id != &selected.id) { continue; }
             for event in view.history(table, id) {
+                if matches!(contents, Contents::FamilyReview(_, selected) if !std::ptr::eq(event, selected)) { continue; }
                 let target: &mut Vec<_> = events.entry(event.cut.basis).or_default();
                 let put_until = event.image.as_ref().map(|image| {
                     image.expires_at.unwrap_or(event.valid.upper()).clamp(event.valid.lower(), event.valid.upper())
@@ -116,6 +128,9 @@ fn snapshot(
             for (table, definition) in view.tables() {
                 if !includes(table) { continue; }
                 let mut columns = definition.columns.clone();
+                if matches!(contents, Contents::FamilyReview(..)) {
+                    columns.retain(|name, _| name == "_id");
+                }
                 columns.insert(WRITTEN_BASIS_COLUMN.into(), LogicalType::Scalar(ScalarType::Binary));
                 buffer.declare_table(table.clone(), columns.keys().cloned())?;
                 buffer.declare_document_types(table, &columns)?;
@@ -137,7 +152,7 @@ fn snapshot(
                     append_custody_inventory(view, &mut buffer, Some(groups))?;
                     append_custody_placements(view, &mut buffer, Some(groups))?;
                 }
-                Contents::Primary(_) => {}
+                Contents::Primary(_) | Contents::FamilyReview(..) => {}
             }
         }
         live = Arc::new(live.apply(&buffer.stage()?)?);

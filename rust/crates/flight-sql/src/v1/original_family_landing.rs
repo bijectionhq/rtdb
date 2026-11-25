@@ -23,6 +23,8 @@ use super::{error, proto, transact};
 
 mod vault;
 mod wire;
+mod managed;
+pub(super) use managed::{MANAGED_FEATURE, is_managed_family};
 pub(super) use vault::NativeFamilyVault;
 use vault::{
     Accepted, Author, Authored, Close, Family, Hold, Landing, MAX_HOLDS, Sealed, conflict, full, hash, invalid_record,
@@ -33,13 +35,16 @@ use wire::{
     key, nonzero, stage, stage_scope,
 };
 
-pub(super) const ACTION: &str = "rtdb.v1.OriginalFamilyLanding";
+pub(crate) const ACTION: &str = "rtdb.v1.OriginalFamilyLanding";
 pub(super) const FEATURE: &str = "row-custody.original-family-landing";
 
 impl Service {
     pub(super) async fn original_family_landing(&self, call: &Call, body: &[u8]) -> Result<Vec<u8>, Status> {
         if body.len() > MAX_ACTION_BYTES {
             return Err(invalid());
+        }
+        if call.session.caller.principal.workload_grant().is_some_and(rtdb_auth::VerifiedWorkloadGrant::is_original_family) {
+            return self.managed_family_action(call, body).await;
         }
         let route = self.custody_route(call)?;
         if self.follower_only() || call.session.caller.principal.workload_grant().is_some() {
@@ -64,6 +69,7 @@ impl Service {
                 authority,
                 family,
                 line_registry: route.family_line_registry.as_ref(),
+                managed: None,
             };
             call.cancellation
                 .run_until_cancelled(operation.execute(call, request))
@@ -88,6 +94,7 @@ struct FamilyCall<'a> {
     authority: CustodyCarrierAuthority,
     family: [u8; 16],
     line_registry: Option<&'a TableRef>,
+    managed: Option<&'a rtdb_auth::OriginalFamilyGrant>,
 }
 
 impl FamilyCall<'_> {
@@ -137,6 +144,13 @@ impl FamilyCall<'_> {
                 None
             };
             let target = transact::custody_target(decode_proto(&native_target_b64)?, call.memory())?;
+            let created = basis(&branch_created_basis)?;
+            let group = nonzero(&group)?;
+            if self.managed.is_some_and(|scope|
+                target.branch != scope.branch || created.to_bytes() != scope.created || group != scope.group)
+            {
+                return Err(error::anomaly(conflict()));
+            }
             let line = match (target.branch.as_str() == MAIN_BRANCH, line_binding) {
                 (true, None) => None,
                 (false, Some(line)) => {
@@ -156,13 +170,13 @@ impl FamilyCall<'_> {
                 assertion,
                 disclosure: nonzero(&disclosure_sha256)?,
                 order: NativeAuthoring {
-                    group: nonzero(&group)?,
+                    group,
                     placement,
                     write_key,
                     line,
                     rewrite,
                     target,
-                    branch_created: basis(&branch_created_basis)?,
+                    branch_created: created,
                 },
                 payload: None,
                 link: None,
@@ -172,6 +186,7 @@ impl FamilyCall<'_> {
         }
 
         let record = lock.family().map_err(error::anomaly)?.clone();
+        self.check_managed_stage(&request, &record)?;
         let result = match request {
             Request::SealAuthoring { assertion, write_key, carrier_b64, .. } => {
                 self.seal_authoring(
@@ -334,7 +349,8 @@ impl FamilyCall<'_> {
             Request::RecordDrain { revoked_at, inventory_sha256, .. } => {
                 self.drain(lock, record, basis(&revoked_at)?, nonzero(&inventory_sha256)?).await
             }
-            Request::Scope {} | Request::EnrollAuthoring { .. } => return Err(invalid()),
+            Request::Scope {} | Request::EnrollAuthoring { .. }
+            | Request::SubmitPlacement { .. } | Request::PlacementReceipt { .. } => return Err(invalid()),
         };
         result.map_err(error::anomaly)
     }
@@ -480,6 +496,12 @@ impl FamilyCall<'_> {
         family.live()?;
         let review = &landing.order.review;
         if family.group != review.group || review.cut.branch == MAIN_BRANCH {
+            return Err(conflict());
+        }
+        if self.managed.is_some_and(|scope| review.cut.branch != scope.branch || review.group != scope.group
+            || review.cut.basis.to_bytes()[..16] != scope.created[..16]
+            || review.cut.basis.to_bytes() < scope.created)
+        {
             return Err(conflict());
         }
         let (member, original) = authored_at(&family, review.original)?;

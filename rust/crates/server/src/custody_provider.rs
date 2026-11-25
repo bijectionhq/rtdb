@@ -22,6 +22,7 @@ pub struct Settings {
     pub(crate) owner: Option<String>,
     pub(crate) original_family_vault: Option<std::path::PathBuf>,
     pub(crate) original_family_line_registry: Option<TableRef>,
+    pub(crate) original_family_authoring_key: Option<[u8; 32]>,
     endpoint: Url,
     ca_certificate: Option<String>,
     bearer: Secret,
@@ -89,6 +90,8 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
             TableRef::parse(&name).map_err(|_| invalid())
         })
         .transpose()?;
+    let original_family_authoring_key = fields.string("originalFamilyAuthoringKey")?
+        .map(|key| fixed_hex::<32>(&key)).transpose()?;
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -96,6 +99,8 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         || authority.registry == [0; 32]
         || authority.original_writer == [0; 32]
         || public_key == [0; 32]
+        || original_family_authoring_key.is_some_and(|key| key == [0; 32] || key == public_key
+            || owner.is_none() || original_family_vault.is_none() || original_family_line_registry.is_none())
     {
         return Err(invalid());
     }
@@ -104,6 +109,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         owner,
         original_family_vault,
         original_family_line_registry,
+        original_family_authoring_key,
         endpoint,
         ca_certificate,
         bearer: Secret::new(bearer),

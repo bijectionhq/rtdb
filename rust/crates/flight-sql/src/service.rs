@@ -59,7 +59,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -76,6 +76,10 @@ impl CallKind {
 
     fn allows_original_custody_control(self) -> bool {
         matches!(self, Self::Handshake | Self::V1CustodyRelease)
+    }
+
+    fn allows_original_family(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1Capabilities | Self::V1Query | Self::V1OriginalFamily)
     }
 
     fn allows_workload_grant(self) -> bool {
@@ -333,6 +337,8 @@ impl Service {
             if let Some(grant) = principal.workload_grant() {
                 let allowed = if grant.is_original_custody_control() {
                     kind.allows_original_custody_control()
+                } else if grant.is_original_family() {
+                    kind.allows_original_family()
                 } else if grant.is_custody_reader() {
                     matches!(kind, CallKind::Handshake | CallKind::V1Query | CallKind::V1Capabilities)
                 } else if grant.is_root_reader() {
@@ -775,6 +781,7 @@ impl FlightService for Service {
                 crate::v1::MANAGED_WORKLOAD => CallKind::ManagedWorkload,
                 crate::v1::TX_STATUS => CallKind::TxStatus,
                 crate::v1::custody::RELEASE => CallKind::V1CustodyRelease,
+                crate::v1::original_family_landing::ACTION => CallKind::V1OriginalFamily,
                 _ => CallKind::V1Action,
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
@@ -860,6 +867,24 @@ mod tests {
         assert!(!release.allows_workload_grant());
         assert!(!release.allows_workload_root_read());
         assert!(!release.serves_assigned_follower());
+    }
+
+    #[test]
+    fn original_family_admits_only_its_handshake_capabilities_review_and_action() {
+        for kind in [CallKind::Handshake, CallKind::V1Capabilities, CallKind::V1Query, CallKind::V1OriginalFamily] {
+            assert!(kind.allows_original_family());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes,
+            CallKind::V1Action, CallKind::V1CustodyRelease, CallKind::ManagedCreate, CallKind::ManagedWorkload,
+            CallKind::TxStatus] {
+            assert!(!kind.allows_original_family());
+        }
+        let family = CallKind::V1OriginalFamily;
+        assert!(!family.allows_workload_grant());
+        assert!(!family.allows_workload_root_read());
+        assert!(!family.allows_original_custody_control());
+        assert!(!family.allows_label_scope());
+        assert!(!family.serves_assigned_follower());
     }
 
     #[test]
