@@ -35,7 +35,7 @@ pub use assertion::family::{ManagedFamilyTransfer, ManagedFamilyTransferSource};
 pub use assertion::family::{FamilyTransfer, FamilyTransferArtifact, FamilyTransferAuthority, FamilyTransferContributor, FamilyTransferDestination,
     FamilyTransferDestinationObservation, FamilyTransferDestinationState, FamilyTransferFanout, FamilyTransferSource,
     FamilyTransferRead, FamilyTransferSourceDrain, FamilyTransferSourceObservation};
-pub(crate) use assertion::family::WorldRankFrame;
+pub(crate) use assertion::family::{RankTransferAgreement, RankTransferMember, WorldRankFrame};
 pub use assertion::family::{
     AcceptedWorldRankReplay, WorldRankDestinationCustody, WorldRankSourceCensus, WorldRankSourceDrain,
     WorldRankTransfer, WorldRankTransferAuthority, WorldRankTransferBinding, WorldRankTransferContributor,
