@@ -240,6 +240,16 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
             DataType::Int64,
             Value::Null,
         ),
+        (
+            Arc::new(ListArray::new(
+                Arc::new(Field::new("$data$", DataType::UInt8, false)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, 0])),
+                Arc::new(UInt8Array::from(Vec::<u8>::new())),
+                None,
+            )) as ArrayRef,
+            DataType::List(Arc::new(Field::new("$data$", DataType::Int8, false))),
+            Value::list(vec![]),
+        ),
     ] {
         let mut request = input("SELECT $1 AS n");
         request.params_ipc = Some(parameter(values));
