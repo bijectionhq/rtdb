@@ -32,7 +32,9 @@ pub use custody_prepare::prepare_custody;
 pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
 pub use funding::{DECISION_CLOCK_OFFER, FundedReceipt, FundingCommand, FundingInput, funding_invalid, funding_unsupported};
+pub use funding::appointment::{AppointmentCommand, FUNDED_APPOINTMENT, appointment_invalid, appointment_unavailable};
 use funding::{FundingDecision, resolve_funding};
+use funding::appointment::{AppointmentDecision, check_appointment_effects, resolve_appointment};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
@@ -403,6 +405,7 @@ impl PreparedAppend {
 
 const RECORD_VERSION: u8 = 2;
 const FUNDED_RECORD_VERSION: u8 = 3;
+const APPOINTMENT_RECORD_VERSION: u8 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -416,7 +419,7 @@ impl TransactionRecord {
         if matches!(self, Self::Tx(tx) if tx.request.is_none()) {
             return Err(Anomaly::fault("rtdb/transaction-encoding", "An admitted transaction needs its canonical request"));
         }
-        let version = if self.carries_funding() { FUNDED_RECORD_VERSION } else { RECORD_VERSION };
+        let version = self.version();
         serde_json::to_vec(&(version, self)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-encoding", error.to_string()))
     }
@@ -424,9 +427,7 @@ impl TransactionRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (version, record): (u8, Self) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-decoding", error.to_string()))?;
-        if (version, record.carries_funding()) != (RECORD_VERSION, false)
-            && ((version, record.carries_funding()) != (FUNDED_RECORD_VERSION, true) || !funded_record(bytes))
-        {
+        if version != record.version() || version != RECORD_VERSION && !funded_record(bytes) {
             return Err(Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version"));
         }
         if let Self::Tx(tx) = &record {
@@ -435,8 +436,11 @@ impl TransactionRecord {
         Ok(record)
     }
 
-    fn carries_funding(&self) -> bool {
-        matches!(self, Self::Tx(tx) if tx.receipt.decision_clock.is_some())
+    fn version(&self) -> u8 {
+        match self {
+            Self::Tx(tx) => tx.receipt.record_version(),
+            _ => RECORD_VERSION,
+        }
     }
 
     pub fn funded_journal_cutoff(bytes: &[u8]) -> Result<Option<rtdb_types::TimedJournalCutoff>> {
@@ -448,7 +452,17 @@ impl TransactionRecord {
 
 fn funded_record(bytes: &[u8]) -> bool {
     // The admitted encoder emits this exact version prefix. A funded decode rejects alternate framing.
-    bytes.starts_with(b"[3,")
+    bytes.starts_with(b"[3,") || bytes.starts_with(b"[4,")
+}
+
+impl Receipt {
+    fn record_version(&self) -> u8 {
+        match self.decision_clock {
+            Some(offer) if offer.is_appointment() => APPOINTMENT_RECORD_VERSION,
+            Some(_) => FUNDED_RECORD_VERSION,
+            None => RECORD_VERSION,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -485,6 +499,7 @@ impl ResolvedTransact {
         if let Some(funding) = self.receipt.decision_clock
             && !matches!(self.receipt.outcome, Outcome::Refused { .. })
         {
+            if funding.is_appointment() { return funding.appointment_guard(); }
             return funding.journal_guard();
         }
         Ok(None)
@@ -507,6 +522,7 @@ impl ResolvedTransact {
         if let Some(funding) = self.receipt.decision_clock {
             let request = self.request.as_ref().ok_or_else(invalid_record)?;
             let request = Transact::decode_canonical_request(request.get().as_bytes()).map_err(|_| invalid_record())?;
+            if funding.is_appointment() { return funding.check_appointment_admission(self, &request); }
             request.check_funded_shape(self.receipt_namespace.is_some()).map_err(|_| invalid_record())?;
             funding.check_admission(&request, &self.receipt, self.receipt.basis.position(), self.receipt_namespace)?;
             if request.key != self.receipt.key || request.logical_sha256()? != self.fingerprint
@@ -579,6 +595,7 @@ pub(crate) struct View<'a> {
     pub(crate) index: &'a BranchIndex,
     pub(crate) durable_index: &'a BranchIndex,
     pub(crate) receipts: &'a Receipts,
+    appointment_addresses: &'a BTreeSet<[u8; 32]>,
     pub(crate) pending: bool,
     pub(crate) time_floor: Option<Timestamp>,
 }
@@ -588,13 +605,17 @@ pub(crate) struct View<'a> {
 pub struct TransactState {
     index: BranchIndex,
     receipts: Receipts,
+    appointment_addresses: BTreeSet<[u8; 32]>,
     pending: Option<Pending>,
     pending_erasure: Option<TxKey>,
 }
 
 impl TransactState {
     pub fn new(incarnation: [u8; 16]) -> Self {
-        Self { index: BranchIndex::new(incarnation), receipts: BTreeMap::new(), pending: None, pending_erasure: None }
+        Self {
+            index: BranchIndex::new(incarnation), receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(),
+            pending: None, pending_erasure: None,
+        }
     }
 
     pub fn index(&self) -> &BranchIndex { &self.index }
@@ -631,7 +652,9 @@ impl TransactState {
         let mut count = 0;
         for stored in receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
             let basis = stored.installed.and_then(&map).ok_or_else(invalid_record)?;
-            if stored.workload.is_some() || self.index.exact(basis)?.system_time != stored.receipt.system_time {
+            if stored.workload.is_some() || stored.receipt.decision_clock.is_some_and(FundedReceipt::is_appointment)
+                || self.index.exact(basis)?.system_time != stored.receipt.system_time
+            {
                 return Err(invalid_record());
             }
             stored.receipt.basis = basis;
@@ -762,6 +785,7 @@ impl TransactState {
         self.require_native_checkpoint_receipts()?;
         self.index.restore_native_checkpoint(custody)?;
         self.receipts.clear();
+        self.appointment_addresses.clear();
         Ok(())
     }
 
@@ -770,6 +794,7 @@ impl TransactState {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         self.index.restore_in(incarnation)?;
+        self.appointment_addresses.clear();
         self.receipts.retain(|_, receipts| {
             receipts.retain(|_, stored| !stored.receipt.decision_clock.is_some_and(|offer| offer.booked()));
             !receipts.is_empty()
@@ -783,11 +808,13 @@ impl TransactState {
     }
 
     fn encode_checkpoint_index(&self, index: &BranchIndex) -> Result<Bytes> {
-        let receipts = self.receipts.values().flat_map(|namespace| namespace.values())
-            .filter(|stored| stored.receipt.basis <= index.head().basis).collect::<Vec<_>>();
-        let version = if receipts.iter().any(|stored| stored.receipt.decision_clock.is_some()) {
-            FUNDED_RECORD_VERSION
-        } else { RECORD_VERSION };
+        use std::borrow::Cow;
+        let cut = index.head().basis;
+        let receipts = self.receipts.values().flat_map(|namespace| namespace.values()).filter_map(|stored| {
+            if stored.receipt.basis <= cut { return Some(Cow::Borrowed(stored)); }
+            stored.receipt.decision_clock?.appointment_checkpoint(stored, cut).map(Cow::Owned)
+        }).collect::<Vec<_>>();
+        let version = receipts.iter().map(|stored| stored.receipt.record_version()).max().unwrap_or(RECORD_VERSION);
         serde_json::to_vec(&(version, index, receipts)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
     }
@@ -796,13 +823,14 @@ impl TransactState {
         let invalid = || Anomaly::fault("rtdb/transaction-checkpoint", "Checkpoint does not match the expected cut");
         let (version, index, receipts): (u8, BranchIndex, Vec<StoredReceipt>) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
-        let funded = receipts.iter().any(|stored| stored.receipt.decision_clock.is_some());
-        if (version, funded) != (RECORD_VERSION, false) && (version, funded) != (FUNDED_RECORD_VERSION, true)
+        if version != receipts.iter().map(|stored| stored.receipt.record_version()).max().unwrap_or(RECORD_VERSION)
             || index.head() != expected || index.exact(expected.basis)? != expected
         {
             return Err(invalid());
         }
-        let mut state = Self { index, receipts: BTreeMap::new(), pending: None, pending_erasure: None };
+        let mut state = Self {
+            index, receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(), pending: None, pending_erasure: None,
+        };
         for stored in receipts {
             let receipt = &stored.receipt;
             validate_key(&receipt.key).map_err(|_| invalid())?;
@@ -814,6 +842,14 @@ impl TransactState {
             if receipt.erasure == Some(Erasure::Pending) && state.pending_erasure.is_some() {
                 return Err(invalid());
             }
+            if let Some(offer) = receipt.decision_clock
+                && let Some(address) = offer.appointment_address()
+                && (stored.receipt_namespace.is_some() || stored.workload.is_some() || receipt.erasure.is_some()
+                    || !offer.appointment_valid(BranchCut { basis: receipt.basis, system_time: receipt.system_time })
+                    || state.appointment_addresses.contains(&address))
+            {
+                return Err(invalid());
+            }
             if state.store_receipt(stored).is_some() { return Err(invalid()); }
         }
         Ok(state)
@@ -821,6 +857,9 @@ impl TransactState {
 
     fn store_receipt(&mut self, stored: StoredReceipt) -> Option<StoredReceipt> {
         let key = stored.receipt.key.clone();
+        if let Some(address) = stored.receipt.decision_clock.and_then(FundedReceipt::appointment_address) {
+            self.appointment_addresses.insert(address);
+        }
         if stored.receipt.erasure == Some(Erasure::Pending) {
             self.pending_erasure = Some(TxKey { namespace: stored.receipt_namespace, key: key.clone() });
         }
@@ -899,6 +938,7 @@ impl TransactState {
     }
 
     pub fn project_receipt(&self, mut receipt: Receipt, scope: &LabelScope) -> Result<Receipt> {
+        if receipt.decision_clock.is_some_and(FundedReceipt::is_appointment) { return Err(appointment_invalid()); }
         let cut = self.index.project_main_visibility(scope)?.projected_cut(receipt.basis)?;
         receipt.basis = cut.basis;
         receipt.system_time = cut.system_time;
@@ -913,6 +953,7 @@ impl TransactState {
             index: &self.index,
             durable_index: &self.index,
             receipts: &self.receipts,
+            appointment_addresses: &self.appointment_addresses,
             pending: self.pending.is_some(),
             time_floor: None,
         };
@@ -929,6 +970,15 @@ impl TransactState {
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         view.index.require_local_custody()?;
         validate_key(&request.key)?;
+        let appointment = funding.filter(|input| input.is_appointment());
+        let funding = funding.filter(|input| !input.is_appointment());
+        let funded_request = funding.is_some() || appointment.is_some();
+        if appointment.is_some() && (authority.is_some() || workload.is_some()) {
+            return Err(appointment_invalid());
+        }
+        if appointment.is_none() && request.require.iter().any(|feature| feature == FUNDED_APPOINTMENT) {
+            return Err(appointment_invalid());
+        }
         let hold = if request.ops.iter().chain(&request.otherwise).any(|op| matches!(op, Op::ScopedHold(_))) {
             let [Op::ScopedHold(command)] = request.ops.as_slice() else { return Err(invalid_scoped_hold()); };
             if authority.is_none_or(|authority| authority.receipt_namespace != command.owner())
@@ -948,7 +998,7 @@ impl TransactState {
         let fingerprint = request.custody_request_digest
             .unwrap_or_else(|| Sha256::digest(canonical_request.get().as_bytes()).into());
         let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
-        if let Some(stored) = stored {
+        if let Some(stored) = stored && appointment.is_none() {
             let same_request = match workload_digest {
                 Some(digest) => stored.matches_workload_digest(digest)
                     && (stored.workload_digest.is_none() || stored.fingerprint == fingerprint),
@@ -988,8 +1038,8 @@ impl TransactState {
 
         if view.pending { return Err(pending_error()); }
         let head = view.index.head();
-        let validation = funding.is_none() && workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty();
-        let before = if funded.is_some() {
+        let validation = !funded_request && workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty();
+        let before = if funded_request {
             None
         } else if validation {
             if !features.contains(&LINEARIZABLE) { return Err(feature_required(LINEARIZABLE)); }
@@ -1018,13 +1068,40 @@ impl TransactState {
                 system_time: now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN)),
             }
         };
+        let appointment = match appointment {
+            Some(FundingInput::Appointment { owner, command, sample }) => {
+                match resolve_appointment(&view, request, owner, command, sample, stored, cut, fingerprint)? {
+                    AppointmentDecision::Replay(receipt) => return Ok((Resolution::Answer(receipt), None)),
+                    decision => Some(decision),
+                }
+            }
+            _ => None,
+        };
         let mut base = view.index.clone();
         if !validation { base.advance(cut)?; }
         let decision_time = now.max(cut.system_time);
         let advanced = base.clone();
         let scope = authority.map(|authority| authority.labels);
         let mut decision_clock = None;
-        let result = if let Some(funded) = funded {
+        let result = if let Some(appointment) = appointment {
+            let (offer, decision) = match appointment {
+                AppointmentDecision::Prepare(offer) => (offer, (Outcome::Then, Vec::new(), base)),
+                AppointmentDecision::Activate { appointment, sample } => {
+                    let decision = Self::decide(request, base, sample, sample, features, claims, None,
+                        view.durable_index, Some(sample))?;
+                    (appointment, decision)
+                }
+                AppointmentDecision::Consume { appointment, sample } => {
+                    let decision = Self::decide(request, base, sample, sample, features, claims, None,
+                        view.durable_index, Some(appointment.reading()))?;
+                    (appointment, decision)
+                }
+                AppointmentDecision::Replay(_) => unreachable!("replay answered above"),
+            };
+            check_appointment_effects(request, offer, &decision.0, &decision.1)?;
+            decision_clock = Some(offer);
+            Ok(decision)
+        } else if let Some(funded) = funded {
             match funded {
                 FundingDecision::Book(offer) => {
                     decision_clock = Some(offer);
@@ -1085,7 +1162,7 @@ impl TransactState {
         if let Some(feature) = request.require.iter().filter(|feature| {
             !features.contains(&feature.as_str())
                 && !(feature.as_str() == REVIEWED_CUSTODY_PLACEMENT && features.contains(&ROW_CUSTODY))
-                && !(feature.as_str() == DECISION_CLOCK_OFFER && terms_time.is_some())
+                && !(matches!(feature.as_str(), DECISION_CLOCK_OFFER | FUNDED_APPOINTMENT) && terms_time.is_some())
         }).min() {
             return Err(feature_required(feature));
         }
@@ -1146,6 +1223,11 @@ impl TransactState {
         }
 
         let visibility = std::cell::OnceCell::new();
+        let guard_time = if request.require.iter().any(|feature| feature == FUNDED_APPOINTMENT) {
+            time
+        } else {
+            terms_time.unwrap_or(time)
+        };
         let evaluate = |guard: &Guard, index: &BranchIndex| {
             if let (Some(reading), Some(scope)) = (terms_time, scope) {
                 let projected = visibility.get_or_init(|| durable.project_main_visibility(scope))
@@ -1159,7 +1241,7 @@ impl TransactState {
                 ),
                 _ => None,
             };
-            guard.evaluate(index, terms_time.unwrap_or(time), claims, visible)
+            guard.evaluate(index, guard_time, claims, visible)
         };
         for (i, requirement) in request.requires.iter().enumerate() {
             if requirement.after() {
@@ -1232,6 +1314,14 @@ impl TransactState {
                 let head = self.index.head();
                 let previous = self.receipts.get(&tx.receipt_namespace).and_then(|namespace| namespace.get(&receipt.key));
                 let exact_booking = match (receipt.decision_clock, previous) {
+                    (Some(offer), previous) if offer.is_appointment() => {
+                        offer.appointment_matches_previous(previous.and_then(|entry| entry.receipt.decision_clock))
+                            && match previous {
+                                Some(entry) => entry.receipt.decision_clock.is_some_and(FundedReceipt::is_appointment),
+                                None => self.index.exact(offer.original()).is_ok()
+                                    && offer.appointment_address().is_some_and(|address| !self.appointment_addresses.contains(&address)),
+                            }
+                    }
                     (Some(offer), None) => offer.booked() && self.index.exact(offer.original()).is_ok(),
                     (Some(offer), Some(previous)) => previous.fingerprint == tx.fingerprint
                         && previous.receipt.decision_clock.is_some_and(|booked| offer.terminal_of(booked)),

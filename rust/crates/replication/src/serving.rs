@@ -166,19 +166,26 @@ pub struct NativeServingHandle {
     pub(crate) source_authority: Arc<SourceAuthority>,
     pub(crate) source_replies: Arc<SourceReplies>,
     pub(crate) local_read_fence: Option<Arc<crate::LocalDefaultErasureReadFence>>,
-    pub(crate) funded_writer: bool,
+    pub(crate) funded_record_limit: Option<usize>,
 }
 
 impl NativeServingHandle {
     pub fn supports_funded_transact(&self) -> bool {
-        self.funded_writer && self.is_compatible()
+        self.funded_record_limit.is_some() && self.is_compatible()
             && matches!(self.replication.watch_status().borrow().role, crate::Role::Leading(_))
+    }
+
+    pub fn supports_funded_appointment(&self) -> bool {
+        self.funded_record_limit.is_some_and(|limit| limit > 0) && self.supports_funded_transact()
     }
 
     pub async fn transact_funded(
         &self, transaction: Transact, claims: VerifiedClaims, scope: Option<NativeServingScope>,
         funding: rtdb_tx::transact::FundingInput, cancellation: &CancellationToken,
     ) -> Result<Receipt> {
+        if funding.is_appointment() && !self.supports_funded_appointment() {
+            return Err(rtdb_tx::transact::appointment_unavailable());
+        }
         if !self.supports_funded_transact() { return Err(rtdb_tx::transact::funding_unsupported()); }
         let request = NativeRequest { transaction, claims, scope: scope.clone(), funding: Some(funding) };
         let bytes = cancellation.run_until_cancelled(self.source_authority.seal(request)).await
@@ -662,6 +669,8 @@ impl NativeServing {
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
         let scope = request.scope.as_ref().map(NativeServingScope::authority);
         let decision = match (request.funding, self.funded_record_limit) {
+            (Some(input), None | Some(0)) if input.is_appointment() =>
+                Err(rtdb_tx::transact::appointment_unavailable()),
             (Some(funding), Some(limit)) =>
                 pipeline.decide_funded(&request.transaction, now, &features, &request.claims, scope, time_floor, funding, limit),
             (Some(_), None) => Err(rtdb_tx::transact::funding_unsupported()),

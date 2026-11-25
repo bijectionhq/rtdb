@@ -101,6 +101,9 @@
 -- A funded DecisionClock source request carries the canonical request and the authenticated booking command in one admission.
 -- The confirmed writer resolves funded acceptance against installed receiver evidence and orders the accepting record through the timed original quorum.
 -- Default read-back verifies the committed replica delivery's timed cutoff and certificate against the exact funded record.
+-- An Original appointment preparation reserves its receipt point without row effects, and the subsequent activation and terminal decision each use the timed original quorum.
+-- The canonical activation records the guarded control writes, and the canonical terminal records the selected effects and exact create-only Original receipt together.
+-- The ordered fold and its checkpoint preserve the appointment's stage, original reading, bounds and exact retry fingerprints.
 -- Read-only validation answers at a linearizable applied cut.
 -- A block produced for the branch attachment carries its fold and receipt checkpoint at the block boundary.
 -- An append receipt reports the durable position and timestamp of the record.

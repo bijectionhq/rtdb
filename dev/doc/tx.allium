@@ -1878,6 +1878,14 @@ invariant TimedEffectsFollowSettle {
 -- A funded accepting record requires a certificate-bound append under the original quorum before its exclusive cutoff.
 -- A funded scoped validation resolves against the projected history at the advertised reading.
 
+-- An Original funded appointment reserves an exact receipt point and intent digest before the final request exists.
+-- The prepared stage retains its owner, key, predecessor, authenticated reading, certificate and exclusive decision and journal bounds.
+-- Activating the appointment orders the guarded control writes before the advertised reading while the receipt point remains absent.
+-- Consuming an active appointment resolves the complete canonical final request against its live guards and advertised reading.
+-- Its selected arm creates the exact receipt point alongside the business effects and settlement.
+-- Exact stage retries recover the retained order, and one appointment can retain a single final request digest and outcome.
+-- Before a terminal order, a closed window or lost response leaves keyed status pending for recovery through the Original receipt point.
+
 ---- Open Questions
 
 open question "AutoCommitDml stamps opts with user and default_tz only. Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"

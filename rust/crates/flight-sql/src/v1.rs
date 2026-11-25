@@ -22,6 +22,7 @@ pub(crate) mod error;
 mod query;
 mod scoped_hold;
 mod tokens;
+mod appointment;
 mod transact;
 mod workload;
 
@@ -40,11 +41,13 @@ pub(crate) const MANAGED_CREATE: &str = "rtdb.admin.v1.CreateDeployment";
 pub(crate) const MANAGED_WORKLOAD: &str = "rtdb.v1.ManagedWorkload";
 pub(crate) const TX_STATUS: &str = "rtdb.v1.TxStatus";
 pub(crate) const OFFER_DECISION_CLOCK: &str = "rtdb.v1.OfferDecisionClock";
-pub(crate) const ACTIONS: [&str; 5] = [
+pub(crate) const ACTIONS: [&str; 7] = [
     CAPABILITIES,
     "rtdb.v1.Transact",
     TX_STATUS,
     OFFER_DECISION_CLOCK,
+    appointment::PREPARE,
+    appointment::ACTIVATE,
     MANAGED_WORKLOAD,
 ];
 
@@ -260,6 +263,9 @@ impl Service {
                     && clock.funded_offers_for(driver.incarnation()).await
                 {
                     features.push(DECISION_CLOCK_OFFER.into());
+                    if appointment::owner(&call).is_some() && driver.supports_funded_appointment().await {
+                        features.push(rtdb_tx::transact::FUNDED_APPOINTMENT.into());
+                    }
                 }
                 Ok(proto::CapabilitiesResponse {
                     api: API.into(),
@@ -280,6 +286,14 @@ impl Service {
             original_family_landing::ACTION => self.original_family_landing(&call, &action.body).await,
             OFFER_DECISION_CLOCK => match decode(action.body) {
                 Ok(request) => self.v1_offer_decision_clock(&call, request).await,
+                Err(status) => Err(status),
+            },
+            appointment::PREPARE => match decode(action.body) {
+                Ok(request) => self.prepare_funded_appointment(&call, request).await,
+                Err(status) => Err(status),
+            },
+            appointment::ACTIVATE => match decode(action.body) {
+                Ok(request) => self.activate_funded_appointment(&call, request).await,
                 Err(status) => Err(status),
             },
             "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
@@ -308,6 +322,12 @@ impl Service {
     async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
         let mut request: proto::TransactRequest = decode(source)?;
         check_key(&request.key)?;
+        if let Some(appointment) = request.funded_appointment.take() {
+            if request.decision_clock_offer.is_some() {
+                return Err(error::incorrect("Transact may consume one funding instrument"));
+            }
+            return self.consume_funded_appointment(call, request, appointment).await;
+        }
         if let Some(booking) = request.decision_clock_offer.take() {
             let booking = booking.as_slice().try_into().map_err(|_| error::incorrect("Invalid DecisionClock booking"))?;
             let receipt = self.funded_transact(call, request, FundingCommand::Consume { booking }).await?;
@@ -366,7 +386,9 @@ impl Service {
     }
 
     fn funded_wire_receipt(&self, call: &Call, receipt: rtdb_tx::transact::Receipt) -> proto::Receipt {
-        let evidence = receipt.decision_clock.filter(|offer| funding_owner(call).is_some_and(|owner| offer.belongs_to(owner)));
+        let evidence = receipt.decision_clock.filter(|offer| {
+            !offer.is_appointment() && funding_owner(call).is_some_and(|owner| offer.belongs_to(owner))
+        });
         let mut receipt = transact::receipt(receipt);
         receipt.decision_clock = evidence.map(|offer| transact::decision_clock(
             offer, call.session.caller.principal.label_scope().is_some(),
@@ -392,6 +414,9 @@ impl Service {
             None => driver.tx_status(&request.key, &call.cancellation).await,
         }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
+        if receipt.decision_clock.is_some_and(rtdb_tx::transact::FundedReceipt::is_appointment) {
+            return Ok(appointment::terminal(call, receipt)?.encode_to_vec());
+        }
         Ok(self.funded_wire_receipt(call, receipt).encode_to_vec())
     }
 

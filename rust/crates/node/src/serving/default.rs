@@ -142,6 +142,10 @@ impl ServingDriver for DefaultServing {
         self.writable && self.handle.supports_funded_transact()
     }
 
+    async fn supports_funded_appointment(&self) -> bool {
+        self.writable && self.handle.supports_funded_appointment()
+    }
+
     async fn transact_funded(
         &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
         cancellation: &CancellationToken,

@@ -663,9 +663,9 @@ impl ReplicationDriver {
         if !self.config.external_source && self.resolve.decision_clock.as_ref().is_some_and(|clock| clock.supports_funded_offers()) {
             serving.funded_record_limit = self.logs.replica_timed_original_append_limit().map(|limit| limit.saturating_sub(1024));
         }
-        let funded_writer = serving.funded_record_limit.is_some();
+        let funded_record_limit = serving.funded_record_limit;
         self.serving = Some(serving);
-        Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies, funded_writer,
+        Ok(NativeServingHandle { replication, view, authority, source_authority, source_replies, funded_record_limit,
             local_read_fence: self.local_erasure_read_fence.clone() })
     }
 

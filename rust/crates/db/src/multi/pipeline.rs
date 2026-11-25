@@ -622,12 +622,20 @@ impl MultiDatabase {
         self.authority().is_ok() && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some()
     }
 
+    pub fn supports_funded_appointment(&self) -> bool {
+        self.authority().is_ok()
+            && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some_and(|limit| limit > 1024)
+    }
+
     async fn transact_funded_serial(
         &mut self, request: &Transact, scope: Option<ScopedTransact<'_>>, owner: [u8; 32],
         command: rtdb_tx::transact::FundingCommand, clock: &dyn rtdb_tx::DecisionClock,
     ) -> Result<Receipt> {
         self.refresh().await?;
         self.require_active()?;
+        if command.is_appointment() && !self.supports_funded_appointment() {
+            return Err(rtdb_tx::transact::appointment_unavailable());
+        }
         if !self.supports_funded_transact() || !clock.supports_funded_offers() {
             return Err(rtdb_tx::transact::funding_unsupported());
         }

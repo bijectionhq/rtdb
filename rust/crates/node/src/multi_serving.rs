@@ -567,6 +567,10 @@ impl ServingDriver for MultiServing {
         self.database.lock().await.supports_funded_transact()
     }
 
+    async fn supports_funded_appointment(&self) -> bool {
+        self.classic_workload_fence.is_none() && self.database.lock().await.supports_funded_appointment()
+    }
+
     async fn transact_funded(
         &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
         cancellation: &CancellationToken,

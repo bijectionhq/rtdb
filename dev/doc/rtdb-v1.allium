@@ -223,6 +223,22 @@ surface StatelessDatabase {
         -- A scoped request evaluates an effect-free validation against its projected history and returns only the opaque booking and projected predecessor.
         -- Independently identical receiver evidence and projected histories produce identical scoped outcomes.
 
+    @guarantee FundedAppointment
+        -- An authenticated Original writer sees transact.funded-appointment on a route with an installed receiver and positive timed original journal capacity.
+        -- PrepareFundedAppointment reserves the native key and one absent main-branch receipt point, identified by its table, typed ID and explicit valid time.
+        -- Preparation binds the Original predecessor and business intent digest to an inert booking, the advertised reading and separate exclusive receiver and journal cutoffs.
+        -- ActivateFundedAppointment uses the same key and booking and orders the guarded control writes together before the advertised reading.
+        -- Activation requires at least two explicitly guarded control points and absence of the exact business receipt.
+        -- Final Transact field 9 supplies the booking and intent digest and requires transact.funded-appointment.
+        -- The final request requires the original activation Basis on two distinct live control points, the exact business receipt's absence and the caller's live prerequisites.
+        -- Live requirements use the authenticated decision observation, and transaction-relative terms use the advertised reading.
+        -- The selected terminal arm creates the exact business receipt point alongside its effects and settlement.
+        -- Activation and the accepting terminal each verify the original timed append proof for their exact sealed record under the retained certificate.
+        -- Each stage accepts an exact retry by canonical request, and one canonical final request can consume the active appointment.
+        -- Prepare returns the preparation Basis, and Activate and terminal Receipt field 10 return the original activation Basis and bounds.
+        -- Keyed status is pending until a terminal publishes and then returns the original terminal Basis, system time and appointment after the window closes.
+        -- An ordered exclusion at the same Original receipt point blocks later consumption while leaving the appointment's keyed status pending.
+
     @guarantee TransactionRequirements
         -- A write route that supports requirements advertises transact.requires.
         -- TransactRequest carries the ordered requires list as repeated Guard at protobuf field 7.

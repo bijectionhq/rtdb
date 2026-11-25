@@ -178,12 +178,16 @@ impl TransactPipeline {
         let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace));
         let identity = TxKey { namespace: request.receipt_namespace(namespace), key: request.key.clone() };
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
+        if funding.is_some_and(|(input, _)| input.is_appointment()) && !self.in_flight.is_empty() {
+            return Err(pending_error());
+        }
         if funding.is_none() && workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.
             let view = View {
                 index: &self.durable.index,
                 durable_index: &self.durable.index,
                 receipts: &self.durable.receipts,
+                appointment_addresses: &self.durable.appointment_addresses,
                 pending: false,
                 time_floor,
             };
@@ -202,6 +206,7 @@ impl TransactPipeline {
             index: &self.speculative,
             durable_index: &self.durable.index,
             receipts: &self.durable.receipts,
+            appointment_addresses: &self.durable.appointment_addresses,
             pending: false,
             time_floor,
         };

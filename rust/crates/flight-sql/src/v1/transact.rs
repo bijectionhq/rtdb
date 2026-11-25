@@ -23,6 +23,9 @@ pub(super) fn request(
     if request.decision_clock_offer.is_some() {
         return Err(error::incorrect("A DecisionClock booking must be consumed through Transact"));
     }
+    if request.funded_appointment.is_some() {
+        return Err(error::incorrect("A funded appointment must be consumed through Transact"));
+    }
     let mut require = request.require;
     require.sort_unstable();
     require.dedup();
@@ -60,7 +63,7 @@ pub(super) fn request(
     })
 }
 
-fn decode_guard(guard: proto::Guard, memory: &Arc<MemoryBudget>) -> Result<Guard, Status> {
+pub(super) fn decode_guard(guard: proto::Guard, memory: &Arc<MemoryBudget>) -> Result<Guard, Status> {
     use proto::guard::Guard as WireGuard;
     use proto::version::Expect;
     Ok(
@@ -546,6 +549,7 @@ pub(super) fn receipt(receipt: tx::Receipt) -> proto::Receipt {
         }),
         replayed: receipt.replayed,
         decision_clock: None,
+        funded_appointment: None,
         erasure: match receipt.erasure {
             Some(tx::Erasure::Armed { unreadable_by }) => Some(proto::Erasure { unreadable_by_micros: unreadable_by.0 }),
             _ => None,

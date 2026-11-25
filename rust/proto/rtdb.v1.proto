@@ -10,6 +10,8 @@ service Rtdb {
   rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
   rpc Query(QueryRequest) returns (stream QueryFrame);
   rpc OfferDecisionClock(OfferDecisionClockRequest) returns (DecisionClockOffer);
+  rpc PrepareFundedAppointment(PrepareFundedAppointmentRequest) returns (FundedAppointment);
+  rpc ActivateFundedAppointment(ActivateFundedAppointmentRequest) returns (FundedAppointment);
   rpc Transact(TransactRequest) returns (Receipt);
   rpc TxStatus(TxStatusRequest) returns (Receipt);
   rpc Changes(ChangesRequest) returns (stream ChangesFrame);
@@ -208,6 +210,7 @@ message TransactRequest {
   repeated Guard requires = 7;
   // Funded requests also list transact.decision-clock-offer in require.
   optional bytes decision_clock_offer = 8;
+  FundedAppointmentUse funded_appointment = 9;
 }
 message TxStatusRequest { bytes key = 1; }
 message OfferDecisionClockRequest {
@@ -221,6 +224,33 @@ message DecisionClockOffer {
   // Original writer coordinates are omitted from a scoped response.
   optional sint64 reading_micros = 3;
   optional sint64 before_micros = 4;
+}
+
+message PrepareFundedAppointmentRequest {
+  bytes key = 1;
+  Basis predecessor = 2;
+  // Version.Absent on the Original main branch with an explicit valid-time point.
+  Version receipt_absent = 3;
+  bytes intent_sha256 = 4;
+  sint64 before_micros = 5;
+}
+message ActivateFundedAppointmentRequest {
+  // The guarded control transaction names the prepared key and requires transact.funded-appointment.
+  TransactRequest transaction = 1;
+  bytes booking = 2;
+}
+message FundedAppointmentUse {
+  bytes booking = 1;
+  bytes intent_sha256 = 2;
+}
+message FundedAppointment {
+  bytes booking = 1;
+  // Preparation returns its own Basis. Activation and a terminal receipt return the activation Basis.
+  Basis basis = 2;
+  sint64 reading_micros = 3;
+  sint64 decision_before_micros = 4;
+  sint64 journal_before_micros = 5;
+  bytes certificate_sha256 = 6;
 }
 
 message WorkloadHolder { bytes assignment_id = 1; string holder = 2; }
@@ -524,6 +554,7 @@ message Receipt {
   bool replayed = 7;
   Erasure erasure = 8;
   DecisionClockOffer decision_clock = 9;
+  FundedAppointment funded_appointment = 10;
 }
 enum Order { ORDER_ASCENDING = 0; ORDER_DESCENDING = 1; }
 enum Images {

@@ -2,12 +2,20 @@ use super::*;
 use crate::{DecisionClock, DecisionObservation, clock_slot_reading};
 use rtdb_types::TimedJournalCutoff;
 
+pub(super) mod appointment;
+use appointment::{Appointment, AppointmentCommand, AppointmentSample};
+
 pub const DECISION_CLOCK_OFFER: &str = "transact.decision-clock-offer";
 
 #[derive(Clone, Copy, Debug)]
 pub enum FundingCommand {
     Book { predecessor: Basis, booking: [u8; 16] },
     Consume { booking: [u8; 16] },
+    Appointment(AppointmentCommand),
+}
+
+impl FundingCommand {
+    pub fn is_appointment(self) -> bool { matches!(self, Self::Appointment(_)) }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -24,6 +32,11 @@ pub enum FundingInput {
         observed: Option<DecisionObservation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         certificate: Option<[u8; 32]>,
+    },
+    Appointment {
+        owner: [u8; 32],
+        command: AppointmentCommand,
+        sample: Option<AppointmentSample>,
     },
 }
 
@@ -50,6 +63,7 @@ pub struct FundedReceipt {
 enum Phase {
     Booked,
     Terminal { observed: DecisionObservation },
+    Appointment(Appointment),
 }
 
 impl FundingInput {
@@ -57,8 +71,11 @@ impl FundingInput {
         match command {
             FundingCommand::Book { predecessor, booking } => Self::Book { owner, predecessor, booking, issued: None },
             FundingCommand::Consume { booking } => Self::Consume { owner, booking, observed: None, certificate: None },
+            FundingCommand::Appointment(command) => Self::Appointment { owner, command, sample: None },
         }
     }
+
+    pub fn is_appointment(self) -> bool { matches!(self, Self::Appointment { .. }) }
 
     pub async fn verify(
         &mut self, request: &Transact, state: &TransactState, scope: Option<ScopedTransact<'_>>, clock: &dyn DecisionClock,
@@ -81,6 +98,9 @@ impl FundingInput {
                     *observed = Some(sample);
                     *certificate = clock.funded_certificate(offer.original, sample);
                 }
+            }
+            Self::Appointment { owner, command, sample } => {
+                *sample = if scope.is_none() { command.verify(*owner, request, state, clock).await } else { None };
             }
         }
     }
@@ -126,14 +146,18 @@ impl FundedReceipt {
     pub fn before(&self) -> Timestamp { self.clock.before }
     pub fn belongs_to(&self, owner: [u8; 32]) -> bool { self.owner == owner }
 
-    pub(super) fn booked(&self) -> bool { self.phase == Phase::Booked }
+    pub(super) fn booked(&self) -> bool {
+        matches!(self.phase, Phase::Booked) || self.is_pending_appointment()
+    }
 
     pub(super) fn original(&self) -> Basis { self.original }
 
     fn matches(&self, input: FundingInput) -> bool {
+        if self.is_appointment() { return false; }
         match input {
             FundingInput::Book { owner, predecessor, .. } => self.owner == owner && self.predecessor == predecessor,
             FundingInput::Consume { owner, booking, .. } => self.owner == owner && self.booking == booking,
+            FundingInput::Appointment { .. } => false,
         }
     }
 
@@ -142,7 +166,7 @@ impl FundedReceipt {
     }
 
     pub(super) fn terminal_of(self, original: Self) -> bool {
-        original.booked() && !self.booked() && self.same_booking(original)
+        matches!(original.phase, Phase::Booked) && !self.booked() && self.same_booking(original)
     }
 
     pub(super) fn acceptance_is_valid(&self) -> bool {
@@ -224,6 +248,7 @@ pub(super) fn resolve_funding(
                     receipt: FundedReceipt { phase: Phase::Terminal { observed }, ..offer },
                 })
             }
+            FundingInput::Appointment { .. } => Err(funding_invalid()),
         };
     }
     let FundingInput::Book { owner, predecessor, booking, issued } = input else {

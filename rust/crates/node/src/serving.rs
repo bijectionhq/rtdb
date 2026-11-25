@@ -176,6 +176,8 @@ pub trait ServingDriver: Send + Sync {
 
     async fn supports_funded_transact(&self) -> bool { false }
 
+    async fn supports_funded_appointment(&self) -> bool { false }
+
     async fn transact_funded(
         &self, _request: Transact, _scope: Option<ServingScope>, _funding: FundingSubmission,
         _cancellation: &CancellationToken,
