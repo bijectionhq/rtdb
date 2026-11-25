@@ -63,9 +63,9 @@ rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
 rtdb-logkeeper = { path = "crates/logkeeper" }
-journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "2fba3b1391cf571d9779254a006f9ec013c7e00a" }
-stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "2fba3b1391cf571d9779254a006f9ec013c7e00a", features = ["stream"] }
-ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "2fba3b1391cf571d9779254a006f9ec013c7e00a", features = ["ordered-daemon"] }
+journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "b12e0e5fef040d5079723bc6b4d73bb49d81ab26" }
+stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "b12e0e5fef040d5079723bc6b4d73bb49d81ab26", features = ["stream"] }
+ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "b12e0e5fef040d5079723bc6b4d73bb49d81ab26", features = ["ordered-daemon"] }
 rtdb-multi = { path = "crates/multi" }
 rtdb-simulation = { path = "crates/simulation" }
 rtdb-text = { path = "crates/text" }
