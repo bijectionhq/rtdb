@@ -125,15 +125,6 @@ impl Service {
         if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
             return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
         }
-        if action.r#type == crate::catalog_actions::SCAN_CATALOG {
-            if !self.0.config.owned_native_actions || !ipc_stream {
-                return Err(call.error(unsupported()));
-            }
-            if call.session.audience_source().is_some() {
-                return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
-            }
-            return self.scan_catalog_action(call, action.body).await;
-        }
         if let Some(batch) = owned_batch::BatchKind::for_action(&action.r#type) {
             if call.session.audience_source().is_some() != batch.audience() {
                 return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
@@ -209,8 +200,6 @@ impl Service {
             }
             let reply_format = if ipc_stream { OwnedReplyFormat::StreamV1 } else { OwnedReplyFormat::Unary };
             let results = match action_type {
-                crate::catalog_actions::PUBLISH_CATALOG => Ok(vec![Ok(Box::pin(self.publish_catalog_action(&call, action.body)).await?)]),
-                crate::catalog_actions::WATCH_RELATION => Ok(vec![Ok(Box::pin(self.watch_relation_action(&call, action.body)).await?)]),
                 crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
                 crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECIDE_HOSTED_V4 | crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1
