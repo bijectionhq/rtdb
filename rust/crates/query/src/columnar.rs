@@ -1121,6 +1121,17 @@ impl ColumnBatch {
     }
 
     pub(crate) fn select_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if let Some(&(0, start)) = rows.first()
+            && let Some(end) = start.checked_add(rows.len()).filter(|&end| end <= self.len)
+            && rows.iter().copied().eq((start..end).map(|row| (0, row)))
+        {
+            match self.select_key_span(start..end, memory) {
+                Ok(Some(keys)) => return Ok(keys),
+                Ok(None) => {}
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) => return Err(error),
+            }
+        }
         let positions: Vec<_> = (0..self.columns.len()).collect();
         if rows.len() < self.len {
             match Self::take_rows_with_custody(&[self], rows, &positions, false, memory) {
@@ -1130,6 +1141,65 @@ impl ColumnBatch {
             }
         }
         Self::take_rows_with_custody(&[self], rows, &positions, true, memory)
+    }
+
+    fn select_key_span(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let width = self.columns.len();
+        let base = width.checked_mul(size_of::<Column>() + size_of::<Arc<MemoryReservation>>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let scratch = width.checked_mul(256).and_then(|bytes| bytes.checked_add(base)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(scratch)?;
+        let lease = Arc::get_mut(&mut reservation).expect("The key span owns its metadata");
+        let mut metadata = base;
+        let mut descriptors = 0usize;
+        let mut columns = Vec::with_capacity(width);
+        let mut appended = Vec::with_capacity(width);
+        let mut views = Vec::with_capacity(width);
+        for (position, column) in self.columns.iter().enumerate() {
+            let owner = self.column_reservation(position);
+            let (array, field, logical, owner, span) = match column {
+                Column::Arrow { array, field, logical } => (array, field, logical, owner, rows.clone()),
+                Column::Selected(selection) => {
+                    let Some(((array, field, logical, custody), span)) = selection.contiguous_source(rows.clone()) else {
+                        return Ok(None);
+                    };
+                    (array, field, logical, custody.as_ref().unwrap_or(owner), span)
+                }
+                Column::Values(_) => return Ok(None),
+            };
+            if span.end > array.len() || array.data_type() != field.data_type() {
+                return Ok(None);
+            }
+            let descriptor = array.get_array_memory_size().saturating_sub(array.get_buffer_memory_size());
+            let whole = span.len() == array.len();
+            let logical_bytes = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?;
+            metadata = metadata.checked_add(logical_bytes).ok_or_else(size_error)?;
+            descriptors = descriptors.checked_add(if whole { 0 } else { descriptor }).ok_or_else(size_error)?;
+            let scratch = descriptor.checked_mul(4).and_then(|bytes| bytes.checked_add(logical_bytes)).ok_or_else(size_error)?;
+            lease.grow_to(lease.bytes().checked_add(scratch).ok_or_else(size_error)?)?;
+            let view = if whole { Arc::clone(array) } else { array.slice(span.start, span.len()) };
+            views.push(Arc::clone(&view));
+            appended.push(Arc::clone(owner));
+            columns.push(Column::Arrow { array: view, field: Arc::clone(field), logical: logical.clone() });
+        }
+        let visible = rtdb_columnar::visible_buffer_bytes(&views).unwrap_or(0);
+        let backing = distinct_charges(&appended, &mut HashSet::new())
+            .max(views.iter().map(|array| array.get_buffer_memory_size()).max().unwrap_or(0));
+        drop(views);
+        if backing > visible.saturating_mul(2).saturating_add(4096) {
+            for (column, owner) in columns.iter_mut().zip(&mut appended) {
+                let Column::Arrow { array, field, .. } = column else { unreachable!("Key span columns have Arrow layouts") };
+                if !can_interleave_layout(array.as_ref(), true) { return Ok(None); }
+                let Ok((compact, custody)) = compact_arrow_rows(array.as_ref(), field, 0..rows.len(), memory) else {
+                    return Ok(None);
+                };
+                *array = compact;
+                *owner = custody;
+            }
+            descriptors = 0;
+        }
+        lease.shrink_to(metadata.checked_add(descriptors).ok_or_else(size_error)?)?;
+        Ok(Some(Self { columns, len: rows.len(), reservation, appended }))
     }
 
     pub(crate) fn key_projection(&self, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -3036,6 +3106,20 @@ impl PredicateSelection {
         let count = values.count_set_bits();
         Self::settled(BooleanArray::new(values, None), count, reservation)
     }
+
+    pub(crate) fn build(
+        len: usize, memory: &Arc<MemoryBudget>, fill: impl FnOnce(&mut BooleanBufferBuilder) -> Result<()>,
+    ) -> Result<Self> {
+        let reservation = memory.reserve(Self::bitmap_bound(len))?;
+        let mut bits = BooleanBufferBuilder::new(len);
+        fill(&mut bits)?;
+        let values = bits.finish();
+        debug_assert_eq!(values.len(), len);
+        let count = values.count_set_bits();
+        Self::settled(BooleanArray::new(values, None), count, reservation)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool { self.count == 0 }
 
     fn from_arrow(mask: BooleanArray, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let count = mask.true_count();

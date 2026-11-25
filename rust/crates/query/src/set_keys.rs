@@ -1,5 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, mem::size_of, sync::Arc};
 
+use arrow_buffer::BooleanBufferBuilder;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Result, Value};
 
@@ -279,8 +280,15 @@ impl<'a> Key<'a> {
 struct Position {
     batch: usize,
     row: usize,
-    next: Option<usize>,
+    link: PositionLink,
     consumed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PositionLink {
+    Pending(u32),
+    Next(usize),
+    End,
 }
 
 #[derive(Default)]
@@ -298,24 +306,54 @@ impl Positions {
     }
 
     fn push(&mut self, bucket: u64, batch: usize, row: usize) {
-        use std::collections::hash_map::Entry;
         let index = self.rows.len();
+        self.rows.push(Position { batch, row, link: PositionLink::End, consumed: false });
+        self.link(bucket, index);
+    }
+
+    fn link(&mut self, bucket: u64, index: usize) {
+        use std::collections::hash_map::Entry;
+        self.rows[index].link = PositionLink::End;
         match self.chains.entry(bucket) {
             Entry::Occupied(mut entry) => {
                 let (_, last) = entry.get_mut();
-                self.rows[*last].next = Some(index);
+                self.rows[*last].link = PositionLink::Next(index);
                 *last = index;
             }
             Entry::Vacant(entry) => {
                 entry.insert((index, index));
             }
         }
-        self.rows.push(Position {
-            batch,
-            row,
-            next: None,
-            consumed: false,
+    }
+
+    fn build_page(&mut self, page: usize, len: usize, mut hash: impl FnMut(usize) -> Result<u32>) -> Result<()> {
+        let start = self.rows.len();
+        let end = start.checked_add(len).ok_or_else(size_error)?;
+        // During growth, keep the prior allocation so a failed hash can also roll back the capacity charge.
+        let mut grown = (end > self.rows.capacity()).then(|| {
+            let mut rows = Vec::with_capacity(end.max(self.rows.capacity().saturating_mul(2)));
+            rows.extend_from_slice(&self.rows);
+            rows
         });
+        let rows = grown.as_mut().unwrap_or(&mut self.rows);
+        for row in 0..len {
+            let hash = match hash(row) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    rows.truncate(start);
+                    return Err(error);
+                }
+            };
+            rows.push(Position { batch: page, row, link: PositionLink::Pending(hash), consumed: false });
+        }
+        if let Some(grown) = grown {
+            self.rows = grown;
+        }
+        for index in start..end {
+            let PositionLink::Pending(hash) = self.rows[index].link else { unreachable!("The build page is unlinked") };
+            self.link(u64::from(hash), index);
+        }
+        Ok(())
     }
 
     fn find(
@@ -337,7 +375,11 @@ impl Positions {
                 }
                 return Ok(Some(index));
             }
-            next = position.next;
+            next = match position.link {
+                PositionLink::Next(index) => Some(index),
+                PositionLink::End => None,
+                PositionLink::Pending(_) => unreachable!("Hash chains contain only linked positions"),
+            };
         }
         Ok(None)
     }
@@ -404,12 +446,12 @@ impl BatchKeyIndex {
             .map(Some)
     }
 
-    fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32]) -> Result<()> {
+    fn reserve_page(&mut self, len: usize) -> Result<()> {
         let rows = self
             .positions
             .rows
             .len()
-            .checked_add(hashes.len())
+            .checked_add(len)
             .ok_or_else(size_error)?;
         let batches = self
             .batches
@@ -422,7 +464,11 @@ impl BatchKeyIndex {
             .ok_or_else(size_error)?;
         Arc::get_mut(&mut self.reservation)
             .expect("The key index owns its reservation")
-            .grow_to(bytes)?;
+            .grow_to(bytes)
+    }
+
+    fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32]) -> Result<()> {
+        self.reserve_page(hashes.len())?;
         let page = self.batches.len();
         self.batches.push((batch, projected));
         for (row, &hash) in hashes.iter().enumerate() {
@@ -440,19 +486,27 @@ impl BatchKeyIndex {
         if batch.len == 0 {
             return Ok(());
         }
-        let _hashes = context.memory.reserve(
-            batch
-                .len
-                .checked_mul(size_of::<u32>())
-                .ok_or_else(size_error)?,
-        )?;
-        let mut hashes = Vec::with_capacity(batch.len);
-        for row in 0..batch.len {
-            context.check_cancelled_at(row)?;
-            let (hash, _) = Key::bind(&batch, row, projected, context, self.hashing)?;
-            hashes.push(hash);
+        context.check_cancelled()?;
+        let previous_charge = self.reservation.bytes();
+        self.reserve_page(batch.len)?;
+        let page = self.batches.len();
+        let hashing = self.hashing;
+        let built = self.positions.build_page(page, batch.len, |row| {
+            if row != 0 {
+                context.check_cancelled_at(row)?;
+            }
+            let (hash, _) = Key::bind(&batch, row, projected, context, hashing)?;
+            Ok(hash)
+        });
+        if let Err(error) = built {
+            Arc::get_mut(&mut self.reservation)
+                .expect("The key index owns its reservation")
+                .shrink_to(previous_charge)
+                .expect("The build reserved at least its previous charge");
+            return Err(error);
         }
-        self.append(batch, projected, &hashes)
+        self.batches.push((batch, projected));
+        Ok(())
     }
 
     pub fn matches(
@@ -537,13 +591,13 @@ impl BatchKeyIndex {
         &mut self,
         batch: &ColumnBatch,
         projected: bool,
-        mask: &mut Vec<bool>,
+        bits: &mut BooleanBufferBuilder,
         context: &QueryContext,
         schema: &rtdb_plan::Schema,
         mut select: impl FnMut(usize) -> Result<bool>,
     ) -> Result<()> {
         self.identify(batch, projected, context, schema, |row, _, first| {
-            mask.push(first && select(row)?);
+            bits.append(first && select(row)?);
             Ok(())
         })
     }
@@ -618,7 +672,7 @@ fn size_error() -> rtdb_types::Anomaly {
 mod tests {
     use std::collections::BTreeMap;
 
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use rtdb_columnar::{MemoryBudget, OwnedBatch};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
@@ -626,7 +680,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, columnar::Column};
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, columnar::PredicateSelection};
 
     fn context() -> Arc<QueryContext> {
         let database = DatabaseSnapshot {
@@ -715,23 +769,122 @@ mod tests {
         let input = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
         let input =
             ColumnBatch::from_owned(OwnedBatch::new(input, &context.memory).unwrap()).unwrap();
-        let mut mask = Vec::new();
         let mut index = BatchKeyIndex::new(&context).unwrap();
-        index
-            .distinct(
+        let selection = PredicateSelection::build(input.len, &context.memory, |bits| {
+            index.distinct(
                 &input,
                 false,
-                &mut mask,
+                bits,
                 &context,
                 &rtdb_plan::Schema::default(),
                 |_| Ok(true),
             )
-            .unwrap();
-        assert_eq!(mask, vec![true; 16]);
-        drop(input);
+        }).unwrap();
+        assert!((0..input.len).all(|row| selection.contains(row)));
+        let [Column::Arrow { array: retained, .. }] = index.batches[0].0.columns.as_slice() else {
+            panic!("Expected an Arrow key page");
+        };
+        let [Column::Arrow { array: source, .. }] = input.columns.as_slice() else {
+            panic!("Expected an Arrow input page");
+        };
+        assert!(Arc::ptr_eq(retained, source));
+        drop((input, selection));
         assert!(context.memory.used_bytes() < 600 * 1024);
-        assert!(matches!(index.batches[0].0.columns[0], Column::Selected(_)));
         drop(index);
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn distinct_key_span_shares_proportionate_backing() {
+        let context = context();
+        let input = batch(
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+            vec![None, Some("one"), Some("two"), None],
+            &context,
+        );
+        let data = |array: &dyn Array| array.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
+        let (source, _, _, _) = input.columns[0].arrow_cell(0).unwrap().unwrap();
+        let ptr = data(source).wrapping_add(1);
+        let keys = input.select_keys(&[(0, 1), (0, 2)], &context.memory).unwrap();
+        drop(input);
+        let (retained, _, _, _) = keys.columns[0].arrow_cell(0).unwrap().unwrap();
+        assert_eq!(data(retained), ptr);
+        assert_eq!(keys.columns[0].value(0).unwrap(), Value::I64(1));
+        assert_eq!(keys.columns[1].value(1).unwrap(), Value::Utf8("two".into()));
+        drop(keys);
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn distinct_key_span_detaches_even_a_full_page_with_oversized_backing() {
+        let context = context();
+        let large = "x".repeat(1 << 16);
+        let input = batch(
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+            vec![Some(large.as_str()), Some("a"), Some("b"), Some(large.as_str())],
+            &context,
+        ).slice(1, 2, &context.memory).unwrap();
+        let keys = input.select_keys(&[(0, 0), (0, 1)], &context.memory).unwrap();
+        drop(input);
+        assert!(context.memory.used_bytes() < large.len());
+        assert_eq!(keys.columns[0].value(0).unwrap(), Value::I64(1));
+        assert_eq!(keys.columns[1].value(1).unwrap(), Value::Utf8("b".into()));
+        drop(keys);
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn distinct_keeps_one_zero_column_row_across_pages() {
+        let context = context();
+        let mut index = BatchKeyIndex::new(&context).unwrap();
+        let decide = |index: &mut BatchKeyIndex, input: &ColumnBatch| {
+            PredicateSelection::build(input.len, &context.memory, |bits| {
+                index.distinct(input, false, bits, &context, &rtdb_plan::Schema::default(), |_| Ok(true))
+            }).unwrap()
+        };
+        let input = ColumnBatch::settled(vec![], 9, context.memory.reserve(256).unwrap()).unwrap();
+        let selection = decide(&mut index, &input);
+        assert!(selection.contains(0));
+        assert!((1..input.len).all(|row| !selection.contains(row)));
+        let output = input.select_predicate(&selection, &context.memory).unwrap();
+        assert_eq!(output.len, 1);
+        assert!(output.columns.is_empty());
+        assert!(decide(&mut index, &output).is_empty());
+        drop((index, output, selection));
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_failed_build_restores_positions_chains_and_admission() {
+        let context = context();
+        let page = |values: Vec<Value>| {
+            let len = values.len();
+            ColumnBatch::settled(vec![Column::Values(values)], len, context.memory.reserve(1024).unwrap()).unwrap()
+        };
+        let probe = page(vec![Value::I64(1), Value::I64(2)]);
+        for spare in [false, true] {
+            let mut index = BatchKeyIndex::vector_hashing(&context).unwrap();
+            index.build(page(vec![Value::I64(1); 4]), false, &context).unwrap();
+            if spare {
+                index.build(page(vec![Value::I64(3)]), false, &context).unwrap();
+            }
+            let before = index.len();
+            assert_eq!(index.positions.rows.capacity() - before >= 3, spare);
+            assert!(index.matches(&probe, 0, false, true, &context).unwrap());
+            let bytes = context.memory.used_bytes();
+            let rejected = page(vec![Value::I64(1), Value::I64(2), Value::F16(0)]);
+            assert_eq!(index.build(rejected, false, &context).unwrap_err().code, "rtdb/jvm-half-float");
+            assert_eq!(index.len(), before);
+            assert_eq!(context.memory.used_bytes(), bytes);
+
+            assert!(!index.matches(&probe, 1, false, false, &context).unwrap());
+            index.build(page(vec![Value::I64(1)]), false, &context).unwrap();
+            for _ in 0..4 {
+                assert!(index.matches(&probe, 0, false, true, &context).unwrap());
+            }
+            assert!(!index.matches(&probe, 0, false, true, &context).unwrap());
+        }
+        drop(probe);
         assert_eq!(context.memory.used_bytes(), 0);
     }
 

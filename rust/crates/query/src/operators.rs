@@ -6,6 +6,7 @@ use rtdb_expr::{integer, is_true, null_eq_in_timezone};
 use rtdb_plan::{ApplyKind, Expr, NamedExpr, Relation, RelationNode, Schema, SetOperator};
 use rtdb_types::{LogicalType, Result, Value};
 
+use crate::columnar::PredicateSelection;
 use crate::context::Execution;
 use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
@@ -809,10 +810,10 @@ impl crate::columnar::BatchCursor for BatchDistinct {
             if batch.len == 0 { continue; }
             let context = &self.execution.context;
             let memory = &context.memory;
-            let _mask = memory.reserve(batch.len.saturating_add(256))?;
-            let mut mask = Vec::with_capacity(batch.len);
-            self.seen.distinct(&batch, self.projected, &mut mask, context, self.schema.schema(), |_| Ok(true))?;
-            if mask.iter().any(|keep| *keep) { return batch.select(&mask, memory).map(Some); }
+            let selection = PredicateSelection::build(batch.len, memory, |bits| {
+                self.seen.distinct(&batch, self.projected, bits, context, self.schema.schema(), |_| Ok(true))
+            })?;
+            if !selection.is_empty() { return batch.select_predicate(&selection, memory).map(Some); }
         }
         Ok(None)
     }
@@ -919,23 +920,26 @@ impl crate::columnar::BatchCursor for BatchSet {
         while let Some(batch) = crate::columnar::poll_nested_batch(self.left.as_mut()).await? {
             if batch.len == 0 { continue; }
             validate_set_types(&self.runtime)?;
-            let _mask = memory.reserve(batch.len.saturating_add(256))?;
-            let mut mask = Vec::with_capacity(batch.len);
-            let built = self.built.as_mut().ok_or_else(|| invalid("set-state", "Set input was not built"))?;
-            let left_projected = self.left_projected;
-            let mut retain = |row| {
-                let matched = built.matches(&batch, row, left_projected, self.all, context)?;
-                Ok(matched == (self.operator == SetOperator::Intersect))
-            };
-            if self.all {
-                for row in 0..batch.len {
-                    context.check_cancelled_at(row)?;
-                    mask.push(retain(row)?);
+            let selection = PredicateSelection::build(batch.len, memory, |bits| {
+                let built = self.built.as_mut().ok_or_else(|| invalid("set-state", "Set input was not built"))?;
+                let left_projected = self.left_projected;
+                let all = self.all;
+                let intersect = self.operator == SetOperator::Intersect;
+                let mut retain = |row| {
+                    let matched = built.matches(&batch, row, left_projected, all, context)?;
+                    Ok(matched == intersect)
+                };
+                if all {
+                    for row in 0..batch.len {
+                        context.check_cancelled_at(row)?;
+                        bits.append(retain(row)?);
+                    }
+                    Ok(())
+                } else {
+                    self.seen.distinct(&batch, left_projected, bits, context, self.runtime.child(0)?.schema(), retain)
                 }
-            } else {
-                self.seen.distinct(&batch, left_projected, &mut mask, context, self.runtime.child(0)?.schema(), retain)?;
-            }
-            if mask.iter().any(|keep| *keep) { return batch.select(&mask, memory).map(Some); }
+            })?;
+            if !selection.is_empty() { return batch.select_predicate(&selection, memory).map(Some); }
         }
         Ok(None)
     }
