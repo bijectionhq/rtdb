@@ -10,6 +10,7 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use bytes::{Buf, Bytes};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_format::ipc::RecordSpans;
 use rtdb_storage::{IoRegion, audience_work, sealing::{PlaintextDelivery, PlaintextView}};
 use tonic::{Response, Status, metadata::MetadataValue};
 
@@ -30,6 +31,7 @@ const MAX_REQUEST_BYTES: usize = 2 << 20;
 const MAX_POINTS: u16 = 256;
 const MAX_RANGES: u16 = 32;
 const MAX_AUDIENCE_POINTS: u16 = 4;
+const DEFAULT_IPC_ALIGNMENT: usize = 64;
 const IPC_EOS: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
 
 #[derive(Clone, Copy)]
@@ -286,7 +288,10 @@ impl SelectionEncoder {
         } else {
             None
         };
-        if let Some(batch) = batch {
+        if let Some(batch) = batch
+            && (batch.schema_ref().fields() != schema.fields()
+                || !append_exact_record(&mut response, batch, memory)?)
+        {
             let (dictionaries, data) = IpcDataGenerator::default().encode(
                 batch, &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
             ).map_err(arrow)?;
@@ -305,6 +310,23 @@ impl SelectionEncoder {
         let retained = memory.reserve(response.len()).map_err(status)?;
         Ok(Some(ActionResult { body: wire::retain(response, retained) }))
     }
+}
+
+fn append_exact_record(
+    frame: &mut Vec<u8>, batch: &RecordBatch, memory: &Arc<MemoryBudget>,
+) -> Result<bool, Status> {
+    let spans = match RecordSpans::exact(batch, DEFAULT_IPC_ALIGNMENT, memory) {
+        Ok(Some(spans)) => spans,
+        Ok(None) => return Ok(false),
+        // The caller already holds the original encoder's grant for the fallback.
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(false),
+        Err(error) => return Err(status(error)),
+    };
+    let (metadata, body_len) = spans.framed_metadata().map_err(status)?;
+    frame.try_reserve_exact(wire::add(metadata.len(), body_len)?).map_err(arrow)?;
+    frame.extend_from_slice(&metadata);
+    spans.write_body(frame).map_err(arrow)?;
+    Ok(true)
 }
 
 pub(super) fn is_ipc_stream(body: &[u8]) -> bool {
@@ -375,7 +397,7 @@ impl OwnedIpcReply {
         let bound = wire::add(wire::schema_bound(schema)?, wire::mul(bytes, 8)?)?;
         let _encoding = memory.reserve(bound).map_err(status)?;
         if stream && pages.iter().all(|page| page.schema_ref().as_ref() == schema)
-            && let Ok(frames) = encode_ipc_frames(schema, pages)
+            && let Ok(frames) = encode_ipc_frames(schema, pages, memory)
         {
             return retain_ipc_frames(memory, frames, maximum);
         }
@@ -412,7 +434,9 @@ impl OwnedIpcReply {
     }
 }
 
-fn encode_ipc_frames(schema: &Schema, batches: &[RecordBatch]) -> Result<Vec<Bytes>, Status> {
+fn encode_ipc_frames(
+    schema: &Schema, batches: &[RecordBatch], memory: &Arc<MemoryBudget>,
+) -> Result<Vec<Bytes>, Status> {
     let options = IpcWriteOptions::default();
     let schema_frame = rtdb_format::ipc::write_schema_message_with_options(schema, &options).map_err(status)?;
     let message = arrow_ipc::root_as_message(&schema_frame[8..]).map_err(arrow)?;
@@ -423,11 +447,17 @@ fn encode_ipc_frames(schema: &Schema, batches: &[RecordBatch]) -> Result<Vec<Byt
             register_dictionaries(field, &mut tracker);
         }
     }
+    let dictionary_free = tracker.dict_id().is_empty();
 
     let mut frames = vec![schema_frame.into()];
     let generator = IpcDataGenerator::default();
     let mut compression = CompressionContext::default();
     for batch in batches {
+        let mut frame = Vec::new();
+        if dictionary_free && append_exact_record(&mut frame, batch, memory)? {
+            frames.push(frame.into());
+            continue;
+        }
         let (dictionaries, record) = generator.encode(batch, &mut tracker, &options, &mut compression).map_err(arrow)?;
         for message in dictionaries.into_iter().chain(std::iter::once(record)) {
             let mut frame = Vec::new();
@@ -475,8 +505,15 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 20);
         let data = RecordBatch::try_from_iter([
-            ("_id", Arc::new(StringArray::from(vec!["row"])) as ArrayRef),
-        ]).unwrap();
+            ("_id", Arc::new(StringArray::from(vec!["before", "row", "after"])) as ArrayRef),
+        ]).unwrap().slice(1, 1);
+        assert!(RecordSpans::exact(&data, DEFAULT_IPC_ALIGNMENT, &memory).unwrap().is_some());
+        let original = rtdb_format::ipc::write_arrow_stream(
+            data.schema_ref(), std::slice::from_ref(&data), IpcWriteOptions::default(),
+        ).unwrap();
+        let mut original = IpcFrames(original.into());
+        let schema_frame = original.next().unwrap().unwrap().body;
+        let record = original.next().unwrap().unwrap().body;
         let mut encoder = SelectionEncoder::default();
         let encode = |encoder: &mut SelectionEncoder, revision: &str| {
             let schema = Arc::new(data.schema_ref().as_ref().clone()
@@ -489,7 +526,10 @@ mod tests {
         assert_eq!(&next[..2], &[b'P', 0]);
         assert_eq!(&first[22..23], b"2");
         assert_eq!(&next[22..23], b"3");
-        assert!(next.len() < first.len());
+        let schema_len = u32::from_be_bytes(first[23..27].try_into().unwrap()) as usize;
+        assert_eq!(&first[27..27 + schema_len], schema_frame.as_ref());
+        assert_eq!(&first[27 + schema_len..], record.as_ref());
+        assert_eq!(&next[23..], record.as_ref());
     }
 
     #[test]
@@ -528,6 +568,39 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].body.as_ref(), IPC_EOS);
         assert_eq!([frames[0].body.as_ref(), frames[1].body.as_ref()].concat(), input);
+    }
+
+    #[test]
+    fn detached_ipc_matches_original_for_spans_and_generic_records() {
+        use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef),
+            ("name", Arc::new(StringArray::from(vec!["skip", "longer", "z"])) as ArrayRef),
+            ("flag", Arc::new(BooleanArray::from(vec![true, true, false])) as ArrayRef),
+        ]).unwrap();
+        let pages = [batch.slice(1, 2), batch.slice(0, 1)];
+        let schema = batch.schema_ref();
+        let memory = MemoryBudget::new(1 << 20);
+        assert!(RecordSpans::exact(&pages[0], DEFAULT_IPC_ALIGNMENT, &memory).unwrap().is_some());
+        assert!(RecordSpans::exact(&pages[1], DEFAULT_IPC_ALIGNMENT, &memory).unwrap().is_none());
+
+        let original = OwnedIpcReply::encode(&memory, schema, &pages, false, 1 << 20).unwrap().into_unary();
+        let maximum = original.encoded_len();
+        let expected = IpcFrames(original.body.clone()).collect::<Result<Vec<_>, _>>().unwrap();
+        let bytes = pages.iter().map(RecordBatch::get_array_memory_size).sum::<usize>();
+        let bound = wire::schema_bound(schema).unwrap() + 8 * bytes;
+        let fallback = MemoryBudget::new(bound + original.body.len());
+        for budget in [&memory, &fallback] {
+            let before = budget.used_bytes();
+            let OwnedIpcReply::Frames(frames) = OwnedIpcReply::encode(budget, schema, &pages, true, maximum).unwrap() else {
+                panic!("expected one Flight result per IPC message");
+            };
+            assert_eq!(frames, expected);
+            assert_eq!(budget.used_bytes() - before, original.body.len());
+            drop(frames);
+            assert_eq!(budget.used_bytes(), before);
+        }
     }
 
     #[test]
@@ -592,7 +665,7 @@ mod tests {
 
     #[test]
     fn detached_ipc_charges_the_original_aggregate_until_the_last_frame_is_dropped() {
-        let frames = encode_ipc_frames(&Schema::empty(), &[]).unwrap();
+        let frames = encode_ipc_frames(&Schema::empty(), &[], &MemoryBudget::new(1 << 20)).unwrap();
         let original = ActionResult { body: frames.concat().into() };
         let cap = original.encoded_len();
         assert!(frames.iter().all(|body| ActionResult { body: body.clone() }.encoded_len() < cap - 1));
@@ -618,7 +691,7 @@ mod tests {
     fn ranked_reply_prefix_counts_toward_the_limit_and_reuses_ipc_frames() {
         let memory = MemoryBudget::new(1 << 20);
         let prefix = ActionResult { body: Bytes::from_static(b"inventory") };
-        let frames = encode_ipc_frames(&Schema::empty(), &[]).unwrap();
+        let frames = encode_ipc_frames(&Schema::empty(), &[], &memory).unwrap();
         let retained_schema = frames[0].clone();
         let maximum = frames.iter().fold(prefix.encoded_len(), |size, body| {
             size + ActionResult { body: body.clone() }.encoded_len()
