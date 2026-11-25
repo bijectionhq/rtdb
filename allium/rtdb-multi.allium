@@ -636,6 +636,13 @@ contract LogService {
         -- A separate bounded point-history read returns only selected literal co-written application rows from that certified replay, preserving their typed addresses, valid intervals and Original event order.
         -- The migration scratch stage stays private and cannot seed a Classic target writer.
 
+    @invariant ClassicMigrationProviderDrain
+        -- The Classic transfer fence retains the exact admitted directory catalog reader cohort for the enrolled Local residence.
+        -- A separate Original directory revision records the drain after the registered provider regions close and their catalog readers release.
+        -- Private status binds the retained directory drain to the selected Begin and application writer closure through the verified scratch replay.
+        -- Private release status joins one exact registered family response part, its ordered application settlement, and its immutable Original vault terminal.
+        -- An exact status retry reopens the same provider terminal while the Original and scratch authorities retain its evidence.
+
     @invariant ClassicMigrationNativeCandidate
         -- The authenticated recovery operator selects the exact fenced source name and authority, capture, scratch artifact and migration request.
         -- The recovery envelope authenticates the Original tenant name and the sealed stage binds its independently determined scratch name.

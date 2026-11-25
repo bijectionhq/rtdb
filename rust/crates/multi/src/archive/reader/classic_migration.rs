@@ -142,6 +142,7 @@ pub(crate) enum ClassicRead {
         begin: [u8; 32],
         cut: rtdb_types::TransactionKey,
         points: Option<PointHistoryRead>,
+        provider_release: Option<crate::recovery::classic_provider::ReleaseSelection>,
         layout: Arc<ApplicationLayout>,
     },
 }
@@ -311,9 +312,10 @@ pub(crate) async fn read_classic_migration(
                 let (mut projection, mut receipt) = match read {
                     ClassicRead::Inventory => (None, None),
                     ClassicRead::Projection(request) => (Some(projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))), None),
-                    ClassicRead::Application { request, begin, cut, points, layout } if !serving_suffix => (Some(
+                    ClassicRead::Application { request, begin, cut, points, provider_release, layout } if !serving_suffix => (Some(
                         projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))
-                            .with_application(application::Application::new(layout, begin, cut, destination).with_points(points)),
+                            .with_application(application::Application::new(layout, begin, cut, destination)
+                                .with_points(points).with_provider_release(provider_release)),
                     ), None),
                     ClassicRead::Application { .. } => return Err(unavailable("Application closure lookup requires the complete canonical suffix replay")),
                     ClassicRead::Receipt(lookup) if !serving_suffix => (None, Some(lookup)),

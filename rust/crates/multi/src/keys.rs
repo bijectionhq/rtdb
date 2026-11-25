@@ -72,6 +72,7 @@ pub enum ArchiveKeyWithdrawal {
 #[async_trait::async_trait]
 pub trait KeyService: Send + Sync {
     async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.key(NAMESPACE_KEY_ID).await }
+    async fn existing_namespace_id(&self) -> Result<Option<[u8; KEY_BYTES]>> { self.existing_key(NAMESPACE_KEY_ID).await }
     async fn existing(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         self.existing_key(deployment).await?.ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb.multi/key-missing", "The deployment has no installed key")
@@ -378,6 +379,15 @@ impl KeyService for LocalKeyService {
     }
 
     async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.load_key(self.directory.join(".namespace"), None).await }
+
+    async fn existing_namespace_id(&self) -> Result<Option<[u8; KEY_BYTES]>> {
+        let path = self.directory.join(".namespace");
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => read_key(&path, bytes).map(Some),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io(error)),
+        }
+    }
 
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
         sign_deletion(self.load_key(self.directory.join(".deletion-signer"), None).await?, facts)

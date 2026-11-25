@@ -31,6 +31,7 @@ use crate::{
 };
 
 mod classic_destination;
+pub(crate) mod classic_provider;
 
 const FRAME_BYTES: usize = 2048;
 const ORIGINAL_RECEIPT_FRAME_BYTES: usize = 4096;
@@ -176,6 +177,12 @@ enum Action {
         selection: classic_destination::Selection,
         candidate_binding: CandidateBinding,
         classic_cut: rtdb_types::TransactionKey,
+    },
+    ClassicMigrationProviderDrainStatus {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        classic_cut: rtdb_types::TransactionKey,
+        provider: classic_provider::Population,
     },
     ReadClassicMigrationPointHistories {
         selection: classic_destination::Selection,
@@ -345,6 +352,14 @@ enum Reply {
         selection: classic_destination::Selection,
         candidate_binding: CandidateBinding,
         application: archive::ApplicationReadback,
+    },
+    ClassicMigrationProviderDrain {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        source: ClassicMigrationSource,
+        fenced_writer_epoch: u64,
+        application: classic_provider::ApplicationClose,
+        terminal: classic_provider::Terminal,
     },
     ClassicMigrationPointHistories {
         selection: classic_destination::Selection,
@@ -937,12 +952,16 @@ impl RecoveryService {
             )).await,
             Action::ReadClassicMigrationApplicationClosure { selection, candidate_binding, classic_cut } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
-                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None },
+                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, provider: None },
+            )).await,
+            Action::ClassicMigrationProviderDrainStatus { selection, candidate_binding, classic_cut, provider } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection,
+                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, provider: Some(provider) },
             )).await,
             Action::ReadClassicMigrationPointHistories { selection, candidate_binding, classic_cut, valid_at, points } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
                 classic_destination::Operation::Application {
-                    candidate_binding, classic_cut, points: Some(archive::PointHistoryRead::new(valid_at, points)?),
+                    candidate_binding, classic_cut, points: Some(archive::PointHistoryRead::new(valid_at, points)?), provider: None,
                 },
             )).await,
             Action::InspectClassicMigrationInventory { destination, stage_operation, staged_manifest_sha256, ciphertext_sha256 } => {
@@ -1325,6 +1344,7 @@ fn admits_frame_size(action: &Action, bytes: usize) -> bool {
         | Action::ClassicMigrationDestinationStatus { .. } | Action::HoldClassicMigrationDestinationReady { .. }
         | Action::ClassicMigrationDestinationReadyStatus { .. }
         | Action::ReadClassicMigrationApplicationClosure { .. }
+        | Action::ClassicMigrationProviderDrainStatus { .. }
         | Action::ReadClassicMigrationPointHistories { .. } => CANDIDATE_FRAME_BYTES,
         Action::ReadClassicMigrationOriginalReceipt { .. } => ORIGINAL_RECEIPT_FRAME_BYTES,
         _ => FRAME_BYTES,

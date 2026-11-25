@@ -263,6 +263,9 @@ pub struct DeploymentRecord {
     pub local_publications: BTreeMap<uuid::Uuid, BTreeMap<uuid::Uuid, (String, rtdb_types::ServingPublication)>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalog_readers: BTreeMap<uuid::Uuid, CatalogReader>,
+    /// The source-side catalog cohort and drain ordered under a Classic transfer fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_catalog_drain: Option<Box<ClassicCatalogDrain>>,
     /// Installed catalog admission floors, keyed by storage root.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalog_admission_floors: BTreeMap<String, CatalogAdmissionFloor>,
@@ -1148,6 +1151,24 @@ pub struct CheckpointTransferFence {
     pub drained_source_through: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassicCatalogCohort {
+    /// Original directory revision that closed admission and selected the reader IDs.
+    pub fenced_at: Version,
+    pub residence: String,
+    pub namespaces: StorageNamespaces,
+    pub readers: Vec<uuid::Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassicCatalogDrain {
+    pub cohort: ClassicCatalogCohort,
+    /// Original directory revision that retained provider drain for this cohort.
+    pub drained_at: Option<Version>,
+}
+
 /// Source owner's terminal receipt. The source log retains the certified interval.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointTransferTerminal {
@@ -1220,7 +1241,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), classic_catalog_drain: None, catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
             cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
@@ -1691,6 +1712,21 @@ fn prepare_checkpoint_transfer(
     }
     let mut source = source.clone();
     let mut destination = destination.clone();
+    let fenced_at = source.version.checked_add(1).ok_or_else(transfer_changed)?;
+    source.classic_catalog_drain = source.storage_namespaces.filter(|_| {
+        intent.classic_migration.is_some() && source.catalog_readers.len() <= 512
+            && source.catalog_readers.values().all(|reader| {
+                reader.replica_epoch == source.log_epoch
+                    && matches!(source.storage_regions.get(&reader.owner),
+                        Some(StorageRegion::Local { archive: None, .. }))
+            })
+    }).map(|namespaces| Box::new(ClassicCatalogDrain {
+        cohort: ClassicCatalogCohort {
+            fenced_at, residence: source.storage_prefix(), namespaces,
+            readers: source.catalog_readers.keys().copied().collect(),
+        },
+        drained_at: None,
+    }));
     let fence = CheckpointTransferFence {
         destination: stage.clone(), source_writer_epoch: source.epoch,
         fenced_writer_epoch: source.epoch.checked_add(1).ok_or_else(transfer_changed)?,
@@ -1702,7 +1738,7 @@ fn prepare_checkpoint_transfer(
     source.resident_idle = None;
     source.move_intent = None;
     source.placement_move = None;
-    source.version = source.version.checked_add(1).ok_or_else(transfer_changed)?;
+    source.version = fenced_at;
     destination.version = destination.version.checked_add(1).ok_or_else(transfer_changed)?;
     source.checkpoint_transfer_fence = Some(Box::new(fence.clone()));
     destination.checkpoint_transfer_fence = Some(Box::new(fence.clone()));
@@ -1864,6 +1900,17 @@ fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) 
     {
         return Err(transfer_changed());
     }
+    if current.classic_catalog_drain != next.classic_catalog_drain {
+        match (current.classic_catalog_drain.as_deref(), next.classic_catalog_drain.as_deref()) {
+            (Some(prior), Some(proposed)) if prior.cohort == proposed.cohort
+                && prior.drained_at.is_none() && proposed.drained_at.is_some()
+                && proposed.drained_at == current.version.checked_add(1)
+                && current.checkpoint_transfer_terminal.is_none()
+                && current.storage_regions.is_empty() && next.storage_regions.is_empty()
+                && current.catalog_readers.is_empty() && next.catalog_readers.is_empty() => (),
+            _ => return Err(transfer_changed()),
+        }
+    }
     let Some(fence) = current.checkpoint_transfer_fence.as_deref() else { return Ok(()); };
     if current.checkpoint_transfer_activation.is_some() {
         if next.checkpoint_stage.is_some() || next.log_epoch != current.log_epoch
@@ -1874,6 +1921,12 @@ fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) 
         return Ok(());
     }
     let capture = &fence.destination.intent.capture;
+    if current.id == fence.destination.intent.source.to_string()
+        && current.classic_catalog_drain.is_some()
+        && next.catalog_readers.iter().any(|(id, reader)| current.catalog_readers.get(id) != Some(reader))
+    {
+        return Err(transfer_changed());
+    }
     if next.lifecycle != Lifecycle::Restoring || next.holder.is_some()
         || current.epoch != next.epoch || current.incarnation != next.incarnation
         || current.log_epoch != next.log_epoch || current.checkpoint != next.checkpoint
@@ -2011,7 +2064,7 @@ impl MemoryDirectory {
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord,
         lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
+        if record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
         if !installed_reservation::memory_allows_insert(
             state.installed_journals.contains(&record.id), stage_version.is_some(), state.deployments.contains_key(&record.id),
         ) {
@@ -2268,6 +2321,17 @@ mod tests {
         source.epoch = 4;
         source.log_epoch = 2;
         source.holder = Some(MemberId::fresh());
+        source.storage_namespaces = Some(StorageNamespaces { objects: uuid::Uuid::new_v4(), keys: [7; 32] });
+        let owner = uuid::Uuid::new_v4();
+        source.storage_regions.insert(owner, StorageRegion::Local {
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: true,
+            checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        });
+        let ticket = uuid::Uuid::new_v4();
+        source.catalog_readers.insert(ticket, CatalogReader {
+            owner, storage_root: "original".into(), replica_epoch: source.log_epoch,
+            cut: None, catalog_file_paths: None,
+        });
         let checkpoint = Checkpoint { block: 2, boundary: 10, source: 8, system_time: 20, root_sha256: Some([1; 32]) };
         source.checkpoint = Some(checkpoint);
         let capture = uuid::Uuid::new_v4();
@@ -2308,6 +2372,16 @@ mod tests {
         let (mut closed, held, fence) = prepare_checkpoint_transfer(&source, &target, &selection).unwrap();
         assert_eq!(closed.lifecycle, Lifecycle::Restoring);
         assert!(closed.holder.is_none() && held.holder.is_none());
+        let cohort = &closed.classic_catalog_drain.as_ref().unwrap().cohort;
+        assert_eq!(cohort.fenced_at, closed.version);
+        assert_eq!(cohort.readers, [ticket]);
+        assert!(held.classic_catalog_drain.is_none());
+        let mut late_reader = closed.clone();
+        late_reader.catalog_readers.insert(uuid::Uuid::new_v4(), source.catalog_readers[&ticket].clone());
+        assert!(require_transfer_update(&closed, &late_reader).is_err());
+        let mut premature_drain = closed.clone();
+        premature_drain.classic_catalog_drain.as_mut().unwrap().drained_at = Some(closed.version + 1);
+        assert!(require_transfer_update(&closed, &premature_drain).is_err());
         assert_eq!(prepare_checkpoint_transfer(&closed, &held, &selection).unwrap().2, fence);
         let mut changed_target = selection.stage.clone();
         changed_target.intent.classic_migration.as_mut().unwrap().destination = uuid::Uuid::new_v4();
@@ -2323,14 +2397,17 @@ mod tests {
         };
         assert!(prepare_checkpoint_transfer_terminal(&closed, &terminal).is_err());
         terminal.source_through = 11;
-        let reader = uuid::Uuid::new_v4();
-        closed.catalog_readers.insert(reader, CatalogReader {
-            owner: uuid::Uuid::new_v4(), storage_root: "original".into(), replica_epoch: source.log_epoch,
-            cut: None, catalog_file_paths: None,
-        });
         assert!(prepare_checkpoint_transfer_terminal(&closed, &terminal).is_err());
-        closed.catalog_readers.remove(&reader);
+        closed.catalog_readers.remove(&ticket);
+        closed.storage_regions.remove(&owner);
+        let mut drained = closed.clone();
+        drained.classic_catalog_drain.as_mut().unwrap().drained_at = Some(closed.version + 1);
+        assert!(require_transfer_update(&closed, &drained).is_ok());
+        drained.version += 1;
+        assert!(require_transfer_update(&drained, &closed).is_err());
+        let closed = drained;
         let sealed = prepare_checkpoint_transfer_terminal(&closed, &terminal).unwrap();
+        assert_eq!(closed.classic_catalog_drain, sealed.classic_catalog_drain);
         assert_eq!(prepare_checkpoint_transfer_terminal(&sealed, &terminal).unwrap(), sealed);
         let mut discarded = sealed.clone();
         discarded.checkpoint_captures.remove(&capture);

@@ -18,6 +18,7 @@ pub(crate) struct ApplicationLayout {
     pub(super) sql_cutoff_prefix: String,
     pub(super) inventory: Vec<TableRef>,
     pub(super) sql_release: SqlReleaseLayout,
+    pub(super) external_key_recovery: Option<TableRef>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +75,11 @@ impl ApplicationLayout {
             || sql.iter().copied().collect::<BTreeSet<_>>().len() != sql.len()
             || !layout.inventory.contains(&layout.closure.table)
             || !sql.iter().all(|table| layout.inventory.contains(*table))
+            || layout.external_key_recovery.as_ref().is_some_and(|table| {
+                !layout.inventory.contains(table)
+                    || points.iter().any(|point| &point.table == table)
+                    || sql.contains(&table)
+            })
         {
             return Err(invalid());
         }

@@ -511,6 +511,22 @@ impl<'a> AssertionFamilies<'a> {
         }
     }
 
+    pub(crate) async fn retained_release_terminal(
+        &self, registration: FamilyReleaseRegistration,
+    ) -> Result<Option<(&'static str, [u8; 32])>> {
+        let Some(phase) = self.read_release_terminal(registration).await? else { return Ok(None); };
+        let (disposition, tag) = match phase {
+            ReleasePhase::Cancelled => ("cancelled", 0),
+            ReleasePhase::Disposed => ("disposed", 1),
+            ReleasePhase::Private | ReleasePhase::Promoted => return Err(malformed()),
+        };
+        let mut hash = Context::new(&SHA256);
+        hash.update(TERMINAL_HEADER);
+        hash.update(&[tag]);
+        hash.update(&registration.binding);
+        Ok(Some((disposition, finish(hash))))
+    }
+
     /// A vault-side drain check. RTDB's delivery owner must separately drain
     /// its Flight and worker output before a release holder signs a disposition.
     pub async fn family_release_holds_drained(&self, client_family: Uuid, expected: AssertionFamilyFenceMarker) -> Result<bool> {
@@ -650,6 +666,7 @@ mod tests {
         let deployment = Uuid::new_v4();
         let offered = registration(Uuid::new_v4(), deployment);
         let family_id = offered.family();
+        assert!(families.retained_release_terminal(offered).await?.is_none());
         families.enroll_original(family_id, EnrolledWorldRow {
             world: Uuid::new_v4(), assertion: AssertionId::from_bytes([1; 32]),
             capability: AssertionStage::new(deployment, NonZeroU64::MIN, Uuid::new_v4())?,
@@ -658,10 +675,20 @@ mod tests {
         let (prior, revision) = families.read(family_id).await?.unwrap();
         families.finish_family_release(offered, ReleasePhase::Cancelled).await?;
         assert_eq!(families.read_release_terminal(offered).await?, Some(ReleasePhase::Cancelled));
+        let retained = families.retained_release_terminal(offered).await?.unwrap();
+        let mut expected = b"RFT1\0".to_vec();
+        expected.extend_from_slice(&offered.binding);
+        assert_eq!(retained, ("cancelled", crate::archive::sha256(&expected)));
+        let mut sibling = offered;
+        sibling.binding[0] ^= 1;
+        assert!(families.retained_release_terminal(sibling).await.is_err());
         let (current, _) = families.read(family_id).await?.unwrap();
         assert!(current.release_holds.is_empty());
         assert!(!families.write(family_id, Some(&revision), &prior).await?);
         families.finish_family_release(offered, ReleasePhase::Cancelled).await?;
+        let reopened = LocalKeyService::with_archive_broker(directory.path())?;
+        let reopened = reopened.assertion_families(IoRegion::new()).unwrap();
+        assert_eq!(reopened.retained_release_terminal(offered).await?, Some(retained));
         assert!(families.require_family_release(offered).await.is_err());
         Ok(())
     }

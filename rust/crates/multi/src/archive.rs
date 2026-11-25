@@ -2517,6 +2517,7 @@ pub(crate) async fn seal_checkpoint_transfer(
         return Ok(terminal.clone());
     }
     await_storage_drain(directory, storage, keys, &source).await?;
+    record_classic_catalog_drain(directory, storage, keys, &source, fence).await?;
     let stream = administration_stream(directory, &source, 4 << 20).await?;
     let sealed = rtdb_logkeeper::seal_recover_committed(&stream, fence.fenced_writer_epoch).await?.0;
     let mut node = rtdb_node::NodeOptions::default();
@@ -2561,6 +2562,45 @@ pub(crate) async fn seal_checkpoint_transfer(
         placed_debt: terminal.placed_debt,
         replica_sha256, lifetime_floors_sha256,
     }).await
+}
+
+async fn record_classic_catalog_drain(
+    directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService,
+    source: &DeploymentRecord, fence: &rtdb_directory::CheckpointTransferFence,
+) -> Result<()> {
+    let Some(drain) = source.classic_catalog_drain.as_ref().filter(|_| matches!(storage, CellStorage::Local { .. })) else {
+        return Ok(());
+    };
+    if drain.drained_at.is_some() { return Ok(()); }
+    let cohort = &drain.cohort;
+    let region = rtdb_storage::IoRegion::new();
+    let objects = async {
+        let bucket = storage.bucket(region.clone()).await?;
+        crate::deployment::existing_storage_namespace(bucket.as_ref()).await
+    }.await;
+    region.close_and_wait().await;
+    if objects? != Some(cohort.namespaces.objects) || keys.existing_namespace_id().await? != Some(cohort.namespaces.keys) {
+        return Ok(());
+    }
+    update_installation(directory, &source.id, |current| {
+        if current.checkpoint_transfer_fence.as_deref() != Some(fence)
+            || current.lifecycle != Lifecycle::Restoring || current.epoch != fence.fenced_writer_epoch
+            || current.storage_prefix() != cohort.residence || current.storage_namespaces != Some(cohort.namespaces)
+        {
+            return Err(inconsistent("The Classic provider drain lost its Original residence"));
+        }
+        let retained = current.classic_catalog_drain.as_mut().filter(|retained| &retained.cohort == cohort)
+            .ok_or_else(|| inconsistent("The Classic provider drain lost its fenced reader cohort"))?;
+        if retained.drained_at.is_none() {
+            if !current.storage_regions.is_empty() || !current.catalog_readers.is_empty() {
+                return Err(unavailable("The Classic catalog readers still hold their provider residence"));
+            }
+            retained.drained_at = Some(current.version.checked_add(1)
+                .ok_or_else(|| inconsistent("The Classic provider directory revision is exhausted"))?);
+        }
+        Ok(())
+    }).await?;
+    Ok(())
 }
 
 pub(crate) async fn restore_checkpoint(

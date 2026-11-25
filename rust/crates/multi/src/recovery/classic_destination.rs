@@ -15,7 +15,7 @@ use rtdb_types::{Anomaly, EntityId, Result, TableRef, TransactionKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{RecoveryService, Reply, valid_manifest};
+use super::{RecoveryService, Reply, classic_provider, valid_manifest};
 use crate::archive::{
     self, ApplicationEvidence, ClassicProjection, ClassicRead, PointHistoryRead, ReceiptHistory,
     ReceiptLookup, ReceiptLookups, StageSelector,
@@ -128,6 +128,7 @@ pub(super) enum Operation {
         candidate_binding: Binding,
         classic_cut: TransactionKey,
         points: Option<PointHistoryRead>,
+        provider: Option<classic_provider::Population>,
     },
 }
 
@@ -210,7 +211,7 @@ impl RecoveryService {
             &selection,
         ))?);
         let mut evidence = Evidence {
-            name: source.name,
+            name: source.name.clone(),
             authority,
             capture,
             source_incarnation: source.incarnation,
@@ -262,7 +263,7 @@ impl RecoveryService {
             evidence.original_receipt_coverage = readback.coverage;
             return Ok(Reply::ClassicMigrationDestination { evidence });
         }
-        if let Operation::Application { candidate_binding, classic_cut, points } = operation {
+        if let Operation::Application { candidate_binding, classic_cut, points, provider } = operation {
             let Some(layout) = &self.classic_application_layout else {
                 return Ok(Reply::Refused);
             };
@@ -277,12 +278,29 @@ impl RecoveryService {
             {
                 return Err(conflict());
             }
+            let provider_release = match &provider {
+                Some(classic_provider::Population::FamilyRelease { registration }) => {
+                    let registered = registration.registration()?;
+                    let history = rtdb_types::PlacedAttemptScope::new(&source.stream("replica"), terminal.fence.source_writer_epoch)?;
+                    if registered.owner().source_history != history.history_fingerprint()
+                        || registered.owner().deployment != authority
+                        || source.storage_namespaces.is_none_or(|namespaces| namespaces.keys == [0; 32])
+                    {
+                        return Err(conflict());
+                    }
+                    Some(registration.clone())
+                }
+                Some(classic_provider::Population::LocalCatalog) if source.classic_catalog_drain.as_ref().is_none_or(|drain| drain.drained_at.is_none()) => {
+                    return Ok(Reply::Deferred);
+                }
+                _ => None,
+            };
             let (_, prepared, _) = Box::pin(archive::read_classic_migration(
                 directory, &self.storage, self.keys.as_ref(), self.classic_stage_selector(&evidence),
                 authority, evidence.selection.ciphertext_sha256, self.hosted_task.clone(),
                 ClassicRead::Application {
                     request: request_sha256, begin: candidate_binding.begin_sha256, cut: classic_cut,
-                    points, layout: Arc::clone(layout),
+                    points, provider_release, layout: Arc::clone(layout),
                 },
             )).await?;
             let prepared = prepared.ok_or_else(conflict)?;
@@ -295,7 +313,61 @@ impl RecoveryService {
             {
                 return Err(conflict());
             }
-            return Ok(match prepared.application.ok_or_else(conflict)? {
+            let application = prepared.application.ok_or_else(conflict)?;
+            if let Some(provider) = provider {
+                let ApplicationEvidence::Closure(application) = application else { return Err(conflict()); };
+                let stage = &terminal.fence.destination;
+                let migration = stage.intent.classic_migration.ok_or_else(conflict)?;
+                if migration.source.incarnation != source.incarnation || migration.source.log_epoch != source.log_epoch
+                    || migration.source.writer_epoch != terminal.fence.source_writer_epoch
+                {
+                    return Err(conflict());
+                }
+                let provider_terminal = match provider {
+                    classic_provider::Population::LocalCatalog => {
+                        let drain = source.classic_catalog_drain.as_ref().ok_or_else(conflict)?;
+                        let cohort = drain.cohort.clone();
+                        let drained_at = drain.drained_at.ok_or_else(conflict)?;
+                        if source.version < drained_at || drained_at <= cohort.fenced_at
+                            || source.storage_namespaces != Some(cohort.namespaces)
+                            || source.storage_prefix() != cohort.residence
+                        {
+                            return Err(conflict());
+                        }
+                        classic_provider::Terminal::LocalCatalog(classic_provider::CatalogDrain {
+                            fenced_at: cohort.fenced_at, drained_at, residence: cohort.residence,
+                            object_namespace: cohort.namespaces.objects, readers: cohort.readers,
+                        })
+                    }
+                    classic_provider::Population::FamilyRelease { registration } => {
+                        let namespaces = source.storage_namespaces.ok_or_else(conflict)?;
+                        if self.keys.existing_namespace_id().await? != Some(namespaces.keys) { return Err(conflict()); }
+                        let (settled_at, settlement_sha256) = application.provider_release.ok_or_else(conflict)?;
+                        let registered = registration.registration()?;
+                        let region = rtdb_storage::IoRegion::new();
+                        let vault = self.keys.assertion_families(region.clone()).ok_or_else(conflict)?;
+                        let observed = vault.retained_release_terminal(registered).await;
+                        region.close_and_wait().await;
+                        let Some((disposition, terminal_sha256)) = observed? else { return Ok(Reply::Deferred); };
+                        classic_provider::Terminal::FamilyRelease(classic_provider::ReleaseDrain {
+                            locator: registration.locator,
+                            address_sha256: archive::sha256(&registration.address),
+                            settled_at, settlement_sha256, disposition, terminal_sha256,
+                        })
+                    }
+                };
+                return Ok(Reply::ClassicMigrationProviderDrain {
+                    selection: evidence.selection, candidate_binding, source: migration.source,
+                    fenced_writer_epoch: terminal.fence.fenced_writer_epoch,
+                    application: classic_provider::ApplicationClose {
+                        classic_cut: application.classic_cut, sql_cutoff: application.sql_cutoff(),
+                        epoch: application.source_epoch, assignment: application.source_assignment,
+                        custody_sha256: application.custody_sha256, selection_sha256: application.selection_sha256,
+                    },
+                    terminal: provider_terminal,
+                });
+            }
+            return Ok(match application {
                 ApplicationEvidence::Closure(application) => Reply::ClassicMigrationApplicationReadback {
                     selection: evidence.selection, candidate_binding, application,
                 },

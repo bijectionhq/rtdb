@@ -16,6 +16,9 @@ use super::layout::{ApplicationLayout, SqlReleaseLayout};
 use super::points::{PointHistories, PointHistoryRead, PointSelector};
 use super::{RelationInventory, RetainedInventory, inconsistent, unavailable};
 use crate::archive::{encode, sha256};
+use crate::recovery::classic_provider::ReleaseSelection;
+
+mod provider;
 
 const MAX_ROWS: usize = 4096;
 const MAX_INVENTORY_BYTES: usize = 2 << 20;
@@ -29,6 +32,7 @@ pub(super) struct Application {
     events: BTreeMap<(TableRef, EntityId, TxId, Timestamp, Timestamp), EventHeader>,
     charges: Vec<Arc<MemoryReservation>>,
     points: Option<PointHistoryRead>,
+    provider_release: Option<ReleaseSelection>,
 }
 
 pub(crate) enum ApplicationEvidence {
@@ -54,11 +58,11 @@ struct WriterSelection {
 
 #[derive(Serialize)]
 pub(crate) struct ApplicationReadback {
-    classic_cut: TransactionKey,
-    source_epoch: u64,
-    source_assignment: [u8; 16],
-    custody_sha256: [u8; 32],
-    selection_sha256: [u8; 32],
+    pub(crate) classic_cut: TransactionKey,
+    pub(crate) source_epoch: u64,
+    pub(crate) source_assignment: [u8; 16],
+    pub(crate) custody_sha256: [u8; 32],
+    pub(crate) selection_sha256: [u8; 32],
     closure: Stamp,
     sql_release_cutoff: Stamp,
     closed_writer: Stamp,
@@ -67,6 +71,8 @@ pub(crate) struct ApplicationReadback {
     writer_acknowledged: TransactionKey,
     inventory: Vec<DispositionRelation>,
     retained: RetainedInventory,
+    #[serde(skip)]
+    pub(crate) provider_release: Option<(TransactionKey, [u8; 32])>,
     #[serde(skip)]
     _charges: Vec<Arc<MemoryReservation>>,
 }
@@ -109,11 +115,17 @@ impl Application {
             events: BTreeMap::new(),
             charges: Vec::new(),
             points: None,
+            provider_release: None,
         }
     }
 
     pub(super) fn with_points(mut self, points: Option<PointHistoryRead>) -> Self {
         self.points = points;
+        self
+    }
+
+    pub(super) fn with_provider_release(mut self, release: Option<ReleaseSelection>) -> Self {
+        self.provider_release = release;
         self
     }
 
@@ -261,6 +273,10 @@ impl Application {
             return Err(invalid());
         }
 
+        let provider_release = self.provider_release.as_ref().map(|selection| {
+            self.read_provider_release(index, &view, selection, epoch, release_cut, sha256(body))
+        }).transpose()?;
+
         let terminal = index.head();
         let end = index.view(
             MAIN_BRANCH,
@@ -356,6 +372,7 @@ impl Application {
             writer_acknowledged: selected.writer.acknowledged,
             inventory,
             retained: retained.clone(),
+            provider_release,
             _charges: charges,
         }))
     }
@@ -401,6 +418,10 @@ impl Application {
             row_sha256: sha256(&encode(cells)?),
         })
     }
+}
+
+impl ApplicationReadback {
+    pub(crate) fn sql_cutoff(&self) -> TransactionKey { self.sql_release_cutoff.written }
 }
 
 fn require_sql_disposition(

@@ -474,7 +474,7 @@ impl DynamoDirectory {
     async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>,
         stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
+        if record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() { return Err(transfer_changed()); }
         record.version = stage_version.unwrap_or(0) + 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?));
         let deployment = match stage_version {
@@ -972,7 +972,7 @@ impl Directory for DynamoDirectory {
     }
 
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        if !record.writer_handoffs.is_empty() || record.fork_stage.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() {
+        if !record.writer_handoffs.is_empty() || record.fork_stage.is_some() || record.classic_catalog_drain.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() || record.checkpoint_transfer_activation.is_some() {
             let Some(current) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
             if current.version != expected { return Ok(Cas::Conflict(Some(current))); }
             require_fork_stage_update(&current, &record)?;

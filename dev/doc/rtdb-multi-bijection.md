@@ -459,7 +459,7 @@ The cutoff uses the closure table and the mounted prefix followed by the old epo
 `inventory` is an ordered array of distinct public table references that includes the closure table and each SQL release role.
 `sql_release` maps its distinct `grants`, `rows`, `execution_units`, `joined` and `stopped` roles to public table references.
 The file is bounded at 16 KiB and 64 inventory tables.
-Both readback actions refuse when the layout is absent.
+Application closure, point histories and provider drain status all require this layout.
 
 The success outcome `classic_migration_application_readback` contains `selection`, `candidate_binding` and `application`.
 The application value carries `classic_cut`, `source_epoch`, `source_assignment`, `custody_sha256`, `selection_sha256` (SHA-256 of the exact persisted Bijection closure selection bytes), `closure`, `sql_release_cutoff`, `closed_writer`, `predecessor_writer`, `custody_pin`, and `writer_acknowledged`.
@@ -500,6 +500,44 @@ The reader refuses a missing, deleted, redacted, ambiguous, unpositioned or diff
 It proves the same retained Begin and application close for the requested points in one certified replay.
 The consumer compares the literal binding bytes and the exact closed writer fields with its independently retained Bijection selection and fence.
 This outcome carries no Original obligation inventory or disposition and excludes the selected business receipt relation.
+
+#### Classic provider drain status
+
+On the authenticated Original recovery envelope, use `classic_migration_provider_drain_status` with the same `selection`, full `candidate_binding` and `classic_cut` as the application closure readback.
+Supply `provider` as `{"population":"local_catalog"}` or `{"population":"family_release","registration":{"locator":L,"address":A}}`.
+The newline-terminated request has the same 16 KiB bound as the application readback.
+The mounted application layout and the exact held scratch replay are required.
+
+The `classic_migration_provider_drain` outcome echoes `selection` and `candidate_binding`.
+It includes `source` with `incarnation`, `log_epoch` and `writer_epoch`, the `fenced_writer_epoch`, and `application` with `classic_cut`, `sql_cutoff`, `epoch`, `assignment`, `custody_sha256` and `selection_sha256`.
+`application.epoch` and `application.assignment` are Bijection placement coordinates from the closed writer row at the Classic application cut.
+CUT matches the status to that writer, the exact SQL cutoff and persisted selection bytes, the independently retained Original catalog commitment, and the still-held Begin with its full Original scope, placement and `begun_at`.
+The Begin digest comes from the checked candidate binding and exact Classic closure row.
+The independent Original catalog commitment and holder come from Bijection's held observation.
+
+The `local_catalog` terminal reports the Original directory `fenced_at` and `drained_at` revisions, the `residence` and `object_namespace`, and the ordered `readers` UUIDs captured by the transfer fence.
+This population covers directory `CatalogReaders` whose owners at the fence are Local serving regions for the Original replica epoch, up to 512 registered tickets on an enrolled residence.
+Closing the residence and selecting its catalog population share the directory fence transition.
+The Original owner joins the provider regions or verifies their exact Local volume witnesses before the independent directory drain CAS can commit.
+The seal operation checks for provider drain evidence before requesting keeper sealing.
+The Original directory record preserves any receipt retained by that check.
+On a lost reply, repeat status with the exact selector after the scratch is available.
+The selector returns `deferred` when the Original lacks a retained Local catalog drain, including older fences, unbound namespaces and hosted provider residences.
+
+For `family_release`, supply the exact canonical lowercase 278-character `KeyRecoveryAttempt` index key and its 188-byte nonsecret `RFR1` address as a JSON byte array.
+Commission `external_key_recovery` as the exact schema-qualified relation in the mounted layout's inventory, using the same table object as the other layout roles.
+The family release action uses this relation in the Original registry commitment and requires the mounted role.
+The Bijection cutoff owner has both coordinates at registration and must retain them before its SQL erase if it needs later provider readback.
+The checked scratch replay matches the locator, exact address digest and creator in the frozen `classic-key-delivery-cohort.v1/` row and the exact ordered `classic-key-delivery-settled.v1/` row under the same application selection.
+The Original vault then reopens the matching immutable `RFT1` provider terminal, including the registration binding.
+The `family_release` terminal contains `locator`, `address_sha256`, `settled_at`, `settlement_sha256` over the exact settlement binding bytes, `disposition` of `cancelled` or `disposed`, and `terminal_sha256` over the exact provider terminal bytes.
+Repeat the exact status after a lost reply to recover those coordinates from the retained scratch and vault.
+The action returns `deferred` for a missing provider terminal and refuses foreign registrations or mismatched evidence.
+
+These two selectors establish only the reported populations.
+The retained application SQL and mounted Owned evidence stay under their existing authorities.
+Flight handles and query streams, recovery export and replay delivery, separately registered response parts and external egress have their own owners.
+Retained Worlds, holds, and key disposition require their own evidence before route readiness.
 
 ### Private native candidate
 
