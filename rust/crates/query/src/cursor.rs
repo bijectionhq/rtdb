@@ -764,10 +764,10 @@ impl QueryCursor {
             }
             if replacements.is_empty() {
                 drop(charge);
-                return emit_columns(schema, memory, &input, indices.map(|index| (index, index)), fields, |_| false);
+                return emit_columns(schema, memory, &input, indices.map(|index| (index, index)), fields, |_| false, false);
             }
             let skip = |index| replacements.binary_search_by_key(&index, |(index, _)| *index).is_ok();
-            let output = match emit_columns(schema, memory, &input, indices.map(|index| (index, index)), fields, skip) {
+            let output = match emit_columns(schema, memory, &input, indices.map(|index| (index, index)), fields, skip, false) {
                 Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
                     drop(replacements);
                     drop(charge);
@@ -884,7 +884,7 @@ impl QueryCursor {
 pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
     let indices = 0..schema.len();
     let fields = output_fields(schema, &batch, indices.clone())?;
-    emit_columns(schema, memory, &batch, indices.map(|index| (index, index)), fields, |_| false)
+    emit_columns(schema, memory, &batch, indices.map(|index| (index, index)), fields, |_| false, false)
 }
 
 fn output_fields(schema: &Schema, batch: &crate::columnar::ColumnBatch, indices: impl Iterator<Item = usize>) -> Result<Vec<ArrowField>> {
@@ -898,7 +898,7 @@ fn output_fields(schema: &Schema, batch: &crate::columnar::ColumnBatch, indices:
 fn emit_columns(
     schema: &Schema, memory: &Arc<MemoryBudget>, batch: &crate::columnar::ColumnBatch,
     indices: impl Iterator<Item = (usize, usize)> + Clone, mut fields: Vec<ArrowField>,
-    defer: impl Fn(usize) -> bool,
+    defer: impl Fn(usize) -> bool, selected_probe: bool,
 ) -> Result<OwnedBatch> {
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
     let kept: Vec<Option<ArrayRef>> = indices.clone().zip(&mut fields).map(|((index, source), arrow)| {
@@ -916,7 +916,12 @@ fn emit_columns(
         if let Some(array) = kept { arrays.push(array); continue; }
         let column = &batch.columns[source];
         let field = &schema.fields()[index];
-        if let Some((array, _scratch)) = crate::columnar::relayout_output(column, &field.data_type, arrow, memory)? {
+        let relayout = if selected_probe {
+            crate::columnar::relayout_spatial_probe_output(column, &field.data_type, arrow, memory)
+        } else {
+            crate::columnar::relayout_output(column, &field.data_type, arrow, memory)
+        };
+        if let Some((array, _scratch)) = relayout? {
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("batch-size", "An output batch's charge is shared"))?;
             lease.grow_to(lease.bytes().checked_add(array.get_array_memory_size()).ok_or_else(overflow)?)?;
             arrays.push(array);
@@ -1007,7 +1012,7 @@ impl<P> SpatialProbeFallback<P> {
         let fields = output_fields(schema, &self.input, indices.iter().copied())?;
         let original = indices.iter().copied().map(|index| (index, index));
         if rows.iter().copied().eq(0..self.input.len) {
-            return emit_columns(schema, memory, &self.input, original, fields, |_| false).map(|page| (page, true));
+            return emit_columns(schema, memory, &self.input, original, fields, |_| false, false).map(|page| (page, true));
         }
         let can_select = indices.iter().zip(&fields).all(|(&index, field)| {
             if self.plan(index).is_some() {
@@ -1019,13 +1024,13 @@ impl<P> SpatialProbeFallback<P> {
                     .layouts().is_some()
         });
         if !can_select {
-            return emit_columns(schema, memory, &self.input, original, fields, |_| false).map(|page| (page, false));
+            return emit_columns(schema, memory, &self.input, original, fields, |_| false, false).map(|page| (page, false));
         }
         let _positions = memory.reserve(size_of_val(rows) * 2)?;
         let picks = rows.iter().map(|&row| (0, row)).collect::<Vec<_>>();
         let selected = crate::columnar::ColumnBatch::take_rows_with_custody(&[&self.input], &picks, indices, true, memory)?;
         let selected_indices = indices.iter().copied().zip(0..indices.len());
-        emit_columns(schema, memory, &selected, selected_indices, fields, |_| false).map(|page| (page, true))
+        emit_columns(schema, memory, &selected, selected_indices, fields, |_| false, true).map(|page| (page, true))
     }
 }
 enum ReportRows {
@@ -1135,6 +1140,31 @@ mod tests {
         let child = array.child(id).as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(child.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr(), original);
         assert!(child.column(1).is_null(0));
+    }
+
+    #[test]
+    fn spatial_probe_relayouts_only_selected_union_rows_under_a_small_grant() -> Result<()> {
+        let source_memory = MemoryBudget::new(4 << 20);
+        let selected_memory = MemoryBudget::new(64 << 10);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let target = LogicalType::from_legs([text.clone(), LogicalType::Scalar(ScalarType::I64)]);
+        let small = Value::Utf8("selected".into());
+        let values = [Value::Utf8("x".repeat(256 << 10)), small.clone()];
+        let array = copy_array(&text, &values)?;
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![to_field("v", &text)?])), vec![array]).unwrap();
+        let source = crate::columnar::ColumnBatch::from_owned(OwnedBatch::new(batch, &source_memory)?)?;
+        let picked = crate::columnar::ColumnBatch::take_rows_with_custody(
+            &[&source], &[(0, 1), (0, 1)], &[0], true, &selected_memory,
+        )?;
+        let field = to_field("v", &target)?;
+        let (array, _reservation) = crate::columnar::relayout_spatial_probe_output(
+            &picked.columns[0], &target, &field, &selected_memory,
+        )?.expect("selected rows fit under the narrow grant");
+        assert_eq!(array.len(), 2);
+        for row in 0..2 {
+            assert_eq!(rtdb_columnar::read_value(&field, array.as_ref(), row)?, small);
+        }
+        Ok(())
     }
 
     #[test]

@@ -657,11 +657,16 @@ mod tests {
         window.absorb(settled).unwrap();
         assert_eq!([payload(&window.hits[1]), payload(&window.hits[2])], source_payloads);
 
+        let construction = window.hits.iter().fold(4096, |bytes, hit| {
+            bytes + identity_charge(EntityIdRef::from(&hit.id)) * 4 + 128
+        });
         let page = window.finish().unwrap();
         assert_eq!(page.total, 8);
         let batch = page.hits.batch();
         assert_eq!(batch.num_rows(), 5);
-        assert_eq!(memory.used_bytes(), rtdb_columnar::shared_allocation_size(batch).unwrap());
+        assert_eq!(memory.used_bytes(), page.hits.reservation().bytes());
+        assert!(memory.used_bytes() >= rtdb_columnar::shared_allocation_size(batch).unwrap());
+        assert!(memory.used_bytes() < construction);
         let field = batch.schema_ref().field(0);
         assert_eq!(field, &rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type()).unwrap());
         let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
