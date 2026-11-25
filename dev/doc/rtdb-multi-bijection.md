@@ -596,6 +596,18 @@ The authority signs compact JSON `["rtdb.multi/classic-ordinary-flight-commissio
 The typed `commission` object begins with the exact `CheckpointStageIntent` in `intent`, followed by the five coverage fields in the order just given.
 The affirmative outcome `classic_migration_ordinary_flight_commissioned` carries `coverage_sha256`.
 
+If the commissioned capture is overtaken, recover the exact old seal until it returns `classic_migration_capture_overtaken`.
+Select a new current capture and fresh scratch operation, then issue `commission_classic_migration_ordinary_flight` with a new signature over that exact intent before sending its seal.
+Use the same source incarnation, log and writer epochs, and native destination.
+Reuse the identical held Begin, Original catalog, coverage, retained path and prior-generation list.
+The directory compares the Original and both scratch identities in one order, requires the exact old scratch to be durably closed without a transfer fence, and checks that the new capture is still current and overtakes the old checkpoint.
+The replacement scratch can be unallocated or already held for the exact new selection.
+The rebind changes only the selected transfer intent and keeps every enrollment and join.
+An exact commissioning retry can recover the same acknowledgement after a lost reply.
+An ambiguous old seal, a missing old scratch record, or an already fenced Original cannot authorize a replacement.
+The commissioned Original accepts a transfer fence only for its currently selected intent.
+New retained Flight grants use the rebound capture and manifest.
+
 `join_classic_migration_ordinary_flight_owner` uses the same recovery envelope after observing its exact paired fence.
 Its `disposition` object has `fence_sha256`, `generation`, `role` and `disposal_sha256` in order, and the request carries a base64url unpadded `signature`.
 The transport disposition authority signs compact JSON `["rtdb.multi/classic-ordinary-flight-generation-join/v1", original_name, commission, disposition]`.

@@ -31,7 +31,7 @@ use audience_seat::{SeatCondition, SeatPredecessor, SeatRevision, acquire_condit
 use crate::{
     CheckpointTransferActivation, CheckpointTransferBootstrap, CheckpointTransferFence, CheckpointTransferReplica, CheckpointTransferSelection, CheckpointTransferTerminal, ForkPreparation, fork_stage_changed,
     fork_stage_version, prepare_checkpoint_transfer, prepare_checkpoint_transfer_activation, prepare_checkpoint_transfer_bootstrap, prepare_checkpoint_transfer_replica, prepare_checkpoint_transfer_terminal, require_fork_stage_update,
-    installed_journal_id, require_transfer_update, stage_fork_record, transfer_changed,
+    classic_flight, installed_journal_id, require_transfer_update, stage_fork_record, transfer_changed,
 };
 
 mod audience_seat;
@@ -880,6 +880,42 @@ impl Directory for DynamoDirectory {
         }
         held.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(held)
+    }
+
+    async fn rebind_classic_flight(&self, previous: &classic_flight::Commission, replacement: &classic_flight::Commission) -> Result<()> {
+        let id = replacement.intent.source.to_string();
+        let source = self.deployment(&id).await?.ok_or_else(classic_flight::conflict)?;
+        if classic_flight::commission(&source) == Some(replacement) { return Ok(()); }
+        let excluded_id = previous.intent.destination.to_string();
+        let scratch_id = replacement.intent.destination.to_string();
+        let (excluded, scratch) = tokio::try_join!(self.deployment(&excluded_id), self.deployment(&scratch_id))?;
+        let excluded = excluded.ok_or_else(classic_flight::conflict)?;
+        let rebound = classic_flight::prepare_rebind(&source, &excluded, scratch.as_ref(), previous, replacement)?;
+        let put = Put::builder().table_name(&self.tables.deployments)
+            .set_item(Some(deployment_item(&rebound, self.pack_parked_records)?))
+            .condition_expression(EXACT_VERSION)
+            .expression_attribute_names("#v", VERSION)
+            .expression_attribute_values(":expected", number(source.version))
+            .build().map_err(build_fault)?;
+        let replacement_check = if let Some(scratch) = scratch {
+            self.require_deployment_version(&scratch_id, scratch.version)?
+        } else {
+            let missing = ConditionCheck::builder().table_name(&self.tables.deployments)
+                .key(ID, AttributeValue::S(scratch_id))
+                .condition_expression(NEW_ITEM)
+                .expression_attribute_names("#id", ID)
+                .build().map_err(build_fault)?;
+            TransactWriteItem::builder().condition_check(missing).build()
+        };
+        if self.write_retirement(vec![
+            self.require_deployment_version(&excluded_id, excluded.version)?,
+            replacement_check,
+            TransactWriteItem::builder().put(put).build(),
+        ]).await? || self.deployment(&id).await?.as_ref().and_then(classic_flight::commission) == Some(replacement) {
+            return Ok(());
+        }
+        Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.directory/classic-flight-rebind",
+            "The Classic Flight commission or a scratch revision changed during rebind"))
     }
 
     async fn fence_checkpoint_transfer(&self, selection: &CheckpointTransferSelection) -> Result<CheckpointTransferFence> {

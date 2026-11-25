@@ -1040,6 +1040,12 @@ pub struct Checkpoint {
     pub root_sha256: Option<[u8; 32]>,
 }
 
+impl Checkpoint {
+    pub fn overtakes(self, earlier: Self) -> bool {
+        self.block > earlier.block && self.boundary >= earlier.boundary && self.source >= earlier.source
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointDecision {
     pub checkpoint: Checkpoint,
@@ -1533,6 +1539,10 @@ pub trait Directory: Send + Sync {
     /// The name of a deployment never changes.
     async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>>;
 
+    async fn rebind_classic_flight(&self, _previous: &classic_flight::Commission, _replacement: &classic_flight::Commission) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.directory/classic-flight-rebind", "This directory cannot rebind a Classic Flight commission"))
+    }
+
     /// Fences only the exact source writer, while reserving the exact staged target atomically.
     /// The caller must still drain and seal the original source log at the returned epoch.
     async fn fence_checkpoint_transfer(&self, _selection: &CheckpointTransferSelection) -> Result<CheckpointTransferFence> {
@@ -1759,7 +1769,7 @@ fn prepare_checkpoint_transfer(
         fenced_writer_epoch: source.epoch.checked_add(1).ok_or_else(transfer_changed)?,
         drained_source_through: selection.drained_source_through,
     };
-    classic_flight::freeze(&mut source, &fence, fenced_at);
+    classic_flight::freeze(&mut source, &fence, fenced_at)?;
     source.lifecycle = Lifecycle::Restoring;
     source.epoch = fence.fenced_writer_epoch;
     source.holder = None;
@@ -2231,6 +2241,21 @@ impl Directory for MemoryDirectory {
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
         let state = self.state()?;
         Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].as_ref().clone()).collect())
+    }
+    async fn rebind_classic_flight(&self, previous: &classic_flight::Commission, replacement: &classic_flight::Commission) -> Result<()> {
+        let mut state = self.state()?;
+        let id = replacement.intent.source.to_string();
+        let source = state.deployments.get(&id).ok_or_else(classic_flight::conflict)?;
+        if classic_flight::commission(source) == Some(replacement) { return Ok(()); }
+        let excluded = state.deployments.get(&previous.intent.destination.to_string()).ok_or_else(classic_flight::conflict)?;
+        let scratch_id = replacement.intent.destination.to_string();
+        if state.installed_journals.contains(&scratch_id) { return Err(classic_flight::conflict()); }
+        let scratch = state.deployments.get(&scratch_id).map(Box::as_ref);
+        let rebound = classic_flight::prepare_rebind(source, excluded, scratch, previous, replacement)?;
+        state.deployments.insert(id, Box::new(rebound.clone()));
+        self.persist(&mut state)?;
+        self.changes.publish(rebound);
+        Ok(())
     }
     async fn fence_checkpoint_transfer(&self, selection: &CheckpointTransferSelection) -> Result<CheckpointTransferFence> {
         let mut state = self.state()?;

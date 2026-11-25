@@ -653,7 +653,10 @@ contract LogService {
     @invariant ClassicMigrationOrdinaryFlightDrain
         -- The Original can reobserve the exact ordered transfer fence from its capture and private scratch before the keeper seal completes.
         -- The Original directory orders admission of each ordinary gateway and receiver generation against the same source revision as the transfer fence.
+        -- The Original may replace the commissioned capture and scratch before fencing when the exact prior scratch is durably excluded and the replacement selects the current overtaking checkpoint.
+        -- The rebind preserves the selected Begin, Original catalog, ingress coverage, retained path and all generation admissions and joins.
         -- The exact transfer fence freezes the bounded roster and its independently commissioned ingress coverage.
+        -- A commissioned Original can fence only the currently selected transfer intent.
         -- The installed gateway, subscriber and receiver exclude unclassified FreshFlight for the commissioned Original.
         -- A generic gateway route authenticates a retained read before forwarding its bounded action, and the holder verifies its caller's identity and attachment.
         -- A trusted transport disposition authority can join a previously enrolled generation with positive evidence at the exact fence.

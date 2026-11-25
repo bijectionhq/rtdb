@@ -906,9 +906,7 @@ impl RecoveryService {
                     && archive::capture_receipt(&installation, &self.archive, request.authority, request.capture)?
                         .is_some_and(|(point, manifest)| manifest == intent.source_manifest_sha256
                             && point.incarnation == source.incarnation && point.log_epoch == source.log_epoch
-                            && current_checkpoint.block > point.checkpoint.block
-                            && current_checkpoint.boundary >= point.checkpoint.boundary
-                            && current_checkpoint.source >= point.checkpoint.source)
+                            && current_checkpoint.overtakes(point.checkpoint))
                 {
                     let _ = archive::discard_checkpoint_stage(directory.as_ref(), &installation, &self.archive,
                         &self.storage, self.keys.as_ref(), intent).await?;
@@ -1033,15 +1031,17 @@ impl RecoveryService {
             Action::CommissionClassicMigrationOrdinaryFlight { selection, coverage, signature } => {
                 let Some(owner) = &self.classic_flight_authority else { return Ok(Reply::Refused); };
                 let intent = selection.intent(request.authority, request.capture, &self.org)?;
-                classic_provider::observe_ordinary_flight_fence(&installation, &intent)?;
-                archive::require_capture_open(&installation, request.capture)?;
-                let current_capture = archive::capture_receipt(
-                    &installation, &self.archive, request.authority, request.capture,
-                )?.is_some_and(|(point, manifest)| {
-                    point.incarnation == installation.incarnation && point.log_epoch == installation.log_epoch
-                        && installation.checkpoint == Some(point.checkpoint) && manifest == intent.source_manifest_sha256
-                });
-                if !current_capture { return Ok(Reply::Refused); }
+                if rtdb_directory::classic_flight::commission(&installation).is_none_or(|stored| stored.intent != intent) {
+                    classic_provider::observe_ordinary_flight_fence(&installation, &intent)?;
+                    archive::require_capture_open(&installation, request.capture)?;
+                    let current_capture = archive::capture_receipt(
+                        &installation, &self.archive, request.authority, request.capture,
+                    )?.is_some_and(|(point, manifest)| {
+                        point.incarnation == installation.incarnation && point.log_epoch == installation.log_epoch
+                            && installation.checkpoint == Some(point.checkpoint) && manifest == intent.source_manifest_sha256
+                    });
+                    if !current_capture { return Ok(Reply::Refused); }
+                }
                 owner.commission(directory.as_ref(), &installation, intent, coverage, &signature).await
             }
             Action::JoinClassicMigrationOrdinaryFlightOwner { disposition, signature } => {
@@ -1522,6 +1522,7 @@ mod tests {
             control: ControlKey::default(), memory: MemoryBudget::new(1 << 20),
             classic_destination: None,
             classic_application_layout: None,
+            classic_flight_authority: None,
             storage: CellStorage::Local { root: temporary.path().join("serving") },
             archive: CellStorage::Local { root: temporary.path().join("archive") },
             keys: Arc::new(crate::keys::LocalKeyService::new(&temporary.path().join("keys"))?),
@@ -1649,6 +1650,7 @@ mod tests {
             memory: MemoryBudget::new(4096),
             classic_destination: None,
             classic_application_layout: None,
+            classic_flight_authority: None,
         };
         let manifest = URL_SAFE_NO_PAD.encode([4; 32]);
         installation.checkpoint_captures.insert(capture, rtdb_directory::CheckpointCapture {
@@ -1717,6 +1719,7 @@ mod tests {
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
             classic_application_layout: None,
+            classic_flight_authority: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local { root: temporary.path().join("serving") },
@@ -1809,6 +1812,7 @@ mod tests {
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
             classic_application_layout: None,
+            classic_flight_authority: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local { root: temporary.path().join("serving") },
@@ -1923,6 +1927,7 @@ mod tests {
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
             classic_application_layout: None,
+            classic_flight_authority: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {

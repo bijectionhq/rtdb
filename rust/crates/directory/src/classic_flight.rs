@@ -6,7 +6,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Cas, CheckpointStageIntent, CheckpointTransferFence, ClassicMigrationSource, DeploymentRecord, Directory, Lifecycle, Version};
+use crate::{Cas, Checkpoint, CheckpointStage, CheckpointStageIntent, CheckpointTransferFence, ClassicMigrationSource, DeploymentRecord, Directory, Lifecycle, Version};
 
 pub const MAX_GENERATIONS: usize = 128;
 const MAX_CAS_ATTEMPTS: usize = 8;
@@ -95,7 +95,9 @@ fn selects_live(record: &DeploymentRecord, commission: &Commission) -> bool {
         && intent.org == record.org
         && record.lifecycle == Lifecycle::Live
         && record.holder.is_some()
+        && record.checkpoint_stage.is_none()
         && record.checkpoint_transfer_fence.is_none()
+        && record.checkpoint_transfer_terminal.is_none()
         && record.move_from.is_none()
         && intent.classic_migration.is_some_and(|migration| {
             migration.source == ClassicMigrationSource {
@@ -125,13 +127,81 @@ fn completely_joined(admission: &Admission) -> bool {
         && admission.owners.values().all(|owner| owner.joined.is_some())
 }
 
-pub(crate) fn freeze(record: &mut DeploymentRecord, fence: &CheckpointTransferFence, at: Version) {
-    if let Some(admission) = &mut record.classic_flight
-        && selects_fence(&admission.commission, fence)
-    {
+pub(crate) fn freeze(record: &mut DeploymentRecord, fence: &CheckpointTransferFence, at: Version) -> Result<()> {
+    if let Some(admission) = &mut record.classic_flight {
+        if !selects_fence(&admission.commission, fence) { return Err(conflict()); }
         let drained_at = completely_joined(admission).then_some(at);
         admission.frozen = Some(Frozen { at, drained_at });
     }
+    Ok(())
+}
+
+fn exact_scratch<'a>(record: &'a DeploymentRecord, intent: &CheckpointStageIntent) -> Option<&'a CheckpointStage> {
+    let migration = intent.classic_migration?;
+    record.checkpoint_stage.as_deref().filter(|stage| {
+        stage.intent == *intent && stage.transfer_only
+            && stage.source_incarnation == migration.source.incarnation
+            && stage.source_log_epoch == migration.source.log_epoch
+            && record.id == intent.destination.to_string() && record.lineage == record.id
+            && record.name == intent.name && record.org == intent.org && record.incarnation == 1
+            && record.holder.is_none() && record.parent.is_none() && record.fork_stage.is_none()
+            && record.checkpoint.is_none() && record.ensemble.is_empty() && record.replica_journals.is_empty()
+            && record.move_from.is_none() && record.moved_at_ms.is_none()
+            && record.checkpoint_transfer_fence.is_none() && record.checkpoint_transfer_terminal.is_none()
+            && record.checkpoint_transfer_bootstrap.is_none() && record.checkpoint_transfer_replica.is_none()
+            && record.checkpoint_transfer_activation.is_none()
+    })
+}
+
+fn registered_checkpoint(record: &DeploymentRecord, intent: &CheckpointStageIntent) -> Option<Checkpoint> {
+    if record.checkpoint_capture_retirements.contains_key(&intent.capture) { return None; }
+    record.checkpoint_captures.get(&intent.capture).filter(|capture| {
+        capture.incarnation == record.incarnation && capture.log_epoch == record.log_epoch
+            && capture.media_bound && capture.remote_disposal.is_none()
+            && capture.manifest_sha256.as_deref() == Some(intent.source_manifest_sha256.as_str())
+    }).map(|capture| capture.checkpoint)
+}
+
+pub(crate) fn prepare_rebind(
+    source: &DeploymentRecord, excluded: &DeploymentRecord, replacement_scratch: Option<&DeploymentRecord>,
+    previous: &Commission, replacement: &Commission,
+) -> Result<DeploymentRecord> {
+    let mut admission = source.classic_flight.as_deref().filter(|admission| {
+        admission.commission == *previous && admission.frozen.is_none()
+    }).ok_or_else(conflict)?.clone();
+    let prior = &previous.intent;
+    let next = &replacement.intent;
+    if !selects_live(source, previous) || next.source != prior.source || next.org != prior.org
+        || next.classic_migration != prior.classic_migration
+        || next.capture == prior.capture || next.capture.is_nil()
+        || next.operation != next.destination || next.name != format!("checkpoint-stage-{}", next.operation)
+        || next.operation.is_nil() || next.operation == prior.operation || next.destination == prior.destination
+        || next.destination == next.source
+    {
+        return Err(conflict());
+    }
+    admission.commission.intent = next.clone();
+    if admission.commission != *replacement { return Err(conflict()); }
+    let old_stage = exact_scratch(excluded, prior).ok_or_else(conflict)?;
+    if !matches!(excluded.lifecycle, Lifecycle::Deleting | Lifecycle::Deleted)
+        || excluded.lifecycle == Lifecycle::Deleted && excluded.disposal.is_none()
+    {
+        return Err(conflict());
+    }
+    let checkpoint = registered_checkpoint(source, next).ok_or_else(conflict)?;
+    if source.checkpoint != Some(checkpoint) || checkpoint.root_sha256.is_none()
+        || !checkpoint.overtakes(old_stage.checkpoint)
+        || replacement_scratch.is_some_and(|record| {
+            record.lifecycle != Lifecycle::Restoring
+                || exact_scratch(record, next).is_none_or(|stage| stage.checkpoint != checkpoint)
+        })
+    {
+        return Err(conflict());
+    }
+    let mut rebound = source.clone();
+    rebound.version = source.version.checked_add(1).ok_or_else(conflict)?;
+    rebound.classic_flight = Some(Box::new(admission));
+    Ok(rebound)
 }
 
 pub fn terminal<'a>(record: &'a DeploymentRecord, fence: &CheckpointTransferFence) -> Option<Terminal<'a>> {
@@ -176,12 +246,7 @@ fn transition(record: &DeploymentRecord, change: Change<'_>) -> Result<Admission
             || selected.coverage_sha256 == [0; 32] || selected.begin_sha256 == [0; 32]
             || selected.original_catalog_sha256 == [0; 32]
             || selected.retained_path_sha256 == [0; 32]
-            || !record.checkpoint_captures.get(&selected.intent.capture).is_some_and(|capture| {
-                capture.incarnation == record.incarnation && capture.log_epoch == record.log_epoch
-                    && capture.media_bound && capture.remote_disposal.is_none()
-                    && capture.manifest_sha256.as_deref() == Some(selected.intent.source_manifest_sha256.as_str())
-            })
-            || record.checkpoint_capture_retirements.contains_key(&selected.intent.capture)
+            || registered_checkpoint(record, &selected.intent).is_none_or(|checkpoint| record.checkpoint != Some(checkpoint))
         {
             return Err(conflict());
         }
@@ -266,6 +331,10 @@ async fn apply(directory: &dyn Directory, source: Uuid, exact: &Commission, chan
 }
 
 pub async fn install(directory: &dyn Directory, commission: &Commission) -> Result<()> {
+    let source = directory.deployment(&commission.intent.source.to_string()).await?.ok_or_else(conflict)?;
+    if let Some(previous) = self::commission(&source) && previous != commission {
+        return directory.rebind_classic_flight(previous, commission).await;
+    }
     apply(directory, commission.intent.source, commission, Change::Commission(commission)).await
 }
 
@@ -279,7 +348,7 @@ pub async fn join(
     apply(directory, commission.intent.source, commission, Change::Join { generation, role, disposal_sha256 }).await
 }
 
-fn conflict() -> Anomaly {
+pub(crate) fn conflict() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/classic-flight-order",
         "The exact Classic Flight admission or owner generation is unavailable")
 }
@@ -326,4 +395,108 @@ pub(super) fn check_transfer_order(
     let terminal = terminal(&reopened, &fence).unwrap();
     assert_eq!((terminal.fenced_at, terminal.drained_at), (fenced.version, drained.version));
     assert_eq!((terminal.gateway_generations, terminal.receiver_generations), (1, 1));
+}
+
+#[tokio::test]
+async fn overtaken_capture_rebind_preserves_joined_and_live_generations() {
+    use crate::{CellMedia, CheckpointCapture, CheckpointTransferSelection, ClassicMigration, MemberId, MemoryDirectory};
+
+    let directory = MemoryDirectory::new();
+    let mut source = DeploymentRecord::new("original", "cell", vec![], 0);
+    source.epoch = 4;
+    source.log_epoch = 2;
+    source.holder = Some(MemberId::fresh());
+    let migration = ClassicMigration {
+        source: ClassicMigrationSource { incarnation: source.incarnation, log_epoch: source.log_epoch, writer_epoch: source.epoch },
+        destination: Uuid::new_v4(),
+    };
+    let stage = |block, capture, manifest: &str| {
+        let scratch = Uuid::new_v4();
+        let mut record = DeploymentRecord::new(format!("checkpoint-stage-{scratch}"), "cell", vec![], 0);
+        record.id = scratch.to_string();
+        record.lineage = record.id.clone();
+        record.lifecycle = Lifecycle::Restoring;
+        let checkpoint = Checkpoint { block, boundary: block + 1, source: block, system_time: block, root_sha256: Some([1; 32]) };
+        let stage = CheckpointStage {
+            intent: CheckpointStageIntent {
+                operation: scratch, destination: scratch, name: record.name.clone(), org: record.org.clone(),
+                source: source.id.parse().unwrap(), capture, source_manifest_sha256: manifest.into(),
+                classic_migration: Some(migration),
+            },
+            checkpoint, source_incarnation: source.incarnation, source_log_epoch: source.log_epoch,
+            media: CellMedia { objects: [2; 32], keys: "keys".into() },
+            transfer_only: true, staged_manifest_sha256: Some("staged".into()),
+        };
+        record.checkpoint_stage = Some(Box::new(stage.clone()));
+        let registration = CheckpointCapture {
+            archive: "archive".into(), key_namespace: None, incarnation: stage.source_incarnation,
+            log_epoch: stage.source_log_epoch, checkpoint, automatic_fork: false, world_replay: None,
+            media_bound: true, manifest_sha256: Some(manifest.into()), remote_disposal: None,
+        };
+        (record, stage, registration)
+    };
+    let (old_scratch, old_stage, old_capture) = stage(1, Uuid::new_v4(), "old");
+    let (new_scratch, new_stage, new_capture) = stage(2, Uuid::new_v4(), "replacement");
+    source.checkpoint = Some(old_stage.checkpoint);
+    source.checkpoint_captures.insert(old_stage.intent.capture, old_capture);
+    let source = directory.create_deployment(source).await.unwrap();
+    let gateway = Uuid::new_v4();
+    let receiver = Uuid::new_v4();
+    let previous = Commission {
+        intent: old_stage.intent, coverage_sha256: [1; 32], begin_sha256: [2; 32], original_catalog_sha256: [3; 32],
+        retained_path_sha256: [4; 32], prior_generations: vec![Generation { generation: gateway, role: Role::Gateway }],
+    };
+    let replacement = Commission { intent: new_stage.intent.clone(), ..previous.clone() };
+    install(directory.as_ref(), &previous).await.unwrap();
+    enroll(directory.as_ref(), &previous, receiver, Role::Receiver).await.unwrap();
+    join(directory.as_ref(), &previous, gateway, Role::Gateway, [5; 32]).await.unwrap();
+
+    let mut advanced = directory.deployment(&source.id).await.unwrap().unwrap();
+    advanced.checkpoint = Some(new_stage.checkpoint);
+    advanced.checkpoint_captures.insert(new_stage.intent.capture, new_capture);
+    let version = advanced.version;
+    let advanced = directory.replace_deployment(advanced, version).await.unwrap().applied().unwrap();
+    let roster = advanced.classic_flight.as_deref().unwrap().owners.clone();
+    let new_scratch = directory.create_deployment(new_scratch).await.unwrap();
+    let mut seal = CheckpointTransferSelection {
+        stage: new_stage, source_version: advanced.version, destination_version: new_scratch.version,
+        drained_source_through: Some(2),
+    };
+    assert!(directory.fence_checkpoint_transfer(&seal).await.is_err());
+    assert!(install(directory.as_ref(), &replacement).await.is_err());
+    let mut old_scratch = directory.create_deployment(old_scratch).await.unwrap();
+    assert!(install(directory.as_ref(), &replacement).await.is_err());
+    old_scratch.lifecycle = Lifecycle::Deleting;
+    let mut ambiguous = old_scratch.clone();
+    ambiguous.checkpoint_transfer_fence = Some(Box::new(CheckpointTransferFence {
+        destination: ambiguous.checkpoint_stage.as_deref().unwrap().clone(),
+        source_writer_epoch: advanced.epoch,
+        fenced_writer_epoch: advanced.epoch + 1,
+        drained_source_through: Some(1),
+    }));
+    assert!(prepare_rebind(&advanced, &ambiguous, Some(&new_scratch), &previous, &replacement).is_err());
+    let version = old_scratch.version;
+    assert!(directory.replace_deployment(old_scratch, version).await.unwrap().applied().is_some());
+    let wrong_coverage = Commission { coverage_sha256: [8; 32], ..replacement.clone() };
+    assert!(install(directory.as_ref(), &wrong_coverage).await.is_err());
+
+    install(directory.as_ref(), &replacement).await.unwrap();
+    let rebound = directory.deployment(&source.id).await.unwrap().unwrap();
+    assert!(excludes_unclassified(&rebound));
+    assert_eq!(rebound.classic_flight.as_deref().unwrap().owners, roster);
+    assert!(install(directory.as_ref(), &previous).await.is_err());
+    assert!(directory.fence_checkpoint_transfer(&seal).await.is_err());
+    seal.source_version = rebound.version;
+    let fence = directory.fence_checkpoint_transfer(&seal).await.unwrap();
+    install(directory.as_ref(), &replacement).await.unwrap();
+    let fenced = directory.deployment(&source.id).await.unwrap().unwrap();
+    assert!(terminal(&fenced, &fence).is_none());
+    assert!(install(directory.as_ref(), &previous).await.is_err());
+    join(directory.as_ref(), &replacement, receiver, Role::Receiver, [6; 32]).await.unwrap();
+    let drained = directory.deployment(&source.id).await.unwrap().unwrap();
+    let reopened: DeploymentRecord = serde_json::from_slice(&serde_json::to_vec(&drained).unwrap()).unwrap();
+    let terminal = terminal(&reopened, &fence).unwrap();
+    assert_eq!(terminal.commission, &replacement);
+    assert_eq!((terminal.gateway_generations, terminal.receiver_generations), (1, 1));
+    assert_eq!(terminal.owners.get(&gateway), roster.get(&gateway));
 }
