@@ -227,6 +227,8 @@ impl<'input> ParsedStatement<'input> {
             _ => false,
         }
     }
+    pub fn is_explain(&self) -> bool { matches!(&self.tree.statement, Syntax::Standard(ast::Statement::Explain { .. })) }
+
     pub fn kind(&self) -> StatementKind {
         match &self.tree.statement {
             Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. }) => StatementKind::Query,

@@ -82,7 +82,7 @@
 -- The ticket keeps the parameter types admitted for its result description across later bindings of the prepared statement.
 -- The authenticated session and original attachment authorize redemption of its ticket.
 -- A prepared statement reuses its cached plan when its parameter types, planning options, and observed catalog lookups agree.
--- Query statements prepared in any session of a node share a plan, charged to the node, when their source, planning options and observed catalog lookups agree.
+-- Query statements other than EXPLAIN prepared in any session of a node share a plan, charged to the node, when their source, planning options and observed catalog lookups agree.
 -- Rebinding charges execution to the query budget while the statement retains its plan charge.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.

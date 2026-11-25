@@ -19,6 +19,7 @@ struct PreparedData {
     snapshot_selector: rtdb_plan::QuerySettings,
     result: PreparedResult,
     policy: ResultSignaturePolicy,
+    sharable: bool,
     _reservation: Arc<MemoryReservation>,
     plan: std::sync::Mutex<Option<CachedPlan>>,
 }
@@ -116,6 +117,7 @@ impl PreparedSql {
         let source = parsed.source();
         let count = parsed.parameter_count();
         let ordered_index_command_tag = parsed.ordered_index_command_tag();
+        let sharable = !parsed.is_explain();
         let snapshot_selector = parsed.snapshot_selector()?;
         if options.parameter_types.keys().any(|index| *index >= count) { return Err(parameter_error("Declared parameter lies outside the statement")); }
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
@@ -129,7 +131,7 @@ impl PreparedSql {
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let (query, inferred, lookups) = match shared_plan(source, context, &options)? {
+                let (query, inferred, lookups) = match sharable.then(|| shared_plan(source, context, &options)).transpose()?.flatten() {
                     Some(shared) => {
                         notices.clone_from(&shared.notices);
                         (shared.query.clone(), shared.parameter_types.clone(), Some(Arc::clone(&shared.lookups)))
@@ -162,7 +164,7 @@ impl PreparedSql {
         let bytes = bytes.checked_add(snapshot_selector.retained_bytes()?).ok_or_else(size_error)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, _reservation: reservation, plan: std::sync::Mutex::new(cached) })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, sharable, _reservation: reservation, plan: std::sync::Mutex::new(cached) })))
     }
 
     pub fn search_path(&self) -> &[String] { &self.0.options.search_path }
@@ -403,7 +405,7 @@ impl PreparedSql {
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
         let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref().filter(|plan| plan.options == options).map(|plan| (plan.lookups.clone(), plan.query.clone())));
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
-        if let Some(shared) = shared_plan(&self.0.source, context, &options)? {
+        if let Some(shared) = self.0.sharable.then(|| shared_plan(&self.0.source, context, &options)).transpose()?.flatten() {
             let query = shared.query.recharged(&context.memory)?;
             if let Ok(mut plan) = self.0.plan.lock() {
                 *plan = Some(CachedPlan { options, lookups: Arc::clone(&shared.lookups), query: shared.query.clone() });
@@ -715,6 +717,22 @@ mod shared_plan_tests {
         put(&state, 2, "alt", Value::I64(2), &memory);
         assert_eq!(value_of(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), &["alt", "public"]).await, Value::I64(2));
     }
+
+    #[test]
+    fn explain_and_dml_never_plan_into_the_shared_cache() {
+        let node = MemoryBudget::new(1 << 30);
+        let plans = Arc::new(SharedPlans::new(&node));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let explain = PreparedSql::prepare("EXPLAIN SELECT 1 AS one", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        explain.bind(&context, &[], true).unwrap();
+        let dml = PreparedSql::prepare("DELETE FROM docs WHERE _id = 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        assert!(dml.bind(&context, &[], true).is_err());
+        assert_eq!(node.peak_bytes(), 0);
+        PreparedSql::prepare("SELECT 1 AS one", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        assert!(node.used_bytes() > 0, "a plain query is shared");
+    }
+
 
     #[test]
     fn a_full_cache_budget_evicts_old_plans_for_new_ones() {
