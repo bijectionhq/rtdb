@@ -78,6 +78,9 @@
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
+-- A direct Arrow parameter projection chooses retention or detachment for each result column independently.
+-- A compatible first-cell view keeps its source backing charge when the retained storage is proportionate to the cell.
+-- A detached result column holds its own backing charge, and the projected page admits its descriptors and schema separately.
 -- When a bound Boolean or nullable buffer needs normalization, the projection copies selected cells within Arrow.
 -- Compatible nested fields and union legs retain their value buffers when encoding changes their declared layout.
 -- Floating-point list output gathers selected row and component validity into the declared Arrow layout.

@@ -212,56 +212,49 @@ impl PreparedQuery {
         } else { Arc::clone(&context) };
         let schema = self.emit_result_schema(&operator, types)?;
         let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &operator.catalog, types, &operator.memory)?.output();
-        let mut metadata = operator.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
-        let mut fields = Vec::with_capacity(runtime_schema.schema().len());
-        let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
+        let logical = runtime_schema.schema();
+        let memory = &operator.memory;
         let computed = if projection_has_computation(&self.relation) {
-            let _parameter_fields = operator.memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
-            let Some(columns) = project_bound_columns(&self.relation, arguments, &operator.memory)? else { return Ok(None); };
-            Some(columns)
+            let bytes = crate::runtime_schema::allocation_bound(&self.relation)?
+                .checked_add(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)
+                .ok_or_else(parameter_projection_size)?;
+            let scratch = memory.reserve(bytes)?;
+            let Some(columns) = project_bound_columns(&self.relation, arguments, memory)? else { return Ok(None); };
+            Some((columns, scratch))
         } else { None };
-        let mut copy_cells = batch.num_rows() > 1 || computed.is_some();
-        for (position, result) in runtime_schema.schema().fields().iter().enumerate() {
-            let field = to_field(&result.name, &result.data_type)?;
-            let (array, source) = if let Some(columns) = &computed {
-                let Some(crate::columnar::Column::Arrow { array, field, .. }) = columns.get(position) else { return Ok(None); };
-                (array, field.as_ref())
-            } else {
-                let Some(index) = projected_parameter(&self.relation, position) else { return Ok(None); };
+        let arrow = ResultArrowSchema::new(logical, 0..logical.len(), &|_| false, memory)?;
+        let fields = arrow.schema.fields();
+        let sources_bytes = fields.len().checked_mul(size_of::<(&ArrayRef, bool)>())
+            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(parameter_projection_size)?;
+        let _sources = memory.reserve(sources_bytes)?;
+        let mut sources = Vec::with_capacity(fields.len());
+        for (position, field) in fields.iter().enumerate() {
+            let (array, source, direct) = if let Some(index) = projected_parameter(&self.relation, position) {
                 let Some(array) = batch.columns().get(index) else { return Ok(None); };
-                (array, batch.schema_ref().field(index))
+                (array, batch.schema_ref().field(index), true)
+            } else if let Some((columns, _)) = &computed {
+                let Some(crate::columnar::Column::Arrow { array, field, .. }) = columns.get(position) else { return Ok(None); };
+                (array, field.as_ref(), false)
+            } else {
+                return Ok(None);
             };
             if field.data_type() != array.data_type() || field.metadata() != source.metadata() {
                 return Ok(None);
             }
-            copy_cells |= array.nulls().is_some() || matches!(array.data_type(),
-                DataType::Boolean | DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(..) | DataType::Union(..));
-            fields.push(field);
-            arrays.push(Arc::clone(array));
+            sources.push((array, direct));
         }
-        let reservation = if copy_cells {
-            let bound = fields.iter().zip(&arrays).try_fold(metadata.bytes(), |bytes, (field, array)| {
-                bytes.checked_add(estimate_copy_cell_bytes(field, array.as_ref(), 0)?)
-                    .ok_or_else(|| invalid("parameter-size", "Projected parameters exceed addressable memory"))
-            })?;
-            Arc::get_mut(&mut metadata).expect("projection owns its reservation").grow_to(bound)?;
-            for array in &mut arrays {
-                *array = copy_nullable_cells(&[array.as_ref()], &[Some((0, 0))])?;
-            }
-            metadata
-        } else {
-            for array in &mut arrays {
-                *array = rtdb_columnar::retain_array(Arc::clone(array), &metadata)?;
-            }
-            Arc::clone(arguments.reservation())
-        };
+        let bytes = fields.len().checked_mul(size_of::<ArrayRef>())
+            .and_then(|bytes| bytes.checked_add(size_of::<OwnedBatch>() + 256)).ok_or_else(parameter_projection_size)?;
+        let mut reservation = memory.reserve(bytes)?;
+        let page = Arc::get_mut(&mut reservation).expect("Parameter projection owns its page reservation");
+        let mut arrays = Vec::with_capacity(fields.len());
+        for ((array, direct), field) in sources.into_iter().zip(fields) {
+            arrays.push(project_parameter_array(field, array, direct, arguments, page, &arrow.reservation)?);
+        }
         let options = RecordBatchOptions::new().with_row_count(Some(1));
-        let projected = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
-        let projected = match OwnedBatch::with_reservation(projected, reservation) {
-            Ok(batch) => batch,
-            Err(error) if error.code == "rtdb/undersized-reservation" => return Ok(None),
-            Err(error) => return Err(error),
-        };
+        let projected = RecordBatch::try_new_with_options(arrow.schema, arrays, &options)
+            .map_err(|error| invalid("output-arrow", error))?;
+        let projected = OwnedBatch::with_funded_columns(projected, reservation).with_schema_reservation(arrow.reservation);
         let query_span = crate::trace::QueryTrace::start(&context, text);
         let parent = query_span.as_ref().map(|span| span.context());
         let operator = operator.with_tracer(context.tracer.clone(), parent);
@@ -456,6 +449,67 @@ fn projected_parameter(mut relation: &Relation, mut position: usize) -> Option<u
     }
 }
 
+fn parameter_projection_size() -> rtdb_types::Anomaly {
+    invalid("parameter-size", "Projected parameters exceed addressable memory")
+}
+
+const PARAMETER_PROJECTION_RETENTION_SLACK: usize = 4096;
+
+fn project_parameter_array(
+    field: &ArrowField, array: &ArrayRef, direct: bool, arguments: &OwnedBatch,
+    page: &mut MemoryReservation, schema: &Arc<MemoryReservation>,
+) -> Result<ArrayRef> {
+    if array.nulls().is_none() && array.data_type() != &DataType::Boolean
+        && !crate::columnar::nested_layout(array.data_type())
+    {
+        let backing = parameter_projection_backing(array, direct, arguments);
+        let retained = page.bytes();
+        if array.len() != 1 || array.data_type() == &DataType::Null {
+            let descriptors = array.get_array_memory_size().checked_sub(array.get_buffer_memory_size())
+                .and_then(|bytes| bytes.checked_add(64)).ok_or_else(parameter_projection_size)?;
+            page.grow_to(retained.checked_add(descriptors).ok_or_else(parameter_projection_size)?)?;
+        }
+        let view = if array.len() == 1 { Arc::clone(array) } else { array.slice(0, 1) };
+        if backing <= PARAMETER_PROJECTION_RETENTION_SLACK
+            || rtdb_columnar::visible_buffer_bytes(std::slice::from_ref(&view)).is_some_and(|visible| {
+                backing <= visible.saturating_mul(2).saturating_add(PARAMETER_PROJECTION_RETENTION_SLACK)
+            })
+        {
+            return Ok(view);
+        }
+        drop(view);
+        page.shrink_to(retained)?;
+    }
+
+    let bound = estimate_copy_cell_bytes(field, array.as_ref(), 0)?.checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(field.size().checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(512)).ok_or_else(parameter_projection_size)?;
+    let scratch = page.budget().reserve(bound)?;
+    let copy = copy_nullable_cells(&[array.as_ref()], &[Some((0, 0))])?;
+    retain_result_array(copy, scratch, ResultArrayFunding::Copy, page, schema)
+}
+
+fn parameter_projection_backing(array: &ArrayRef, direct: bool, arguments: &OwnedBatch) -> usize {
+    if array.data_type() == &DataType::Null { return 0; }
+    let backing = array.get_buffer_memory_size();
+    let charge = arguments.reservation().bytes();
+    if direct { return backing.max(charge); }
+
+    // A same-type vector cast can return its input view, whose wrapped buffers report only the view's size.
+    let data = array.to_data();
+    arguments.batch().columns().iter().filter(|source| source.data_type() == array.data_type())
+        .fold(backing, |backing, source| {
+            let source_backing = charge.max(source.get_buffer_memory_size());
+            if source_backing <= backing.max(PARAMETER_PROJECTION_RETENTION_SLACK) { return backing; }
+            let source = source.to_data();
+            let shared = data.buffers().iter().any(|buffer| source.buffers().iter().any(|input| {
+                (buffer.as_ptr() as usize).checked_sub(input.as_ptr() as usize)
+                    .is_some_and(|offset| offset <= input.len())
+            }));
+            if shared { source_backing } else { backing }
+        })
+}
+
 fn parameter_projection_expression(expression: &Expr) -> bool {
     stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match expression {
         Expr::Parameter { .. } | Expr::Column { .. } => true,
@@ -486,7 +540,15 @@ fn project_bound_columns(
     let parameters = ColumnBatch::from_owned(arguments.slice(0, 1)?)?;
     let bound_column = |expr: &Expr, schema: &Schema, input: &[Column]| {
         if let Some(column) = crate::columnar::projection::bound_column(expr, schema, input, &parameters.columns)? {
-            return Ok(Some(column));
+            return match column {
+                Column::Arrow { array, field, logical } if !matches!(expr, Expr::Column { .. } | Expr::Parameter { .. }) => {
+                    let bytes = array.get_array_memory_size().checked_add(512).ok_or_else(parameter_projection_size)?;
+                    let charge = memory.reserve(bytes)?;
+                    let array = rtdb_columnar::retain_array(array, &charge)?;
+                    Ok(Some(Column::Arrow { array, field, logical }))
+                }
+                column => Ok(Some(column)),
+            };
         }
         crate::vector::bound_column(expr, schema, input, &parameters.columns, memory)
     };
