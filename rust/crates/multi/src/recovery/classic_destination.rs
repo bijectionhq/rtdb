@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_directory::{CheckpointTransferTerminal, DeploymentRecord, Directory, Lifecycle};
+use rtdb_directory::{CheckpointTransferTerminal, ClassicCatalogProvider, DeploymentRecord, Directory, Lifecycle};
 use rtdb_server::multi::{
     ClassicCandidate,
     classic_ingress::{
@@ -278,6 +278,14 @@ impl RecoveryService {
             {
                 return Err(conflict());
             }
+            let catalog_drain = if let Some(provider) = provider.as_ref().and_then(classic_provider::Population::catalog_provider) {
+                let Some(drain) = source.classic_catalog_drain.as_ref().filter(|drain| drain.cohort.provider == provider)
+                    else { return Ok(Reply::Deferred); };
+                let Some(drained_at) = drain.drained_at else { return Ok(Reply::Deferred); };
+                Some((&drain.cohort, drained_at))
+            } else {
+                None
+            };
             let provider_release = match &provider {
                 Some(classic_provider::Population::FamilyRelease { registration }) => {
                     let registered = registration.registration()?;
@@ -289,9 +297,6 @@ impl RecoveryService {
                         return Err(conflict());
                     }
                     Some(registration.clone())
-                }
-                Some(classic_provider::Population::LocalCatalog) if source.classic_catalog_drain.as_ref().is_none_or(|drain| drain.drained_at.is_none()) => {
-                    return Ok(Reply::Deferred);
                 }
                 _ => None,
             };
@@ -324,20 +329,22 @@ impl RecoveryService {
                     return Err(conflict());
                 }
                 let provider_terminal = match provider {
-                    classic_provider::Population::LocalCatalog => {
-                        let drain = source.classic_catalog_drain.as_ref().ok_or_else(conflict)?;
-                        let cohort = drain.cohort.clone();
-                        let drained_at = drain.drained_at.ok_or_else(conflict)?;
+                    classic_provider::Population::LocalCatalog | classic_provider::Population::HostedCatalog => {
+                        let (cohort, drained_at) = catalog_drain.ok_or_else(conflict)?;
                         if source.version < drained_at || drained_at <= cohort.fenced_at
                             || source.storage_namespaces != Some(cohort.namespaces)
                             || source.storage_prefix() != cohort.residence
                         {
                             return Err(conflict());
                         }
-                        classic_provider::Terminal::LocalCatalog(classic_provider::CatalogDrain {
-                            fenced_at: cohort.fenced_at, drained_at, residence: cohort.residence,
-                            object_namespace: cohort.namespaces.objects, readers: cohort.readers,
-                        })
+                        let terminal = classic_provider::CatalogDrain {
+                            fenced_at: cohort.fenced_at, drained_at, residence: cohort.residence.clone(),
+                            object_namespace: cohort.namespaces.objects, readers: cohort.readers.clone(),
+                        };
+                        match cohort.provider {
+                            ClassicCatalogProvider::Local => classic_provider::Terminal::LocalCatalog(terminal),
+                            ClassicCatalogProvider::HostedS3 => classic_provider::Terminal::HostedCatalog(terminal),
+                        }
                     }
                     classic_provider::Population::FamilyRelease { registration } => {
                         let namespaces = source.storage_namespaces.ok_or_else(conflict)?;

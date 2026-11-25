@@ -1,6 +1,6 @@
 use std::{fmt::Write as _, num::NonZeroU64};
 
-use rtdb_directory::Version;
+use rtdb_directory::{ClassicCatalogProvider, Version};
 use rtdb_types::{Anomaly, Result, TransactionKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -18,13 +18,25 @@ pub(crate) struct ReleaseSelection {
 #[serde(tag = "population", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Population {
     LocalCatalog,
+    HostedCatalog,
     FamilyRelease { registration: ReleaseSelection },
+}
+
+impl Population {
+    pub(super) fn catalog_provider(&self) -> Option<ClassicCatalogProvider> {
+        match self {
+            Self::LocalCatalog => Some(ClassicCatalogProvider::Local),
+            Self::HostedCatalog => Some(ClassicCatalogProvider::HostedS3),
+            Self::FamilyRelease { .. } => None,
+        }
+    }
 }
 
 #[derive(Serialize)]
 #[serde(tag = "population", rename_all = "snake_case")]
 pub(super) enum Terminal {
     LocalCatalog(CatalogDrain),
+    HostedCatalog(CatalogDrain),
     FamilyRelease(ReleaseDrain),
 }
 

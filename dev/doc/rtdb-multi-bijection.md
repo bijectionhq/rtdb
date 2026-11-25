@@ -504,7 +504,7 @@ This outcome carries no Original obligation inventory or disposition and exclude
 #### Classic provider drain status
 
 On the authenticated Original recovery envelope, use `classic_migration_provider_drain_status` with the same `selection`, full `candidate_binding` and `classic_cut` as the application closure readback.
-Supply `provider` as `{"population":"local_catalog"}` or `{"population":"family_release","registration":{"locator":L,"address":A}}`.
+Supply `provider` as `{"population":"local_catalog"}`, `{"population":"hosted_catalog"}` or `{"population":"family_release","registration":{"locator":L,"address":A}}`.
 The newline-terminated request has the same 16 KiB bound as the application readback.
 The mounted application layout and the exact held scratch replay are required.
 
@@ -522,7 +522,10 @@ The Original owner joins the provider regions or verifies their exact Local volu
 The seal operation checks for provider drain evidence before requesting keeper sealing.
 The Original directory record preserves any receipt retained by that check.
 On a lost reply, repeat status with the exact selector after the scratch is available.
-The selector returns `deferred` when the Original lacks a retained Local catalog drain, including older fences, unbound namespaces and hosted provider residences.
+The `hosted_catalog` terminal reports the corresponding directory coordinates for the enrolled S3 serving residence.
+At the fence, the directory selects only tickets from the Original replica epoch with an identified hosted task in the serving-region registry.
+The Original owner joins each region or recovers the exact provider task stop and any admitted upload dispositions before removing it. The final drain CAS requires an empty current region and catalog registry and the matched object and key namespaces.
+Each catalog selector returns `deferred` without its own retained drain. Older fences and unidentified or mismatched residences supply no terminal. These receipts cover the selected provider catalog readers. Application sessions, response deliveries and retained history require their own disposition.
 
 For `family_release`, supply the exact canonical lowercase 278-character `KeyRecoveryAttempt` index key and its 188-byte nonsecret `RFR1` address as a JSON byte array.
 Commission `external_key_recovery` as the exact schema-qualified relation in the mounted layout's inventory, using the same table object as the other layout roles.

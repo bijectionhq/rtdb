@@ -2568,10 +2568,14 @@ async fn record_classic_catalog_drain(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService,
     source: &DeploymentRecord, fence: &rtdb_directory::CheckpointTransferFence,
 ) -> Result<()> {
-    let Some(drain) = source.classic_catalog_drain.as_ref().filter(|_| matches!(storage, CellStorage::Local { .. })) else {
-        return Ok(());
+    use rtdb_directory::ClassicCatalogProvider;
+
+    let Some(drain) = source.classic_catalog_drain.as_ref() else { return Ok(()); };
+    let provider = match storage {
+        CellStorage::Local { .. } => ClassicCatalogProvider::Local,
+        CellStorage::S3 { .. } => ClassicCatalogProvider::HostedS3,
     };
-    if drain.drained_at.is_some() { return Ok(()); }
+    if drain.drained_at.is_some() || drain.cohort.provider != provider { return Ok(()); }
     let cohort = &drain.cohort;
     let region = rtdb_storage::IoRegion::new();
     let objects = async {

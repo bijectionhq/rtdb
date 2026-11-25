@@ -1151,11 +1151,31 @@ pub struct CheckpointTransferFence {
     pub drained_source_through: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassicCatalogProvider {
+    #[default]
+    Local,
+    HostedS3,
+}
+
+impl ClassicCatalogProvider {
+    fn is_local(&self) -> bool { *self == Self::Local }
+
+    fn owns(self, region: &StorageRegion) -> bool {
+        matches!((self, region),
+            (Self::Local, StorageRegion::Local { archive: None, .. })
+            | (Self::HostedS3, StorageRegion::Remote { archive: None, owner: Some(_), .. }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClassicCatalogCohort {
     /// Original directory revision that closed admission and selected the reader IDs.
     pub fenced_at: Version,
+    #[serde(default, skip_serializing_if = "ClassicCatalogProvider::is_local")]
+    pub provider: ClassicCatalogProvider,
     pub residence: String,
     pub namespaces: StorageNamespaces,
     pub readers: Vec<uuid::Uuid>,
@@ -1713,16 +1733,20 @@ fn prepare_checkpoint_transfer(
     let mut source = source.clone();
     let mut destination = destination.clone();
     let fenced_at = source.version.checked_add(1).ok_or_else(transfer_changed)?;
+    let catalog_provider = if source.storage_regions.values().any(|region| ClassicCatalogProvider::HostedS3.owns(region)) {
+        ClassicCatalogProvider::HostedS3
+    } else {
+        ClassicCatalogProvider::Local
+    };
     source.classic_catalog_drain = source.storage_namespaces.filter(|_| {
         intent.classic_migration.is_some() && source.catalog_readers.len() <= 512
             && source.catalog_readers.values().all(|reader| {
                 reader.replica_epoch == source.log_epoch
-                    && matches!(source.storage_regions.get(&reader.owner),
-                        Some(StorageRegion::Local { archive: None, .. }))
+                    && source.storage_regions.get(&reader.owner).is_some_and(|region| catalog_provider.owns(region))
             })
     }).map(|namespaces| Box::new(ClassicCatalogDrain {
         cohort: ClassicCatalogCohort {
-            fenced_at, residence: source.storage_prefix(), namespaces,
+            fenced_at, provider: catalog_provider, residence: source.storage_prefix(), namespaces,
             readers: source.catalog_readers.keys().copied().collect(),
         },
         drained_at: None,
@@ -2375,7 +2399,29 @@ mod tests {
         let cohort = &closed.classic_catalog_drain.as_ref().unwrap().cohort;
         assert_eq!(cohort.fenced_at, closed.version);
         assert_eq!(cohort.readers, [ticket]);
+        assert_eq!(cohort.provider, ClassicCatalogProvider::Local);
         assert!(held.classic_catalog_drain.is_none());
+
+        let task = HostedTask::new(
+            "arn:aws:ecs:us-east-1:123456789012:cluster/source",
+            "arn:aws:ecs:us-east-1:123456789012:task/source/abcdef0123456789abcdef0123456789",
+        ).unwrap();
+        let mut hosted = source.clone();
+        hosted.storage_regions.insert(owner, StorageRegion::Remote {
+            tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: None,
+            owner: Some(task), closed: false, publications: BTreeMap::new(),
+        });
+        let (hosted_closed, _, _) = prepare_checkpoint_transfer(&hosted, &target, &selection).unwrap();
+        let hosted_cohort = &hosted_closed.classic_catalog_drain.as_ref().unwrap().cohort;
+        assert_eq!(hosted_cohort.readers, [ticket]);
+        assert_eq!(hosted_cohort.provider, ClassicCatalogProvider::HostedS3);
+        let mut unnamed = hosted.clone();
+        let Some(StorageRegion::Remote { owner: task, .. }) = unnamed.storage_regions.get_mut(&owner)
+            else { panic!("expected a hosted serving region"); };
+        *task = None;
+        let (unnamed_closed, _, _) = prepare_checkpoint_transfer(&unnamed, &target, &selection).unwrap();
+        assert!(unnamed_closed.classic_catalog_drain.is_none());
         let mut late_reader = closed.clone();
         late_reader.catalog_readers.insert(uuid::Uuid::new_v4(), source.catalog_readers[&ticket].clone());
         assert!(require_transfer_update(&closed, &late_reader).is_err());
