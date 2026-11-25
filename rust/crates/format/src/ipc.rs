@@ -277,32 +277,71 @@ impl ArrowFile {
 
     /// Funds newly read wire bytes and the selected decode independently.
     /// Existing retained ranges must carry their reader's allocation charge.
+    // arrow-flow-scope: rtdb.event.projected
     pub fn read_event_page_reserved(
         &mut self, page: usize, put_columns: &[String], memory: &Arc<MemoryBudget>,
     ) -> Result<(RecordBatch, Arc<MemoryReservation>)> {
+        use rtdb_columnar::arrow_flow::{self, Measures};
+
+        let flow = arrow_flow::sample();
         let range = self.pages.page_range(page)?;
         let start = usize::try_from(range.start).map_err(invalid)?;
         let end = usize::try_from(range.end).map_err(invalid)?;
         let wire = match self.reader.block_slice(start..end, true) {
-            Some(buffer) => buffer,
+            Some(buffer) => {
+                // arrow-flow: rtdb.event.projected/wire-slice stored-page retained-ipc borrow event-page retained - | Slice a page from storage backing already held by its reader.
+                if let Some(flow) = flow {
+                    flow.record("rtdb.event.projected/wire-slice", Measures {
+                        copied_bytes: Some(0),
+                        new_backing_bytes: Some(0),
+                        output_buffer: Some(1),
+                        ..Measures::default()
+                    });
+                }
+                buffer
+            }
             None => {
                 let charge = memory.reserve(end - start)?;
+                // arrow-flow: rtdb.event.projected/wire-read stored-page retained-ipc read event-page required read_block_copy | Read the range when the reader cannot lend it.
                 let buffer = read_block_copy(self.reader.as_mut(), range)?;
+                if let Some(flow) = flow {
+                    flow.record("rtdb.event.projected/wire-read", Measures {
+                        copied_bytes: Some(buffer.len()),
+                        new_backing_bytes: Some(buffer.capacity()),
+                        reservation_bytes: Some(charge.bytes()),
+                        output_buffer: Some(1),
+                        ..Measures::default()
+                    });
+                }
                 rtdb_columnar::retain_buffer_with_owner(&buffer, charge)
             }
         };
-        let (batch, charge) = match self.pages.decode_projected_buffer_reserved(
+        let measured_wire = flow.map(|_| wire.clone());
+        // arrow-flow: rtdb.event.projected/selected retained-ipc decoded-page decode event-page required decode_projected_buffer_reserved | Decode an admitted projection when the record supports the requested columns.
+        let (batch, charge, edge) = match self.pages.decode_projected_buffer_reserved(
             page, &wire, PageProjection::PutColumns(put_columns), |bytes| memory.reserve(bytes),
         )? {
-            Some(decoded) => decoded,
+            Some((batch, charge)) => (batch, charge, "rtdb.event.projected/selected"),
             None => {
                 let charge = memory.reserve(self.pages.full_page_decode_bound(page, &wire)?)?;
-                (self.pages.decode_page(page, wire)?, charge)
+                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Fully decode a page when selective decode declines its physical layout.
+                let batch = self.pages.decode_page(page, wire)?;
+                (batch, charge, "rtdb.event.projected/full-page")
             }
         };
+        if let (Some(flow), Some(input)) = (flow, measured_wire) {
+            flow.record(edge, Measures {
+                rows: Some(batch.num_rows()),
+                new_backing_bytes: rtdb_columnar::new_buffer_backing_bytes(&batch, &input),
+                reservation_bytes: Some(charge.bytes()),
+                input_buffer: Some(1),
+                ..Measures::default()
+            });
+        }
         self.next_page = page + 1;
         Ok((batch, charge))
     }
+    // arrow-flow-end
 
 }
 

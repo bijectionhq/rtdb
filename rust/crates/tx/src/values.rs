@@ -22,6 +22,7 @@ impl RetainedBytes {
         Self::with_reservation(data, reservation)
     }
     pub fn as_slice(&self) -> &[u8] { &self.data }
+    pub(crate) fn reservation_bytes(&self) -> usize { self._reservation.bytes() }
     pub(crate) fn into_parts(self) -> (Bytes, Arc<MemoryReservation>) {
         (self.data, self._reservation)
     }
