@@ -175,6 +175,13 @@ impl Key {
             Self::Row(address) => address.key.len(),
         }
     }
+
+    fn copy_for_pointer(&self) -> Self {
+        match self {
+            Self::Posting { tuple: KeyRow::Arrow(..), .. } => self.clone(),
+            _ => self.view().owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -831,6 +838,10 @@ impl Tree {
     }
 
     async fn open(&self, link: &Link) -> Result<Arc<Node>> {
+        self.open_page(link, true).await
+    }
+
+    async fn open_page(&self, link: &Link, cache: bool) -> Result<Arc<Node>> {
         let pointer = match link {
             Link::New(node) => return Ok(Arc::clone(node)),
             Link::Stored(pointer) => pointer,
@@ -896,6 +907,9 @@ impl Tree {
             measure,
             _memory: memory,
         });
+        if !cache {
+            return Ok(node);
+        }
         // The read or maintenance operation owns the decoded pages. An idle
         // replica has no independently retained copy after it releases the tree.
         let mut decoded = self.decoded.lock();
@@ -1254,6 +1268,13 @@ impl Tree {
             } else {
                 reservation.shrink_to(capacity)?;
             }
+            let first = link.first();
+            let last = link.last();
+            let memory = self.memory.reserve(
+                (size_of::<Pointer>() + ARC_HEADER_BYTES + 64)
+                    .saturating_add(first.owned_backing_bytes())
+                    .saturating_add(last.owned_backing_bytes()),
+            )?;
             let digest = format!("{:x}", Sha256::digest(&encoded));
             let size = encoded.len();
             let object = self.page_key(generation, &digest)?;
@@ -1268,9 +1289,9 @@ impl Tree {
                 size,
                 entries: node.entries,
                 measure: node.measure,
-                first: link.first().clone(),
-                last: link.last().clone(),
-                _memory: None,
+                first: first.copy_for_pointer(),
+                last: last.copy_for_pointer(),
+                _memory: Some(memory),
             });
             written.insert(identity, Arc::clone(&pointer));
             Ok(pointer)
@@ -1300,7 +1321,7 @@ impl Tree {
                 .bytes
                 .checked_add(pointer.size as u64)
                 .ok_or_else(|| format_error("Ordered index file bytes overflow"))?;
-            let node = self.open(&Link::Stored(pointer)).await?;
+            let node = self.open_page(&Link::Stored(pointer), false).await?;
             match &node.page {
                 Page::Branch(children) => {
                     for child in children {
@@ -1673,6 +1694,10 @@ mod count_tests {
             .await?;
         assert_eq!(pointer.entries, 150);
         let reopened = Tree::new(&storage, &directory, &memory, 0).await?;
+        let mut reachable = ReachablePages::default();
+        reopened.mark(Arc::clone(&pointer), &mut reachable, &cancel).await?;
+        assert!(reachable.keys.len() > 1);
+        assert!(reopened.decoded.lock().entries.is_empty());
         let root = Some(Link::Stored(pointer));
         for n in [0, 1, 63, 64, 127, 128, 149, 150, 200] {
             let before =

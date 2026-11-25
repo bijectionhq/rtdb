@@ -151,7 +151,8 @@ pub(super) fn encode(references: &[(Option<IndexRevision>, Option<&Pointer>)]) -
     Ok(keys.batch().clone())
 }
 
-pub(super) fn decode(
+#[cfg(test)]
+fn decode(
     batch: RecordBatch,
     max: usize,
     memory: &Arc<MemoryReservation>,

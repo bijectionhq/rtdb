@@ -7,9 +7,10 @@ use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, Int64Array, NullArray, RecordBatch, UInt64Array,
     builder::FixedSizeBinaryBuilder,
 };
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_storage::{Error, ObjectKey, cache::BufferPool};
+use rtdb_storage::{Error, IoRegion, ObjectKey, cache::BufferPool};
 use rtdb_types::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,8 +35,6 @@ pub(super) struct Checkpoint {
     revisions: Option<Arc<Pointer>>,
     #[serde(skip)]
     manifest_bytes: u64,
-    #[serde(skip)]
-    _allocation: Option<Arc<MemoryReservation>>,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +94,18 @@ fn decode_legacy_manifest(bytes: &[u8]) -> Result<Checkpoint> {
 }
 
 impl Checkpoint {
+    fn validate(&self, object: &ObjectKey) -> Result<()> {
+        if frontier(object) != Some(self.through)
+            || self.through < 0
+            || self.scope > self.through as u64 + 1
+            || self.source_rows < 0
+            || self.revisions.as_ref().is_some_and(|root| !root.exists_by(self.through))
+        {
+            return Err(format_error("Invalid ordered index checkpoint"));
+        }
+        Ok(())
+    }
+
     pub fn roots(&self) -> RevisionRoots {
         RevisionRoots {
             archived: self.revisions.clone().map(Link::Stored),
@@ -278,45 +289,58 @@ pub(super) async fn latest(
     }
     let store = storage.object_store();
     let head = key(directory, format_args!("{MANIFESTS}/{through:016x}"))?;
-    let object = match store.head_fresh(&head).await {
-        Ok(object) => Some(object),
-        Err(Error::MissingObject(_)) => store
-            .list(Some(&key(directory, MANIFESTS)?))
-            .await?
-            .into_iter()
-            .filter(|object| frontier(&object.key).is_some_and(|block| block <= through))
-            .max_by_key(|object| frontier(&object.key)),
+    let observed = match store.observe_head(&head).await {
+        Ok(object) => object,
+        Err(Error::MissingObject(_)) => {
+            let listed = store
+                .list(Some(&key(directory, MANIFESTS)?))
+                .await?
+                .into_iter()
+                .filter(|object| frontier(&object.key).is_some_and(|block| block <= through))
+                .max_by_key(|object| frontier(&object.key));
+            let Some(listed) = listed else { return Ok(None); };
+            let observed = store.observe_head(&listed.key).await?;
+            if observed.value != listed {
+                return Err(format_error("Ordered index manifest length changed"));
+            }
+            observed
+        }
         Err(error) => return Err(error.into()),
     };
-    let Some(object) = object else {
-        return Ok(None);
-    };
+    let object = observed.value;
     let size = usize::try_from(object.size).map_err(format_error)?;
-    let allocation = memory.reserve(size.saturating_mul(8).saturating_add(4096))?;
-    let bytes = store.get_fresh(&object.key).await?;
-    if bytes.len() != size {
+    let decode_bound = size.saturating_mul(8).saturating_add(4096);
+    let input = store.exact_object_allocation(&object.key, size)?;
+    let read_bound = input.retained_bytes.saturating_add(input.scratch_bytes);
+    let allocation = memory.reserve(decode_bound.max(read_bound))?;
+    let read = IoRegion::retaining(
+        Arc::clone(&allocation),
+        store.observe_fresh_exact(&object.key, size),
+    )
+    .await?;
+    if read.value.len() != size {
         return Err(format_error("Ordered index manifest length changed"));
     }
-    let mut checkpoint = if bytes.starts_with(&ipc::CONTINUATION) {
-        decode_manifest(ipc::decode(bytes, 1)?, &allocation)?
+    if observed.version.is_some() && observed.version != read.version {
+        return Err(format_error("Ordered index manifest version changed"));
+    }
+    let mut opening = Arc::try_unwrap(allocation)
+        .map_err(|_| format_error("Ordered index manifest read still owns its opening grant"))?;
+    let mut checkpoint = if read.value.starts_with(&ipc::CONTINUATION) {
+        let backing = Buffer::from(read.value);
+        decode_manifest(ipc::decode_buffer(backing.clone(), 1)?, &backing, &mut opening)?
     } else if store.ordered_index_arrow_only() {
         return Err(format_error("The installed ordered index checkpoint requires Arrow IPC"));
     } else {
-        decode_legacy_manifest(&bytes)?
+        let mut checkpoint = decode_legacy_manifest(&read.value)?;
+        if let Some(root) = &mut checkpoint.revisions {
+            let root = Arc::get_mut(root).expect("decoded manifest root is unpublished");
+            root._memory = Some(opening.split_off(root.owned_backing_bytes())?);
+        }
+        checkpoint
     };
-    if frontier(&object.key) != Some(checkpoint.through)
-        || checkpoint.through < 0
-        || checkpoint.scope > checkpoint.through as u64 + 1
-        || checkpoint.source_rows < 0
-        || checkpoint
-            .revisions
-            .as_ref()
-            .is_some_and(|root| !root.exists_by(checkpoint.through))
-    {
-        return Err(format_error("Invalid ordered index checkpoint"));
-    }
+    checkpoint.validate(&object.key)?;
     checkpoint.manifest_bytes = object.size;
-    checkpoint._allocation = Some(allocation);
     Ok(Some(checkpoint))
 }
 
@@ -377,16 +401,15 @@ pub(super) async fn publish(
         }
         None => None,
     };
-    let checkpoint = Checkpoint {
+    let mut checkpoint = Checkpoint {
         through,
         scope: tree.scope,
         source_rows,
         revisions,
         manifest_bytes: 0,
-        _allocation: None,
     };
     let arrow = tree.writes_arrow_references();
-    let _scratch = arrow.then(|| tree.memory.reserve(32 << 10)).transpose()?;
+    let scratch = tree.memory.reserve(if arrow { 32 << 10 } else { 4096 })?;
     let encoded = if arrow {
         ipc::encode(&encode_manifest(&checkpoint)?)?
     } else {
@@ -396,13 +419,18 @@ pub(super) async fn publish(
         return Err(cancelled());
     }
     let manifest = key(&tree.directory, format_args!("{MANIFESTS}/{through:016x}"))?;
-    tree.storage
-        .object_store()
-        .put(&manifest, encoded.into())
-        .await?;
-    latest(&tree.storage, &tree.directory, &tree.memory, through)
+    checkpoint.manifest_bytes = encoded.len() as u64;
+    let store = tree.storage.object_store();
+    let publication = IoRegion::retaining(scratch, store.put_with_publication(&manifest, encoded.into())).await?;
+    if publication.is_some() {
+        checkpoint.validate(&manifest)?;
+        return Ok(checkpoint);
+    }
+    let reopened = latest(&tree.storage, &tree.directory, &tree.memory, through)
         .await?
-        .ok_or_else(|| format_error("Published checkpoint is unavailable"))
+        .filter(|reopened| reopened.through == through)
+        .ok_or_else(|| format_error("Published checkpoint is unavailable"))?;
+    Ok(reopened)
 }
 
 fn manifest_fields(revisions: DataType) -> [Field; 5] {
@@ -468,7 +496,7 @@ fn encode_manifest(checkpoint: &Checkpoint) -> Result<RecordBatch> {
     .map_err(format_error)
 }
 
-fn decode_manifest(batch: RecordBatch, memory: &Arc<MemoryReservation>) -> Result<Checkpoint> {
+fn decode_manifest(batch: RecordBatch, backing: &Buffer, opening: &mut MemoryReservation) -> Result<Checkpoint> {
     let invalid = || format_error("Invalid ordered index checkpoint");
     let Some(revisions) = batch.columns().get(4) else {
         return Err(invalid());
@@ -491,7 +519,7 @@ fn decode_manifest(batch: RecordBatch, memory: &Arc<MemoryReservation>) -> Resul
     let root = if revisions.data_type() == &DataType::Null {
         None
     } else {
-        let mut roots = references::decode(ipc::unlist(revisions.as_ref())?, 1, memory)?;
+        let mut roots = references::decode_page(ipc::unlist(revisions.as_ref())?, 1, backing, opening)?;
         let Some((None, Some(root))) = roots.pop() else {
             return Err(invalid());
         };
@@ -503,7 +531,6 @@ fn decode_manifest(batch: RecordBatch, memory: &Arc<MemoryReservation>) -> Resul
         source_rows: arrow::<Int64Array>(batch.column(2).as_ref())?.value(0),
         revisions: root,
         manifest_bytes: 0,
-        _allocation: None,
     };
     let checksum = arrow::<FixedSizeBinaryArray>(batch.column(3).as_ref())?.value(0);
     if checksum != manifest_checksum(&checkpoint)? {
@@ -710,6 +737,31 @@ mod tests {
             let Item::Row(spans) = correction.item else { panic!("Expected correction spans"); };
             assert_eq!(spans.as_ref(), std::slice::from_ref(&span));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopened_root_retains_only_its_pointer_after_checkpoint_drop() -> Result<()> {
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let directory = ObjectKey::new("index")?;
+        let writer_memory = MemoryBudget::new(8 << 20);
+        let tree = Tree::new(&storage, &directory, &writer_memory, 0).await?;
+        let token = CancellationToken::new();
+        let roots = RevisionRoots {
+            archived: None,
+            changes: BTreeMap::from([(IndexRevision::through_time(Timestamp(10)), None)]),
+        };
+        let root = store_roots(&tree, 0, &roots, &token).await?;
+        publish(&tree, 0, 1, root, &token).await?;
+
+        let reader_memory = MemoryBudget::new(8 << 20);
+        let checkpoint = latest(&storage, &directory, &reader_memory, 0).await?.unwrap();
+        let roots = checkpoint.roots();
+        drop(checkpoint);
+        let Some(Link::Stored(pointer)) = &roots.archived else { panic!("Missing archived root") };
+        assert_eq!(reader_memory.used_bytes(), pointer.owned_backing_bytes());
+        drop(roots);
+        assert_eq!(reader_memory.used_bytes(), 0);
         Ok(())
     }
 
