@@ -112,6 +112,7 @@ Receiver clock and protected release evidence require their owning routes.
 
 Use `rtdb.v1.OpenExactRead` with the exact Basis, tracking mode and a TTL of at most 2,000 milliseconds.
 The open captures the selected native view on the verified assignment and retains its storage before returning the opaque scope.
+The response attests the selected basis, system time, applied position and assignment so a guest can be admitted before its first page.
 The open and scoped pages use the locally retained cut and require neither a writer-head sample nor an available writer.
 Send `QueryRequest.exact_read_scope` (tag 16) on every plain SQL page in the same Flight session.
 Each request must use the same exact Basis and tracking mode, and a continuation belongs to that scope and query.

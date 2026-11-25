@@ -169,13 +169,23 @@ impl Service {
         .map_err(|_| expired())??;
 
         let scope = Uuid::new_v4();
+        let assignment = super::query::follower_assignment(route);
+        let receipt = proto::OpenExactReadResponse {
+            scope: scope.as_bytes().to_vec(),
+            cut: Some(proto::ExactReadCut {
+                basis: Some(cut.basis.into()),
+                system_time_micros: Some(cut.system_time.0),
+                applied_position: Some(cut.basis.position()),
+                assignment: Some(assignment.clone()),
+            }),
+        };
         let read = Arc::new(ExactRead {
             session: call.session.id.clone(),
             database,
             basis,
             time: cut.system_time,
             generation,
-            assignment: super::query::follower_assignment(route),
+            assignment,
             track: request.track,
             context,
             deadline,
@@ -191,9 +201,7 @@ impl Service {
                 .map_err(error::anomaly)
         })?;
         drop(guard.disarm());
-        Ok(proto::OpenExactReadResponse {
-            scope: scope.as_bytes().to_vec(),
-        })
+        Ok(receipt)
     }
 
     pub(super) fn exact_read(

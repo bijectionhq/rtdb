@@ -63,7 +63,16 @@ message OpenExactReadRequest {
   uint32 ttl_millis = 2;
   bool track = 3;
 }
-message OpenExactReadResponse { bytes scope = 1; }
+message OpenExactReadResponse {
+  bytes scope = 1;
+  ExactReadCut cut = 2;
+}
+message ExactReadCut {
+  Basis basis = 1;
+  optional sint64 system_time_micros = 2;
+  optional uint64 applied_position = 3;
+  FollowerProgress assignment = 4;
+}
 message CloseExactReadRequest { bytes scope = 1; }
 message QueryRequest {
   Source source = 1;
@@ -80,7 +89,7 @@ message QueryRequest {
   // Require a tracked exact cut whose full applied branch view is proved clear.
   bool require_clear_rank_input = 8;
   // Obtain the comparable position of this Query's selected native cut.
-  // Available only on an unscoped native database route.
+  // Also available on an assigned follower's exact read scope.
   bool observe_applied_position = 9;
   // Inspect persisted ranked artefacts for a tracked, clear exact-cut catalog read.
   bool verify_ranked_artefacts = 10;
