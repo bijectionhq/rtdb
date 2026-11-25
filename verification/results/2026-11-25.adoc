@@ -1,0 +1,27 @@
+= RTDB kernel study results, 2026-11-25
+
+== Shared plan cache
+
+The node's shared plan cache (`rust/crates/query/src/shared_plans.rs`) serves a query plan built in one session to another session with an equal key whose recorded catalog lookups replay the same answers.
+Planning reads only the SQL source, its `PrepareOptions` and the catalog: `rtdb_sql::prepare_in` and `PreparedQuery::from_prepared` take no other input, and the key destructures every `PrepareOptions` field.
+
+[cols="1,4",options="header"]
+|===
+|Evidence |Result
+
+|Lean 4.35.0, link:../lean/SharedPlans.lean[SharedPlans.lean]
+|Ten audited theorems proved with at most `propext` and `Quot.sound`, with no `sorry`.
+A served plan equals the fresh plan, a stale entry is never served, EXPLAIN and DML bypass the cache, every reachable cache keeps reservations equal to its entries within the budget and capacity, and evicting every entry releases every reservation.
+All four model controls failed at their declared theorems.
+
+|Verus 0.2026.11.02.8bf68ee, link:../verus/shared_plans/README.md[shared_plans]
+|12 functions verified in the shipped `shared_plan_entries.rs` and `lookup_replay.rs` and the area's laws.
+All five source controls failed at their declared functions with 11 verified.
+
+|Native tests, `rtdb-node` `statement::shared_plan_tests`
+|Eight cases pass.
+Sessions differing in default database, search path, timezone or parameter types do not share a plan, and a column type change or a table created earlier on the search path replans.
+The full-budget and EXPLAIN cases fail on the cache as first landed and pass with the eviction and EXPLAIN fixes.
+|===
+
+The Lean and Verus checks ran through `verify_shared_plans_lean` and `verify_verus` from `verification/run.py` on the selected area only, not the full runner.

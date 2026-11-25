@@ -451,6 +451,33 @@ def verify_search_windows(args, scratch):
     verify_lean_model(args, scratch, path, "search-windows", controls, 7)
 
 
+def verify_shared_plans_lean(args, scratch):
+    path = Path("verification/lean/SharedPlans.lean")
+    controls = {
+        "serve-without-replay": (
+            "  | some e => if replays cat e.trace then some e.plan else none",
+            "  | some e => some e.plan",
+            ["a_cached_plan_had_the_same_inputs", "a_cached_plan_had_the_same_inputs", "a_stale_plan_is_never_served"],
+        ),
+        "admit-past-budget": (
+            "  if c.reserved + bytes ≤ budget ∧ c.entries.length < capacity",
+            "  if c.reserved ≤ budget ∧ c.entries.length < capacity",
+            ["admit_keeps_the_invariant"],
+        ),
+        "evict-without-release": (
+            "  | e :: rest => ⟨rest, c.reserved - e.bytes⟩",
+            "  | e :: rest => ⟨rest, c.reserved⟩",
+            ["evict_keeps_the_invariant", "evict_keeps_the_invariant", "evicting_every_entry_releases_every_reservation"],
+        ),
+        "explain-enters-cache": (
+            "  | _ => (fresh planner k cat, c)",
+            "  | _ => (fresh planner k cat, admit planner budget capacity k cat bytes c)",
+            ["every_step_keeps_the_budget", "explain_and_dml_bypass_the_cache", "explain_and_dml_bypass_the_cache"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "shared-plans", controls, 10)
+
+
 def verify_partitioned_top_k(args, scratch):
     path = Path("verification/lean/PartitionedTopK.lean")
     controls = {
@@ -2168,6 +2195,7 @@ def verify_lean(args, scratch):
             verify_compaction_intervals(args, scratch, directory)
             verify_search_windows(args, scratch)
             verify_search_member_bounds(args, scratch)
+            verify_shared_plans_lean(args, scratch)
             verify_partitioned_top_k(args, scratch)
             verify_catalog_recovery(args, scratch)
             verify_checkpoint_discovery(args, scratch)

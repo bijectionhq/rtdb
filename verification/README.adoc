@@ -154,6 +154,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   On the same date, Verus 0.2026.11.20.9da409b checked eight items and 16 controls in link:verus/audience_session_seats/area.json[the Flight seat area] and five items and seven controls in link:verus/audience_cross_holder_claim/area.json[the shared claim area].
   The production checks cover the local handoff decision and exact release condition.
   See link:../dev/doc/rtdb-multi-bijection.md#resource-enforced-seat-generations[the resource design and correspondence limits].
+* link:verus/shared_plans/README.md[Shared plans] checks the node plan cache's key lookup, catalog replay and bounded admission, and models its reuse, invalidation, exclusion and budget laws in link:lean/SharedPlans.lean[Lean].
+  On 2026-11-25, Verus 0.2026.11.02.8bf68ee verified 12 functions and rejected all five controls at their declared functions, and Lean 4.35.0 proved the ten audited theorems with standard axioms and rejected all four model controls.
 * link:verus/installed_directory_bypass/README.md[Installed directory bypass] checks the installed-UUID ingress guards, node route and move guards, and pressure candidate selection.
 * link:verus/installed_custodian_retention/README.md[Installed custodian retention] checks the exclusive checkpoint cut, exact trim target and disposal-before-trim attempt order.
 * link:verus/survivor_checkpoint/README.md[Survivor checkpoint] checks the shipped event and member decisions against a Lean exact-head filter and a native conformance fixture.

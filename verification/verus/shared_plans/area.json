@@ -1,0 +1,110 @@
+{
+  "summary": "Shared plan lookup by exact key, replay of every recorded catalog answer, and bounded least-recently-used admission.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "replay",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 12,
+  "controls": {
+    "hit-on-another-key": {
+      "defect": "A lookup returns the first entry whose key differs.",
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "find": "        if entries[index].0 == *key { return Some(index); }",
+          "replace": "        if entries[index].0 != *key { return Some(index); }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "function": "find",
+          "category": "invariant not satisfied at end of loop body"
+        },
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "function": "find",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "accept-a-changed-answer": {
+      "defect": "Replay treats a lookup whose answer changed as answered the same.",
+      "mutate": [
+        {
+          "file": "rust/crates/plan/src/lookup_replay.rs",
+          "find": "            Ok(true) => {}",
+          "replace": "            Ok(_) => {}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/plan/src/lookup_replay.rs",
+          "function": "replays_every",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "keep-the-equal-key": {
+      "defect": "Admission keeps the stale entry of an equal key.",
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "find": "    if let Some(index) = find(entries, &key) { entries.remove(index); }",
+          "replace": "    let _ = find(entries, &key);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "function": "admit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "admit-past-capacity": {
+      "defect": "Admission keeps every entry when the cache is full.",
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "find": "    if entries.len() == capacity { entries.remove(0); }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "function": "admit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "drop-the-used-entry": {
+      "defect": "Using a plan drops it from the cache.",
+      "mutate": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "find": "    entries.push(entry);",
+          "replace": "    let _ = entry;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/query/src/shared_plan_entries.rs",
+          "function": "touch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    }
+  }
+}
