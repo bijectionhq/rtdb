@@ -542,3 +542,24 @@ Ciphertext then ages out with its world or archive.
 | `rtdb.owned/assertion-family-scope` | Forbidden | A capability names another deployment or incarnation, or a position names a foreign line. |
 | `rtdb.owned/assertion-profile-uninstalled` | Unsupported | Settlement requires the fixed assertion profile. |
 | `rtdb.world/unavailable` | Incorrect | The session is not the placed writer or the host has no family vault. |
+
+## Founding World rank transfer authority
+
+The host-only [World rank transfer authority](../../rust/crates/multi/src/keys/assertion/family/world_rank_transfer.rs) adapts the Original vault agreement, reciprocal observation and read checks from the managed checkpoint transfer.
+The agreement uses the current [retired Original handoff](../../rust/crates/node/src/node/hosted_control/retired_original.rs), the frozen archive digest, the exact destination installation, incarnation and hold, and one co-ordered Binary rank derivative per founding member.
+The Original validates the live member, both stages, the bound World and complete slot, and the registered derivative inventory.
+The host authenticates both envelopes without opening the payloads and supplies the full frozen contributor census, including retained and shadowed images.
+The Original enrolls one agreement in every contributing family before acknowledging the bound transfer.
+Its fence commitment includes those entries, and release-hold drain and family settlement require a positive destination terminal and Original copy drain for each entry.
+An installed terminal identifies the accepted replay receipt, backed data and closed copy activity.
+The destination serves the sealed Original stage through an exact held slot and receipt.
+The read gate attaches current destination generation and every contributing Original family fence to the existing plaintext delivery scope.
+The response owner still has to acquire its normal ordered release hold before exposing a result.
+
+The authority is reusable by trusted hosted adapters.
+The active held restore has no World rank transfer mount yet.
+Its source adapter must feed the complete authenticated Binary census across every frozen archive file and join each derivative with the founding carrier, protected journal and clock before taking the Original writer retirement as authority.
+Its destination adapter must order the reciprocal preparation on the native restore hold and confirm the accepted replay and seal from the durable restore ledger, then provide both positive copy drains.
+On serving, the held-world rank reader must obtain the exact Original transfer and response hold for that selected destination generation.
+The existing retired family Flight operation grants one exact Root landing and supplies no World rank response grant.
+Landed Root selectors, inherited members, rewrites and backfills require additional evidence and stay outside this profile.

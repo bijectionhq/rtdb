@@ -228,6 +228,17 @@ impl StagedCapability {
         }
         envelope.open(&authoring.binding(stage), self.key())
     }
+
+    pub(super) fn verify(&self, stage: AssertionStage, authoring: AssertionAuthoring, envelope: AssertionEnvelope) -> Result<()> {
+        if self.envelope != envelope { return Err(stage_mismatch()); }
+        let binding = authoring.binding(stage);
+        let opened = Cipher::new(self.key())?
+            .open(&format!("rtdb.multi/assertion-envelope/v2/key/{binding}"), &envelope.0[HEADER.len()..BODY_OFFSET])
+            .map_err(|_| stage_mismatch())?;
+        let mut opened = opened.try_into_mut().map_err(|_| stage_mismatch())?;
+        zeroize::Zeroize::zeroize(opened.as_mut());
+        Ok(())
+    }
 }
 
 fn candidate_commitment(
@@ -328,6 +339,10 @@ impl TryFrom<Bytes> for AssertionBackup {
 
 #[async_trait::async_trait]
 pub trait AssertionKeyService: Send + Sync {
+    async fn verify_assertion_envelope(&self, _stage: AssertionStage, _authoring: AssertionAuthoring,
+        _region: &Arc<IoRegion>, _envelope: AssertionEnvelope) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.multi/assertion-envelope-proof", "The key vault cannot authenticate a retained envelope"))
+    }
     /// A retry of the admitted candidate returns the original frame.
     async fn seal_assertion_stage(
         &self, stage: AssertionStage, authoring: AssertionAuthoring, region: &Arc<IoRegion>,
@@ -350,6 +365,22 @@ pub trait AssertionKeyService: Send + Sync {
 
 #[async_trait::async_trait]
 impl AssertionKeyService for LocalKeyService {
+    async fn verify_assertion_envelope(&self, stage: AssertionStage, authoring: AssertionAuthoring,
+        region: &Arc<IoRegion>, envelope: AssertionEnvelope) -> Result<()> {
+        self.require_assertion_broker()?;
+        let authority = self.clone();
+        region.run_blocking(move || {
+            let verify = || {
+                let vault = authority.archive_vault()?;
+                let path = vault.path(&stage.key_id())?;
+                let _lock = vault.lock_key_shared(&path)?;
+                let bytes = fs::read(&path).map_err(io)?;
+                if is_destroyed(&bytes) { return Err(rtdb_storage::Error::ErasedUnderView.into()); }
+                StagedCapability::read(bytes.into())?.verify(stage, authoring, envelope)
+            };
+            Ok(verify())
+        }).await?
+    }
     async fn seal_assertion_stage(
         &self, stage: AssertionStage, authoring: AssertionAuthoring, region: &Arc<IoRegion>,
         plaintext: Bytes,
@@ -473,6 +504,7 @@ mod tests {
         assert_ne!(first.digest(), second.digest());
         let retry_vault = LocalKeyService::with_archive_broker(directory.path())?;
         assert_eq!(retry_vault.seal_assertion_stage(a, a_form, &region, secret.clone()).await?, first);
+        retry_vault.verify_assertion_envelope(a, a_form, &region, first.clone()).await?;
         for substitute in [
             b_form,
             AssertionAuthoring { scope_commitment: [5; 32], ..a_form },
@@ -480,6 +512,7 @@ mod tests {
         ] {
             assert!(retry_vault.seal_assertion_stage(a, substitute, &region, secret.clone()).await.is_err());
             assert!(retry_vault.open_assertion_for_resolution(a, substitute, &region, first.clone()).await.is_err());
+            assert!(retry_vault.verify_assertion_envelope(a, substitute, &region, first.clone()).await.is_err());
         }
         assert_eq!(vault.open_assertion_for_resolution(a, a_form, &region, first.clone()).await?, secret);
         assert!(vault.open_assertion_for_resolution(b, b_form, &region, first.clone()).await.is_err());
@@ -491,6 +524,7 @@ mod tests {
         let mut swapped = first.0[..BODY_OFFSET].to_vec();
         swapped.extend_from_slice(&second.0[BODY_OFFSET..]);
         let swapped = AssertionEnvelope::try_from(Bytes::from(swapped))?;
+        assert!(vault.verify_assertion_envelope(a, a_form, &region, swapped.clone()).await.is_err());
         assert!(vault.open_assertion_for_resolution(a, a_form, &region, swapped).await.is_err());
 
         let retained = Bytes::from(first);
