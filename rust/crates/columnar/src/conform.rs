@@ -40,11 +40,36 @@ pub fn event_relayout_bound(array: &dyn arrow_array::Array, source: &arrow_schem
 /// The safe Rust batch marks null-bearing fields nullable; the declared wire schema preserves the caller's flags.
 /// Integer buffers may retain signed execution bits under a same-width unsigned declared field.
 /// Decimal precision, scale, and width must match an admitted declared leg.
-pub struct DeclaredBatch { batch: OwnedBatch, declared: SchemaRef, _reservation: Arc<MemoryReservation> }
+pub struct DeclaredBatch { batch: OwnedBatch, declared: DeclaredSchema }
 
 impl DeclaredBatch {
     pub fn batch(&self) -> &RecordBatch { self.batch.batch() }
-    pub fn declared_schema(&self) -> &SchemaRef { &self.declared }
+    pub fn declared_schema(&self) -> &SchemaRef { self.declared.schema() }
+}
+
+/// An immutable declaration whose allocation is covered by its owner's reservation.
+#[derive(Clone)]
+pub struct DeclaredSchema {
+    schema: SchemaRef,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl DeclaredSchema {
+    /// The caller reserves the declaration before constructing it.
+    pub fn with_reservation(schema: Schema, reservation: Arc<MemoryReservation>) -> Self {
+        Self { schema: Arc::new(schema), _reservation: reservation }
+    }
+
+    pub fn schema(&self) -> &SchemaRef { &self.schema }
+
+    pub fn conform(&self, batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<DeclaredBatch> {
+        if batch.batch().schema_ref() == self.schema() {
+            return Ok(DeclaredBatch { batch, declared: self.clone() });
+        }
+        let bound = conformance_bound(&batch, self.schema())?;
+        let _scratch = memory.reserve(bound)?;
+        adapt_batch(batch, self.clone(), memory, bound)
+    }
 }
 
 /// Conforms one page to the declared field order, preserving the reference ConformingUnloader's NULL promotion.
@@ -53,11 +78,20 @@ impl DeclaredBatch {
 /// Declared nested field order, metadata and dense union type IDs are retained.
 /// Exact-schema pages retain their existing physical layout without rebuilding.
 pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBudget>) -> Result<DeclaredBatch> {
+    let bound = conformance_bound(&batch, declared)?;
+    let reservation = memory.reserve(bound)?;
+    let declared = DeclaredSchema::with_reservation(declared.clone(), reservation);
+    if batch.batch().schema_ref() == declared.schema() { return Ok(DeclaredBatch { batch, declared }); }
+    adapt_batch(batch, declared, memory, bound)
+}
+
+fn conformance_bound(batch: &OwnedBatch, declared: &Schema) -> Result<usize> {
     let metadata_bound = declared.metadata().iter().try_fold(multiply(declared.metadata().capacity(), std::mem::size_of::<(String, String)>())?, |bytes, (key, value)| add(bytes, add(key.capacity(), value.capacity())?))?;
-    let schema_bound = declared.fields().iter().chain(batch.batch().schema().fields()).try_fold(add(8192, multiply(metadata_bound, 64)?)?, |bytes, field| add(bytes, multiply(field.size(), 4)?))?;
-    let reservation = memory.reserve(schema_bound)?;
-    let declared = Arc::new(declared.clone());
-    if batch.batch().schema().as_ref() == declared.as_ref() { return Ok(DeclaredBatch { batch, declared, _reservation: reservation }); }
+    declared.fields().iter().chain(batch.batch().schema_ref().fields()).try_fold(add(8192, multiply(metadata_bound, 64)?)?, |bytes, field| add(bytes, multiply(field.size(), 4)?))
+}
+
+fn adapt_batch(batch: OwnedBatch, declaration: DeclaredSchema, memory: &Arc<MemoryBudget>, schema_bound: usize) -> Result<DeclaredBatch> {
+    let declared = declaration.schema();
     let source = batch.batch().schema();
     if source.fields().iter().any(|field| !declared.fields().iter().any(|target| target.name() == field.name())) {
         return Err(fault("page-outside-declared-type", "Page contains a field outside its declared schema"));
@@ -101,7 +135,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
     let schema = Arc::new(Schema::new(fields).with_metadata(declared.metadata().clone()));
     let physical = RecordBatch::try_new_with_options(schema, arrays, &RecordBatchOptions::new().with_row_count(Some(batch.batch().num_rows()))).map_err(crate::arrow_error)?;
     let batch = OwnedBatch::with_reservation(physical, output)?;
-    Ok(DeclaredBatch { batch, declared, _reservation: reservation })
+    Ok(DeclaredBatch { batch, declared: declaration })
 }
 
 fn layout(target: &L, source: &L) -> Result<L> {
