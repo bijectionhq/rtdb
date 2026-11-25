@@ -135,12 +135,20 @@ impl ObjectStore for SnapshotStore {
         self.read(key, |store| async move { store.head_fresh(key).await }).await
     }
 
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+        self.read(key, |store| async move { store.observe_head(key).await }).await
+    }
+
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         self.read(key, |store| async move { store.get_fresh(key).await }).await
     }
 
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
         self.read(key, |store| async move { store.get_fresh_exact(key, length).await }).await
+    }
+
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        self.read(key, |store| async move { store.observe_fresh_exact(key, length).await }).await
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
@@ -151,6 +159,10 @@ impl ObjectStore for SnapshotStore {
 
     fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         self.allocation.whole_object_allocation(key, length)
+    }
+
+    fn exact_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        self.allocation.exact_object_allocation(key, length)
     }
 
     async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {

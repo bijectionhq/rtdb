@@ -4,11 +4,12 @@ use rtdb_types::{ListKind, LogicalType as L, ScalarType as S, TableRef, TimeUnit
 
 pub(crate) struct Definition { pub schema: &'static str, pub name: &'static str, fields: &'static str }
 pub(crate) fn allocation_bound(database: &str) -> rtdb_types::Result<usize> {
-    let overflow = || crate::invalid("catalog-size", "System schema allocation exceeds addressable memory");
     DEFINITIONS.iter().try_fold(4096usize, |bytes, definition| {
-        let text = database.len().checked_add(definition.schema.len()).and_then(|n| n.checked_add(definition.name.len())).and_then(|n| n.checked_add(definition.fields.len())).ok_or_else(overflow)?;
-        bytes.checked_add(text.checked_mul(256).ok_or_else(overflow)?).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)
+        bytes.checked_add(definition.allocation_bound(database)?).ok_or_else(system_schema_size)
     })
+}
+fn system_schema_size() -> rtdb_types::Anomaly {
+    crate::invalid("catalog-size", "System schema allocation exceeds addressable memory")
 }
 macro_rules! definition { ($schema:literal, $name:literal, $fields:literal) => { Definition { schema: $schema, name: $name, fields: $fields } }; }
 pub(crate) const DEFINITIONS: &[Definition] = &[
@@ -61,6 +62,11 @@ pub(crate) const DEFINITIONS: &[Definition] = &[
 
 pub(crate) fn definition(table: &TableRef) -> Option<&'static Definition> { DEFINITIONS.iter().find(|entry| entry.schema == table.schema && entry.name == table.table) }
 impl Definition {
+    pub(crate) fn allocation_bound(&self, database: &str) -> rtdb_types::Result<usize> {
+        database.len().checked_add(self.schema.len()).and_then(|n| n.checked_add(self.name.len()))
+            .and_then(|n| n.checked_add(self.fields.len())).and_then(|n| n.checked_mul(256))
+            .and_then(|n| n.checked_add(4096)).ok_or_else(system_schema_size)
+    }
     pub fn columns(&self) -> StructFields<L> {
         self.fields.split_ascii_whitespace().map(|field| {
             let (name, ty) = field.split_once(':').expect("catalog field delimiter");

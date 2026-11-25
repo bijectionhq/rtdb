@@ -44,6 +44,8 @@ entity ProbePlan {
 -- A zero vector has no distance, and a zero probe is invalid.
 -- A bounded exact Query can select the effective filtered corpus before ranking, including replacements and tombstones staged by the caller.
 -- Its total counts non-null distances before the requested window, and ties use the complete typed entity sort key.
+-- Serving lookup validates the catalog rows and retains the selected definition under its own admission.
+-- The artefact builder retains admitted definition metadata while enumerating jobs or building a generation.
 --
 -- Generations
 --
@@ -58,8 +60,10 @@ entity ProbePlan {
 -- Each cluster starts at a 64-byte boundary and holds one Arrow IPC stream with 64-byte message and buffer alignment relative to that start.
 -- The directory names every cluster's partition, centroid, byte range, row count and SHA-256 digest covering the stream through its end marker.
 -- Generation staging admits row descriptors and normalized components before growing their buffers.
--- Each cluster streams its selected components in row order from the staged arena into one logical IPC buffer.
--- Training and output scratch have a separate reservation.
+-- Each cluster streams its side columns and selected components in row order from the staged rows and arena.
+-- A single-cluster partition writes its ordered member range directly.
+-- Training and IPC scratch are scoped to the partition and stream that use them.
+-- The directory admits retained rows and centroids as they accumulate.
 -- The artefact record carries the directory's location and digest, and a reader checks every directory and cluster byte it uses against them.
 -- The artefact lane builds generations for the tries `wants` admits and publishes them with ArtefactsAdded.
 -- Compaction output gets its own generation; an erased version is absent from compacted tries and so from their generations.
@@ -72,14 +76,22 @@ entity ProbePlan {
 -- The route applies only at a valid-time point and a system-time point, without transaction overlays.
 -- The published frontier is the set of live current tries that carry a generation of the definition.
 -- Tries above the frontier and the live segments are read exactly, up to a byte budget; beyond it the scan ranks exactly.
+-- Source planning admits descriptor growth and can decline as soon as uncovered trie sizes exceed the budget.
 -- An equality filter that fixes every partition column selects the clusters of that partition before any ranking.
 -- An IID scope from another accelerator small enough to rank exactly leaves the scan exact.
 -- Each generation probes its eligible clusters nearest centroid first; the recall target sets the starting probe fraction and shortlist.
--- The directory is validated in place. The read reserves ranking scratch before retaining the eligible cluster descriptions.
+-- Cluster reads limit concurrent range and decode work using available admission.
+-- A read refused by concurrent memory pressure is retried alone after the other reads settle.
+-- The directory is validated in place, including ascending partition order.
+-- A partition filter seeks its contiguous directory row range.
+-- The read reserves ranking scratch before retaining the eligible cluster descriptions.
+-- The shortlist retains admitted normalized probe components and scores eligible borrowed frontier cells in component order.
+-- Fallback vector and partition cells use individually admitted decode scratch.
 -- The shortlist keeps the nearest distinct IIDs by unit-vector distance across generations and the frontier.
 -- One funded score per distinct IID stays available for subsequent rounds, including IIDs omitted from a narrower round.
 -- The scan uses exact ranking if another distinct IID would exceed the funded score bound.
--- The scan's verifier resolves the shortlist at the read cut and applies every predicate of the scan.
+-- A round hands its funded Arrow IID membership to the exact verifier.
+-- The verifier resolves the shortlist at the read cut and applies every predicate of the scan.
 -- Fewer visible candidates than the limit double the probe fraction and the shortlist until the limit is met, every cluster and row has been considered, or the shortlist would exceed its budget and the scan ranks exactly.
 -- The scan reads only the shortlisted IIDs, resolves their visible versions and computes the exact COSINE_DISTANCE on their stored vectors.
 -- An erased, deleted or superseded version never reaches a result, because resolution at the read cut decides visibility.

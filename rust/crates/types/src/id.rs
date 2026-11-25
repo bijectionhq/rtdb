@@ -454,10 +454,16 @@ pub struct OwnedRelation(String);
 impl OwnedRelation {
     pub fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
-        if name.is_empty() || name.len() > 96 || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')) {
+        if !Self::valid_name(&name) {
             return Err(Anomaly::incorrect("rtdb.owned/invalid-relation", "Owned relation must be a nonempty lower-case name of at most 96 bytes"));
         }
         Ok(Self(name))
+    }
+
+    fn valid_name(name: &str) -> bool {
+        !name.is_empty() && name.len() <= 96 && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
     }
 
     pub fn name(&self) -> &str { &self.0 }
@@ -709,10 +715,13 @@ impl TableRef {
 
     /// True only for ordinary owned relations within this protected catalog's namespace.
     pub fn owns_path_target(&self, target: &Self) -> bool {
+        self.owns_path_target_parts(&target.schema, &target.table)
+    }
+
+    pub fn owns_path_target_parts(&self, schema: &str, table: &str) -> bool {
         (self.is_owned_path_catalog() || self.is_owned_search_catalog() || self.is_owned_spatial_catalog() || self.is_owned_vector_catalog())
-            && target.supported_owned_name()
-            && target.table.split_once('-').is_some_and(|(_, logical)| OwnedRelation::new(logical).is_ok())
-            && target.table[..64] == self.table[..64]
+            && schema == OWNED_SCHEMA_V1
+            && table.split_once('-').is_some_and(|(owner, logical)| owner == &self.table[..64] && OwnedRelation::valid_name(logical))
     }
 
     /// A principal's logical data relation or its world overlay. Protected

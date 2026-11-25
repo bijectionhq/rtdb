@@ -706,6 +706,10 @@ impl ObjectStore for ServingStore {
         self.read(key, |store| store.get_fresh(key)).await
     }
 
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
+        Ok(self.observe_fresh_exact(key, length).await?.value)
+    }
+
     async fn observe_fresh_exact(
         &self,
         key: &ObjectKey,
@@ -741,6 +745,10 @@ impl ObjectStore for ServingStore {
         length: usize,
     ) -> rtdb_storage::Result<ObjectReadAllocation> {
         self.upper.whole_object_allocation(key, length)
+    }
+
+    fn exact_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        self.upper.exact_object_allocation(key, length)
     }
 
     fn scan_range_allocation(
@@ -781,6 +789,9 @@ impl ObjectStore for ServingStore {
         if let Some(lower) = self.inherited(key).await? {
             if lower.get_fresh_exact(key, bytes.len()).await? != bytes {
                 return Err(Error::ConflictingObject(key.to_string()));
+            }
+            if rtdb_format::keys::is_ordered_index_object(key.as_str()) {
+                return Ok(None);
             }
             return lower.retirement_publication(key).await;
         }

@@ -254,6 +254,11 @@ fn output_column(name: &str, array: ArrayRef) -> Result<Column> {
 }
 
 pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: Parameters<'_>, context: &QueryContext) -> Result<Option<Column>> {
+    Ok(funded_column(expr, schema, batch, params, context)?.map(|(column, _)| column))
+}
+
+pub(super) fn funded_column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: Parameters<'_>, context: &QueryContext)
+    -> Result<Option<(Column, Arc<rtdb_columnar::MemoryReservation>)>> {
     let Expr::Call { name, args, .. } = expr else { return Ok(None) };
     let Some(function) = Function::of(name, args.len()) else { return Ok(None) };
     let analyzer = rtdb_plan::call_analyzer(name, args)?;
@@ -384,7 +389,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
         Function::Terms => Arc::new(terms.finish()),
         Function::Fingerprint => Arc::new(binary.finish()),
     };
-    output_column(name, array).map(Some)
+    Ok(Some((output_column(name, array)?, retained)))
 }
 
 #[cfg(test)]

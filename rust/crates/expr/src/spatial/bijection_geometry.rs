@@ -3,18 +3,84 @@ use std::borrow::Cow;
 use geometry::{GeometryWork, Gv, Scalar, ValueView};
 use rtdb_types::Result;
 
-use super::{geometry_error, invalid};
+use super::{geometry_error, invalid, work_limit};
+
+#[derive(Clone, Copy, Default)]
+struct Span {
+    start: u32,
+    next: u32,
+    children: u32,
+}
+
+pub struct Decoded<'a> {
+    bytes: &'a [u8],
+    spans: Spans,
+}
+
+impl Decoded<'_> {
+    pub fn value(&self) -> Value<'_> {
+        Value { bytes: self.bytes, raw: self.bytes, spans: self.spans.as_slice(), index: 0 }
+    }
+}
+
+enum Spans {
+    Inline { entries: [Span; 8], len: usize },
+    Heap(Vec<Span>),
+}
+
+impl Spans {
+    fn as_slice(&self) -> &[Span] {
+        match self {
+            Self::Inline { entries, len } => &entries[..*len],
+            Self::Heap(entries) => entries,
+        }
+    }
+
+    fn push(&mut self, span: Span) {
+        match self {
+            Self::Inline { entries, len } if *len < entries.len() => {
+                entries[*len] = span;
+                *len += 1;
+            }
+            Self::Inline { entries, .. } => {
+                let mut heap = Vec::with_capacity(entries.len() + 1);
+                heap.extend_from_slice(entries);
+                heap.push(span);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(entries) => {
+                if entries.capacity() == entries.len() {
+                    entries.reserve_exact((entries.len() / 2).max(1));
+                }
+                entries.push(span);
+            }
+        }
+    }
+
+    fn set(&mut self, index: usize, span: Span) {
+        match self {
+            Self::Inline { entries, .. } => entries[index] = span,
+            Self::Heap(entries) => entries[index] = span,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
-pub struct Value<'a>(&'a [u8]);
+pub struct Value<'a> {
+    bytes: &'a [u8],
+    raw: &'a [u8],
+    spans: &'a [Span],
+    index: usize,
+}
 
-pub fn decode<'a>(mut bytes: &'a [u8], work: &mut GeometryWork) -> Result<Value<'a>> {
-    let value = Value(bytes);
-    validate(&mut bytes, 0, work)?;
-    if !bytes.is_empty() {
+pub fn decode<'a>(bytes: &'a [u8], work: &mut GeometryWork) -> Result<Decoded<'a>> {
+    let mut decoded = Decoded { bytes, spans: Spans::Inline { entries: [Span::default(); 8], len: 0 } };
+    let mut tail = bytes;
+    decoded.validate(&mut tail, 0, 0, work)?;
+    if !tail.is_empty() {
         return Err(invalid("Bijection geometry has trailing bytes"));
     }
-    Ok(value)
+    Ok(decoded)
 }
 
 fn take<'a>(bytes: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
@@ -83,118 +149,102 @@ fn float(bytes: &[u8]) -> f64 {
     f64::from_bits(if encoded < (1 << 63) { !encoded } else { encoded ^ (1 << 63) })
 }
 
-fn validate(bytes: &mut &[u8], depth: usize, work: &mut GeometryWork) -> Result<()> {
-    if depth > 64 {
-        return Err(invalid("Bijection geometry is too deeply nested"));
+impl<'a> Decoded<'a> {
+    fn offset(&self, tail: &[u8]) -> Result<u32> {
+        u32::try_from(self.bytes.len() - tail.len()).map_err(|_| work_limit())
     }
-    work.charge(1).map_err(geometry_error)?;
-    // Preserve the admission allowance for a stored image regardless of its decoder.
-    work.allocate(std::mem::size_of::<Gv>()).map_err(geometry_error)?;
-    match take(bytes, 1)?[0] {
-        2 => (),
-        3 => {
-            if take(bytes, 1)?[0] > 1 {
-                return Err(invalid("Invalid Bijection geometry boolean"));
-            }
+
+    fn validate(&mut self, bytes: &mut &'a [u8], start: u32, depth: usize, work: &mut GeometryWork) -> Result<()> {
+        if depth > 64 {
+            return Err(invalid("Bijection geometry is too deeply nested"));
         }
-        4 => { take(bytes, 8)?; }
-        5 => {
-            let value = float(take(bytes, 8)?);
-            if value.is_nan() && value.to_bits() != 0x7ff8_0000_0000_0000 {
-                return Err(invalid("Invalid Bijection geometry float"));
-            }
-        }
-        9 => { validate_text(bytes, work)?; }
-        12 => {
-            while !bytes.starts_with(&[0, 0]) {
-                validate(bytes, depth + 1, work)?;
-            }
-            take(bytes, 2)?;
-        }
-        13 => {
-            let mut previous = None;
-            while !bytes.starts_with(&[0, 0]) {
-                let key = validate_text(bytes, work)?;
-                if previous.is_some_and(|previous| previous >= key) {
-                    return Err(invalid("Bijection geometry fields must be strictly ordered"));
+        work.charge(1).map_err(geometry_error)?;
+        // The existing per-value allowance includes span storage and its growth.
+        work.allocate(size_of::<Gv>()).map_err(geometry_error)?;
+        let index = self.spans.as_slice().len();
+        self.spans.push(Span { start, next: 0, children: 0 });
+        let mut children = 0;
+        match take(bytes, 1)?[0] {
+            2 => (),
+            3 => {
+                if take(bytes, 1)?[0] > 1 {
+                    return Err(invalid("Invalid Bijection geometry boolean"));
                 }
-                work.allocate(std::mem::size_of::<String>()).map_err(geometry_error)?;
-                previous = Some(key);
-                validate(bytes, depth + 1, work)?;
             }
-            take(bytes, 2)?;
+            4 => { take(bytes, 8)?; }
+            5 => {
+                let value = float(take(bytes, 8)?);
+                if value.is_nan() && value.to_bits() != 0x7ff8_0000_0000_0000 {
+                    return Err(invalid("Invalid Bijection geometry float"));
+                }
+            }
+            9 => { validate_text(bytes, work)?; }
+            12 => {
+                while !bytes.starts_with(&[0, 0]) {
+                    let start = self.offset(bytes)?;
+                    self.validate(bytes, start, depth + 1, work)?;
+                    children += 1;
+                }
+                take(bytes, 2)?;
+            }
+            13 => {
+                let mut previous = None;
+                while !bytes.starts_with(&[0, 0]) {
+                    let start = self.offset(bytes)?;
+                    let key = validate_text(bytes, work)?;
+                    if previous.is_some_and(|previous| previous >= key) {
+                        return Err(invalid("Bijection geometry fields must be strictly ordered"));
+                    }
+                    work.allocate(size_of::<String>()).map_err(geometry_error)?;
+                    previous = Some(key);
+                    self.validate(bytes, start, depth + 1, work)?;
+                    children += 1;
+                }
+                take(bytes, 2)?;
+            }
+            _ => return Err(invalid("Unsupported canonical Bijection geometry value")),
         }
-        _ => return Err(invalid("Unsupported canonical Bijection geometry value")),
+        let next = u32::try_from(self.spans.as_slice().len()).map_err(|_| work_limit())?;
+        self.spans.set(index, Span { start, next, children });
+        Ok(())
     }
-    Ok(())
 }
 
-fn skip_text(bytes: &mut &[u8]) {
-    loop {
-        let end = bytes.iter().position(|&byte| byte == 0).expect("validated text");
-        let last = bytes[end + 1] == 1;
-        *bytes = &bytes[end + 2..];
-        if last { return; }
-    }
-}
-
-fn skip(bytes: &mut &[u8]) {
-    let (&tag, tail) = bytes.split_first().expect("validated value");
-    *bytes = tail;
-    match tag {
-        2 => (),
-        3 => *bytes = &bytes[1..],
-        4 | 5 => *bytes = &bytes[8..],
-        9 => skip_text(bytes),
-        12 | 13 => {
-            while !bytes.starts_with(&[0, 0]) {
-                if tag == 13 { skip_text(bytes); }
-                skip(bytes);
-            }
-            *bytes = &bytes[2..];
-        }
-        _ => unreachable!("validated value tag"),
+impl<'a> Value<'a> {
+    fn children(self) -> impl ExactSizeIterator<Item = Self> {
+        let mut next = self.index + 1;
+        (0..self.spans[self.index].children as usize).map(move |_| {
+            let index = next;
+            let span = self.spans[index];
+            next = span.next as usize;
+            Self { raw: &self.bytes[span.start as usize..], index, ..self }
+        })
     }
 }
 
 impl<'a> ValueView<'a> for Value<'a> {
     fn scalar(self) -> Scalar {
-        match self.0[0] {
+        match self.raw[0] {
             2 => Scalar::Null,
-            3 => Scalar::Bool(self.0[1] == 1),
-            5 => Scalar::Float(float(&self.0[1..9])),
+            3 => Scalar::Bool(self.raw[1] == 1),
+            5 => Scalar::Float(float(&self.raw[1..9])),
             _ => Scalar::Other,
         }
     }
 
     fn text(self) -> Option<Cow<'a, str>> {
-        let mut rest = self.0.strip_prefix(&[9])?;
+        let mut rest = self.raw.strip_prefix(&[9])?;
         Some(text(&mut rest).expect("validated text"))
     }
 
     fn array(self) -> Option<impl ExactSizeIterator<Item = Self>> {
-        let mut rest = self.0.strip_prefix(&[12])?;
-        let mut end = rest;
-        let mut len = 0;
-        while !end.starts_with(&[0, 0]) {
-            skip(&mut end);
-            len += 1;
-        }
-        Some((0..len).map(move |_| {
-            let value = Self(rest);
-            skip(&mut rest);
-            value
-        }))
+        (self.raw[0] == 12).then(|| self.children())
     }
 
     fn object(self) -> Option<impl Iterator<Item = (Cow<'a, str>, Self)>> {
-        let mut rest = self.0.strip_prefix(&[13])?;
-        Some(std::iter::from_fn(move || {
-            if rest.starts_with(&[0, 0]) { return None; }
-            let key = text(&mut rest).expect("validated key");
-            let value = Self(rest);
-            skip(&mut rest);
-            Some((key, value))
+        (self.raw[0] == 13).then(|| self.children().map(|mut child| {
+            let key = text(&mut child.raw).expect("validated key");
+            (key, child)
         }))
     }
 }

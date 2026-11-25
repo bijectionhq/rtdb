@@ -29,6 +29,7 @@ entity SpatialPostings {
 -- The spatial writer assigns native generations their own artefact addresses and uses the same posting format.
 -- Dropping the table withdraws the build definition from the shared-main projection.
 -- Native WKB and Bijection images admit their binary ordinates directly into typed geometry.
+-- Canonical geometry validation records direct child boundaries while borrowing the original bytes.
 -- Admission counts the exact canonical JSON byte length with bounded scalar scratch.
 -- Readiness at a held cut requires current-generation postings on the durable sources scheduled for spatial indexing.
 -- The live tail and unscheduled durable sources must fit the fallback scan limits at that cut.
@@ -43,11 +44,12 @@ entity SpatialPostings {
 -- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.
 -- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.
 -- The builder decodes the geometry and partition children of a put where the IPC layout allows projection.
--- The builder appends covering keys to typed Arrow columns and sorts their row positions.
+-- The builder appends covering keys to typed Arrow columns and sorts and deduplicates their row positions when the input is not strictly ordered.
 -- A posting page whose sorted selection is contiguous reuses source Arrow slices.
 -- The completed posting object is published immutably before the catalog records its directory receipt.
 -- The receipt authenticates the directory and Arrow footer at the end of the posting object.
 -- Each directory entry binds an Arrow page's encoded bytes, row count, ordered partition and cell endpoints, and page-wide cell bounds.
+-- The writer hashes each page's emitted file bytes and writes directory entries in page order before the footer.
 -- A held read authenticates the directory before using its fences to select page ranges.
 -- It authenticates each selected range and checks its page contents against the directory before visiting candidates.
 -- A posting read admits each selected range and provider scratch before fetching its bytes.
@@ -59,8 +61,10 @@ entity SpatialPostings {
 -- A held read uses the path definition, source inventory, and live segments selected by the same snapshot.
 -- An unrestricted region's memory reservation covers its full key range and retained metadata.
 -- Exact refinement reuses the prepared region topology and its ordered metric segments across candidates.
+-- Region preparation moves the decoded geometry into the index and admits index and reference allocations as they are built.
 -- Exact refinement acquires temporary workspace when a resolved batch supplies an eligible geometry cell and releases it before pulling another batch.
--- A prepared filter belongs to its authenticated held read and retains its request projection and range or ranked matches.
+-- A prepared filter belongs to its authenticated held read and retains its admitted projection and the controls used by exact fallback.
+-- Retained matches and exact fallback reuse the same authenticated held cut and validity.
 -- A continuation sends the filter capability, complete typed identity, bound, and observation flag.
 -- A negotiated ordinary Flight reply emits spatial page IPC as complete messages under the original hold and release checks.
 -- Repeating a continuation evaluates the same filter and held cut.
@@ -78,14 +82,14 @@ entity SpatialPostings {
 -- Range refinement reads the complete typed identity, IID, geometry and equality partition of each candidate.
 -- A range page advances in complete typed identity order at the original hold.
 -- A held range continuation reuses refined matches after its original anchor.
--- Retained range and probe matches carry complete typed keys and physical IIDs in Arrow columns ordered by row positions.
+-- Retained range and probe matches carry complete typed keys and physical IIDs in Arrow columns with optional row positions for unordered input.
 -- A continuation before the initial range anchor refines the original held cut again.
 -- A held probe can refine its original held cut again when bounded match retention is unavailable.
 -- Each range page gathers documents for the IIDs selected by that page.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
 -- A ranked distance window excludes its exact lower radius and includes its upper radius when supplied.
 -- Consecutive distance windows opened on one held read use its original snapshot and valid instant.
--- The held nearest capability retains complete keys, physical IIDs, and exact distances in ranked Arrow columns.
+-- The held nearest capability retains complete keys, physical IIDs, and exact distances in Arrow columns with optional rank positions.
 -- A ranked continuation anchors on the exact previous distance and complete identity.
 -- Each ranked page resolves only its selected IIDs against the original held cut and validates complete identity before gathering the document columns.
 -- The next ranked row's distance bounds the remaining results.
@@ -93,7 +97,7 @@ entity SpatialPostings {
 -- When a nearest page has a successor, the page carries the exact distance of the first omitted hit.
 -- A document projection includes the resolved document and its system revision in hit order at the original hold.
 -- Selection retains the winning row positions until it gathers the final identities and requested document projection.
--- Selection compares complete identity cells on the retained Arrow pages.
+-- First-page selection compares validated identity locators backed by the retained Arrow pages.
 -- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
 -- An empty selected document page carries the same projection schema as a populated page at the same hold.
 -- A current Root probe uses the identity order and carries the full projection and the fields eligible for omission.
@@ -101,6 +105,8 @@ entity SpatialPostings {
 -- A null size means the field is absent, and a present logical null has size one.
 -- Admitted typed lists and closed structs use the same logical size as their canonical value images.
 -- Unsupported clear measurements keep their original projected values.
+-- Omission evidence owns the admitted size arrays and their field metadata.
+-- A covered deferred field that needs a full value is restored for the selected row positions.
 -- The Point intersection certificate binds the complete equality partition and canonical Bijection geometry column to an admitted Point region.
 -- Every matching row inspected on the first page has a canonical Point geometry before the held filter can certify matches.
 -- A winner gather resolves the selected complete identity at the original present and requires the same winning system revision.

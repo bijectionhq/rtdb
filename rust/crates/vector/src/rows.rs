@@ -1,8 +1,8 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
-use arrow_array::{BooleanArray, cast::AsArray};
+use arrow_array::{BooleanArray, FixedSizeBinaryArray, cast::AsArray};
 use arrow_schema::{DataType, UnionMode};
-use rtdb_columnar::{ArrowCell, MemoryReservation, read_execution_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, estimate_read_value_bytes, read_execution_value};
 use rtdb_format::data::{EncodedEvent, EventRef, PutColumn};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, ListValue, ListView, NumericSpan, Result, Value};
 use sha2::{Digest, Sha256};
@@ -22,29 +22,38 @@ impl Partition {
     pub fn of<'a>(parts: impl IntoIterator<Item = Option<Cow<'a, Value>>>) -> Result<Self> {
         let mut hasher = Sha256::new();
         for part in parts {
-            match part.as_deref() {
-                None | Some(Value::Null | Value::Undefined) => hash_part(&mut hasher, 0, &[]),
-                Some(Value::Bool(value)) => hash_part(&mut hasher, 1, &[u8::from(*value)]),
-                Some(Value::I8(value)) => hash_integer(&mut hasher, i64::from(*value)),
-                Some(Value::I16(value)) => hash_integer(&mut hasher, i64::from(*value)),
-                Some(Value::I32(value)) => hash_integer(&mut hasher, i64::from(*value)),
-                Some(Value::I64(value)) => hash_integer(&mut hasher, *value),
-                Some(Value::U8(value)) => hash_integer(&mut hasher, i64::from(*value)),
-                Some(Value::U16(value)) => hash_integer(&mut hasher, i64::from(*value)),
-                Some(Value::U32(value)) => hash_integer(&mut hasher, i64::from(*value)),
-                Some(Value::U64(value)) => match i64::try_from(*value) {
-                    Ok(value) => hash_integer(&mut hasher, value),
-                    Err(_) => hash_part(&mut hasher, 3, &value.to_be_bytes()),
-                },
-                Some(Value::Utf8(text)) => hash_part(&mut hasher, 4, text.as_bytes()),
-                Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => hash_part(&mut hasher, 5, bytes),
-                Some(Value::Uuid(bytes)) => hash_part(&mut hasher, 6, bytes),
-                Some(_) => return Err(Anomaly::incorrect("rtdb.vector/partition-type",
-                    "A vector index partition column holds booleans, integers, text, binary or UUIDs")),
-            }
+            hash_value_part(&mut hasher, part.as_deref())?;
         }
         Ok(Self(hasher.finalize().into()))
     }
+}
+
+fn hash_value_part(hasher: &mut Sha256, part: Option<&Value>) -> Result<()> {
+    match part {
+        None | Some(Value::Null | Value::Undefined) => hash_part(hasher, 0, &[]),
+        Some(Value::Bool(value)) => hash_part(hasher, 1, &[u8::from(*value)]),
+        Some(Value::I8(value)) => hash_integer(hasher, i64::from(*value)),
+        Some(Value::I16(value)) => hash_integer(hasher, i64::from(*value)),
+        Some(Value::I32(value)) => hash_integer(hasher, i64::from(*value)),
+        Some(Value::I64(value)) => hash_integer(hasher, *value),
+        Some(Value::U8(value)) => hash_integer(hasher, i64::from(*value)),
+        Some(Value::U16(value)) => hash_integer(hasher, i64::from(*value)),
+        Some(Value::U32(value)) => hash_integer(hasher, i64::from(*value)),
+        Some(Value::U64(value)) => match i64::try_from(*value) {
+            Ok(value) => hash_integer(hasher, value),
+            Err(_) => hash_part(hasher, 3, &value.to_be_bytes()),
+        },
+        Some(Value::Utf8(text)) => hash_part(hasher, 4, text.as_bytes()),
+        Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => hash_part(hasher, 5, bytes),
+        Some(Value::Uuid(bytes)) => hash_part(hasher, 6, bytes),
+        Some(_) => return Err(partition_type()),
+    }
+    Ok(())
+}
+
+fn partition_type() -> Anomaly {
+    Anomaly::incorrect("rtdb.vector/partition-type",
+        "A vector index partition column holds booleans, integers, text, binary or UUIDs")
 }
 
 fn hash_part(hasher: &mut Sha256, tag: u8, bytes: &[u8]) {
@@ -57,17 +66,43 @@ fn hash_integer(hasher: &mut Sha256, value: i64) {
     hash_part(hasher, 2, &value.to_be_bytes());
 }
 
-fn arrow_partition(event: &EventRef<'_>, columns: &[String]) -> Option<Partition> {
+fn arrow_partition(event: &EventRef<'_>, columns: &[String], memory: &Arc<MemoryBudget>) -> Result<Partition> {
     let mut hasher = Sha256::new();
+    let mut needs_execution_decode = false;
+    let mut deferred_bottom = None;
+    let mut invalid_type = false;
     for column in columns {
-        match event.put_column(column) {
-            Some(PutColumn::Stored(field, array, row)) => {
-                hash_arrow_part(&mut hasher, ArrowCell { field, array, row })?;
-            }
-            Some(PutColumn::Absent) | None => hash_part(&mut hasher, 0, &[]),
+        let Some(PutColumn::Stored(field, array, row)) = event.put_column(column) else {
+            hash_part(&mut hasher, 0, &[]);
+            continue;
+        };
+        let cell = ArrowCell { field, array, row };
+        let borrowed = hash_arrow_part(&mut hasher, cell).is_some();
+        if borrowed && field.data_type() == &DataType::Null && !field.is_nullable() {
+            // The borrowed hash reads bottom as null; the execution decoder rejects it.
+            deferred_bottom = Some(cell);
+        }
+        if !borrowed || matches!(field.data_type(), DataType::FixedSizeBinary(_)) {
+            needs_execution_decode = true;
+        }
+        if needs_execution_decode && let Some(bottom) = deferred_bottom {
+            read_execution_value(bottom.field, bottom.array, bottom.row)?;
+        }
+        if !borrowed {
+            let _scratch = reserve_decode(field, array, row, memory)?;
+            let value = read_execution_value(field, array, row)?;
+            // A later cell's decode error precedes a digest type error.
+            invalid_type |= hash_value_part(&mut hasher, Some(&value)).is_err();
         }
     }
-    Some(Partition(hasher.finalize().into()))
+    if invalid_type { return Err(partition_type()); }
+    Ok(Partition(hasher.finalize().into()))
+}
+
+fn reserve_decode(field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, memory: &Arc<MemoryBudget>)
+    -> Result<Arc<MemoryReservation>>
+{
+    memory.reserve(estimate_read_value_bytes(field, array, row)?)
 }
 
 fn hash_arrow_part(hasher: &mut Sha256, cell: ArrowCell<'_>) -> Option<()> {
@@ -80,7 +115,7 @@ fn hash_arrow_part(hasher: &mut Sha256, cell: ArrowCell<'_>) -> Option<()> {
     match data_type {
         DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
         | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32
-        | DataType::UInt64 | DataType::Utf8 | DataType::Binary => {}
+        | DataType::UInt64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => {}
         _ => return None,
     }
     if cell.array.is_null(cell.row) {
@@ -94,6 +129,10 @@ fn hash_arrow_part(hasher: &mut Sha256, cell: ArrowCell<'_>) -> Option<()> {
             }
             DataType::Utf8 => hash_part(hasher, 4, cell.array.as_string::<i32>().value(cell.row).as_bytes()),
             DataType::Binary => hash_part(hasher, 5, cell.array.as_binary::<i32>().value(cell.row)),
+            DataType::FixedSizeBinary(_) => {
+                let array = cell.array.as_any().downcast_ref::<FixedSizeBinaryArray>()?;
+                hash_part(hasher, 5, array.value(cell.row));
+            }
             _ => hash_integer(hasher, cell.signed_integer()?),
         }
     }
@@ -110,6 +149,28 @@ pub(crate) struct IndexedRow {
     unit_offset: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ClusterRows<'a> {
+    Ordered(&'a [IndexedRow]),
+    Selected(&'a [IndexedRow], &'a [usize]),
+}
+
+impl<'a> ClusterRows<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Ordered(rows) => rows.len(),
+            Self::Selected(_, order) => order.len(),
+        }
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = &'a IndexedRow> {
+        (0..self.len()).map(move |index| match self {
+            Self::Ordered(rows) => &rows[index],
+            Self::Selected(rows, order) => &rows[order[index]],
+        })
+    }
+}
+
 pub(crate) struct IndexedRows {
     dimensions: usize,
     rows: Vec<IndexedRow>,
@@ -123,17 +184,16 @@ impl IndexedRows {
     pub(crate) fn rows(&self) -> &[IndexedRow] { &self.rows }
     pub(crate) fn unit(&self, row: &IndexedRow) -> &[f32] { &self.units[row.unit_offset..row.unit_offset + self.dimensions] }
 
-    pub(crate) fn unit_spans<'a>(&'a self, mut selected: &'a [&'a IndexedRow]) -> impl Iterator<Item = &'a [f32]> + 'a {
+    pub(crate) fn unit_spans<'a>(&'a self, selected: impl Iterator<Item = &'a IndexedRow> + 'a)
+        -> impl Iterator<Item = &'a [f32]> + 'a
+    {
+        let mut selected = selected.peekable();
         std::iter::from_fn(move || {
-            let start = selected.first()?.unit_offset;
+            let start = selected.next()?.unit_offset;
             let mut end = start + self.dimensions;
-            let mut count = 1;
-            for row in &selected[1..] {
-                if row.unit_offset != end { break; }
+            while selected.next_if(|row| row.unit_offset == end).is_some() {
                 end += self.dimensions;
-                count += 1;
             }
-            selected = &selected[count..];
             Some(&self.units[start..end])
         })
     }
@@ -145,10 +205,15 @@ impl IndexedRows {
     pub(crate) fn push_event(&mut self, event: &EventRef<'_>, definition: &VectorDefinition, staging: &mut MemoryReservation) -> Result<()> {
         let unit_offset = self.units.len();
         let dimensions = self.dimensions;
-        let rows = &mut self.rows;
-        if let Some(partition) = append_indexable_event_unit_with(event, definition, dimensions, &mut self.units, |units| {
-            admit_staging_row(rows, units, dimensions, staging)
-        })? {
+        let memory = Arc::clone(staging.budget());
+        let Some(cell) = event_vector(event, definition) else { return Ok(()) };
+        if with_cell_unit(cell, dimensions, &memory, |component| {
+            admit_staging_row(&mut self.rows, &mut self.units, dimensions, staging)?;
+            self.units.extend((0..dimensions).map(component));
+            Ok(())
+        })?.is_some() {
+            let partition = arrow_partition(event, &definition.partition, &memory)
+                .inspect_err(|_| self.units.truncate(unit_offset))?;
             self.push_row(event.header(), partition, unit_offset);
         }
         Ok(())
@@ -177,54 +242,69 @@ fn admit_staging_row(rows: &mut Vec<IndexedRow>, units: &mut Vec<f32>, dimension
     let row_capacity = grow(rows.capacity(), rows.len().saturating_add(1));
     let unit_capacity = grow(units.capacity(), units.len().saturating_add(dimensions));
     if row_capacity == rows.capacity() && unit_capacity == units.capacity() { return Ok(()); }
-    staging.grow_to(row_capacity.saturating_mul(size_of::<IndexedRow>())
-        .saturating_add(unit_capacity.saturating_mul(size_of::<f32>())))?;
+    let old_rows = rows.capacity().saturating_mul(size_of::<IndexedRow>());
+    let old_units = units.capacity().saturating_mul(size_of::<f32>());
+    let new_rows = row_capacity.saturating_mul(size_of::<IndexedRow>());
+    let new_units = unit_capacity.saturating_mul(size_of::<f32>());
+    let row_growth = if new_rows > old_rows { old_rows.saturating_add(new_rows) } else { old_rows };
+    let unit_growth = if new_units > old_units { old_units.saturating_add(new_units) } else { old_units };
+    staging.grow_to(row_growth.saturating_add(old_units).max(new_rows.saturating_add(unit_growth)))?;
     let allocation_error = |error: std::collections::TryReserveError| {
         Anomaly::fault("rtdb.vector/staging", error.to_string())
     };
     rows.try_reserve_exact(row_capacity - rows.len()).map_err(allocation_error)?;
     units.try_reserve_exact(unit_capacity - units.len()).map_err(allocation_error)?;
+    staging.shrink_to(rows.capacity().saturating_mul(size_of::<IndexedRow>())
+        .saturating_add(units.capacity().saturating_mul(size_of::<f32>())))?;
     Ok(())
 }
 
-fn event_value<'a>(event: &'a EventRef<'_>, column: &str) -> Result<Option<Cow<'a, Value>>> {
-    match event.put_column(column) {
-        Some(PutColumn::Stored(field, array, row)) => Ok(Some(Cow::Owned(read_execution_value(field, array, row)?))),
-        Some(PutColumn::Absent) | None => Ok(None),
-    }
+fn event_vector<'a>(event: &'a EventRef<'_>, definition: &VectorDefinition) -> Option<ArrowCell<'a>> {
+    if event.header().op != EventOp::Put { return None; }
+    let Some(PutColumn::Stored(field, array, row)) = event.put_column(&definition.column) else { return None };
+    Some(ArrowCell { field, array, row })
 }
 
-pub(crate) fn append_indexable_event_unit(event: &EventRef<'_>, definition: &VectorDefinition, dimensions: usize,
-    output: &mut Vec<f32>) -> Result<Option<Partition>> {
-    append_indexable_event_unit_with(event, definition, dimensions, output, |_| Ok(()))
+pub(crate) fn frontier_distance(
+    event: &EventRef<'_>, definition: &VectorDefinition, probe: &[f32], memory: &Arc<MemoryBudget>,
+    eligible: impl FnOnce(Partition) -> bool,
+) -> Result<Option<f64>> {
+    let Some(cell) = event_vector(event, definition) else { return Ok(None) };
+    with_cell_unit(cell, definition.dimensions, memory, |component| {
+        let partition = arrow_partition(event, &definition.partition, memory)?;
+        Ok(eligible(partition).then(|| {
+            1.0 - probe.iter().enumerate()
+                .map(|(index, &left)| f64::from(left) * f64::from(component(index)))
+                .sum::<f64>()
+        }))
+    }).map(Option::flatten)
 }
 
-fn append_indexable_event_unit_with(event: &EventRef<'_>, definition: &VectorDefinition, dimensions: usize,
-    output: &mut Vec<f32>, admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<Option<Partition>> {
-    if event.header().op != EventOp::Put { return Ok(None); }
-    let Some(PutColumn::Stored(field, array, row)) = event.put_column(&definition.column) else { return Ok(None) };
-    let unit_offset = output.len();
-    if !append_cell_unit(ArrowCell { field, array, row }, dimensions, output, admit)? { return Ok(None); }
-    let partition = match arrow_partition(event, &definition.partition) {
-        Some(partition) => partition,
-        None => definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
-            .and_then(Partition::of).inspect_err(|_| output.truncate(unit_offset))?,
-    };
-    Ok(Some(partition))
-}
-
-fn append_cell_unit(cell: ArrowCell<'_>, dimensions: usize, output: &mut Vec<f32>, admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
-    if cell.is_null()? { return Ok(false); }
+fn with_cell_unit<T>(
+    cell: ArrowCell<'_>, dimensions: usize, memory: &Arc<MemoryBudget>,
+    consume: impl FnOnce(&dyn Fn(usize) -> f32) -> Result<T>,
+) -> Result<Option<T>> {
+    if cell.is_null()? { return Ok(None); }
     if let Some((values, range)) = cell.float_list_span() {
-        if range.len() != dimensions { return Ok(false); }
-        return append_unit_with(output, range.map(|index| values.float_component(index)), admit);
+        if range.len() != dimensions { return Ok(None); }
+        return with_normalized(dimensions, |index| values.float_component(range.start + index), consume);
     }
     if let Some(span) = numeric_training_span(cell) {
-        if span.len() != dimensions { return Ok(false); }
-        return append_unit_with(output, (0..span.len()).map(|index| span.get(index)?.signed().as_f64()), admit);
+        if span.len() != dimensions { return Ok(None); }
+        return with_normalized(dimensions, |index| span.get(index)?.signed().as_f64(), consume);
     }
+    let _scratch = reserve_decode(cell.field, cell.array, cell.row, memory)?;
     let value = read_execution_value(cell.field, cell.array, cell.row)?;
-    append_value_unit(output, &value, dimensions, admit)
+    let Some(view) = value.list_view().filter(|view| view.len() == dimensions) else { return Ok(None) };
+    with_normalized(dimensions, |index| list_component(view, index), consume)
+}
+
+fn with_normalized<T>(
+    dimensions: usize, component: impl Fn(usize) -> Option<f64>,
+    consume: impl FnOnce(&dyn Fn(usize) -> f32) -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(norm) = component_norm((0..dimensions).map(&component)) else { return Ok(None) };
+    consume(&|index| normalized(component(index), norm)).map(Some)
 }
 
 fn numeric_training_span(cell: ArrowCell<'_>) -> Option<NumericSpan<'_>> {
@@ -253,16 +333,31 @@ fn numeric_training_span(cell: ArrowCell<'_>) -> Option<NumericSpan<'_>> {
     }
 }
 
-/// The unit vector of a SQL list value, or none where its cosine distance is undefined.
-pub(crate) fn value_unit(value: &Value, dimensions: usize) -> Option<Vec<f32>> {
-    let mut output = Vec::new();
-    append_value_unit(&mut output, value, dimensions, |_| Ok(()))
-        .expect("unreserved normalization has no admission failure").then_some(output)
+/// A scoring probe and its retained normalized components.
+pub struct UnitProbe {
+    values: Vec<f32>,
+    _allocation: Arc<MemoryReservation>,
 }
 
-fn append_value_unit(output: &mut Vec<f32>, value: &Value, dimensions: usize, admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
-    let Some(view) = value.list_view().filter(|view| view.len() == dimensions) else { return Ok(false) };
-    append_unit_with(output, (0..view.len()).map(|index| list_component(view, index)), admit)
+impl UnitProbe {
+    pub(crate) fn values(&self) -> &[f32] { &self.values }
+
+    pub fn from_slice(components: &[f32], memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        Self::prepare(components.len(), |index| Some(f64::from(components[index])), memory)
+    }
+
+    pub(crate) fn from_value(value: &Value, dimensions: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let Some(view) = value.list_view().filter(|view| view.len() == dimensions) else { return Ok(None) };
+        Self::prepare(dimensions, |index| list_component(view, index), memory)
+    }
+
+    fn prepare(dimensions: usize, component: impl Fn(usize) -> Option<f64>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        with_normalized(dimensions, component, |component| {
+            let allocation = memory.reserve(dimensions.saturating_mul(size_of::<f32>()))?;
+            let values = (0..dimensions).map(component).collect();
+            Ok(Self { values, _allocation: allocation })
+        })
+    }
 }
 
 fn list_component(view: ListView<'_>, index: usize) -> Option<f64> {
@@ -276,26 +371,15 @@ fn list_component(view: ListView<'_>, index: usize) -> Option<f64> {
     })
 }
 
-pub(crate) fn unit_of(components: &[f32]) -> Option<Vec<f32>> {
-    let mut output = Vec::new();
-    append_unit(&mut output, components.iter().map(|component| Some(f64::from(*component)))).then_some(output)
-}
-
-/// Normalizes in f64 in component order, so the stored unit vector is a deterministic function of the input.
-fn append_unit(output: &mut Vec<f32>, components: impl Iterator<Item = Option<f64>> + Clone) -> bool {
-    append_unit_with(output, components, |_| Ok(())).expect("unreserved normalization has no admission failure")
-}
-
-fn append_unit_with(output: &mut Vec<f32>, components: impl Iterator<Item = Option<f64>> + Clone,
-    admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
-    let norm = components.clone().try_fold(0.0, |sum, component| {
+fn component_norm(mut components: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    components.try_fold(0.0, |sum, component| {
         let component = component.filter(|value| value.is_finite())?;
         Some(sum + component * component)
-    }).map(f64::sqrt);
-    let Some(norm) = norm.filter(|norm| norm.is_finite() && *norm > 0.0) else { return Ok(false) };
-    admit(output)?;
-    output.extend(components.map(|component| (component.expect("component checked during normalization") / norm) as f32));
-    Ok(true)
+    }).map(f64::sqrt).filter(|norm| norm.is_finite() && *norm > 0.0)
+}
+
+fn normalized(component: Option<f64>, norm: f64) -> f32 {
+    (component.expect("component checked during normalization") / norm) as f32
 }
 
 /// Cosine distance between unit vectors, accumulated in f64 in component order.
@@ -306,6 +390,14 @@ pub(crate) fn unit_distance(left: &[f32], right: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn append_unit_with(output: &mut Vec<f32>, components: impl Iterator<Item = Option<f64>> + Clone,
+        admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
+        let Some(norm) = component_norm(components.clone()) else { return Ok(false) };
+        admit(output)?;
+        output.extend(components.map(|component| normalized(component, norm)));
+        Ok(true)
+    }
 
     #[test]
     fn generation_admits_components_and_row_capacity_before_growth() -> Result<()> {
@@ -375,10 +467,10 @@ mod tests {
         for row in 0..list.len() {
             let cell = ArrowCell { field: &field, array: &list, row };
             assert!(numeric_training_span(cell).is_some());
-            let expected = value_unit(&read_execution_value(&field, &list, row)?, 2);
-            let mut output = vec![42.0];
-            assert_eq!(append_cell_unit(cell, 2, &mut output, |_| Ok(()))?, expected.is_some());
-            assert_eq!(&output[1..], expected.as_deref().unwrap_or_default());
+            let memory = MemoryBudget::new(1 << 20);
+            let expected = UnitProbe::from_value(&read_execution_value(&field, &list, row)?, 2, &memory)?;
+            let output = with_cell_unit(cell, 2, &memory, |unit| Ok([unit(0), unit(1)]))?;
+            assert_eq!(output.as_ref().map(|unit| unit.as_slice()), expected.as_ref().map(UnitProbe::values));
         }
         Ok(())
     }
@@ -389,18 +481,22 @@ mod tests {
         let value = Value::list(vec![Value::F64(components[0]), Value::F64(components[1]), Value::F32(-0.0), Value::I64(9_007_199_254_740_993)]);
         let norm = components.iter().map(|value| value * value).sum::<f64>().sqrt();
         let expected = components.map(|component| ((component / norm) as f32).to_bits());
-        let unit = value_unit(&value, 4).unwrap();
-        assert_eq!(unit.into_iter().map(f32::to_bits).collect::<Vec<_>>(), expected);
+        let memory = MemoryBudget::new(4 * size_of::<f32>());
+        let unit = UnitProbe::from_value(&value, 4, &memory).unwrap().unwrap();
+        assert_eq!(unit.values().iter().copied().map(f32::to_bits).collect::<Vec<_>>(), expected);
+        assert_eq!(memory.used_bytes(), 4 * size_of::<f32>());
+        drop(unit);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
     fn undefined_vectors_leave_staged_components_untouched() {
         let mut output = vec![1.0];
         for components in [[Some(1.0), None], [Some(f64::NAN), Some(1.0)], [Some(0.0), Some(-0.0)], [Some(f64::MAX), Some(1.0)]] {
-            assert!(!append_unit(&mut output, components.into_iter()));
+            assert!(!append_unit_with(&mut output, components.into_iter(), |_| Ok(())).unwrap());
             assert_eq!(output, [1.0]);
         }
-        assert!(append_unit(&mut output, [Some(0.0), Some(1.0)].into_iter()));
+        assert!(append_unit_with(&mut output, [Some(0.0), Some(1.0)].into_iter(), |_| Ok(())).unwrap());
         assert_eq!(output, [1.0, 0.0, 1.0]);
     }
 }

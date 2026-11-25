@@ -247,9 +247,14 @@ impl PreparedTopology {
 
     pub(crate) fn retain_points(&mut self, geometry: &Geometry) -> usize {
         if self.dimension != 0 || self.points.is_some() { return 0; }
-        let count = geometry.position_count();
+        let bytes = self.reference_points_bound(geometry);
         self.points = Some(build_point_set(geometry));
-        count.saturating_mul(80)
+        bytes
+    }
+
+    pub(crate) fn reference_points_bound(&self, geometry: &Geometry) -> usize {
+        if self.dimension != 0 || self.points.is_some() { return 0; }
+        geometry.position_count().saturating_mul(80)
     }
 
     fn geographic(&self) -> bool {

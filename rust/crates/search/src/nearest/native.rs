@@ -1,14 +1,14 @@
-use std::{borrow::Cow, collections::BTreeSet, mem::size_of, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
 
 use rtdb_columnar::{ArrowCell, EntityIdRef};
 use rtdb_index::branches::RankedIndexDeclaration;
 use rtdb_plan::{Binder, Catalog, Expr, QualifiedTable, Relation, Scan, Schema, TemporalFilter};
-use rtdb_query::{PreparedQuery, QueryContext, QueryCursor};
+use rtdb_query::{CandidateIids, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, FloatComponent, Iid, Interval, LogicalType, Result,
+    Anomaly, AnomalyCategory, EntityId, FloatComponent, Interval, LogicalType, Result,
     ScalarType, TableRef, TemporalBounds, TimeUnit, Timestamp, Value,
 };
-use rtdb_vector::{Cut, Partition, Round, Shortlist, VectorDefinition};
+use rtdb_vector::{Cut, Partition, Round, Shortlist, UnitProbe, VectorDefinition};
 
 use super::{
     HeldVectorOverlay, MAX_NEAREST_FILTERS, NearestQuery, NearestWindow, identity_charge,
@@ -79,10 +79,7 @@ impl NativeNearest<'_> {
             .split_first()
             .ok_or_else(native_uncovered)?;
         let partition = self.partition(partition_columns, query)?;
-        let _probe = context
-            .memory
-            .reserve(query.dimensions() * size_of::<f32>())?;
-        let probe = rtdb_vector::unit_probe(&query.probe).ok_or_else(native_uncovered)?;
+        let probe = UnitProbe::from_slice(&query.probe, &context.memory)?.ok_or_else(native_uncovered)?;
         let shortlist = match mounted {
             Some(definition) => Shortlist::open_mounted(context, bounds, definition, probe, query.k, partition).await?,
             None => Shortlist::open_native(context, bounds, self.table, self.index, self.declaration, probe, query.k, partition).await?,
@@ -101,7 +98,7 @@ impl NativeNearest<'_> {
             let mut window = NearestWindow::new(&context.memory, query.k)?;
             if !candidates.is_empty() {
                 let cursor = self
-                    .resolve(context, column, candidates.into_iter().collect())
+                    .resolve(context, column, candidates)
                     .await?;
                 self.rank_rows(context, cursor, query, overlay.shadowed(0), &mut window)
                     .await?;
@@ -145,7 +142,7 @@ impl NativeNearest<'_> {
         &self,
         context: &Arc<QueryContext>,
         column: &str,
-        iids: BTreeSet<Iid>,
+        iids: CandidateIids,
     ) -> Result<QueryCursor> {
         let name = QualifiedTable {
             database: context.catalog.default_database().into(),
@@ -161,7 +158,7 @@ impl NativeNearest<'_> {
         let relation = Relation::scan(Scan {
             table,
             columns,
-            iids: Some(iids),
+            iids: None,
             predicates: Vec::new(),
             matches: Vec::new(),
             valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
@@ -174,8 +171,9 @@ impl NativeNearest<'_> {
             top_k: None,
             ordered_top_k: None,
         })?;
+        let context = Arc::clone(context).for_ranked_candidates(name, iids)?;
         PreparedQuery::new_in(Arc::new(relation), &context.memory)?
-            .execute(Arc::clone(context), Vec::new())
+            .execute(context, Vec::new())
             .await
     }
 

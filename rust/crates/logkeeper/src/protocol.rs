@@ -8,6 +8,9 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+mod frame_parts;
+pub(crate) use frame_parts::{FrameParts, WIRE_BATCH_FRAMES};
+
 pub(crate) const MAXIMUM_FRAME_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const AUTHORITY_FRAME_BYTES: usize = 4096;
 

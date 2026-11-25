@@ -32,15 +32,27 @@ impl Evidence {
     }
 }
 
+pub(super) struct ProjectionColumns {
+    columns: Vec<usize>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl std::ops::Deref for ProjectionColumns {
+    type Target = [usize];
+
+    fn deref(&self) -> &[usize] { &self.columns }
+}
+
 pub(super) fn summarize(
     hits: &[SelectedHit], columns: &[usize], probe: Probe<'_>, evidence: &mut Evidence,
     memory: &Arc<MemoryBudget>,
-) -> Result<Vec<usize>> {
+) -> Result<ProjectionColumns> {
+    let output_reservation = memory.reserve(size_of_val(columns))?;
     if probe.fields.is_empty() {
-        return Ok(columns.to_vec());
+        return Ok(ProjectionColumns { columns: columns.to_vec(), _reservation: output_reservation });
     }
     let schema = hits[0].source.batch().schema_ref();
-    let reservation = memory.reserve(4096 + columns.len() * (256 + hits.len() * 8))?;
+    let mut reservation = memory.reserve(0)?;
     let mut omitted = Vec::new();
     let mut output = Vec::with_capacity(columns.len());
     for &index in columns {
@@ -48,6 +60,7 @@ pub(super) fn summarize(
         if probe.fields.contains(&field.name().as_str())
             && (evidence.point_intersects || probe.point_column != Some(field.name().as_str()))
         {
+            let _measurement = memory.reserve(512 + hits.len() * size_of::<Option<u32>>())?;
             let mut plans = LayoutPlans::new(memory)?;
             let sizes = hits.iter().map(|hit| {
                 let batch = hit.source.batch();
@@ -64,6 +77,9 @@ pub(super) fn summarize(
                 plans.get(field, None, || Measure::compile(field, Shape::Fact))?.cell_size(batch.column(index).as_ref(), hit.row)
             }).collect::<Option<Vec<_>>>();
             if let Some(sizes) = sizes {
+                let retained = Arc::get_mut(&mut reservation).expect("omission evidence owns its reservation");
+                let additional = 512 + field.name().len() + hits.len() * size_of::<u32>() + hits.len().div_ceil(8);
+                retained.grow_to(retained.bytes() + additional)?;
                 omitted.push((
                     Arc::new(Field::new(field.name(), DataType::UInt32, true)),
                     Arc::new(UInt32Array::from(sizes)) as ArrayRef,
@@ -75,10 +91,14 @@ pub(super) fn summarize(
     }
     if !omitted.is_empty() {
         let (fields, sizes): (Vec<_>, Vec<_>) = omitted.into_iter().unzip();
-        evidence.omitted = Some(StructArray::new(Fields::from(fields), sizes, None));
+        let metadata = fields.iter().map(|field| field.size() + size_of::<Arc<Field>>()).sum::<usize>();
+        let omitted = StructArray::new(Fields::from(fields), sizes, None);
+        let retained = omitted.get_array_memory_size() + metadata;
+        Arc::get_mut(&mut reservation).expect("omission evidence owns its reservation").shrink_to(retained)?;
+        evidence.omitted = Some(omitted);
         evidence._reservation = Some(reservation);
     }
-    Ok(output)
+    Ok(ProjectionColumns { columns: output, _reservation: output_reservation })
 }
 
 pub(super) fn gather(hits: &[SelectedHit], columns: &[usize], memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
@@ -88,31 +108,41 @@ pub(super) fn gather(hits: &[SelectedHit], columns: &[usize], memory: &Arc<Memor
         return gather_selected(hits, columns, memory);
     }
     let mut scratch = memory.reserve(4096 + hits.len() * 256)?;
-    let mut sources = HashMap::<usize, Arc<OwnedBatch>>::new();
-    let mut projected = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let source = match sources.entry(Arc::as_ptr(&hit.source).addr()) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let charge = Arc::get_mut(&mut scratch).expect("The probe gather owns its projection scratch");
-                charge.grow_to(charge.bytes() + columns.len() * 64)?;
-                let page = if let Some(fallback) = &hit.probe
-                    && columns.iter().any(|&column| fallback.plan(column).is_some())
-                {
-                    fallback.project(columns, memory)?
-                } else {
-                    let batch = hit.source.batch().project(columns).map_err(|error| {
-                        rtdb_types::Anomaly::fault("rtdb.spatial/projection", error.to_string())
-                    })?;
-                    hit.source.with_retained_buffers(batch)
-                };
-                entry.insert(Arc::new(page))
-            }
-        };
-        projected.push(SelectedHit {
-            source: Arc::clone(source), probe: None, row: hit.row, distance_m: hit.distance_m,
+    let mut source_indices = HashMap::new();
+    let mut sources = Vec::<Vec<usize>>::new();
+    for (index, hit) in hits.iter().enumerate() {
+        let source = *source_indices.entry(Arc::as_ptr(&hit.source).addr()).or_insert_with(|| {
+            sources.push(Vec::new());
+            sources.len() - 1
         });
+        sources[source].push(index);
     }
+    let mut projected = hits.iter().map(|_| None).collect::<Vec<_>>();
+    for positions in sources {
+        let first = &hits[positions[0]];
+        let charge = Arc::get_mut(&mut scratch).expect("the probe gather owns its projection scratch");
+        charge.grow_to(charge.bytes() + columns.len() * 64)?;
+        let (page, compact) = if let Some(fallback) = &first.probe
+            && columns.iter().any(|&column| fallback.plan(column).is_some())
+        {
+            let rows = positions.iter().map(|&position| hits[position].row).collect::<Vec<_>>();
+            fallback.project_rows(columns, &rows, memory)?
+        } else {
+            let batch = first.source.batch().project(columns).map_err(|error| {
+                rtdb_types::Anomaly::fault("rtdb.spatial/projection", error.to_string())
+            })?;
+            (first.source.with_retained_buffers(batch), false)
+        };
+        let page = Arc::new(page);
+        for (row, position) in positions.into_iter().enumerate() {
+            let hit = &hits[position];
+            projected[position] = Some(SelectedHit {
+                source: Arc::clone(&page), probe: None,
+                row: if compact { row } else { hit.row }, distance_m: hit.distance_m,
+            });
+        }
+    }
+    let projected = projected.into_iter().map(|hit| hit.expect("every hit has a source")).collect::<Vec<_>>();
     gather_selected(&projected, &(0..columns.len()).collect::<Vec<_>>(), memory)
 }
 
@@ -450,6 +480,31 @@ fn value_size(image: &mut &[u8], depth: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_omission_keeps_only_its_size_array_under_a_wide_projection() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let batch = arrow_array::RecordBatch::try_from_iter((0..32).map(|index| {
+            (format!("c_{index}"), Arc::new(BinaryArray::from(vec![&[3, 1][..]])) as ArrayRef)
+        })).unwrap();
+        let source = Arc::new(OwnedBatch::new(batch, &memory)?);
+        let hits = [SelectedHit { source, probe: None, row: 0, distance_m: None }];
+        let columns = (0..32).collect::<Vec<_>>();
+        let probe = Probe { fields: &["c_0"], point_column: None, certify_point: false };
+        let mut evidence = Evidence::new(false);
+        let before = memory.used_bytes();
+        let selected = summarize(&hits, &columns, probe, &mut evidence, &memory)?;
+        assert_eq!(&*selected, &columns[1..]);
+        let omitted = evidence.omitted.as_ref().unwrap();
+        assert_eq!(omitted.fields()[0].name(), "c_0");
+        assert_eq!(omitted.column(0).as_any().downcast_ref::<UInt32Array>().unwrap().value(0), 1);
+        drop(selected);
+        assert_eq!(memory.used_bytes() - before, evidence._reservation.as_ref().unwrap().bytes());
+        assert!(memory.used_bytes() - before < 1024);
+        drop(evidence);
+        assert_eq!(memory.used_bytes(), before);
+        Ok(())
+    }
 
     #[test]
     fn typed_clear_fact_preserves_absent_and_explicit_null() {

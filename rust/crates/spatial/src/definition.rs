@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_schema::DataType;
-use rtdb_columnar::{ArrowCell, MemoryBudget};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_format::keys::spatial_posting_id;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::ArtefactDefinition;
@@ -19,6 +19,7 @@ pub(crate) struct Definition {
     pub(crate) encoding: SpatialGeometryEncoding,
     pub(crate) partition: Vec<String>,
     pub(crate) generation: i64,
+    pub(crate) reservation: Arc<MemoryReservation>,
 }
 
 impl Definition {
@@ -81,11 +82,17 @@ pub(crate) async fn definitions(
         if let Some(cursor) =
             rtdb_query::open_owned_path_catalog(Arc::clone(&context), &table, None).await?
         {
-            output.extend(collect(cursor, Some(&table)).await?);
+            visit(cursor, Some(&table), &context.memory, |definition| {
+                output.reserve_exact(1);
+                output.push(definition);
+            }).await?;
         }
     }
-    if has_native && let Some(cursor) = rtdb_query::open_native_spatial_builds(context, None).await? {
-        output.extend(collect(cursor, None).await?);
+    if has_native && let Some(cursor) = rtdb_query::open_native_spatial_builds(Arc::clone(&context), None).await? {
+        visit(cursor, None, &context.memory, |definition| {
+            output.reserve_exact(1);
+            output.push(definition);
+        }).await?;
     }
     Ok(output)
 }
@@ -93,11 +100,12 @@ pub(crate) async fn definitions(
 pub(crate) async fn committed_native_definition(
     context: Arc<QueryContext>, table: &TableRef, name: &str,
 ) -> Result<Option<Definition>> {
+    let _id = context.memory.reserve(table.schema.len() + table.table.len() + name.len() + 64)?;
     let id = rtdb_types::rtdb_v1::ranked_build_id(table, name);
-    let Some(cursor) = rtdb_query::open_native_spatial_builds(context, Some(&id)).await? else { return Ok(None); };
-    let mut definitions = collect(cursor, None).await?;
-    Ok(definitions.pop().filter(|definition| definitions.is_empty() && &definition.table == table
-        && definition.name == format!("{name}~native")))
+    let Some(cursor) = rtdb_query::open_native_spatial_builds(Arc::clone(&context), Some(&id)).await? else { return Ok(None); };
+    let (definition, duplicate) = select(cursor, None, &context.memory).await?;
+    Ok(definition.filter(|definition| !duplicate && &definition.table == table
+        && definition.name.strip_suffix("~native") == Some(name)))
 }
 
 pub(crate) async fn held_definition(
@@ -113,12 +121,12 @@ pub(crate) async fn held_definition(
             "Owned relation has no such spatial path at the held cut",
         )
     };
-    let cursor = rtdb_query::open_owned_path_catalog(context, &catalog, Some(path.name()))
+    let cursor = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, Some(path.name()))
         .await?
         .ok_or_else(absent)?;
-    let mut definitions = collect(cursor, Some(&catalog)).await?;
-    let definition = definitions.pop().ok_or_else(absent)?;
-    if !definitions.is_empty()
+    let (definition, duplicate) = select(cursor, Some(&catalog), &context.memory).await?;
+    let definition = definition.ok_or_else(absent)?;
+    if duplicate
         || definition.name != path.name()
         || definition.table != relation.table(owner)
     {
@@ -140,16 +148,32 @@ fn malformed() -> Anomaly {
     Anomaly::fault("rtdb.spatial/path-catalog", "The spatial path catalog contains an invalid declaration")
 }
 
-async fn collect(mut cursor: QueryCursor, owned_catalog: Option<&TableRef>) -> Result<Vec<Definition>> {
-    let mut output = Vec::new();
+async fn select(
+    cursor: QueryCursor, owned_catalog: Option<&TableRef>, memory: &Arc<MemoryBudget>,
+) -> Result<(Option<Definition>, bool)> {
+    let mut definition = None;
+    let mut duplicate = false;
+    visit(cursor, owned_catalog, memory, |candidate| {
+        if definition.is_some() {
+            duplicate = true;
+        } else {
+            definition = Some(candidate);
+        }
+    }).await?;
+    Ok((definition, duplicate))
+}
+
+async fn visit(
+    mut cursor: QueryCursor, owned_catalog: Option<&TableRef>, memory: &Arc<MemoryBudget>, mut accept: impl FnMut(Definition),
+) -> Result<()> {
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         for row in 0..batch.num_rows() {
             let cell = |name| ArrowCell::named(batch, name, row);
             let text = |name| cell(name).and_then(ArrowCell::utf8).ok_or_else(malformed);
             let name = match owned_catalog {
-                Some(_) => text("_id")?.to_owned(),
-                None => format!("{}~native", text("index_name")?),
+                Some(_) => text("_id")?,
+                None => text("index_name")?,
             };
             let schema = text("schema_name")?;
             let table = text("table_name")?;
@@ -159,38 +183,43 @@ async fn collect(mut cursor: QueryCursor, owned_catalog: Option<&TableRef>) -> R
             let generation = cell("version")
                 .and_then(ArrowCell::int64)
                 .ok_or_else(malformed)?;
-            let encoding = match owned_catalog {
-                Some(_) => path_geometry_encoding(cell("geometry_encoding"))?,
-                None => SpatialGeometryEncoding::parse(text("geometry_encoding")?)?,
+            let (encoding, suffix) = match owned_catalog {
+                Some(_) => (path_geometry_encoding(cell("geometry_encoding"))?, ""),
+                None => (SpatialGeometryEncoding::parse(text("geometry_encoding")?)?, "~native"),
             };
+            if !(1..=16).contains(&columns.len()) {
+                return Err(malformed());
+            }
+            let base = 2 * size_of::<Definition>() + 256 + 2 * (schema.len() + table.len() + name.len() + suffix.len());
+            let mut reservation = memory.reserve(base)?;
             let table = TableRef::new(schema, table);
-            if !(1..=16).contains(&columns.len())
-                || owned_catalog.is_some_and(|catalog| !catalog.owns_path_target(&table))
-                || (owned_catalog.is_none()
-                    && text("_id")? != rtdb_types::rtdb_v1::ranked_build_id(&table, text("index_name")?))
+            if owned_catalog.is_some_and(|catalog| !catalog.owns_path_target(&table))
+                || (owned_catalog.is_none() && text("_id")? != rtdb_types::rtdb_v1::ranked_build_id(&table, name))
             {
                 return Err(malformed());
             }
-            let mut columns = columns.map(|column| {
-                column
-                    .utf8()
-                    .filter(|name| owned_catalog.is_none() || !name.starts_with('_'))
-                    .map(str::to_owned)
-                    .ok_or_else(malformed)
-            });
-            let geometry = columns.next().ok_or_else(malformed)??;
-            let partition = columns.collect::<Result<_>>()?;
-            output.push(Definition {
-                name,
+            let count = columns.len();
+            let mut names = [""; 16];
+            for (target, column) in names.iter_mut().zip(columns) {
+                *target = column.utf8().filter(|name| owned_catalog.is_none() || !name.starts_with('_')).ok_or_else(malformed)?;
+            }
+            let partition = &names[1..count];
+            let bytes = base.checked_add((count - 1) * size_of::<String>())
+                .and_then(|bytes| names[..count].iter().try_fold(bytes, |sum, name| sum.checked_add(name.len())))
+                .ok_or_else(crate::postings::work_limit)?;
+            Arc::get_mut(&mut reservation).expect("catalog row owns its reservation").grow_to(bytes)?;
+            accept(Definition {
+                name: [name, suffix].concat(),
                 table,
-                geometry,
+                geometry: names[0].to_owned(),
                 encoding,
-                partition,
+                partition: partition.iter().map(|name| (*name).to_owned()).collect(),
                 generation,
+                reservation,
             });
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]

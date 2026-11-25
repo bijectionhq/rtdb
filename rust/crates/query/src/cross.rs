@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_join_gathers_columns_in_left_major_order() {
+    async fn cross_join_materializes_arrow_columns_in_left_major_order() {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
         use crate::columnar::Column;
@@ -149,13 +149,59 @@ mod tests {
         for expected in [[vec![1, 1, 2, 2], vec![10, 20, 10, 20]], [vec![3, 3], vec![10, 20]]] {
             let batch = cursor.next_batch().await.unwrap().unwrap();
             for (column, expected) in batch.columns.iter().zip(expected) {
-                let Column::Arrow { array, .. } = column else { panic!("Expected an Arrow cross join column"); };
+                assert!(matches!(column, Column::Selected(_)));
+                let (_, field, logical, _) = column.arrow_cell(0).unwrap().unwrap();
+                let (array, _charge) = crate::columnar::relayout_output(column, logical.unwrap(), field, &context.memory).unwrap().unwrap();
                 assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), expected.as_slice());
             }
         }
         assert!(cursor.next_batch().await.unwrap().is_none());
         drop(cursor);
         assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn cross_join_keeps_source_payloads_under_a_charge_independent_of_the_product() {
+        use arrow_array::{ArrayRef, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let context = context(1);
+        let input = |values: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+            let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+            ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(batch, &context.memory).unwrap()).unwrap()
+        };
+        let left_source: ArrayRef = Arc::new(StringArray::from_iter_values((0..256).map(|row| format!("left-{row}"))));
+        let right_source: ArrayRef = Arc::new(StringArray::from_iter_values((0..256).map(|row| format!("right-{row}"))));
+        let left = input(Arc::clone(&left_source));
+        let right = input(Arc::clone(&right_source));
+        let before = context.memory.used_bytes();
+        let result = ColumnBatch::cross(&left, &right, product(left.len, right.len).unwrap(), &context).unwrap();
+        assert!(context.memory.used_bytes() - before < 16 * 1024);
+        drop((left, right));
+
+        let result = result.slice(255, 2, &context.memory).unwrap();
+        for (column, source, positions) in [
+            (&result.columns[0], left_source, [0, 1]),
+            (&result.columns[1], right_source, [255, 0]),
+        ] {
+            for (row, position) in positions.into_iter().enumerate() {
+                let (array, _, _, offset) = column.arrow_cell(row).unwrap().unwrap();
+                assert!(std::ptr::eq(array, source.as_ref()));
+                assert_eq!(offset, position);
+            }
+        }
+        assert_eq!(result.working_set_bytes(&context.memory).unwrap(), context.memory.used_bytes());
+        drop(result);
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn cross_join_checks_the_product_before_expanding() {
+        let limit = i32::MAX as usize;
+        assert_eq!(product(limit, 1).unwrap(), limit);
+        assert_eq!(product(limit, 2).unwrap_err().code, "rtdb.query/cross-join-size");
+        assert_eq!(product(usize::MAX, 2).unwrap_err().code, "rtdb.query/cross-join-size");
     }
 
     #[test]

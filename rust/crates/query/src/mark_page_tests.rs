@@ -106,6 +106,39 @@ async fn membership_spill_keeps_probe_payloads_and_global_null_facts() {
 }
 
 #[tokio::test]
+async fn scalar_membership_marks_the_probe_key_at_its_payload_position() {
+    let ty = LogicalType::Scalar(ScalarType::I64).maybe();
+    let probe_key = field(0, ty.clone());
+    let build_key = field(1, ty.clone());
+    let values = |payload, key: &Field, rows: &[(i64, Value)]| {
+        Arc::new(Relation::new(
+            Schema::new(vec![field(payload, ty.clone()), key.clone()]).unwrap(),
+            RelationNode::Values {
+                rows: rows.iter().map(|(payload, key)| vec![literal(*payload), Expr::Literal(key.clone())]).collect(),
+            },
+        ).unwrap())
+    };
+    let input = values(3, &probe_key, &[(7, Value::I64(1)), (1, Value::I64(3)), (9, Value::Null)]);
+    let dependent = values(4, &build_key, &[(3, Value::I64(1)), (9, Value::Null)]);
+    let comparison = Expr::binary(BinaryOp::Eq, probe_key.expression(), build_key.expression());
+    let relation = mark(input, dependent, comparison, false);
+    for threshold in [0, 10] {
+        let execution = execution_threshold(32, threshold);
+        let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().unwrap();
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            rows.extend(page_rows(page));
+        }
+        assert_eq!(execution.context.spill_peak_bytes() > 0, threshold == 0);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&vec![Value::I64(7), Value::I64(1), Value::Bool(true)]));
+        assert!(rows.contains(&vec![Value::I64(1), Value::I64(3), Value::Null]));
+        assert!(rows.contains(&vec![Value::I64(9), Value::Null, Value::Null]));
+    }
+}
+
+#[tokio::test]
 async fn correlated_scalar_apply_keeps_computed_dependent_vectors() {
     use rtdb_plan::{ApplyKind, NamedExpr};
     let execution = execution(2);

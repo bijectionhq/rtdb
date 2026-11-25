@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub struct PreparedNearest {
-    ranking: OwnedBatch,
+    ranking: RankedMatches,
     relation: OwnedRelation,
     valid_at: Timestamp,
 }
@@ -83,7 +83,7 @@ impl PreparedNearest {
         if !(1..=128).contains(&limit) {
             return Err(kernel::invalid("Invalid spatial page size"));
         }
-        let batch = self.ranking.batch();
+        let batch = self.ranking.batch.batch();
         let keys = batch
             .column(0)
             .as_any()
@@ -94,20 +94,21 @@ impl PreparedNearest {
             .as_any()
             .downcast_ref::<Float64Array>()
             .ok_or_else(inconsistent_ranking)?;
-        let start = seek(keys, distances, after)?;
+        let row_at = |rank| self.ranking.row(rank);
+        let start = seek(keys, distances, row_at, after)?;
         let end = keys.len().min(start + limit);
         let more = end < keys.len();
-        let next_distance_m = more.then(|| distances.value(end));
+        let next_distance_m = more.then(|| distances.value(row_at(end)));
         let _selection = context.memory.reserve(4096 + (end - start) * 256)?;
         let positions = (start..end)
-            .map(|row| Ok((EntityIdRef::from_handle_bytes(keys.value(row))?, row)))
+            .map(|rank| Ok((EntityIdRef::from_handle_bytes(keys.value(row_at(rank)))?, rank)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         if positions.len() != end - start {
             return Err(inconsistent_ranking());
         }
         let stored_iids = IidView::new(batch.column(2).as_ref())?;
         let iids = (start..end)
-            .map(|row| stored_iids.get(row))
+            .map(|rank| stored_iids.get(row_at(rank)))
             .collect::<Result<_>>()?;
         let cursor = open_owned_spatial_scan(
             Arc::clone(&context),
@@ -146,7 +147,7 @@ impl PreparedNearest {
                         source: Arc::clone(&source),
                         probe: None,
                         row,
-                        distance_m: Some(distances.value(rank)),
+                        distance_m: Some(distances.value(row_at(rank))),
                     });
                 }
             }
@@ -177,19 +178,19 @@ impl PreparedNearest {
             };
             gather_selected(&selected, columns, &context.memory)?
         };
-        let values = &distances.values()[start..end];
-        let distance_bytes = size_of_val(values);
+        let count = end - start;
+        let distance_bytes = count * size_of::<f64>();
         let (distances, distance_reservation) =
-            if distances.get_buffer_memory_size() <= distance_bytes {
+            if self.ranking.order.is_none() && distances.get_buffer_memory_size() <= distance_bytes {
                 (
-                    distances.slice(start, values.len()),
-                    Arc::clone(self.ranking.reservation()),
+                    distances.slice(start, count),
+                    Arc::clone(self.ranking.batch.reservation()),
                 )
             } else {
                 let reservation = context
                     .memory
                     .reserve(size_of::<Float64Array>() + distance_bytes)?;
-                let values = Buffer::from_vec(values.to_vec());
+                let values = Buffer::from_vec((start..end).map(|rank| distances.value(row_at(rank))).collect::<Vec<_>>());
                 let distances = Float64Array::new(retain_buffer(&values, &reservation).into(), None);
                 (distances, reservation)
             };
@@ -292,6 +293,7 @@ pub(super) async fn gather_range(
 fn seek(
     keys: &BinaryArray,
     distances: &Float64Array,
+    row_at: impl Fn(usize) -> usize,
     after: Option<NearestPosition<'_>>,
 ) -> Result<usize> {
     let Some(after) = after else {
@@ -300,13 +302,17 @@ fn seek(
     if !after.distance_m.is_finite() || after.distance_m < 0.0 {
         return Err(kernel::invalid("Invalid nearest continuation distance"));
     }
+    let mut integer = [0; 8];
+    let bound = after.id.handle_parts(&mut integer);
     let mut lower = 0;
     let mut upper = keys.len();
     while lower < upper {
         let mid = lower + (upper - lower) / 2;
-        let order = distances.value(mid).total_cmp(&after.distance_m);
+        let row = row_at(mid);
+        let order = distances.value(row).total_cmp(&after.distance_m);
         let order = if order.is_eq() {
-            EntityIdRef::from_handle_bytes(keys.value(mid))?.cmp(&after.id)
+            let key = keys.value(row);
+            (key[0], &key[1..]).cmp(&bound)
         } else {
             order
         };
@@ -325,6 +331,18 @@ const RANKING_OVERHEAD: usize = 16 << 10;
 const IID_BYTES: usize = 16;
 const RANKING_ROW_BYTES: usize = size_of::<i32>() + size_of::<f64>() + IID_BYTES;
 
+#[derive(Debug)]
+struct RankedMatches {
+    order: Option<UInt32Array>,
+    batch: OwnedBatch,
+}
+
+impl RankedMatches {
+    fn row(&self, rank: usize) -> usize {
+        self.order.as_ref().map_or(rank, |order| order.value(rank) as usize)
+    }
+}
+
 struct RankingBuilder {
     keys: Vec<u8>,
     offsets: Vec<i32>,
@@ -332,6 +350,7 @@ struct RankingBuilder {
     iids: Vec<u8>,
     work_key_bytes: usize,
     memory: Arc<MemoryReservation>,
+    ordered: bool,
 }
 
 impl RankingBuilder {
@@ -344,6 +363,7 @@ impl RankingBuilder {
             iids: Vec::new(),
             work_key_bytes: 0,
             memory,
+            ordered: true,
         })
     }
 
@@ -358,17 +378,8 @@ impl RankingBuilder {
             .filter(|&bytes| i32::try_from(bytes).is_ok())
             .ok_or_else(work_limit)?;
 
-        let integer;
-        let (tag, payload): (u8, &[u8]) = match &id {
-            EntityIdRef::String(value) => (0, value.as_bytes()),
-            EntityIdRef::Keyword(value) => (1, value.as_bytes()),
-            EntityIdRef::Integer(value) => {
-                integer = ((*value as u64) ^ (1 << 63)).to_be_bytes();
-                (2, &integer)
-            }
-            EntityIdRef::Uuid(value) => (3, value),
-            EntityIdRef::Binary(value) => (4, value),
-        };
+        let mut integer = [0; 8];
+        let (tag, payload) = id.handle_parts(&mut integer);
         let end = self
             .keys
             .len()
@@ -377,16 +388,19 @@ impl RankingBuilder {
             .ok_or_else(work_limit)?;
         let offset = i32::try_from(end).map_err(|_| work_limit())?;
         let next_count = self.offsets.len();
+        let ordered = self.ordered && self.distances.last().is_none_or(|previous| {
+            previous.total_cmp(&distance).then_with(|| {
+                let key = &self.keys[self.offsets[next_count - 2] as usize..];
+                (key[0], &key[1..]).cmp(&(tag, payload))
+            }).is_lt()
+        });
         let rows_capacity = next_count
             .checked_next_power_of_two()
             .ok_or_else(work_limit)?;
-        let sort_and_output = next_count
-            .checked_mul(RANKING_ROW_BYTES + size_of::<u32>())
-            .and_then(|bytes| bytes.checked_add(end))
-            .ok_or_else(work_limit)?;
+        let order_bytes = if ordered { 0 } else { next_count.checked_mul(size_of::<u32>()).ok_or_else(work_limit)? };
         let fixed = rows_capacity
             .checked_mul(RANKING_ROW_BYTES)
-            .and_then(|bytes| bytes.checked_add(sort_and_output))
+            .and_then(|bytes| bytes.checked_add(order_bytes))
             .and_then(|bytes| bytes.checked_add(RANKING_OVERHEAD + 2 * size_of::<i32>()))
             .ok_or_else(work_limit)?;
         let current = self.keys.capacity();
@@ -425,10 +439,11 @@ impl RankingBuilder {
         self.distances.push(distance);
         self.iids.extend_from_slice(iid.as_bytes());
         self.work_key_bytes = work_key_bytes;
+        self.ordered = ordered;
         Ok(())
     }
 
-    fn finish(self, check: impl Fn() -> Result<()>) -> Result<OwnedBatch> {
+    fn finish(self, check: impl Fn() -> Result<()>) -> Result<RankedMatches> {
         check()?;
         let Self {
             // Local bindings drop in reverse order, so the buffers release before their charge.
@@ -437,29 +452,36 @@ impl RankingBuilder {
             mut offsets,
             mut distances,
             mut iids,
+            ordered,
             ..
         } = self;
         let count = u32::try_from(distances.len()).map_err(|_| work_limit())?;
-        let mut positions = (0..count).collect::<Vec<_>>();
-        let key_at = |row: usize| &keys[offsets[row] as usize..offsets[row + 1] as usize];
-        // Complete key bytes sort in the same order as the typed identities.
-        positions.sort_unstable_by(|&left, &right| {
-            let (left, right) = (left as usize, right as usize);
-            distances[left]
-                .total_cmp(&distances[right])
-                .then_with(|| key_at(left).cmp(key_at(right)))
-        });
-        check()?;
-        let order = if positions.iter().copied().eq(0..count) {
-            drop(positions);
+        let order = if ordered {
+            let compact = [
+                (keys.capacity(), keys.len(), 1),
+                (offsets.capacity(), offsets.len(), size_of::<i32>()),
+                (distances.capacity(), distances.len(), size_of::<f64>()),
+                (iids.capacity(), iids.len(), 1),
+            ].into_iter().filter(|(capacity, len, _)| capacity > len)
+                .map(|(_, len, width)| len * width).max().unwrap_or(0);
+            let _compact = memory.budget().reserve(compact)?;
             keys = keys.into_boxed_slice().into_vec();
             offsets = offsets.into_boxed_slice().into_vec();
             distances = distances.into_boxed_slice().into_vec();
             iids = iids.into_boxed_slice().into_vec();
             None
         } else {
+            let mut positions = (0..count).collect::<Vec<_>>();
+            let key_at = |row: usize| &keys[offsets[row] as usize..offsets[row + 1] as usize];
+            positions.sort_unstable_by(|&left, &right| {
+                let (left, right) = (left as usize, right as usize);
+                distances[left]
+                    .total_cmp(&distances[right])
+                    .then_with(|| key_at(left).cmp(key_at(right)))
+            });
             Some(UInt32Array::from(positions))
         };
+        check()?;
         let keys = BinaryArray::try_new(
             OffsetBuffer::new(offsets.into()),
             Buffer::from_vec(keys),
@@ -474,21 +496,13 @@ impl RankingBuilder {
             Field::new("distance_m", DataType::Float64, false),
             Field::new("_iid", DataType::FixedSizeBinary(IID_BYTES as i32), false),
         ]));
-        let columns: Vec<ArrayRef> = if let Some(order) = order {
-            let ordered = |values: &dyn Array| {
-                arrow_select::take::take(values, &order, None).map_err(ranking_arrow_error)
-            };
-            let columns = vec![ordered(&keys)?, ordered(&distances)?, ordered(&iids)?];
-            drop((keys, distances, iids));
-            columns
-        } else {
-            vec![Arc::new(keys), Arc::new(distances), Arc::new(iids)]
-        };
+        let columns: Vec<ArrayRef> = vec![Arc::new(keys), Arc::new(distances), Arc::new(iids)];
         let batch = RecordBatch::try_new(schema, columns).map_err(ranking_arrow_error)?;
+        let retained = batch.get_array_memory_size() + order.as_ref().map_or(0, |order| order.get_array_memory_size());
         Arc::get_mut(&mut memory)
             .expect("ranking owns its reservation")
-            .shrink_to(batch.get_array_memory_size())?;
-        OwnedBatch::with_reservation(batch, memory)
+            .shrink_to(retained)?;
+        Ok(RankedMatches { order, batch: OwnedBatch::with_reservation(batch, memory)? })
     }
 }
 
@@ -522,20 +536,23 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
     {
         builder.push(id, Iid([row as u8; 16]), distance).unwrap();
     }
+    let source = builder.keys.as_ptr();
     let ranking = builder.finish(|| Ok(())).unwrap();
-    let keys = ranking
+    assert!(ranking.order.is_some());
+    let keys = ranking.batch
         .batch()
         .column(0)
         .as_any()
         .downcast_ref::<BinaryArray>()
         .unwrap();
-    let distances = ranking
+    assert_eq!(keys.value_data().as_ptr(), source);
+    let distances = ranking.batch
         .batch()
         .column(1)
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    let iids = IidView::new(ranking.batch().column(2).as_ref()).unwrap();
+    let iids = IidView::new(ranking.batch.batch().column(2).as_ref()).unwrap();
     for (rank, (id, source_row)) in [
         (EntityIdRef::String("same"), 1),
         (EntityIdRef::Keyword("same"), 3),
@@ -547,14 +564,15 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
     .enumerate()
     {
         assert_eq!(
-            EntityIdRef::from_handle_bytes(keys.value(rank)).unwrap(),
+            EntityIdRef::from_handle_bytes(keys.value(ranking.row(rank))).unwrap(),
             id
         );
-        assert_eq!(iids.get(rank).unwrap(), Iid([source_row; 16]));
+        assert_eq!(iids.get(ranking.row(rank)).unwrap(), Iid([source_row; 16]));
         assert_eq!(
             seek(
                 keys,
                 distances,
+                |rank| ranking.row(rank),
                 Some(NearestPosition {
                     id,
                     distance_m: 1.0
@@ -567,6 +585,7 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
             seek(
                 keys,
                 distances,
+                |rank| ranking.row(rank),
                 Some(NearestPosition {
                     id,
                     distance_m: later
@@ -575,7 +594,7 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
             .is_err()
         );
     }
-    assert_eq!(distances.value(5).to_bits(), later.to_bits());
+    assert_eq!(distances.value(ranking.row(5)).to_bits(), later.to_bits());
 }
 
 #[cfg(test)]
@@ -589,7 +608,8 @@ fn already_ranked_rows_retain_compact_buffers_until_the_last_slice_drops() -> Re
         }
         let source = builder.keys.as_ptr();
         let ranking = builder.finish(|| Ok(()))?;
-        let batch = ranking.batch();
+        assert!(ranking.order.is_none());
+        let batch = ranking.batch.batch();
         let keys = batch
             .column(0)
             .as_any()
@@ -633,8 +653,8 @@ fn already_ranked_rows_retain_compact_buffers_until_the_last_slice_drops() -> Re
 fn rank_key_growth_falls_back_to_exact_need_and_refuses_without_appending() -> Result<()> {
     let limit = RANKING_OVERHEAD
         + 2 * size_of::<i32>()
-        + 2 * (2 * RANKING_ROW_BYTES + size_of::<u32>())
-        + 2 * 8;
+        + 2 * (RANKING_ROW_BYTES + size_of::<u32>())
+        + 8;
     let memory = MemoryBudget::new(limit);
     let mut builder = RankingBuilder::new(&memory)?;
     builder.push(EntityIdRef::String("abcde"), Iid::MIN, 2.0)?;
@@ -648,9 +668,9 @@ fn rank_key_growth_falls_back_to_exact_need_and_refuses_without_appending() -> R
         "rtdb/memory-budget-exceeded",
     );
     let ranking = builder.finish(|| Ok(()))?;
-    assert_eq!(ranking.batch().num_rows(), 2);
+    assert_eq!(ranking.batch.batch().num_rows(), 2);
     assert_eq!(
-        IidView::new(ranking.batch().column(2).as_ref())?.get(0)?,
+        IidView::new(ranking.batch.batch().column(2).as_ref())?.get(ranking.row(0))?,
         Iid::MAX
     );
     drop(ranking);

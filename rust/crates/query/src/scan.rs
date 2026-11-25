@@ -866,7 +866,7 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        let restricted_iids = context.catalog.owned_spatial_candidates(&scan.table.name);
+        let restricted_iids = context.catalog.owned_candidates(&scan.table.name);
         if restricted_iids.is_some() && scan.iids.is_some() {
             return Err(invalid("scan-iid-scope", "An owned spatial candidate scan already has a fixed IID scope"));
         }
@@ -1390,7 +1390,7 @@ struct OrderedPayload {
 #[async_trait]
 impl crate::columnar::BatchCursor for OrderedPayload {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
-        use crate::columnar::{Column, ColumnBatch, predicate_mask};
+        use crate::columnar::{Column, ColumnBatch, predicate_selection};
 
         let memory = &self.execution.context.memory;
         while self.remaining != 0 {
@@ -1468,13 +1468,13 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                     return Err(invalid("ordered-row-iid", "Ordered scan returned no IID array"));
                 };
                 let iids = rtdb_columnar::IidView::new(array.as_ref())?;
-                let mask = match &self.predicate {
-                    Some(predicate) => Some(predicate_mask(&batch, predicate, &self.schema, &self.execution).await?),
+                let selection = match &self.predicate {
+                    Some(predicate) => Some(predicate_selection(&batch, predicate, &self.schema, &self.execution).await?),
                     None => None,
                 };
                 for row in 0..batch.len {
                     let iid = iids.get(row)?;
-                    let selected = mask.as_ref().is_none_or(|mask| mask[row]);
+                    let selected = selection.as_ref().is_none_or(|selection| selection.contains(row));
                     let position = selected.then_some((batches.len(), row));
                     if self.found.insert(iid, position).is_some() {
                         return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
@@ -1587,8 +1587,8 @@ impl ScanVerifier<'_> {
         };
         if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
             let schema = Schema::new(scan.columns.clone())?;
-            let mask = crate::columnar::predicate_mask(&batch, &predicate, &schema, execution).await?;
-            batch = batch.select(&mask, &execution.context.memory)?;
+            let selection = crate::columnar::predicate_selection(&batch, &predicate, &schema, execution).await?;
+            batch = batch.select_predicate(&selection, &execution.context.memory)?;
         }
         Ok(Some((batch.len != 0).then_some(batch)))
     }
@@ -1639,12 +1639,12 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
                 return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
             };
             let resolved = rtdb_columnar::IidView::new(array.as_ref())?;
-            let mask = match &predicate {
-                Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
+            let selection = match &predicate {
+                Some(predicate) => Some(crate::columnar::predicate_selection(&batch, predicate, &schema, self.execution).await?),
                 None => None,
             };
             for row in 0..batch.len {
-                if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
+                if selection.as_ref().is_some_and(|selection| !selection.contains(row)) { continue; }
                 let position = iids.position(resolved.get(row)?).ok_or_else(|| invalid("verifier-iid", "Verified scan returned an IID outside its candidate selection"))?;
                 visible[position] = true;
             }
@@ -1774,15 +1774,15 @@ impl ScanVerifier<'_> {
             (!positions.is_empty()).then(|| (memory, positions, Arc::<[_]>::from(columns)))
         });
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
-        let mask = match predicate {
-            Some(predicate) => Some(crate::columnar::predicate_mask(&batch, &predicate, &Schema::new(scan.columns)?, self.execution).await?),
+        let selection = match predicate {
+            Some(predicate) => Some(crate::columnar::predicate_selection(&batch, &predicate, &Schema::new(scan.columns)?, self.execution).await?),
             None => None,
         };
         let mut verified = Vec::new();
         let mut types = crate::columnar::search::TextTypes::default();
         for (position_in_batch, row) in rows.into_iter().enumerate() {
             self.execution.context.check_cancelled_at(position_in_batch)?;
-            if mask.as_ref().is_some_and(|mask| !mask[position_in_batch]) { continue; }
+            if selection.as_ref().is_some_and(|selection| !selection.contains(position_in_batch)) { continue; }
             let PutText::Utf8(text) = types.text(&batch.columns[position], position_in_batch)? else { continue; };
             let token_bytes = text.len().saturating_mul(32);
             audience_work::decode_bytes(token_bytes)?;
@@ -1839,13 +1839,13 @@ impl ScanVerifier<'_> {
                 return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
             };
             let iids = rtdb_columnar::IidView::new(array.as_ref())?;
-            let mask = match &predicate {
-                Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
+            let selection = match &predicate {
+                Some(predicate) => Some(crate::columnar::predicate_selection(&batch, predicate, &schema, self.execution).await?),
                 None => None,
             };
             let mut types = crate::columnar::search::TextTypes::default();
             for row in 0..batch.len {
-                if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
+                if selection.as_ref().is_some_and(|selection| !selection.contains(row)) { continue; }
                 let PutText::Utf8(text) = types.text(&batch.columns[position], row)? else { continue; };
                 let _scratch = memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
                 let score = scorer.bm25_text(text);

@@ -10,7 +10,7 @@ use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{definition::{self, VectorDefinition}, file, kmeans, rows::IndexedRows};
+use crate::{definition::{self, Definitions, VectorDefinition}, file, kmeans, rows::IndexedRows};
 
 /// Builds one immutable generation per current trie for each approximate vector index (vector.allium: BuildGeneration).
 /// The artefact lane publishes it with the trie, and the collector deletes it with the trie or its retired definition.
@@ -25,28 +25,31 @@ impl ArtefactKind for VectorArtefacts {
 struct Builder(ArtefactDatabase);
 
 impl Builder {
-    async fn read_definitions(&self, snapshot: &PartitionValue, cancellation: &CancellationToken) -> Result<Vec<VectorDefinition>> {
+    async fn read_definitions(&self, snapshot: &PartitionValue, cancellation: &CancellationToken) -> Result<[Definitions; 3]> {
         let database = &self.0;
-        let mut definitions = definition::definitions_in(&database.name, vec![snapshot.snapshot()], Arc::clone(&database.storage),
+        let sql = definition::definitions_in(&database.name, vec![snapshot.snapshot()], Arc::clone(&database.storage),
             Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
-        definitions.extend(definition::owned_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
-            Arc::clone(&database.memory), (database.clock)(), cancellation).await?);
-        definitions.extend(definition::native_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
-            Arc::clone(&database.memory), (database.clock)(), cancellation).await?);
-        Ok(definitions)
+        let owned = definition::owned_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
+            Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
+        let native = definition::native_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
+            Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
+        Ok([sql, owned, native])
     }
 }
 
 #[async_trait]
 impl ArtefactBuilder for Builder {
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>> {
-        Ok(self.read_definitions(snapshot, cancellation).await?.iter().map(VectorDefinition::artefact).collect())
+        let definitions = self.read_definitions(snapshot, cancellation).await?;
+        Ok(definitions.iter().flat_map(Definitions::rows).map(|definition| definition.artefact()).collect())
     }
 
     async fn build(&self, job: &ArtefactJob, source: ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
-        let definition = self.read_definitions(snapshot, cancellation).await?.into_iter()
-            .find(|definition| definition.artefact() == job.definition)
+        let mut definitions = self.read_definitions(snapshot, cancellation).await?;
+        let matches = |definition: &VectorDefinition| definition.artefact() == job.definition;
+        let definition = definitions.iter_mut().find_map(|catalog| catalog.take(matches))
             .ok_or_else(|| fault("Vector definition left force before its build"))?;
+        drop(definitions);
         let ArtefactOwner::Trie(trie) = &job.owner else { return Err(fault("A vector generation covers one trie")) };
         let table = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| fault("Unknown vector index relation"))?;
         let key = ObjectKey::new(table.slug.owner_artefact_key(&job.owner, definition::KIND, &job.definition.id, definition.generation)?)?;
@@ -61,8 +64,8 @@ impl ArtefactBuilder for Builder {
         let memory = Arc::clone(&self.0.memory);
         let cancel = cancellation.clone();
         let written = tokio::task::spawn_blocking(move || {
-            let mut writer = std::io::BufWriter::new(std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?);
-            write_generation(source, &definition, &memory, &cancel, &mut writer)
+            let writer = std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?;
+            write_generation(source, &definition, &memory, &cancel, writer)
         }).await.map_err(fault)??;
         if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
         let published_version = self.0.store.put_file_with_publication(&key, &output).await?.map(Into::into);
@@ -80,18 +83,15 @@ impl ArtefactBuilder for Builder {
 }
 
 fn write_generation(source: impl Read + Seek + Send + 'static, definition: &VectorDefinition,
-    memory: &Arc<MemoryBudget>, cancellation: &CancellationToken, writer: &mut impl Write) -> Result<file::Written> {
+    memory: &Arc<MemoryBudget>, cancellation: &CancellationToken, writer: impl Write) -> Result<file::Written> {
     let mut staging = memory.reserve(0)?;
     let mut rows = IndexedRows::new(definition.dimensions);
     read_indexed_rows(source, definition, memory, cancellation, &mut rows,
         Arc::get_mut(&mut staging).expect("generation owns its staging reservation"))?;
-    let training_bytes_per_component = size_of::<f32>() + size_of::<f64>();
-    let directory_bytes_per_component = 2 * size_of::<f32>();
-    let work_per_row = definition.dimensions
-        .saturating_mul(training_bytes_per_component + directory_bytes_per_component)
-        .saturating_add(384);
-    let _work = memory.reserve(16_384usize.saturating_add(rows.rows().len().saturating_mul(work_per_row)))?;
-    let written = file::write_generation(rows, writer, cancellation)?;
+    const WRITE_BUFFER_BYTES: usize = 8192;
+    let _write_buffer = memory.reserve(WRITE_BUFFER_BYTES)?;
+    let mut writer = std::io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, writer);
+    let written = file::write_generation(rows, staging, &mut writer, memory, cancellation)?;
     writer.flush().map_err(fault)?;
     Ok(written)
 }
@@ -100,7 +100,7 @@ pub fn stage_native_generation(source: std::fs::File, definition: &VectorDefinit
     memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<(std::fs::File, ArtefactRecord)> {
     let mut source = source;
     source.rewind().map_err(fault)?;
-    let mut target = std::io::BufWriter::new(tempfile::tempfile().map_err(fault)?);
+    let mut target = tempfile::tempfile().map_err(fault)?;
     let written = write_generation(source, definition, memory, cancellation, &mut target)?;
     let artefact = definition.artefact();
     let record = ArtefactRecord {
@@ -111,7 +111,7 @@ pub fn stage_native_generation(source: std::fs::File, definition: &VectorDefinit
         file_size: Some(i64::try_from(written.size).map_err(fault)?),
         ..Default::default()
     };
-    Ok((target.into_inner().map_err(fault)?, record))
+    Ok((target, record))
 }
 
 /// Appends the indexable puts of a stored trie file in page order.
