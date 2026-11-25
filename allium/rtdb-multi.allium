@@ -380,6 +380,8 @@ config {
     -- Control.
     activations_per_node_per_second: Integer = 200
     moves_per_node_per_pass: Integer = 8
+    -- Zero leaves journal balancing off.
+    journal_moves_per_pass: Integer = 0
     handoff_lag_threshold: Duration = 10.milliseconds
     move_reservation: Duration = 70.seconds
     quarantine_crashes: Integer = 2
@@ -1125,6 +1127,8 @@ entity MemberRecord {
         draining -> dead         -- lease expired while draining
         -- Retired and dead are terminal for compute members.
         -- A locked logkeeper journal may reacquire its member record and become eligible again.
+        -- A draining logkeeper keeps serving its journal, renews over the drain, and reacquires its record as draining.
+        -- The reaper leaves a draining logkeeper's record in place.
     }
 
     -- Derived: what it may hold or serve.
@@ -2610,6 +2614,19 @@ rule PlaceJournals {
         Directory.cas(record.id, record.epoch, change: {
             journal_placement: JournalPlacement(operation: Fresh, destination: destination)
         })
+}
+
+rule BalanceJournals {
+    -- The controller records at most journal_moves_per_pass journal placements per pass and never parks a holder for them.
+    -- It first replaces each draining logkeeper in a deployment's planned journals, choosing the least loaded eligible logkeeper that keeps the destination valid.
+    -- It then moves one journal at a time from a logkeeper to one carrying at least two fewer deployments.
+    -- A deployment's planned journals are its pending placement's destination, else its ensemble, and they count as its load until a claim applies them.
+    -- Each placement is a CAS on the version of the record it planned from.
+    when: JournalBalancePass(cell)
+
+    ensures:
+        for record in DeploymentsToRebalanceJournals(cell) limit config.journal_moves_per_pass:
+            JournalPlacementRequested(record, BalancedDestination(record))
 }
 
 rule DrainMember {

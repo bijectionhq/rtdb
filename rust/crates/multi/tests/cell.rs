@@ -3151,6 +3151,40 @@ async fn a_journal_placement_moves_a_held_deployment_onto_the_named_journals_and
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draining_logkeeper_keeps_its_lease_and_its_deployments_leave_it_at_their_next_claim() {
+    let mut cell = Cell::start_durable(1).await;
+    cell.add_logkeeper().await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let leaving = before.ensemble[0].clone();
+
+    admin::drain(cell.directory.as_ref(), &leaving).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let drained = cell.directory.member(&leaving).await.unwrap().unwrap();
+    assert_eq!(drained.state, rtdb_directory::MemberState::Draining);
+    assert!(drained.is_live(rtdb_directory::now_ms()), "the drained logkeeper still renews its lease");
+
+    assert_eq!(admin::balance_journals(cell.directory.as_ref(), 8).await.unwrap(), 1);
+    let planned = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let placement = planned.journal_placement.clone().unwrap();
+    assert!(!placement.destination.contains(&leaving));
+    assert_eq!(planned.ensemble, before.ensemble, "balancing leaves the holder serving on its ensemble");
+    assert_eq!(admin::balance_journals(cell.directory.as_ref(), 8).await.unwrap(), 0);
+
+    cell.node(0).agent.park("shop").await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let moved = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(placement.reached_by(&moved.ensemble));
+    assert_eq!(moved.journal_placement, None);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletion_drops_a_recorded_copy_outside_the_current_ensemble() {
     use rtdb_multi::logs::{DirectoryRecorder, EnsembleRecorder};
     use rtdb_storage::log::{Log, LogOffset};

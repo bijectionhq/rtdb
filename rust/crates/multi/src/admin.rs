@@ -25,7 +25,7 @@ pub use holder::{HolderObservation, observe_holder};
 pub(crate) use holder::observe_holder_record;
 mod holder_handoff;
 mod journals;
-pub use journals::place_journals;
+pub use journals::{balance_journals, place_journals};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 const CONCURRENT_SUSPICION_PROBES: usize = 16;
@@ -2507,7 +2507,11 @@ pub async fn reap_members(directory: &dyn Directory, grace: Duration) -> Result<
     let mut reaped = 0;
     let threshold = now_ms() - grace.as_millis() as i64;
     for member in directory.members().await? {
-        if matches!(member.state, MemberState::Dead | MemberState::Retired) || member.lease_expires_at_ms > threshold { continue; }
+        if matches!(member.state, MemberState::Dead | MemberState::Retired) || member.lease_expires_at_ms > threshold
+            || (member.role == MemberRole::Logkeeper && member.state == MemberState::Draining)
+        {
+            continue;
+        }
         let mut dead = member.clone();
         dead.state = MemberState::Dead;
         if let Cas::Applied(_) = directory.replace_member(dead, member.version).await? { reaped += 1; }
@@ -2527,10 +2531,12 @@ pub struct ControllerOptions {
     pub probe_timeout: Duration,
     /// The cell's control key, with which the controller signs its probes and moves.
     pub control: ControlKey,
+    /// Journal placements the controller may record per pass, evacuating draining logkeepers and then balancing the eligible ones.
+    pub journal_moves: usize,
 }
 
 impl Default for ControllerOptions {
-    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, load_limits: Default::default(), read_width: None, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default() } }
+    fn default() -> Self { Self { interval: Duration::from_secs(1), grace: Duration::from_secs(5), rebalance_moves: 0, load_limits: Default::default(), read_width: None, suspicion_probes: 2, probe_timeout: Duration::from_millis(300), control: ControlKey::default(), journal_moves: 0 } }
 }
 
 pub struct FailedMemberProbe { control: String, pgwire: String, consecutive: u32 }
@@ -2619,6 +2625,9 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
                     } else {
                         let _ = rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await;
                     }
+                }
+                if options.journal_moves > 0 {
+                    let _ = balance_journals(directory.as_ref(), options.journal_moves).await;
                 }
             }
         }

@@ -581,6 +581,10 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    The claiming holder copies the retained history onto the destination under a handoff certificate, and records the new ensemble and clears the placement in one directory change.
    A placement whose destination is not live waits for a later claim.
    Installed ordered journals do not read the directory placement.
+   `rtdb-multi controller --journal-balance MOVES` records up to that many placements per pass: off logkeepers drained with `rtdb-multi drain`, then from the busiest eligible logkeeper to one carrying at least two fewer deployments.
+   The balancer never parks a holder, so a placement applies at the deployment's next park, move or failover.
+   A drained logkeeper keeps its lease and its draining state across restarts.
+   It reads every deployment record on each pass; an indexed or paged scan remains open, as does the certified closure that would let an evacuated journal be decommissioned.
 
    An installed ordered journal route supplies the node's exact worker enrollment and the gateway's read-only journal identity.
    On that route the journal owns nominations, the writer fence, append reconciliation, fresh read markers and checkpoint publication.

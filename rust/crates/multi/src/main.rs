@@ -53,7 +53,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
-       rtdb-multi controller --directory DIR [--rebalance MOVES] [--rebalance-write-bytes-per-second BYTES] [--rebalance-tail-bytes BYTES] [--rebalance-cache-bytes BYTES] [--rebalance-query-cpu-ms-per-second MS] [--read-sessions-per-node N --max-read-width N] [--cell-secret FILE]\n\
+       rtdb-multi controller --directory DIR [--rebalance MOVES] [--rebalance-write-bytes-per-second BYTES] [--rebalance-tail-bytes BYTES] [--rebalance-cache-bytes BYTES] [--rebalance-query-cpu-ms-per-second MS] [--read-sessions-per-node N --max-read-width N] [--journal-balance MOVES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE [--recovery-native-destination FILE] [--recovery-classic-application-layout FILE] [--recovery-classic-flight-authority FILE]]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
@@ -769,7 +769,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 return Err(usage("--max-read-width requires --read-sessions-per-node".into()));
             }
             let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", default_moves)?,
-                load_limits, read_width, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?), ..Default::default() };
+                load_limits, read_width, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?),
+                journal_moves: arguments.number("journal-balance", 0usize)?, ..Default::default() };
             admin::run_controller(directory, options, cancellation).await;
             Ok(())
         }

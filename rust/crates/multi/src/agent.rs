@@ -672,7 +672,7 @@ impl NodeAgent {
     }
 
     /// The configuration a holder opens `record` with.
-    /// A recorded journal placement whose destination is live moves the stream there (`JournalPlacementMovesOnNextClaim`).
+    /// A recorded journal placement whose destination is live moves the stream there (`PlaceJournals`).
     /// Otherwise it stays on its ensemble while a quorum of it is live and every member is, and else moves to an ensemble of live logkeepers that keeps the live members (`FlushOnDegradedEnsemble`).
     fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
         let now = now_ms();

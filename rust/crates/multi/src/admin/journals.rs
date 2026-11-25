@@ -1,10 +1,10 @@
-//! Durability placement: which logkeeper journals hold a deployment's stream (`PlaceJournals`).
+//! Durability placement: which logkeeper journals hold a deployment's stream (`PlaceJournals`, `BalanceJournals`).
 //!
 //! A placement is a directory decision; the deployment's next holder copies the stream onto it under a handoff certificate and records the new ensemble.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rtdb_directory::{DeploymentRecord, Directory, JournalPlacement, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, JournalPlacement, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 use crate::control::{ControlKey, Request};
@@ -34,6 +34,98 @@ pub async fn place_journals(directory: &dyn Directory, name: &str, destination: 
             format!("{name} is held but has not moved to its recorded journals; its next claim retries the move")));
     }
     Ok(settled)
+}
+
+/// Records at most `moves` journal placements: first off draining logkeepers, then from the most to the least loaded eligible one.
+/// It never parks a holder; each placement applies at the deployment's next claim, and its destination counts as the deployment's load meanwhile.
+pub async fn balance_journals(directory: &dyn Directory, moves: usize) -> Result<usize> {
+    if moves == 0 { return Ok(0); }
+    let members = members(directory).await?;
+    let deployments = directory.deployments().await?;
+    let mut placed = 0;
+    for (index, destination) in plan_journal_placements(&deployments, &members, now_ms(), moves) {
+        let current = &deployments[index];
+        let mut next = current.clone();
+        record_placement(&mut next, uuid::Uuid::new_v4(), &destination);
+        if next == *current { continue; }
+        if let Cas::Applied(_) = directory.replace_deployment(next, current.version).await? { placed += 1; }
+    }
+    Ok(placed)
+}
+
+/// The journals a deployment will be on: its pending placement's destination, else its ensemble.
+fn planned_journals(record: &DeploymentRecord) -> &[MemberId] {
+    record.journal_placement.as_ref().map_or(&record.ensemble, |placement| &placement.destination)
+}
+
+/// The placements to record, as indexes into `deployments` and their destinations.
+pub(super) fn plan_journal_placements(
+    deployments: &[DeploymentRecord], members: &BTreeMap<MemberId, MemberRecord>, now: i64, moves: usize,
+) -> Vec<(usize, Vec<MemberId>)> {
+    let eligible = |id: &MemberId| members.get(id).is_some_and(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Eligible && member.is_live(now));
+    let draining = |id: &MemberId| members.get(id).is_some_and(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Draining);
+    let mut load: BTreeMap<&MemberId, usize> = members.keys().filter(|id| eligible(id)).map(|id| (id, 0)).collect();
+    let movable: Vec<usize> = (0..deployments.len()).filter(|&index| require_movable(&deployments[index]).is_ok()).collect();
+    for &index in &movable {
+        for id in planned_journals(&deployments[index]) {
+            if let Some(count) = load.get_mut(id) { *count += 1; }
+        }
+    }
+    let mut plans = Vec::new();
+    let mut planned = BTreeSet::new();
+    for &index in &movable {
+        if plans.len() == moves { return plans; }
+        let record = &deployments[index];
+        let mut next = planned_journals(record).to_vec();
+        if !next.iter().any(|id| draining(id)) { continue; }
+        for slot in 0..next.len() {
+            if !draining(&next[slot]) { continue; }
+            let mut candidates: Vec<_> = load.iter().filter(|(id, _)| !next.contains(id)).map(|(id, count)| (*count, *id)).collect();
+            candidates.sort();
+            let replacement = candidates.into_iter().map(|(_, id)| id).find(|id| {
+                let mut trial = next.clone();
+                trial[slot] = (*id).clone();
+                trial.iter().all(|journal| eligible(journal) || draining(journal))
+                    && distinct_addresses(&trial, members) && zone_count(&trial, members) >= zone_count(&record.ensemble, members)
+            });
+            let Some(replacement) = replacement else { break };
+            next[slot] = replacement.clone();
+            *load.get_mut(replacement).expect("a candidate is eligible") += 1;
+        }
+        if validate_destination(record, &next, members, now).is_ok() {
+            plans.push((index, next));
+            planned.insert(index);
+        }
+    }
+    while plans.len() < moves {
+        let mut ranked: Vec<_> = load.iter().map(|(id, count)| (*count, *id)).collect();
+        ranked.sort();
+        let chosen = ranked.iter().rev().find_map(|&(busiest, source)| {
+            ranked.iter().take_while(|(count, _)| *count + 1 < busiest).find_map(|&(_, target)| {
+                movable.iter().filter(|index| !planned.contains(*index)).find_map(|&index| {
+                    let journals = planned_journals(&deployments[index]);
+                    if !journals.contains(source) || journals.contains(target) { return None; }
+                    let next: Vec<_> = journals.iter().map(|id| if id == source { target.clone() } else { id.clone() }).collect();
+                    validate_destination(&deployments[index], &next, members, now).is_ok().then(|| (index, source, target, next))
+                })
+            })
+        });
+        let Some((index, source, target, next)) = chosen else { break };
+        *load.get_mut(source).expect("ranked") -= 1;
+        *load.get_mut(target).expect("ranked") += 1;
+        plans.push((index, next));
+        planned.insert(index);
+    }
+    plans
+}
+
+fn distinct_addresses(journals: &[MemberId], members: &BTreeMap<MemberId, MemberRecord>) -> bool {
+    let addresses: BTreeSet<_> = journals.iter().filter_map(|id| members.get(id)).map(|member| member.address.as_str()).collect();
+    addresses.len() == journals.len()
+}
+
+fn zone_count(journals: &[MemberId], members: &BTreeMap<MemberId, MemberRecord>) -> usize {
+    journals.iter().filter_map(|id| members.get(id)).map(|member| member.availability_zone.as_str()).collect::<BTreeSet<_>>().len()
 }
 
 /// Sets the placement on `record`, or clears it when the ensemble already names the destination.
@@ -119,6 +211,36 @@ mod tests {
         let (record, mut members) = cell();
         members.get_mut(&MemberId("d".into())).unwrap().state = MemberState::Draining;
         assert!(validate_destination(&record, &ids(&["d", "b", "c"]), &members, 0).is_err());
+    }
+
+    #[test]
+    fn a_draining_logkeeper_is_evacuated_onto_the_least_loaded_journal_in_its_zone_spread() {
+        let (record, mut members) = cell();
+        members.get_mut(&MemberId("a".into())).unwrap().state = MemberState::Draining;
+        members.insert(MemberId("f".into()), logkeeper("f", "f:1", "z4"));
+        let plans = plan_journal_placements(&[record], &members, 0, 8);
+        assert_eq!(plans.len(), 1);
+        let (_, destination) = &plans[0];
+        assert!(!destination.contains(&MemberId("a".into())));
+        assert!(destination.contains(&MemberId("b".into())) && destination.contains(&MemberId("c".into())));
+    }
+
+    #[test]
+    fn balancing_moves_one_journal_from_the_busiest_to_an_idle_logkeeper_and_then_settles() {
+        let (record, mut members) = cell();
+        members.remove(&MemberId("e".into()));
+        members.get_mut(&MemberId("d".into())).unwrap().availability_zone = "z4".into();
+        let deployments: Vec<_> = (0..4).map(|_| record.clone()).collect();
+        let plans = plan_journal_placements(&deployments, &members, 0, 8);
+        assert!(!plans.is_empty());
+        let mut load: BTreeMap<MemberId, usize> = BTreeMap::new();
+        for (index, deployment) in deployments.iter().enumerate() {
+            let journals = plans.iter().find(|(planned, _)| *planned == index).map_or(&deployment.ensemble, |(_, next)| next);
+            for id in journals { *load.entry(id.clone()).or_default() += 1; }
+        }
+        let (most, least) = (load.values().max().unwrap(), members.keys().map(|id| load.get(id).copied().unwrap_or(0)).min().unwrap());
+        assert!(most - least <= 1, "{load:?}");
+        assert!(plans.iter().all(|(_, next)| validate_destination(&record, next, &members, 0).is_ok()));
     }
 
     #[test]

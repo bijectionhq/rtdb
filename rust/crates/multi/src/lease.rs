@@ -71,6 +71,7 @@ impl MemberLease {
             return Err(conflict());
         }
         candidate.state = MemberState::Joining;
+        let mut draining = false;
         let mut record = tokio::time::timeout(options.lease + options.heartbeat, async {
             loop {
                 let previous = directory.member(&candidate.id).await?;
@@ -81,6 +82,7 @@ impl MemberLease {
                     return Err(conflict());
                 }
                 if !previous.is_live(now) {
+                    draining = previous.state == MemberState::Draining;
                     if let Cas::Applied(record) = directory.replace_member(candidate.clone(), previous.version).await? {
                         return Ok(record);
                     }
@@ -93,7 +95,8 @@ impl MemberLease {
             return Err(conflict());
         }
         let version = record.version;
-        record.state = MemberState::Eligible;
+        // An operator's drain of the journal outlives the process that serves it.
+        record.state = if draining { MemberState::Draining } else { MemberState::Eligible };
         record.lease_expires_at_ms = now_ms() + options.lease.as_millis() as i64;
         let Cas::Applied(record) = directory.replace_member(record, version).await? else {
             return Err(conflict());
@@ -133,6 +136,16 @@ impl MemberLease {
         next.lease_expires_at_ms = now_ms() + self.options.lease.as_millis() as i64;
         match self.directory.replace_member(next, current.version).await? {
             Cas::Applied(stored) => { *self.record.lock() = stored; Ok(true) }
+            Cas::Conflict(Some(stored)) if current.role == MemberRole::Logkeeper && stored.state == MemberState::Draining
+                && stored.address == current.address && stored.lease_expires_at_ms == current.lease_expires_at_ms =>
+            {
+                let mut next = stored.clone();
+                next.lease_expires_at_ms = now_ms() + self.options.lease.as_millis() as i64;
+                match self.directory.replace_member(next, stored.version).await? {
+                    Cas::Applied(stored) => { *self.record.lock() = stored; Ok(true) }
+                    Cas::Conflict(_) => Ok(false),
+                }
+            }
             Cas::Conflict(_) if current.role == MemberRole::Logkeeper => Ok(false),
             Cas::Conflict(Some(stored)) if stored.state == MemberState::Dead || stored.state == MemberState::Retired => Ok(false),
             Cas::Conflict(Some(stored)) => {
@@ -158,7 +171,11 @@ impl MemberLease {
         let mut current = self.record();
         for _ in 0..8 {
             let mut next = current.clone();
-            next.state = MemberState::Retired;
+            if current.role == MemberRole::Logkeeper && current.state == MemberState::Draining {
+                next.lease_expires_at_ms = now_ms();
+            } else {
+                next.state = MemberState::Retired;
+            }
             match self.directory.replace_member(next, current.version).await? {
                 Cas::Applied(stored) => { *self.record.lock() = stored; return Ok(()); }
                 // A drain moved a node's record after this lease last read it.
