@@ -41,7 +41,7 @@ mod admin;
 pub use admin::{DeploymentAdminAction, DeploymentAdminAuthority};
 #[cfg(feature = "multi")]
 pub mod admin_client;
-pub use v1::custody::CustodyProviderRoute;
+pub use v1::custody::{CustodyProviderRoute, OriginalFamilyReadbackLayout};
 pub use v1::{OWNED_HOSTED_FEATURE, RETIRED_ORIGINAL_FAMILY_FEATURE, RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE};
 
 pub mod rtdb {

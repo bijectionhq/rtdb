@@ -507,17 +507,47 @@ impl BranchIndex {
         Ok(())
     }
 
+    pub fn receipt_written_local_point(
+        &self, branch: &str, created: Basis, basis: Basis, table: &TableRef, id: &EntityId,
+    ) -> Result<Option<&BranchEvent>> {
+        let cut = self.exact(basis)?;
+        let data = self.active_branch(branch, cut, cut.system_time)?;
+        if data.created != created || self.has_visibility_history()
+            || self.erased.is_some_and(|erased| erased > basis)
+        {
+            return Err(unknown_branch(branch));
+        }
+        let Some(definition) = self.definition(table, basis).filter(|definition| !definition.dropped) else {
+            return Ok(None);
+        };
+        let Some(rows) = data.tables.get(table).filter(|rows| !rows.erased.contains_key(id)) else {
+            return Ok(None);
+        };
+        Ok(rows.events.get(id).and_then(|events| events.iter().rev().find_map(|(generation, event)| {
+            (*generation == definition.generation && event.written_basis() == Some(basis)
+                && event.valid.contains(cut.system_time)).then_some(event)
+        })).filter(|event| event.image_at(cut.system_time).is_some()))
+    }
+
     pub fn has_branch(&self, branch: &str) -> bool { self.branches.contains_key(branch) }
 
-    pub fn lineage(&self, at: Basis) -> Vec<BranchLineage> {
-        self.branches.iter().filter(|(_, data)| data.created <= at).map(|(branch, data)| BranchLineage {
-            branch: branch.clone(),
+    pub fn lineage_at(&self, branch: &str, at: Basis) -> Option<BranchLineage> {
+        self.branch_lineage(branch, self.branches.get(branch)?, at)
+    }
+
+    fn branch_lineage(&self, branch: &str, data: &BranchData, at: Basis) -> Option<BranchLineage> {
+        (data.created <= at).then(|| BranchLineage {
+            branch: branch.to_owned(),
             base: data.base.clone(),
             created: data.created,
             writable: data.writable,
             expires_at: data.expires_at(at),
             dropped: data.dropped.filter(|dropped| *dropped <= at),
-        }).collect()
+        })
+    }
+
+    pub fn lineage(&self, at: Basis) -> Vec<BranchLineage> {
+        self.branches.iter().filter_map(|(branch, data)| self.branch_lineage(branch, data, at)).collect()
     }
 
     pub fn active_names(&self, now: Timestamp) -> impl Iterator<Item = &str> {
@@ -929,6 +959,11 @@ impl<'a> BranchView<'a> {
         labels.contains(label).then_some(event)
     }
 
+    pub fn has_erased_point(&self, table: &TableRef, id: &EntityId) -> bool {
+        self.layers().any(|(_, data)| data.tables.get(table)
+            .is_some_and(|rows| rows.erased.contains_key(id)))
+    }
+
     pub fn erased_after(&self, table: &TableRef, id: &EntityId, basis: Basis) -> bool {
         self.layers().any(|(_, data)| {
             data.tables.get(table).and_then(|rows| rows.erased.get(id)).is_some_and(|at| *at > basis)
@@ -1065,5 +1100,50 @@ mod entries {
             }
         }
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+
+    #[test]
+    fn retained_local_point_requires_literal_write_after_branch_drop() -> Result<()> {
+        let incarnation = [1; 16];
+        let mut index = BranchIndex::new(incarnation);
+        let cut = |position| BranchCut { basis: Basis::new(incarnation, position), system_time: Timestamp(position as i64) };
+        let table = TableRef::new("app", "member_mappings");
+        let id = EntityId::String("member".into());
+        let created = cut(1);
+        index.advance(created)?;
+        index.apply(BranchEffect::Fork {
+            child: "proposal".into(), from: (MAIN_BRANCH.into(), cut(0).basis), writable: true, expires_at: None,
+        })?;
+        let authored = cut(2);
+        index.advance(authored)?;
+        index.apply(BranchEffect::Write {
+            branch: "proposal".into(), table: table.clone(),
+            event: BranchEvent {
+                id: id.clone(), valid: Interval::new(authored.system_time, Timestamp::MAX)?,
+                cut: authored, written: WrittenVersion::Branch,
+                image: Some(Arc::new(RowImage {
+                    cells: StructFields::default(), expires_at: None, custody_group: None, custody_payload: None,
+                })),
+            },
+        })?;
+        let dropped = cut(3);
+        index.advance(dropped)?;
+        index.apply(BranchEffect::Drop { branch: "proposal".into() })?;
+
+        assert!(index.view("proposal", At::Exactly(authored.basis), Layer::Merged, dropped.system_time).is_err());
+        assert_eq!(index.receipt_written_local_point("proposal", created.basis, authored.basis, &table, &id)?
+            .and_then(BranchEvent::written_basis), Some(authored.basis));
+        assert!(index.receipt_written_local_point("proposal", cut(0).basis, authored.basis, &table, &id).is_err());
+        assert!(index.receipt_written_local_point("proposal", created.basis, created.basis, &table, &id)?.is_none());
+
+        index.advance(cut(4))?;
+        index.apply(BranchEffect::Erase { branch: None, table: table.clone(), id: id.clone() })?;
+        assert!(index.receipt_written_local_point("proposal", created.basis, authored.basis, &table, &id).is_err());
+        Ok(())
     }
 }

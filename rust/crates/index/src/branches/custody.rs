@@ -164,6 +164,43 @@ impl BranchIndex {
         })
     }
 
+    pub fn custody_placement_at(
+        &self, group: CustodyGroupId, placement_id: CustodyPlacementId, at: Basis,
+    ) -> Result<Option<CustodyPlacementEntry<'_>>> {
+        self.exact(at)?;
+        let record = self.live_custody(group)?;
+        if self.visibility_projection {
+            return Ok(None);
+        }
+        if let Some(original) = record.original.as_ref().filter(|original| {
+            original.placement_id == placement_id && original.written <= at
+        }) {
+            return Ok(Some(CustodyPlacementEntry {
+                group, placement_id, enrolled: original.written, reservation: None, occurrence: Some(original), reviewed: None,
+            }));
+        }
+        Ok(record.reservations.get(&placement_id).filter(|entry| entry.at <= at).map(|entry| CustodyPlacementEntry {
+            group, placement_id, enrolled: entry.at,
+            reservation: Some(entry.commitment(at.incarnation(), group)),
+            occurrence: entry.occurrence.as_ref().filter(|occurrence| occurrence.written <= at),
+            reviewed: entry.reviewed.as_ref().map(|reviewed| (reviewed, &entry.reservation)),
+        }))
+    }
+
+    pub fn matches_reviewed_activation(
+        &self, group: CustodyGroupId, placement: CustodyPlacementId, basis: Basis, key: &[u8],
+    ) -> Result<bool> {
+        let record = self.live_custody(group)?;
+        let mut matches = record.reservations.values().filter_map(|entry| {
+            entry.reviewed.as_ref()?;
+            entry.occurrence.as_ref().filter(|row| {
+                row.target.branch == MAIN_BRANCH && row.written <= basis && row.receipt_key == key
+            })
+        });
+        Ok(matches.next().is_some_and(|row| row.placement_id == placement && row.written == basis)
+            && matches.next().is_none())
+    }
+
     pub fn custody_revocation(&self, group: CustodyGroupId) -> Option<Basis> {
         self.custody.get(&group)?.revoked
     }

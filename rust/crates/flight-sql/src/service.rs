@@ -59,7 +59,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -80,6 +80,10 @@ impl CallKind {
 
     fn allows_original_family(self) -> bool {
         matches!(self, Self::Handshake | Self::V1Capabilities | Self::V1Query | Self::V1OriginalFamily)
+    }
+
+    fn allows_original_family_readback(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1Capabilities | Self::V1OriginalFamilyReadback)
     }
 
     fn allows_workload_grant(self) -> bool {
@@ -145,6 +149,13 @@ impl Call {
                     .and_then(|grant| grant.original_family(&self.database, route.authority(), self.service.0.node.now()).ok())
                     .is_some_and(|(scope, _, _)| rtdb_types::rtdb_v1::Basis::from_bytes(&scope.created)
                         .is_ok_and(|created| scope.fence.covers_imported_family_line(fence, &scope.writer, created)))
+            }));
+        let allowed = allowed || (caller.verified_credential && self.kind.allows_original_family_readback()
+            && self.service.0.config.custody_providers.get(&self.database).is_some_and(|route| {
+                caller.principal.workload_grant()
+                    .and_then(|grant| grant.original_family_readback(&self.database, route.authority(), self.service.0.node.now()).ok())
+                    .is_some_and(|(scope, _, _)| rtdb_types::rtdb_v1::Basis::from_bytes(&scope.line.created)
+                        .is_ok_and(|created| scope.line.fence.covers_imported_family_line(fence, &scope.line.writer, created)))
             }));
         if allowed { Ok(()) } else { Err(Status::permission_denied("This deployment requires its exact imported workload assignment")) }
     }
@@ -355,6 +366,8 @@ impl Service {
                     kind.allows_original_custody_control()
                 } else if grant.is_original_family() {
                     kind.allows_original_family()
+                } else if grant.is_original_family_readback() {
+                    kind.allows_original_family_readback()
                 } else if grant.is_funded_appointment() {
                     kind.allows_funded_appointment()
                 } else if grant.is_custody_reader() {
@@ -451,6 +464,10 @@ impl Service {
             let placement = if let Some(attachment) = follower_attachment {
                 caller.principal.authorize_database(attachment.name(), DatabaseAccess::Read).map_err(status)?;
                 Some(attachment)
+            } else if let Some(grant) = caller.principal.workload_grant()
+                .filter(|grant| grant.is_original_family_readback())
+            {
+                Some(catalog.database(grant.database()).map_err(status)?)
             } else if catalog.is_placed() {
                 let name = placed_name()?;
                 if caller.principal.label_scope().is_none() {
@@ -687,6 +704,9 @@ impl FlightService for Service {
     type DoExchangeStream = Output<flight::FlightData>;
     async fn handshake(&self, request: Request<Streaming<flight::HandshakeRequest>>) -> Result<Response<Self::HandshakeStream>, Status> {
         let call = self.call_with_kind(&request, 0, CallKind::Handshake).await?;
+        if crate::v1::original_family_readback::is_readback(&call) {
+            self.check_family_readback_handshake(&call).await.map_err(|status| call.error(status))?;
+        }
         result_stream(call, Vec::new())
     }
     async fn list_flights(&self, request: Request<flight::Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }
@@ -801,6 +821,7 @@ impl FlightService for Service {
                 crate::v1::TX_STATUS => CallKind::TxStatus,
                 crate::v1::custody::RELEASE => CallKind::V1CustodyRelease,
                 crate::v1::original_family_landing::ACTION => CallKind::V1OriginalFamily,
+                crate::v1::original_family_readback::ACTION => CallKind::V1OriginalFamilyReadback,
                 crate::v1::appointment::PREPARE | crate::v1::appointment::ACTIVATE | "rtdb.v1.Transact" => CallKind::V1Appointment,
                 _ => CallKind::V1Action,
             };
@@ -918,6 +939,25 @@ mod tests {
         assert!(!family.allows_original_custody_control());
         assert!(!family.allows_label_scope());
         assert!(!family.serves_assigned_follower());
+    }
+
+    #[test]
+    fn original_family_readback_admits_only_its_handshake_capabilities_and_action() {
+        for kind in [CallKind::Handshake, CallKind::V1Capabilities, CallKind::V1OriginalFamilyReadback] {
+            assert!(kind.allows_original_family_readback());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query,
+            CallKind::V1Changes, CallKind::V1Action, CallKind::V1CustodyRelease, CallKind::V1OriginalFamily,
+            CallKind::V1Appointment, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
+            assert!(!kind.allows_original_family_readback());
+        }
+        let readback = CallKind::V1OriginalFamilyReadback;
+        assert!(!readback.allows_original_family());
+        assert!(!readback.allows_workload_grant());
+        assert!(!readback.allows_workload_root_read());
+        assert!(!readback.allows_original_custody_control());
+        assert!(!readback.allows_label_scope());
+        assert!(!readback.serves_assigned_follower());
     }
 
     #[test]

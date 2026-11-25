@@ -72,6 +72,9 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
             if let Some(issuer) = fields.take("originalFamily") {
                 config = config.with_original_family(workload_issuer(issuer, "authn.originalFamily", false)?)?;
             }
+            if let Some(issuer) = fields.take("originalFamilyReadback") {
+                config = config.with_original_family_readback(workload_issuer(issuer, "authn.originalFamilyReadback", false)?)?;
+            }
             AuthConfig::ManagedWorkloadOidc(Box::new(config))
         }
         _ => return Err(invalid(format!("Unknown authentication configuration tag '{tag}'"))),

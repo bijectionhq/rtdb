@@ -39,6 +39,11 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
             if let Some(issuer) = config.original_family() {
                 authentication["original_family"] = describe_workload_issuer(issuer, "authn.originalFamily.issuerUrl", report);
             }
+            if let Some(issuer) = config.original_family_readback() {
+                authentication["original_family_readback"] = describe_workload_issuer(
+                    issuer, "authn.originalFamilyReadback.issuerUrl", report,
+                );
+            }
             authentication
         }
     });

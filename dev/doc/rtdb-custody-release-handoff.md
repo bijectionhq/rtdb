@@ -93,6 +93,84 @@ Each additional main row has literal validity `[0, infinity)`, a matching `Versi
 Main settlement cannot write the writer or line registry relation, modify protected addresses, execute a Delete, or accompany a reservation.
 The writer makes one decision for the protected occurrence and the application controls, using the same immutable keyed receipt.
 
+#### Independent managed Original family readback
+
+Commission `authn.originalFamilyReadback` under `!ManagedWorkloadOidc` with `issuerUrl`, `issuerCaCertificate`, `audience` and `clientIdPrefix`.
+Use a dedicated HTTPS origin, private CA and disjoint client prefix alongside the existing custody provider and its named line registry.
+
+Set `originalFamilyReadbackLayout` on the same `flightSql.custodyProviders` entry as the Original owner, family vault and line registry.
+The v5 capability requires all seven relations to be mounted.
+Use distinct, schema-qualified application relations with schema and table names of at most 255 bytes, outside the writer relation, line registry, system schemas and native owned schemas.
+This example uses application-defined relation names.
+
+```yaml
+originalFamilyReadbackLayout:
+  carrier: app.protected_rows
+  memberMapping: app.member_mappings
+  admission: app.admission_controls
+  businessReceipt: app.business_receipts
+  execution: app.execution_slots
+  publication: app.publications
+  rootVersion: app.root_versions
+```
+
+The layout supplies the physical relations for every application projection.
+The action continues to select the fixed columns, points and validity instants described below.
+The UserInfo subject matches the installed custody provider owner.
+The issuer commissions the exact current installation, database, incarnation, assignment holder and fence, ClaimWriter and named Fork creation.
+After Classic import the ordered ClaimWriter follows the assignment fence and the Fork follows that ClaimWriter.
+A Client handshake pins the local writer attachment for that session.
+
+UserInfo issues `rtdb_workload_grant` with `version: 5`, `audience`, `database`, `incarnation`, `grant_id`, `expires_at_micros` and `original_family_readback`.
+All binary OIDC fields are JSON byte arrays.
+The readback scope has these fields.
+
+| Field | Commissioned value |
+| --- | --- |
+| `line` | The v4 family scope shape, including `authority`, `fence`, `writer`, `branch`, `created`, `family` and `group`. |
+| `generation`, `creation_key` | The exact 16-byte generation and raw 16–64 byte provisioning key from the co-written main registry. |
+| `observation` | Optional exact 24-byte held observation Basis on or after creation. |
+| `carrier` | Optional `Point` for one Text identity on the mounted `carrier` at one literal valid instant. The shape is `{"table":{"schema":"app","table":"protected_rows"},"id":{"String":"selected-row"},"valid_at":0}`. |
+| `witness` | Optional `{"receipt":{...},"placement":[...],"projection":{...}}` for one positive family receipt and one 16-byte placement. The receipt contains the original v4 `namespace`, raw `key`, exact `basis` and `system_time_micros`. |
+
+Use one witness credential per author, reserve or landing receipt.
+The independent issuer pins the literal witness identities from the authorized application order, and RTDB checks the retained family enrollment and positive receipt.
+The `projection` has exactly one of the following shapes.
+
+| `kind` | Other fields |
+| --- | --- |
+| `author` | Optional `mapping_sha256` of the named mapping's clear `body` bytes and optional `settlement` with Text `command`, `head`, `dispatch`, `pending`, `business_receipt` and `execution_slot` identities. |
+| `reserve` | Only the kind is required. The placement must match a derived rewrite reserve or reviewed landing reserve. |
+| `landing` | Optional `mapping_sha256` of the landed main mapping's clear `body` bytes and optional `settlement` with distinct Text `receipt` and `proof` identities and their shared `body_sha256`. |
+
+Require `row-custody.managed-original-family-readback` from `rtdb.v1.Capabilities` on this bearer.
+Use Flight DoAction `rtdb.v1.ManagedOriginalFamilyReadback` with a JSON object and read one JSON result.
+The action accepts only the selectors below.
+Binary fields in action messages use lowercase hex strings.
+A response `cut` contains `basis` and `system_time_micros`.
+A response point contains Text `id`, `written_basis`, `system_time_micros`, `valid_from_micros` and exclusive `valid_to_micros`.
+Infinity is `i64::MAX`.
+
+| Request | Response |
+| --- | --- |
+| `{"op":"scope"}` | `database`, `incarnation`, `branch`, `created_basis`, `line_generation`, `creation_key`, `family`, `group`, effective `expires_at_micros`, optional `observation_basis`, optional literal `carrier` identity and valid instant, and optional `witness` with its applied receipt coordinate and placement. |
+| `{"op":"lineage","basis":"..."}` | `cut`, exact `branch`, `base_branch`, `base_basis`, `base_system_time_micros`, `created_basis`, `writable`, optional `expires_at_micros` and optional `dropped_basis`. The parent time comes from the authenticated Fork coordinate, including a retained parent below the import or receipt floor. |
+| `{"op":"registry","basis":"...","location":"main"}` | `cut`, `point` and `cells` for the configured registry at valid time zero. Use `"location":"named"` for the live cursor on the named line. The fixed fields are `frame`, `parent`, `parent_micros`, `base_source`, `base_clock`, `initial_clock`, `clock`, `created_basis`, `writable`, `expires`, `dropped_basis`, `retained_owner`, `proposal_owner`, `line_generation` and `creation_key`. |
+| `{"op":"carrier","basis":"..."}` | `cut`, `valid_at_micros` and either `state:"written"` with the exact `point`, or `state:"absent"` with the exact `id`. Erasure, withheld metadata and mismatched custody refuse the action. |
+| `{"op":"placement"}` | `cut` and one `placement` with `id`, `group_id`, `enrolled_basis`, `reservation_sha256`, `occurrence_sha256`, `carrier_sha256`, `written_basis` and `ordinal`. Reviewed placements also return `reviewed` with `branch`, `basis`, `valid_at_micros`, `inventory_sha256`, `original_sha256`, `source_sha256`, `review_sha256`, `carrier_sha256`, `link_sha256`, `link_id`, `target_table`, `target_id`, `reserve_key`, `activation_key`, `envelope_sha256`, `written_valid_from_micros` and `written_valid_to_micros`. |
+| `{"op":"mapping"}` | `cut`, `point` and the digest-checked clear `body` from the mounted `memberMapping` relation at the receipt system microsecond. An author mapping remains available from the receipt's exact local co-write after drop. A landed mapping selects main. |
+| `{"op":"settlement"}` | An author response contains `cut` and `witnesses` under the six commissioned names, each with `point` and a per-column `sha256` object. The hashed columns are `admission` on the mounted admission relation for the first four, `outcome` on the mounted business receipt relation and `marker` and `capsule` on the mounted execution relation. A landing response contains `cut`, the shared clear `body` and separate `receipt`, `proof`, `publication` and `root_version` points on main. The acceptance cells are selected in the mounted admission relation at zero and the two Root markers in the mounted publication and Root version relations at the accepting system microsecond. |
+
+The accepted Basis selectors are the named creation, the optional held observation and the positive commissioned receipt.
+The service refuses to deliver a projection if the ordered head advances during admission or handoff, so the client can retry the same exact selector.
+The action accepts a request of up to 1 KiB, a response of up to 128 KiB, a returned clear body of up to 48 KiB and hashed cells of up to 8 MiB each.
+A dropped named line serves historical main checks and the receipt-bound mapping only through these fixed selectors.
+
+Use the typed actions above for independent point and catalog readback.
+The separate version 2 receipt-recovery bearer owns creation `TxStatus` with family 7.
+The version 4 authoring bearer owns the family receipt, activation, and tracked exact Query with fields 7 and 13 on the same bearer as the signed reserve.
+Fetch any required opaque authoring envelopes through the custody owner or the client's retained authoring evidence.
+
 #### Provisioning the named line
 
 Commission a separate version 2 credential from the managed assignment issuer with `authority.role` set to `provision-branch`.

@@ -14,7 +14,7 @@ use rtdb_node::{
     },
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyOccurrence, Op, Outcome, Transact};
-use rtdb_types::{Timestamp, rtdb_v1::Basis};
+use rtdb_types::{TableRef, Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -83,6 +83,41 @@ impl ScopedReads {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct OriginalFamilyReadbackLayout {
+    pub carrier: TableRef,
+    pub member_mapping: TableRef,
+    pub admission: TableRef,
+    pub business_receipt: TableRef,
+    pub execution: TableRef,
+    pub publication: TableRef,
+    pub root_version: TableRef,
+}
+
+impl OriginalFamilyReadbackLayout {
+    pub fn validate(&self, writer: &TableRef, registry: &TableRef) -> rtdb_types::Result<()> {
+        let tables = [
+            &self.carrier, &self.member_mapping, &self.admission, &self.business_receipt,
+            &self.execution, &self.publication, &self.root_version,
+        ];
+        let bounded = |name: &str| rtdb_tx::transact::workload::bounded(name) && !name.contains(['.', '/']);
+        if !tables.iter().enumerate().all(|(idx, &table)| {
+            let schema = table.schema.to_ascii_lowercase();
+            bounded(&table.schema) && bounded(&table.table)
+                && !matches!(schema.as_str(), "xt" | "information_schema" | "pg_catalog")
+                && !TableRef::owned_schema(&schema)
+                && table != writer && table != registry
+                && !tables[..idx].contains(&table)
+        }) {
+            return Err(rtdb_types::Anomaly::incorrect(
+                "rtdb/custody-provider-configuration",
+                "Original family readback requires seven distinct schema-qualified application relations",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct CustodyProviderRoute {
     installation: CustodyProviderInstallation,
     owner: Option<String>,
@@ -90,6 +125,7 @@ pub struct CustodyProviderRoute {
     pub(super) family_vault: Option<super::original_family_landing::NativeFamilyVault>,
     pub(super) family_line_registry: Option<rtdb_types::TableRef>,
     pub(super) family_authoring_key: Option<[u8; 32]>,
+    pub(super) family_readback_layout: Option<OriginalFamilyReadbackLayout>,
     pub(super) family_authoring_controls: std::collections::BTreeSet<rtdb_types::TableRef>,
 }
 impl fmt::Debug for CustodyProviderRoute {
@@ -107,6 +143,7 @@ impl CustodyProviderRoute {
             family_vault: None,
             family_line_registry: None,
             family_authoring_key: None,
+            family_readback_layout: None,
             family_authoring_controls: Default::default(),
         }
     }
@@ -153,6 +190,9 @@ impl CustodyProviderRoute {
     }
 
     pub fn with_original_family_line_registry(mut self, table: rtdb_types::TableRef) -> rtdb_types::Result<Self> {
+        if let Some(layout) = &self.family_readback_layout {
+            layout.validate(&self.installation.writer.table, &table)?;
+        }
         let vault = self.family_vault.as_ref().ok_or_else(|| {
             rtdb_types::Anomaly::incorrect(
                 "rtdb/custody-provider-configuration",
@@ -161,6 +201,19 @@ impl CustodyProviderRoute {
         })?;
         vault.bind_line_registry(self.installation.authority, &table)?;
         self.family_line_registry = Some(table);
+        Ok(self)
+    }
+
+    pub fn with_original_family_readback_layout(
+        mut self, layout: OriginalFamilyReadbackLayout,
+    ) -> rtdb_types::Result<Self> {
+        let registry = self.family_line_registry.as_ref().filter(|_| self.owner().is_some())
+            .ok_or_else(|| rtdb_types::Anomaly::incorrect(
+                "rtdb/custody-provider-configuration",
+                "Original family readback requires the configured Original owner and family line registry",
+            ))?;
+        layout.validate(&self.installation.writer.table, registry)?;
+        self.family_readback_layout = Some(layout);
         Ok(self)
     }
 

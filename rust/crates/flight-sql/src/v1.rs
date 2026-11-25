@@ -18,6 +18,7 @@ use crate::{
 mod changes;
 pub(crate) mod custody;
 pub(crate) mod original_family_landing;
+pub(crate) mod original_family_readback;
 pub(crate) mod error;
 mod query;
 mod scoped_hold;
@@ -72,7 +73,7 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
 }
 
 pub(crate) fn is_action(name: &str) -> bool {
-    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name.starts_with("rtdb.admin.v1.")
+    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name.starts_with("rtdb.admin.v1.")
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -99,6 +100,11 @@ impl Service {
         call: Call,
         action: flight::Action,
     ) -> Result<Response<Output<flight::Result>>, Status> {
+        if action.r#type == original_family_readback::ACTION
+            || action.r#type == CAPABILITIES && original_family_readback::is_readback(&call)
+        {
+            return self.family_readback_action(call, action);
+        }
         let outcome = match action.r#type.as_str() {
             CAPABILITIES if appointment::is_managed(&call) => async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;

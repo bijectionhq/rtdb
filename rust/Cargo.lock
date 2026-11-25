@@ -4895,6 +4895,7 @@ dependencies = [
  "rtdb-crypt",
  "rtdb-expr",
  "rtdb-format",
+ "rtdb-index",
  "rtdb-maintenance",
  "rtdb-metrics",
  "rtdb-node",

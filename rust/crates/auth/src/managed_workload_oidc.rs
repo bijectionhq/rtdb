@@ -76,6 +76,7 @@ pub struct ManagedWorkloadOidcConfig {
     assignment: WorkloadIssuerConfig,
     scoped_audience: Option<ScopedAudienceIssuerConfig>,
     original_family: Option<WorkloadIssuerConfig>,
+    original_family_readback: Option<WorkloadIssuerConfig>,
 }
 
 impl ManagedWorkloadOidcConfig {
@@ -102,11 +103,14 @@ impl ManagedWorkloadOidcConfig {
             assignment,
             scoped_audience: None,
             original_family: None,
+            original_family_readback: None,
         })
     }
 
     pub fn with_scoped_audience(mut self, scope: ScopedAudienceIssuerConfig) -> Result<Self> {
-        for workload in [&self.create, &self.assignment].into_iter().chain(self.original_family.as_ref()) {
+        for workload in [&self.create, &self.assignment].into_iter()
+            .chain(self.original_family.as_ref()).chain(self.original_family_readback.as_ref())
+        {
             if scope.issuer_url.origin() == workload.issuer_url.origin() {
                 return Err(invalid(
                     "The scoped audience issuer requires a distinct HTTPS origin",
@@ -126,7 +130,7 @@ impl ManagedWorkloadOidcConfig {
         let conflicts = |url: &Url, prefix: &str| issuer.issuer_url.origin() == url.origin()
             || prefixes_overlap(issuer.grants.client_id_prefix(), prefix);
         if issuer.grants.assignment().is_some()
-            || [&self.create, &self.assignment].iter().any(|other|
+            || [&self.create, &self.assignment].into_iter().chain(self.original_family_readback.as_ref()).any(|other|
                 conflicts(&other.issuer_url, other.grants.client_id_prefix()))
             || self.scoped_audience.as_ref().is_some_and(|scope|
                 conflicts(&scope.issuer_url, &scope.client_id_prefix))
@@ -138,6 +142,28 @@ impl ManagedWorkloadOidcConfig {
         );
         self.original_family = Some(issuer);
         Ok(self)
+    }
+
+    pub fn with_original_family_readback(mut self, mut issuer: WorkloadIssuerConfig) -> Result<Self> {
+        let conflicts = |url: &Url, prefix: &str| issuer.issuer_url.origin() == url.origin()
+            || prefixes_overlap(issuer.grants.client_id_prefix(), prefix);
+        if issuer.grants.assignment().is_some()
+            || [&self.create, &self.assignment].into_iter().chain(self.original_family.as_ref())
+                .any(|other| conflicts(&other.issuer_url, other.grants.client_id_prefix()))
+            || self.scoped_audience.as_ref().is_some_and(|scope|
+                conflicts(&scope.issuer_url, &scope.client_id_prefix))
+        {
+            return Err(invalid("Original family readback requires a distinct issuer origin and client ID prefix"));
+        }
+        issuer.grants = issuer.grants.for_original_family_readback(
+            self.assignment.grants.assignment().ok_or_else(|| invalid("Missing Original authority point"))?.clone(),
+        );
+        self.original_family_readback = Some(issuer);
+        Ok(self)
+    }
+
+    pub fn original_family_readback(&self) -> Option<&WorkloadIssuerConfig> {
+        self.original_family_readback.as_ref()
     }
 
     pub fn create(&self) -> &WorkloadIssuerConfig {
@@ -160,6 +186,7 @@ pub(crate) struct ManagedWorkloadOidc {
     assignment: Arc<oidc::Provider>,
     scoped_audience: Option<Arc<oidc::Provider>>,
     original_family: Option<Arc<oidc::Provider>>,
+    original_family_readback: Option<Arc<oidc::Provider>>,
 }
 
 impl ManagedWorkloadOidc {
@@ -224,6 +251,15 @@ impl ManagedWorkloadOidc {
             }
             None => None,
         };
+        let original_family_readback = match config.original_family_readback {
+            Some(issuer) => {
+                let http = transport(&issuer.issuer_url, &issuer.issuer_ca_pem)?;
+                Some(oidc::Provider::open_workload(
+                    issuer.issuer_url, issuer.grants, Arc::clone(memory), Arc::clone(&clock), http,
+                ).await?)
+            }
+            None => None,
+        };
         let scoped_audience = match scoped {
             Some((scope, http)) => Some(
                 oidc::Provider::open_scoped_audience(
@@ -242,6 +278,7 @@ impl ManagedWorkloadOidc {
             assignment,
             scoped_audience,
             original_family,
+            original_family_readback,
         })
     }
 
@@ -253,11 +290,13 @@ impl ManagedWorkloadOidc {
                 .as_ref()
                 .filter(|provider| provider.accepts_scoped_audience(id)),
             self.original_family.as_ref().filter(|provider| provider.workload_config(id).is_some()),
+            self.original_family_readback.as_ref().filter(|provider| provider.workload_config(id).is_some()),
         ) {
-            (Some(_), None, None, None) => (&self.create, VerifiedWorkloadGrant::is_create),
-            (None, Some(_), None, None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment_issued),
-            (None, None, Some(provider), None) => return provider.client_credentials(id, secret).await,
-            (None, None, None, Some(provider)) => (provider, VerifiedWorkloadGrant::is_original_family),
+            (Some(_), None, None, None, None) => (&self.create, VerifiedWorkloadGrant::is_create),
+            (None, Some(_), None, None, None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment_issued),
+            (None, None, Some(provider), None, None) => return provider.client_credentials(id, secret).await,
+            (None, None, None, Some(provider), None) => (provider, VerifiedWorkloadGrant::is_original_family),
+            (None, None, None, None, Some(provider)) => (provider, VerifiedWorkloadGrant::is_original_family_readback),
             _ => return Err(workload_grant::invalid_grant()),
         };
         let principal = provider.client_credentials(id, secret).await?;

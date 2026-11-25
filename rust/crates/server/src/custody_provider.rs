@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use rtdb_auth::Secret;
 use rtdb_columnar::MemoryBudget;
+use rtdb_flight_sql::OriginalFamilyReadbackLayout;
 use rtdb_format::config::{Yaml, YamlFields};
 use rtdb_node::serving::custody_release::{
     CarrierObservation, CustodyCarrierAuthority, CustodyProviderInstallation,
@@ -24,6 +25,7 @@ pub struct Settings {
     pub(crate) original_family_line_registry: Option<TableRef>,
     pub(crate) original_family_authoring_key: Option<[u8; 32]>,
     pub(crate) original_family_authoring_controls: BTreeSet<TableRef>,
+    pub(crate) original_family_readback_layout: Option<OriginalFamilyReadbackLayout>,
     endpoint: Url,
     ca_certificate: Option<String>,
     bearer: Secret,
@@ -100,6 +102,15 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
             return Err(invalid());
         }
     }
+    let original_family_readback_layout = fields.take("originalFamilyReadbackLayout")
+        .map(readback_layout)
+        .transpose()?;
+    if let Some(layout) = &original_family_readback_layout {
+        let registry = original_family_line_registry.as_ref()
+            .filter(|_| owner.is_some() && original_family_vault.is_some())
+            .ok_or_else(invalid)?;
+        layout.validate(&writer.table, registry)?;
+    }
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -120,6 +131,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         original_family_line_registry,
         original_family_authoring_key,
         original_family_authoring_controls,
+        original_family_readback_layout,
         endpoint,
         ca_certificate,
         bearer: Secret::new(bearer),
@@ -127,6 +139,28 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         authority,
         writer,
     })
+}
+
+fn readback_layout(value: Yaml) -> Result<OriginalFamilyReadbackLayout> {
+    let mut fields = YamlFields::new(value, "flightSql.custodyProviders.originalFamilyReadbackLayout")?;
+    let mut relation = |key: &str| -> Result<TableRef> {
+        let Yaml::String(name) = fields.require(key)? else { return Err(invalid()); };
+        if !name.contains('.') {
+            return Err(invalid());
+        }
+        TableRef::parse(&name).map_err(|_| invalid())
+    };
+    let layout = OriginalFamilyReadbackLayout {
+        carrier: relation("carrier")?,
+        member_mapping: relation("memberMapping")?,
+        admission: relation("admission")?,
+        business_receipt: relation("businessReceipt")?,
+        execution: relation("execution")?,
+        publication: relation("publication")?,
+        root_version: relation("rootVersion")?,
+    };
+    fields.finish()?;
+    Ok(layout)
 }
 
 fn invalid() -> Anomaly {

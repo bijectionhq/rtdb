@@ -6,6 +6,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rtdb_auth::{OriginalFamilyReadbackGrant, OriginalFamilyReadbackProjection};
 use rtdb_crypt::{CustodyVault, FileKms};
 use rtdb_node::{
     Clock, SystemClock,
@@ -82,6 +83,67 @@ impl NativeFamilyVault {
         .map_err(task_error)?
     }
 
+    pub(in crate::v1) async fn check_readback(
+        &self, scope: &OriginalFamilyReadbackGrant, registry: &TableRef, admission: &TableRef,
+        native_group_live: bool,
+    ) -> Result<()> {
+        let line = &scope.line;
+        let name = format!("family-{}-{}.json", Uuid::from_bytes(line.authority.incarnation), Uuid::from_bytes(line.family));
+        let path = self.root.join(name);
+        let record = tokio::task::spawn_blocking(move || read_record::<ReadbackFamily>(&path, MAX_RECORD_BYTES))
+            .await.map_err(task_error)??;
+        let Some(record) = record else {
+            return if native_group_live || scope.witness.is_some() { Err(unavailable()) } else { Ok(()) };
+        };
+        if record.authority != line.authority || record.family != line.family || record.group != line.group {
+            return Err(unavailable());
+        }
+        if record.close.is_some() {
+            return Err(rtdb_crypt::erased_under_view());
+        }
+        let authors = record.authors.iter().filter(|author| {
+            author.order.target.branch == line.branch && author.order.branch_created.to_bytes() == line.created
+                && author.order.group == line.group && author.order.line.as_ref().is_some_and(|binding| {
+                    binding.generation == scope.generation && binding.creation_key == scope.creation_key
+                        && &binding.registry == registry
+                })
+        });
+        if native_group_live && authors.clone().next().is_none() {
+            return Err(unavailable());
+        }
+        let Some(witness) = &scope.witness else { return Ok(()); };
+        let key = &witness.receipt.key;
+        let landing = |reserve: bool| record.landings.iter().find(|landing| {
+            let order = &landing.order;
+            let retained_key = if reserve { &order.reserve_key } else { &order.accept_key };
+            retained_key == key && order.destination == witness.placement
+                && order.review.cut.branch == line.branch && order.review.cut.basis.to_bytes() >= line.created
+                && order.review.group == line.group
+        });
+        let admitted = match &witness.projection {
+            OriginalFamilyReadbackProjection::Author { .. } => authors.clone().any(|author| {
+                author.order.placement == witness.placement && &author.order.write_key == key
+            }),
+            OriginalFamilyReadbackProjection::Reserve {} => landing(true).is_some() || authors.clone().any(|author| {
+                author.order.placement == witness.placement
+                    && author.order.rewrite.as_ref().is_some_and(|rewrite| &rewrite.reserve_key == key)
+            }),
+            OriginalFamilyReadbackProjection::Landing { settlement, .. } => landing(false).is_some_and(|landing| {
+                settlement.as_ref().is_none_or(|expected| {
+                    let matches = |witness: &rtdb_node::serving::custody_release::NativeLandingWitness, id: &str| {
+                        &witness.table == admission
+                            && matches!(&witness.id, rtdb_types::EntityId::String(written) if written == id)
+                            && witness.column == "admission" && witness.valid_at == Timestamp(0)
+                    };
+                    landing.body == Some(expected.body_sha256)
+                        && matches(&landing.order.receipt, &expected.receipt)
+                        && matches(&landing.order.proof, &expected.proof)
+                })
+            }),
+        };
+        if admitted { Ok(()) } else { Err(unavailable()) }
+    }
+
     fn keys(&self, authority: CustodyCarrierAuthority, family: [u8; 16]) -> CustodyVault {
         let mut hash = Sha256::new();
         hash.update(b"rtdb/v1/original-family-vault\0");
@@ -143,6 +205,27 @@ impl NativeFamilyVault {
         keys.retire(stage, closed_at.0).await?;
         keys.destroy(stage).await
     }
+}
+
+#[derive(Deserialize)]
+struct ReadbackFamily {
+    authority: CustodyCarrierAuthority,
+    family: [u8; 16],
+    group: [u8; 16],
+    authors: Vec<ReadbackAuthor>,
+    landings: Vec<ReadbackLanding>,
+    close: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct ReadbackAuthor {
+    order: NativeAuthoring,
+}
+
+#[derive(Deserialize)]
+struct ReadbackLanding {
+    order: NativeLandingOrder,
+    body: Option<[u8; 32]>,
 }
 
 pub(super) struct LockedFamily {

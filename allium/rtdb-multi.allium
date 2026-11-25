@@ -669,6 +669,8 @@ contract LogService {
         -- Exact attempt settlement on the imported stream exposes only terminals ordered after that fence.
         -- Commissioned Original branch provisioning and family placement require the current ordered writer at or beyond the imported fence.
         -- The commissioned named family starts at a creation Basis after that writer's ClaimWriter, and its retained receipts remain strictly after the imported fence.
+        -- Commissioned Original family readback verifies the current writer and import fence and limits receipt-bearing projections to the named family after its creation.
+        -- Parent observation returns only the Basis and system time reached by the authenticated named Fork.
         -- Historical readback returns the exact ordered opening or exclusion independently of current authority.
 
     @invariant InstalledJournalErasureCommit

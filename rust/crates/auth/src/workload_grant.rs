@@ -15,6 +15,7 @@ pub struct WorkloadGrantConfig {
     client_id_prefix: String,
     assignment: Option<Point>,
     original_family: bool,
+    original_family_readback: bool,
     funded_appointment_client_prefix: Option<String>,
 }
 
@@ -31,6 +32,7 @@ impl WorkloadGrantConfig {
             client_id_prefix,
             assignment: None,
             original_family: false,
+            original_family_readback: false,
             funded_appointment_client_prefix: None,
         })
     }
@@ -60,6 +62,12 @@ impl WorkloadGrantConfig {
     pub(crate) fn for_original_family(mut self, point: Point) -> Self {
         self.assignment = Some(point);
         self.original_family = true;
+        self
+    }
+
+    pub(crate) fn for_original_family_readback(mut self, point: Point) -> Self {
+        self.assignment = Some(point);
+        self.original_family_readback = true;
         self
     }
 
@@ -132,6 +140,109 @@ impl OriginalFamilyGrant {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFamilyReadbackGrant {
+    pub line: OriginalFamilyGrant,
+    pub generation: [u8; 16],
+    pub creation_key: Vec<u8>,
+    pub carrier: Option<Point>,
+    pub observation: Option<[u8; Basis::WIDTH]>,
+    pub witness: Option<OriginalFamilyReadbackWitness>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFamilyReadbackWitness {
+    pub receipt: Applied,
+    pub placement: [u8; 16],
+    pub projection: OriginalFamilyReadbackProjection,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum OriginalFamilyReadbackProjection {
+    Author {
+        mapping_sha256: Option<[u8; 32]>,
+        settlement: Option<OriginalFamilyAuthorSettlement>,
+    },
+    Reserve {},
+    Landing {
+        mapping_sha256: Option<[u8; 32]>,
+        settlement: Option<OriginalFamilyLandingSettlement>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFamilyAuthorSettlement {
+    pub command: String,
+    pub head: String,
+    pub dispatch: String,
+    pub pending: String,
+    pub business_receipt: String,
+    pub execution_slot: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFamilyLandingSettlement {
+    pub receipt: String,
+    pub proof: String,
+    pub body_sha256: [u8; 32],
+}
+
+impl OriginalFamilyReadbackWitness {
+    fn valid(&self, created: [u8; Basis::WIDTH]) -> bool {
+        self.placement != [0; 16]
+            && self.receipt.namespace != [0; 32]
+            && (16..=64).contains(&self.receipt.key.len())
+            && self.receipt.basis[..16] == created[..16]
+            && self.receipt.basis > created
+            && match &self.projection {
+                OriginalFamilyReadbackProjection::Author { settlement, .. } =>
+                    settlement.as_ref().is_none_or(|witness| {
+                        let ids = [&witness.command, &witness.head, &witness.dispatch, &witness.pending];
+                        ids.iter().enumerate().all(|(idx, id)| bounded_readback_id(id)
+                            && !ids[..idx].contains(id))
+                            && bounded_readback_id(&witness.business_receipt)
+                            && bounded_readback_id(&witness.execution_slot)
+                    }),
+                OriginalFamilyReadbackProjection::Reserve {} => true,
+                OriginalFamilyReadbackProjection::Landing { settlement, .. } =>
+                    settlement.as_ref().is_none_or(|witness| {
+                        witness.receipt != witness.proof && bounded_readback_id(&witness.receipt)
+                            && bounded_readback_id(&witness.proof) && witness.body_sha256 != [0; 32]
+                    }),
+            }
+    }
+}
+
+impl OriginalFamilyReadbackGrant {
+    fn valid(&self, incarnation: [u8; 16]) -> bool {
+        self.line.valid(incarnation)
+            && self.line.created > self.line.writer.basis
+            && self.generation != [0; 16]
+            && (16..=64).contains(&self.creation_key.len())
+            && self.observation.is_none_or(|basis| {
+                Basis::from_bytes(&basis).is_ok_and(|at| at.incarnation() == incarnation)
+                    && basis >= self.line.created
+            })
+            && self.witness.as_ref().is_none_or(|witness| witness.valid(self.line.created))
+            && self.carrier.as_ref().is_none_or(|point| {
+                let bounded_identifier = |name: &str| valid_identity(name) && !name.contains(['.', '/']);
+                point.valid_at != Timestamp::MAX
+                    && bounded_identifier(&point.table.schema)
+                    && bounded_identifier(&point.table.table)
+                    && matches!(&point.id, rtdb_types::EntityId::String(id) if bounded_readback_id(id))
+            })
+    }
+}
+
+fn bounded_readback_id(id: &str) -> bool {
+    (1..=1024).contains(&id.len()) && !id.chars().any(char::is_control)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Claim<'a> {
@@ -145,6 +256,7 @@ struct Claim<'a> {
     authority: Option<Authority>,
     original_custody: Option<OriginalCustodyControl>,
     original_family: Option<OriginalFamilyGrant>,
+    original_family_readback: Option<OriginalFamilyReadbackGrant>,
 }
 
 pub struct VerifiedWorkloadGrant {
@@ -160,6 +272,7 @@ enum Permission {
     Assignment { authority: Box<Authority>, point: Point },
     OriginalCustody(OriginalCustodyControl),
     OriginalFamily { scope: Box<OriginalFamilyGrant>, point: Point },
+    OriginalFamilyReadback { scope: Box<OriginalFamilyReadbackGrant>, point: Point },
     FundedAppointment { scope: Box<FundedAppointmentScope>, point: Point },
 }
 
@@ -186,7 +299,16 @@ impl VerifiedWorkloadGrant {
         {
             return Err(invalid_grant());
         }
-        let permission = if config.original_family {
+        let permission = if config.original_family_readback {
+            match (claim.version, claim.original_family_readback, config.assignment()) {
+                (5, Some(scope), Some(point)) if ["operations", "authority", "original_custody", "original_family"]
+                    .iter().all(|field| claim_field_absent(raw, field)) && scope.valid(claim.incarnation) =>
+                    Permission::OriginalFamilyReadback { scope: Box::new(scope), point: point.clone() },
+                _ => return Err(invalid_grant()),
+            }
+        } else if !claim_field_absent(raw, "original_family_readback") {
+            return Err(invalid_grant());
+        } else if config.original_family {
             match (claim.version, claim.original_family, config.assignment()) {
                 (4, Some(scope), Some(point)) if ["operations", "authority", "original_custody"].iter()
                     .all(|field| claim_field_absent(raw, field)) && scope.valid(claim.incarnation) =>
@@ -230,6 +352,10 @@ impl VerifiedWorkloadGrant {
             hash.update(b"rtdb.v1/original-family\0");
             hash.update(serde_json::to_vec(scope.as_ref()).map_err(|_| invalid_grant())?);
         }
+        if let Permission::OriginalFamilyReadback { scope, point } = &permission {
+            hash.update(b"rtdb.v1/original-family-readback\0");
+            hash.update(serde_json::to_vec(&(scope, point)).map_err(|_| invalid_grant())?);
+        }
         if let Permission::FundedAppointment { scope, point } = &permission {
             hash.update(b"rtdb.v1/managed-funded-appointment\0");
             hash.update(serde_json::to_vec(&(scope, point)).map_err(|_| invalid_grant())?);
@@ -259,6 +385,22 @@ impl VerifiedWorkloadGrant {
 
     pub fn is_original_family(&self) -> bool {
         matches!(self.permission, Permission::OriginalFamily { .. })
+    }
+
+    pub fn is_original_family_readback(&self) -> bool {
+        matches!(self.permission, Permission::OriginalFamilyReadback { .. })
+    }
+
+    pub fn original_family_readback(
+        &self, database: &str, authority: CustodyCarrierAuthority, now: Timestamp,
+    ) -> Result<(&OriginalFamilyReadbackGrant, &Point, Timestamp)> {
+        self.revalidate(now)?;
+        match &self.permission {
+            Permission::OriginalFamilyReadback { scope, point }
+                if self.database == database && scope.line.authority == authority =>
+                Ok((scope, point, self.expires_at)),
+            _ => Err(invalid_grant()),
+        }
     }
 
     pub fn is_funded_appointment(&self) -> bool {
@@ -358,6 +500,7 @@ impl VerifiedWorkloadGrant {
         self.database.capacity() + match &self.permission {
             Permission::Create(_) | Permission::OriginalCustody(_) => 0,
             Permission::Assignment { .. } | Permission::OriginalFamily { .. } | Permission::FundedAppointment { .. } => 8192,
+            Permission::OriginalFamilyReadback { .. } => 16 * 1024,
         }
     }
 }
@@ -472,4 +615,70 @@ mod tests {
         scope.branch = MAIN_BRANCH.into();
         assert!(verify(&raw(&scope), &family).is_err());
     }
+    #[test]
+    fn original_family_readback_credential_is_disjoint_and_pins_literal_selectors() {
+        let incarnation = [1; 16];
+        let authority = CustodyCarrierAuthority {
+            incarnation, installation: [2; 16], source_history: [3; 32], registry: [4; 32], original_writer: [5; 32],
+        };
+        let applied = |position| Applied {
+            namespace: [6; 32], key: vec![7; 16], basis: Basis::new(incarnation, position).to_bytes(),
+            system_time_micros: position as i64,
+        };
+        let line = OriginalFamilyGrant {
+            authority, branch: "draft".into(), created: Basis::new(incarnation, 3).to_bytes(),
+            family: [8; 16], group: [9; 16], writer: applied(2),
+            fence: Fence { applied: applied(1), placement: Placement { epoch: 1,
+                assignment: Some(Holder { assignment_id: [10; 16], holder: "holder".into() }),
+            }},
+        };
+        let point = Point::new("public.writer", "authority".into(), Timestamp(0)).unwrap();
+        let issuer = WorkloadGrantConfig::new("readback".into(), "readback-".into()).unwrap();
+        let v4 = issuer.clone().for_original_family(point.clone());
+        let v5 = issuer.clone().for_original_family_readback(point);
+        let mut raw = json!({
+            "version": 5, "audience": "readback", "database": "exact", "incarnation": incarnation,
+            "grant_id": [11; 16], "expires_at_micros": 100,
+            "original_family_readback": {
+                "line": line, "generation": [12; 16], "creation_key": [13; 16],
+                "carrier": Point::new("app.protected_carriers", "selected".into(), Timestamp(20)).unwrap(),
+                "observation": Basis::new(incarnation, 4).to_bytes(),
+                "witness": { "receipt": applied(5), "placement": [14; 16], "projection": { "kind": "reserve" } },
+            },
+        });
+        let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
+            raw, "https://readback.example.invalid/", config, "owner", Timestamp(90), Timestamp(0),
+        );
+        assert!(verify(&raw, &v4).is_err());
+        assert!(verify(&raw, &issuer).is_err());
+        let grant = verify(&raw, &v5).unwrap();
+        assert!(grant.is_original_family_readback());
+        assert!(!grant.is_original_family());
+        assert!(grant.assignment("exact", incarnation, Timestamp(0)).is_err());
+        assert!(grant.original_family("exact", authority, Timestamp(0)).is_err());
+        assert!(grant.original_family_readback("other", authority, Timestamp(0)).is_err());
+        assert!(grant.original_family_readback("exact", authority, Timestamp(90)).is_err());
+        let mut v4_raw = raw.clone();
+        let family = v4_raw.as_object_mut().unwrap().remove("original_family_readback").unwrap();
+        v4_raw["version"] = json!(4);
+        v4_raw["original_family"] = family["line"].clone();
+        assert!(verify(&v4_raw, &v5).is_err());
+        assert!(verify(&v4_raw, &v4).is_ok());
+        let mut mixed = raw.clone();
+        mixed["authority"] = serde_json::Value::Null;
+        assert!(verify(&mixed, &v5).is_err());
+        let mut foreign = raw.clone();
+        foreign["original_family_readback"]["witness"]["receipt"]["basis"] = json!(Basis::new([2; 16], 5).to_bytes());
+        assert!(verify(&foreign, &v5).is_err());
+        raw["original_family_readback"]["carrier"]["table"]["table"] = json!("another_carrier");
+        assert!(verify(&raw, &v5).is_ok());
+        raw["original_family_readback"]["carrier"]["table"]["table"] = json!("app.another_carrier");
+        assert!(verify(&raw, &v5).is_err());
+        raw["original_family_readback"]["carrier"]["table"]["table"] = json!("another_carrier");
+        raw["original_family_readback"]["carrier"]["id"] = json!({ "String": "x".repeat(1025) });
+        assert!(verify(&raw, &v5).is_err());
+        raw["original_family_readback"]["carrier"]["id"] = json!({ "Integer": 1 });
+        assert!(verify(&raw, &v5).is_err());
+    }
+
 }

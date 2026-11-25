@@ -396,6 +396,17 @@ surface StatelessDatabase {
         -- At valid time zero the registry row identifies the child by name, generation, creation Basis, raw creation key and owner.
         -- Receipt readback uses the provision namespace and operation family at a Basis strictly after the import fence when present.
 
+    @guarantee ManagedOriginalFamilyReadback
+        -- A separate issuer commissions a readback bearer for the current Original installation, attachment, assignment fence, ClaimWriter, named creation, family and group.
+        -- The Original mount commissions seven distinct application relations for carrier, member, admission, business receipt, execution, publication and Root version evidence.
+        -- The bearer selects exact lineage and registry observations and a literal point on the mounted carrier relation at its commissioned Basis.
+        -- The lineage observation attests the authenticated parent Basis and system time from the retained cut coordinate.
+        -- A written carrier selection returns its point coordinates and authenticated absence requires a readable exact view.
+        -- One commissioned native receipt binds the placement catalog and its exact co-written application witnesses.
+        -- The reader returns only the commissioned member mapping after the source drops, and main landing settlement uses the exact accepted cut.
+        -- Execution settlement returns commitments to the cells written under the keyed author receipt.
+        -- The reader confirms current writer, attachment, family and grant through response delivery.
+
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.
         -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.
