@@ -816,7 +816,7 @@ impl ColumnBatch {
         self.append_funded_column(column, reservation, memory)
     }
 
-    fn append_funded_column(&mut self, column: Column, reservation: Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<()> {
+    pub(crate) fn append_funded_column(&mut self, column: Column, reservation: Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<()> {
         let old_columns = self.columns.len().checked_mul(size_of::<Column>()).ok_or_else(size_error)?;
         let old_leases = self.appended.len().checked_mul(size_of::<Arc<MemoryReservation>>()).ok_or_else(size_error)?;
         let _scratch = memory.reserve(old_columns.checked_add(old_leases).ok_or_else(size_error)?)?;
@@ -945,10 +945,70 @@ impl ColumnBatch {
         Ok(Self { columns, len: batch.batch().num_rows(), reservation: Arc::clone(batch.reservation()), appended: Vec::new() })
     }
 
+    pub(crate) fn retain_ordered_list_span(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let owner = self.column_reservation(0);
+        let (array, field, logical, owner, rows) = match &self.columns[0] {
+            Column::Arrow { array, field, logical } => (array, field, logical, owner, rows),
+            Column::Selected(selected) => {
+                let Some(((array, field, logical, custody), span)) = selected.contiguous_source(rows) else { return Ok(None); };
+                (array, field, logical, custody.as_ref().unwrap_or(owner), span)
+            }
+            Column::Values(_) => return Ok(None),
+        };
+        if rows.end > array.len() || array.data_type() != field.data_type() || !can_interleave_layout(array.as_ref(), true)
+            || array.data_type() == &DataType::Null
+        {
+            return Ok(None);
+        }
+        let bytes = field.size().checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+        let bytes = bytes.checked_add(logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?).ok_or_else(size_error)?;
+        let reservation = memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(owner)))?;
+        let view = if rows.len() == array.len() { Arc::clone(array) } else { array.slice(rows.start, rows.len()) };
+        // A slice preserves the payload of null slots that list compaction clears.
+        if scalar_layout(view.data_type()) && view.null_count() != 0 { return Ok(None); }
+        let visible = rtdb_columnar::visible_buffer_bytes(std::slice::from_ref(&view)).unwrap_or(0);
+        let backing = distinct_charges(std::iter::once(owner), memory)?.max(view.get_buffer_memory_size());
+        if backing > visible.saturating_mul(2).saturating_add(4096) { return Ok(None); }
+        let column = Column::Arrow { array: view, field: Arc::clone(field), logical: logical.clone() };
+        Ok(Some(Self::sharing(vec![column], rows.len(), reservation)))
+    }
+
+    pub(crate) fn collect_lists_from_rows(
+        sources: &[Self], rows: impl Iterator<Item = (usize, usize)> + Clone, len: usize,
+        offsets: Vec<i32>, valid: Vec<bool>, output: &rtdb_plan::Field, memory: &Arc<MemoryBudget>,
+    ) -> Result<(Column, Arc<MemoryReservation>)> {
+        if len == 0 {
+            return Self::sharing(vec![], 0, memory.reserve(256)?).collect_lists(offsets, valid, output, memory);
+        }
+        if let [source] = sources && source.len == len
+            && !source.column_reservation(0).backing().is_empty()
+            && rows.clone().eq((0..len).map(|row| (0, row)))
+            && let [Column::Arrow { array, field, logical }] = source.columns.as_slice()
+            && scalar_layout(array.data_type()) && array.data_type() != &DataType::Null && array.null_count() == 0
+        {
+            let physical = rtdb_columnar::to_field(&output.name, &output.data_type)?;
+            let DataType::List(item) = physical.data_type() else { return Err(invalid("column-list", "Expected a list result field")); };
+            let bytes = valid.len().checked_mul(32)
+                .and_then(|bytes| field.size().checked_mul(8).and_then(|size| bytes.checked_add(size)))
+                .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+            let owner = Arc::clone(source.column_reservation(0));
+            let reservation = memory.reserve_with_backing(bytes, std::iter::once(owner))?;
+            let item = if logical.as_ref().is_some_and(|ty| stable_read_layout(ty, field)) {
+                Arc::new(field.as_ref().clone().with_name(item.name()))
+            } else {
+                Arc::clone(field)
+            };
+            let column = Self::finish_list(&physical, offsets, valid, Arc::clone(array), item)?;
+            return Ok((column, reservation));
+        }
+        let (column, charge) = gather_column_cells(|page| &sources[page], rows.map(Some), len, 0, false, memory)?;
+        Self::settled(vec![column], len, charge)?.collect_lists(offsets, valid, output, memory)
+    }
+
     pub(crate) fn collect_lists(
         &self, offsets: Vec<i32>, valid: Vec<bool>, field: &rtdb_plan::Field, memory: &Arc<MemoryBudget>,
     ) -> Result<(Column, Arc<MemoryReservation>)> {
-        use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
         let physical = rtdb_columnar::to_field(&field.name, &field.data_type)?;
         let DataType::List(item) = physical.data_type() else { return Err(invalid("column-list", "Expected a list result field")); };
         let mut child_field = field.clone();
@@ -982,11 +1042,17 @@ impl ColumnBatch {
         let lease = Arc::get_mut(&mut reservation).expect("The list owns its child reservation");
         let bytes = valid.len().checked_mul(32).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
         lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+        let column = Self::finish_list(&physical, offsets, valid, child, item)?;
+        Ok((column, reservation))
+    }
+
+    fn finish_list(physical: &ArrowField, offsets: Vec<i32>, valid: Vec<bool>, child: ArrayRef, item: Arc<ArrowField>) -> Result<Column> {
+        use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
         let array = ListArray::try_new(item, OffsetBuffer::new(ScalarBuffer::from(offsets)), child, Some(NullBuffer::from(valid)))
             .map_err(|error| invalid("column-list", error))?;
         let field = Arc::new(ArrowField::new(physical.name(), array.data_type().clone(), physical.is_nullable() || array.null_count() != 0));
         let logical = rtdb_columnar::from_field(&field)?;
-        Ok((Column::Arrow { array: Arc::new(array), field, logical: Some(logical) }, reservation))
+        Ok(Column::Arrow { array: Arc::new(array), field, logical: Some(logical) })
     }
 
     pub(crate) fn pack_evaluated(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -1322,6 +1388,7 @@ impl ColumnBatch {
         Ok(Some(Self::sharing(columns, 1, reservation)))
     }
 
+    #[cfg(test)]
     pub(crate) fn compact_group_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
         self.compact_group_key_columns(rows, None, memory)
     }
