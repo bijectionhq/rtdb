@@ -353,7 +353,12 @@ pub async fn owned_nearest_batch(
         let mut columns = vec!["_id", partition.vector.as_str()];
         columns.extend(partition.filters.iter().map(String::as_str));
         let sealed = crate::rank_family::needs_rank_family(&context, owner, &partition.relation).await?;
-        if sealed { columns.push("_system_from"); }
+        if sealed {
+            columns.push("_system_from");
+            if rtdb_storage::sealing::PlaintextView::inherited_root_rank_cut().is_some() {
+                columns.push(rtdb_types::OWNED_EVENT_POSITION_COLUMN);
+            }
+        }
         if query.approximate && !sealed {
             let bounds = TemporalBounds { valid_time: Interval::at(valid)?, system_time: Interval::at(present)? };
             let cut = rtdb_vector::Cut { snapshot, storage: &database.storage, memory: &context.memory, cancellation: &context.cancellation, bounds };

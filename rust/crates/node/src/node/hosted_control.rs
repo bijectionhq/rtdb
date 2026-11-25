@@ -6,7 +6,8 @@ use rtdb_query::{HostedControlPoint, QueryCursor};
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{
     ASSERTION_FAMILY_FENCES, Anomaly, AnomalyCategory, AssertionFamilyFenceMarker, EntityId, Iid,
-    OwnedWorld, PlacedAttempt, PlacedAttemptScope, Result, TableRef, TransactionKey,
+    Interval, OwnedPointVersion, OwnedRelation, OwnedWorld, PlacedAttempt, PlacedAttemptScope,
+    Result, TableRef, TransactionKey,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -74,6 +75,14 @@ impl RootCatalogRead {
 }
 
 impl OwnedReadSession {
+    pub async fn world_registration_version(&self, world: Iid) -> Result<Option<OwnedPointVersion>> {
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        let version = world_registration_version(&self.context, &self.owner, world).await?;
+        self.check()?;
+        Ok(version)
+    }
+
     pub(super) async fn original_inventory_provider_guard(
         &self, scope: PlacedAttemptScope,
     ) -> Result<impl Fn() -> Result<()> + Send + Sync + use<>> {
@@ -270,6 +279,61 @@ impl CurrentAssertionFamilyRead {
         self.context.check_cancelled()?;
         Ok(registration.map(|(world, _)| world))
     }
+
+    pub async fn world_registration_version(&self, world: Iid) -> Result<Option<OwnedPointVersion>> {
+        world_registration_version(&self.context, &self.owner, world).await
+    }
+
+    pub async fn require_unerased_root_point(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, expected: OwnedPointVersion,
+    ) -> Result<()> {
+        let floor = rtdb_query::owned_purge_floor(Arc::clone(&self.context), &self.owner, relation, id).await?;
+        if floor.is_some() {
+            return Err(rtdb_storage::Error::ErasedUnderView.into());
+        }
+        let current = rtdb_query::read_owned_point_version(
+            Arc::clone(&self.context), &self.owner, relation, id, valid,
+        ).await?;
+        require_rank_point_version(current, expected)?;
+        self.context.check_cancelled()
+    }
+
+    pub async fn require_rank_erasure_projection(
+        &self, relation: &OwnedRelation, canonical: &EntityId, valid: Interval, cut: TransactionKey,
+    ) -> Result<()> {
+        let markers = OwnedRelation::new("fact_sealed_search_erasures")?;
+        let id = EntityId::String(relation.name().to_owned());
+        if let Some(marker) = rtdb_query::read_owned_point_version(
+            Arc::clone(&self.context), &self.owner, &markers, &id, Interval::ALL,
+        ).await? {
+            let ordered = TransactionKey { tx_id: marker.position.transaction, system_time: marker.history };
+            require_rank_marker_at_cut(ordered, cut)?;
+        }
+        if rtdb_query::read_owned_point_revision(
+            Arc::clone(&self.context), &self.owner, relation, canonical, valid,
+        ).await?.is_some() {
+            return Err(hosted_source_unavailable());
+        }
+        self.context.check_cancelled()
+    }
+}
+
+fn require_rank_marker_at_cut(marker: TransactionKey, through: TransactionKey) -> Result<()> {
+    if !marker.at_or_before(through) { return Err(rtdb_storage::Error::ErasedUnderView.into()); }
+    Ok(())
+}
+
+fn require_rank_point_version(current: Option<OwnedPointVersion>, expected: OwnedPointVersion) -> Result<()> {
+    if current != Some(expected) { return Err(hosted_source_unavailable()); }
+    Ok(())
+}
+
+async fn world_registration_version(
+    context: &Arc<rtdb_query::QueryContext>, owner: &str, world: Iid,
+) -> Result<Option<OwnedPointVersion>> {
+    rtdb_query::read_owned_point_version(
+        Arc::clone(context), owner, &OwnedRelation::world_catalog(), &EntityId::Uuid(world.0), Interval::ALL,
+    ).await
 }
 
 async fn read_carrier_point(
@@ -384,5 +448,43 @@ impl NativeSession {
 
     pub async fn current_assertion_family_read(&self, deployment: Uuid) -> Result<CurrentAssertionFamilyRead> {
         self.assertion_family_reader()?.current(deployment, self.state.cancellation()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rtdb_types::{EventPosition, Timestamp, TxId};
+
+    use super::*;
+
+    #[test]
+    fn inherited_rank_requires_the_current_occurrence_even_at_equal_sql_times() {
+        let expected = OwnedPointVersion {
+            history: Timestamp(100),
+            position: EventPosition { transaction: TxId(20), ordinal: 3 },
+        };
+        let alternate_ordinal = EventPosition { ordinal: 4, ..expected.position };
+        let alternate_transaction = EventPosition { transaction: TxId(21), ..expected.position };
+        for (current, admitted) in [
+            (Some(expected), true),
+            (None, false),
+            (Some(OwnedPointVersion { position: alternate_ordinal, ..expected }), false),
+            (Some(OwnedPointVersion { position: alternate_transaction, ..expected }), false),
+        ] {
+            assert_eq!(require_rank_point_version(current, expected).is_ok(), admitted);
+        }
+    }
+
+    #[test]
+    fn inherited_rank_refuses_a_projected_erase_after_its_cut_at_the_same_sql_time() {
+        let cut = TransactionKey { tx_id: TxId(20), system_time: Timestamp(100) };
+        for (marker, admitted) in [
+            (TransactionKey { tx_id: TxId(19), ..cut }, true),
+            (cut, true),
+            (TransactionKey { tx_id: TxId(21), ..cut }, false),
+            (TransactionKey { tx_id: TxId(21), system_time: Timestamp(101) }, false),
+        ] {
+            assert_eq!(require_rank_marker_at_cut(marker, cut).is_ok(), admitted);
+        }
     }
 }

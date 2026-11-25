@@ -4,6 +4,7 @@ use arrow_array::{Array, BinaryArray, StringArray, UInt64Array};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
+use rtdb_storage::sealing::PlaintextView;
 use rtdb_text::{Corpus, Query, Scorer};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 
@@ -288,7 +289,12 @@ impl HeldTextCorpus {
             return Ok(());
         }
         let mut columns = vec!["_id", &column];
-        if sealed { columns.push("_system_from"); }
+        if sealed {
+            columns.push("_system_from");
+            if PlaintextView::inherited_root_rank_cut().is_some() {
+                columns.push(rtdb_types::OWNED_EVENT_POSITION_COLUMN);
+            }
+        }
         let Some(mut cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(context), owner, relation, valid, &columns,
         ).await? else { return Err(corpus_limit()); };

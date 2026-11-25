@@ -318,19 +318,20 @@ impl ArrowFile {
         };
         let measured_wire = flow.map(|_| wire.clone());
         // arrow-flow: rtdb.event.projected/selected retained-ipc decoded-page decode event-page required decode_projected_buffer_reserved | Decode an admitted projection when the record supports the requested columns.
-        let (batch, charge, edge) = match self.pages.decode_projected_buffer_reserved(
+        let (batch, charge, edge, fallback_reason) = match self.pages.decode_projected_buffer_reserved(
             page, &wire, PageProjection::PutColumns(put_columns), |bytes| memory.reserve(bytes),
         )? {
-            Some((batch, charge)) => (batch, charge, "rtdb.event.projected/selected"),
-            None => {
+            ProjectionAttempt::Selected(batch, charge) => (batch, charge, "rtdb.event.projected/selected", None),
+            ProjectionAttempt::Fallback(reason) => {
                 let charge = memory.reserve(self.pages.full_page_decode_bound(page, &wire)?)?;
-                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Use the file decoder when the selected physical layout still requires it.
+                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Decode the full page after projection planning declines or projected decoding fails.
                 let batch = self.pages.decode_page(page, wire)?;
-                (batch, charge, "rtdb.event.projected/full-page")
+                (batch, charge, "rtdb.event.projected/full-page", Some(reason))
             }
         };
         if let (Some(flow), Some(input)) = (flow, measured_wire) {
             flow.record(edge, Measures {
+                fallback_reason: fallback_reason.map(ProjectionFallback::label),
                 rows: Some(batch.num_rows()),
                 new_backing_bytes: rtdb_columnar::new_buffer_backing_bytes(&batch, &input),
                 reservation_bytes: Some(charge.bytes()),
@@ -360,6 +361,25 @@ pub struct PageDecoder {
 pub enum PageProjection<'a> {
     Iid,
     PutColumns(&'a [String]),
+}
+
+enum ProjectionAttempt<G> {
+    Selected(RecordBatch, G),
+    Fallback(ProjectionFallback),
+}
+
+enum ProjectionFallback {
+    PlanDeclined,
+    DecodeFailed,
+}
+
+impl ProjectionFallback {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlanDeclined => "plan-declined",
+            Self::DecodeFailed => "decode-failed",
+        }
+    }
 }
 
 impl PageDecoder {
@@ -505,24 +525,30 @@ impl PageDecoder {
         &self, page: usize, wire: impl AsRef<[u8]> + Send + 'static, selection: PageProjection<'_>,
         reserve: impl FnMut(usize) -> Result<G>,
     ) -> Result<Option<(RecordBatch, G)>> {
-        self.decode_projected_buffer_reserved(page, &Buffer::from(Bytes::from_owner(wire)), selection, reserve)
+        let wire = Buffer::from(Bytes::from_owner(wire));
+        Ok(match self.decode_projected_buffer_reserved(page, &wire, selection, reserve)? {
+            ProjectionAttempt::Selected(batch, grant) => Some((batch, grant)),
+            ProjectionAttempt::Fallback(_) => None,
+        })
     }
 
     fn decode_projected_buffer_reserved<G>(
         &self, page: usize, bytes: &Buffer, selection: PageProjection<'_>,
         mut reserve: impl FnMut(usize) -> Result<G>,
-    ) -> Result<Option<(RecordBatch, G)>> {
+    ) -> Result<ProjectionAttempt<G>> {
         let indices = self.projection_indices(selection)?;
         let (batch, version, body) = self.projected_block(page, bytes)?;
         let body = bytes.slice(body);
         let Some(plan) = projection::prepare(&body, batch, &self.decoded_schema, version,
             |_, field| selection.field(field), projection::Preparation::Measure, &mut reserve)? else {
-            return Ok(None);
+            return Ok(ProjectionAttempt::Fallback(ProjectionFallback::PlanDeclined));
         };
         let charge = reserve(plan.bound)?;
         let _workspace = (plan.workspace != 0).then(|| reserve(plan.workspace)).transpose()?;
-        Ok(self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice()))
-            .ok().map(|batch| (batch, charge)))
+        Ok(match self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice())) {
+            Ok(batch) => ProjectionAttempt::Selected(batch, charge),
+            Err(_) => ProjectionAttempt::Fallback(ProjectionFallback::DecodeFailed),
+        })
     }
 
     fn decode_projected_page(&self, page: usize, bytes: &Buffer, selection: PageProjection<'_>) -> Result<RecordBatch> {
@@ -2300,6 +2326,35 @@ fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {
     assert!(rtdb_columnar::shared_allocation_size(&decoded).unwrap() < bytes.len());
     drop((reader, bytes));
     assert_eq!(decoded, batch);
+}
+
+#[test]
+fn projected_page_fallback_distinguishes_planning_and_decode() {
+    use arrow_array::{builder::StringDictionaryBuilder, types::Int8Type};
+    use arrow_ipc::writer::FileWriter;
+
+    let mut values = StringDictionaryBuilder::<Int8Type>::new();
+    values.append("selected").unwrap();
+    let batch = RecordBatch::try_from_iter([("_iid", Arc::new(values.finish()) as ArrayRef)]).unwrap();
+    let mut writer = FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = Buffer::from(writer.into_inner().unwrap());
+    let layout = inspect_file(&mut Cursor::new(bytes.as_slice())).unwrap();
+    let mut file = ArrowFile::from_inspected_buffer(bytes.clone(), None, layout).unwrap();
+    let range = file.pages.page_range(0).unwrap();
+    let wire = bytes.slice_with_length(range.start as usize, (range.end - range.start) as usize);
+    let memory = MemoryBudget::new(1 << 20);
+
+    let attempt = file.pages.decode_projected_buffer_reserved(0, &wire, PageProjection::Iid, |size| memory.reserve(size)).unwrap();
+    assert!(matches!(attempt, ProjectionAttempt::Fallback(ProjectionFallback::DecodeFailed)));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(file.read_page(0).unwrap(), batch);
+
+    // Use a mismatched selected schema to make the planner decline before decode.
+    file.pages.decoded_schema = Arc::new(Schema::empty());
+    let attempt = file.pages.decode_projected_buffer_reserved(0, &wire, PageProjection::PutColumns(&[]), |size| memory.reserve(size)).unwrap();
+    assert!(matches!(attempt, ProjectionAttempt::Fallback(ProjectionFallback::PlanDeclined)));
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]

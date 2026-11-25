@@ -79,6 +79,7 @@ pub struct CatalogSnapshot {
 #[derive(Clone)]
 pub(crate) enum OwnedSelection {
     Relation,
+    PositionedProjection,
     Point(rtdb_types::EntityId),
     Artefacts(Arc<OwnedArtefactKeys>),
     Candidates(crate::CandidateIids),
@@ -268,6 +269,10 @@ impl CatalogSnapshot {
             Some((_, OwnedSelection::Point(id))) => Some(id),
             _ => None,
         }
+    }
+    pub(crate) fn admits_owned_event_positions(&self, name: &QualifiedTable) -> bool {
+        matches!(&self.owned_relation,
+            Some((table, OwnedSelection::Point(_) | OwnedSelection::PositionedProjection)) if table == name)
     }
     pub(crate) fn owned_artefact_keys(&self) -> Option<&OwnedArtefactKeys> {
         match self.owned_relation.as_ref() {

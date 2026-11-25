@@ -1111,7 +1111,7 @@ fn settle_fork_pin(
     }
 }
 
-fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
+pub(crate) fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
     world.ancestors == world_ancestors(retained)
         && world.id.0 == *retained.world.as_bytes()
         && world.capture.0 == *retained.capture.as_bytes()
@@ -1150,6 +1150,8 @@ fn admit_world_media(
 
 struct OpenWorld {
     incarnation: u64,
+    writer: PlacedAttemptScope,
+    storage_generation: Option<Uuid>,
     retained: CheckpointWorldRetention,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
@@ -1200,6 +1202,8 @@ async fn open_world(
     }
     Ok(OpenWorld {
         incarnation: installation.incarnation,
+        writer: PlacedAttemptScope::new(&installation.stream("replica"), installation.epoch)?,
+        storage_generation: installation.storage_generation,
         retained: retained.clone(),
         snapshot,
         record: world,
