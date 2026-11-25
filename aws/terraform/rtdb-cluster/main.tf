@@ -6,16 +6,19 @@ locals {
   multi                      = var.mode == "multi"
   custom_multi_configuration = local.multi && var.multi_configuration_secret != null
   classic_candidate          = local.multi ? var.classic_candidate_ingress : null
+  classic_opening            = local.multi ? var.classic_opening_ingress : null
   peer_discovery_host        = "node.${aws_service_discovery_private_dns_namespace.cluster.name}"
   node_ports = concat(
     [{ containerPort = local.flight_port, protocol = "tcp" }],
     local.multi ? [{ containerPort = local.peer_port, protocol = "tcp" }] : [],
-    local.classic_candidate == null ? [] : [{ containerPort = local.classic_candidate.port, protocol = "tcp" }]
+    local.classic_candidate == null ? [] : [{ containerPort = local.classic_candidate.port, protocol = "tcp" }],
+    local.classic_opening == null ? [] : [{ containerPort = local.classic_opening.port, protocol = "tcp" }]
   )
   secrets = merge(
     { RTDB_ROOT_PASSWORD = var.root_password_secret },
     local.custom_multi_configuration ? { RTDB_MULTI_CONFIG_YAML = var.multi_configuration_secret } : {},
     local.classic_candidate == null ? {} : { RTDB_CLASSIC_CANDIDATE_INGRESS_CONFIG = local.classic_candidate.configuration_secret },
+    local.classic_opening == null ? {} : { RTDB_CLASSIC_OPENING_INGRESS_CONFIG = local.classic_opening.configuration_secret },
     merge({}, [
       for slot, credential in(var.journal_credentials == null ? {} : var.journal_credentials) : {
         "RTDB_JOURNAL_${slot}_CA_CERTIFICATE" = credential.ca_certificate
@@ -45,6 +48,8 @@ locals {
     RTDB_KAFKA_TOPIC     = var.kafka_topic
     }, local.classic_candidate == null ? {} : {
     RTDB_CLASSIC_CANDIDATE_INGRESS_PORT = tostring(local.classic_candidate.port)
+    }, local.classic_opening == null ? {} : {
+    RTDB_CLASSIC_OPENING_INGRESS_PORT = tostring(local.classic_opening.port)
   })
 }
 
@@ -143,6 +148,10 @@ resource "aws_ecs_task_definition" "node" {
     precondition {
       condition     = local.multi || var.classic_candidate_ingress == null
       error_message = "Classic candidate ingress requires Multi mode."
+    }
+    precondition {
+      condition     = var.classic_opening_ingress == null || (local.multi && (local.classic_candidate == null || try(local.classic_candidate.port != local.classic_opening.port && local.classic_candidate.configuration_secret != local.classic_opening.configuration_secret, false)))
+      error_message = "Classic opening ingress requires Multi mode and a listener and secret distinct from the Classic candidate ingress."
     }
   }
   tags = var.tags

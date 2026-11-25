@@ -555,6 +555,11 @@ Certificate and key files are PEM, and each caller digest is the SHA-256 of its 
 An opening operator requires a distinct certificate digest and a `verifier` with `endpoint`, `history_id`, `target`, `ca_file`, `client_certificate_file` and `client_private_key_file`.
 The outbound client certificate must be installed in Bijection's dedicated opening verifier role.
 A status-only peer can omit both the operator and verifier configuration.
+The native ECS module uses an alternative bound selector with `RTDB_CLASSIC_OPENING_INGRESS_PORT` and `RTDB_CLASSIC_OPENING_INGRESS_CONFIG`.
+Supply the port separately and the TLS material in the version-pinned JSON as `certificate_pem`, `private_key_pem` and `client_ca_pem`.
+The optional verifier has `endpoint`, `history_id`, `target`, `ca_pem`, `client_certificate_pem` and `client_private_key_pem`.
+Keep the caller leaf digest fields and the paired operator and verifier requirement.
+Only one configuration form can be installed.
 The operator follows any selected-writer redirect over the same commissioned TLS trust profile.
 The Bijection reconciler uses its distinct read-only credential and neither peer operation consumes the Original recovery bearer.
 

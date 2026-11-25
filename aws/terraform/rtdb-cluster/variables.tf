@@ -120,6 +120,33 @@ variable "classic_candidate_ingress" {
   }
 }
 
+variable "classic_opening_ingress" {
+  description = "Optional private Multi ingress for the Classic opening operator and read-only reconciler."
+  type = object({
+    port                      = number
+    source_security_group_ids = set(string)
+    configuration_secret      = string
+  })
+  default = null
+  validation {
+    condition = var.classic_opening_ingress == null || try(
+      var.classic_opening_ingress.port == floor(var.classic_opening_ingress.port) &&
+      var.classic_opening_ingress.port >= 1024 &&
+      var.classic_opening_ingress.port <= 65535 &&
+      !contains([3000, 3001], var.classic_opening_ingress.port) &&
+      length(var.classic_opening_ingress.source_security_group_ids) > 0 &&
+      alltrue([for group in var.classic_opening_ingress.source_security_group_ids :
+        can(regex("^sg-([a-f0-9]{8}|[a-f0-9]{17})$", group))
+      ]) &&
+      can(regex(
+        "^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}:[^:\\r\\n]*::[A-Za-z0-9-]{32,64}$",
+        var.classic_opening_ingress.configuration_secret
+      )), false
+    )
+    error_message = "Supply a separate private TCP port, source security groups and a version-pinned ECS secret for Classic opening."
+  }
+}
+
 variable "kafka_bootstrap" {
   description = "Comma-separated bootstrap endpoints for default mode."
   type        = string

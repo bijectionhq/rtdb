@@ -15,3 +15,12 @@ output "classic_candidate_relay_target" {
     port  = local.classic_candidate.port
   }
 }
+
+output "classic_opening_target" {
+  description = "Private DNS entry, TCP port and node security group for Classic opening and status."
+  value = local.classic_opening == null ? null : {
+    entry             = local.peer_discovery_host
+    port              = local.classic_opening.port
+    security_group_id = aws_security_group.node.id
+  }
+}

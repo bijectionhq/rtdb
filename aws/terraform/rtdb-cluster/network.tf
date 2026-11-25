@@ -62,6 +62,15 @@ resource "aws_vpc_security_group_ingress_rule" "classic_candidate" {
   to_port                      = local.classic_candidate.port
 }
 
+resource "aws_vpc_security_group_ingress_rule" "classic_opening" {
+  for_each                     = local.classic_opening == null ? toset([]) : local.classic_opening.source_security_group_ids
+  security_group_id            = aws_security_group.node.id
+  referenced_security_group_id = each.value
+  ip_protocol                  = "tcp"
+  from_port                    = local.classic_opening.port
+  to_port                      = local.classic_opening.port
+}
+
 resource "aws_vpc_security_group_egress_rule" "node" {
   security_group_id = aws_security_group.node.id
   ip_protocol       = "tcp"

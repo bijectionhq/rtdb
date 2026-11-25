@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs::File,
     io::Read,
     net::SocketAddr,
@@ -39,6 +40,7 @@ use crate::multi::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
+const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const VERIFY: &str = "/bijection.native.v1.Administration/VerifyHostedHistoryOpening";
 
 #[derive(Deserialize)]
@@ -62,6 +64,28 @@ struct VerifierConfiguration {
     ca_file: PathBuf,
     client_certificate_file: PathBuf,
     client_private_key_file: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretConfiguration {
+    certificate_pem: String,
+    private_key_pem: String,
+    client_ca_pem: String,
+    operator_certificate_sha256: Option<[u8; 32]>,
+    reconciler_certificate_sha256: [u8; 32],
+    verifier: Option<VerifierSecret>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifierSecret {
+    endpoint: String,
+    history_id: [u8; 16],
+    target: u64,
+    ca_pem: String,
+    client_certificate_pem: String,
+    client_private_key_pem: String,
 }
 
 #[derive(Deserialize)]
@@ -114,17 +138,45 @@ struct Verifier {
 
 impl Verifier {
     fn from_configuration(config: VerifierConfiguration) -> Result<Self> {
-        if config.history_id == [0; 16]
-            || config.target == 0
-            || !config.endpoint.starts_with("https://")
-        {
-            return Err(invalid());
-        }
-        let ca = Certificate::from_pem(read_file(&config.ca_file)?);
+        let ca = read_file(&config.ca_file)?;
         let certificate = read_file(&config.client_certificate_file)?;
         let key = zeroize::Zeroizing::new(read_file(&config.client_private_key_file)?);
-        let identity = Identity::from_pem(certificate, key.as_slice());
-        let endpoint = Endpoint::from_shared(config.endpoint)
+        Self::from_pem(
+            config.endpoint,
+            config.history_id,
+            config.target,
+            &ca,
+            &certificate,
+            &key,
+        )
+    }
+
+    fn from_secret(config: VerifierSecret) -> Result<Self> {
+        let key = zeroize::Zeroizing::new(config.client_private_key_pem);
+        Self::from_pem(
+            config.endpoint,
+            config.history_id,
+            config.target,
+            config.ca_pem.as_bytes(),
+            config.client_certificate_pem.as_bytes(),
+            key.as_bytes(),
+        )
+    }
+
+    fn from_pem(
+        endpoint: String,
+        history_id: [u8; 16],
+        target: u64,
+        ca: &[u8],
+        certificate: &[u8],
+        key: &[u8],
+    ) -> Result<Self> {
+        if history_id == [0; 16] || target == 0 || !endpoint.starts_with("https://") {
+            return Err(invalid());
+        }
+        let ca = Certificate::from_pem(ca);
+        let identity = Identity::from_pem(certificate, key);
+        let endpoint = Endpoint::from_shared(endpoint)
             .map_err(|_| invalid())?
             .tls_config(ClientTlsConfig::new().ca_certificate(ca).identity(identity))
             .map_err(|_| invalid())?
@@ -132,8 +184,8 @@ impl Verifier {
             .timeout(DEADLINE);
         Ok(Self {
             channel: endpoint.connect_lazy(),
-            history_id: config.history_id,
-            target: config.target,
+            history_id,
+            target,
         })
     }
 
@@ -236,24 +288,85 @@ pub(in crate::multi) struct Ingress {
 
 impl Ingress {
     pub(in crate::multi) fn installed() -> Result<Option<Arc<Self>>> {
-        let Some(path) = std::env::var_os("RTDB_CLASSIC_OPENING_INGRESS_FILE") else {
-            return Ok(None);
-        };
+        match (
+            std::env::var_os("RTDB_CLASSIC_OPENING_INGRESS_FILE"),
+            std::env::var_os("RTDB_CLASSIC_OPENING_INGRESS_CONFIG"),
+            std::env::var_os("RTDB_CLASSIC_OPENING_INGRESS_PORT"),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(path), None, None) => Self::from_file(Path::new(&path)).map(Some),
+            (None, Some(secret), Some(port)) => Self::from_secret(secret, port).map(Some),
+            _ => Err(invalid()),
+        }
+    }
+
+    fn from_file(path: &Path) -> Result<Arc<Self>> {
         let config: Configuration =
-            serde_json::from_slice(&read_file(Path::new(&path))?).map_err(|_| invalid())?;
-        if config.port == 0
-            || config.port == crate::multi::peer::PORT
-            || config.operator_certificate_sha256 == Some([0; 32])
-            || config.reconciler_certificate_sha256 == [0; 32]
-            || config.operator_certificate_sha256 == Some(config.reconciler_certificate_sha256)
-            || config.operator_certificate_sha256.is_some() != config.verifier.is_some()
+            serde_json::from_slice(&read_file(path)?).map_err(|_| invalid())?;
+        let certificate = read_file(&config.certificate_file)?;
+        let key = zeroize::Zeroizing::new(read_file(&config.private_key_file)?);
+        let ca = read_file(&config.client_ca_file)?;
+        let verifier = config
+            .verifier
+            .map(Verifier::from_configuration)
+            .transpose()?;
+        Self::from_pem(
+            config.port,
+            &certificate,
+            &key,
+            &ca,
+            config.operator_certificate_sha256,
+            config.reconciler_certificate_sha256,
+            verifier,
+        )
+    }
+
+    fn from_secret(secret: OsString, port: OsString) -> Result<Arc<Self>> {
+        let secret = zeroize::Zeroizing::new(secret.into_string().map_err(|_| invalid())?);
+        if secret.len() > MAX_CONFIG_BYTES {
+            return Err(invalid());
+        }
+        let config: SecretConfiguration = serde_json::from_str(&secret).map_err(|_| invalid())?;
+        let key = zeroize::Zeroizing::new(config.private_key_pem);
+        let port = port
+            .to_str()
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port >= 1024)
+            .ok_or_else(invalid)?;
+        let verifier = config.verifier.map(Verifier::from_secret).transpose()?;
+        Self::from_pem(
+            port,
+            config.certificate_pem.as_bytes(),
+            key.as_bytes(),
+            config.client_ca_pem.as_bytes(),
+            config.operator_certificate_sha256,
+            config.reconciler_certificate_sha256,
+            verifier,
+        )
+    }
+
+    fn from_pem(
+        port: u16,
+        certificate: &[u8],
+        key: &[u8],
+        ca: &[u8],
+        operator: Option<[u8; 32]>,
+        reconciler: [u8; 32],
+        verifier: Option<Verifier>,
+    ) -> Result<Arc<Self>> {
+        if port == 0
+            || port == 3000
+            || port == crate::multi::peer::PORT
+            || operator == Some([0; 32])
+            || reconciler == [0; 32]
+            || operator == Some(reconciler)
+            || operator.is_some() != verifier.is_some()
         {
             return Err(invalid());
         }
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = rustls::RootCertStore::empty();
-        let ca = read_file(&config.client_ca_file)?;
-        for cert in CertificateDer::pem_slice_iter(&ca) {
+        for cert in CertificateDer::pem_slice_iter(ca) {
             roots
                 .add(cert.map_err(|_| invalid())?)
                 .map_err(|_| invalid())?;
@@ -264,30 +377,24 @@ impl Ingress {
         )
         .build()
         .map_err(|_| invalid())?;
-        let cert = read_file(&config.certificate_file)?;
-        let chain = CertificateDer::pem_slice_iter(&cert)
+        let chain = CertificateDer::pem_slice_iter(certificate)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| invalid())?;
-        let key = zeroize::Zeroizing::new(read_file(&config.private_key_file)?);
-        let key = PrivateKeyDer::from_pem_slice(&key).map_err(|_| invalid())?;
+        let key = PrivateKeyDer::from_pem_slice(key).map_err(|_| invalid())?;
         let tls = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|_| invalid())?
             .with_client_cert_verifier(clients)
             .with_single_cert(chain, key)
             .map_err(|_| invalid())?;
-        let verifier = config
-            .verifier
-            .map(Verifier::from_configuration)
-            .transpose()?;
-        Ok(Some(Arc::new(Self {
-            port: config.port,
+        Ok(Arc::new(Self {
+            port,
             tls: TlsAcceptor::from(Arc::new(tls)),
-            operator: config.operator_certificate_sha256,
-            reconciler: config.reconciler_certificate_sha256,
+            operator,
+            reconciler,
             verifier,
             mutations: Semaphore::new(1),
-        })))
+        }))
     }
 
     pub(in crate::multi) async fn serve(
@@ -432,9 +539,12 @@ impl Ingress {
 fn read_file(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     File::open(path)
-        .and_then(|file| file.take(65537).read_to_end(&mut bytes))
+        .and_then(|file| {
+            file.take((MAX_CONFIG_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+        })
         .map_err(|_| invalid())?;
-    if bytes.len() > 65536 {
+    if bytes.len() > MAX_CONFIG_BYTES {
         return Err(invalid());
     }
     Ok(bytes)
