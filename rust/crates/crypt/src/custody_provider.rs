@@ -20,6 +20,16 @@ pub fn verify_family_placement(
             "The exact Original family placement has no commissioned signature"))
 }
 
+pub fn verify_private_replay(
+    key: &[u8; 32], purpose: &str, body_sha256: &[u8; 32], signature_bytes: &[u8; 64],
+) -> Result<()> {
+    let message = [b"rtdb/v1/original-private-replay\0".as_slice(), purpose.as_bytes(), b"\0", body_sha256].concat();
+    signature::UnparsedPublicKey::new(&signature::ED25519, key)
+        .verify(&message, signature_bytes)
+        .map_err(|_| Anomaly::new(AnomalyCategory::Forbidden, "rtdb/original-private-replay",
+            "The exact private replay evidence has no commissioned signature"))
+}
+
 pub fn verify_response(
     key: &[u8; 32],
     request: &[u8],

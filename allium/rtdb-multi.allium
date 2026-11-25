@@ -694,6 +694,10 @@ contract LogService {
         -- Commissioned Original branch provisioning and family placement require the current ordered writer at or beyond the imported fence.
         -- The commissioned named family starts at a creation Basis after that writer's ClaimWriter, and its retained receipts remain strictly after the imported fence.
         -- Commissioned Original family readback verifies the current writer and import fence and limits receipt-bearing projections to the named family after its creation.
+        -- The mounted Original admits private replay against the current writer, named creation and selected cursor, paired same-session review proof and Claim, and exact author receipts.
+        -- The independent reader claims the ordered hold once under the current group and cutoff.
+        -- Positive independent comparison for the exact claim authorizes consumption by one same-session retained reservation with the committed reserve and acceptance keys.
+        -- Native family drain waits for the positive authenticated disposition of each private replay hold.
         -- Parent observation returns only the Basis and system time reached by the authenticated named Fork.
         -- Historical readback returns the exact ordered opening or exclusion independently of current authority.
 

@@ -360,6 +360,10 @@ impl ServerDriver {
                     Some(layout) => route.with_original_family_readback_layout(layout.clone())?,
                     None => route,
                 };
+                let route = match &provider.original_private_replay {
+                    Some((key, directory)) => route.with_original_private_replay(*key, directory.clone())?,
+                    None => route,
+                };
                 if custody_providers.insert(provider.database.clone(), Arc::new(route)).is_some() {
                     return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "A database accepts one configured original custody provider"));
                 }

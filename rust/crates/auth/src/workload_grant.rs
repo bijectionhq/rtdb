@@ -105,6 +105,7 @@ pub enum WorkloadOperation {
 pub enum OriginalCustodyOperation {
     Release,
     Dispose,
+    PrivateReplay,
 }
 
 #[derive(Deserialize)]
@@ -381,6 +382,11 @@ impl VerifiedWorkloadGrant {
 
     pub fn is_original_custody_control(&self) -> bool {
         matches!(self.permission, Permission::OriginalCustody(_))
+    }
+
+    pub fn is_original_private_replay(&self) -> bool {
+        matches!(&self.permission, Permission::OriginalCustody(control)
+            if control.operation == OriginalCustodyOperation::PrivateReplay)
     }
 
     pub fn is_original_family(&self) -> bool {

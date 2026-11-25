@@ -27,6 +27,7 @@ pub struct Settings {
     pub(crate) original_family_authoring_key: Option<[u8; 32]>,
     pub(crate) original_family_authoring_controls: BTreeSet<TableRef>,
     pub(crate) original_family_readback_layout: Option<OriginalFamilyReadbackLayout>,
+    pub(crate) original_private_replay: Option<([u8; 32], std::path::PathBuf)>,
     endpoint: Url,
     ca_certificate: Option<String>,
     bearer: Secret,
@@ -112,6 +113,19 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
             .ok_or_else(invalid)?;
         layout.validate(&writer.table, registry)?;
     }
+    let original_private_replay = fields.take("originalPrivateReplay").map(|value| {
+        let mut fields = YamlFields::new(value, "originalPrivateReplay")?;
+        let key = fixed_hex(&fields.required_string("approvalPublicKey")?)?;
+        let directory = std::path::PathBuf::from(fields.required_string("approvalDirectory")?);
+        fields.finish()?;
+        if key == [0; 32] || key == public_key || original_family_authoring_key == Some(key)
+            || original_family_authoring_controls.is_empty() || original_family_readback_layout.is_none()
+            || !directory.is_absolute()
+        {
+            return Err(invalid());
+        }
+        Ok((key, directory))
+    }).transpose()?;
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -133,6 +147,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         original_family_authoring_key,
         original_family_authoring_controls,
         original_family_readback_layout,
+        original_private_replay,
         endpoint,
         ca_certificate,
         bearer: Secret::new(bearer),

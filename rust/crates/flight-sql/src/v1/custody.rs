@@ -126,6 +126,7 @@ pub struct CustodyProviderRoute {
     pub(super) family_line_registry: Option<rtdb_types::TableRef>,
     pub(super) family_authoring_key: Option<[u8; 32]>,
     pub(super) family_readback_layout: Option<OriginalFamilyReadbackLayout>,
+    pub(super) private_replay: Option<super::original_family_landing::private_replay::ReplayApprovals>,
     pub(super) family_authoring_controls: std::collections::BTreeSet<rtdb_types::TableRef>,
 }
 impl fmt::Debug for CustodyProviderRoute {
@@ -144,6 +145,7 @@ impl CustodyProviderRoute {
             family_line_registry: None,
             family_authoring_key: None,
             family_readback_layout: None,
+            private_replay: None,
             family_authoring_controls: Default::default(),
         }
     }
@@ -215,6 +217,26 @@ impl CustodyProviderRoute {
         layout.validate(&self.installation.writer.table, registry)?;
         self.family_readback_layout = Some(layout);
         Ok(self)
+    }
+
+    pub fn with_original_private_replay(
+        mut self, key: [u8; 32], directory: std::path::PathBuf,
+    ) -> rtdb_types::Result<Self> {
+        if key == [0; 32] || self.family_authoring_key == Some(key)
+            || self.family_authoring_controls.is_empty() || self.family_readback_layout.is_none()
+            || !directory.is_absolute() || !directory.is_dir()
+        {
+            return Err(rtdb_types::Anomaly::incorrect(
+                "rtdb/custody-provider-configuration",
+                "Original private replay requires distinct approval trust and a mounted approval directory",
+            ));
+        }
+        self.private_replay = Some(super::original_family_landing::private_replay::ReplayApprovals { key, directory });
+        Ok(self)
+    }
+
+    pub(crate) fn private_replay_configured(&self) -> bool {
+        self.private_replay.is_some()
     }
 
     pub(super) async fn acquire(

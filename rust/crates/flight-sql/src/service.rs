@@ -62,7 +62,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -165,6 +165,16 @@ impl Call {
                     .and_then(|grant| grant.original_family_readback(&self.database, route.authority(), self.service.0.node.now()).ok())
                     .is_some_and(|(scope, _, _)| rtdb_types::rtdb_v1::Basis::from_bytes(&scope.line.created)
                         .is_ok_and(|created| scope.line.fence.covers_imported_family_line(fence, &scope.line.writer, created)))
+            }));
+        let allowed = allowed || (caller.verified_credential
+            && matches!(self.kind, CallKind::Handshake | CallKind::V1OriginalPrivateReplay)
+            && self.service.0.config.custody_providers.get(&self.database).is_some_and(|route| {
+                route.private_replay_configured()
+                    && route.owner().is_some() && caller.principal.user_id() == route.owner()
+                    && caller.principal.workload_grant().is_some_and(|grant| grant.admit_original_custody(
+                        &self.database, route.authority(), rtdb_auth::OriginalCustodyOperation::PrivateReplay,
+                        self.service.0.node.now(),
+                    ).is_ok())
             }));
         if allowed { Ok(()) } else { Err(Status::permission_denied("This deployment requires its exact imported workload assignment")) }
     }
@@ -390,7 +400,9 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                let allowed = if grant.is_original_custody_control() {
+                let allowed = if grant.is_original_private_replay() {
+                    matches!(kind, CallKind::Handshake | CallKind::V1OriginalPrivateReplay)
+                } else if grant.is_original_custody_control() {
                     kind.allows_original_custody_control()
                 } else if grant.is_original_family() {
                     kind.allows_original_family()
@@ -494,7 +506,7 @@ impl Service {
                 caller.principal.authorize_database(attachment.name(), DatabaseAccess::Read).map_err(status)?;
                 Some(attachment)
             } else if let Some(grant) = caller.principal.workload_grant()
-                .filter(|grant| grant.is_original_family_readback())
+                .filter(|grant| grant.is_original_family_readback() || grant.is_original_private_replay())
             {
                 Some(catalog.database(grant.database()).map_err(status)?)
             } else if catalog.is_placed() {
@@ -869,6 +881,7 @@ impl FlightService for Service {
                 crate::v1::custody::RELEASE => CallKind::V1CustodyRelease,
                 crate::v1::original_family_landing::ACTION => CallKind::V1OriginalFamily,
                 crate::v1::original_family_readback::ACTION => CallKind::V1OriginalFamilyReadback,
+                crate::v1::original_family_landing::private_replay::ACTION => CallKind::V1OriginalPrivateReplay,
                 crate::v1::appointment::PREPARE | crate::v1::appointment::ACTIVATE | "rtdb.v1.Transact" => CallKind::V1Appointment,
                 _ => CallKind::V1Action,
             };

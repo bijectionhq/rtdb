@@ -786,6 +786,49 @@ impl Readback<'_> {
     }
 }
 
+pub(super) fn verify_replay_author(
+    index: &BranchIndex,
+    layout: &OriginalFamilyReadbackLayout,
+    order: &rtdb_node::serving::custody_release::NativeAuthoring,
+    evidence: &super::original_family_landing::private_replay::AuthorEvidence,
+    written: Basis,
+    system_time_micros: i64,
+    now: Timestamp,
+) -> Result<(), Status> {
+    use super::original_family_landing::wire::nonzero;
+    let cut = index.exact(written).map_err(error::anomaly)?;
+    if cut.system_time.0 != system_time_micros || order.target.table != layout.carrier {
+        return Err(denied());
+    }
+    let mapping_id = EntityId::String(format!("{}:{}", encode_hex(&order.group), encode_hex(&order.placement)));
+    let mapping = index.receipt_written_local_point(
+        &order.target.branch, order.branch_created, written, &layout.member_mapping, &mapping_id,
+    ).map_err(error::anomaly)?.ok_or_else(denied)?;
+    committed_body(mapping, "body", &nonzero(&evidence.mapping_sha256)?)?;
+    let view = index.view(MAIN_BRANCH, At::Exactly(written), Layer::Merged, now).map_err(error::anomaly)?;
+    for (table, id, columns) in [
+        (&layout.admission, &evidence.command, &[("admission", &evidence.command_sha256)][..]),
+        (&layout.business_receipt, &evidence.business_receipt, &[("outcome", &evidence.business_receipt_sha256)][..]),
+        (&layout.execution, &evidence.execution_slot, &[("marker", &evidence.marker_sha256), ("capsule", &evidence.capsule_sha256)][..]),
+    ] {
+        if !(1..=1024).contains(&id.len()) || id.chars().any(char::is_control) {
+            return Err(denied());
+        }
+        let event = co_written(&view, table, &EntityId::String(id.clone()), Timestamp(0))?;
+        if event.cut.system_time != cut.system_time
+            || event.valid.lower() != Timestamp(0) || event.valid.upper() != Timestamp::MAX
+        {
+            return Err(denied());
+        }
+        for (column, expected) in columns {
+            if cell_digest(event, column)? != nonzero(expected)? {
+                return Err(denied());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn exact_point<'a>(
     view: &BranchView<'a>,
     table: &TableRef,
@@ -862,15 +905,19 @@ fn committed_body<'a>(
 }
 
 fn digest_point(event: &BranchEvent, columns: &[&str]) -> Result<Json, Status> {
-    let image = clear_image(event)?;
     let mut digests = serde_json::Map::new();
     for &column in columns {
-        let value = binary(image.cells.get(column))
-            .filter(|bytes| bytes.len() <= MAX_DIGEST_CELL_BYTES)
-            .ok_or_else(denied)?;
-        digests.insert(column.into(), json!(encode_hex(&Sha256::digest(value))));
+        digests.insert(column.into(), json!(encode_hex(&cell_digest(event, column)?)));
     }
     Ok(json!({ "point": coordinates(event)?, "sha256": digests }))
+}
+
+fn cell_digest(event: &BranchEvent, column: &str) -> Result<[u8; 32], Status> {
+    let image = clear_image(event)?;
+    let value = binary(image.cells.get(column))
+        .filter(|bytes| bytes.len() <= MAX_DIGEST_CELL_BYTES)
+        .ok_or_else(denied)?;
+    Ok(Sha256::digest(value).into())
 }
 
 fn clear_image(event: &BranchEvent) -> Result<&RowImage, Status> {

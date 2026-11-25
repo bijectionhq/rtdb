@@ -3,7 +3,7 @@ use prost::Message;
 use rtdb_node::serving::custody_release::{CustodyCarrierAuthority, CustodyReleaseRegistration, NativeLandingWitness};
 use rtdb_tx::transact::CustodyOccurrence;
 use rtdb_types::{EntityId, TableRef, Timestamp, rtdb_v1::Basis};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::v1::{error, proto};
@@ -72,6 +72,7 @@ pub(super) enum Request {
         reviewed_source_b64: String,
         original_author: AuthorReceipt,
         selected_author: AuthorReceipt,
+        private_replay: Option<super::private_replay::ReplayReference>,
         custody_read_proof_b64: String,
         claim_b64: String,
         native_target_b64: String,
@@ -80,6 +81,16 @@ pub(super) enum Request {
         request_sha256: String,
         receipt: Witness,
         proof: Witness,
+    },
+    AcquirePrivateReplay {
+        family: String,
+        hold: String,
+        authorization_sha256: String,
+        reviewed_source_b64: String,
+        original_author: AuthorReceipt,
+        selected_author: AuthorReceipt,
+        custody_read_proof_b64: String,
+        claim_b64: String,
     },
     SealPayload {
         family: String,
@@ -147,6 +158,7 @@ impl Request {
             | Self::ConfirmAuthoring { family, .. }
             | Self::Reserve { family, .. }
             | Self::ReserveRetainedAuthoring { family, .. }
+            | Self::AcquirePrivateReplay { family, .. }
             | Self::SealPayload { family, .. }
             | Self::SealLink { family, .. }
             | Self::BindAcceptanceBody { family, .. }
@@ -162,7 +174,7 @@ impl Request {
     }
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AuthorReceipt {
     pub(super) key: String,
@@ -220,7 +232,7 @@ pub(super) fn fixed<const N: usize>(value: &str) -> Result<[u8; N], Status> {
     hex(value)?.try_into().map_err(|_| invalid())
 }
 
-pub(super) fn nonzero<const N: usize>(value: &str) -> Result<[u8; N], Status> {
+pub(in crate::v1) fn nonzero<const N: usize>(value: &str) -> Result<[u8; N], Status> {
     let bytes = fixed(value)?;
     if bytes == [0; N] {
         return Err(invalid());
@@ -262,7 +274,7 @@ pub(super) fn key(value: &str) -> Result<Vec<u8>, Status> {
     hex(value)
 }
 
-pub(super) fn basis(value: &str) -> Result<Basis, Status> {
+pub(in crate::v1) fn basis(value: &str) -> Result<Basis, Status> {
     Basis::from_bytes(&fixed::<24>(value)?).map_err(error::anomaly)
 }
 

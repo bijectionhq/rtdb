@@ -73,7 +73,7 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
 }
 
 pub(crate) fn is_action(name: &str) -> bool {
-    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name.starts_with("rtdb.admin.v1.")
+    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -115,9 +115,14 @@ impl Service {
                 let family = self.managed_family(&call).await?;
                 let mut features = [
                     original_family_landing::FEATURE, original_family_landing::MANAGED_FEATURE,
-                    original_family_landing::RETAINED_AUTHORING_REVIEW,
                     ROW_CUSTODY, REVIEWED_CUSTODY_PLACEMENT, "query", "query.track",
                 ].map(str::to_owned).to_vec();
+                if family.route.family_authoring_controls.is_empty() || family.route.private_replay_configured() {
+                    features.push(original_family_landing::RETAINED_AUTHORING_REVIEW.into());
+                }
+                if family.route.private_replay_configured() {
+                    features.push(original_family_landing::private_replay::FEATURE.into());
+                }
                 if !family.route.family_authoring_controls.is_empty() {
                     features.push(original_family_landing::REGISTERED_AUTHORING.into());
                 }
@@ -299,6 +304,7 @@ impl Service {
             scoped_hold::ACTION => self.scoped_hold_action(&call, &action.body).await,
             custody::RELEASE => self.custody_release_action(&call, &action.body).await,
             original_family_landing::ACTION => self.original_family_landing(&call, &action.body).await,
+            original_family_landing::private_replay::ACTION => self.original_private_replay(&call, &action.body).await,
             OFFER_DECISION_CLOCK => match decode(action.body) {
                 Ok(request) => self.v1_offer_decision_clock(&call, request).await,
                 Err(status) => Err(status),

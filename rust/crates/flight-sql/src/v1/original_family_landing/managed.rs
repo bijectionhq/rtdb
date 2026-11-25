@@ -20,6 +20,7 @@ use rtdb_types::{
 
 use super::*;
 use crate::v1::custody::{CustodyProviderRoute, family_review_commitment, session_binding};
+use private_replay::ReplayReference;
 use vault::RetainedReviewQuery;
 use wire::AuthorReceipt;
 
@@ -335,9 +336,19 @@ impl Service {
                     .await
                     .map_err(error::anomaly)?;
                 let record = lock.family().map_err(error::anomaly)?;
-                operation
-                    .check_placement(record, &transaction)
+                let landing = operation
+                    .check_placement(record, &transaction, !managed.route.family_authoring_controls.is_empty())
                     .map_err(error::anomaly)?;
+                if let Some((landing, reference)) = landing.and_then(|landing| {
+                    Some((landing, landing.private_replay.as_ref()?))
+                }) {
+                    let hold = record.private_replay(reference)?;
+                    if !hold.matches_consumed(landing, call) {
+                        return Err(denied());
+                    }
+                    let reserved = (transaction.key == landing.order.accept_key).then_some(landing.order.destination);
+                    hold.current(&operation, managed.route, &managed.database, call, reserved).await?;
+                }
                 if transaction
                     .ops
                     .iter()
@@ -403,7 +414,7 @@ impl Service {
             ),
             Request::ReserveRetainedAuthoring {
                 member, winner, reservation, target, reviewed_source_b64,
-                original_author, selected_author, custody_read_proof_b64, claim_b64,
+                original_author, selected_author, private_replay, custody_read_proof_b64, claim_b64,
                 native_target_b64, reserve_key, accept_key, request_sha256, receipt, proof, ..
             } => {
                 let (landing, source) = Reservation {
@@ -416,8 +427,23 @@ impl Service {
                     read_proof: custody_read_proof_b64,
                     claim: claim_b64,
                 };
-                operation.reserve_retained_authoring(&managed, call, landing, &source, authors).await?
+                operation.reserve_retained_authoring(&managed, call, landing, &source, authors, private_replay).await?
             }
+            Request::AcquirePrivateReplay {
+                hold, authorization_sha256, reviewed_source_b64,
+                original_author, selected_author, custody_read_proof_b64, claim_b64, ..
+            } => {
+                let authors = RetainedAuthoring {
+                    original: original_author,
+                    selected: selected_author,
+                    read_proof: custody_read_proof_b64,
+                    claim: claim_b64,
+                };
+                operation.acquire_private_replay(
+                    &managed, call, hold, authorization_sha256, reviewed_source_b64, authors,
+                ).await?
+            }
+            Request::Reserve { .. } if !managed.route.family_authoring_controls.is_empty() => return Err(denied()),
             request @ (Request::ConfirmAuthoring { .. } | Request::Activate { .. }) => {
                 let exact_key = match &request {
                     Request::ConfirmAuthoring { write_key, .. } => key(write_key)?,
@@ -445,12 +471,21 @@ impl FamilyCall<'_> {
         mut landing: Landing,
         evidence: &proto::CustodyReviewedSource,
         authors: RetainedAuthoring,
+        private_replay: Option<ReplayReference>,
     ) -> Result<Value, Status> {
         let lock = self.vault.lock(self.authority, self.family).await.map_err(error::anomaly)?;
-        let record = lock.family().map_err(error::anomaly)?.clone();
+        let mut record = lock.family().map_err(error::anomaly)?.clone();
         record.live().map_err(error::anomaly)?;
         let verified = self.verify_retained_review(managed, call, &record, &landing.order.review, evidence, &authors).await?;
         landing.retained_query = Some(verified.query);
+        landing.private_replay = private_replay;
+        if let Some(reference) = &landing.private_replay {
+            let prior = record.landings.iter().find(|prior| prior.assertion == landing.assertion);
+            let hold = record.private_replays.iter_mut().find(|hold| hold.has_reference(reference)).ok_or_else(denied)?;
+            hold.consume(self, managed, call, &landing, prior).await?;
+        } else if !managed.route.family_authoring_controls.is_empty() {
+            return Err(denied());
+        }
         self.reserve(
             lock, record, landing, evidence, &verified.original_frame,
             verified.selected_frame.as_deref().unwrap_or(&verified.original_frame),
@@ -693,13 +728,16 @@ impl FamilyCall<'_> {
         if allowed { Ok(()) } else { Err(denied()) }
     }
 
-    fn check_placement(&self, family: &Family, tx: &Transact) -> rtdb_types::Result<()> {
+    fn check_placement<'f>(
+        &self, family: &'f Family, tx: &Transact, private_replay_required: bool,
+    ) -> rtdb_types::Result<Option<&'f Landing>> {
         let scope = self.managed.ok_or_else(conflict)?;
         family.live()?;
         if scope.group != family.group || !tx.otherwise.is_empty() || tx.ops.is_empty() {
             return Err(conflict());
         }
         let mut checked = false;
+        let mut reviewed_landing = None;
         let mut created_group = false;
         let mut initial_placement = false;
         for op in &tx.ops {
@@ -765,37 +803,42 @@ impl FamilyCall<'_> {
                     reservation,
                     source,
                     read_proof,
-                } if *group == scope.group => family.landings.iter().any(|landing| {
-                    matches_landing(scope, landing)
-                        && landing.order.reserve_key == tx.key
-                        && landing.order.review.cut == *source
-                        && landing.body.is_some()
-                        && landing.order.review.original == reservation.original
-                        && landing.order.review.selected == reservation.source
-                        && landing.order.destination == reservation.destination
-                        && landing.order.link == reservation.link
-                        && landing.order.target == reservation.target
-                        && landing.order.review_sha256 == reservation.review_sha256
-                        && landing.retained_query.as_ref().is_none_or(|query| {
-                            query.proof == hash(read_proof)
-                                && tx.requires.iter().any(|guard| matches!(guard,
-                                    Guard::Unchanged(claim) if query.claim == hash(claim.as_bytes())))
-                        })
-                        && landing
-                            .payload
-                            .as_ref()
-                            .is_some_and(|sealed| sealed.digest == reservation.carrier_sha256)
-                        && landing
-                            .link
-                            .as_ref()
-                            .is_some_and(|sealed| sealed.digest == reservation.link_sha256)
-                }),
+                } if *group == scope.group => {
+                    reviewed_landing = family.landings.iter().find(|landing| {
+                        matches_landing(scope, landing)
+                            && (!private_replay_required || landing.private_replay.is_some())
+                            && landing.order.reserve_key == tx.key
+                            && landing.order.review.cut == *source
+                            && landing.body.is_some()
+                            && landing.order.review.original == reservation.original
+                            && landing.order.review.selected == reservation.source
+                            && landing.order.destination == reservation.destination
+                            && landing.order.link == reservation.link
+                            && landing.order.target == reservation.target
+                            && landing.order.review_sha256 == reservation.review_sha256
+                            && landing.retained_query.as_ref().is_none_or(|query| {
+                                query.proof == hash(read_proof)
+                                    && tx.requires.iter().any(|guard| matches!(guard,
+                                        Guard::Unchanged(claim) if query.claim == hash(claim.as_bytes())))
+                            })
+                            && landing
+                                .payload
+                                .as_ref()
+                                .is_some_and(|sealed| sealed.digest == reservation.carrier_sha256)
+                            && landing
+                                .link
+                                .as_ref()
+                                .is_some_and(|sealed| sealed.digest == reservation.link_sha256)
+                    });
+                    reviewed_landing.is_some()
+                }
                 Op::LandCustodyBranch { branch, placements }
                     if branch == &scope.branch && placements.len() == 1 =>
                 {
                     let place = &placements[0];
-                    family.landings.iter().any(|landing| {
+                    reviewed_landing = family.landings.iter().find(|landing| {
                         matches_landing(scope, landing)
+                            && (!private_replay_required || landing.private_replay.is_some())
                             && landing.order.accept_key == tx.key
                             && landing.order.reserve_key == place.reserve_key
                             && landing.order.destination == place.placement.placement_id
@@ -818,7 +861,8 @@ impl FamilyCall<'_> {
                                 matches_witness(tx, &landing.order.receipt, digest)
                                     && matches_witness(tx, &landing.order.proof, digest)
                             })
-                    })
+                    });
+                    reviewed_landing.is_some()
                 }
                 _ => false,
             };
@@ -837,7 +881,7 @@ impl FamilyCall<'_> {
         if !checked || created_group && !initial_placement {
             return Err(conflict());
         }
-        Ok(())
+        Ok(reviewed_landing)
     }
 
     async fn placement_basis(

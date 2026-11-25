@@ -22,7 +22,8 @@ use crate::service::{Call, Service};
 use super::{error, proto, transact};
 
 mod vault;
-mod wire;
+pub(super) mod wire;
+pub(crate) mod private_replay;
 mod managed;
 pub(super) use managed::{MANAGED_FEATURE, REGISTERED_AUTHORING, RETAINED_AUTHORING_REVIEW, is_managed_family};
 pub(super) use vault::NativeFamilyVault;
@@ -62,7 +63,7 @@ impl Service {
         mounted.require_original_writer().await.map_err(error::anomaly)?;
         let authority = mounted.native_landing_authority();
         let request: Request = serde_json::from_slice(body).map_err(|_| invalid())?;
-        if matches!(request, Request::ReserveRetainedAuthoring { .. }) {
+        if matches!(request, Request::ReserveRetainedAuthoring { .. } | Request::AcquirePrivateReplay { .. }) {
             return Err(error::unsupported(RETAINED_AUTHORING_REVIEW));
         }
         let result = if let Some(family) = request.family()? {
@@ -183,6 +184,7 @@ impl Reservation {
                 selected.carrier_sha256.as_slice().try_into().map_err(|_| invalid())?,
             ],
             retained_query: None,
+            private_replay: None,
             review_evidence: hash(&source.encode_to_vec()),
             body: None,
             payload: None,
@@ -405,7 +407,8 @@ impl FamilyCall<'_> {
                 self.drain(lock, record, basis(&revoked_at)?, nonzero(&inventory_sha256)?).await
             }
             Request::Scope {} | Request::EnrollAuthoring { .. } | Request::ReserveRetainedAuthoring { .. }
-            | Request::SubmitPlacement { .. } | Request::PlacementReceipt { .. } => return Err(invalid()),
+            | Request::AcquirePrivateReplay { .. } | Request::SubmitPlacement { .. }
+            | Request::PlacementReceipt { .. } => return Err(invalid()),
         };
         result.map_err(error::anomaly)
     }
@@ -420,6 +423,7 @@ impl FamilyCall<'_> {
                 authors: Vec::new(),
                 landings: Vec::new(),
                 holds: Vec::new(),
+                private_replays: Vec::new(),
                 close: None,
             },
             None => return Err(conflict()),
@@ -576,6 +580,12 @@ impl FamilyCall<'_> {
                 return Ok(ok());
             }
         } else {
+            if landing.private_replay.is_some() && family.landings.iter().any(|prior| {
+                [&prior.order.reserve_key, &prior.order.accept_key].iter()
+                    .any(|key| **key == landing.order.reserve_key || **key == landing.order.accept_key)
+            }) {
+                return Err(conflict());
+            }
             if family.authors.iter().any(|author| author.assertion == landing.assertion) {
                 return Err(conflict());
             }
@@ -847,7 +857,9 @@ impl FamilyCall<'_> {
         inventory: [u8; 32],
     ) -> rtdb_types::Result<Value> {
         let close = family.close.as_ref().ok_or_else(conflict)?;
-        if (close.revoked_at, close.native_inventory) != (revoked_at, inventory) || !family.holds.is_empty() {
+        if (close.revoked_at, close.native_inventory) != (revoked_at, inventory) || !family.holds.is_empty()
+            || family.private_replays.iter().any(private_replay::ReplayHold::blocks_drain)
+        {
             return Err(conflict());
         }
         if close.drained {

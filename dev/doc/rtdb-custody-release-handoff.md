@@ -775,3 +775,99 @@ The existing recorded and clear response rules apply.
 
 Issue and exercise the dedicated credentials in the paired Bijection integration before enabling managed delivery.
 Keep scoped Query and Changes on the separately authenticated private audience attachment.
+
+## Mounted Original private replay
+
+This opt-in Flight contract enables a registered managed authoring review to reserve a landing after the independent reader has completed its private replay.
+Local authoring keeps its existing native family path.
+The registered managed path requires a hold at both the vault reserve and the effect-bearing placement orders.
+It retains the original tracked v4 Query, its Claim and its custody read proof on one session.
+Query keeps `scoped_hold` at tag 12 and `custody_review` at tag 13.
+The author commands and execution keys stay with the Original reader.
+
+### Flight wire
+
+The same v4 session sends `rtdb.v1.OriginalFamilyLanding` with the following JSON object:
+
+```json
+{
+  "operation": "acquire_private_replay",
+  "family": "<16-byte hex>",
+  "hold": "<caller-generated random 32-byte hex>",
+  "authorization_sha256": "<32-byte hex>",
+  "reviewed_source_b64": "<CustodyReviewedSource protobuf>",
+  "original_author": {"key": "<32-byte hex>", "basis": "<24-byte hex>", "system_time_micros": 0},
+  "selected_author": {"key": "<32-byte hex>", "basis": "<24-byte hex>", "system_time_micros": 0},
+  "custody_read_proof_b64": "<raw custody read token>",
+  "claim_b64": "<Claim protobuf>"
+}
+```
+
+An independent owner session uses the existing v3 Original custody issuer with `original_custody.operation` set to `private-replay` and the exact mounted authority.
+That session can call `rtdb.v1.OriginalPrivateReplay`.
+Its request is `{operation,family,hold,receipt}` for `private_replay_status`, `complete_private_replay` and `dispose_private_replay`.
+For `claim_private_replay`, add `nonce` with the 32-byte hex reader nonce.
+For status after a lost acquisition reply, supply `authorization_sha256` in place of `receipt`.
+Use exactly one status selector.
+
+Every successful operation replies with `{hold,receipt,state,fresh,claim_receipt,disposed,expires_at_micros}`.
+Both receipts are opaque 32-byte hex and `claim_receipt` is null until a successful claim.
+The state is one of `held`, `claimed`, `completed`, `consumed`, or `cancelled`.
+The runner may open once only on a successful claim response with `fresh:true`.
+An exact retry or status can recover the ordered state with `fresh:false`, including after a lost claim reply.
+If the claim reply is lost, the reader authority must establish positive disposition before requesting disposal.
+Status can report historical state past the replay cutoff and after native family close.
+
+The existing v4 `reserve_retained_authoring` operation adds `private_replay: {hold,receipt}` using the acquired receipt.
+Its caller keeps the original v4 session, paired proof and Claim, author selectors, and the preselected reserve and acceptance keys.
+The vault records consumption and the exact reservation together.
+An existing native acceptance can still be recovered by its exact receipt.
+The exclusive replay cutoff and current authority gate fresh placement orders.
+
+### Independent evidence mount
+
+Commission `originalPrivateReplay` on the mounted managed custody provider with `approvalDirectory` and `approvalPublicKey`.
+The directory is an absolute read-only projection on the eligible native writer and the public key is a distinct Ed25519 verification key in 32-byte lowercase hex.
+This uses the installed Original owner, registered authoring controls, native family vault, line registry, and commissioned v5 readback layout.
+The private replay capability is `row-custody.managed-original-private-replay`.
+
+The independent authority publishes each file as `{"body_b64":"…","signature":"…"}`.
+Base64 is URL-safe and unpadded.
+Hex is lowercase without a prefix.
+The signature is 64-byte hex and signs the concatenation of ASCII `rtdb/v1/original-private-replay`, NUL, the ASCII purpose, NUL, and the 32 raw SHA-256 bytes of the decoded JSON body.
+All fields listed below are required except that a disposal for a never-claimed hold uses a null claim receipt.
+RTDB compares the exact decoded body digest, so the publisher can choose any strict JSON object encoding and must retain those same bytes for recovery.
+
+| File | Body fields |
+| --- | --- |
+| `<hold>.authorize.json` | `hold`, `database`, `family`, `receipt_namespace`, `line_generation`, `creation_key`, `parent_basis`, `reviewed_source_sha256`, `custody_read_proof_sha256`, `claim_sha256`, `request_sha256`, `reserve_key`, `accept_key`, `reader_nonce_sha256`, `decision_sha256`, `owner_version_sha256`, `replay_head_version_sha256`, `audience_version_sha256`, `expires_at_micros`, `review_expires_at_micros`, `original`, `selected` |
+| `<hold>.complete.json` | `hold`, acquired `receipt`, `claim_receipt`, `authorization_sha256`, `comparison_sha256`, `expires_at_micros` |
+| `<hold>.dispose.json` | `hold`, acquired `receipt`, `claim_receipt`, `authorization_sha256`, `disposition`, `disposition_sha256` |
+
+The authorization namespace is the existing v4 author receipt namespace, including its exact writer and named creation.
+The generation is 16 bytes, the parent is a 24-byte Basis, and RTDB uses its existing 16-to-64-byte key encoding for creation, reserve and acceptance.
+The source digest hashes the raw reviewed-source protobuf and the proof and Claim digests hash the raw tokens.
+The nonce digest hashes the decoded 32 nonce bytes.
+Other commitments are 32-byte SHA-256 hex.
+The four decision and Version digests commit independently reviewed current application evidence.
+The application owner must remove the current authorization projection when any of those Versions or the underlying decision cease to apply.
+The holder cannot renew a changed authorization at the same hold identity.
+The independent reader grant must cover the exclusive hold cutoff for a fresh claim or completion.
+
+Both author objects have fields `receipt` (the exact author selector from the acquire frame), `command`, `command_sha256`, `business_receipt`, `business_receipt_sha256`, `execution_slot`, `marker_sha256`, `capsule_sha256`, `mapping_sha256`, `sealed_replay_sha256`, `request_fingerprint_sha256`, `root_position`, `private_label_sha256`, and `recovery_expires_at_micros`.
+The command, business receipt and slot are literal Text IDs in the commissioned v5 relations.
+The mapping digest is for the existing v5 `body` projection.
+The command, business outcome and both ciphertext digests are checked at the exact author Then cut, alongside the native contributor pair.
+First-only acquisition uses identical author objects and selectors.
+The selected cursor matches the reviewed cut.
+
+The completion authority publishes a positive comparison after the exact claimed reader has replayed the sealed request and checked the staged effect, result, reviewed decision and current Versions.
+Its comparison digest commits that evidence, and its expiry must cover the hold cutoff.
+The disposition authority publishes a positive terminal after the exact reader and its execution custody have settled.
+Use `released` for a disposed reader whose completed handoff can proceed, or `cancelled` to fence the hold.
+Neither completion, consumption nor expiry settles the reader for family drain.
+The installed evidence publisher must retain the exact disposition for recovery and preserve current authorization through the final acceptance while its evidence still applies.
+
+The paired lane owns the v3 credential issuer, the independently retained application authorization and its invalidation, the comparison and reader disposition publishers, and the private runner.
+Commission the shared read-only approvals projection and verify producer-backed revocation and reader join before enabling fresh managed replay.
+The RTDB endpoint reads only bounded signed commitments and exact co-written digests.

@@ -273,7 +273,7 @@ fn lock_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn read_record<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Result<Option<T>> {
+pub(super) fn read_record<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Result<Option<T>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -308,6 +308,8 @@ pub(super) struct Family {
     pub(super) authors: Vec<Author>,
     pub(super) landings: Vec<Landing>,
     pub(super) holds: Vec<Hold>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) private_replays: Vec<super::private_replay::ReplayHold>,
     pub(super) close: Option<Close>,
 }
 
@@ -382,6 +384,8 @@ pub(super) struct Landing {
     pub(super) source_carriers: [[u8; 32]; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) retained_query: Option<RetainedReviewQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) private_replay: Option<super::private_replay::ReplayReference>,
     pub(super) review_evidence: [u8; 32],
     pub(super) body: Option<[u8; 32]>,
     pub(super) payload: Option<Sealed>,
@@ -398,6 +402,7 @@ impl Landing {
             && self.winner == other.winner
             && self.source_carriers == other.source_carriers
             && self.retained_query == other.retained_query
+            && self.private_replay == other.private_replay
             && self.review_evidence == other.review_evidence
     }
 }
@@ -508,6 +513,7 @@ mod tests {
             authors: vec![],
             landings: vec![],
             holds: vec![],
+            private_replays: vec![],
             close: Some(Close {
                 key: vec![10; 16],
                 revoked_at: Basis::new(authority.incarnation, 2),

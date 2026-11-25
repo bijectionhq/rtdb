@@ -318,16 +318,16 @@ impl BranchIndex {
             .is_some_and(|(winner, authored)| std::ptr::eq(winner, authored))
     }
 
-    fn check_current_custody_review(
-        &self, group: CustodyGroupId, reservation: &CustodyReservation, review: &CustodyReview,
+    pub fn check_current_custody_review(
+        &self, group: CustodyGroupId, original: [u8; 32], selected: [u8; 32], review: &CustodyReview,
         except: Option<CustodyPlacementId>,
     ) -> Result<()> {
-        let (observed, original, source) = self.custody_review_at(
-            &review.branch, review.basis, review.valid_at, group, reservation.source,
+        let (observed, founding, source) = self.custody_review_at(
+            &review.branch, review.basis, review.valid_at, group, selected,
         )?;
         let view = self.view(&review.branch, At::Latest, Layer::Merged, self.head.system_time)?;
         let current = self.live_custody(group)?.inventory_except(group, self.head.basis, except);
-        if observed != *review || original.commitment(group) != reservation.original
+        if observed != *review || founding.commitment(group) != original
             || current.is_none_or(|inventory| inventory.sha256 != review.inventory_sha256)
             || view.data.changed.is_some_and(|changed| changed > review.basis)
             || !self.custody_winner(&view, group, source, review.valid_at)
@@ -346,7 +346,7 @@ impl BranchIndex {
         {
             return Err(placement_conflict());
         }
-        self.check_current_custody_review(group, reservation, &reviewed.source, None)
+        self.check_current_custody_review(group, reservation.original, reservation.source, &reviewed.source, None)
     }
 
     pub fn check_custody_activation_route(
@@ -364,7 +364,9 @@ impl BranchIndex {
                 {
                     return Err(placement_conflict());
                 }
-                self.check_current_custody_review(group, &pending.reservation, &reviewed.source, Some(destination))
+                self.check_current_custody_review(
+                    group, pending.reservation.original, pending.reservation.source, &reviewed.source, Some(destination),
+                )
             }
             _ => Err(placement_conflict()),
         }
