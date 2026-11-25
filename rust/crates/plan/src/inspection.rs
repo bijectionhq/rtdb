@@ -3,7 +3,7 @@ use rtdb_types::StructFields;
 use async_trait::async_trait;
 use rtdb_types::{Result, Value};
 
-use crate::CatalogRows;
+use crate::{CatalogRows, Field};
 
 pub type InspectionRow = StructFields<Value>;
 
@@ -26,5 +26,10 @@ pub trait CatalogInspection: Send {
     /// Returns at most `limit` records with the provider's physical fields.
     async fn next_arrow(&mut self, _limit: usize) -> Result<Option<rtdb_columnar::OwnedBatch>> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.plan/inspection-arrow", "The inspection provider does not return Arrow batches"))
+    }
+
+    /// The scan fields include columns read by predicates. An empty slice still requests rows.
+    async fn next_arrow_projected(&mut self, limit: usize, _columns: &[Field]) -> Result<Option<rtdb_columnar::OwnedBatch>> {
+        self.next_arrow(limit).await
     }
 }
