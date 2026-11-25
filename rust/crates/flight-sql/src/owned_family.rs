@@ -29,6 +29,7 @@ pub(crate) const OPEN_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.OpenWorldOverlayR
 pub(crate) const PLAN_ASSERTION_FAMILY_FENCE_V1: &str = "rtdb.owned.PlanAssertionFamilyFence.v1";
 pub(crate) const FAMILY_RESPONSE_RELEASE_V2: &str = "rtdb.owned.FamilyResponseRelease.v2";
 pub(crate) const RETIRED_ORIGINAL_FAMILY_V1: &str = "rtdb.owned.RetiredOriginalFamily.v1";
+pub(crate) const RETIRED_ORIGINAL_WORLD_RANK_V1: &str = "rtdb.owned.RetiredOriginalWorldRank.v1";
 pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionFamily.v1";
 
 pub(crate) fn is_family_action(action: &str) -> bool {
@@ -38,7 +39,7 @@ pub(crate) fn is_family_action(action: &str) -> bool {
         | RESOLVE_FAMILY_MEMBER_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
         | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1 | FAMILY_RESPONSE_RELEASE_V2
-        | RETIRED_ORIGINAL_FAMILY_V1)
+        | RETIRED_ORIGINAL_FAMILY_V1 | RETIRED_ORIGINAL_WORLD_RANK_V1)
 }
 
 const MAX_DERIVED_PER_REQUEST: usize = 256;
@@ -161,6 +162,28 @@ impl RetiredFamilyRequest {
     }
 }
 
+pub struct RetiredWorldRankRequest {
+    pub address: [u8; 32],
+    pub signature: [u8; 64],
+    pub signed_body: Bytes,
+}
+
+impl RetiredWorldRankRequest {
+    pub fn release(tail: &Bytes) -> Result<FamilyReleaseRequest, Status> {
+        let mut frame = Frame(tail);
+        let request = frame.family_release()?;
+        frame.finish()?;
+        Ok(request)
+    }
+
+    pub fn open(tail: &Bytes) -> Result<(FamilyReleaseRegistrationWire, Bytes), Status> {
+        let mut frame = Frame(tail);
+        let registration = frame.release_registration()?;
+        let carrier = frame.tail(tail, 1 << 20)?;
+        Ok((registration, carrier))
+    }
+}
+
 pub enum FamilyRequest {
     Scope,
     EnrollOriginal(WorldRowAuthoring),
@@ -195,6 +218,7 @@ pub enum FamilyRequest {
     Settle { family: Uuid },
     Release(FamilyReleaseRequest),
     Retired(RetiredFamilyRequest),
+    RetiredWorldRank(RetiredWorldRankRequest),
 }
 
 pub struct FamilyFenceReply {
@@ -214,6 +238,7 @@ pub enum FamilyReply {
     Opened(Bytes),
     Fence(FamilyFenceReply),
     ReleaseRegistration(Bytes),
+    RankTransferPrepared(Bytes),
 }
 
 struct Frame<'a>(&'a [u8]);
@@ -465,6 +490,11 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
             signature: frame.take("custody reader signature")?,
             signed_body: frame.tail(body, 325 + MAX_ROW_BYTES)?,
         }),
+        RETIRED_ORIGINAL_WORLD_RANK_V1 => FamilyRequest::RetiredWorldRank(RetiredWorldRankRequest {
+            address: frame.take("World rank transfer address")?,
+            signature: frame.take("World rank transfer signature")?,
+            signed_body: frame.tail(body, MAX_ROW_BYTES - 128)?,
+        }),
         SETTLE_ASSERTION_FAMILY_V1 => FamilyRequest::Settle { family: frame.uuid("family")? },
         _ => return Err(unsupported()),
     };
@@ -533,11 +563,17 @@ impl Service {
         if !self.0.config.owned_native_actions || call.session.audience_source().is_some() { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         if (action == FAMILY_RESPONSE_RELEASE_V2 && !self.supports_hosted_upload(call))
-            || (action == RETIRED_ORIGINAL_FAMILY_V1 && !self.supports_retired_original_family(call))
+            || (matches!(action, RETIRED_ORIGINAL_FAMILY_V1 | RETIRED_ORIGINAL_WORLD_RANK_V1)
+                && !self.supports_retired_original_family(call))
         {
             return Err(unsupported());
         }
         let request = decode(action, body)?;
+        let _world_rank_charge = if let FamilyRequest::RetiredWorldRank(request) = &request {
+            Some(call.reserve(wire::mul(request.signed_body.len(), 4)?)?)
+        } else {
+            None
+        };
         if let FamilyRequest::Retired(request) = &request
             && matches!(request.signed_body.first(), Some(3 | 5))
             && !self.supports_hosted_upload(call)
@@ -578,7 +614,8 @@ impl Service {
                 put_stage(&mut out, member.capability);
                 out.freeze()
             },
-            FamilyReply::Sealed(bytes) | FamilyReply::Opened(bytes) | FamilyReply::ReleaseRegistration(bytes) => {
+            FamilyReply::Sealed(bytes) | FamilyReply::Opened(bytes) | FamilyReply::ReleaseRegistration(bytes)
+            | FamilyReply::RankTransferPrepared(bytes) => {
                 let charge = call.reserve(bytes.len())?;
                 wire::retain(bytes, charge)
             }
@@ -595,6 +632,29 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_world_rank_preserves_the_raw_signed_body_and_exact_carrier() {
+        let mut bytes = vec![2; 32];
+        bytes.extend_from_slice(&[3; 64]);
+        bytes.extend_from_slice(&[2, 0, 255, 0]);
+        let body = Bytes::from(bytes);
+        let FamilyRequest::RetiredWorldRank(request) = decode(RETIRED_ORIGINAL_WORLD_RANK_V1, &body).unwrap()
+            else { panic!("expected retired World rank custody"); };
+        assert_eq!(request.address, [2; 32]);
+        assert_eq!(request.signature, [3; 64]);
+        assert_eq!(request.signed_body, body.slice(96..));
+        assert!(decode(RETIRED_ORIGINAL_WORLD_RANK_V1, &body.slice(..96)).is_err());
+
+        let mut bytes = vec![4; 324];
+        let carrier = b"BJWP1\0\xff\0";
+        bytes.extend_from_slice(carrier);
+        let body = Bytes::from(bytes);
+        let (registration, decoded) = RetiredWorldRankRequest::open(&body).unwrap();
+        assert_eq!(registration.address, [4; 188]);
+        assert_eq!(decoded.as_ref(), carrier);
+        assert!(RetiredWorldRankRequest::open(&body.slice(..324)).is_err());
+    }
 
     #[test]
     fn retired_family_transport_accepts_only_a_named_authenticated_attachment() {

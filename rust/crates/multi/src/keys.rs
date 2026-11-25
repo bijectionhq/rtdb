@@ -30,6 +30,12 @@ pub use unit::{UnitScope, UnitSlot};
 pub(crate) use unit::UnitLedger;
 pub(crate) use assertion::family::{assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment};
 pub use assertion::family::{AssertionFamilies, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation, WorldRowSlot, CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
+pub(crate) use assertion::family::WorldRankFrame;
+pub use assertion::family::{
+    AcceptedWorldRankReplay, WorldRankDestinationCustody, WorldRankSourceCensus, WorldRankSourceDrain,
+    WorldRankTransfer, WorldRankTransferAuthority, WorldRankTransferBinding, WorldRankTransferContributor,
+    WorldRankTransferDestination, WorldRankTransferRead, WorldRankTransferSource, WorldRankTransferState,
+};
 pub use assertion::issuer::{AssertionIngressTicket, AssertionIssuerScope, AssertionIssuers};
 pub use assertion::{AssertionAuthoring, AssertionBackup, AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;
