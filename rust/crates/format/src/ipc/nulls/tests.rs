@@ -52,6 +52,11 @@ fn unknown_null_counts_are_derived_for_nested_compressed_and_dictionary_buffers(
         let options = IpcWriteOptions::default().try_with_compression(compression).unwrap();
         let bytes = ipc::write_arrow_stream(batch.schema().as_ref(), &[batch.clone()], options).unwrap();
         let bytes = replace_null_counts(bytes, -1);
+        let memory = rtdb_columnar::MemoryBudget::new(72 << 20);
+        let owned = ipc::OwnedStream::read(&bytes, &memory).unwrap();
+        assert_eq!(owned.pages()[0].batch(), &batch, "{compression:?}");
+        drop(owned);
+        assert_eq!(memory.used_bytes(), 0);
         let (_, pages) = ipc::read_stream(bytes.into()).unwrap();
         assert_eq!(pages, vec![batch.clone()], "{compression:?}");
         for column in pages[0].columns() { column.to_data().validate_full().unwrap(); }

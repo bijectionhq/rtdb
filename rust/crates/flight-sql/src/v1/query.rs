@@ -852,7 +852,7 @@ impl Parameters {
                 .await
         } else {
             let batch = self.batch.batch();
-            let (_metadata, signed) = if batch
+            let signed = if batch
                 .schema_ref()
                 .fields()
                 .iter()
@@ -866,9 +866,9 @@ impl Parameters {
                 let Some(signed) = self.signed_batch() else {
                     return Ok(None);
                 };
-                (Some(metadata), Some(signed))
+                Some(signed.with_schema_reservation(metadata))
             } else {
-                (None, None)
+                None
             };
             // The prepared plan keeps the declared types. Where it has no declaration, the
             // cursor falls back to the same observed type it would get from a decoded value.
@@ -930,7 +930,7 @@ impl Parameters {
             batch.schema_ref().metadata().clone(),
         ));
         let signed = RecordBatch::try_new(schema, arrays).ok()?;
-        OwnedBatch::with_reservation(signed, Arc::clone(self.batch.reservation())).ok()
+        Some(self.batch.with_retained_buffers(signed))
     }
 }
 

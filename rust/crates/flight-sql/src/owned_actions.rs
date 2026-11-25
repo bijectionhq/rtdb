@@ -1997,7 +1997,7 @@ impl Service {
 
     fn owned_payload(&self, relation: &OwnedRelation, batch: &OwnedBatch, row: usize, positions: &[usize]) -> Result<Option<ArrowDocuments>, Status> {
         let selected = batch.batch().slice(row, 1).project(positions).map_err(arrow)?;
-        let selected = OwnedBatch::with_reservation(selected, batch.reservation().clone()).map_err(status)?;
+        let selected = batch.with_retained_buffers(selected);
         if rtdb_tx::HostedControlWrite::supports_arrow_catalog(relation) {
             return ArrowDocuments::from_owned_payload(&selected, self.memory()).map_err(status);
         }

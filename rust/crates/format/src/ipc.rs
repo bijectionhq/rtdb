@@ -14,7 +14,7 @@ use arrow_ipc::writer::{
 };
 use arrow_schema::{ArrowError, DataType, Schema, SchemaRef, UnionMode};
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_columnar::{BufferIdentity, MemoryBudget, MemoryReservation, OwnedBatch, RetainedArray};
 use rtdb_types::{Anomaly, Result};
 
 mod decoded_schema;
@@ -693,7 +693,7 @@ impl<R: Read> StreamInput<R> {
             }
             Self::Retained { bytes, position } => {
                 if *position == bytes.len() { return Ok(None); }
-                let Some((metadata, body)) = stream_message(bytes, position)? else { return Ok(None); };
+                let Some(StreamFrame { header, body, .. }) = stream_message(bytes, position)? else { return Ok(None); };
                 let body = if body.is_empty() {
                     Buffer::default()
                 } else {
@@ -705,7 +705,7 @@ impl<R: Read> StreamInput<R> {
                         Buffer::from(body.to_vec())
                     }
                 };
-                Ok(Some((Cow::Borrowed(metadata), body)))
+                Ok(Some((Cow::Borrowed(header), body)))
             }
         }
     }
@@ -813,90 +813,383 @@ pub fn normalize_java_stream_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     decoded_schema::normalize_stream_validity(batch)
 }
 
-/// Owns a complete IPC stream's schema and decoded Arrow buffers under one reservation.
+/// Owns a complete IPC stream's decoded schema and independently funded pages.
 pub struct OwnedStream {
     schema: SchemaRef,
     pages: Vec<OwnedBatch>,
-    _reservation: Arc<MemoryReservation>,
+    _schema_reservation: Arc<MemoryReservation>,
 }
 
 impl OwnedStream {
     /// The input must end with an IPC end marker. Its allocation belongs to the caller.
     pub fn read(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let bound = stream_bound(bytes, true, arrow_descriptors)?;
-        let reservation = memory.reserve(bound)?;
-        Self::from_stream(ArrowStream::from_reader(bytes, None)?, reservation)
+        Self::read_contiguous(StreamSource::Borrowed(bytes), memory)
     }
 
     /// Requires a complete IPC stream whose input bytes own their allocation charge.
     pub fn read_bytes(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let bound = stream_bound(&bytes, true, arrow_descriptors)?;
-        let reservation = memory.reserve(bound)?;
-        Self::from_stream(ArrowStream::from_bytes(bytes, None)?, reservation)
-    }
-
-    fn from_stream<R: Read>(reader: ArrowStream<R>, reservation: Arc<MemoryReservation>) -> Result<Self> {
-        let schema = reader.schema();
-        let pages = reader.map(|page| OwnedBatch::with_reservation(page?, Arc::clone(&reservation))).collect::<Result<_>>()?;
-        Ok(Self { schema, pages, _reservation: reservation })
+        Self::read_contiguous(StreamSource::Bytes(&bytes), memory)
     }
 
     /// The input must end with an IPC end marker.
     /// Decoded arrays can retain the input allocation, so carry its existing charge in the buffer owner.
     pub fn read_buffer(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let reservation = memory.reserve(stream_bound(&bytes, true, arrow_descriptors)?)?;
-        let bytes = &bytes;
-        let mut position = 0;
-        Self::decode_messages(std::iter::from_fn(|| {
-            stream_message(bytes, &mut position).transpose().map(|message| {
-                message.map(|(header, body)| (header, bytes.slice_with_length(body.start, body.len())))
-            })
-        }), reservation)
+        Self::read_contiguous(StreamSource::Buffer(&bytes), memory)
     }
 
-    /// Like a complete IPC stream, with each message held in a separate buffer.
+    fn read_contiguous(source: StreamSource<'_>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut admission = StreamAdmission::new(memory);
+        visit_stream_frames(source.bytes(), true, |frame| admission.push(source, frame))?;
+        admission.decode(memory)
+    }
+
+    /// Reads a complete IPC stream with each message held in a separate funded buffer.
     pub fn read_frames(frames: &[Buffer], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let (end, frames) = frames.split_last().ok_or_else(|| invalid("Arrow stream has no end marker"))?;
         if end.as_slice() != [255, 255, 255, 255, 0, 0, 0, 0] {
             return Err(invalid("Arrow stream has no end marker"));
         }
-        let messages = || frames.iter().map(|frame| {
+        let mut admission = StreamAdmission::new(memory);
+        for frame in frames {
             let mut position = 0;
-            let (header, body) = stream_message(frame, &mut position)?
+            let parsed = stream_message(frame, &mut position)?
                 .ok_or_else(|| invalid("Arrow stream ended before its last frame"))?;
             if position != frame.len() { return Err(invalid("Arrow stream frame contains trailing bytes")); }
-            Ok((header, frame.slice_with_length(body.start, body.len())))
-        });
-        let bound = messages().try_fold(8192, |bound, message| {
-            let (header, body) = message?;
-            allocation_add(bound, framed_message_bound(header, &body, header.len(), arrow_descriptors)?)
-        })?;
-        Self::decode_messages(messages(), memory.reserve(bound)?)
-    }
-
-    fn decode_messages<'a>(
-        mut messages: impl Iterator<Item = Result<(&'a [u8], Buffer)>>,
-        reservation: Arc<MemoryReservation>,
-    ) -> Result<Self> {
-        let (header, body) = messages.next().transpose()?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
-        if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
-        let schema = decoded_schema::adapt(&Arc::new(read_schema_header(header)?))?;
-        let dense_unions = schema.fields().iter().any(|field| contains_dense_union(field.data_type()));
-        let mut dictionaries = HashMap::new();
-        let mut pages = Vec::new();
-        for message in messages {
-            let (header, body) = message?;
-            let body = if dense_unions { align_ipc_body(body) } else { body };
-            if let Some(batch) = decode_stream_batch(Cow::Borrowed(header), body, &schema, &mut dictionaries, None)? {
-                pages.push(OwnedBatch::with_reservation(batch, Arc::clone(&reservation))?);
-            }
+            admission.push(StreamSource::Buffer(frame), parsed)?;
         }
-        Ok(Self { schema, pages, _reservation: reservation })
+        admission.decode(memory)
     }
 
+    /// Borrow the schema under this stream's charge. Owned pages also carry the shared schema charge.
     pub fn schema(&self) -> &SchemaRef { &self.schema }
     pub fn pages(&self) -> &[OwnedBatch] { &self.pages }
     pub fn into_pages(self) -> Vec<OwnedBatch> { self.pages }
+}
+
+#[derive(Clone, Copy)]
+enum StreamSource<'a> {
+    Borrowed(&'a [u8]),
+    Bytes(&'a Bytes),
+    Buffer(&'a Buffer),
+}
+
+impl<'a> StreamSource<'a> {
+    fn bytes(self) -> &'a [u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Bytes(bytes) => bytes.as_ref(),
+            Self::Buffer(bytes) => bytes.as_slice(),
+        }
+    }
+
+    fn needs_copy(self, bytes: &[u8], dense_unions: bool) -> bool {
+        !bytes.is_empty() && match self {
+            Self::Borrowed(_) => true,
+            Self::Bytes(_) => bytes.as_ptr().align_offset(std::mem::align_of::<u128>()) != 0,
+            Self::Buffer(_) => dense_unions && bytes.as_ptr().align_offset(std::mem::align_of::<i32>()) != 0,
+        }
+    }
+
+    fn body(self, range: Range<usize>, dense_unions: bool, grant: &mut MemoryReservation) -> Result<Buffer> {
+        if range.is_empty() { return Ok(Buffer::default()); }
+        let bytes = &self.bytes()[range.clone()];
+        if self.needs_copy(bytes, dense_unions) {
+            let mut backing = grant.split_off(allocation_add(bytes.len(), 256)?)?;
+            let body = Buffer::from_slice_ref(bytes);
+            Arc::get_mut(&mut backing).expect("IPC body owns its grant")
+                .shrink_to(allocation_add(body.capacity(), 128)?)?;
+            return Ok(rtdb_columnar::retain_buffer(&body, &backing));
+        }
+        Ok(match self {
+            Self::Bytes(bytes) => Buffer::from(bytes.slice(range)),
+            Self::Buffer(bytes) => {
+                let view = bytes.slice_with_length(range.start, range.len());
+                rtdb_columnar::retain_buffer_with_owner(&view, Arc::new(()))
+            }
+            Self::Borrowed(_) => unreachable!("Borrowed IPC bodies are copied"),
+        })
+    }
+}
+
+struct AdmittedFrame<'a> {
+    source: StreamSource<'a>,
+    frame: StreamFrame<'a>,
+    storage: usize,
+}
+
+struct StreamAdmission<'a> {
+    frames: Result<(Vec<AdmittedFrame<'a>>, Arc<MemoryReservation>)>,
+    storage: usize,
+    scratch: usize,
+    pages: usize,
+    dictionaries: usize,
+}
+
+impl<'a> StreamAdmission<'a> {
+    fn new(memory: &Arc<MemoryBudget>) -> Self {
+        Self { frames: memory.reserve(0).map(|grant| (Vec::new(), grant)), storage: 0, scratch: 0,
+            pages: 0, dictionaries: 0 }
+    }
+
+    fn push(&mut self, source: StreamSource<'a>, frame: StreamFrame<'a>) -> Result<()> {
+        let body = &source.bytes()[frame.body.clone()];
+        let message = &frame.message;
+        let header_work = allocation_add(8192, allocation_mul(frame.header.len(), 16)?)?;
+        let mut storage = 8192;
+        let mut scratch = header_work;
+        if let Some(schema) = message.header_as_schema() {
+            validate_decimal_metadata(schema)?;
+            storage = allocation_add(header_work, stream_schema_fields_bound(schema.fields().into_iter().flatten())?)?;
+            storage = allocation_add(storage, stream_metadata_bound(schema.custom_metadata().into_iter().flatten())?)?;
+            scratch = storage;
+        }
+        if let Some(batch) = stream_batch_header(message) {
+            let workspace = codec_workspace(batch)?;
+            storage = record_field_bound(storage, batch, arrow_descriptors)?;
+            scratch = allocation_add(scratch, allocation_add(storage, workspace)?)?;
+            visit_decoded_buffer_lengths(batch, body.len(), |start| compressed_buffer_length(body, start), |decoded| {
+                storage = allocation_add(storage, allocation_add(decoded, 512)?)?;
+                scratch = allocation_add(scratch, allocation_add(allocation_mul(decoded, 3)?, 256)?)?;
+                Ok(())
+            })?;
+        }
+        if source.needs_copy(body, true) {
+            storage = allocation_add(storage, allocation_add(body.len(), 256)?)?;
+        }
+        self.storage = allocation_add(self.storage, storage)?;
+        self.scratch = self.scratch.max(scratch);
+        self.pages = allocation_add(self.pages, usize::from(message.header_type() == arrow_ipc::MessageHeader::RecordBatch))?;
+        self.dictionaries = allocation_add(self.dictionaries, usize::from(message.header_type() == arrow_ipc::MessageHeader::DictionaryBatch))?;
+        if let Ok((frames, grant)) = &mut self.frames {
+            match cache_stream_frame(frames, grant) {
+                Ok(()) => frames.push(AdmittedFrame { source, frame, storage }),
+                // A late malformed frame takes precedence over cache admission.
+                Err(error) => self.frames = Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(self, memory: &Arc<MemoryBudget>) -> Result<OwnedStream> {
+        let inventory = allocation_mul(self.dictionaries, 256)?;
+        let bound = allocation_add(allocation_add(self.storage, self.scratch)?, inventory)?;
+        let (frames, _frame_charge) = self.frames?;
+        let mut charge = memory.reserve(bound)?;
+        let grant = Arc::get_mut(&mut charge).expect("IPC stream owns its grant");
+        let mut frames = frames.into_iter();
+        let first = frames.next().ok_or_else(|| invalid("Arrow stream has no schema"))?;
+        if !first.frame.body.is_empty() { return Err(invalid("Arrow schema has a body")); }
+        let mut schema_charge = grant.split_off(first.storage)?;
+        let schema = decoded_schema::adapt(&Arc::new(decode_schema_message(first.frame.message)?))?;
+        Arc::get_mut(&mut schema_charge).expect("IPC schema owns its grant").shrink_to(retained_stream_schema_bound(&schema)?)?;
+        let dense_unions = schema.fields().iter().any(|field| contains_dense_union(field.data_type()));
+        let mut dictionaries = StreamDictionaries::new(&schema)?;
+        let mut pages = Vec::with_capacity(self.pages);
+        for frame in frames {
+            let mut charge = grant.split_off(frame.storage)?;
+            let frame_grant = Arc::get_mut(&mut charge).expect("IPC frame owns its grant");
+            if let Some(page) = frame.decode(&schema, &schema_charge, dense_unions, &mut dictionaries, frame_grant)? {
+                pages.push(page);
+            }
+        }
+        Ok(OwnedStream { schema, pages, _schema_reservation: schema_charge })
+    }
+}
+
+fn cache_stream_frame(frames: &mut Vec<AdmittedFrame<'_>>, grant: &mut Arc<MemoryReservation>) -> Result<()> {
+    if frames.len() != frames.capacity() { return Ok(()); }
+    let capacity = allocation_mul(frames.capacity(), 2)?.max(8);
+    let grant = Arc::get_mut(grant).expect("IPC frame cache owns its grant");
+    let bytes = allocation_mul(capacity, std::mem::size_of::<AdmittedFrame<'_>>())?;
+    grant.grow_to(allocation_add(grant.bytes(), bytes)?)?;
+    frames.try_reserve_exact(capacity - frames.len()).map_err(invalid)?;
+    grant.shrink_to(bytes)
+}
+
+impl AdmittedFrame<'_> {
+    fn decode(self, schema: &SchemaRef, schema_charge: &Arc<MemoryReservation>, dense_unions: bool,
+        dictionaries: &mut StreamDictionaries, grant: &mut MemoryReservation,
+    ) -> Result<Option<OwnedBatch>> {
+        let body = self.source.body(self.frame.body, dense_unions, grant)?;
+        let normalized;
+        let message = if stream_batch_needs_normalization(&self.frame.message, &body)? {
+            let mut metadata = self.frame.header.to_vec();
+            nulls::normalize(&mut metadata, &body, schema)?;
+            normalized = metadata;
+            revalidate_normalized_message(self.frame.message, &normalized)?
+        } else {
+            self.frame.message
+        };
+        let body_identity = BufferIdentity::of(&body);
+        dictionaries.admit_descriptors(grant)?;
+        let is_funded = |buffer| buffer == body_identity || dictionaries.funds(buffer);
+        if let Some(batch) = message.header_as_record_batch() {
+            let batch = arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(schema), &dictionaries.arrow_values, None, &message.version()).map_err(invalid)?;
+            return OwnedBatch::with_independent_buffers(batch, grant, Arc::clone(schema_charge), is_funded).map(Some);
+        }
+        let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Unexpected Arrow stream message"))?;
+        let values = decode_stream_dictionary(&body, dictionary, schema, &dictionaries.arrow_values, &message.version())?;
+        let incoming = RetainedArray::new(values, grant, is_funded)?;
+        let next = if dictionary.isDelta() {
+            dictionaries.append(dictionary.id(), &incoming, grant.budget())?
+        } else {
+            incoming
+        };
+        dictionaries.install(dictionary.id(), next);
+        Ok(None)
+    }
+}
+
+struct StreamDictionaries {
+    references: HashMap<i64, (usize, usize)>,
+    values: HashMap<i64, RetainedArray>,
+    arrow_values: HashMap<i64, ArrayRef>,
+}
+
+impl StreamDictionaries {
+    #[allow(deprecated)]
+    fn new(schema: &Schema) -> Result<Self> {
+        let mut references = HashMap::new();
+        for field in schema.flattened_fields() {
+            if let (Some(id), DataType::Dictionary(_, values)) = (field.dict_id(), field.data_type()) {
+                let (uses, missing_work) = references.entry(id).or_insert((0, 0));
+                *uses = allocation_add(*uses, 1)?;
+                *missing_work = allocation_add(*missing_work, allocation_mul(values.size(), 16)?)?;
+            }
+        }
+        Ok(Self { references, values: HashMap::new(), arrow_values: HashMap::new() })
+    }
+
+    fn funds(&self, buffer: BufferIdentity) -> bool {
+        self.values.values().any(|dictionary| dictionary.funds(buffer))
+    }
+
+    fn admit_descriptors(&self, grant: &mut MemoryReservation) -> Result<()> {
+        let work = self.references.iter().try_fold(0, |bytes, (id, &(uses, missing_work))| {
+            let extra = match self.values.get(id) {
+                Some(dictionary) => allocation_mul(uses, allocation_mul(dictionary.descriptor_bytes(), 4)?)?,
+                None => missing_work,
+            };
+            allocation_add(bytes, extra)
+        })?;
+        if work != 0 { grant.grow_to(allocation_add(grant.bytes(), work)?)?; }
+        Ok(())
+    }
+
+    fn install(&mut self, id: i64, values: RetainedArray) {
+        self.arrow_values.insert(id, Arc::clone(values.array()));
+        self.values.insert(id, values);
+    }
+
+    fn append(&self, id: i64, incoming: &RetainedArray, memory: &Arc<MemoryBudget>) -> Result<RetainedArray> {
+        let current = self.values.get(&id).ok_or_else(|| invalid(ArrowError::InvalidArgumentError(
+            format!("No existing dictionary for delta dictionary with id '{id}'"),
+        )))?;
+        let inspection = memory.reserve(allocation_add(4096, allocation_mul(
+            allocation_add(current.descriptor_bytes(), incoming.descriptor_bytes())?, 2,
+        )?)?)?;
+        let left = current.array().to_data();
+        let right = incoming.array().to_data();
+        let rows = allocation_add(left.len(), right.len())?;
+        let bound = allocation_add(dictionary_concat_bound(&left, rows, 1)?, dictionary_concat_bound(&right, rows, 1)?)?;
+        drop((left, right, inspection));
+        let mut charge = memory.reserve(bound)?;
+        let combined = arrow_select::concat::concat(&[current.array().as_ref(), incoming.array().as_ref()]).map_err(|error| {
+            invalid(ArrowError::InvalidArgumentError(format!("Failed to concat delta dictionary: {error}")))
+        })?;
+        let grant = Arc::get_mut(&mut charge).expect("IPC dictionary concatenation owns its grant");
+        RetainedArray::new(combined, grant, |buffer| self.funds(buffer) || incoming.funds(buffer))
+    }
+}
+
+#[allow(deprecated)]
+fn decode_stream_dictionary(body: &Buffer, dictionary: arrow_ipc::DictionaryBatch<'_>, schema: &Schema,
+    dictionaries: &HashMap<i64, ArrayRef>, version: &arrow_ipc::MetadataVersion,
+) -> Result<ArrayRef> {
+    let fields = schema.fields_with_dict_id(dictionary.id());
+    let Some(DataType::Dictionary(_, values)) = fields.first().map(|field| field.data_type()) else {
+        return Err(invalid(ArrowError::InvalidArgumentError(format!("dictionary id {} not found in schema", dictionary.id()))));
+    };
+    let batch = dictionary.data().ok_or_else(|| invalid("Dictionary message has no record batch"))?;
+    let schema = Arc::new(Schema::new(vec![arrow_schema::Field::new("", values.as_ref().clone(), true)]));
+    let batch = arrow_ipc::reader::read_record_batch(body, batch, schema, dictionaries, None, version).map_err(invalid)?;
+    Ok(Arc::clone(batch.column(0)))
+}
+
+fn dictionary_concat_bound(data: &arrow_data::ArrayData, inherited_rows: usize, copies: usize) -> Result<usize> {
+    let rows = inherited_rows.max(allocation_mul(data.len(), copies)?);
+    let width = match data.data_type() {
+        DataType::FixedSizeBinary(width) => usize::try_from(*width).map_err(invalid)?,
+        data_type => data_type.primitive_width().unwrap_or(16),
+    };
+    let mut bytes = allocation_add(4096, allocation_mul(rows, allocation_add(width, 1)?)?)?;
+    for buffer in data.buffers() {
+        bytes = allocation_add(bytes, allocation_add(512, allocation_mul(allocation_mul(buffer.len(), copies)?, 4)?)?)?;
+    }
+    let (child_rows, child_copies) = match data.data_type() {
+        DataType::FixedSizeList(_, width) => (allocation_mul(rows, usize::try_from(*width).map_err(invalid)?)?, copies),
+        DataType::Dictionary(_, _) => {
+            let values = allocation_mul(data.child_data()[0].len(), copies)?;
+            bytes = allocation_add(bytes, allocation_mul(values, 256)?)?;
+            (values, copies)
+        }
+        DataType::Union(_, UnionMode::Dense) if stream_dense_offsets_repeat(data) => (rows, allocation_mul(copies, data.len())?),
+        DataType::ListView(_) if stream_list_view_offsets_overlap::<i32>(data) => (rows, allocation_mul(copies, data.len())?),
+        DataType::LargeListView(_) if stream_list_view_offsets_overlap::<i64>(data) => (rows, allocation_mul(copies, data.len())?),
+        _ => (rows, copies),
+    };
+    for child in data.child_data() { bytes = allocation_add(bytes, dictionary_concat_bound(child, child_rows, child_copies)?)?; }
+    Ok(bytes)
+}
+
+fn stream_dense_offsets_repeat(data: &arrow_data::ArrayData) -> bool {
+    let mut last = [-1; 128];
+    data.buffer::<i8>(0).iter().zip(data.buffer::<i32>(1)).take(data.len()).any(|(&leg, &offset)| {
+        let Ok(leg) = usize::try_from(leg) else { return true; };
+        let previous = &mut last[leg];
+        let repeats = offset <= *previous;
+        *previous = offset;
+        repeats
+    })
+}
+
+fn stream_list_view_offsets_overlap<T: arrow_buffer::ArrowNativeType>(data: &arrow_data::ArrayData) -> bool {
+    let mut end = 0;
+    data.buffer::<T>(0).iter().zip(data.buffer::<T>(1)).take(data.len()).any(|(&offset, &size)| {
+        let start = offset.as_usize();
+        let overlaps = size.as_usize() != 0 && start < end;
+        end = end.max(start.saturating_add(size.as_usize()));
+        overlaps
+    })
+}
+
+fn stream_schema_fields_bound<'a>(fields: impl Iterator<Item = arrow_ipc::Field<'a>>) -> Result<usize> {
+    fields.into_iter().try_fold(0, |bytes, field| {
+        let name = field.name().map_or(0, str::len);
+        let timezone = field.type_as_timestamp().and_then(|ty| ty.timezone()).map_or(0, str::len);
+        let union_ids = field.type_as_union().and_then(|ty| ty.typeIds()).map_or(0, |ids| ids.len());
+        let strings = allocation_mul(allocation_add(name, timezone)?, 8)?;
+        let entries = stream_metadata_bound(field.custom_metadata().into_iter().flatten())?;
+        let children = stream_schema_fields_bound(field.children().into_iter().flatten())?;
+        let field = allocation_add(2048, allocation_add(allocation_mul(union_ids, 16)?, strings)?)?;
+        allocation_add(bytes, allocation_add(field, allocation_add(entries, children)?)?)
+    })
+}
+
+fn stream_metadata_bound<'a>(entries: impl Iterator<Item = arrow_ipc::KeyValue<'a>>) -> Result<usize> {
+    entries.into_iter().try_fold(0, |bytes, entry| {
+        let length = allocation_add(entry.key().map_or(0, str::len), entry.value().map_or(0, str::len))?;
+        allocation_add(bytes, allocation_add(512, allocation_mul(length, 8)?)?)
+    })
+}
+
+fn retained_stream_schema_bound(schema: &Schema) -> Result<usize> {
+    let metadata = schema.metadata();
+    let slots = allocation_mul(metadata.capacity(), 64)?;
+    let bytes = metadata.iter().try_fold(allocation_add(256, slots)?, |bytes, (key, value)| {
+        allocation_add(bytes, allocation_add(key.capacity(), value.capacity())?)
+    })?;
+    schema.fields().iter().try_fold(bytes, |bytes, field| allocation_add(bytes, allocation_add(64, field.size())?))
 }
 
 fn contains_dense_union(ty: &DataType) -> bool {
@@ -926,21 +1219,52 @@ fn decode_stream_batch(
     dictionaries: &mut HashMap<i64, ArrayRef>, projection: Option<&[usize]>,
 ) -> Result<Option<RecordBatch>> {
     let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
-    validate_lz4_lengths(&message, &body)?;
-    let data = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
-    if let Some(data) = data {
-        let nodes = data.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
-        if nodes.iter().any(|node| node.null_count() < 0) {
-            nulls::normalize(metadata.to_mut(), &body, schema)?;
-        }
-    }
-    let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
+    let message = if stream_batch_needs_normalization(&message, &body)? {
+        nulls::normalize(metadata.to_mut(), &body, schema)?;
+        arrow_ipc::root_as_message(&metadata).map_err(invalid)?
+    } else {
+        message
+    };
     if let Some(batch) = message.header_as_record_batch() {
         return arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(schema), dictionaries, projection, &message.version()).map(Some).map_err(invalid);
     }
     let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Unexpected Arrow stream message"))?;
     arrow_ipc::reader::read_dictionary(&body, dictionary, schema, dictionaries, &message.version()).map_err(invalid)?;
     Ok(None)
+}
+
+fn stream_batch_header<'a>(message: &arrow_ipc::Message<'a>) -> Option<arrow_ipc::RecordBatch<'a>> {
+    message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()))
+}
+
+fn stream_batch_needs_normalization(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result<bool> {
+    let Some(batch) = stream_batch_header(message) else { return Ok(false); };
+    validate_lz4_batch(batch, body)?;
+    let nodes = batch.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
+    Ok(nodes.iter().any(|node| node.null_count() < 0))
+}
+
+fn revalidate_normalized_message<'a>(original: arrow_ipc::Message<'_>, metadata: &'a [u8]) -> Result<arrow_ipc::Message<'a>> {
+    let normalized = arrow_ipc::root_as_message(metadata).map_err(invalid)?;
+    let changed = || invalid("Arrow null-count normalization changed the admitted batch layout");
+    let before = stream_batch_header(&original).ok_or_else(changed)?;
+    let after = stream_batch_header(&normalized).ok_or_else(changed)?;
+    let compression = |batch: arrow_ipc::RecordBatch<'_>| batch.compression().map(|value| (value.method(), value.codec()));
+    let dictionary = |message: arrow_ipc::Message<'_>| message.header_as_dictionary_batch().map(|value| (value.id(), value.isDelta()));
+    if original.version() != normalized.version()
+        || original.header_type() != normalized.header_type()
+        || original.bodyLength() != normalized.bodyLength()
+        || dictionary(original) != dictionary(normalized)
+        || before.length() != after.length()
+        || compression(before) != compression(after)
+        || !before.buffers().into_iter().flatten().eq(after.buffers().into_iter().flatten())
+        || !before.nodes().into_iter().flatten().map(|node| node.length())
+            .eq(after.nodes().into_iter().flatten().map(|node| node.length()))
+        || !before.variadicBufferCounts().into_iter().flatten().eq(after.variadicBufferCounts().into_iter().flatten())
+    {
+        return Err(changed());
+    }
+    Ok(normalized)
 }
 
 fn row_descriptors(rows: usize) -> Result<usize> { allocation_mul(allocation_add(rows, 1)?, 4096) }
@@ -965,22 +1289,38 @@ fn framed_message_bound(header: &[u8], body: &[u8], metadata_length: usize, fiel
     message_bound(&message, metadata_length, body.len(), field_bound, |start| compressed_buffer_length(body, start))
 }
 
-fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, field_bound: fn(usize) -> Result<usize>, mut compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
+fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, field_bound: fn(usize) -> Result<usize>, compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
     let mut bound = allocation_add(8192, allocation_add(allocation_mul(header_length, 16)?, allocation_mul(body_length, 4)?)?)?;
     if usize::try_from(message.bodyLength()).map_err(invalid)? > body_length { return Err(invalid("Arrow message body is truncated")); }
-    if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
+    if let Some(batch) = stream_batch_header(message) {
         bound = allocation_add(bound, codec_workspace(batch)?)?;
-        if let Some(nodes) = batch.nodes() {
-            for node in nodes { bound = allocation_add(bound, field_bound(usize::try_from(node.length()).map_err(invalid)?)?)?; }
-        }
-        if let Some(buffers) = batch.buffers() {
-            for buffer in buffers {
-                let (decoded, _) = decoded_buffer_length(buffer, body_length, batch.compression().is_some(), &mut compressed_length)?;
-                bound = allocation_add(bound, decoded_buffer_bound(decoded)?)?;
-            }
-        }
+        bound = record_field_bound(bound, batch, field_bound)?;
+        visit_decoded_buffer_lengths(batch, body_length, compressed_length, |decoded| {
+            bound = allocation_add(bound, decoded_buffer_bound(decoded)?)?;
+            Ok(())
+        })?;
     }
     Ok(bound)
+}
+
+fn record_field_bound(mut bound: usize, batch: arrow_ipc::RecordBatch<'_>, field_bound: fn(usize) -> Result<usize>) -> Result<usize> {
+    if let Some(nodes) = batch.nodes() {
+        for node in nodes { bound = allocation_add(bound, field_bound(usize::try_from(node.length()).map_err(invalid)?)?)?; }
+    }
+    Ok(bound)
+}
+
+fn visit_decoded_buffer_lengths(batch: arrow_ipc::RecordBatch<'_>, body_length: usize,
+    mut compressed_length: impl FnMut(usize) -> Result<i64>, mut visit: impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    let compressed = batch.compression().is_some();
+    if let Some(buffers) = batch.buffers() {
+        for buffer in buffers {
+            let (decoded, _) = decoded_buffer_length(buffer, body_length, compressed, &mut compressed_length)?;
+            visit(decoded)?;
+        }
+    }
+    Ok(())
 }
 
 fn codec_workspace(batch: arrow_ipc::RecordBatch<'_>) -> Result<usize> {
@@ -1068,19 +1408,36 @@ pub fn validate_complete_stream(bytes: &[u8]) -> Result<()> {
 }
 
 fn stream_bound(bytes: &[u8], terminated: bool, field_bound: fn(usize) -> Result<usize>) -> Result<usize> {
-    let mut position = 0;
     let mut bound = 8192;
-    while position < bytes.len() {
-        let Some((header, body)) = stream_message(bytes, &mut position)? else {
-            if terminated && position != bytes.len() { return Err(invalid("Bytes follow IPC stream end marker")); }
-            return Ok(bound);
-        };
-        bound = allocation_add(bound, framed_message_bound(header, &bytes[body], header.len(), field_bound)?)?;
-    }
-    if terminated { Err(invalid("IPC stream has no end marker")) } else { Ok(bound) }
+    visit_stream_frames(bytes, terminated, |frame| {
+        if let Some(schema) = frame.message.header_as_schema() { validate_decimal_metadata(schema)?; }
+        let body = &bytes[frame.body];
+        let message = message_bound(&frame.message, frame.header.len(), body.len(), field_bound, |start| compressed_buffer_length(body, start))?;
+        bound = allocation_add(bound, message)?;
+        Ok(())
+    })?;
+    Ok(bound)
 }
 
-fn stream_message<'a>(bytes: &'a [u8], position: &mut usize) -> Result<Option<(&'a [u8], std::ops::Range<usize>)>> {
+fn visit_stream_frames<'a>(bytes: &'a [u8], terminated: bool, mut visit: impl FnMut(StreamFrame<'a>) -> Result<()>) -> Result<()> {
+    let mut position = 0;
+    while position < bytes.len() {
+        let Some(frame) = stream_message(bytes, &mut position)? else {
+            if terminated && position != bytes.len() { return Err(invalid("Bytes follow IPC stream end marker")); }
+            return Ok(());
+        };
+        visit(frame)?;
+    }
+    if terminated { Err(invalid("IPC stream has no end marker")) } else { Ok(()) }
+}
+
+struct StreamFrame<'a> {
+    header: &'a [u8],
+    message: arrow_ipc::Message<'a>,
+    body: Range<usize>,
+}
+
+fn stream_message<'a>(bytes: &'a [u8], position: &mut usize) -> Result<Option<StreamFrame<'a>>> {
     let mut length = inspection_i32(bytes, position)?;
     if length == -1 { length = inspection_i32(bytes, position)?; }
     if length == 0 { return Ok(None); }
@@ -1090,7 +1447,7 @@ fn stream_message<'a>(bytes: &'a [u8], position: &mut usize) -> Result<Option<(&
     let body_end = allocation_add(end, usize::try_from(message.bodyLength()).map_err(invalid)?)?;
     if body_end > bytes.len() { return Err(invalid("Arrow stream body is truncated")); }
     *position = body_end;
-    Ok(Some((header, end..body_end)))
+    Ok(Some(StreamFrame { header, message, body: end..body_end }))
 }
 
 /// Bounds the footer, dictionaries and all record batches decoded from an immutable IPC file.
@@ -1671,7 +2028,11 @@ pub fn read_schema_message(bytes: &[u8]) -> Result<Schema> {
 /// Decodes an unframed IPC Schema message with full-width decimal scales.
 /// The caller reserves metadata scratch before calling this function.
 pub fn read_schema_header(bytes: &[u8]) -> Result<Schema> {
-    crate::ipc_decimal::decode(arrow_ipc::root_as_message(bytes).map_err(invalid)?.header_as_schema().ok_or_else(|| invalid("Arrow message has no schema"))?)
+    decode_schema_message(arrow_ipc::root_as_message(bytes).map_err(invalid)?)
+}
+
+fn decode_schema_message(message: arrow_ipc::Message<'_>) -> Result<Schema> {
+    crate::ipc_decimal::decode(message.header_as_schema().ok_or_else(|| invalid("Arrow message has no schema"))?)
 }
 
 /// Checks external decimal precision, bit width, endianness and reserved metadata recursively.
@@ -1883,9 +2244,140 @@ fn owned_ipc_decodes_dense_unions_from_an_unaligned_envelope() {
     let bytes = Buffer::from_slice_ref(&envelope).slice(1);
     let mut position = 0;
     stream_message(&bytes, &mut position).unwrap().unwrap();
-    let (_, body) = stream_message(&bytes, &mut position).unwrap().unwrap();
+    let StreamFrame { body, .. } = stream_message(&bytes, &mut position).unwrap().unwrap();
     assert_ne!(bytes[body].as_ptr().align_offset(std::mem::align_of::<i32>()), 0);
 
     let stream = OwnedStream::read_buffer(bytes, &MemoryBudget::new(1 << 20)).unwrap();
     assert_eq!(stream.pages()[0].batch(), &page);
+}
+
+#[test]
+fn owned_stream_frames_hold_only_the_wire_for_live_dictionary_generations() {
+    use arrow_array::{DictionaryArray, Int32Array, StringArray, types::Int32Type};
+
+    let dictionary_page = |value: &str| {
+        let dictionary = DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), Arc::new(StringArray::from(vec![value]))).unwrap();
+        RecordBatch::try_from_iter([("value", Arc::new(dictionary) as ArrayRef)]).unwrap()
+    };
+    let first = dictionary_page("first dictionary generation");
+    let second = dictionary_page("second dictionary generation");
+    let bytes = write_arrow_stream(first.schema_ref(), &[first.clone(), second.clone()], IpcWriteOptions::default()).unwrap();
+    let wire = MemoryBudget::new(1 << 20);
+    let mut frames = Vec::new();
+    let mut position = 0;
+    let mut start = 0;
+    let mut expected_wire = 0;
+    while position < bytes.len() {
+        let _frame = stream_message(&bytes, &mut position).unwrap();
+        let frame = Buffer::from_slice_ref(&bytes[start..position]);
+        let charge = wire.reserve(frame.capacity()).unwrap();
+        if frames.len() == 1 { expected_wire = charge.bytes(); }
+        frames.push(rtdb_columnar::retain_buffer(&frame, &charge));
+        start = position;
+    }
+    let memory = MemoryBudget::new(1 << 20);
+    let stream = OwnedStream::read_frames(&frames, &memory).unwrap();
+    assert_eq!(stream.pages()[0].batch(), &first);
+    assert_eq!(stream.pages()[1].batch(), &second);
+
+    let values = Arc::clone(stream.pages()[0].batch().column(0)
+        .as_any().downcast_ref::<DictionaryArray<Int32Type>>().unwrap().values());
+    let all = wire.used_bytes();
+    drop(frames);
+    assert!(wire.used_bytes() < all);
+    drop(stream);
+    assert_eq!(wire.used_bytes(), expected_wire);
+    assert_eq!(values.as_any().downcast_ref::<StringArray>().unwrap().value(0), "first dictionary generation");
+    drop(values);
+    assert_eq!(wire.used_bytes(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn owned_stream_delta_dictionaries_leave_earlier_pages_unchanged() {
+    use arrow_array::{DictionaryArray, Int32Array, StringArray, types::Int32Type};
+    use arrow_ipc::writer::DictionaryHandling;
+
+    let dictionary_page = |key: i32, values: Vec<&str>| {
+        let dictionary = DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![key]), Arc::new(StringArray::from(values))).unwrap();
+        RecordBatch::try_from_iter([("value", Arc::new(dictionary) as ArrayRef)]).unwrap()
+    };
+    let first = dictionary_page(0, vec!["first"]);
+    let second = dictionary_page(1, vec!["first", "second"]);
+    let options = IpcWriteOptions::default().with_dictionary_handling(DictionaryHandling::Delta);
+    let bytes = write_arrow_stream(first.schema_ref(), &[first.clone(), second.clone()], options).unwrap();
+    let mut has_delta = false;
+    visit_stream_frames(&bytes, true, |frame| {
+        has_delta |= frame.message.header_as_dictionary_batch().is_some_and(|dictionary| dictionary.isDelta());
+        Ok(())
+    }).unwrap();
+    assert!(has_delta);
+    let memory = MemoryBudget::new(1 << 20);
+    let stream = OwnedStream::read(&bytes, &memory).unwrap();
+    assert_eq!(stream.pages()[0].batch(), &first);
+    assert_eq!(stream.pages()[1].batch(), &second);
+    drop(stream);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn complete_stream_reports_late_framing_errors_when_its_frame_cache_cannot_be_funded() {
+    use arrow_array::Int64Array;
+
+    let batch = RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(vec![1])) as ArrayRef)]).unwrap();
+    let bytes = write_arrow_stream(batch.schema_ref(), &[batch.clone(), batch.clone()], IpcWriteOptions::default()).unwrap();
+    let mut position = 0;
+    stream_message(&bytes, &mut position).unwrap().unwrap();
+    stream_message(&bytes, &mut position).unwrap().unwrap();
+
+    let memory = MemoryBudget::new(0);
+    let valid = OwnedStream::read(&bytes, &memory).err().unwrap();
+    assert_eq!(valid.code, "rtdb/memory-budget-exceeded");
+    let malformed = OwnedStream::read(&bytes[..position + 1], &memory).err().unwrap();
+    assert_eq!(malformed.message.as_deref(), Some("Arrow IPC prefix is truncated"));
+    let mut trailing = bytes;
+    trailing.push(1);
+    let malformed = OwnedStream::read(&trailing, &memory).err().unwrap();
+    assert_eq!(malformed.message.as_deref(), Some("Bytes follow IPC stream end marker"));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn owned_stream_rejects_lz4_output_larger_than_its_declared_buffer() {
+    use arrow_array::Int64Array;
+
+    let batch = RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(vec![7; 4096])) as ArrayRef)]).unwrap();
+    let options = IpcWriteOptions::default().try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME)).unwrap();
+    let mut bytes = write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), options).unwrap();
+    let start = {
+        let mut position = 0;
+        stream_message(&bytes, &mut position).unwrap().unwrap();
+        let frame = stream_message(&bytes, &mut position).unwrap().unwrap();
+        let batch = frame.message.header_as_record_batch().unwrap();
+        let buffer = batch.buffers().unwrap().iter().find(|buffer| buffer.length() > 0).unwrap();
+        frame.body.start + buffer.offset() as usize
+    };
+    bytes[start..start + 8].copy_from_slice(&1i64.to_le_bytes());
+    let memory = MemoryBudget::new(72 << 20);
+    let error = OwnedStream::read(&bytes, &memory).err().unwrap();
+    assert_eq!(error.message.as_deref(), Some("LZ4 data exceeds its declared Arrow buffer length"));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn owned_stream_revalidates_batch_layout_after_normalizing_metadata() {
+    use arrow_array::Int64Array;
+
+    let page = |rows| RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef)]).unwrap();
+    let first = page(4);
+    let second = page(8);
+    let bytes = write_arrow_stream(first.schema_ref(), &[first.clone(), second], IpcWriteOptions::default()).unwrap();
+    let mut position = 0;
+    stream_message(&bytes, &mut position).unwrap().unwrap();
+    let first = stream_message(&bytes, &mut position).unwrap().unwrap();
+    let second = stream_message(&bytes, &mut position).unwrap().unwrap();
+
+    assert!(revalidate_normalized_message(first.message, first.header).is_ok());
+    let error = revalidate_normalized_message(first.message, second.header).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Arrow null-count normalization changed the admitted batch layout"));
 }

@@ -196,7 +196,7 @@ impl WorldProjectionCustody {
             .with_original_reader(&self.original, self.deployment, &self.cancellation);
         let vault = self.keys.assertion_keys().ok_or_else(invalid)?;
         let opened = async {
-            families.require_derived_capability(family, stage, carrier.member, slot).await?;
+            let accepted = families.require_world_rank_occurrence(family, stage, carrier.member, slot).await?;
             let authoring = AssertionAuthoring {
                 assertion_id: carrier.member, scope_commitment: world_row_scope(slot, &carrier.disclosure), codec: CODEC,
             };
@@ -204,7 +204,10 @@ impl WorldProjectionCustody {
             let body = OpenedProjection::new(
                 vault.open_assertion_for_resolution(stage, authoring, &self.region, envelope).await?,
             );
-            families.require_derived_capability(family, stage, carrier.member, slot).await?;
+            let current = families.require_world_rank_occurrence(family, stage, carrier.member, slot).await?;
+            if accepted != current {
+                return Err(invalid());
+            }
             body
         };
         let charge = memory.reserve(bytes.len().saturating_mul(16))?;

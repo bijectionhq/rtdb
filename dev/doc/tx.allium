@@ -477,6 +477,8 @@
 -- The catalog scan sends the declared schema first and the stream terminator last.
 -- Catalog scan pages in the declared layout share its funded schema.
 -- The packed hosted decision accepts related Arrow runs in a shared stream and restores their scheduled order before the existing decision, control, and source admission.
+-- Complete Arrow request streams budget for peak sequential decode scratch and release it after decoding.
+-- A retained run carries the shared schema charge and the backing charges of the Arrow buffers it reaches, including values from earlier dictionary generations.
 --
 -- == Boundaries ==
 --

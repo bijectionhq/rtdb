@@ -100,6 +100,34 @@ impl OwnedBatch {
         Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation) })
     }
 
+    /// Adopts a decoded page, charging its slot and descriptors separately from each new backing allocation.
+    /// Shared buffers carry their existing backing charge through the page and any independently retained slices.
+    /// The funding predicate must select only buffers whose owners carry that charge.
+    pub fn with_independent_buffers(batch: RecordBatch, grant: &mut MemoryReservation,
+        schema_reservation: Arc<MemoryReservation>, is_funded: impl Fn(BufferIdentity) -> bool,
+    ) -> Result<Self> {
+        let mut allocations = BTreeMap::new();
+        let mut descriptors = sum(256, std::mem::size_of::<Self>())?;
+        for array in batch.columns() {
+            descriptors = sum(descriptors, sum(32, array_descriptors(array)?)?)?;
+            visit_buffers(&array.to_data(), &mut |buffer| {
+                descriptors = sum(descriptors, 256)?;
+                count_new_buffer(&mut allocations, buffer, &is_funded)
+            })?;
+        }
+        let reservation = grant.split_off(descriptors)?;
+        let allocations = split_buffer_reservations(allocations, grant)?;
+        let descriptors: Arc<dyn Send + Sync> = Arc::new((Arc::clone(&reservation), Arc::clone(&schema_reservation)));
+        let batch = attach_batch(batch, |buffer| {
+            let owner: Arc<dyn Send + Sync> = match allocations.get(&BufferIdentity::of(buffer)) {
+                Some(backing) => Arc::new((Arc::clone(backing), Arc::clone(&descriptors))),
+                None => Arc::clone(&descriptors),
+            };
+            retain_buffer_with_owner(buffer, owner)
+        })?;
+        Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation) })
+    }
+
     /// Carries the owners through a layout change with already funded backing buffers.
     pub fn with_retained_buffers(&self, batch: RecordBatch) -> Self {
         Self { batch, reservation: Arc::clone(&self.reservation), schema_reservation: self.schema_reservation.clone() }
@@ -534,7 +562,8 @@ pub fn retain_result_array(
 pub struct BufferIdentity { base: usize, capacity: usize }
 
 impl BufferIdentity {
-    fn of(buffer: &Buffer) -> Self {
+    /// Identifies the allocation behind this view while the buffer is live.
+    pub fn of(buffer: &Buffer) -> Self {
         Self { base: buffer.data_ptr().as_ptr() as usize, capacity: buffer.capacity() }
     }
 }
@@ -557,8 +586,7 @@ impl RetainedArray {
         })?;
         // One IPC body can back multiple slices, and a delta can keep only some of those slices.
         let descriptors = grant.split_off(descriptors)?;
-        let allocations = allocations.into_iter().map(|(key, bytes)| Ok((key, grant.split_off(bytes)?)))
-            .collect::<Result<BTreeMap<_, _>>>()?;
+        let allocations = split_buffer_reservations(allocations, grant)?;
         let data = attach_buffers(data, &|buffer| match allocations.get(&BufferIdentity::of(buffer)) {
             Some(reservation) => retain_buffer(buffer, reservation),
             None => buffer.clone(),
@@ -574,6 +602,11 @@ impl RetainedArray {
     pub fn array(&self) -> &ArrayRef { &self.array }
     pub fn funds(&self, buffer: BufferIdentity) -> bool { self.buffers.contains(&buffer) }
     pub fn descriptor_bytes(&self) -> usize { self.descriptors.bytes() }
+}
+
+fn split_buffer_reservations(allocations: BTreeMap<BufferIdentity, usize>, grant: &mut MemoryReservation)
+    -> Result<BTreeMap<BufferIdentity, Arc<MemoryReservation>>> {
+    allocations.into_iter().map(|(key, bytes)| Ok((key, grant.split_off(bytes)?))).collect()
 }
 
 fn visit_buffers(data: &ArrayData, visit: &mut impl FnMut(&Buffer) -> Result<()>) -> Result<()> {
