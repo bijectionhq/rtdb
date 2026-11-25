@@ -80,6 +80,15 @@ resource "aws_vpc_security_group_ingress_rule" "native_dependent_custody" {
   to_port                      = local.native_dependent_ingress.port
 }
 
+resource "aws_vpc_security_group_ingress_rule" "original_private_replay_approvals" {
+  count                        = local.replay_approvals == null ? 0 : 1
+  security_group_id            = local.replay_approvals.mount_target_security_group_id
+  referenced_security_group_id = aws_security_group.node.id
+  ip_protocol                  = "tcp"
+  from_port                    = 2049
+  to_port                      = 2049
+}
+
 resource "aws_vpc_security_group_egress_rule" "node" {
   security_group_id = aws_security_group.node.id
   ip_protocol       = "tcp"

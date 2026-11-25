@@ -89,3 +89,14 @@ The process refuses startup when the mounted profile disagrees with the deployed
 Use `native_dependent_custody_target` for the private address and enroll the certificate name on eligible selected writers.
 The port has no public or ordinary Flight listener.
 The custody protocol and request shapes are in link:../../../dev/doc/rtdb-custody-release-handoff.md#stock-private-custody-transport[the RTDB handoff].
+
+=== Original private replay approvals
+
+Set `original_private_replay_approvals` on a Multi cluster with a custom configuration to mount the independently published replay approvals at `/run/rtdb/original-private-replay`.
+Use that directory for `originalPrivateReplay.approvalDirectory` and configure the independent public verifier in `originalPrivateReplay.approvalPublicKey`.
+Supply the commissioned encrypted EFS file system ARN, dedicated access point ARN and mount target security group ID.
+The module allows NFS from the native node group and grants the node role TLS-only `ClientMount` at that access point.
+The file-system owner controls its resource policy, read-only consumer access and the separate publisher's write access.
+The app reader and native writer each verify the same signed records before use.
+Keep the approval signing key and application enrollment credentials outside this projection.
+The order and wire for authorization, completion and disposal are in link:../../../dev/doc/rtdb-custody-release-handoff.md#mounted-original-private-replay[the RTDB handoff].

@@ -10,6 +10,8 @@ locals {
   native_dependent_custody   = local.multi ? var.native_dependent_custody : null
   native_dependent_ingress   = try(local.native_dependent_custody.ingress, null)
   native_dependent_directory = "/run/rtdb/native-dependent-custody"
+  replay_approvals           = local.multi ? var.original_private_replay_approvals : null
+  replay_approvals_directory = "/run/rtdb/original-private-replay"
   peer_discovery_host        = "node.${aws_service_discovery_private_dns_namespace.cluster.name}"
   node_ports = concat(
     [{ containerPort = local.flight_port, protocol = "tcp" }],
@@ -131,6 +133,20 @@ resource "aws_ecs_task_definition" "node" {
       }
     }
   }
+  dynamic "volume" {
+    for_each = local.replay_approvals == null ? [] : [local.replay_approvals]
+    content {
+      name = "original-private-replay"
+      efs_volume_configuration {
+        file_system_id     = split("/", volume.value.file_system_arn)[1]
+        transit_encryption = "ENABLED"
+        authorization_config {
+          access_point_id = split("/", volume.value.access_point_arn)[1]
+          iam             = "ENABLED"
+        }
+      }
+    }
+  }
   container_definitions = jsonencode([{
     name        = "rtdb"
     image       = var.image
@@ -142,6 +158,7 @@ resource "aws_ecs_task_definition" "node" {
     mountPoints = concat(
       local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : [],
       local.native_dependent_custody == null ? [] : [{ sourceVolume = "native-dependent-custody", containerPath = local.native_dependent_directory, readOnly = true }],
+      local.replay_approvals == null ? [] : [{ sourceVolume = "original-private-replay", containerPath = local.replay_approvals_directory, readOnly = true }],
     )
     stopTimeout     = 90
     portMappings    = local.node_ports
@@ -180,6 +197,15 @@ resource "aws_ecs_task_definition" "node" {
     precondition {
       condition     = local.multi || var.native_dependent_custody == null
       error_message = "Native dependent custody requires Multi mode."
+    }
+    precondition {
+      condition = var.original_private_replay_approvals == null || try(
+        local.custom_multi_configuration && (
+          local.native_dependent_custody == null ||
+          local.replay_approvals.access_point_arn != local.native_dependent_custody.access_point_arn
+        ), false
+      )
+      error_message = "Original replay approvals require a custom Multi configuration and a separate approval access point."
     }
     precondition {
       condition = local.native_dependent_ingress == null || try(
@@ -225,6 +251,8 @@ resource "aws_ecs_service" "node" {
     aws_vpc_security_group_ingress_rule.classic_candidate,
     aws_vpc_security_group_ingress_rule.native_dependent_custody,
     aws_iam_role_policy.native_dependent_custody,
+    aws_vpc_security_group_ingress_rule.original_private_replay_approvals,
+    aws_iam_role_policy.original_private_replay_approvals,
     aws_vpc_security_group_egress_rule.node,
     aws_iam_role_policy.objects,
     aws_iam_role_policy.secrets,

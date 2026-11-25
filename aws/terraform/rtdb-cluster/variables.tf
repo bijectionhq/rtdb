@@ -179,6 +179,27 @@ variable "native_dependent_custody" {
   }
 }
 
+variable "original_private_replay_approvals" {
+  description = "Optional read-only EFS projection from the independent Original replay approval publisher."
+  type = object({
+    file_system_arn                = string
+    access_point_arn               = string
+    mount_target_security_group_id = string
+  })
+  default = null
+
+  validation {
+    condition = var.original_private_replay_approvals == null || try(
+      can(regex("^arn:[a-z0-9-]+:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:file-system/fs-[0-9a-f]+$", var.original_private_replay_approvals.file_system_arn)) &&
+      can(regex("^arn:[a-z0-9-]+:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:access-point/fsap-[0-9a-f]+$", var.original_private_replay_approvals.access_point_arn)) &&
+      slice(split(":", var.original_private_replay_approvals.file_system_arn), 0, 5) == slice(split(":", var.original_private_replay_approvals.access_point_arn), 0, 5) &&
+      can(regex("^sg-([a-f0-9]{8}|[a-f0-9]{17})$", var.original_private_replay_approvals.mount_target_security_group_id)),
+      false
+    )
+    error_message = "Original replay approvals need a dedicated private EFS access point and mount target security group."
+  }
+}
+
 variable "kafka_bootstrap" {
   description = "Comma-separated bootstrap endpoints for default mode."
   type        = string
