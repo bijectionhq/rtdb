@@ -1,4 +1,6 @@
 mod allocation;
+#[doc(hidden)]
+pub mod arrow_flow;
 mod cell;
 mod conform;
 mod decimal;
@@ -28,7 +30,7 @@ pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells,
 pub use hash::{decimal_cell_as_f64, hash_cell, hash_float_components, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
 pub use memory::{BatchBuilder, BufferIdentity, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn,
     ResultArrayFunding, RetainedArray, Selection, retain_array, retain_buffer, retain_buffer_with_owner, retain_result_array, shared_allocation_size,
-    shared_allocation_size_excluding, shared_batches_allocation_size, visible_buffer_bytes};
+    shared_allocation_size_excluding, shared_batches_allocation_size, new_buffer_backing_bytes, visible_buffer_bytes};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
 pub use text::{TextCell, binary_cell, owned_text_cell, selected_cell, text_cell, utf8_list};
 pub use values::{ColumnReader, build_array, build_array_refs, build_list_array, build_struct_array, copy_array, copy_array_refs, copy_evaluated_cells, pack_runs, read_execution_entity_id_as, read_execution_owned_entity_id, read_value, read_value_as, repack_numeric_list, repack_scalar_list, struct_field_cell};

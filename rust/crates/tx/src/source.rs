@@ -372,7 +372,11 @@ impl SourceTransaction {
         Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
+    // arrow-flow-scope: rtdb.proposal.landing
     pub(crate) fn landing_footprint(&self) -> Result<Self> {
+        use rtdb_columnar::arrow_flow::{self, Measures};
+
+        let flow = arrow_flow::sample();
         let batch = self.operation_batch(None, SourcePurpose::Log)?;
         let schema = batch.batch().schema_ref();
         let schema_bytes = rtdb_format::ipc::schema_translation_bound(schema)?;
@@ -383,28 +387,69 @@ impl SourceTransaction {
             Self::from_operations(operations, self.options.clone(), &self.memory)
         };
         let mut masked = false;
-        if schema.fields().iter().zip(batch.batch().columns())
-            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref(), &mut masked))
-        {
+        let mismatch = schema.fields().iter().zip(batch.batch().columns())
+            .find_map(|(field, column)| landing_ipc_mismatch(field, column.as_ref(), &mut masked));
+        if mismatch.is_none() {
             let _schema = self.memory.reserve(schema_bytes)?;
             if masked {
+                // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Normalize masked children and read operations directly from Arrow.
                 if let Ok(normalized) = rtdb_format::ipc::normalize_java_stream_batch(batch.batch()) {
                     let normalized = OwnedBatch::with_reservation(normalized, Arc::clone(batch.reservation()))?;
+                    if let Some(flow) = flow {
+                        flow.record("rtdb.proposal.landing/masked", Measures {
+                            layout: Some("masked-children"),
+                            rows: Some(normalized.batch().num_rows()),
+                            reservation_bytes: Some(normalized.reservation().bytes()),
+                            ..Measures::default()
+                        });
+                    }
                     return decode(std::slice::from_ref(&normalized));
                 }
             } else {
+                // arrow-flow: rtdb.proposal.landing/compatible operation-batch operations materialize java-v5 required adapt_stream_batch | Read operations from a compatible in-memory layout.
                 let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch())? {
                     Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation()))?,
                     None => batch,
                 };
+                if let Some(flow) = flow {
+                    flow.record("rtdb.proposal.landing/compatible", Measures {
+                        layout: Some("compatible"),
+                        rows: Some(batch.batch().num_rows()),
+                        reservation_bytes: Some(batch.reservation().bytes()),
+                        ..Measures::default()
+                    });
+                }
                 return decode(std::slice::from_ref(&batch));
             }
         }
 
+        // arrow-flow: rtdb.proposal.landing/fallback-encode operation-batch temporary-ipc encode java-v5 candidate ipc::encode | The in-memory normalization cases declined. The temporary stream exists for the decoder below.
         let footprint = crate::ipc::encode(schema, [batch.batch()], &self.memory)?;
+        let layout = mismatch.unwrap_or("masked-normalization-declined");
+        if let Some(flow) = flow {
+            flow.record("rtdb.proposal.landing/fallback-encode", Measures {
+                layout: Some(layout),
+                rows: Some(batch.batch().num_rows()),
+                encoded_bytes: Some(footprint.as_slice().len()),
+                reservation_bytes: Some(footprint.reservation_bytes()),
+                output_buffer: Some(1),
+                ..Measures::default()
+            });
+        }
         drop(batch);
-        decode(&crate::ipc::decode(&footprint.into_bytes(), &self.memory)?)
+        // arrow-flow: rtdb.proposal.landing/fallback-decode temporary-ipc operations decode java-v5 candidate ipc::decode | Decode the temporary stream to preserve landing normalization.
+        let pages = crate::ipc::decode(&footprint.into_bytes(), &self.memory)?;
+        if let Some(flow) = flow {
+            flow.record("rtdb.proposal.landing/fallback-decode", Measures {
+                layout: Some(layout),
+                rows: Some(pages.iter().map(|page| page.batch().num_rows()).sum()),
+                input_buffer: Some(1),
+                ..Measures::default()
+            });
+        }
+        decode(&pages)
     }
+    // arrow-flow-end
 
     pub fn encode(&self) -> Result<RetainedBytes> {
         let bounded = BoundedRetry::from_metadata(self.options.user_metadata.as_ref())?;
@@ -555,28 +600,32 @@ impl SourceTransaction {
     }
 }
 
-fn landing_field_matches_ipc(field: &Field, array: &dyn Array, masked: &mut bool) -> bool {
-    if rtdb_columnar::decimal_field_parameters(field).is_err() { return false; }
+fn landing_ipc_mismatch(field: &Field, array: &dyn Array, masked: &mut bool) -> Option<&'static str> {
+    if rtdb_columnar::decimal_field_parameters(field).is_err() { return Some("decimal-metadata"); }
     *masked |= !field.is_nullable() && array.null_count() != 0;
     match field.data_type() {
         DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
-            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref(), masked)),
+            .find_map(|(field, column)| landing_ipc_mismatch(field, column.as_ref(), masked)),
         DataType::Union(fields, UnionMode::Dense) => fields.iter()
-            .all(|(id, field)| landing_field_matches_ipc(field, array.as_union().child(id).as_ref(), masked)),
-        DataType::List(item) => landing_field_matches_ipc(item, array.as_list::<i32>().values().as_ref(), masked),
-        DataType::LargeList(item) => landing_field_matches_ipc(item, array.as_list::<i64>().values().as_ref(), masked),
-        DataType::FixedSizeList(item, _) => landing_field_matches_ipc(item, array.as_fixed_size_list().values().as_ref(), masked),
-        DataType::Map(entries, _) => landing_field_matches_ipc(entries, array.as_map().entries(), masked),
+            .find_map(|(id, field)| landing_ipc_mismatch(field, array.as_union().child(id).as_ref(), masked)),
+        DataType::List(item) => landing_ipc_mismatch(item, array.as_list::<i32>().values().as_ref(), masked),
+        DataType::LargeList(item) => landing_ipc_mismatch(item, array.as_list::<i64>().values().as_ref(), masked),
+        DataType::FixedSizeList(item, _) => landing_ipc_mismatch(item, array.as_fixed_size_list().values().as_ref(), masked),
+        DataType::Map(entries, _) => landing_ipc_mismatch(entries, array.as_map().entries(), masked),
         // Arrow IPC omits an empty timezone string from the schema.
-        DataType::Timestamp(_, zone) => zone.as_ref().is_none_or(|zone| !zone.is_empty()),
+        DataType::Timestamp(_, zone) => zone.as_ref().is_some_and(|zone| zone.is_empty()).then_some("empty-timezone"),
         DataType::Null | DataType::Boolean
         | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
         | DataType::Float16 | DataType::Float32 | DataType::Float64
         | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
         | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_)
-        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => true,
-        _ => false,
+        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => None,
+        DataType::Dictionary(..) => Some("dictionary"),
+        DataType::Union(_, UnionMode::Sparse) => Some("sparse-union"),
+        DataType::RunEndEncoded(..) => Some("run-end-encoded"),
+        DataType::Utf8View | DataType::BinaryView | DataType::ListView(_) | DataType::LargeListView(_) => Some("view"),
+        _ => Some("unsupported-ipc-type"),
     }
 }
 
