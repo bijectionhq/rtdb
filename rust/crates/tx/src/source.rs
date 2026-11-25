@@ -393,8 +393,10 @@ impl SourceTransaction {
         if !layout.run_end_encoded {
             let _schema = self.memory.reserve(schema_bytes)?;
             let normalized = if layout.masked || layout.empty_timezone {
+                // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Apply Java stream validity and decoded field types in memory.
                 Some(rtdb_format::ipc::normalize_java_stream_batch(batch.batch())?)
             } else {
+                // arrow-flow: rtdb.proposal.landing/compatible operation-batch operations materialize java-v5 required adapt_stream_batch | Read operations from a compatible in-memory layout.
                 rtdb_format::ipc::adapt_stream_batch(batch.batch())?
             };
             let batch = match normalized {
@@ -408,13 +410,11 @@ impl SourceTransaction {
                     ..Measures::default()
                 };
                 if layout.masked {
-                    // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Apply Java stream validity and decoded field types in memory.
                     flow.record("rtdb.proposal.landing/masked", Measures { layout: Some("masked-children"), ..measures });
                 } else if layout.empty_timezone {
-                    // arrow-flow: rtdb.proposal.landing/empty-timezone operation-batch operations materialize java-v5 required normalize_java_stream_batch | Apply the stream schema's omission of empty timestamp timezones in memory.
+                    // arrow-flow: rtdb.proposal.landing/empty-timezone operation-batch operations materialize java-v5 required - | The shared in-memory normalizer omits empty timestamp timezones.
                     flow.record("rtdb.proposal.landing/empty-timezone", Measures { layout: Some("empty-timezone"), ..measures });
                 } else {
-                    // arrow-flow: rtdb.proposal.landing/compatible operation-batch operations materialize java-v5 required adapt_stream_batch | Read operations from a compatible in-memory layout.
                     flow.record("rtdb.proposal.landing/compatible", Measures { layout: Some("compatible"), ..measures });
                 }
             }
