@@ -526,7 +526,11 @@ impl SearchFile {
     pub fn rectangles(&self, doc: u32) -> impl Iterator<Item = [i64; 4]> + '_ { self.manifest.rectangles(doc) }
 
     pub fn events(&self, iid: &[u8; 16]) -> Result<Vec<KeyedEvent>> {
-        self.manifest.rows_of(iid).map(|row| self.manifest.event(row)).collect()
+        self.event_rows(iid).collect()
+    }
+
+    pub(crate) fn event_rows<'a>(&'a self, iid: &[u8; 16]) -> impl Iterator<Item = Result<KeyedEvent>> + use<'a> {
+        self.manifest.rows_of(iid).map(move |row| self.manifest.event(row))
     }
 
     pub fn rows_of(&self, iid: &[u8; 16]) -> Result<Vec<(u32, KeyedEvent)>> {
@@ -711,7 +715,11 @@ impl SearchFile {
         Ok(Ranked(Some(Windows { file: Arc::clone(self), matching, scorer, bounds, windows: ordered, next: 0, ascending_id })))
     }
 
-    pub fn match_set(self: &Arc<Self>, column: &str, query: &Query) -> Result<MatchSet> {
+    pub(crate) fn match_all_bytes(&self) -> usize {
+        256 + (self.manifest.documents as usize).div_ceil(8).next_multiple_of(64)
+    }
+
+    pub(crate) fn match_set(self: &Arc<Self>, column: &str, query: &Query, charge: Arc<MemoryReservation>) -> Result<MatchSet> {
         let column = self.column(column);
         let mut bits = BooleanBufferBuilder::new(self.manifest.documents as usize);
         bits.append_n(self.manifest.documents as usize, false);
@@ -723,30 +731,42 @@ impl SearchFile {
                 }
             }
         }
-        Ok(MatchSet { file: Arc::clone(self), column, matching: MatchingDocuments::All(BooleanArray::new(bits.finish(), None)) })
+        Ok(MatchSet {
+            file: Arc::clone(self), column, matching: MatchingDocuments::All(BooleanArray::new(bits.finish(), None)),
+            _charge: charge,
+        })
     }
 
-    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: rtdb_query::IidScope<'_>) -> Result<MatchSet> {
-        let column = self.column(column);
-        let mut documents = BTreeSet::new();
-        let mut bits = BooleanBufferBuilder::new(iids.len());
-        if let Some(column) = column {
+    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: rtdb_query::IidScope<'_>,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<MatchSet> {
+        let field = self.column(column);
+        let mut documents = [0u32; 1024];
+        let mut len = 0;
+        if let Some(field) = field {
             for iid in iids.iter() {
                 for row in self.manifest.rows_of(&iid.0) {
-                    if let RowDoc::Run(doc) = self.manifest.row_doc(column, row) {
-                        documents.insert(doc);
-                        if documents.len() > 1024 { return self.match_set(&self.columns[column], query); }
+                    if let RowDoc::Run(doc) = self.manifest.row_doc(field, row)
+                        && let Err(at) = documents[..len].binary_search(&doc) {
+                        if len == documents.len() { return self.match_set(column, query, memory.reserve(self.match_all_bytes())?); }
+                        documents.copy_within(at..len, at + 1);
+                        documents[at] = doc;
+                        len += 1;
                     }
                 }
             }
-            let mut pages = PostingPages::new(self, column);
-            let matching = if documents.is_empty() { None } else { Matching::new(query, |term, positions| pages.get(term, positions))? };
-            for &doc in &documents {
+        }
+        let charge = memory.reserve(256 + len * size_of::<u32>() + (len.div_ceil(8)).next_multiple_of(64))?;
+        let mut bits = BooleanBufferBuilder::new(len);
+        if let Some(field) = field.filter(|_| len != 0) {
+            let mut pages = PostingPages::new(self, field);
+            let matching = Matching::new(query, |term, positions| pages.get(term, positions))?;
+            for &doc in &documents[..len] {
                 bits.append(matching.as_ref().is_some_and(|matching| matching.includes(doc)));
             }
         }
-        let matching = MatchingDocuments::Selected(UInt32Array::from_iter_values(documents), BooleanArray::new(bits.finish(), None));
-        Ok(MatchSet { file: Arc::clone(self), column, matching })
+        let matching = MatchingDocuments::Selected(UInt32Array::from(documents[..len].to_vec()), BooleanArray::new(bits.finish(), None));
+        Ok(MatchSet { file: Arc::clone(self), column: field, matching, _charge: charge })
     }
 
     pub fn corpus(&self, column: &str, query: &Query) -> Result<Corpus> {
@@ -814,7 +834,12 @@ enum MatchingDocuments {
     Selected(UInt32Array, BooleanArray),
 }
 
-pub struct MatchSet { file: Arc<SearchFile>, column: Option<usize>, matching: MatchingDocuments }
+pub struct MatchSet {
+    file: Arc<SearchFile>,
+    column: Option<usize>,
+    matching: MatchingDocuments,
+    _charge: Arc<MemoryReservation>,
+}
 
 impl MatchSet {
     pub fn value(&self, page: usize, row: usize) -> Result<Option<bool>> {
@@ -1079,7 +1104,8 @@ mod tests {
                 .map(|scores| scores.into_iter().map(|(doc, score)| (doc, score.to_bits())).collect::<Vec<_>>());
             assert_eq!(scored(&built)?, scored(&durable)?);
         }
-        let matches = Arc::new(built).match_set("body", &matching)?;
+        let charge = memory.reserve(built.match_all_bytes())?;
+        let matches = Arc::new(built).match_set("body", &matching, charge)?;
         assert_eq!(matches.value(0, 0)?, Some(true));
         assert_eq!(matches.value(0, 1)?, Some(false));
         Ok(())
@@ -1358,7 +1384,7 @@ mod tests {
         write_search_file(&columns(), pages.iter().cloned().map(Ok), "job", None, &mut bytes).unwrap();
         let file = Arc::new(SearchFile::open(bytes, &columns()).unwrap());
         let query = Query::parse("invoice");
-        let set = file.match_set("body", &query).unwrap();
+        let set = file.match_set("body", &query, MemoryBudget::new(1 << 20).reserve(file.match_all_bytes()).unwrap()).unwrap();
         for (page, rows) in pages.iter().enumerate() {
             for (row, search_row) in rows.iter().enumerate() {
                 let expected = search_row.values[1].as_ref().map(|tokens| query.matches(tokens));
@@ -1367,7 +1393,7 @@ mod tests {
             assert!(set.value(page, rows.len()).is_err() || page + 1 < pages.len(), "past the last row of the last page");
         }
         assert!(set.value(pages.len(), 0).is_err());
-        assert!(file.match_set("title", &query).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
+        assert!(file.match_set("title", &query, MemoryBudget::new(1 << 20).reserve(file.match_all_bytes()).unwrap()).unwrap().value(0, 0).unwrap().is_none(), "a column no row holds is null everywhere");
     }
 
     #[test]
@@ -1382,11 +1408,15 @@ mod tests {
         let file = open(&rows);
         let query = Query::parse("\"overdue invoice\"");
         let iids = BTreeSet::from([Iid(rows[0].iid), Iid(rows[1].iid), Iid(rows[3].iid)]);
-        let selected = file.match_selected_iids("body", &query, rtdb_query::IidScope::Set(&iids)).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let selected = file.match_selected_iids("body", &query, rtdb_query::IidScope::Set(&iids), &memory).unwrap();
+        assert!(memory.used_bytes() > 0);
         assert_eq!(selected.value(0, 0).unwrap(), Some(true));
         assert_eq!(selected.value(0, 1).unwrap(), Some(false));
         assert!(selected.value(0, 2).is_err());
         assert_eq!(selected.value(0, 3).unwrap(), None);
+        drop(selected);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
@@ -1422,7 +1452,7 @@ mod tests {
         assert_eq!(file.events(&[1; 16]).unwrap().into_iter().map(|key| key.system_from).collect::<Vec<_>>(), [30, 20, 10]);
         assert_eq!(file.events(&[128; 16]).unwrap().len(), 1);
 
-        let set = Arc::new(file.match_set("body", &query).unwrap());
+        let set = Arc::new(file.match_set("body", &query, MemoryBudget::new(1 << 20).reserve(file.match_all_bytes()).unwrap()).unwrap());
         let (first, empty, third) = (set.member(0).unwrap(), set.member(1).unwrap(), set.member(2).unwrap());
         assert_eq!((first.value(0, 0).unwrap(), first.value(0, 1).unwrap(), first.value(1, 0).unwrap()), (Some(true), Some(false), Some(true)));
         assert!(first.value(2, 0).is_err());

@@ -1176,7 +1176,7 @@ mod tests {
         let bounds = TemporalBounds { valid_time: Interval::at(Timestamp(2))?, system_time: Interval::at(Timestamp(2))? };
         assert_eq!(exact.matches("body", &query, bounds)?.iter().map(|doc| doc.iid).collect::<Vec<_>>(), [iid(0)]);
         assert_eq!(exact.events(&iid(1024))?.len(), 1);
-        let set = Arc::new(exact.match_set("body", &query)?);
+        let set = Arc::new(exact.match_set("body", &query, memory.reserve(exact.match_all_bytes())?)?);
         let member = set.member(0)?;
         use rtdb_query::FileMatches;
         assert_eq!(member.value(0, 0)?, Some(true));

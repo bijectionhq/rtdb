@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{borrow::Borrow, collections::BTreeMap, sync::Arc};
 
 use arrow_array::{Array, BinaryArray, StringArray, UInt64Array};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
@@ -130,7 +130,7 @@ impl<'a> TextShadows<'a> {
         let mut corpus = HeldTextCorpus::new(memory, analyzer, text)?;
         for (partition, id, text) in self.rows() {
             let matched = corpus.observe(id, text)?;
-            if corpus.shadows.entry(partition).or_default().insert(id.into_owned(), matched).is_some() {
+            if corpus.shadows.entry(partition).or_default().insert(ShadowKey(id.into_owned()), matched).is_some() {
                 return Err(corpus_limit());
             }
             check()?;
@@ -139,13 +139,53 @@ impl<'a> TextShadows<'a> {
     }
 }
 
+struct ShadowKey(EntityId);
+
+trait ShadowIdentity {
+    fn key(&self) -> EntityIdRef<'_>;
+}
+
+impl ShadowIdentity for ShadowKey {
+    fn key(&self) -> EntityIdRef<'_> { EntityIdRef::from(&self.0) }
+}
+
+impl ShadowIdentity for EntityIdRef<'_> {
+    fn key(&self) -> EntityIdRef<'_> { *self }
+}
+
+impl<'a> Borrow<dyn ShadowIdentity + 'a> for ShadowKey {
+    fn borrow(&self) -> &(dyn ShadowIdentity + 'a) { self }
+}
+
+impl Eq for dyn ShadowIdentity + '_ {}
+impl PartialEq for dyn ShadowIdentity + '_ {
+    fn eq(&self, other: &Self) -> bool { self.key() == other.key() }
+}
+impl Ord for dyn ShadowIdentity + '_ {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.key().cmp(&other.key()) }
+}
+impl PartialOrd for dyn ShadowIdentity + '_ {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+impl Eq for ShadowKey {}
+impl PartialEq for ShadowKey {
+    fn eq(&self, other: &Self) -> bool { self.key() == other.key() }
+}
+impl Ord for ShadowKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.key().cmp(&other.key()) }
+}
+impl PartialOrd for ShadowKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
 /// Accumulate exact statistics after the held world owner resolves visibility.
 /// Only match frequencies are retained. Scoring waits for the complete corpus.
 pub struct HeldTextCorpus {
     memory: Arc<MemoryBudget>,
     query: Query,
     corpus: Corpus,
-    shadows: BTreeMap<usize, BTreeMap<EntityId, Option<Match>>>,
+    shadows: BTreeMap<usize, BTreeMap<ShadowKey, Option<Match>>>,
     roots: BTreeMap<usize, BTreeMap<EntityId, Option<Match>>>,
     identities: usize,
     text_bytes: usize,
@@ -214,17 +254,17 @@ impl HeldTextCorpus {
             return Err(corpus_limit());
         }
         let matched = self.observe(EntityIdRef::from(&id), text)?;
-        self.shadows.entry(partition).or_default().insert(id, matched);
+        self.shadows.entry(partition).or_default().insert(ShadowKey(id), matched);
         Ok(())
     }
 
     pub fn contains_shadow(&self, partition: usize, id: &EntityId) -> bool {
-        self.shadows.get(&partition).is_some_and(|rows| rows.contains_key(id))
+        self.contains_shadow_key(partition, EntityIdRef::from(id))
     }
 
     pub(crate) fn contains_shadow_key(&self, partition: usize, id: EntityIdRef<'_>) -> bool {
-        self.shadows.get(&partition)
-            .is_some_and(|rows| rows.keys().any(|key| EntityIdRef::from(key) == id))
+        let key: &dyn ShadowIdentity = &id;
+        self.shadows.get(&partition).is_some_and(|rows| rows.contains_key(key))
     }
 
     pub(crate) async fn read_root_partition(
@@ -298,8 +338,15 @@ impl HeldTextCorpus {
     }
 
     pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow<'_>) -> Result<()> {
-        let matches = self.shadows.into_iter().chain(self.roots).flat_map(|(partition, rows)| {
-            rows.into_iter().filter_map(move |(id, matched)| matched.map(|matched| (partition, id, matched)))
+        let mut retained = self.retained;
+        let shadows = self.shadows.into_iter().flat_map(|(partition, rows)| {
+            rows.into_iter().map(move |(id, matched)| (partition, id.0, matched))
+        });
+        let roots = self.roots.into_iter().flat_map(|(partition, rows)| {
+            rows.into_iter().map(move |(id, matched)| (partition, id, matched))
+        });
+        let matches = shadows.chain(roots).filter_map(|(partition, id, matched)| {
+            matched.map(|matched| (partition, id, matched))
         });
         for (partition, id, matched) in matches {
             window.admit_candidate()?;
@@ -308,7 +355,9 @@ impl HeldTextCorpus {
                 return Err(corpus_limit());
             }
             if let Some(at) = window.position(partition, EntityIdRef::from(&id), score) {
-                window.insert_at(at, partition, RankedIdentity::Held(id), score)?;
+                let charge = Arc::get_mut(&mut retained).expect("exclusive corpus reservation")
+                    .split_off(identity_charge(EntityIdRef::from(&id)))?;
+                window.insert_at(at, partition, RankedIdentity::Held(id, charge), score);
             }
         }
         Ok(())
@@ -405,6 +454,10 @@ mod tests {
         assert_eq!(corpus.retained.bytes(), before);
         assert_eq!(corpus.statistics().documents, 3);
         assert_eq!(corpus.statistics().tokens, 3);
+        let binary = [0, 0xff, 0];
+        corpus.shadow(0, EntityId::Binary(binary.to_vec()), None).unwrap();
+        assert!(corpus.contains_shadow_key(0, EntityIdRef::Binary(&binary)));
+        assert!(!corpus.contains_shadow_key(1, EntityIdRef::Binary(&binary)));
         let page = corpus.finish(0, 3).unwrap();
         assert_eq!(page.total, 3);
         assert_eq!(page.hits.into_iter().map(|hit| (hit.id, hit.partition)).collect::<Vec<_>>(),
