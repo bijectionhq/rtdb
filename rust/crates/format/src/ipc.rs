@@ -324,7 +324,7 @@ impl ArrowFile {
             Some((batch, charge)) => (batch, charge, "rtdb.event.projected/selected"),
             None => {
                 let charge = memory.reserve(self.pages.full_page_decode_bound(page, &wire)?)?;
-                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Fully decode a page when selective decode declines its physical layout.
+                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Use the file decoder when the selected physical layout still requires it.
                 let batch = self.pages.decode_page(page, wire)?;
                 (batch, charge, "rtdb.event.projected/full-page")
             }
@@ -461,9 +461,18 @@ impl PageDecoder {
     pub fn decode_event_page(&self, page: usize, bytes: Buffer, put_columns: &[String]) -> Result<RecordBatch> {
         match self.decode_projected_page(page, &bytes, PageProjection::PutColumns(put_columns)) {
             Ok(batch) => Ok(batch),
-            // Some reference layouts use undefined union legs or unknown null counts.
+            // Reference dense unions can use undefined type IDs that the projected decoder cannot read.
             Err(_) => self.decode_page(page, bytes),
         }
+    }
+
+    pub fn narrow_put_projection<'a>(&self, columns: &'a [String]) -> Option<PageProjection<'a>> {
+        let op = self.decoded_schema.field_with_name("op").ok()?;
+        let DataType::Union(legs, _) = op.data_type() else { return None; };
+        legs.iter().any(|(_, leg)| {
+            leg.name() == "put" && matches!(leg.data_type(), DataType::Struct(fields)
+                if fields.iter().any(|field| !columns.contains(field.name())))
+        }).then_some(PageProjection::PutColumns(columns))
     }
 
     /// Configures `decode_file_page` to select event headers, the document ID, and the named put fields.
@@ -846,8 +855,8 @@ pub fn restore_spill_page_schema(batch: &RecordBatch, schema: &SchemaRef) -> Res
 /// Returns a replacement only when the stream reader would change the schema.
 pub fn adapt_stream_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> { decoded_schema::adapt_batch(batch) }
 
-/// Removes validity that the Java stream layout discards, then adapts the decoded schema.
-/// The caller establishes that the Java stream writer models the layout and preserves its field types.
+/// Applies Java stream validity and the decoded schema, including the omission of empty timestamp timezones.
+/// The caller establishes that the Java stream writer models the batch layout.
 pub fn normalize_java_stream_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     decoded_schema::normalize_stream_validity(batch)
 }
@@ -2244,7 +2253,7 @@ fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {
 }
 
 #[test]
-fn seekable_event_projection_funds_only_selected_decode_and_wire() {
+fn seekable_event_projection_funds_only_selected_decode_and_wire_with_unknown_null_counts() {
     use crate::data::{EventBatch, StoredEvent, StoredOperation, build_event_batch};
     use rtdb_types::{Iid, Interval, StructFields, Timestamp, Value};
 
@@ -2260,7 +2269,17 @@ fn seekable_event_projection_funds_only_selected_decode_and_wire() {
     let batch = build_event_batch(std::slice::from_ref(&event), None, None).unwrap();
     let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
     writer.write(&batch).unwrap();
-    let bytes = writer.into_inner().unwrap();
+    let mut bytes = writer.into_inner().unwrap();
+    let tail = bytes.len() - 10;
+    let footer = tail - arrow_ipc::reader::read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+    let pages = PageDecoder::from_footer(&bytes[footer..tail], footer as u64, None).unwrap();
+    let range = pages.page_range(0).unwrap();
+    let block = &bytes[range.start as usize..range.end as usize];
+    let (header, _) = block_message(pages.block(0).unwrap(), block).unwrap();
+    let message = arrow_ipc::root_as_message(&block[header]).unwrap();
+    let offsets: Vec<_> = message.header_as_record_batch().unwrap().nodes().unwrap().iter()
+        .map(|node| node.0.as_ptr() as usize - bytes.as_ptr() as usize + 8).collect();
+    for offset in offsets { bytes[offset..offset + 8].copy_from_slice(&(-1_i64).to_le_bytes()); }
     let mut reader = ArrowFile::from_reader(Cursor::new(bytes), None).unwrap();
     let memory = MemoryBudget::new(512 << 10);
     assert!(reader.page_allocation_bound(0).unwrap() > memory.limit_bytes());

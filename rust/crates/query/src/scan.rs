@@ -61,10 +61,6 @@ impl DataFileReader {
         Ok(self.opened.as_ref().expect("the data file is open"))
     }
 
-    async fn decode_page(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
-        self.decode_page_as(page, memory, DataProjection::Full).await
-    }
-
     async fn page_rows(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<usize> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
@@ -73,25 +69,14 @@ impl DataFileReader {
         decoder.page_rows(page, metadata.as_slice())
     }
 
-    async fn decode_page_as(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
-        self.decode_funded_page(page, memory, projection, true).await
-    }
-
-    async fn decode_funded_page(
+    async fn decode_event_page(
         &mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>, include_builder_bound: bool,
     ) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
-        let mut bound = reader.page_bound(page, bytes.as_slice())?;
-        // Arrow-only visitors can project a file whose full schema has no SQL builder layout.
-        if include_builder_bound {
-            for field in reader.schema().fields() {
-                bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
-                    .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
-            }
-        }
+        let bound = page_decode_bound(reader, page, &bytes, include_builder_bound)?;
         audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
         let bytes = page_buffer(bytes);
@@ -102,6 +87,48 @@ impl DataFileReader {
         Ok((batch, charged))
     }
 
+    async fn decode_scan_page(
+        &mut self, page: usize, memory: &Arc<MemoryBudget>, put_columns: impl FnOnce() -> Vec<String>,
+    ) -> Result<(Arc<IndexBatch>, Option<Arc<MemoryReservation>>)> {
+        self.open(memory).await?;
+        let opened = self.opened.as_ref().expect("the data file is open");
+        let reader = &opened.layout.decoder;
+        let wire = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
+        let bound = page_decode_bound(reader, page, &wire, true)?;
+
+        if let Some(reservation) = self.storage.admit(bound) {
+            let range = reader.page_metadata_range(page)?;
+            let end = usize::try_from(range.end - range.start).map_err(|error| invalid("page-metadata", error))?;
+            let metadata = wire.as_slice().get(..end).ok_or_else(|| invalid("page-metadata", "Arrow page header exceeds its block"))?;
+            let rows = reader.page_rows(page, metadata)?;
+            // A full fill must fit the cache and query budgets at the same time.
+            if let Some(headers) = self.storage.admit(IndexBatch::header_bytes(rows)?)
+                && let Ok(charged) = memory.reserve(bound)
+            {
+                audience_work::decode_bytes(bound)?;
+                let batch = reader.decode_page(page, page_buffer(wire))?;
+                audience_work::scan_items(batch.num_rows())?;
+                let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(batch, reservation)?, headers)?;
+                return Ok((batch, Some(charged)));
+            }
+        }
+
+        let selected = put_columns();
+        let projected = match reader.narrow_put_projection(&selected) {
+            Some(projection) => decode_projected_page(reader, page, &wire, projection, memory)?,
+            None => None,
+        };
+        let (batch, charged) = if let Some(projected) = projected {
+            projected
+        } else {
+            audience_work::decode_bytes(bound)?;
+            let charged = memory.reserve(bound)?;
+            (reader.decode_page(page, page_buffer(wire))?, charged)
+        };
+        audience_work::scan_items(batch.num_rows())?;
+        Ok((IndexBatch::from_owned(OwnedBatch::with_reservation(batch, charged)?)?, None))
+    }
+
     async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>, expected_metadata: Option<&[u8]>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
@@ -110,21 +137,13 @@ impl DataFileReader {
         if expected_metadata.is_some_and(|metadata| !wire.as_slice().starts_with(metadata)) {
             return Err(invalid("page-metadata", "Arrow page header changed after row admission"));
         }
-        let reserve = |bound| {
-            audience_work::decode_bytes(bound)?;
-            memory.reserve(bound)
-        };
-        if let Some((mut batch, charge)) = reader.decode_projected_page_reserved(page, wire.clone(), projection, reserve)? {
-            if matches!(projection, PageProjection::PutColumns(_)) && batch.get_array_memory_size() > charge.bytes() {
-                // Arrow reports the wire owner's full capacity on each slice, even though the lease already funds it.
-                let columns = batch.columns().iter().map(|array| rtdb_columnar::retain_array(Arc::clone(array), &charge))
-                    .collect::<Result<Vec<_>>>()?;
-                batch = arrow_array::RecordBatch::try_new(batch.schema(), columns).map_err(|error| invalid("page-size", error))?;
-            }
-            return Ok((batch, charge));
+        if let Some(projected) = decode_projected_page(reader, page, &wire, projection, memory)? {
+            return Ok(projected);
         }
 
-        let charge = reserve(reader.full_page_decode_bound(page, wire.as_slice())?)?;
+        let bound = reader.full_page_decode_bound(page, wire.as_slice())?;
+        audience_work::decode_bytes(bound)?;
+        let charge = memory.reserve(bound)?;
         let bytes = match projection {
             PageProjection::Iid => Buffer::from(Bytes::from_owner(wire)),
             PageProjection::PutColumns(_) => page_buffer(wire),
@@ -182,6 +201,34 @@ impl DataFileReader {
         let layout = Arc::new(CachedLayout { decoder, _reservation: Arc::clone(&opening), _dictionaries: dictionaries });
         Ok((layout, opening))
     }
+}
+
+fn page_decode_bound(reader: &PageDecoder, page: usize, wire: &CacheLease, include_builder_bound: bool) -> Result<usize> {
+    let mut bound = reader.page_bound(page, wire.as_slice())?;
+    // Arrow-only visitors can project a file whose full schema has no SQL builder layout.
+    if include_builder_bound {
+        for field in reader.schema().fields() {
+            bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
+                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
+        }
+    }
+    Ok(bound)
+}
+
+fn decode_projected_page(
+    reader: &PageDecoder, page: usize, wire: &CacheLease, projection: PageProjection<'_>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<(arrow_array::RecordBatch, Arc<MemoryReservation>)>> {
+    let Some((mut batch, charge)) = reader.decode_projected_page_reserved(page, wire.clone(), projection, |bound| {
+        audience_work::decode_bytes(bound)?;
+        memory.reserve(bound)
+    })? else { return Ok(None); };
+    if matches!(projection, PageProjection::PutColumns(_)) && batch.get_array_memory_size() > charge.bytes() {
+        // Arrow reports the wire owner's full capacity on each slice, even though the lease already funds it.
+        let columns = batch.columns().iter().map(|array| rtdb_columnar::retain_array(Arc::clone(array), &charge))
+            .collect::<Result<Vec<_>>>()?;
+        batch = arrow_array::RecordBatch::try_new(batch.schema(), columns).map_err(|error| invalid("page-size", error))?;
+    }
+    Ok(Some((batch, charge)))
 }
 
 /// Visits pages up to the row limit and returns the number of rows visited.
@@ -248,7 +295,7 @@ async fn visit_trie_events_as(
     let pages = file.open(memory).await?.layout.decoder.page_count();
     for page in 0..pages {
         if cancellation.is_cancelled() { return Err(point_cancelled()); }
-        let (batch, _charge) = file.decode_page_as(page, memory, projection).await?;
+        let (batch, _charge) = file.decode_event_page(page, memory, projection, true).await?;
         visit(&EventBatch::new(batch)?)?;
     }
     Ok(())
@@ -264,7 +311,7 @@ pub async fn visit_projected_data_events(
     let pages = file.open(memory).await?.layout.decoder.page_count();
     for page in 0..pages {
         check_cancelled()?;
-        let (batch, _charge) = file.decode_funded_page(page, memory, DataProjection::PutColumns(put_columns), false).await?;
+        let (batch, _charge) = file.decode_event_page(page, memory, DataProjection::PutColumns(put_columns), false).await?;
         check_cancelled()?;
         visit(&EventBatch::new(batch)?)?;
     }
@@ -373,7 +420,7 @@ pub(crate) async fn primary_point_events(
                 (held.batch.view().clone(), memory.reserve(held.bound)?)
             }
             None => {
-                let (batch, charge) = file.decode_page_as(page, memory, DataProjection::PutColumns(&[])).await?;
+                let (batch, charge) = file.decode_event_page(page, memory, DataProjection::PutColumns(&[]), true).await?;
                 (EventBatch::new(batch)?, charge)
             }
         };
@@ -1908,7 +1955,7 @@ impl ScanVerifier<'_> {
                         Arc::clone(&cached.batch)
                     }
                     None => {
-                        let (batch, lease) = file.decode_page_as(page as usize, memory, DataProjection::PutColumns(put_columns)).await?;
+                        let (batch, lease) = file.decode_event_page(page as usize, memory, DataProjection::PutColumns(put_columns), true).await?;
                         audience_work::scan_items(batch.num_rows())?;
                         IndexBatch::from_owned(OwnedBatch::with_reservation(batch, lease)?)?
                     }
@@ -2262,28 +2309,24 @@ impl PartitionScan {
             (PageSource::File { file, page: page_index, .. }, None) => {
                 let data = &mut self.files.entries[*file].reader;
                 let context = &self.execution.context;
-                let (page, charged) = if context.spatial_refinement {
+                let batch = if context.spatial_refinement {
                     let selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
-                    data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected), None).await?
+                    let (page, charged) = data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected), None).await?;
+                    audience_work::scan_items(page.num_rows())?;
+                    IndexBatch::from_owned(OwnedBatch::with_reservation(page, charged)?)?
                 } else {
-                    data.decode_page(*page_index, &context.memory).await?
-                };
-                let bound = charged.bytes();
-                audience_work::scan_items(page.num_rows())?;
-                let headers = IndexBatch::header_bytes(page.num_rows())?;
-                let cached_page = if context.spatial_refinement {
-                    None
-                } else {
-                    data.storage.admit(bound).zip(data.storage.admit(headers))
-                };
-                let batch = match cached_page {
-                    Some((reservation, headers)) => {
-                        let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(page, reservation)?, headers)?;
-                        admitted = Some((Arc::clone(&batch), bound));
-                        charge = Some(charged);
-                        batch
+                    let scan = &self.scan;
+                    let ranking = &self.ranking;
+                    let (batch, charged) = data.decode_scan_page(*page_index, &context.memory, || {
+                        scan.columns.iter().map(|field| &field.name)
+                            .chain(scan.matches.iter().map(|matched| &matched.column))
+                            .chain(ranking.iter().map(|rank| &rank.source)).cloned().collect()
+                    }).await?;
+                    if let Some(charged) = &charged {
+                        admitted = Some((Arc::clone(&batch), charged.bytes()));
                     }
-                    None => IndexBatch::from_owned(OwnedBatch::with_reservation(page, charged)?)?,
+                    charge = charged;
+                    batch
                 };
                 ActiveRows::File(batch)
             }
@@ -3791,12 +3834,9 @@ mod tests {
         let mut reader = DataFileReader::new(&storage, key.clone());
         let warmup = MemoryBudget::new(16 << 20);
         for page in 0..2 {
-            let (batch, charged) = reader.decode_page(page, &warmup).await.unwrap();
-            let bound = charged.bytes();
+            let (batch, charged) = reader.decode_scan_page(page, &warmup, Vec::new).await.unwrap();
+            let bound = charged.unwrap().bytes();
             if page == 1 { assert!(bound > context.memory.limit_bytes()); }
-            let headers = storage.admit(IndexBatch::header_bytes(batch.num_rows()).unwrap()).unwrap();
-            let owned = OwnedBatch::with_reservation(batch, storage.admit(bound).unwrap()).unwrap();
-            let batch = IndexBatch::from_owned_with_headers(owned, headers).unwrap();
             assert!(storage.insert_view(&key, View::Page(page), Arc::new(CachedPage { batch, bound })));
         }
 
@@ -3842,28 +3882,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_sparse_projection_keeps_fixed_size_lists_in_arrow() {
+    async fn cold_sparse_projection_skips_uncacheable_put_children_and_keeps_arrow_lists() {
         let values = (1..=3).map(|n| Value::Struct(StructFields::from([
             ("set".into(), Value::Set(vec![Value::I64(n)])),
             ("pair".into(), Value::FixedSizeList(vec![Value::I64(n), Value::I64(-n)].into())),
         ]))).collect::<Vec<_>>();
-        let (state, table, events) = live_table_with_values(values.clone());
+        let (state, table, mut events) = live_table_with_values(values.clone());
+        for event in &mut events {
+            let StoredOperation::Put(document) = &mut event.operation else { panic!("Expected a put") };
+            document.insert("unselected".into(), Value::Utf8("x".repeat(128 << 10)));
+        }
         let captured = state.value();
         let table_entry = captured.table_catalog().entry(&table).unwrap();
         let trie = TrieKey::l0(captured.live().block_index()).unwrap();
-        let put_fields = captured.live().tables()[&table].column_types().clone();
+        let mut put_fields = captured.live().tables()[&table].column_types().clone();
+        put_fields.insert("unselected".into(), LogicalType::Scalar(ScalarType::Utf8));
         let page = build_event_batch(&events, Some(put_fields), None).unwrap();
         let mut metadata = MetadataBuilder::new(false, false);
         metadata.write_leaf(&page).unwrap();
         let (metadata, statistics) = metadata.finish().unwrap();
         let data = write_file(page.schema().as_ref(), &[page]).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let file = rtdb_format::ipc::inspect_file(&mut Cursor::new(data.as_slice())).unwrap();
+        assert!(file.page_decoding_bounds[0] > memory.limit_bytes());
         let addition = CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap();
         let store = Arc::new(MemoryStore::default());
         store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
-        store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
+        let key = ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap();
+        store.put(&key, data.into()).await.unwrap();
         let nascent = CatalogTrie::notification("l01-r20200101-b00".parse().unwrap(), 0, None).unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
-        let (mut scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, Arc::new(BufferPool::new(store, 1 << 20)));
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut scan, mut execution, _) = descriptor_scan(state.value().snapshot(), table, Arc::clone(&storage));
+        Arc::make_mut(&mut execution.context).memory = Arc::clone(&memory);
         scan.iids = Some([events[0].iid, events[2].iid].into());
         let logical = scan.columns[0].data_type.clone();
         let field = rtdb_columnar::to_field("v", &logical).unwrap();
@@ -3884,6 +3935,7 @@ mod tests {
         assert!(cursor.next_batch().await.unwrap().is_none());
         let counts = cursor.scan_counts().unwrap();
         assert_eq!((counts.files_used, counts.pages_used, counts.rows_read), (1, 1, 3));
+        assert!(storage.view::<CachedPage>(&key, View::Page(0)).is_none());
     }
 
     #[tokio::test]

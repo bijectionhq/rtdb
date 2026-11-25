@@ -386,49 +386,46 @@ impl SourceTransaction {
             let operations = decode_operation_pages(pages, false, &self.memory, scratch)?;
             Self::from_operations(operations, self.options.clone(), &self.memory)
         };
-        let mut masked = false;
-        let mismatch = schema.fields().iter().zip(batch.batch().columns())
-            .find_map(|(field, column)| landing_ipc_mismatch(field, column.as_ref(), &mut masked));
-        if mismatch.is_none() {
+        let mut layout = LandingLayout::default();
+        for (field, column) in schema.fields().iter().zip(batch.batch().columns()) {
+            layout.inspect(field, column.as_ref())?;
+        }
+        if !layout.run_end_encoded {
             let _schema = self.memory.reserve(schema_bytes)?;
-            if masked {
-                // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Normalize masked children and read operations directly from Arrow.
-                if let Ok(normalized) = rtdb_format::ipc::normalize_java_stream_batch(batch.batch()) {
-                    let normalized = OwnedBatch::with_reservation(normalized, Arc::clone(batch.reservation()))?;
-                    if let Some(flow) = flow {
-                        flow.record("rtdb.proposal.landing/masked", Measures {
-                            layout: Some("masked-children"),
-                            rows: Some(normalized.batch().num_rows()),
-                            reservation_bytes: Some(normalized.reservation().bytes()),
-                            ..Measures::default()
-                        });
-                    }
-                    return decode(std::slice::from_ref(&normalized));
-                }
+            let normalized = if layout.masked || layout.empty_timezone {
+                // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Apply Java stream validity and decoded field types in memory.
+                Some(rtdb_format::ipc::normalize_java_stream_batch(batch.batch())?)
             } else {
                 // arrow-flow: rtdb.proposal.landing/compatible operation-batch operations materialize java-v5 required adapt_stream_batch | Read operations from a compatible in-memory layout.
-                let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch())? {
-                    Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation()))?,
-                    None => batch,
+                rtdb_format::ipc::adapt_stream_batch(batch.batch())?
+            };
+            let batch = match normalized {
+                Some(normalized) => OwnedBatch::with_reservation(normalized, Arc::clone(batch.reservation()))?,
+                None => batch,
+            };
+            if let Some(flow) = flow {
+                let measures = Measures {
+                    rows: Some(batch.batch().num_rows()),
+                    reservation_bytes: Some(batch.reservation().bytes()),
+                    ..Measures::default()
                 };
-                if let Some(flow) = flow {
-                    flow.record("rtdb.proposal.landing/compatible", Measures {
-                        layout: Some("compatible"),
-                        rows: Some(batch.batch().num_rows()),
-                        reservation_bytes: Some(batch.reservation().bytes()),
-                        ..Measures::default()
-                    });
+                if layout.masked {
+                    flow.record("rtdb.proposal.landing/masked", Measures { layout: Some("masked-children"), ..measures });
+                } else if layout.empty_timezone {
+                    // arrow-flow: rtdb.proposal.landing/empty-timezone operation-batch operations materialize java-v5 required - | The shared in-memory normalizer omits empty timestamp timezones.
+                    flow.record("rtdb.proposal.landing/empty-timezone", Measures { layout: Some("empty-timezone"), ..measures });
+                } else {
+                    flow.record("rtdb.proposal.landing/compatible", Measures { layout: Some("compatible"), ..measures });
                 }
-                return decode(std::slice::from_ref(&batch));
             }
+            return decode(std::slice::from_ref(&batch));
         }
 
-        // arrow-flow: rtdb.proposal.landing/fallback-encode operation-batch temporary-ipc encode java-v5 candidate ipc::encode | The in-memory normalization cases declined. The temporary stream exists for the decoder below.
+        // arrow-flow: rtdb.proposal.landing/fallback-encode operation-batch temporary-ipc encode java-v5 candidate ipc::encode | A run-end field makes Java layout pass the entire Arrow batch body through. Arrow IPC rebases sliced runs and retains native validity.
         let footprint = crate::ipc::encode(schema, [batch.batch()], &self.memory)?;
-        let layout = mismatch.unwrap_or("masked-normalization-declined");
         if let Some(flow) = flow {
             flow.record("rtdb.proposal.landing/fallback-encode", Measures {
-                layout: Some(layout),
+                layout: Some("run-end-encoded"),
                 rows: Some(batch.batch().num_rows()),
                 encoded_bytes: Some(footprint.as_slice().len()),
                 reservation_bytes: Some(footprint.reservation_bytes()),
@@ -437,11 +434,11 @@ impl SourceTransaction {
             });
         }
         drop(batch);
-        // arrow-flow: rtdb.proposal.landing/fallback-decode temporary-ipc operations decode java-v5 candidate ipc::decode | Decode the temporary stream to preserve landing normalization.
+        // arrow-flow: rtdb.proposal.landing/fallback-decode temporary-ipc operations decode java-v5 candidate ipc::decode | Read the rebased run-end layout and its batch validity before lowering operations.
         let pages = crate::ipc::decode(&footprint.into_bytes(), &self.memory)?;
         if let Some(flow) = flow {
             flow.record("rtdb.proposal.landing/fallback-decode", Measures {
-                layout: Some(layout),
+                layout: Some("run-end-encoded"),
                 rows: Some(pages.iter().map(|page| page.batch().num_rows()).sum()),
                 input_buffer: Some(1),
                 ..Measures::default()
@@ -600,32 +597,43 @@ impl SourceTransaction {
     }
 }
 
-fn landing_ipc_mismatch(field: &Field, array: &dyn Array, masked: &mut bool) -> Option<&'static str> {
-    if rtdb_columnar::decimal_field_parameters(field).is_err() { return Some("decimal-metadata"); }
-    *masked |= !field.is_nullable() && array.null_count() != 0;
-    match field.data_type() {
-        DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
-            .find_map(|(field, column)| landing_ipc_mismatch(field, column.as_ref(), masked)),
-        DataType::Union(fields, UnionMode::Dense) => fields.iter()
-            .find_map(|(id, field)| landing_ipc_mismatch(field, array.as_union().child(id).as_ref(), masked)),
-        DataType::List(item) => landing_ipc_mismatch(item, array.as_list::<i32>().values().as_ref(), masked),
-        DataType::LargeList(item) => landing_ipc_mismatch(item, array.as_list::<i64>().values().as_ref(), masked),
-        DataType::FixedSizeList(item, _) => landing_ipc_mismatch(item, array.as_fixed_size_list().values().as_ref(), masked),
-        DataType::Map(entries, _) => landing_ipc_mismatch(entries, array.as_map().entries(), masked),
-        // Arrow IPC omits an empty timezone string from the schema.
-        DataType::Timestamp(_, zone) => zone.as_ref().is_some_and(|zone| zone.is_empty()).then_some("empty-timezone"),
-        DataType::Null | DataType::Boolean
-        | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-        | DataType::Float16 | DataType::Float32 | DataType::Float64
-        | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
-        | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_)
-        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => None,
-        DataType::Dictionary(..) => Some("dictionary"),
-        DataType::Union(_, UnionMode::Sparse) => Some("sparse-union"),
-        DataType::RunEndEncoded(..) => Some("run-end-encoded"),
-        DataType::Utf8View | DataType::BinaryView | DataType::ListView(_) | DataType::LargeListView(_) => Some("view"),
-        _ => Some("unsupported-ipc-type"),
+#[derive(Default)]
+struct LandingLayout {
+    masked: bool,
+    empty_timezone: bool,
+    run_end_encoded: bool,
+}
+
+impl LandingLayout {
+    fn inspect(&mut self, field: &Field, array: &dyn Array) -> Result<()> {
+        rtdb_columnar::decimal_field_parameters(field)?;
+        self.masked |= !field.is_nullable() && array.null_count() != 0;
+        match field.data_type() {
+            DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
+                .try_for_each(|(field, column)| self.inspect(field, column.as_ref())),
+            DataType::Union(fields, UnionMode::Dense) => fields.iter()
+                .try_for_each(|(id, field)| self.inspect(field, array.as_union().child(id).as_ref())),
+            DataType::List(item) => self.inspect(item, array.as_list::<i32>().values().as_ref()),
+            DataType::LargeList(item) => self.inspect(item, array.as_list::<i64>().values().as_ref()),
+            DataType::FixedSizeList(item, _) => self.inspect(item, array.as_fixed_size_list().values().as_ref()),
+            DataType::Map(entries, _) => self.inspect(entries, array.as_map().entries()),
+            DataType::Timestamp(_, zone) => {
+                self.empty_timezone |= zone.as_ref().is_some_and(|zone| zone.is_empty());
+                Ok(())
+            }
+            DataType::RunEndEncoded(..) => {
+                self.run_end_encoded = true;
+                Ok(())
+            }
+            DataType::Null | DataType::Boolean
+            | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+            | DataType::Float16 | DataType::Float32 | DataType::Float64
+            | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+            | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_)
+            | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => Ok(()),
+            data_type => Err(Anomaly::unsupported("rtdb/arrow-type", format!("Unsupported XTDB Arrow type: {data_type:?}"))),
+        }
     }
 }
 
@@ -5153,6 +5161,113 @@ mod tests {
             let detail = documents.array().column(2).as_struct();
             assert!(detail.is_null(1));
             assert!(detail.column(0).is_valid(1));
+        }
+    }
+
+    #[test]
+    fn landing_footprint_normalizes_empty_timezones_and_preserves_decimal_and_null_cells() {
+        use arrow_array::{Decimal128Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray};
+        use rtdb_columnar::{DecimalParameters, decimal_field_parameters, with_decimal_parameters};
+
+        let memory = budget();
+        let decimal = DecimalParameters { precision: 300, scale: -200, bit_width: 128 };
+        let amount = Decimal128Array::from(vec![1, -2, 3]).with_precision_and_scale(1, 1).unwrap();
+        let amount_field = with_decimal_parameters(Field::new("amount", amount.data_type().clone(), false), decimal).unwrap();
+        let times = Arc::new(TimestampMicrosecondArray::from(vec![11, 22, 33]).with_timezone(""));
+        let tags = UnionArray::try_new(
+            UnionFields::try_new([4, 8, 9], [
+                Field::new("i64", DataType::Int64, false),
+                Field::new("null", DataType::Null, true),
+                Field::new("undefined", DataType::Null, false),
+            ]).unwrap(),
+            vec![4, 8, 9].into(), Some(vec![0, 0, 0].into()),
+            vec![Arc::new(Int64Array::from(vec![7])), Arc::new(NullArray::new(1)), Arc::new(NullArray::new(1))],
+        ).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            amount_field,
+            Field::new("at", times.data_type().clone(), false),
+            Field::new("tag", tags.data_type().clone(), true),
+        ])), vec![
+            Arc::new(StringArray::from(vec!["first", "second", "third"])),
+            Arc::new(amount), times.clone(), Arc::new(tags),
+        ]).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+        let ids = EntityIds::new(vec![], &memory).unwrap();
+        let table = TableRef::new("public", "unused");
+        let source = SourceTransaction::new(vec![
+            TxOp::DeleteDocs { table: table.clone(), ids: ids.clone(), valid_from: None, valid_to: None },
+            TxOp::OwnedArrowDocs {
+                relation: rtdb_types::OwnedRelation::new("facts").unwrap(), documents, create_only: false,
+                valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
+            },
+            TxOp::HostedConstraintRefusal,
+            TxOp::EraseDocs { table, ids },
+        ], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+        let footprint = source.landing_footprint().unwrap();
+        assert_eq!(footprint.encode().unwrap().as_slice(), replay.encode().unwrap().as_slice());
+        assert_eq!(footprint.body_digest().unwrap(), replay.body_digest().unwrap());
+        let [
+            Operation::OwnedArrowIids {
+                documents, presence: Some(presence), valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), ..
+            },
+            Operation::Public(TxOp::HostedConstraintRefusal),
+        ] = footprint.operations.as_slice() else { panic!("expected the ordered landing footprint"); };
+        let array = documents.array();
+        assert_eq!(decimal_field_parameters(&array.fields()[1]).unwrap(), Some(decimal));
+        assert_eq!(array.column(1).as_primitive::<arrow_array::types::Decimal128Type>().values().as_ref(), &[1, -2, 3]);
+        assert_eq!(array.fields()[2].data_type(), &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None));
+        let normalized = array.column(2).as_primitive::<arrow_array::types::TimestampMicrosecondType>();
+        assert_eq!(normalized.value(2), 33);
+        assert_eq!(normalized.values().as_ptr(), times.values().as_ptr());
+        assert_eq!(array.column(3).as_union().type_ids().as_ref(), &[4, 8, 9]);
+        assert!(presence[1].contains("tag"));
+        assert!(!presence[2].contains("tag"));
+    }
+
+    #[test]
+    fn landing_footprint_with_run_ends_preserves_native_batch_validity() {
+        use arrow_array::{Int16Array, Int64Array, RunArray, StringArray, types::Int16Type};
+
+        let memory = budget();
+        let runs = RunArray::<Int16Type>::try_new(
+            &Int16Array::from(vec![2, 4, 6]), &Int64Array::from(vec![10, 20, 30]),
+        ).unwrap().slice(1, 3);
+        let detail = StructArray::new(
+            vec![Field::new("code", DataType::Int64, false)].into(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]))],
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Utf8, false),
+            Field::new("runs", runs.data_type().clone(), false),
+            Field::new("detail", detail.data_type().clone(), true),
+        ])), vec![
+            Arc::new(StringArray::from(vec!["first", "second", "third"])),
+            Arc::new(runs), Arc::new(detail),
+        ]).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+        let source = SourceTransaction::new(vec![TxOp::OwnedArrowDocs {
+            relation: rtdb_types::OwnedRelation::new("facts").unwrap(), documents, create_only: true,
+            valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+        let footprint = source.landing_footprint().unwrap();
+        for footprint in [footprint, replay.landing_footprint().unwrap()] {
+            assert_eq!(footprint.encode().unwrap().as_slice(), replay.encode().unwrap().as_slice());
+            let Operation::OwnedArrowIids { documents, .. } = &footprint.operations[0] else {
+                panic!("expected the retained run-end payload");
+            };
+            let runs = documents.array().column(1).as_any().downcast_ref::<RunArray<Int16Type>>().unwrap();
+            assert_eq!(runs.run_ends().values(), &[1, 3]);
+            let detail = documents.array().column(2).as_struct();
+            assert!(detail.is_null(1));
+            assert!(detail.column(0).is_null(1));
         }
     }
 

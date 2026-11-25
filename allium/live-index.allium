@@ -14,6 +14,8 @@
 --   The transient appends only, and what it appends the value it came from cannot see; committing it yields the table's next value, and applying a transaction installs those values.
 --   A table's immutable row lineage advances when rows are appended.
 --   Arrow chunk coalescing preserves row addresses and lineage.
+--   An incremental transaction snapshot keeps compatible pending Arrow runs funded until it copies them and the eligible chunk tail into their replacement chunk in row-address order.
+--   A holder of an earlier snapshot retains its original chunks and their funding.
 --   The row lineage starts a new generation at its revision limit.
 --   The derived index builds coverage anew for that generation.
 --   A derived posting page can serve a related snapshot when its covered rows lie in both snapshots' shared prefix.
@@ -238,6 +240,7 @@ entity StagedTx {
 entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
+    -- The native replica transaction carries each table delta as one Arrow record batch.
     -- Ordinary document operations and SQL put mutations stage document vectors with the event headers for their selected positions.
     -- When an Arrow document supplies the identity, staging derives its IID from that typed cell.
     -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.

@@ -509,6 +509,9 @@ contract SearchFileLayout {
         -- Format 15 authenticates term, posting, rank and IID visibility data against the root named by the held catalog.
         -- A bounded root may travel in that catalog receipt, with terminal range references that eliminate intermediate directory reads.
         -- Table routing is computed from one held catalog and uses negative term or time evidence only to omit nominations.
+        -- Routing reads the pack's lifespan sections from the same catalog IPC stream as the first accepted member's root locator.
+        -- Each member's receipt must name the expected format and file length and agree with the pack's root locator.
+        -- A pack with invalid lifespan sections remains eligible for term nomination.
         -- Every primary event has its logical version, valid interval, operation, member and primary Arrow position in the visibility directory.
         -- A physical rewrite may change the member and Arrow position of an event while preserving its logical version.
 
@@ -592,6 +595,9 @@ contract SearchCorrectness {
         -- A committed native snapshot holds its admitted search postings alongside the primary live rows of that cut.
         -- A live posting page is admitted before construction and its reservation survives cache eviction while the page or its tokens remain in use.
         -- A live posting page can retain its token list as a slice of the accepted delta under the delta buffers' reservation.
+        -- The journal delta writer limits the complete Arrow IPC file to 1 MiB, including its schema, record and footer.
+        -- A write that would cross the allowance declines the delta before extending its output buffer.
+        -- Matching replica readback reuses the prepared Arrow batch held with the encoded delta.
         -- Replay checks the single-record delta profile and row allowance before admitting Arrow decode.
         -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
         -- A partially admitted segment keeps its coverage frontier.

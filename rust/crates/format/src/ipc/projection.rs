@@ -12,7 +12,7 @@ use rtdb_types::{Anomaly, Result};
 
 use super::{
     PageProjection, allocation_add, allocation_mul, arrow_descriptors, codec_workspace, compressed_buffer_length,
-    decoded_buffer_bound, decoded_buffer_span, field_metadata_bound, invalid, schema_metadata_bound,
+    decoded_buffer_bound, decoded_buffer_span, field_metadata_bound, invalid, nulls, schema_metadata_bound,
     validate_lz4_frame,
 };
 
@@ -130,8 +130,10 @@ pub(super) fn prepare<'a, 'selection, G>(
 ) -> Result<Option<Plan<'a, G>>> {
     let measure = matches!(preparation, Preparation::Measure);
     let workspace = codec_workspace(batch)?;
+    let mut invalid_null_count = false;
     for node in batch.nodes().into_iter().flatten() {
         usize::try_from(node.length()).map_err(invalid)?;
+        invalid_null_count |= node.null_count() < -1;
     }
 
     let lz4 = !matches!(preparation, Preparation::ReadPreparedFile)
@@ -169,7 +171,7 @@ pub(super) fn prepare<'a, 'selection, G>(
         return Err(error);
     }
     let base = base?;
-    if selection.is_err() || layout.position != inventory {
+    if selection.is_err() || layout.position != inventory || (layout.retained.unknown_null_counts && invalid_null_count) {
         return Ok(None);
     }
     let inventory = layout.retained;
@@ -250,6 +252,7 @@ struct Inventory<'a> {
     selected: Position,
     top_level: usize,
     nested: bool,
+    unknown_null_counts: bool,
     native_incompatible: bool,
     bound: usize,
 }
@@ -263,6 +266,9 @@ impl<G> Plan<'_, G> {
         output_schema: impl FnOnce(bool) -> Result<SchemaRef>,
         scratch: Option<&Mutex<Descriptors>>,
     ) -> Result<RecordBatch> {
+        if self.inventory.unknown_null_counts && !native_version {
+            return Err(invalid("Arrow page and footer metadata versions differ"));
+        }
         for frame in self.inventory.frames.iter() {
             validate_lz4_frame(frame.bytes, frame.expected)?;
         }
@@ -272,6 +278,7 @@ impl<G> Plan<'_, G> {
             && columns == self.inventory.top_level
             && matches!(self.version, MetadataVersion::V4 | MetadataVersion::V5)
             && !self.inventory.nested
+            && !self.inventory.unknown_null_counts
             && !self.inventory.native_incompatible
             && batch.nodes().is_some()
             && batch.buffers().is_some()
@@ -333,8 +340,24 @@ impl<G> Plan<'_, G> {
                 variadicBufferCounts: counts,
             },
         );
-        builder.finish(batch, None);
-        let batch = flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(builder.finished_data()).map_err(invalid)?;
+        let batch = if self.inventory.unknown_null_counts {
+            let message = arrow_ipc::Message::create(&mut builder, &arrow_ipc::MessageArgs {
+                version: self.version,
+                header_type: arrow_ipc::MessageHeader::RecordBatch,
+                header: Some(batch.as_union_value()),
+                bodyLength: i64::try_from(self.body.len()).map_err(invalid)?,
+                ..Default::default()
+            });
+            builder.finish(message, None);
+            let (metadata, start) = builder.mut_finished_buffer();
+            let metadata = &mut metadata[start..];
+            nulls::normalize(metadata, self.body, &schema)?;
+            arrow_ipc::root_as_message(metadata).map_err(invalid)?.header_as_record_batch()
+                .ok_or_else(|| invalid("Projected Arrow message has no record batch"))?
+        } else {
+            builder.finish(batch, None);
+            flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(builder.finished_data()).map_err(invalid)?
+        };
         arrow_ipc::reader::read_record_batch(self.body, batch, schema, &HashMap::new(), None, &self.version)
             .map_err(invalid)
     }
@@ -461,8 +484,11 @@ impl<'a, 'b> Layout<'a, 'b> {
             .filter(|nodes| start.node < nodes.len())
             .ok_or_else(|| invalid("Arrow schema exceeds its field-node inventory"))?;
         let node = nodes.get(start.node);
-        if keep && node.null_count() < 0 {
-            return Err(invalid("Projected Arrow fields require known null counts"));
+        if keep {
+            if node.null_count() < -1 {
+                return Err(invalid("Arrow null count is below the unknown-count sentinel"));
+            }
+            self.retained.unknown_null_counts |= node.null_count() == -1;
         }
         self.position.node += 1;
 

@@ -1,9 +1,10 @@
-use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, io::{self, Write}, ops::Range, sync::Arc};
 
 use arrow_array::{Array, BooleanArray, LargeListArray, RecordBatch, builder::{BooleanBuilder, LargeListBuilder, StringBuilder}, cast::AsArray};
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::{FileDecoder, read_footer_length};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_ipc::writer::FileWriter;
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::data::PutText;
 use rtdb_index::{PreparedSearchDelta, StagedWrite};
@@ -14,6 +15,7 @@ use crate::{SearchDefinition, accelerate::search_cancelled, lane::LogicalIndex};
 
 pub(crate) const MAX_BYTES: usize = 1 << 20;
 const MAX_ROWS: usize = 2048;
+const ENCODED_ALLOWANCE: &str = "Search delta exceeds its encoded allowance";
 
 /// A table column under one analyzer: definitions with different analyzers on one column keep separate tokens.
 pub(crate) type Column = (TableRef, String, rtdb_text::Analyzer);
@@ -40,6 +42,39 @@ impl AsRef<[u8]> for DeltaBytes {
         let Self(bytes, _reservation) = self;
         bytes
     }
+}
+
+struct DeltaOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for DeltaOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let len = self.bytes.len();
+        let required = len.checked_add(bytes.len()).filter(|&end| end <= self.limit)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+        if required > self.bytes.capacity() {
+            let capacity = required.max(self.bytes.capacity().saturating_mul(2)).min(self.limit);
+            self.bytes.try_reserve_exact(capacity - len).map_err(io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+fn encode_batch(batch: &RecordBatch, limit: usize) -> Result<Vec<u8>> {
+    let encode = || {
+        let mut writer = FileWriter::try_new(DeltaOutput { bytes: Vec::new(), limit }, batch.schema_ref())?;
+        writer.write(batch)?;
+        writer.into_inner().map(|output| output.bytes)
+    };
+    encode().map_err(|error| match error {
+        ArrowError::IoError(_, cause) if cause.kind() == io::ErrorKind::FileTooLarge => invalid(ENCODED_ALLOWANCE),
+        error => invalid(error),
+    })
 }
 
 pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, memory: &Arc<MemoryBudget>,
@@ -92,10 +127,7 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
     let schema = Arc::new(schema());
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(schemas.finish()), Arc::new(tables.finish()),
         Arc::new(fields.finish()), Arc::new(analyzers.finish()), Arc::new(present.finish()), Arc::new(tokens.finish())]).map_err(invalid)?;
-    let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), &schema).map_err(invalid)?;
-    writer.write(&batch).map_err(invalid)?;
-    let encoded = writer.into_inner().map_err(invalid)?;
-    if encoded.len() > MAX_BYTES { return Err(invalid("Search delta exceeds its encoded allowance")); }
+    let encoded = encode_batch(&batch, MAX_BYTES)?;
     Arc::get_mut(&mut charge).expect("unpublished delta owns its reservation").shrink_to(encoded.capacity())?;
     Ok(Some(PreparedSearchDelta {
         encoded: bytes::Bytes::from_owner(DeltaBytes(encoded, charge)),
@@ -111,7 +143,7 @@ pub(crate) struct Delta {
 
 impl Delta {
     pub(crate) fn read(encoded: bytes::Bytes, write: &StagedWrite, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        if encoded.len() > MAX_BYTES { return Err(invalid("Search delta exceeds its encoded allowance")); }
+        if encoded.len() > MAX_BYTES { return Err(invalid(ENCODED_ALLOWANCE)); }
         Self::new(read_batch(Buffer::from(encoded), memory)?, write)
     }
 
@@ -226,6 +258,25 @@ mod tests {
     use arrow_array::StringArray;
     use rtdb_index::{IndexBatch, StoredEvent, StoredOperation, TableWrite};
     use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, Timestamp, TransactionKey, TxId, Value};
+
+    #[test]
+    fn delta_output_bound_covers_schema_record_and_footer() {
+        let batch = RecordBatch::new_empty(Arc::new(schema()));
+        let mut reference = FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
+        let schema_end = reference.get_ref().len();
+        reference.write(&batch).unwrap();
+        let record_end = reference.get_ref().len();
+        let encoded = reference.into_inner().unwrap();
+
+        for limit in [schema_end - 1, record_end - 1, encoded.len() - 1] {
+            let error = encode_batch(&batch, limit).unwrap_err();
+            assert_eq!(error.code, "rtdb.search/invalid-delta");
+            assert_eq!(error.message.as_deref(), Some("Search delta exceeds its encoded allowance"));
+        }
+
+        let bounded = encode_batch(&batch, encoded.len()).unwrap();
+        assert_eq!(bounded, encoded);
+    }
 
     #[test]
     fn replay_rejects_oversized_row_declarations_before_decode_admission() {

@@ -123,8 +123,10 @@
 --   Resolution and apply never interleave, so a transaction is never half-applied.
 --   Staging, ownership and the durability handles: live-index.allium. The role lifecycle, the claim and the term: log-processor-lifecycle.allium.
 --
--- A native hosted Proposal source record carries immutable table batches prepared by the submitter against its authenticated installed cut.
--- Source resolution admits that generation at the same durable predecessor and offered clock and adds order-assigned metadata.
+-- A native hosted Proposal source record carries the ordered operations for preparation by the installed writer at the authenticated durable predecessor.
+-- Preparation normalizes the operation batch in Arrow, preserving the source reader's operation order, field presence and typed values.
+-- A batch containing run-end encoding uses the stream codec to rebase sliced runs and preserve native batch validity.
+-- Source resolution admits the prepared table batches at the same durable predecessor and offered clock and adds order-assigned metadata.
 -- Replica read-back remains the visibility fence for the one selected success or refusal transaction.
 -- The installed writer reports the first admitted committed erase together with its replica position.
 -- Each managed replica effect carries its stable origin across fork replay.
@@ -2229,6 +2231,8 @@ surface QueryAccess {
         -- Mixed Float32 and Float64 components retain their respective widths in a dense Arrow union.
         -- A scan reads compatible leaf counts, bounds, and Bloom bytes at cached Arrow positions.
         -- Metadata read from a cache-owned immutable object retains its Arrow buffers from that object.
+        -- An ordinary persisted scan can decode only the needed put children when a full page lacks cache admission and its IPC layout supports projection.
+        -- The scan retains the event headers and exact entity keys required for temporal resolution.
         -- A spatial fallback read projects IIDs from persisted pages.
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
