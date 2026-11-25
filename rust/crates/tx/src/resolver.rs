@@ -2157,7 +2157,7 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedDelete { relation, .. }) if publish_root && !bounded_write && relation.is_root_data() => {
                         root_rows = root_rows.saturating_add(1);
                     }
-                    Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected })
+                    Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected, .. })
                         if matches!(relation.name(), rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
                             | rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION)
                             && id == "head" && checked_tip.is_none() => {
@@ -2351,7 +2351,7 @@ impl<'a> OpenTransaction<'a> {
                         }
                     };
                     if !operations.iter().any(|operation| matches!(operation,
-                        Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: None })
+                        Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: None, .. })
                             if relation == write.relation && observed == &id && reading.is_none_or(|reading| *valid_at == reading)
                     )) {
                         return Err(unavailable());
@@ -2619,7 +2619,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 continue;
             }
-            let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
+            let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected, revealed }) = operation else { continue; };
             require_root_carrier_id(relation, id.into())?;
             let observed = if self.buffer.base_snapshot().contains_table(&relation.lifetime_table(owner)) {
                 let accepted = self.decision_time();
@@ -2635,12 +2635,35 @@ impl<'a> OpenTransaction<'a> {
             let upper = observed.0.checked_add(1).map(Timestamp)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
             let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-            let actual = rtdb_query::read_owned_point_version(context, owner, relation, id, Interval::new(observed, upper)?).await?;
+            let actual = rtdb_query::read_owned_point_version(Arc::clone(&context), owner, relation, id, Interval::new(observed, upper)?).await?;
             let coordinate = |version: rtdb_types::OwnedPointVersion| {
                 (version.position.transaction.0, version.position.ordinal, version.history.0)
             };
-            if !crate::system_time::owned_point_matches(actual.map(coordinate), expected.map(coordinate)) {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
+            let same_version = crate::system_time::owned_point_matches(actual.map(coordinate), expected.map(coordinate));
+            let Some(revealed) = revealed else {
+                if !same_version {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
+                }
+                continue;
+            };
+            // A revealed read holds over its clock interval, from its valid
+            // instant through acceptance. An unchanged version at an instant
+            // acceptance has not passed needs no further read.
+            let accepted = self.decision_time();
+            if same_version && accepted <= observed {
+                continue;
+            }
+            let through = accepted.max(observed).0.checked_add(1).map(Timestamp)
+                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's clock interval has no following microsecond"))?;
+            if !rtdb_query::owned_point_reveals(context, owner, relation, id, Interval::new(observed, through)?, *revealed).await? {
+                return Err(if same_version {
+                    // The values changed at an instant inside the reader's
+                    // clock interval, so the read is undetermined.
+                    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/undetermined-point",
+                        "The owned point changes inside the observation's clock interval")
+                } else {
+                    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering")
+                });
             }
         }
         self.check_shared_column_retirement(owner, operations, archive_replay).await?;

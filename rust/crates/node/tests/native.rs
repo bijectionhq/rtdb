@@ -590,6 +590,7 @@ async fn normal_owned_points_and_commits_keep_colliding_full_ids_independent() {
 
     let check = |id: &EntityId, expected| TxOp::OwnedCheck {
         relation: relation.clone(), id: id.clone(), valid_at: held.present().system_time, expected,
+        revealed: None,
     };
     let replace = TxOp::OwnedReplaceDocs {
         relation: relation.clone(), documents: documents(&second, 3), valid_from: None, valid_to: None,
@@ -651,7 +652,7 @@ async fn owned_erase_revokes_old_holds_without_erasing_a_colliding_identity() {
     drop(batch);
     drop(observation);
     let purge = session.state_mut().execute_tx(vec![
-        TxOp::OwnedCheck { relation: relation.clone(), id: erased.clone(), valid_at: old_valid, expected },
+        TxOp::OwnedCheck { relation: relation.clone(), id: erased.clone(), valid_at: old_valid, expected, revealed: None },
         TxOp::OwnedErase { relation: relation.clone(), id: erased.clone() },
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(purge.committed(), "{:?}", purge.error());
@@ -5987,6 +5988,7 @@ async fn held_owned_changes_preserve_whole_groups_and_cover_the_ordered_cut() {
     };
     let refused = writer.state_mut().execute_tx(vec![delete.clone(), TxOp::OwnedCheck {
         relation: relation.clone(), id: EntityId::Integer(1), valid_at: Timestamp(15), expected: None,
+        revealed: None,
     }], AutonomousTxOptions::default()).await.unwrap();
     assert!(!refused.committed());
     let after_refusal = writer.open_owned_read().await.unwrap();

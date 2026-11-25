@@ -3824,6 +3824,7 @@ impl NativeSession {
                 id: rtdb_types::EntityId::String("head".into()),
                 valid_at: record.basis.system_time,
                 expected: fork.cut.root_point,
+                revealed: None,
             });
         }
         let marker = (!refusal.is_empty())
@@ -4121,6 +4122,7 @@ impl NativeSession {
             if let OwnedWorldObservation::Point { id, valid_at, revision } = check.observation {
                 ops.push(TxOp::OwnedCheck {
                     relation: check.relation, id, valid_at, expected: revision,
+                    revealed: None,
                 });
             }
         }

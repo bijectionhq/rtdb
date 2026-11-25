@@ -189,6 +189,35 @@ pub struct OwnedPointVersion {
     pub history: Timestamp,
 }
 
+/// What a reader saw of an owned point at its clock: absence, or a present
+/// winner's revealed columns committed by `rtdb_query::owned_revealed_digest`.
+/// A check carrying it is validated by these values, not by the version: a
+/// change the reader could not see keeps it valid, and the values must hold
+/// at every instant from the read's valid instant to acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnedRevealed {
+    Absent,
+    Present([u8; 32]),
+}
+
+impl OwnedRevealed {
+    /// The commit wire form: empty for absence, the 32-byte digest otherwise.
+    pub fn from_wire(bytes: &[u8]) -> Option<Self> {
+        match bytes.len() {
+            0 => Some(Self::Absent),
+            32 => Some(Self::Present(bytes.try_into().ok()?)),
+            _ => None,
+        }
+    }
+
+    pub fn to_wire(self) -> Vec<u8> {
+        match self {
+            Self::Absent => Vec::new(),
+            Self::Present(digest) => digest.to_vec(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHeader {
     pub position: Option<EventPosition>,

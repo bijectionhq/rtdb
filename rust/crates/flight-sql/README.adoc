@@ -218,8 +218,10 @@ At that instant, two nulls in `_read_system_micros: Int64` and `_read_event_posi
 A present point requires both the observed SQL history coordinate and the 16-byte event position.
 The event position contains the original signed 64-bit transaction position and unsigned 64-bit event ordinal, in big-endian order.
 A mutation without a valid instant carries no observation.
+A nullable `_read_revealed: Binary` makes the check compare what the reader saw instead of the version: empty for an observed absence, or the 32-byte digest from the point reply for a present row.
+Such a check holds when no row, or rows whose revealed columns all have that digest, cover every instant from `_read_valid_micros` through the acceptance reading; a change to columns the reader did not see keeps it valid, and a change inside that clock interval leaves it undetermined and aborts the transaction.
 The point reply includes `rtdb.owned.valid_micros` as signed decimal microseconds.
-For a present row it also includes `rtdb.owned.revision_micros` as signed decimal microseconds and `rtdb.owned.event_position` as hexadecimal.
+For a present row it also includes `rtdb.owned.revision_micros` as signed decimal microseconds, `rtdb.owned.event_position` as hexadecimal, and `rtdb.owned.revealed` as the hexadecimal SHA-256 commitment to the row's revealed columns: every column except system time, validity endpoints and private `_rtdb_` metadata, in name order.
 A successful commit reply has the same schema as the create reply.
 An expired deadline or stale observation aborts the entire transaction before mutations apply.
 

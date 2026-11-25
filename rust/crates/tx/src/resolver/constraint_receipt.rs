@@ -872,6 +872,7 @@ mod tests {
                     id: EntityId::String("row".into()),
                     valid_at: Timestamp(4),
                     expected: None,
+                    revealed: None,
                 },
             ]
             .into_iter()

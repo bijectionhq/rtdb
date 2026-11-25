@@ -609,7 +609,7 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
     let create = TxOp::OwnedInsertDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
     let replace = || TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
     let delete = || TxOp::OwnedDelete { relation: relation.clone(), id: id.clone(), valid_from: Some(Timestamp(0)), valid_to: None };
-    let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected };
+    let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected, revealed: None };
     let first = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![create]), &context).await.unwrap();
     assert!(first.result().committed());
     let point_version = |resolved: &rtdb_tx::ResolvedTx| rtdb_types::OwnedPointVersion {

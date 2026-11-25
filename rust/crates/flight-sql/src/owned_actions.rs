@@ -1617,7 +1617,9 @@ impl Service {
         let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut operations, &mut rows_left, CommitEffects::Facts)?;
         let _points = call.reserve(wire::mul(operations.len(), std::mem::size_of::<rtdb_node::AppliedOwnedPoint>())?)?;
         let points = operations.into_iter().map(|operation| match operation {
-            TxOp::OwnedCheck { relation, id, valid_at, expected } =>
+            // A durable hosted read confirms the exact version; that is at
+            // least as strict as any revealed commitment the check carries.
+            TxOp::OwnedCheck { relation, id, valid_at, expected, .. } =>
                 Ok(rtdb_node::AppliedOwnedPoint { relation, id, valid_at, expected }),
             _ => Err(invalid("Hosted validation supports only point and control checks")),
         }).collect::<Result<Vec<_>, _>>()?;
@@ -2028,7 +2030,7 @@ impl Service {
     ) -> Result<bool, Status> {
         let source = batch.batch();
         let controls = [
-            "_op", "_read_valid_micros", "_read_system_micros", "_read_event_position", "_valid_from", "_valid_to",
+            "_op", "_read_valid_micros", "_read_system_micros", "_read_event_position", "_read_revealed", "_valid_from", "_valid_to",
             "_valid_from_offset_micros", "_valid_to_offset_micros", "_archive_origin",
         ];
         let positions = owned_payload_columns(source, row, &controls)?;
@@ -2095,9 +2097,14 @@ impl Service {
             cell.binary().ok_or_else(|| invalid("Owned observation position must be Binary"))
         }).transpose()?;
         let expected = owned_point_expectation(signed("_read_system_micros")?, position)?;
+        let revealed = optional("_read_revealed")?.map(|cell| {
+            cell.binary().and_then(rtdb_types::OwnedRevealed::from_wire)
+                .ok_or_else(|| invalid("Owned revealed commitment must be empty or a 32-byte Binary digest"))
+        }).transpose()?;
+        let revealed = owned_revealed_expectation(expected, revealed)?;
         match valid_at {
-            Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: own_id()?, valid_at, expected }),
-            None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
+            Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: own_id()?, valid_at, expected, revealed }),
+            None if expected.is_some() || revealed.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
             None => (),
         }
         let endpoint = |name| -> Result<Option<Timestamp>, Status> {
@@ -2195,9 +2202,16 @@ impl Service {
                 _ => return Err(invalid("Owned observation position must be Binary")),
             };
             let expected = owned_point_expectation(optional_micros(row.remove("_read_system_micros"))?, position.as_deref())?;
+            let revealed = match row.remove("_read_revealed") {
+                None | Some(Value::Null | Value::Undefined) => None,
+                Some(Value::Binary(bytes)) => Some(rtdb_types::OwnedRevealed::from_wire(&bytes)
+                    .ok_or_else(|| invalid("Owned revealed commitment must be empty or a 32-byte Binary digest"))?),
+                _ => return Err(invalid("Owned revealed commitment must be Binary")),
+            };
+            let revealed = owned_revealed_expectation(expected, revealed)?;
             match valid_at {
-                Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at, expected }),
-                None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
+                Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at, expected, revealed }),
+                None if expected.is_some() || revealed.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
                 None => (),
             }
             let archive_origin = match row.remove("_archive_origin") {
@@ -6208,6 +6222,19 @@ impl Service {
             }
             metadata.insert("rtdb.owned.event_position".into(), encoded);
         }
+        // The reader's commitment to what it saw; a check echoes it so a
+        // change to nothing revealed keeps the read valid. A row whose values
+        // have no canonical encoding is compared by version only.
+        if let Some(digest) = batch.filter(|batch| revision.is_some() && batch.num_rows() == 1)
+            .and_then(|batch| rtdb_query::owned_revealed_digest(batch, 0).ok())
+        {
+            use std::fmt::Write;
+            let mut encoded = String::with_capacity(64);
+            for byte in digest {
+                write!(encoded, "{byte:02x}").expect("String writes are infallible");
+            }
+            metadata.insert("rtdb.owned.revealed".into(), encoded);
+        }
         let columns: Vec<_> = schema.fields().iter().enumerate()
             .filter(|(_, field)| !matches!(field.name().as_str(),
                 "_system_from" | "_assertion_ordinal" | rtdb_types::HOSTED_RECEIPT_TX_ID | rtdb_types::OWNED_EVENT_POSITION_COLUMN))
@@ -6559,6 +6586,16 @@ fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), 
         row.remove(name.as_str());
     }
     Ok(())
+}
+
+/// A revealed absence pairs with an absent version, and a revealed digest with a present one.
+fn owned_revealed_expectation(
+    expected: Option<rtdb_types::OwnedPointVersion>, revealed: Option<rtdb_types::OwnedRevealed>,
+) -> Result<Option<rtdb_types::OwnedRevealed>, Status> {
+    match (expected, revealed) {
+        (_, None) | (None, Some(rtdb_types::OwnedRevealed::Absent)) | (Some(_), Some(rtdb_types::OwnedRevealed::Present(_))) => Ok(revealed),
+        _ => Err(invalid("An owned revealed commitment must match its observed presence")),
+    }
 }
 
 fn owned_point_expectation(history: Option<Timestamp>, position: Option<&[u8]>) -> Result<Option<rtdb_types::OwnedPointVersion>, Status> {

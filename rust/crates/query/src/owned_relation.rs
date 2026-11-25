@@ -88,6 +88,87 @@ pub async fn read_owned_point_version(
     Ok(version)
 }
 
+/// Whether a stored column is revealed to a point's reader: every column
+/// except system time, validity endpoints and private RTDB metadata.
+fn owned_revealed_column(name: &str) -> bool {
+    !matches!(name, "_system_from" | "_system_to" | "_valid_from" | "_valid_to" | "_assertion_ordinal")
+        && !name.starts_with("_rtdb_")
+}
+
+/// Commit to the revealed columns of one point row, ordered by name. The
+/// point reply and acceptance both use it, so a changed version with the same
+/// revealed values yields the same digest.
+pub fn owned_revealed_digest(batch: &arrow_array::RecordBatch, row: usize) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    if row >= batch.num_rows() {
+        return Err(Anomaly::fault("rtdb.owned/revealed-row", "The revealed point row is outside its batch"));
+    }
+    let schema = batch.schema_ref();
+    let mut columns: Vec<_> = schema.fields().iter().enumerate()
+        .filter(|(_, field)| owned_revealed_column(field.name()))
+        .collect();
+    columns.sort_by(|(_, left), (_, right)| left.name().cmp(right.name()));
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb.owned.revealed.v1");
+    for (index, field) in columns {
+        let value = rtdb_columnar::read_value(field, batch.column(index).as_ref(), row)?;
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|_| Anomaly::fault("rtdb.owned/revealed-value", "A revealed point value has no canonical encoding"))?;
+        digest.update((field.name().len() as u64).to_be_bytes());
+        digest.update(field.name().as_bytes());
+        digest.update((encoded.len() as u64).to_be_bytes());
+        digest.update(&encoded);
+    }
+    Ok(digest.finalize().into())
+}
+
+/// Whether a point reveals the same values at every instant of `valid`: no
+/// row for an observed absence, or rows that cover `valid` without a gap and
+/// each commit to the observed digest. A boundary inside `valid` that changes
+/// what the reader sees leaves the read undetermined, so this is false.
+pub async fn owned_point_reveals(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+    revealed: rtdb_types::OwnedRevealed,
+) -> Result<bool> {
+    use arrow_array::{Array, TimestampMicrosecondArray};
+
+    if owner.is_empty() || relation.is_world_catalog() || valid.is_empty() { return Err(address_unavailable()); }
+    let Some(mut cursor) = open_owned_table_point_with_edges(
+        Arc::clone(&context), relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true, false,
+    ).await? else {
+        return Ok(revealed == rtdb_types::OwnedRevealed::Absent);
+    };
+    let rtdb_types::OwnedRevealed::Present(expected) = revealed else {
+        while let Some(rows) = cursor.next_batch().await? {
+            if rows.batch().num_rows() != 0 { return Ok(false); }
+        }
+        return Ok(true);
+    };
+    let mut slices = Vec::new();
+    while let Some(rows) = cursor.next_batch().await? {
+        let batch = rows.batch();
+        let edge = |name: &str, row: usize, open: Timestamp| -> Result<Timestamp> {
+            let array = batch.column_by_name(name)
+                .and_then(|array| array.as_any().downcast_ref::<TimestampMicrosecondArray>())
+                .ok_or_else(address_unavailable)?;
+            Ok(if array.is_valid(row) { Timestamp(array.value(row)) } else { open })
+        };
+        for row in 0..batch.num_rows() {
+            context.check_cancelled()?;
+            if owned_revealed_digest(batch, row).ok() != Some(expected) { return Ok(false); }
+            slices.push((edge("_valid_from", row, Timestamp::MIN)?, edge("_valid_to", row, Timestamp::MAX)?));
+        }
+    }
+    slices.sort();
+    let mut covered = valid.lower();
+    for (from, to) in slices {
+        if from > covered { return Ok(false); }
+        covered = covered.max(to);
+    }
+    Ok(covered >= valid.upper())
+}
+
 pub fn owned_row_event_position(batch: &arrow_array::RecordBatch, row: usize) -> Result<rtdb_types::EventPosition> {
     use arrow_array::{Array, BinaryArray};
 

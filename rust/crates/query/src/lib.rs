@@ -100,7 +100,7 @@ pub use owned_relation::{
 };
 pub use owned_relation::{
     open_owned_lifetime_point, open_owned_point_with_position_mask, open_owned_valid_during_with_position_mask, open_owned_world_constraint_projection,
-    owned_receipt_transaction, owned_row_event_position, read_owned_point_version, owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
+    owned_point_reveals, owned_receipt_transaction, owned_revealed_digest, owned_row_event_position, read_owned_point_version, owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
     try_owned_lifetime_range_expiry,
 };
 

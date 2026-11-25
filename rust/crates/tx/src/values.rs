@@ -1780,7 +1780,13 @@ pub enum TxOp {
         scope: rtdb_types::PlacedAttemptScope, frontier: i64, until: Timestamp,
         region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
     },
-    OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<rtdb_types::OwnedPointVersion> },
+    /// Revalidate one point. With `revealed`, the reader's revealed values
+    /// (or absence) must hold at every instant from `valid_at` to acceptance;
+    /// the version is only the fast path. Without it, the version must match.
+    OwnedCheck {
+        relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp,
+        expected: Option<rtdb_types::OwnedPointVersion>, revealed: Option<rtdb_types::OwnedRevealed>,
+    },
     OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },
     OwnedReplayResidue {
         relation: rtdb_types::OwnedRelation, id: EntityId, origin: rtdb_types::EventOrigin,
