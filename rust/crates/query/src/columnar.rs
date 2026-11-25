@@ -8,9 +8,10 @@ pub(crate) mod search;
 use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray,
     builder::{BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder},
 };
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
@@ -88,10 +89,17 @@ impl SelectedColumn {
         self.sources.iter().flatten().map(|(array, field, logical, _)| (array.as_ref(), field.as_ref(), logical.as_ref()))
     }
 
-    fn select(self, mask: &[bool], selected: usize) -> Self {
-        let mut cells = Vec::with_capacity(selected);
-        cells.extend(self.cells.iter().zip(mask).filter_map(|(cell, &keep)| keep.then_some(cell)));
-        Self { sources: self.sources, cells: SelectedRows::Picks(Arc::new(cells)) }
+    fn select(self, selection: &PredicateSelection, span: Option<&Range<usize>>) -> Self {
+        let cells = if let Some(rows) = span {
+            self.cells.slice(rows.clone())
+        } else {
+            let mut cells = Vec::with_capacity(selection.count);
+            cells.extend(selection.mask.values().set_indices().map(|row| {
+                self.cells.get(row).expect("The column covers the selection")
+            }));
+            SelectedRows::Picks(Arc::new(cells))
+        };
+        Self { sources: self.sources, cells }
     }
 
     pub(crate) fn fragment_boundaries(&self, boundaries: &mut [bool]) {
@@ -2548,22 +2556,109 @@ impl ColumnBatch {
 
     /// Keeps the rows `mask` selects, column by column.
     pub(crate) fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let selected = mask.iter().filter(|keep| **keep).count();
+        if mask.len() == self.len && mask.iter().all(|&keep| keep) { return Ok(self); }
+        let selection = PredicateSelection::from_bits(mask.iter().copied(), memory)?;
+        self.select_predicate(&selection, memory)
+    }
+
+    fn filter_slice_fits(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>) -> bool {
+        if self.columns.iter().any(|column| match column {
+            Column::Arrow { array, field, .. } => array.len() < self.len || array.data_type() != field.data_type()
+                || !scalar_layout(array.data_type()) || array.data_type() == &DataType::Null || array.nulls().is_some(),
+            Column::Selected(_) => false,
+            Column::Values(_) => true,
+        }) {
+            return false;
+        }
+        let scratch = self.columns.len().saturating_mul(256).saturating_add(self.appended.len().saturating_mul(64));
+        let Ok(_scratch) = memory.reserve(scratch) else { return false; };
+        let views = self.columns.iter().filter_map(|column| match column {
+            Column::Arrow { array, .. } => Some(array.slice(rows.start, rows.len())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let Some(visible) = rtdb_columnar::visible_buffer_bytes(&views) else { return false; };
+        let backing = self.collect_charges(&mut HashSet::new())
+            .max(views.iter().map(|array| array.get_buffer_memory_size()).max().unwrap_or(0));
+        backing <= visible.saturating_mul(2).saturating_add(4096)
+    }
+
+    pub(crate) fn select_predicate(self, selection: &PredicateSelection, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if selection.mask.len() != self.len {
+            return Err(invalid("column-filter", "Filter predicate length differs from its batch"));
+        }
+        let selected = selection.count;
         if selected == self.len { return Ok(self); }
-        let spans = self.columns.iter().filter(|column| matches!(column, Column::Selected(SelectedColumn { cells: SelectedRows::Span(_), .. }))).count();
-        let picks = spans.checked_mul(selected).and_then(|cells| cells.checked_mul(std::mem::size_of::<(usize, usize)>())).ok_or_else(size_error)?;
+        let span = selection.contiguous_span();
+        if let Some(rows) = &span
+            && self.filter_slice_fits(rows.clone(), memory)
+        {
+            return self.slice(rows.start, rows.len(), memory);
+        }
+        let spans = if span.is_some() { 0 } else {
+            self.columns.iter().filter(|column| matches!(column, Column::Selected(SelectedColumn { cells: SelectedRows::Span(_), .. }))).count()
+        };
+        let picks = spans.checked_mul(selected).and_then(|cells| cells.checked_mul(size_of::<(usize, usize)>())).ok_or_else(size_error)?;
         let bytes = {
             let _owners = memory.reserve(self.appended.len().checked_mul(64).ok_or_else(size_error)?)?;
             self.collect_charges(&mut HashSet::new())
         };
-        let reservation = memory.reserve(bytes.saturating_add(mask.len()).saturating_add(picks))?;
-        let predicate = arrow_array::BooleanArray::from(mask.to_vec());
+        let reservation = memory.reserve(bytes.saturating_add(picks))?;
+        let predicate = arrow_select::filter::FilterBuilder::new(&selection.mask).build();
         let columns = self.columns.into_iter().map(|column| Ok(match column {
-            Column::Arrow { array, field, logical } => Column::Arrow { array: arrow_select::filter::filter(array.as_ref(), &predicate).map_err(|error| invalid("column-filter", error))?, field, logical },
-            Column::Selected(column) => Column::Selected(column.select(mask, selected)),
-            Column::Values(values) => Column::Values(values.into_iter().zip(mask).filter_map(|(value, keep)| keep.then_some(value)).collect()),
+            Column::Arrow { array, field, logical } => Column::Arrow {
+                array: predicate.filter(array.as_ref()).map_err(|error| invalid("column-filter", error))?, field, logical,
+            },
+            Column::Selected(column) => Column::Selected(column.select(selection, span.as_ref())),
+            Column::Values(values) => Column::Values(values.into_iter().zip(selection.mask.values().iter())
+                .filter_map(|(value, keep)| keep.then_some(value)).collect()),
         })).collect::<Result<Vec<_>>>()?;
         Self::settled(columns, selected, reservation)
+    }
+}
+
+pub(crate) struct PredicateSelection {
+    mask: BooleanArray,
+    count: usize,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PredicateSelection {
+    fn bitmap_bound(len: usize) -> usize { len.div_ceil(8) + 256 }
+
+    fn settled(mask: BooleanArray, count: usize, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
+        let lease = Arc::get_mut(&mut reservation).expect("The filter bitmap owns its reservation");
+        let bytes = mask.get_array_memory_size();
+        if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+        Ok(Self { mask, count, _reservation: reservation })
+    }
+
+    fn from_bits(bits: impl ExactSizeIterator<Item = bool>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(Self::bitmap_bound(bits.len()))?;
+        let values = bits.collect::<BooleanBuffer>();
+        let count = values.count_set_bits();
+        Self::settled(BooleanArray::new(values, None), count, reservation)
+    }
+
+    fn from_arrow(mask: BooleanArray, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
+        let count = mask.true_count();
+        let mask = if mask.null_count() == 0 || count == mask.values().count_set_bits() {
+            // Search's builder leaves the value bits clear in null slots.
+            BooleanArray::new(mask.into_parts().0, None)
+        } else {
+            let copy = reservation.budget().reserve(Self::bitmap_bound(mask.len()))?;
+            let values = arrow_select::filter::prep_null_mask_filter(&mask);
+            drop(mask);
+            reservation = copy;
+            values
+        };
+        Self::settled(mask, count, reservation)
+    }
+
+    pub(crate) fn contains(&self, row: usize) -> bool { self.mask.value(row) }
+
+    fn contiguous_span(&self) -> Option<Range<usize>> {
+        let (start, end) = self.mask.values().set_slices().next()?;
+        (end - start == self.count).then_some(start..end)
     }
 }
 
@@ -2583,9 +2678,9 @@ impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         'batches: while let Some(mut batch) = poll_nested_batch(self.input.as_mut()).await? {
             for predicate in &self.stages {
-                let mask = predicate_mask(&batch, predicate, &self.schema, &self.execution).await?;
-                if !mask.iter().any(|keep| *keep) { continue 'batches; }
-                batch = batch.select(&mask, &self.execution.context.memory)?;
+                let selection = predicate_selection(&batch, predicate, &self.schema, &self.execution).await?;
+                if selection.count == 0 { continue 'batches; }
+                batch = batch.select_predicate(&selection, &self.execution.context.memory)?;
             }
             return Ok(Some(batch));
         }
@@ -2603,37 +2698,57 @@ pub(crate) fn typed_predicate_mask(
     Some(truth.into_iter().map(|value| value == Some(true)).collect())
 }
 
-/// Computes selection in place so an ordered seek can keep row offsets into the original batch.
-pub(crate) async fn predicate_mask(
+pub(crate) async fn predicate_selection(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
-) -> Result<Vec<bool>> {
+) -> Result<PredicateSelection> {
     execution.context.check_cancelled()?;
+    let params = execution.parameters.evaluator();
+    let memory = &execution.context.memory;
     if search::shaped(predicate)
-        && let Some(Column::Arrow { array, .. }) = search::column(predicate, schema, batch, execution.parameters.evaluator(), &execution.context)?
-        && let Some(values) = array.as_any().downcast_ref::<arrow_array::BooleanArray>()
+        && let Some((Column::Arrow { array, .. }, reservation)) = search::funded_column(predicate, schema, batch, params, &execution.context)?
+        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
     {
-        return Ok(values.iter().map(|value| value == Some(true)).collect());
+        let values = values.clone();
+        drop(array);
+        return PredicateSelection::from_arrow(values, reservation);
     }
-    if let Some(mask) = typed_predicate_mask(batch, predicate, schema, execution.parameters.evaluator()) {
+    let prepare_typed = || -> Result<()> {
         if batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
             let metadata = execution.scope()?;
             execution.prepare_expression(predicate, schema, &metadata)?;
         }
-        return Ok(mask);
+        Ok(())
+    };
+    if let Some(truth) = kernel::truth(predicate, schema, batch, params) {
+        prepare_typed()?;
+        return PredicateSelection::from_bits(truth.into_iter().map(|value| value == Some(true)), memory);
+    }
+    if let Some(array) = crate::vector::evaluate(predicate, schema, batch, params)
+        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
+    {
+        prepare_typed()?;
+        let reservation = memory.reserve(values.get_array_memory_size())?;
+        let values = values.clone();
+        drop(array);
+        return PredicateSelection::from_arrow(values, reservation);
     }
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
     let scope = execution.scope()?;
-    let mut mask = Vec::with_capacity(batch.len);
+    let reservation = memory.reserve(PredicateSelection::bitmap_bound(batch.len))?;
+    let mut mask = BooleanBufferBuilder::new(batch.len);
+    let mut count = 0;
     for row in 0..batch.len {
         let input = BatchRow { batch, row, admit_dates: false };
         let value = execution.evaluate_invocation_row(
             &scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
         ).await?;
-        mask.push(rtdb_expr::is_true(&value)?);
+        let keep = rtdb_expr::is_true(&value)?;
+        mask.append(keep);
+        count += usize::from(keep);
         scope.reset()?;
     }
-    Ok(mask)
+    PredicateSelection::settled(BooleanArray::new(mask.finish(), None), count, reservation)
 }
 
 pub(crate) struct BatchRow<'a> { pub batch: &'a ColumnBatch, pub row: usize, pub admit_dates: bool }
@@ -2971,6 +3086,126 @@ mod tests {
         Column::Arrow { field: Arc::new(ArrowField::new("c", array.data_type().clone(), true)), array, logical: Some(LogicalType::Scalar(scalar)) }
     }
 
+    #[test]
+    fn arrow_predicate_reuses_clear_null_bits_and_masks_set_null_bits() {
+        use arrow_buffer::NullBuffer;
+
+        let memory = MemoryBudget::new(4096);
+        for null_bit in [false, true] {
+            let predicate = BooleanArray::new(
+                BooleanBuffer::from(vec![true, false, true, null_bit, true, true]),
+                Some(NullBuffer::from(vec![true, true, true, false, true, true])),
+            ).slice(1, 4);
+            let input = predicate.values().inner().as_ptr();
+            let reservation = memory.reserve(predicate.get_array_memory_size()).unwrap();
+            let predicate = PredicateSelection::from_arrow(predicate, reservation).unwrap();
+
+            assert_eq!(predicate.mask.iter().collect::<Vec<_>>(), [Some(false), Some(true), Some(false), Some(true)]);
+            assert_eq!(predicate.count, 2);
+            assert_eq!(predicate.contiguous_span(), None);
+            assert_eq!(predicate.mask.values().inner().as_ptr() == input, !null_bit);
+            assert_eq!(memory.used_bytes(), predicate.mask.get_array_memory_size());
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn contiguous_filter_shares_arrow_owner_and_composes_a_selected_span() {
+        let memory = MemoryBudget::new(1 << 20);
+        let payload = Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4, 5]));
+        let input = payload.values().as_ptr();
+        let field = Arc::new(ArrowField::new("v", DataType::Int64, false));
+        let logical = Some(LogicalType::Scalar(ScalarType::I64));
+        let columns = vec![
+            Column::Arrow { array: payload.clone(), field: Arc::clone(&field), logical: logical.clone() },
+            Column::Selected(SelectedColumn {
+                sources: Arc::new(vec![Some((payload, field, logical, None))]),
+                cells: SelectedRows::Span(0..6),
+            }),
+        ];
+        let batch = ColumnBatch::settled(columns, 6, memory.reserve(0).unwrap()).unwrap()
+            .pack_evaluated(&memory).unwrap().slice(1, 4, &memory).unwrap();
+        let owner = Arc::downgrade(batch.column_reservation(0));
+
+        let filtered = batch.select(&[false, true, true, false], &memory).unwrap();
+
+        let [Column::Arrow { array, .. }, Column::Selected(selection)] = filtered.columns.as_slice() else {
+            panic!("Expected the original column layouts");
+        };
+        let values = array.as_any().downcast_ref::<Int64Array>().unwrap().values();
+        assert_eq!(values.as_ptr(), input.wrapping_add(2));
+        assert_eq!(values.as_ref(), &[2, 3]);
+        assert!(matches!(&selection.cells, SelectedRows::Span(rows) if *rows == (2..4)));
+        assert_eq!(filtered.columns[1].value(1).unwrap(), Value::I64(3));
+        assert_eq!(Arc::as_ptr(filtered.column_reservation(0)), owner.as_ptr());
+        drop(filtered);
+        assert!(owner.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn contiguous_filter_detaches_a_small_run_between_large_payloads() {
+        let memory = MemoryBudget::new(1 << 20);
+        let wide = "x".repeat(1 << 16);
+        let column = arrow(Arc::new(StringArray::from(vec![wide.as_str(), "a", "b", wide.as_str()])), ScalarType::Utf8);
+        let batch = ColumnBatch::settled(vec![column], 4, memory.reserve(0).unwrap()).unwrap();
+        let owner = Arc::downgrade(batch.column_reservation(0));
+
+        let filtered = batch.select(&[false, true, true, false], &memory).unwrap();
+
+        assert!(owner.upgrade().is_none());
+        let Column::Arrow { array, .. } = &filtered.columns[0] else { panic!("Expected a compact Arrow column"); };
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.value_offsets(), &[0, 1, 2]);
+        assert_eq!(strings.value_data(), b"ab");
+        assert!(memory.used_bytes() < 4096);
+    }
+
+    #[test]
+    fn contiguous_filter_preserves_null_payloads_in_the_compact_layout() {
+        use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let strings = StringArray::new(
+            OffsetBuffer::new(vec![0, 1, 3, 4].into()),
+            Buffer::from(b"axxb".to_vec()),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let batch = ColumnBatch::settled(vec![arrow(Arc::new(strings), ScalarType::Utf8)], 3, memory.reserve(0).unwrap()).unwrap();
+
+        let filtered = batch.select(&[false, true, true], &memory).unwrap();
+
+        let Column::Arrow { array, .. } = &filtered.columns[0] else { panic!("Expected a compact Arrow column"); };
+        let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.value_offsets(), &[0, 2, 3]);
+        assert_eq!(strings.value_data(), b"xxb");
+        assert_eq!(strings.iter().collect::<Vec<_>>(), [None, Some("b")]);
+    }
+
+    #[test]
+    fn disjoint_filter_keeps_selected_and_owned_rows_in_input_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let batch = ColumnBatch::settled(vec![
+            Column::Selected(SelectedColumn {
+                sources: Arc::new(vec![Some((
+                    Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4])),
+                    Arc::new(ArrowField::new("a", DataType::Int64, false)),
+                    Some(LogicalType::Scalar(ScalarType::I64)), None,
+                ))]),
+                cells: SelectedRows::Span(1..5),
+            }),
+            Column::Values(vec![Value::I64(10), Value::I64(20), Value::I64(30), Value::I64(40)]),
+        ], 4, memory.reserve(0).unwrap()).unwrap();
+
+        let filtered = batch.select(&[true, false, false, true], &memory).unwrap();
+
+        assert_eq!(filtered.len, 2);
+        for (column, values) in filtered.columns.iter().zip([[1, 4], [10, 40]]) {
+            assert_eq!(column.value(0).unwrap(), Value::I64(values[0]));
+            assert_eq!(column.value(1).unwrap(), Value::I64(values[1]));
+        }
+    }
+
     #[tokio::test]
     async fn scalar_projection_only_admits_its_referenced_input_cells() {
         struct Input(Option<ColumnBatch>);
@@ -3267,7 +3502,9 @@ mod tests {
             expr: Box::new(schema.fields()[0].expression()), name: "selected".into(), data_type: LogicalType::Scalar(ScalarType::I64),
         };
         let predicate = Expr::binary(BinaryOp::Eq, leaf, Expr::Literal(Value::I64(2)));
-        assert_eq!(predicate_mask(&batch, &predicate, &schema, &execution).await.unwrap(), [false, true]);
+        let selection = predicate_selection(&batch, &predicate, &schema, &execution).await.unwrap();
+        assert!(!selection.contains(0));
+        assert!(selection.contains(1));
 
         let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8));
         let array = rtdb_columnar::copy_array(&ty, &[Value::list(vec![Value::Utf8("keep".into()), Value::Utf8(large)])]).unwrap();
@@ -3281,7 +3518,8 @@ mod tests {
             data_type: LogicalType::Scalar(ScalarType::Utf8).maybe(),
         };
         let predicate = Expr::binary(BinaryOp::Eq, first, Expr::Literal(Value::Utf8("keep".into())));
-        assert_eq!(predicate_mask(&batch, &predicate, &schema, &execution).await.unwrap(), [true]);
+        let selection = predicate_selection(&batch, &predicate, &schema, &execution).await.unwrap();
+        assert!(selection.contains(0));
     }
 
     #[test]
