@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, Int32Array, ListArray, NullArray, RecordBatch, StructArray,
@@ -388,6 +388,7 @@ impl MetadataFile {
     }
 
     pub fn from_nodes(nodes: Vec<MetadataNode>, recency_branches: bool) -> Result<Self> {
+        let mut page_layouts = HashSet::new();
         let mut column_types = Vec::new();
         for (parent, node) in nodes.iter().enumerate() {
             match node {
@@ -406,15 +407,17 @@ impl MetadataFile {
                 MetadataNode::Leaf { data_page_index, columns } => {
                     i32::try_from(*data_page_index).map_err(invalid)?;
                     match columns.0.as_ref() {
-                        LeafSource::Page(page) => {
+                        LeafSource::Page(page) if page_layouts.insert(page.data_type()) => {
                             let field = Field::new("$data$", page.data_type().clone(), false);
                             column_types.push(rtdb_columnar::from_field(&field)?);
                         }
+                        LeafSource::Page(_) => {}
                         _ => column_types.extend(columns.values()?.iter().map(Value::logical_type)),
                     }
                 }
             }
         }
+        drop(page_layouts);
         let mut columns = vec![Field::new("col-name", DataType::Utf8, false), Field::new("root-col?", DataType::Boolean, false), Field::new("count", DataType::Int64, false)];
         if let LogicalType::Struct(types) = LogicalType::join_all(&column_types) {
             for (name, ty) in types {
@@ -769,6 +772,42 @@ mod metadata_wave_tests {
     use super::*;
     use crate::data::{StoredEvent, StoredOperation};
     use rtdb_types::Iid;
+
+    #[test]
+    fn metadata_schema_keeps_first_field_and_union_leg_order_with_repeated_page_layouts() {
+        let page = |names: [&str; 2]| {
+            let fields: Fields = names.into_iter()
+                .map(|name| Field::new(name, DataType::Int32, false)).collect();
+            let value: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+            let arrays = vec![value; names.len()];
+            let records = StructArray::try_new(fields, arrays, None).unwrap();
+            LeafColumns(Arc::new(LeafSource::Page(records)))
+        };
+        let decoded = LeafColumns::new(vec![Value::Struct(StructFields::from([
+            ("quantity".into(), Value::F64(1.0)),
+            ("decoded-only".into(), Value::Bool(true)),
+        ]))]);
+        let sources = [
+            page(["left-only", "quantity"]),
+            page(["right-only", "left-only"]),
+            decoded,
+            page(["left-only", "quantity"]),
+        ];
+        let nodes = sources.into_iter().enumerate()
+            .map(|(data_page_index, columns)| MetadataNode::Leaf { data_page_index, columns }).collect();
+        let file = MetadataFile::from_nodes(nodes, false).unwrap();
+        let DataType::Union(legs, _) = file.schema.field(0).data_type() else { panic!("expected node union") };
+        let (_, leaf) = legs.iter().find(|(_, field)| field.name() == "leaf").unwrap();
+        let DataType::Struct(fields) = leaf.data_type() else { panic!("expected leaf fields") };
+        let item = list_item(fields.find("columns").unwrap().1).unwrap();
+        let DataType::Struct(fields) = item.data_type() else { panic!("expected statistics fields") };
+        let names = fields.iter().map(|field| field.name().as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["col-name", "root-col?", "count", "left-only", "quantity", "right-only", "decoded-only"]);
+        assert!(fields.find("left-only").unwrap().1.is_nullable());
+        let DataType::Union(legs, _) = fields.find("quantity").unwrap().1.data_type() else { panic!("expected quantity union") };
+        let types = legs.iter().map(|(_, leg)| leg.data_type()).collect::<Vec<_>>();
+        assert_eq!(types, [&DataType::Int32, &DataType::Null, &DataType::Float64]);
+    }
 
     #[test]
     fn metadata_typed_legs_match_the_legacy_ipc_bytes() {
