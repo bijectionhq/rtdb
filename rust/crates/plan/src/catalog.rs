@@ -253,17 +253,13 @@ impl CatalogLookups {
     }
 
     pub fn replay(&self, catalog: &dyn Catalog) -> Result<bool> {
-        for lookup in &self.0 {
-            let same = match lookup {
-                Lookup::DefaultDatabase(database) => catalog.default_database() == database,
-                Lookup::Databases(databases) => catalog.databases() == *databases,
-                Lookup::Table(name, binding) => catalog.table(name)? == *binding,
-                Lookup::Tables(database, tables) => catalog.tables(database)? == *tables,
-                Lookup::TransactionScoped(scoped) => catalog.transaction_scoped() == *scoped,
-            };
-            if !same { return Ok(false); }
-        }
-        Ok(true)
+        crate::lookup_replay::replays_every(&self.0, |lookup| Ok(match lookup {
+            Lookup::DefaultDatabase(database) => catalog.default_database() == database,
+            Lookup::Databases(databases) => catalog.databases() == *databases,
+            Lookup::Table(name, binding) => catalog.table(name)? == *binding,
+            Lookup::Tables(database, tables) => catalog.tables(database)? == *tables,
+            Lookup::TransactionScoped(scoped) => catalog.transaction_scoped() == *scoped,
+        }))
     }
 }
 

@@ -1,4 +1,5 @@
 mod catalog;
+mod lookup_replay;
 mod expr;
 mod cast;
 mod temporal_cast;
