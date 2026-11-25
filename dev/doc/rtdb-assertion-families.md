@@ -331,13 +331,14 @@ The inventory comes from the admitted corpus before result slicing. It covers no
 The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field.
 Protected partitions require the installed original rank owner before corpus or scoring work.
 The statistics-only artefact route refuses protected partitions.
-An indexed Root landing registers its physical derivative under `bjrl1/<family hex>/<destination assertion hex>/<canonical AddressRef>` before publication.
-The family and assertion fields are 32 and 64 lowercase hexadecimal characters, respectively, and the full physical selector fits the 512-byte derivative key bound.
+An indexed Root landing registers its physical Binary derivative as `BJFR2 || family[16] || destination assertion[32] || address` before publication.
+The complete address uses the ordered reference image. Admission charges the same 104-byte prefix and twice the address length under the 512-byte derivative key bound.
 The ranker uses the canonical address for overlay masks, candidate identity, tie breaks, and output.
 Custody and erasure use the full physical selector.
 The installed writer uses the registered selector for both first publication and later backfill, and ordinary writes cannot replace an active landed carrier.
 This publication contract requires a fresh installation and supported retained cuts with no previous raw family derivative slots.
-A raw projection expresses ordinary protected custody and uses the existing corpus bounds.
+A raw projection uses the full Binary address for ordinary protected custody and uses the existing corpus bounds.
+Shared-unit inventories store `unit[32] || relation_length:u8 || relation || address` in `fact_sealed_search_unit_rows_binary`. The scoped `ReadHeldSealedSearchUnitRows.v2` action returns a terminal range witness only after scanning the complete held prefix. Ordered erasure compares that prefix inventory with each exact Binary effect and the text relation markers.
 Before admitting an unshadowed decorated Root projection, the ranker requires absence of the raw projection and reads the Binary address in `fact_protected_row_carriers` and the protected journal at `[1] || address` at the same held valid and system cut.
 The journal belongs to the installed base relation underlying the search relation.
 The journal uses `[0] || address` for removals. The `row/<address hex>` name identifies the durable erasure fence and the assertion-family World ciphertext slot. `ReadHeldRowCarrierExists.v2` checks the entire valid extent of the Binary carrier under the installed Original scope.

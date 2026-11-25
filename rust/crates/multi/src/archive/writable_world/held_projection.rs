@@ -184,14 +184,14 @@ impl WorldProjectionCustody {
             return Err(invalid());
         }
         let world = fact.authoring_world.ok_or_else(invalid)?;
-        let EntityId::String(key) = id else { return Err(invalid()); };
-        if key.is_empty() || key.len() > 512 {
+        let EntityId::Binary(key) = id else { return Err(invalid()); };
+        if key.len() > 256 || !rtdb_types::is_rank_row_address(key) {
             return Err(invalid());
         }
 
         let stage = AssertionStage::new(carrier.deployment, NonZeroU64::new(carrier.incarnation).ok_or_else(invalid)?, carrier.stage)?;
         let family = family_vault_address(self.deployment, carrier.family);
-        let slot = WorldRowSlot { world: Uuid::from_bytes(world.0), relation: relation.name(), key: key.as_bytes() };
+        let slot = WorldRowSlot { world: Uuid::from_bytes(world.0), relation: relation.name(), key };
         let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(invalid)?
             .with_original_reader(&self.original, self.deployment, &self.cancellation);
         let vault = self.keys.assertion_keys().ok_or_else(invalid)?;
@@ -220,7 +220,7 @@ impl WorldProjectionCustody {
                     input.extend_from_slice(&carrier.incarnation.to_be_bytes());
                     input.extend_from_slice(carrier.stage.as_bytes());
                     input.extend_from_slice(&world.0);
-                    for field in [relation.name().as_bytes(), key.as_bytes()] {
+                    for field in [relation.name().as_bytes(), key.as_slice()] {
                         input.extend_from_slice(&(field.len() as u16).to_be_bytes());
                         input.extend_from_slice(field);
                     }

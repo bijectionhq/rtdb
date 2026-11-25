@@ -33,7 +33,7 @@ pub struct PreparedFamilyDerivative<'a> {
     pub placement: PlacedAttemptScope,
     pub selector: rtdb_types::RootFamilyDerivativeId<'a>,
     pub relation: &'a str,
-    pub key: &'a str,
+    pub key: &'a [u8],
 }
 
 pub struct AssertionFenceClaim<'a> {

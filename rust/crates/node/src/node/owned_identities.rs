@@ -2,14 +2,13 @@ use std::sync::Arc;
 
 use rtdb_columnar::{EntityIdRef, MemoryReservation, estimate_read_value_bytes, read_owned_entity_id};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedIdentityScan, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
-    SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp};
+    SEALED_SEARCH_UNIT_ROWS, SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp, sealed_search_inventory_row};
 
 use super::{OwnedRangeWitness, OwnedReadSession};
 
 const MAX_PAGE_ROWS: usize = 128;
 const MAX_PAGE_BYTES: usize = 8 << 20;
 const PROTECTED_PAGE_ROWS: usize = 64;
-const SEALED_SEARCH_UNIT_ROWS: &str = "fact_sealed_search_unit_rows";
 
 /// A bounded key page with progress through its last returned identity.
 pub struct OwnedIdentityPage {
@@ -75,15 +74,15 @@ impl OwnedReadSession {
     }
 
     pub async fn sealed_search_unit_rows_page(
-        &self, relation: &OwnedRelation, prefix: &str, after: Option<&str>, limit: usize, scope: PlacedAttemptScope,
+        &self, relation: &OwnedRelation, prefix: &[u8; 32], after: Option<&[u8]>, limit: usize, scope: PlacedAttemptScope,
     ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>, impl Fn() -> Result<()> + Send + Sync + use<>)> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || relation.name() != SEALED_SEARCH_UNIT_ROWS {
             return Err(sealed_search_unit_unavailable());
         }
-        if !(1..=PROTECTED_PAGE_ROWS).contains(&limit) || !sealed_search_unit_prefix(prefix)
-            || after.is_some_and(|id| !sealed_search_unit_row(prefix, id))
+        if !(1..=PROTECTED_PAGE_ROWS).contains(&limit)
+            || after.is_some_and(|id| sealed_search_inventory_row(prefix, id).is_none())
         {
             return Err(Anomaly::incorrect("rtdb.owned/sealed-search-unit", "Invalid sealed search unit prefix, continuation or limit"));
         }
@@ -96,9 +95,9 @@ impl OwnedReadSession {
         }
         let original = self.original_inventory_provider_guard(scope).await?;
         let at = self.present.system_time;
-        let page = self.identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::text(after), limit,
-            Some(EntityIdRef::String(prefix))).await?;
-        if page.keys.iter().any(|key| !matches!(key, EntityId::String(id) if sealed_search_unit_row(prefix, id))) {
+        let page = self.identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::binary(after), limit,
+            Some(EntityIdRef::Binary(prefix))).await?;
+        if page.keys.iter().any(|key| !matches!(key, EntityId::Binary(id) if sealed_search_inventory_row(prefix, id).is_some())) {
             return Err(sealed_search_unit_unavailable());
         }
         let witness = if page.more { None } else {
@@ -356,18 +355,6 @@ impl OwnedReadSession {
             _charges: charges,
         })
     }
-}
-
-fn sealed_search_unit_prefix(prefix: &str) -> bool {
-    prefix.strip_suffix('/').is_some_and(|alias|
-        alias.len() == 64 && alias.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
-}
-
-fn sealed_search_unit_row(prefix: &str, id: &str) -> bool {
-    id.strip_prefix(prefix).and_then(|tail| tail.split_once('/')).is_some_and(|(relation, row)|
-        relation.starts_with("fact_") && relation.ends_with("_search") && relation.len() <= 96
-            && relation.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
-            && !row.is_empty())
 }
 
 fn sealed_search_unit_unavailable() -> Anomaly {

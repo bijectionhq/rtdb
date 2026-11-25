@@ -93,7 +93,7 @@ impl SourceTransaction {
         for write in primary.iter().filter_map(crate::hosted_control::owned_document_write) {
             if !write.relation.is_root_data() || !write.relation.name().ends_with("_search") { continue; }
             for row in write.documents.rows() {
-                let Some(key) = row.string_id() else { continue; };
+                let Some(key) = row.binary_id() else { continue; };
                 let Some(selector) = rtdb_types::RootFamilyDerivativeId::parse(key).map_err(|_| invalid())?
                     else { continue; };
                 let original = context.world_constraints.as_ref().ok_or_else(OwnedWorld::unavailable)?;

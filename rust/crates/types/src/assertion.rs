@@ -303,44 +303,26 @@ impl PlacementBinding {
 pub struct RootFamilyDerivativeId<'a> {
     pub family: [u8; 16],
     pub member: AssertionId,
-    pub address: &'a str,
+    pub address: &'a [u8],
 }
 
 impl<'a> RootFamilyDerivativeId<'a> {
-    pub const PREFIX: &'static str = "bjrl1/";
+    pub const PREFIX: &'static [u8] = b"BJFR2";
     pub const MAX_KEY_BYTES: usize = 512;
 
-    pub fn parse(key: &'a str) -> Result<Option<Self>, AssertionWireError> {
+    pub fn parse(key: &'a [u8]) -> Result<Option<Self>, AssertionWireError> {
         let Some(rest) = key.strip_prefix(Self::PREFIX) else { return Ok(None); };
-        let (family, rest) = rest.split_once('/').ok_or(AssertionWireError)?;
-        let (member, address) = rest.split_once('/').ok_or(AssertionWireError)?;
-        if key.len() > Self::MAX_KEY_BYTES || address.is_empty() || address.len() % 2 != 0
-            || !address.bytes().all(lower_hex)
+        let (family, rest) = rest.split_first_chunk::<16>().ok_or(AssertionWireError)?;
+        let (member, address) = rest.split_first_chunk::<32>().ok_or(AssertionWireError)?;
+        // Preserve the admission ceiling of the previously charged physical selector.
+        if 6 + 32 + 1 + 64 + 1 + 2 * address.len() > Self::MAX_KEY_BYTES
+            || *family == [0; 16] || *member == [0; 32]
+            || crate::RootRowCarrier::parse(address).is_none()
         {
             return Err(AssertionWireError);
         }
-        let family = decode_lower_hex(family).ok_or(AssertionWireError)?;
-        let member = decode_lower_hex(member).ok_or(AssertionWireError)?;
-        if family == [0; 16] || member == [0; 32] {
-            return Err(AssertionWireError);
-        }
-        Ok(Some(Self { family, member: AssertionId::from_bytes(member), address }))
+        Ok(Some(Self { family: *family, member: AssertionId::from_bytes(*member), address }))
     }
-}
-
-fn lower_hex(byte: u8) -> bool {
-    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-}
-
-fn decode_lower_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
-    if value.len() != N * 2 || !value.bytes().all(lower_hex) {
-        return None;
-    }
-    let mut out = [0; N];
-    for (index, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[2 * index..2 * index + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 /// The destination slot fixed by the reviewed landing before RTDB assigns
@@ -502,14 +484,18 @@ mod tests {
 
     #[test]
     fn root_family_derivative_keeps_logical_and_physical_coordinates_distinct() {
-        let key = format!("bjrl1/{}/{}/010203", "01".repeat(16), "ab".repeat(32));
+        let mut address = crate::RootRowCarrier::table_prefix(&[1; 16]).to_vec();
+        address.extend_from_slice(&[0, 255, 0, 255]);
+        address.extend_from_slice(&[2; 64]);
+        address.extend_from_slice(&[0, 1]);
+        let key = [RootFamilyDerivativeId::PREFIX, &[1; 16], &[0xab; 32], &address].concat();
         let id = RootFamilyDerivativeId::parse(&key).unwrap().unwrap();
         assert_eq!(id.family, [1; 16]);
         assert_eq!(id.member.to_bytes(), [0xab; 32]);
-        assert_eq!(id.address, "010203");
+        assert_eq!(id.address, address.as_slice());
         assert_eq!(RootFamilyDerivativeId::parse(id.address).unwrap(), None);
-        assert!(RootFamilyDerivativeId::parse(&key.replace("010203", "01AB")).is_err());
-        assert!(RootFamilyDerivativeId::parse(&key.replace("010203", "01/02")).is_err());
+        assert!(RootFamilyDerivativeId::parse(&key[..key.len() - 1]).is_err());
+        assert_eq!(RootFamilyDerivativeId::parse(b"bjrl1/old").unwrap(), None);
     }
 
 

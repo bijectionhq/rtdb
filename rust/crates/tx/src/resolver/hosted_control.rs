@@ -25,7 +25,6 @@ fn invalid_family_fence() -> Anomaly {
 }
 
 const SHARED_COLUMN_RETIREMENTS: &str = "fact_unit_column_retirements";
-const SEALED_SEARCH_UNIT_ROWS: &str = "fact_sealed_search_unit_rows";
 const MAX_SEALED_UNIT_ROWS: usize = 2048;
 
 fn invalid_shared_retirement() -> Anomaly {
@@ -244,6 +243,8 @@ impl OpenTransaction<'_> {
     pub(super) async fn check_shared_search_erasure(
         &mut self, owner: &str, operations: &[Operation], replay: bool,
     ) -> Result<()> {
+        use rtdb_types::{RootRowCarrier, SEALED_SEARCH_UNIT_ROWS, is_rank_row_address, sealed_search_inventory_row};
+
         if replay || operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()
         )) || !operations.iter().any(|operation| matches!(operation,
@@ -253,11 +254,14 @@ impl OpenTransaction<'_> {
         }
         let invalid = || Anomaly::incorrect("rtdb.owned/shared-search-retirement", "Invalid ordered shared search retirement");
         let _scratch = self.context.memory.reserve(operations.len().saturating_mul(96))?;
-        let mut erases = BTreeMap::<&str, BTreeSet<&str>>::new();
+        let mut erases = BTreeMap::<&str, BTreeSet<&[u8]>>::new();
         let mut count = 0;
         let mut markers = BTreeSet::new();
         let mut unit = None;
         let mut creates = None;
+        let mut row_checks = BTreeSet::new();
+        let mut row_fences = BTreeSet::new();
+        let mut row_retirements = BTreeSet::new();
         let mut witness = 0;
         let mut receipt = false;
         for operation in operations {
@@ -265,9 +269,11 @@ impl OpenTransaction<'_> {
                 Operation::Public(TxOp::HostedControl(control)) => {
                     receipt |= control.name() == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE && !control.is_check();
                 },
-                Operation::Public(TxOp::OwnedErase { relation, id: EntityId::String(id) })
+                Operation::Public(TxOp::OwnedErase { relation, id: EntityId::Binary(id) })
                     if crate::hosted_control::family_root_erase(relation) => {
-                    if !erases.entry(relation.name()).or_default().insert(id) || count == MAX_SEALED_UNIT_ROWS {
+                    if !erases.entry(relation.name()).or_default().insert(id)
+                        || !is_rank_row_address(id) || count == MAX_SEALED_UNIT_ROWS
+                    {
                         return Err(invalid());
                     }
                     count += 1;
@@ -277,6 +283,10 @@ impl OpenTransaction<'_> {
                     witness += 1,
                 Operation::Public(TxOp::OwnedCheck { relation, id: EntityId::String(alias), expected, valid_at })
                     if relation.name() == "fact_unit_fences" => {
+                    if alias.starts_with("row/") {
+                        if expected.is_some() || !row_checks.insert(alias.as_str()) { return Err(invalid()); }
+                        continue;
+                    }
                     if unit.replace((alias.as_str(), expected.is_some(), *valid_at)).is_some()
                         || alias.len() != 64 || !alias.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
                     {
@@ -288,7 +298,7 @@ impl OpenTransaction<'_> {
                     if write.relation.name() == "fact_sealed_search_erasures" {
                         if !crate::hosted_control::family_search_erase_marker(&write) { return Err(invalid()); }
                         for row in write.documents.rows() {
-                            if !markers.insert(row.string_id().ok_or_else(invalid)?) { return Err(invalid()); }
+                            markers.insert(row.string_id().ok_or_else(invalid)?);
                         }
                     } else if write.relation.name() == "fact_unit_fences" {
                         let mut rows = write.documents.rows();
@@ -296,17 +306,44 @@ impl OpenTransaction<'_> {
                         if !write.create_only || write.from != Some(Timestamp::MIN)
                             || !matches!(write.to, None | Some(Timestamp::MAX)) || rows.next().is_some()
                             || row.binary("unit_phase", invalid)? != Some(b"BFU1\x01")
-                            || creates.replace(row.string_id().ok_or_else(invalid)?).is_some()
                         {
                             return Err(invalid());
+                        }
+                        let name = row.string_id().ok_or_else(invalid)?;
+                        if name.starts_with("row/") {
+                            if !row_fences.insert(name) { return Err(invalid()); }
+                        } else if creates.replace(name).is_some() { return Err(invalid()); }
+                    } else if write.relation.is_root_data() && write.relation.name().starts_with("fact_")
+                        && write.create_only && write.from.is_none() && write.to.is_none()
+                    {
+                        for row in write.documents.rows() {
+                            if let Some(address) = row.binary_id().and_then(|id| id.strip_prefix(&[0]))
+                                && RootRowCarrier::parse(address).is_some()
+                                && (!row.only_id() || !row_retirements.insert((write.relation.name(), address)))
+                            { return Err(invalid()); }
                         }
                     }
                 },
             }
         }
-        if witness != 1 || !receipt || !markers.into_iter().eq(erases.keys().copied()) {
+        if !receipt || !markers.into_iter().eq(erases.keys().copied()) {
             return Err(invalid());
         }
+        if unit.is_none() && creates.is_none() && witness == 0 {
+            for (relation, keys) in &erases {
+                let journal = relation.strip_suffix("_search").ok_or_else(invalid)?;
+                for &key in keys {
+                    let _name = self.context.memory.reserve(2 * key.len() + 4)?;
+                    let fence = RootRowCarrier::parse(key).ok_or_else(invalid)?.fence_name();
+                    if !row_checks.contains(fence.as_str()) || !row_fences.contains(fence.as_str())
+                        || !row_retirements.contains(&(journal, key))
+                    { return Err(invalid()); }
+                }
+            }
+            self.search_erasure_admitted = true;
+            return Ok(());
+        }
+        if !row_checks.is_empty() || !row_fences.is_empty() || witness != 1 { return Err(invalid()); }
         let (alias, existing, valid) = unit.ok_or_else(invalid)?;
         if existing {
             if creates.is_some() { return Err(invalid()); }
@@ -318,25 +355,27 @@ impl OpenTransaction<'_> {
         } else if creates != Some(alias) {
             return Err(invalid());
         }
-        let prefix = format!("{alias}/");
+        let mut prefix = [0; 32];
+        for (offset, byte) in prefix.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&alias[2 * offset..2 * offset + 2], 16).map_err(|_| invalid())?;
+        }
         let ordered = self.tx_key().system_time;
         let context = self.context.query_context(
             self.buffer.base_snapshot().clone(), ordered, &self.options.default_tz, self.trace_parent,
         )?;
         let mut inventory = rtdb_query::open_owned_root_prefix_projection(
             Arc::clone(&context), owner, &OwnedRelation::new(SEALED_SEARCH_UNIT_ROWS)?, ordered,
-            &["_id"], rtdb_columnar::EntityIdRef::String(&prefix),
+            &["_id"], rtdb_columnar::EntityIdRef::Binary(&prefix),
         ).await?.ok_or_else(invalid)?;
         while let Some(held) = inventory.next_batch().await? {
             let batch = held.batch();
             let (index, field) = batch.schema_ref().column_with_name("_id").ok_or_else(invalid)?;
             for row in 0..batch.num_rows() {
                 context.check_cancelled_at(row)?;
-                let rtdb_columnar::EntityIdRef::String(key) =
+                let rtdb_columnar::EntityIdRef::Binary(key) =
                     rtdb_columnar::read_owned_entity_id(field, batch.column(index).as_ref(), row)?
                 else { return Err(invalid()); };
-                let (relation, id) = key.strip_prefix(&prefix)
-                    .and_then(|key| key.split_once('/')).ok_or_else(invalid)?;
+                let (relation, id) = sealed_search_inventory_row(&prefix, key).ok_or_else(invalid)?;
                 if !erases.get_mut(relation).is_some_and(|ids| ids.remove(id)) { return Err(invalid()); }
             }
         }

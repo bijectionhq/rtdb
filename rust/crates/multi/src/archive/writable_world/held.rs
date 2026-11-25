@@ -46,7 +46,7 @@ impl rtdb_node::WorldConstraintArchive for WorldArchive {
         let family = crate::keys::family_vault_address(deployment, Uuid::from_bytes(derivative.selector.family));
         let families = self.keys.assertion_families(rtdb_storage::IoRegion::new()).ok_or_else(unavailable)?;
         families.require_reserved_root_derivative(
-            family, derivative.selector.member, derivative.relation, derivative.key.as_bytes(),
+            family, derivative.selector.member, derivative.relation, derivative.key,
         ).await
     }
 

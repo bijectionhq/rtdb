@@ -233,6 +233,54 @@ impl<'a> OwnedIdentityScan<'a> {
 
 pub const SHARED_COLUMN_CARRIERS: &str = "fact_unit_shared_column_carriers";
 pub const ROOT_ROW_CARRIERS: &str = "fact_protected_row_carriers";
+pub const SEALED_SEARCH_UNIT_ROWS: &str = "fact_sealed_search_unit_rows_binary";
+
+/// Decode an inventory key in the exact held unit's Binary prefix.
+pub fn sealed_search_inventory_row<'a>(alias: &[u8; 32], key: &'a [u8]) -> Option<(&'a str, &'a [u8])> {
+    let (&length, key) = key.strip_prefix(alias)?.split_first()?;
+    let (relation, address) = key.split_at_checked(usize::from(length))?;
+    let relation = std::str::from_utf8(relation).ok()?;
+    if relation.len() > 96 || !relation.starts_with("fact_") || !relation.ends_with("_search")
+        || !relation.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    if !is_rank_row_address(address) { return None; }
+    Some((relation, address))
+}
+
+/// A rank identity may refer to a clear row with a protected field.
+pub fn is_rank_row_address(image: &[u8]) -> bool {
+    let Some(mut payload) = image.get(17..).and_then(|payload| payload.strip_suffix(&[0, 1])) else { return false; };
+    if image[0] != RootRowCarrier::REFERENCE || payload.is_empty() {
+        return false;
+    }
+    if payload[0] == 0 { return RootRowCarrier::parse(image).is_some(); }
+    while let Some((&byte, rest)) = payload.split_first() {
+        if byte == 0 {
+            let Some(escaped) = rest.strip_prefix(&[255]) else { return false; };
+            payload = escaped;
+        } else {
+            payload = rest;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn sealed_inventory_binds_alias_relation_and_raw_address() {
+    let alias = [7; 32];
+    let relation = b"fact_label_search";
+    let raw_address = [&[11][..], &[8; 16], &[9, b'x', 0, 255, 0, 1]].concat();
+    let key = [&alias[..], &[relation.len() as u8], relation, &raw_address].concat();
+    assert_eq!(sealed_search_inventory_row(&alias, &key), Some(("fact_label_search", raw_address.as_slice())));
+    assert!(sealed_search_inventory_row(&[8; 32], &key).is_none());
+    assert!(sealed_search_inventory_row(&alias, &key[..key.len() - 1]).is_none());
+    let mut malformed = key;
+    malformed[32] += 1;
+    assert!(sealed_search_inventory_row(&alias, &malformed).is_none());
+}
 
 /// The opaque ordered address used by the hosted protected Root row carrier.
 #[derive(Clone, Copy)]
