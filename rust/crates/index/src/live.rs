@@ -112,6 +112,11 @@ impl IndexBatch {
         self.system_times.is_none_or(|times| times == (system_time, system_time))
     }
     fn has_canonical_iids(&self) -> Option<bool> {
+        self.verify_canonical_iids(self.arrow_reservation().budget(), &mut None)
+    }
+    fn verify_canonical_iids(
+        &self, budget: &Arc<MemoryBudget>, scratch: &mut Option<Arc<MemoryReservation>>,
+    ) -> Option<bool> {
         if let Some(proof) = self.canonical_iids.get() { return Some(*proof); }
         let mut puts = self.headers.0.iter().enumerate().filter(|(_, header)| header.op == EventOp::Put);
         if let Some(first) = puts.next() {
@@ -121,14 +126,13 @@ impl IndexBatch {
             let put = operations.child(put_tag).as_any().downcast_ref::<StructArray>()?;
             let (index, field) = put.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")?;
             let array = put.column(index).as_ref();
-            let budget = self.owned.reservation().budget();
-            let mut scratch = budget.reserve(0).ok()?;
+            if scratch.is_none() { *scratch = Some(budget.reserve(0).ok()?); }
+            let charge = Arc::get_mut(scratch.as_mut()?)?;
             let mut typed = None;
             for (row, header) in std::iter::once(first).chain(puts) {
                 let offset = operations.value_offset(row);
                 let bound = estimate_read_value_bytes(field, array, offset).ok()?
                     .checked_mul(3)?.checked_add(1024)?;
-                let charge = Arc::get_mut(&mut scratch)?;
                 if bound > charge.bytes() { charge.grow_to(bound).ok()?; }
                 let typed = *typed.get_or_insert_with(|| self.put_field_types.get(index)
                     .and_then(|logical| to_field(field.name(), logical).ok())
@@ -413,32 +417,54 @@ impl LiveTable {
         Ok(self.chunks[chunk as usize].0.checked_add(offset))
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
-        if self.last_system_time.is_some_and(|previous| previous > system_time) { return Err(invalid("Live table system time moved backwards")); }
-        let mut next = self.clone();
-        next.column_types = merge_column_types(&next.column_types, &write.column_types);
+        let mut next = self.with_appended_schema(&write.column_types, system_time)?;
         crate::catalog::add_declarations(&mut next.declared_columns, &write.declared_columns);
         if let Some(batch) = &write.batch {
-            if batch.view().has_entity_keys() != self.table.is_owned_event_data() {
-                return Err(invalid("The table write has the wrong physical entity-key layout"));
+            self.validate_append(std::iter::once(batch.as_ref()), write.adopted_history, system_time)?;
+            next.canonical_entity_iids = self.canonical_entity_iids && batch.has_canonical_iids().unwrap_or(false);
+            next.append_indexed_chunk(self.row_count, Arc::clone(batch))?;
+            next.merge_small_chunks()?;
+        }
+        Ok(next)
+    }
+
+    fn with_appended_schema(&self, column_types: &StructFields<LogicalType>, system_time: Timestamp) -> Result<Self> {
+        if self.last_system_time.is_some_and(|previous| previous > system_time) {
+            return Err(invalid("Live table system time moved backwards"));
+        }
+        let mut next = self.clone();
+        next.column_types = merge_column_types(&next.column_types, column_types);
+        next.last_system_time = Some(system_time);
+        Ok(next)
+    }
+
+    fn validate_append<'a>(
+        &self, batches: impl Iterator<Item = &'a IndexBatch> + Clone, adopted_history: bool, system_time: Timestamp,
+    ) -> Result<()> {
+        let keyed = self.table.is_owned_event_data();
+        if batches.clone().any(|batch| batch.view().has_entity_keys() != keyed) {
+            return Err(invalid("The table write has the wrong physical entity-key layout"));
+        }
+        if adopted_history {
+            if self.row_count != 0 || !self.chunks.is_empty() {
+                return Err(invalid("An adopted history must start a virgin live table"));
             }
-            if write.adopted_history {
-                if self.row_count != 0 || !self.chunks.is_empty() {
-                    return Err(invalid("An adopted history must start a virgin live table"));
-                }
-            } else if !batch.has_system_time(system_time) {
-                return Err(invalid("Imported event system time differs from its transaction"));
-            }
-            if !write.adopted_history && batch.view().has_entity_keys() && !batch.is_empty() {
+        } else if batches.clone().any(|batch| !batch.has_system_time(system_time)) {
+            return Err(invalid("Imported event system time differs from its transaction"));
+        }
+        if !adopted_history && keyed {
+            let mut headers = batches.flat_map(|batch| batch.headers.0.iter()).peekable();
+            if let Some(first) = headers.peek() {
                 let mut previous = if self.last_system_time == Some(system_time) && self.row_count > 0 {
                     let header = self.header(self.row_count - 1)?;
                     (header.system_from == system_time
                         && header.position.map(|position| position.transaction)
-                            == batch.headers.0[0].position.map(|position| position.transaction))
+                            == first.position.map(|position| position.transaction))
                         .then_some(header.commit_position)
                 } else {
                     None
                 };
-                for header in batch.headers.0.iter() {
+                for header in headers {
                     let position = header.commit_position;
                     if previous.is_some_and(|previous| {
                         if previous == 0 { position != 0 } else { position <= previous }
@@ -448,42 +474,88 @@ impl LiveTable {
                     previous = Some(position);
                 }
             }
-            if next.canonical_entity_iids {
-                next.canonical_entity_iids = batch.has_canonical_iids().unwrap_or(false);
-            }
-            let count = u32::try_from(batch.len()).map_err(invalid)?;
-            let start = next.row_count;
-            next.row_count = crate::row_address::append_chunk(&mut next.chunks, start, count, Arc::clone(batch))
-                .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
-            next.trie = self.trie.add_range(&next, start, count)?;
-            if count > 0 { next.lineage.append(next.row_count); }
-            next.merge_small_chunks()?;
         }
-        next.last_system_time = Some(system_time);
-        Ok(next)
+        Ok(())
     }
+
+    fn append_indexed_chunk(&mut self, chunk_start: u32, batch: Arc<IndexBatch>) -> Result<()> {
+        let count = u32::try_from(batch.len()).map_err(invalid)?;
+        let first_new_row = self.row_count;
+        self.row_count = crate::row_address::append_chunk(&mut self.chunks, chunk_start, count, batch)
+            .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
+        let added = self.row_count.checked_sub(first_new_row).ok_or_else(|| invalid("Merged chunk does not cover the retained rows"))?;
+        self.trie = self.trie.add_range(self, first_new_row, added)?;
+        if added > 0 { self.lineage.append(self.row_count); }
+        Ok(())
+    }
+
+    fn can_merge_chunk(previous: &IndexBatch, rows: usize, schema: &SchemaRef) -> bool {
+        const MERGED_CHUNK_ROWS: usize = 8192;
+        previous.len() <= rows && rows <= MERGED_CHUNK_ROWS.saturating_sub(previous.len())
+            && previous.arrow().schema_ref() == schema
+    }
+
+    fn coalesce_pending_runs<'a>(
+        &'a self, runs: impl Iterator<Item = &'a IndexBatch> + Clone, declared: &StructFields<LogicalType>,
+        system_time: Timestamp, budget: &Arc<MemoryBudget>,
+    ) -> Result<Option<Self>> {
+        let Some(first) = runs.clone().next() else { return Ok(None); };
+        let schema = first.arrow().schema_ref();
+        let mut rows = runs.clone().try_fold(0usize, |rows, batch| {
+            rows.checked_add(batch.len()).ok_or_else(|| invalid("Write batch size overflow"))
+        })?;
+        let mut start_chunk = self.chunks.len();
+        // Earlier chunks can become eligible as the candidate grows, so plan the full tail before copying.
+        for (_, previous) in self.chunks.iter().rev() {
+            if !Self::can_merge_chunk(previous, rows, schema) { break; }
+            rows += previous.len();
+            start_chunk -= 1;
+        }
+        let tail = &self.chunks[start_chunk..];
+        let Some((start, oldest)) = tail.first() else { return Ok(None); };
+
+        let column_types = declare_column_types(first.put_types(), declared);
+        let mut next = self.with_appended_schema(&column_types, system_time)?;
+        self.validate_append(runs.clone(), false, system_time)?;
+        if next.canonical_entity_iids {
+            let mut scratch = None;
+            next.canonical_entity_iids = runs.clone().all(|batch| batch.verify_canonical_iids(budget, &mut scratch).unwrap_or(false));
+        }
+        let inputs = tail.iter().map(|(_, batch)| batch.as_ref()).chain(runs);
+        let merged = Self::concat_live_chunks(schema, inputs, oldest.arrow_reservation().budget())?;
+        next.chunks.truncate(start_chunk);
+        next.append_indexed_chunk(*start, merged)?;
+        Ok(Some(next))
+    }
+
     /// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
-    /// stay small, so a table written a row per transaction is read from chunks of up to `MERGED_CHUNK_ROWS` rows.
+    /// stay small, so a table written a row per transaction is read from chunks of up to 8192 rows.
     /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
     fn merge_small_chunks(&mut self) -> Result<()> {
-        const MERGED_CHUNK_ROWS: usize = 8192;
         while let [.., (_, previous), (_, last)] = self.chunks.as_slice() {
-            if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
-            let schema = previous.arrow().schema();
-            let budget = Arc::clone(previous.owned.reservation().budget());
-            // A concatenation's buffers can outgrow its inputs' (variable-width columns round and grow theirs), so it is reserved for twice them and shrunk to what it holds.
-            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_mul(2)).and_then(|bytes| bytes.checked_add(4096))
-                .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
-            let mut reservation = budget.reserve(bound)?;
-            let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
-            // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
-            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
-            lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
-            lease.shrink_to(merged.get_array_memory_size())?;
-            let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
+            if !Self::can_merge_chunk(previous, last.len(), last.arrow().schema_ref()) { break; }
+            let merged = Self::concat_live_chunks(previous.arrow().schema_ref(), [previous.as_ref(), last.as_ref()].into_iter(),
+                previous.arrow_reservation().budget())?;
             crate::row_address::replace_last_two(&mut self.chunks, merged);
         }
         Ok(())
+    }
+
+    fn concat_live_chunks<'a>(
+        schema: &SchemaRef, batches: impl Iterator<Item = &'a IndexBatch> + Clone, budget: &Arc<MemoryBudget>,
+    ) -> Result<Arc<IndexBatch>> {
+        let bound = batches.clone().try_fold(4096usize, |bytes, batch| {
+            batch.arrow().get_array_memory_size().checked_mul(2).and_then(|size| bytes.checked_add(size))
+                .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))
+        })?;
+        let mut reservation = budget.reserve(bound)?;
+        let merged = arrow_select::concat::concat_batches(schema, batches.map(IndexBatch::arrow)).map_err(invalid)?;
+        // Dense union legs can outgrow the initial bound even when the chunks have the same layout.
+        let size = merged.get_array_memory_size();
+        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
+        lease.grow_to(lease.bytes().max(size))?;
+        lease.shrink_to(size)?;
+        IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)
     }
     pub fn ordered_events(&self) -> Result<Vec<EventRow<RowSource>>> {
         self.trie.sorted_rows(self)?.into_iter().map(|row| {
@@ -1007,7 +1079,53 @@ impl PendingTable {
         WritePosition { events: self.events.len(), batches: self.batches.len() }
     }
 
+    fn compatible_runs_since(&self, written: WritePosition) -> Option<&[PendingBatch]> {
+        let runs = &self.batches[written.batches..];
+        if written.events != self.events.len() || runs.len() < 2 { return None; }
+        let first = &runs[0].batch;
+        let schema = first.arrow().schema_ref();
+        (first.put_types == self.declared && runs.iter().all(|run| {
+            run.can_concat && run.batch.arrow().schema_ref() == schema
+        })).then_some(runs)
+    }
+
+    fn concat_runs(runs: &[PendingBatch], budget: &Arc<MemoryBudget>) -> Result<Arc<IndexBatch>> {
+        let schema = runs[0].batch.arrow().schema_ref();
+        let bytes = runs.iter().try_fold(4096usize, |bytes, run| {
+            run.batch.arrow().get_array_memory_size().checked_mul(4)
+                .and_then(|size| bytes.checked_add(size)).ok_or_else(|| invalid("Write batch size overflow"))
+        })?;
+        let mut reservation = budget.reserve(bytes)?;
+        let combined = arrow_select::concat::concat_batches(schema, runs.iter().map(|run| run.batch.arrow())).map_err(invalid)?;
+        Arc::get_mut(&mut reservation).expect("write concatenation owns its reservation").shrink_to(combined.get_array_memory_size())?;
+        IndexBatch::from_owned(OwnedBatch::with_reservation(combined, reservation)?)
+    }
+
     fn copy_since(&self, written: WritePosition, budget: &Arc<MemoryBudget>) -> Result<Arc<IndexBatch>> {
+        if let Some(runs) = self.compatible_runs_since(written) {
+            return Self::concat_runs(runs, budget);
+        }
+        self.assemble_since(written, budget)
+    }
+
+    fn append_since(
+        &self, written: WritePosition, segment: &LiveTable, system_time: Timestamp, budget: &Arc<MemoryBudget>,
+    ) -> Result<LiveTable> {
+        let batch = if written == self.position() {
+            None
+        } else if let Some(runs) = self.compatible_runs_since(written) {
+            let batches = runs.iter().map(|run| run.batch.as_ref());
+            if let Some(next) = segment.coalesce_pending_runs(batches, &self.declared, system_time, budget)? {
+                return Ok(next);
+            }
+            Some(Self::concat_runs(runs, budget)?)
+        } else {
+            Some(self.assemble_since(written, budget)?)
+        };
+        segment.append(&TableWrite::new(self.declared.clone(), batch), system_time)
+    }
+
+    fn assemble_since(&self, written: WritePosition, budget: &Arc<MemoryBudget>) -> Result<Arc<IndexBatch>> {
         let events = &self.events[written.events..];
         let batches = &self.batches[written.batches..];
         if batches.is_empty() {
@@ -1015,19 +1133,6 @@ impl PendingTable {
         }
         if let [only] = batches && events.is_empty() && only.batch.put_types == self.declared {
             return Ok(Arc::clone(&only.batch));
-        }
-        if events.is_empty() && let Some(first) = batches.first() && first.batch.put_types == self.declared {
-            let schema = first.batch.arrow().schema();
-            if batches.iter().all(|page| page.can_concat && page.batch.arrow().schema() == schema) {
-                let bytes = batches.iter().try_fold(4096usize, |bytes, page| {
-                    page.batch.arrow().get_array_memory_size().checked_mul(4)
-                        .and_then(|size| bytes.checked_add(size)).ok_or_else(|| invalid("Write batch size overflow"))
-                })?;
-                let mut reservation = budget.reserve(bytes)?;
-                let combined = arrow_select::concat::concat_batches(&schema, batches.iter().map(|page| page.batch.arrow())).map_err(invalid)?;
-                Arc::get_mut(&mut reservation).expect("write concatenation owns its reservation").shrink_to(combined.get_array_memory_size())?;
-                return IndexBatch::from_owned(OwnedBatch::with_reservation(combined, reservation)?);
-            }
         }
         let size_error = || invalid("Write batch size overflow");
         let positions = || batches.iter().map(|page| (page.preceding_events, Some(&page.batch)))
@@ -1477,8 +1582,7 @@ impl TransactionBuffer {
             };
             let position = pending.position();
             if done == position && declared == Some(&pending.declared) { continue; }
-            let batch = (done != position).then(|| pending.copy_since(done, &self.budget)).transpose()?;
-            let segment = Arc::new(segment.append(&TableWrite::new(pending.declared.clone(), batch), self.tx_key.system_time)?);
+            let segment = Arc::new(pending.append_since(done, &segment, self.tx_key.system_time, &self.budget)?);
             segments.insert(table.clone(), (segment, position, pending.declared.clone()));
         }
         let current = segments.iter().map(|(table, (segment, ..))| (table.clone(), Arc::clone(segment))).collect();
@@ -1962,6 +2066,88 @@ mod chunk_tests {
         let second = batch.view().read_event(1).unwrap();
         assert_eq!((first.header().commit_position, first.header().op), (3, EventOp::Put));
         assert_eq!((second.header().commit_position, second.header().op), (7, EventOp::Delete));
+    }
+
+    #[test]
+    fn incremental_snapshot_coalesces_funded_runs_within_one_copy_budget() {
+        let memory = MemoryBudget::new(32 << 20);
+        let state = crate::PartitionState::empty(Default::default()).unwrap();
+        let table = TableRef::new("public", "docs");
+        let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(1) };
+        let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory)).unwrap();
+        let event = |id: u8| StoredEvent {
+            position: None,
+            origin: None,
+            commit_position: 0,
+            entity_key: None,
+            iid: EntityId::Integer(i64::from(id)).iid(),
+            system_from: key.system_time,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([
+                ("_id".into(), Value::I64(i64::from(id))),
+                ("payload".into(), Value::Binary(vec![id; if id < 3 { 1 } else { 1 << 18 }])),
+            ])),
+            recency: None,
+        };
+        let append = |transaction: &mut TransactionBuffer, ids: std::ops::Range<u8>| {
+            let events = ids.map(&event).collect::<Vec<_>>();
+            let batch = owned_event_batch(&events, Some(StructFields::from([
+                ("_id".into(), Value::I64(0).logical_type()),
+                ("payload".into(), Value::Binary(Vec::new()).logical_type()),
+            ])), true, &memory).unwrap();
+            transaction.append_batch(&table, batch).unwrap();
+        };
+
+        append(&mut transaction, 0..2);
+        drop(transaction.snapshot().unwrap());
+        append(&mut transaction, 2..3);
+        let previous = transaction.snapshot().unwrap().segments(&table).remove(0);
+        assert_eq!(previous.batches().map(|batch| batch.len()).collect::<Vec<_>>(), [2, 1]);
+        let proof = previous.row_lineage().proof();
+        append(&mut transaction, 3..4);
+        append(&mut transaction, 4..5);
+
+        let denied = memory.reserve(memory.available_bytes()).unwrap();
+        assert_eq!(transaction.snapshot().err().unwrap().code, "rtdb/memory-budget-exceeded");
+        drop(denied);
+
+        let pending_bytes = transaction.tables[&table].batches[2..].iter()
+            .map(|run| run.batch.arrow().get_array_memory_size()).sum::<usize>();
+        let tail_bytes = previous.batches().map(|batch| batch.arrow().get_array_memory_size()).sum::<usize>();
+        assert!(2 * tail_bytes < pending_bytes);
+        let headroom = 4096 + 3 * pending_bytes;
+        let hold = memory.reserve(memory.available_bytes() - headroom).unwrap();
+        let current = transaction.snapshot().unwrap().segments(&table).remove(0);
+        drop(hold);
+
+        assert_eq!(current.batches().count(), 1);
+        assert_eq!(current.row_count(), 5);
+        assert!(proof.is_prefix_of(current.row_lineage()));
+        assert_eq!(previous.row_count(), 3);
+        assert_eq!(previous.locate(2).unwrap(), (1, 0));
+        for id in 0..5u8 {
+            let mut expected = event(id);
+            expected.position = Some(EventPosition { transaction: key.tx_id, ordinal: u64::from(id) });
+            let row = u32::from(id);
+            assert_eq!(current.locate(row).unwrap(), (0, row));
+            assert_eq!(current.header(row).unwrap(), expected.header());
+            assert_eq!(current.row(row).unwrap().event().unwrap(), expected);
+            if row < previous.row_count() {
+                assert_eq!(previous.header(row).unwrap(), current.header(row).unwrap());
+            }
+        }
+        assert!(!state.open_snapshot(None).contains_table(&table));
+        let staged = transaction.stage().unwrap();
+        assert_eq!(staged.tables()[&table].batch().unwrap().arrow(), current.batches().next().unwrap().arrow());
+        state.apply(&staged).unwrap();
+        assert_eq!(state.open_snapshot(Some(key.tx_id)).segments(&table)[0].row_count(), 5);
+
+        let row = current.row(4).unwrap();
+        drop((state, staged, current, previous));
+        assert!(memory.used_bytes() > 0);
+        assert_eq!(row.event().unwrap().operation, event(4).operation);
+        drop(row);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
