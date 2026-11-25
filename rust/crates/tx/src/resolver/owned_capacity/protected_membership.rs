@@ -133,13 +133,13 @@ mod tests {
     use rtdb_index::PartitionState;
     use rtdb_query::QueryOptions;
     use rtdb_storage::{MemoryStore, cache::BufferPool};
-    use rtdb_types::{EntityId, Interval, OwnedIdentityScan, OwnedRelation, OwnedSchema, Result,
+    use rtdb_types::{EntityId, OwnedIdentityScan, OwnedRelation, OwnedSchema, Result,
         SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, StructFields, Timestamp, TransactionKey, TxId, Value};
     use tokio_util::sync::CancellationToken;
 
     use crate::{Documents, SubmitOptions, TxOp, source::Operation};
     use crate::resolver::{OpenTransaction, ResolveContext, TransactionAuthorization};
-    use super::{FENCES, PROTECTED_MEMBERSHIP, ProtectedProjection, ROW_CARRIERS, row_membership_id};
+    use super::{FENCES, PROTECTED_MEMBERSHIP, ProtectedProjection};
 
     fn scope() -> [u8; SharedColumnCarrierPrefix::WIDTH] {
         let mut prefix = [0xff; SharedColumnCarrierPrefix::WIDTH];
