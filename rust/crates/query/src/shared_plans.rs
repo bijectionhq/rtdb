@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryReservation;
@@ -6,6 +6,7 @@ use rtdb_plan::{CatalogLookups, SqlNotice};
 use rtdb_types::{Anomaly, LogicalType, MemoryBudget, Result};
 
 use crate::PreparedQuery;
+use crate::shared_plan_entries::{admit, evict_oldest, find, touch};
 
 /// Everything besides its catalog lookups that planning a SQL statement reads.
 #[derive(Clone, Debug, PartialEq)]
@@ -39,7 +40,8 @@ pub struct SharedPlan {
 /// A plan is reused for an equal key only where its catalog lookups replay the same answers.
 pub struct SharedPlans {
     memory: Arc<MemoryBudget>,
-    entries: Mutex<VecDeque<(SharedPlanKey, Arc<SharedPlan>)>>,
+    entry_bytes: usize,
+    entries: Mutex<Vec<(SharedPlanKey, Arc<SharedPlan>)>>,
 }
 
 impl SharedPlans {
@@ -47,23 +49,29 @@ impl SharedPlans {
     const ENTRY_BYTES: usize = 512 << 10;
 
     pub fn new(memory: &Arc<MemoryBudget>) -> Self {
-        Self { memory: memory.scope_with_limit((memory.limit_bytes() / 64).min(16 << 20)), entries: Mutex::new(VecDeque::new()) }
+        let memory = memory.scope_with_limit((memory.limit_bytes() / 64).min(16 << 20));
+        let entry_bytes = Self::ENTRY_BYTES.min(memory.limit_bytes() / 4);
+        Self { memory, entry_bytes, entries: Mutex::new(Vec::new()) }
     }
 
     /// The budget to plan a statement in before `insert`ing it, since a plan's raw expression metadata stays charged to
     /// the budget it was parsed in.
-    pub fn entry_budget(&self) -> Arc<MemoryBudget> { self.memory.scope_with_limit(Self::ENTRY_BYTES) }
+    /// Evicts the least recently used plans until a plan of the largest admitted size fits within the cache's own limit.
+    pub fn entry_budget(&self) -> Arc<MemoryBudget> {
+        let mut entries = self.entries.lock();
+        while self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) < self.entry_bytes && evict_oldest(&mut entries).is_some() {}
+        self.memory.scope_with_limit(self.entry_bytes)
+    }
 
     pub fn get(&self, key: &SharedPlanKey) -> Option<Arc<SharedPlan>> {
         let mut entries = self.entries.lock();
-        let index = entries.iter().position(|(cached, _)| cached == key)?;
-        let entry = entries.remove(index)?;
-        let plan = Arc::clone(&entry.1);
-        entries.push_back(entry);
+        let index = find(&entries, key)?;
+        let plan = Arc::clone(&entries[index].1);
+        touch(&mut entries, index);
         Some(plan)
     }
 
-    /// Keeps `query`, planned in an `entry_budget`, evicting the least recently used plan when full.
+    /// Keeps `query`, planned in an `entry_budget`, evicting least recently used plans while the cache is full or its budget is short.
     /// A plan whose metadata exceeds the budget is not kept.
     pub fn insert(
         &self, key: SharedPlanKey, lookups: Arc<CatalogLookups>, query: PreparedQuery,
@@ -75,12 +83,17 @@ impl SharedPlans {
             for notice in &notices { bytes = bytes.checked_add(notice.message.capacity()).and_then(|n| n.checked_add(64)).ok_or_else(size_error)?; }
             Ok(bytes)
         };
-        let _metadata = metadata().and_then(|bytes| self.memory.reserve(bytes)).ok()?;
-        let plan = Arc::new(SharedPlan { lookups, query, parameter_types, notices, _metadata });
+        let bytes = metadata().ok()?;
         let mut entries = self.entries.lock();
-        entries.retain(|(cached, _)| *cached != key);
-        if entries.len() == Self::ENTRIES { entries.pop_front(); }
-        entries.push_back((key, Arc::clone(&plan)));
+        if let Some(index) = find(&entries, &key) { entries.remove(index); }
+        let _metadata = loop {
+            match self.memory.reserve(bytes) {
+                Ok(reservation) => break reservation,
+                Err(_) => { evict_oldest(&mut entries)?; }
+            }
+        };
+        let plan = Arc::new(SharedPlan { lookups, query, parameter_types, notices, _metadata });
+        admit(&mut entries, key, Arc::clone(&plan), Self::ENTRIES);
         Some(plan)
     }
 }

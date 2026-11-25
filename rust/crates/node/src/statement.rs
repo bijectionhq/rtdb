@@ -715,6 +715,24 @@ mod shared_plan_tests {
         put(&state, 2, "alt", Value::I64(2), &memory);
         assert_eq!(value_of(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), &["alt", "public"]).await, Value::I64(2));
     }
+
+    #[test]
+    fn a_full_cache_budget_evicts_old_plans_for_new_ones() {
+        let node = MemoryBudget::new(1 << 30);
+        let plans = Arc::new(SharedPlans::new(&node));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let wide = |n: usize| format!("SELECT {} AS c{n}", (0..20).map(|i| format!("{}", i + n)).collect::<Vec<_>>().join(" + "));
+        for n in 0..100 {
+            drop(PreparedSql::prepare(&wide(n), &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), Default::default(), ResultSignaturePolicy::Dynamic).unwrap());
+            assert!(node.used_bytes() <= 16 << 20);
+        }
+        let latest = wide(1000);
+        let (first, second) = (session(&[("xtdb", &state)], "xtdb", "UTC", &plans), session(&[("xtdb", &state)], "xtdb", "UTC", &plans));
+        assert!(Arc::ptr_eq(&plan_of(&latest, &first), &plan_of(&latest, &second)));
+        drop((first, second));
+        drop(plans);
+        assert_eq!(node.used_bytes(), 0);
+    }
 }
 
 #[cfg(test)]
