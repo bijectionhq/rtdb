@@ -92,7 +92,11 @@ impl BloomFilter {
     }
 
     pub fn contains_hashes(&self, hash1: i32, hash2: i32) -> bool {
-        hashes(hash1, hash2).into_iter().all(|hash| self.bitmap.contains(hash))
+        self.contains_positions(&hashes(hash1, hash2))
+    }
+
+    pub fn contains_positions(&self, positions: &[u32; BLOOM_K as usize]) -> bool {
+        positions.iter().all(|&position| self.bitmap.contains(position))
     }
 
     pub fn contains_cell(&self, field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
@@ -102,8 +106,13 @@ impl BloomFilter {
 
     /// Whether a byte-backed value's persisted-column hashes are all present.
     pub fn contains_value(&self, value: &Value) -> Result<bool> {
+        Ok(self.contains_positions(&Self::byte_value_positions(value)?))
+    }
+
+    /// The positions to probe in a persisted column Bloom filter for a byte-backed value.
+    pub fn byte_value_positions(value: &Value) -> Result<[u32; BLOOM_K as usize]> {
         let (first, second) = byte_hashes(value)?;
-        Ok(self.contains_hashes(first, second))
+        Ok(hashes(first, second))
     }
 
     pub fn intersects(&self, other: &Self) -> bool { !self.bitmap.is_disjoint(&other.bitmap) }
