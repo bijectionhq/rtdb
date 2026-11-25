@@ -220,7 +220,7 @@ pub fn replay_artefact_file(
     Ok(Some(slug.recorded_artefact_key(trie, record)?))
 }
 
-const DECLARED_COLUMNS: &str = "io.rtdb.sql.declared-columns.v1";
+pub const DECLARED_COLUMNS: &str = "io.rtdb.sql.declared-columns.v1";
 
 pub fn schema_with_declarations(
     schema: Schema, declarations: &rtdb_types::StructFields<rtdb_types::LogicalType>,
@@ -240,13 +240,6 @@ pub fn schema_declarations(
     schema.metadata().get(DECLARED_COLUMNS)
         .map(|declarations| serde_json::from_str(declarations).map_err(invalid))
         .transpose().map(Option::unwrap_or_default)
-}
-
-pub fn without_schema_declarations(schema: &Schema) -> Option<Schema> {
-    if !schema.metadata().contains_key(DECLARED_COLUMNS) { return None; }
-    let mut metadata = schema.metadata().clone();
-    metadata.remove(DECLARED_COLUMNS);
-    Some(schema.clone().with_metadata(metadata))
 }
 
 impl TableBlock {
