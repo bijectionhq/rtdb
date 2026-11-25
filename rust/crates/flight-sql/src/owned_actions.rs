@@ -316,7 +316,7 @@ pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWo
 pub(crate) const HELD_PROTECTED_COVERAGE_V2: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v2";
 pub(crate) const HELD_ROW_CARRIER_EXISTS_V2: &str = "rtdb.owned.ReadHeldRowCarrierExists.v2";
 pub(crate) const HELD_PROTECTED_CARRIERS_V2: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v2";
-pub(crate) const HELD_SEALED_SEARCH_UNIT_ROWS_V1: &str = "rtdb.owned.ReadHeldSealedSearchUnitRows.v1";
+pub(crate) const HELD_SEALED_SEARCH_UNIT_ROWS_V2: &str = "rtdb.owned.ReadHeldSealedSearchUnitRows.v2";
 pub(crate) const HELD_WORLD_SHARED_COLUMN_CENSUS_V2: &str = "rtdb.owned.ReadHeldWorldSharedColumnCensus.v2";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
@@ -2923,7 +2923,7 @@ impl Service {
         let (page, witness, original) = held.snapshot.sealed_search_unit_rows_page(
             &relation, prefix, after, limit, scope,
         ).await.map_err(status)?;
-        let reply = self.held_prefix_reply(call, &held, &relation, &OwnedIdentityScan::text(after), page, witness, reply_format)?;
+        let reply = self.held_prefix_reply(call, &held, &relation, &OwnedIdentityScan::binary(after), page, witness, reply_format)?;
         original().map_err(status)?;
         Ok(reply)
     }
@@ -6176,9 +6176,11 @@ fn change_region_request(
 }
 
 fn staged_rank_identity(relation: &OwnedRelation, id: EntityIdRef<'_>) -> bool {
+    if relation.name().starts_with("fact_") && relation.name().ends_with("_search") {
+        return matches!(id, EntityIdRef::Binary(id) if rtdb_types::is_rank_row_address(id));
+    }
     match id {
-        EntityIdRef::String(id) => !id.is_empty()
-            && !(relation.name().ends_with("_search") && id.starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX)),
+        EntityIdRef::String(id) => !id.is_empty(),
         EntityIdRef::Binary(id) => !id.is_empty(),
         _ => false,
     }
@@ -6208,24 +6210,25 @@ fn protected_carrier_prefix(batch: &RecordBatch) -> Result<SharedColumnCarrierPr
         .ok_or_else(|| invalid("Protected carrier prefix must be raw Binary BFCP2 scope bytes"))
 }
 
-fn sealed_search_unit_page_request(batch: &RecordBatch) -> Result<(&str, Option<&str>, usize), Status> {
+fn sealed_search_unit_page_request(batch: &RecordBatch) -> Result<(&[u8; 32], Option<&[u8]>, usize), Status> {
     if batch.num_columns() != 3 || batch.num_rows() != 1 {
         return Err(invalid("Sealed search unit page requires a prefix, bound, and limit"));
     }
     let (column, _) = batch.schema_ref().column_with_name("prefix")
-        .filter(|(_, field)| field.metadata().is_empty())
+        .filter(|(_, field)| field.metadata().is_empty() && !field.is_nullable())
         .ok_or_else(|| invalid("Sealed search unit prefix is absent"))?;
-    let prefix = batch.column(column).as_any().downcast_ref::<StringArray>()
+    let prefix = batch.column(column).as_any().downcast_ref::<BinaryArray>()
         .filter(|column| !column.is_null(0))
-        .ok_or_else(|| invalid("Sealed search unit prefix must be Utf8"))?;
+        .ok_or_else(|| invalid("Sealed search unit prefix must be Binary"))?;
     let (column, _) = batch.schema_ref().column_with_name("after")
-        .filter(|(_, field)| field.metadata().is_empty())
+        .filter(|(_, field)| field.metadata().is_empty() && field.is_nullable())
         .ok_or_else(|| invalid("Sealed search unit bound is absent"))?;
-    let after = batch.column(column).as_any().downcast_ref::<StringArray>()
-        .ok_or_else(|| invalid("Sealed search unit bound must be Utf8"))?;
+    let after = batch.column(column).as_any().downcast_ref::<BinaryArray>()
+        .ok_or_else(|| invalid("Sealed search unit bound must be Binary"))?;
     let limit = usize::try_from(history_request_integer(batch, "limit")?)
         .map_err(|_| invalid("Sealed search unit page limit is out of range"))?;
-    Ok((prefix.value(0), (!after.is_null(0)).then(|| after.value(0)), limit))
+    let prefix = prefix.value(0).try_into().map_err(|_| invalid("A sealed search unit alias must be 32 bytes"))?;
+    Ok((prefix, (!after.is_null(0)).then(|| after.value(0)), limit))
 }
 
 fn shared_column_scopes(body: &[u8]) -> Result<(SharedColumnCarrierPrefix<'_>, &str), Status> {

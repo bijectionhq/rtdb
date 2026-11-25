@@ -1569,7 +1569,6 @@ mod retained_release_tests {
         address.extend_from_slice(&[0, 1]);
         let key = RootRowCarrier::parse(&address).unwrap();
         let fence = key.fence_name();
-        let address_name = fence.strip_prefix("row/").unwrap();
         let assertion = key.assertion_key();
         let mut root = StructFields::from([("_id".into(), Value::Binary(address.clone()))]);
         let mut body = b"BJRL1".to_vec();
@@ -1577,7 +1576,8 @@ mod retained_release_tests {
         body.extend([2; 40]);
         body.extend([3; 32]);
         root.insert("sealed_payload".into(), Value::Binary(body));
-        let selector = format!("bjrl1/{}/{}/{address_name}", "01".repeat(16), "03".repeat(32));
+        let selector = [RootFamilyDerivativeId::PREFIX, &[1; 16], &[3; 32], &address].concat();
+        let alias = EntityId::Binary(address.clone());
         let source = rtdb_types::OwnedPointVersion {
             history: Timestamp(3),
             position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(2), ordinal: 1 },
@@ -1586,7 +1586,8 @@ mod retained_release_tests {
             (&carrier, &world_carrier, EntityId::String(fence.clone()), EntityId::Binary(address), root),
             (&journal, &journal, EntityId::Binary(assertion.clone()), EntityId::Binary(assertion.clone()),
                 StructFields::from([("_id".into(), Value::Binary(assertion))])),
-            (&search, &search, EntityId::String(address_name.into()), EntityId::String(selector.clone()), row(&selector)),
+            (&search, &search, alias.clone(), EntityId::Binary(selector.clone()),
+                StructFields::from([("_id".into(), Value::Binary(selector))])),
         ] {
             let local = source_relation.in_world(world)?;
             ops.extend([
@@ -1600,7 +1601,7 @@ mod retained_release_tests {
             ]);
         }
         ops.extend([
-            TxOp::OwnedCheck { relation: search, id: EntityId::String(address_name.into()),
+            TxOp::OwnedCheck { relation: search, id: alias,
                 valid_at: Timestamp(4), expected: None },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
@@ -2014,7 +2015,7 @@ impl<'a> OwnedDocumentRow<'a> {
         }
     }
 
-    fn only_id(&self) -> bool {
+    pub(crate) fn only_id(&self) -> bool {
         match self {
             Self::Values(row) => row.len() == 1,
             Self::Arrow(..) => self.only_columns(&["_id"]),
@@ -2647,24 +2648,24 @@ pub(crate) fn hosted_proposal_land(
             continue;
         }
         if relation.name().ends_with("_search")
-            && (protected || matches!(id, EntityId::String(key) if key.starts_with(RootFamilyDerivativeId::PREFIX)))
+            && (protected || matches!(id, EntityId::Binary(key) if key.starts_with(RootFamilyDerivativeId::PREFIX)))
         {
-            let EntityId::String(physical) = id else { return None; };
+            let EntityId::Binary(physical) = id else { return None; };
             let selector = RootFamilyDerivativeId::parse(physical).ok()??;
             if !protected || !root_checked || !create_only || extents.as_slice() != [None]
                 || !derived_addresses.insert(selector.address)
             {
                 return None;
             }
-            let address = RootRowCarrier::decode_named_address(selector.address)?;
-            if root_members.get(address.as_slice()).copied() != Some((selector.family, selector.member.to_bytes())) {
+            let address = selector.address;
+            if root_members.get(address).copied() != Some((selector.family, selector.member.to_bytes())) {
                 return None;
             }
-            let row = RootRowCarrier::parse(&address)?;
-            let raw = EntityId::String(selector.address.to_owned());
+            let row = RootRowCarrier::parse(address)?;
+            let raw = EntityId::Binary(address.to_vec());
             let position = EntityId::Binary(row.assertion_key());
             let local_carrier = EntityId::String(row.fence_name());
-            let carrier = EntityId::Binary(address);
+            let carrier = EntityId::Binary(address.to_vec());
             let journal = OwnedRelation::new(relation.name().strip_suffix("_search")?).ok()?;
             for (reln, key) in [(&carrier_relation, &carrier), (&journal, &position)] {
                 let matching = writes.get(&(reln.name(), key.handle_bytes()))?;

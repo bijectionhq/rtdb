@@ -113,7 +113,7 @@ pub struct RootRankSelection<'a> {
     pub publication: u64,
     pub ordinal: NonZeroU64,
     pub relation: &'a str,
-    pub selector: &'a str,
+    pub selector: &'a [u8],
 }
 
 #[async_trait::async_trait]

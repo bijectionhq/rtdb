@@ -699,7 +699,7 @@ impl FlightService for Service {
         let hosted_carrier_actions = [
             crate::owned_actions::HELD_PROTECTED_COVERAGE_V2,
             crate::owned_actions::HELD_PROTECTED_CARRIERS_V2,
-            crate::owned_actions::HELD_SEALED_SEARCH_UNIT_ROWS_V1,
+            crate::owned_actions::HELD_SEALED_SEARCH_UNIT_ROWS_V2,
         ];
         let root_rank = self.0.config.owned_native_actions && call.session.audience_source().is_none();
         #[cfg(feature = "multi")]

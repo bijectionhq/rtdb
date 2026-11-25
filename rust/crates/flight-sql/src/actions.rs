@@ -381,7 +381,7 @@ impl Service {
                 crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V2 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_PROTECTED_CARRIERS_V2 =>
                     return self.held_protected_carriers_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_SEALED_SEARCH_UNIT_ROWS_V1 =>
+                crate::owned_actions::HELD_SEALED_SEARCH_UNIT_ROWS_V2 =>
                     return self.held_sealed_search_unit_rows_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_SHARED_COLUMN_CENSUS_V2 =>
                     return self.held_world_shared_column_census_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
