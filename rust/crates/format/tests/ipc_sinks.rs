@@ -81,8 +81,8 @@ fn owned_stream_from_bytes_preserves_frame_bounds_and_charges() {
     let expected = copied.pages()[0].batch();
 
     let input_memory = MemoryBudget::new(1 << 20);
-    let decode_memory = MemoryBudget::new(decode_charge);
     for offset in [16, 17] {
+        let decode_memory = MemoryBudget::new(memory.peak_bytes());
         let mut frame = vec![0; offset];
         frame.extend_from_slice(&ipc);
         frame.push(1);
@@ -104,17 +104,54 @@ fn owned_stream_from_bytes_preserves_frame_bounds_and_charges() {
         let decoded = stream.pages()[0].batch();
         assert_eq!(decoded, expected);
         assert_eq!(decoded.get_array_memory_size(), expected.get_array_memory_size());
+        let retained = decode_memory.used_bytes();
+        assert_eq!(retained < decode_charge, offset == 16);
         let column = Arc::clone(decoded.column(0));
         drop(stream);
 
         let values = column.as_any().downcast_ref::<Int64Array>().unwrap().values();
         assert_eq!(within.contains(&(values.as_ptr() as usize)), offset == 16);
         assert_eq!(input_memory.used_bytes(), if offset == 16 { frame_len } else { 0 });
-        assert_eq!(decode_memory.used_bytes(), decode_charge);
+        assert_eq!(decode_memory.used_bytes(), retained);
         drop(column);
         assert_eq!(input_memory.used_bytes(), 0);
         assert_eq!(decode_memory.used_bytes(), 0);
     }
+}
+
+#[test]
+fn owned_stream_releases_lz4_workspace_and_unreferenced_backing_allocations() {
+    use arrow_array::ArrayRef;
+    use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
+
+    let batch = RecordBatch::try_from_iter([
+        ("left", Arc::new(Int64Array::from(vec![1; 16_384])) as ArrayRef),
+        ("right", Arc::new(Int64Array::from(vec![2; 16_384])) as ArrayRef),
+    ]).unwrap();
+    let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME)).unwrap();
+    let encoded = write_arrow_stream(batch.schema_ref(), &[batch.clone(), batch.clone()], options).unwrap();
+    assert!(encoded.len() < 16 << 10);
+    let memory = MemoryBudget::new(72 << 20);
+    let stream = OwnedStream::read(&encoded, &memory).unwrap();
+    assert_eq!(stream.pages().len(), 2);
+    assert_eq!(stream.pages()[0].batch(), &batch);
+    assert_eq!(stream.pages()[1].batch(), &batch);
+    let complete = memory.used_bytes();
+    assert!(complete < 1 << 20);
+
+    let page = stream.pages()[0].clone();
+    drop(stream);
+    let one_page = memory.used_bytes();
+    assert!(complete - one_page >= 2 * (128 << 10));
+    let column = Arc::clone(page.batch().column(0));
+    drop(page);
+    assert!(one_page - memory.used_bytes() >= 128 << 10);
+    assert!(memory.used_bytes() >= 128 << 10);
+    assert_eq!(column.as_ref(), batch.column(0).as_ref());
+    drop(column);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]

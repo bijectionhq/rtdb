@@ -88,7 +88,7 @@ impl<'a> ImportPage<'a> {
 fn import_run(page: &OwnedBatch, offset: usize, rows: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch, Status> {
     let batch = page.batch().slice(offset, rows);
     let schema = batch.schema_ref();
-    let _scratch = memory.reserve(wire::add(wire::schema_bound(schema)?, wire::mul(
+    let mut scratch = memory.reserve(wire::add(wire::schema_bound(schema)?, wire::mul(
         wire::mul(rows, batch.num_columns())?, 64,
     )?)?).map_err(status)?;
     let absence = batch.column_by_name("_absent").map(|column| {
@@ -128,7 +128,9 @@ fn import_run(page: &OwnedBatch, offset: usize, rows: usize, memory: &Arc<Memory
     }
     // The original run determines its field presence and Arrow field nullability.
     let batch = RecordBatch::try_from_iter(columns).map_err(arrow)?;
-    let run = OwnedBatch::with_reservation(batch, Arc::clone(page.reservation())).map_err(status)?;
+    let schema_charge = Arc::get_mut(&mut scratch).expect("Import run owns its scratch")
+        .split_off(wire::schema_bound(batch.schema_ref())?).map_err(status)?;
+    let run = page.with_retained_buffers(batch).with_schema_reservation(schema_charge);
     let Some(index) = absence_index else { return Ok(run); };
     let (names, bytes) = omitted.iter().flat_map(|row| row.intersection(&payload))
         .try_fold((0, 0), |(names, bytes), name| Ok::<_, Status>((names + 1, wire::add(bytes, name.len())?)))?;

@@ -681,7 +681,9 @@ mod tests {
             let page = owned_event_batch(&[event], Some(fields), false, &memory)?;
             let batch = page.batch();
             let bytes = crate::ipc::encode(batch.schema_ref(), [batch], &memory)?.into_bytes();
-            let decoded_bytes = crate::ipc::decode(&bytes, &memory)?[0].reservation().bytes();
+            let decode_memory = MemoryBudget::new(memory.limit_bytes());
+            drop(crate::ipc::decode(&bytes, &decode_memory)?);
+            let decoded_bytes = decode_memory.peak_bytes();
             let mut frame = ResolvedTx {
                 tx_id: Some(1), src_msg_id: Some(1), system_time_micros: Some(10),
                 committed: Some(true), ..Default::default()
