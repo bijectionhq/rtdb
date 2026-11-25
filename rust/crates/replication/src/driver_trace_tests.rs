@@ -73,6 +73,7 @@ async fn capture(scenario: Scenario) -> Vec<String> {
     let config = ReplicationConfig { idle_heartbeat: false, ..leading_config() };
     let mut fixture = fixture_with_replica(config, 1 << 27, None,
         |log| Arc::new(TraceLog { log, gate: Arc::clone(&gate) })).await;
+    fixture.driver.update_installed_prefix().unwrap();
     let (operation, mut called, finish) = hold_catalog_effect(&mut fixture);
     let mut tail = fixture.logs.replica_tail(fixture.driver.read_position).await.unwrap();
     let empty = tail.poll(Duration::ZERO).await.unwrap();
