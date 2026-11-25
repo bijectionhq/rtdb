@@ -35,6 +35,52 @@ fn expressions(functions: &[WindowFunction]) -> Vec<WindowExpr> {
 }
 
 #[tokio::test]
+async fn window_shift_keeps_identity_and_cross_page_spans_after_cursor_drop() {
+    let execution = execution(4);
+    let baseline = execution.context.memory.used_bytes();
+    let functions = [
+        WindowFunction::Lag { column: ColumnId(1), offset: 0 },
+        WindowFunction::Lead { column: ColumnId(1), offset: 2 },
+        WindowFunction::Lag { column: ColumnId(1), offset: 2 },
+    ];
+    let expressions = expressions(&functions);
+    assert!(expressions.iter().all(|expr| expr.field.data_type.nullable()));
+    let pages = vec![
+        vec![row(1, 10), row(1, 20)],
+        vec![row(1, 30), row(1, 40), row(1, 50), row(1, 60)],
+        vec![row(1, 70), row(1, 80)],
+    ];
+    let mut cursor = BatchWindow::new(input(pages, &execution), schema(), &[], vec![], &expressions, false, execution.clone()).unwrap();
+    let first = cursor.next_batch().await.unwrap().unwrap();
+    let middle = cursor.next_batch().await.unwrap().unwrap();
+    let last = cursor.next_batch().await.unwrap().unwrap();
+    let (source, ..) = middle.columns[1].arrow_cell(0).unwrap().unwrap();
+    for row in 0..2 {
+        let (original, ..) = first.columns[1].arrow_cell(row).unwrap().unwrap();
+        let (identity, _, _, offset) = first.columns[2].arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(identity, original));
+        assert_eq!(offset, row);
+        let (lead, _, _, offset) = first.columns[3].arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(lead, source));
+        assert_eq!(offset, row);
+        let (lag, _, _, offset) = last.columns[4].arrow_cell(row).unwrap().unwrap();
+        assert!(std::ptr::eq(lag, source));
+        assert_eq!(offset, row + 2);
+    }
+    let values = |batch: &ColumnBatch, position: usize| {
+        (0..batch.len).map(|row| batch.columns[position].value(row).unwrap()).collect::<Vec<_>>()
+    };
+    assert_eq!(values(&middle, 3), [Value::I64(50), Value::I64(60), Value::I64(70), Value::I64(80)]);
+    assert_eq!(values(&first, 4), [Value::Null, Value::Null]);
+    assert_eq!(values(&last, 3), [Value::Null, Value::Null]);
+    drop((cursor, middle));
+    assert_eq!(values(&first, 3), [Value::I64(30), Value::I64(40)]);
+    assert_eq!(values(&last, 4), [Value::I64(50), Value::I64(60)]);
+    drop((first, last));
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
 async fn columnar_window_validates_unprojected_bottom_cells_before_emitting_ordinals() {
     use arrow_array::NullArray;
     use crate::columnar::Column;
