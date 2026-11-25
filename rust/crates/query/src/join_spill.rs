@@ -3,6 +3,7 @@ use std::{mem::size_of, sync::Arc};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use rtdb_columnar::MemoryReservation;
+use rtdb_format::ipc::RecordSpans;
 use rtdb_plan::Schema;
 use rtdb_types::{LogicalType, Result, ScalarType};
 
@@ -179,14 +180,14 @@ impl BlockWriter {
             [] => return Ok(()),
             [record] => self.schema.write_record(&mut self.writer, &record.record, context)?,
             many => {
-                let bytes = self.queued_bytes.checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
-                let _compact = context.memory.reserve(bytes)?;
-                let batch = arrow_select::concat::concat_batches(&self.schema.physical, many.iter().map(|record| &record.record))
-                    .map_err(|error| match error {
-                        arrow_schema::ArrowError::OffsetOverflowError(_) => layout_error(),
-                        error => invalid("join-spill", error),
-                    })?;
-                self.schema.write_record(&mut self.writer, &batch, context)?;
+                let _references = context.memory.reserve(many.len().checked_mul(size_of::<&RecordBatch>()).ok_or_else(size_error)?)?;
+                let records = many.iter().map(|record| &record.record).collect::<Vec<_>>();
+                if let Some(spans) = RecordSpans::concat(&records, 64, &context.memory)? {
+                    self.writer.write_frame(&[3])?;
+                    self.writer.write_spanned_record(&spans)?;
+                } else {
+                    write_compacted_records(&self.schema, &mut self.writer, &records, self.queued_bytes, context)?;
+                }
             }
         }
         self.queued.clear();
@@ -200,6 +201,19 @@ impl BlockWriter {
         let blocks = self.blocks.checked_add(usize::from(self.block_rows != 0)).ok_or_else(size_error)?;
         Ok(SpilledBlocks { file: self.writer.finish()?, blocks, schema: self.schema })
     }
+}
+
+fn write_compacted_records(
+    schema: &SpillSchema, writer: &mut SpillWriter, records: &[&RecordBatch], queued_bytes: usize, context: &QueryContext,
+) -> Result<()> {
+    let bytes = queued_bytes.checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
+    let _compact = context.memory.reserve(bytes)?;
+    let batch = arrow_select::concat::concat_batches(&schema.physical, records.iter().copied())
+        .map_err(|error| match error {
+            arrow_schema::ArrowError::OffsetOverflowError(_) => layout_error(),
+            error => invalid("join-spill", error),
+        })?;
+    schema.write_record(writer, &batch, context)
 }
 
 pub(crate) struct SpilledBlocks {

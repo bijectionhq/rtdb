@@ -11,6 +11,7 @@ use arrow_ipc::{
 };
 use arrow_schema::{ArrowError, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_format::ipc::RecordSpans;
 use rtdb_types::Result;
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
@@ -97,6 +98,18 @@ impl SpillWriter {
         if !dictionaries.is_empty() { return Err(invalid("join-spill", "Spilled records require a dictionary-free schema")); }
         let header = (data.ipc_message.len() as u64).to_le_bytes();
         self.write_frame_parts(&[&header, &data.ipc_message, &data.arrow_data])
+    }
+
+    pub fn write_spanned_record(&mut self, record: &RecordSpans) -> Result<()> {
+        let (metadata, body) = record.metadata().map_err(ipc_error)?;
+        let header = (metadata.len() as u64).to_le_bytes();
+        let length = 8u64.checked_add(metadata.len() as u64).and_then(|len| len.checked_add(body as u64))
+            .ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
+        self.write_frame_with(length, |file| {
+            file.write_all(&header).map_err(io_error)?;
+            file.write_all(&metadata).map_err(io_error)?;
+            record.write_body(file).map_err(io_error)
+        })
     }
 
     pub fn write_arrow(&mut self, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {

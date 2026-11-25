@@ -3041,17 +3041,14 @@ fn write_arguments(
 ) -> Result<()> {
     if arguments.retains_uploaded_source_layout() && let Some(pages) = arguments.uniform_arrow_pages() {
         let first = pages[0];
-        let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
-            page.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
-        })?)?;
+        let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(first.schema_ref())?)?;
         let fields = first.schema_ref().fields().iter().enumerate().map(|(index, field)| {
             field.as_ref().clone().with_name(format!("?_{index}"))
         }).collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(fields));
         let mut populated = pages.iter().copied().filter(|page| page.num_rows() != 0);
-        let combined;
-        let page = if pages.len() == 1 {
-            first
+        let single = if pages.len() == 1 {
+            Some(first)
         } else if purpose == SourcePurpose::Log
             && let Some(page) = populated.next()
             && populated.next().is_none()
@@ -3059,7 +3056,21 @@ fn write_arguments(
                 field.data_type().is_numeric() && field.metadata().is_empty() && column.null_count() == 0
             })
         {
-            page
+            Some(page)
+        } else {
+            None
+        };
+        if single.is_none()
+            && let Some(spans) = rtdb_format::ipc::RecordSpans::concat(&pages, 8, memory)?
+        {
+            return spans.write_java_stream(&schema, output);
+        }
+        let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
+            page.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?)?;
+        let combined;
+        let page = if let Some(single) = single {
+            single
         } else {
             // Replay uses IPC page boundaries for SQL error indices and single-page execution.
             combined = arrow_select::concat::concat_batches(first.schema_ref(), pages).map_err(|error| invalid(error.to_string()))?;

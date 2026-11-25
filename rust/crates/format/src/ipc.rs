@@ -22,7 +22,10 @@ mod event_projection;
 mod java_layout;
 mod nulls;
 mod projection;
+mod record_spans;
 mod undefined;
+
+pub use record_spans::RecordSpans;
 
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
