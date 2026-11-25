@@ -1,0 +1,45 @@
+{
+  "summary": "The shared replica driver requires a recognized prefix to promote and activates a fenced writer only after confirmation and installation of the exact recovered position.",
+  "flags": [
+    "--no-external-by-default"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "promote_after_unknown_frame": {
+      "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "    recognized_prefix && may_lead && !already_leading && holds_grant",
+          "replace": "    may_lead && !already_leading && holds_grant"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "function": "may_promote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "activate_after_append_before_apply": {
+      "defect": "A confirmed append can activate a replacement writer while its installed state is behind.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {",
+          "replace": "        if self.is_active() || (confirmed && recognized) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "function": "installed",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}
