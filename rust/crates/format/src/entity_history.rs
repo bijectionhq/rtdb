@@ -393,7 +393,8 @@ impl<W: Write> Write for RangeSink<'_, W> {
         Ok(written)
     }
 
-    fn flush(&mut self) -> io::Result<()> { self.sink.flush() }
+    // The outer history writer flushes the sink after it writes the directory.
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 impl<W: Write> HistoryWriter<W> {
@@ -457,11 +458,11 @@ impl<W: Write> HistoryWriter<W> {
         for first in (0..events.len()).step_by(ROWS_PER_RANGE) {
             let end = (first + ROWS_PER_RANGE).min(events.len());
             let len = end - first;
-            let plain_iids = match events.iids()? {
-                rtdb_columnar::IidView::Plain(values) => Some(values),
+            let plain_iids = match events.iids() {
+                Ok(rtdb_columnar::IidView::Plain(values)) => Some(values),
                 _ => None,
             };
-            let origins = events.origins()?.filter(|origins| (first..end).all(|row| {
+            let origins = events.origins().ok().flatten().filter(|origins| (first..end).all(|row| {
                 origins.is_valid(row) || origins.value(row).iter().all(|&byte| byte == 0)
             }));
             let controls = usize::from(plain_iids.is_none()) * 16

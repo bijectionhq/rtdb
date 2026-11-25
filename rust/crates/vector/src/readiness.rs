@@ -5,7 +5,7 @@ use rtdb_query::QueryContext;
 use rtdb_storage::{ObjectKey, cache::CacheLease};
 use rtdb_types::{Anomaly, Result, TableRef, TemporalBounds};
 
-use crate::{definition::{self, VectorDefinition}, file::{Directory, Locator, verified_directory}};
+use crate::{definition::{self, CatalogDefinition, VectorDefinition}, file::{Directory, Locator, verified_directory}};
 
 const MAX_BYTES: u64 = 256 << 20;
 
@@ -22,7 +22,7 @@ pub async fn committed_native_ready(
 
 pub(crate) async fn native_definition(
     context: &Arc<QueryContext>, table: &TableRef, name: &str, declaration: &RankedIndexDeclaration,
-) -> Result<Option<VectorDefinition>> {
+) -> Result<Option<CatalogDefinition>> {
     let RankedIndexKind::Ivf { dimensions, recall_bits } = &declaration.definition.kind else { return Ok(None); };
     let Some((column, partition)) = declaration.definition.columns.split_first() else { return Ok(None); };
     Ok(definition::committed_native_definition(Arc::clone(context), table, name).await?.filter(|definition|

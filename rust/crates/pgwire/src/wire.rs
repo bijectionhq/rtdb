@@ -46,20 +46,31 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     pub async fn raw(&mut self, bytes: &[u8]) -> Result<()> { self.output.write_all(bytes).await.map_err(network)?; self.flush().await }
     pub async fn flush(&mut self) -> Result<()> { self.output.flush().await.map_err(network) }
     pub async fn send(&mut self, tag: u8, body: &[u8]) -> Result<()> {
-        let length = i32::try_from(body.len().checked_add(4).ok_or_else(|| protocol("Output message too large"))?).map_err(|_| protocol("Output message too large"))?;
+        self.send_header(tag, body.len()).await?;
+        self.output.write_all(body).await.map_err(network)
+    }
+    pub async fn copy_data_parts<'a>(&mut self, body_len: usize, parts: impl Iterator<Item = &'a [u8]> + Send) -> Result<()> {
+        self.send_header(b'd', body_len).await?;
+        for part in parts {
+            self.output.write_all(part).await.map_err(network)?;
+        }
+        Ok(())
+    }
+    async fn send_header(&mut self, tag: u8, body_len: usize) -> Result<()> {
+        let length = i32::try_from(body_len.checked_add(4).ok_or_else(|| protocol("Output message too large"))?).map_err(|_| protocol("Output message too large"))?;
         if self.gateway && let Some(deadline) = rtdb_query::current_delivery_deadline() {
             let cutoff = deadline.wire_nanos().ok_or_else(|| network("The answer deadline cannot be relayed"))?;
             let mut stamp = [0; 9];
             stamp[0] = crate::GATEWAY_ANSWER_DEADLINE_KIND;
             stamp[1..].copy_from_slice(&cutoff.to_be_bytes());
-            self.packet(crate::GATEWAY_SESSION_STATE_TAG, 13, &stamp).await?;
+            self.packet_header(crate::GATEWAY_SESSION_STATE_TAG, 13).await?;
+            self.output.write_all(&stamp).await.map_err(network)?;
         }
-        self.packet(tag, length, body).await
+        self.packet_header(tag, length).await
     }
-    async fn packet(&mut self, tag: u8, length: i32, body: &[u8]) -> Result<()> {
+    async fn packet_header(&mut self, tag: u8, length: i32) -> Result<()> {
         self.output.write_u8(tag).await.map_err(network)?;
-        self.output.write_i32(length).await.map_err(network)?;
-        self.output.write_all(body).await.map_err(network)
+        self.output.write_i32(length).await.map_err(network)
     }
     pub async fn empty(&mut self, tag: u8) -> Result<()> { self.send(tag, &[]).await }
     pub async fn string(&mut self, tag: u8, text: &str) -> Result<()> { self.record(tag, text.len() + 1, |bytes| cstring(bytes, text)).await }

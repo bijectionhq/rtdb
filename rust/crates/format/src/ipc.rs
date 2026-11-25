@@ -350,6 +350,10 @@ impl PageDecoder {
 
     pub fn page_count(&self) -> usize { self.blocks.len() }
 
+    pub fn block_inventory_bytes(&self) -> usize {
+        (self.blocks.capacity() + self.dictionaries.capacity()) * size_of::<arrow_ipc::Block>()
+    }
+
     fn block(&self, page: usize) -> Result<&arrow_ipc::Block> {
         self.blocks.get(page).ok_or_else(|| invalid(format!("Page {page} is outside its Arrow file")))
     }
@@ -1220,7 +1224,13 @@ enum WriterAllocation {
     Owned { memory: Arc<MemoryBudget>, _schema: Arc<MemoryReservation>, blocks: Vec<Arc<MemoryReservation>>, block_bound: usize },
 }
 
-struct LimitedFile { file: File, position: u64, limit: u64, sha256: Option<sha2::Sha256> }
+struct LimitedFile {
+    file: File,
+    position: u64,
+    limit: u64,
+    sha256: Option<sha2::Sha256>,
+    page_sha256: Option<sha2::Sha256>,
+}
 
 impl Write for LimitedFile {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1230,6 +1240,9 @@ impl Write for LimitedFile {
         let count = self.file.write(bytes)?;
         self.position += count as u64;
         if let Some(hash) = &mut self.sha256 {
+            sha2::Digest::update(hash, &bytes[..count]);
+        }
+        if let Some(hash) = &mut self.page_sha256 {
             sha2::Digest::update(hash, &bytes[..count]);
         }
         Ok(count)
@@ -1252,7 +1265,7 @@ impl ArrowFileWriter {
 
     fn new_file(mut file: File, schema: &Schema, limit: u64, sha256: Option<sha2::Sha256>) -> Result<Self> {
         if file.metadata().map_err(invalid)?.len() != 0 || file.stream_position().map_err(invalid)? != 0 { return Err(invalid("Arrow output file must be empty and positioned at zero")); }
-        let writer = JavaFile::new(LimitedFile { file, position: 0, limit, sha256 }, schema)?;
+        let writer = JavaFile::new(LimitedFile { file, position: 0, limit, sha256, page_sha256: None }, schema)?;
         Ok(Self { writer, allocation: WriterAllocation::CallerReserved })
     }
 
@@ -1294,6 +1307,25 @@ impl ArrowFileWriter {
 
     pub fn write(&mut self, page: &RecordBatch) -> Result<()> {
         self.write_page(page, &mut None)
+    }
+
+    /// Returns the exact file range and digest of a dictionary-free record page.
+    pub fn write_hashed_page(&mut self, page: &RecordBatch) -> Result<(Range<u64>, [u8; 32])> {
+        if dictionary_count(page.schema_ref())? != 0 {
+            return Err(invalid("Arrow page hashing requires a dictionary-free schema"));
+        }
+        // The lookahead normally carries the previous frame's last eight bytes into the next write.
+        self.writer.writer.get_mut().write_pending().map_err(invalid)?;
+        let sink = self.writer.sink();
+        let start = sink.position;
+        sink.page_sha256 = Some(sha2::Digest::new());
+        let written = self.write(page).and_then(|()| {
+            self.writer.writer.get_mut().write_pending().map_err(invalid)
+        });
+        let sink = self.writer.sink();
+        let hash = sink.page_sha256.take().expect("page hashing is active");
+        written?;
+        Ok((start..sink.position, sha2::Digest::finalize(hash).into()))
     }
 
     /// Writes a compact event page, charging IPC scratch and nested union cleanup through the write.
@@ -1574,6 +1606,14 @@ pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<I
 }
 
 struct TailWriter<W> { inner: W, pending: Vec<u8> }
+
+impl<W: Write> TailWriter<W> {
+    fn write_pending(&mut self) -> std::io::Result<()> {
+        self.inner.write_all(&self.pending)?;
+        self.pending.clear();
+        Ok(())
+    }
+}
 
 impl<W: Write> Write for TailWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

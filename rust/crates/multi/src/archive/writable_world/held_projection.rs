@@ -262,10 +262,12 @@ impl WorldProjectionCustody {
                 let Some(path) = unique(paths)? else {
                     return shadows.shadow_row(partition, selected, id, None, query);
                 };
-                let filters = selected.filters.iter().map(|column| {
-                    Ok(unique(path.filters.iter().filter(|(name, _)| *name == column.as_str()))?
-                        .map(|(_, key)| *key))
-                }).collect::<Result<Vec<_>>>()?;
+                let _filters = memory.reserve(selected.filters.len().saturating_mul(size_of::<Option<&[u8]>>()))?;
+                let mut filters = Vec::with_capacity(selected.filters.len());
+                for column in &selected.filters {
+                    let matched = unique(path.filters.iter().filter(|(name, _)| *name == column.as_str()))?;
+                    filters.push(matched.map(|(_, key)| *key));
+                }
                 let vector = path.components.iter().map(|bytes| f32::from_le_bytes(*bytes));
                 shadows.shadow_opened_projection(partition, id, vector, &filters, query)
             },

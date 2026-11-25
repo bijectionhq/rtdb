@@ -1,11 +1,11 @@
-use std::{borrow::Cow, collections::BTreeSet, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, ops::Range, sync::{Arc, Mutex}};
 
 use arrow_array::{Float64Array, RecordBatch, StructArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
-use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
+use geometry::{Geometry, GeometryRefusal, GeometryRefusalCode, GeometryWork, KeyRange, WorkObserver, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
-    BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
+    BatchBuilder, EntityIdLocator, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
     copy_selected_cells, estimate_copy_cell_bytes, read_owned_entity_id, visible_buffer_bytes,
 };
 use rtdb_format::data::EventBatch;
@@ -54,6 +54,11 @@ pub(super) struct SelectedHit {
     pub(super) probe: Option<Arc<crate::probe::DeferredPage>>,
     pub(super) row: usize,
     pub(super) distance_m: Option<f64>,
+}
+
+struct PageHit {
+    id: EntityIdLocator,
+    hit: SelectedHit,
 }
 
 pub struct Page {
@@ -189,6 +194,18 @@ pub(super) fn empty_projected_documents(
     if !matches!(projection, Projection::SelectedDocuments(_)) {
         return Ok(None);
     }
+    let logical_bound = match schema {
+        Some((schema, columns)) => columns.iter().try_fold(4096usize, |bytes, &column| {
+            let field = schema.fields().get(column).ok_or_else(inconsistent_projection)?;
+            field.data_type.retained_bytes()?
+                .checked_add(field.name.len())
+                .and_then(|size| size.checked_mul(32))
+                .and_then(|size| bytes.checked_add(size))
+                .ok_or_else(postings::work_limit)
+        })?,
+        None => 16 << 10,
+    };
+    let mut reservation = memory.reserve(logical_bound)?;
     let schema = match schema {
         Some((schema, columns)) => Schema::new(columns.iter().map(|&column| {
             let field = schema.fields().get(column).ok_or_else(inconsistent_projection)?;
@@ -199,9 +216,10 @@ pub(super) fn empty_projected_documents(
             Field::new("_system_from", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
         ]),
     };
-    let scratch = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+    let bound = rtdb_format::ipc::schema_translation_bound(&schema)?.max(logical_bound);
+    Arc::get_mut(&mut reservation).expect("empty projection owns its reservation").grow_to(bound)?;
     let arrays = RecordBatch::new_empty(Arc::new(schema));
-    OwnedBatch::with_reservation(arrays, scratch).map(Some)
+    OwnedBatch::with_reservation(arrays, reservation).map(Some)
 }
 
 pub async fn path_ready(
@@ -349,6 +367,67 @@ enum RegionGeometry {
     Plain(Geometry),
 }
 
+const REGION_METADATA_BYTES: usize = 512;
+
+struct RegionAdmission(Mutex<RegionMemory>);
+
+struct RegionMemory {
+    reservation: Arc<MemoryReservation>,
+    working_bytes: usize,
+    failure: Option<Anomaly>,
+}
+
+impl RegionMemory {
+    fn allocate(&mut self, bytes: usize) -> Result<()> {
+        let working_bytes = self.working_bytes.checked_add(bytes).ok_or_else(postings::work_limit)?;
+        let total = REGION_METADATA_BYTES.checked_add(working_bytes).ok_or_else(postings::work_limit)?;
+        if total > self.reservation.bytes() {
+            Arc::get_mut(&mut self.reservation).expect("region construction owns its reservation").grow_to(total)?;
+        }
+        self.working_bytes = working_bytes;
+        Ok(())
+    }
+}
+
+impl RegionAdmission {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let reservation = memory.reserve(REGION_METADATA_BYTES)?;
+        Ok(Arc::new(Self(Mutex::new(RegionMemory { reservation, working_bytes: 0, failure: None }))))
+    }
+
+    fn references(&self, reserved: usize, retained: usize) -> Result<()> {
+        let mut memory = self.0.lock().expect("region admission is not shared across calls");
+        memory.working_bytes -= reserved;
+        memory.allocate(retained)
+    }
+
+    fn original_error(&self, fallback: Anomaly) -> Anomaly {
+        self.0.lock().expect("region admission is not shared across calls").failure.take().unwrap_or(fallback)
+    }
+}
+
+impl WorkObserver for RegionAdmission {
+    fn charge(&self, _: usize) -> std::result::Result<(), GeometryRefusal> { Ok(()) }
+
+    fn allocate(&self, bytes: usize) -> std::result::Result<(), GeometryRefusal> {
+        let mut memory = self.0.lock().expect("region admission is not shared across calls");
+        memory.allocate(bytes).map_err(|error| {
+            memory.failure = Some(error);
+            GeometryRefusal {
+                code: GeometryRefusalCode::ReadWorkLimit,
+                message: "Spatial region exceeds its memory allowance".into(),
+                bound: None,
+            }
+        })
+    }
+
+    fn release(&self, bytes: usize) {
+        // A geometry returned from a scoped calculation can still be alive at the allocation handoff.
+        let mut memory = self.0.lock().expect("region admission is not shared across calls");
+        memory.working_bytes -= bytes;
+    }
+}
+
 impl RegionGeometry {
     fn retained_bytes(&self) -> usize {
         match self {
@@ -367,7 +446,6 @@ impl RegionGeometry {
 
 impl PreparedRegion {
     pub fn new(region_bytes: &[u8], predicate: Predicate, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        const METADATA_BYTES: usize = 512;
         const FULL_RANGE: KeyRange = KeyRange { start: i64::MIN, end: i64::MAX };
 
         if matches!(predicate, Predicate::All) {
@@ -376,7 +454,7 @@ impl PreparedRegion {
                     "An unrestricted spatial read takes no region",
                 ));
             }
-            let reservation = memory.reserve(METADATA_BYTES + std::mem::size_of::<KeyRange>())?;
+            let reservation = memory.reserve(REGION_METADATA_BYTES + size_of::<KeyRange>())?;
             return Ok(Self {
                 predicate,
                 location: None,
@@ -387,15 +465,17 @@ impl PreparedRegion {
             });
         }
 
-        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
+        let admission = RegionAdmission::new(memory)?;
         let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-        let region = Location::decode(region_bytes, &mut work)?;
+        work.observe(admission.clone());
+        let region = Location::decode(region_bytes, &mut work).map_err(|error| admission.original_error(error))?;
         predicate.validate_region(&region)?;
         let point_geometry = region.is_point_geometry();
         let (geometry, ranges) = if !region.geometry.is_empty() && predicate.cover_predicate().is_some() {
             work.scoped(|work| {
-                let geometry = predicate.prepare_geometry(&region.geometry, work)?;
-                let ranges = predicate.cover(&geometry, work)?;
+                let geometry = predicate.prepare_geometry(region.geometry, work, |reserved, retained| admission.references(reserved, retained))
+                    .map_err(|(_, error)| admission.original_error(error))?;
+                let ranges = predicate.cover(&geometry, work).map_err(|error| admission.original_error(error))?;
                 Ok::<_, Anomaly>((RegionGeometry::Prepared(geometry), ranges))
             })?
         } else {
@@ -406,9 +486,10 @@ impl PreparedRegion {
                 RegionGeometry::Plain(region.geometry)
             } else {
                 let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-                match predicate.prepare_geometry(&region.geometry, &mut preparation) {
+                preparation.observe(admission.clone());
+                match preparation.scoped(|work| predicate.prepare_geometry(region.geometry, work, |reserved, retained| admission.references(reserved, retained))) {
                     Ok(geometry) => RegionGeometry::Prepared(geometry),
-                    Err(_) => RegionGeometry::Plain(region.geometry),
+                    Err((region, _)) => RegionGeometry::Plain(region),
                 }
             };
             (geometry, None)
@@ -416,14 +497,18 @@ impl PreparedRegion {
         let ranges = ranges.unwrap_or_else(|| vec![FULL_RANGE]);
         let bytes = geometry.retained_bytes()
             .checked_add(ranges.capacity() * std::mem::size_of::<KeyRange>())
-            .and_then(|bytes| bytes.checked_add(METADATA_BYTES)).ok_or_else(postings::work_limit)?;
+            .and_then(|bytes| bytes.checked_add(REGION_METADATA_BYTES)).ok_or_else(postings::work_limit)?;
+        let steps = work.usage().steps;
+        drop(work);
+        let mut reservation = Arc::into_inner(admission).expect("geometry work released its observer")
+            .0.into_inner().expect("region admission is not shared across calls").reservation;
         let lease = Arc::get_mut(&mut reservation).expect("geometry construction owns the reservation");
         if bytes > lease.bytes() {
             lease.grow_to(bytes)?;
         } else {
             lease.shrink_to(bytes)?;
         }
-        Ok(Self { predicate, location: Some(geometry), point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
+        Ok(Self { predicate, location: Some(geometry), point_geometry, ranges, steps, _reservation: reservation })
     }
 }
 
@@ -514,8 +599,8 @@ async fn read_page_capturing(
     let capacity = request.limit;
     let _selection = context
         .memory
-        .reserve(capacity * std::mem::size_of::<SelectedHit>())?;
-    let mut selected = Vec::<SelectedHit>::with_capacity(capacity);
+        .reserve(capacity * (size_of::<PageHit>() + size_of::<SelectedHit>()))?;
+    let mut selected = Vec::<PageHit>::with_capacity(capacity);
     let mut more = false;
     let mut point_intersects = probe.is_some_and(|probe| probe.certify_point && probe.point_column.is_some());
     let (projection_layout, document_columns) = visit_matches(
@@ -527,18 +612,23 @@ async fn read_page_capturing(
                 {
                     *retained = None;
                 }
-                let index = selection_position(&selected, id, distance_m)?;
+                let index = selection_position(&selected, id, distance_m);
                 if index < capacity {
+                    let batch = source.batch();
+                    let id = EntityIdLocator::read_owned(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
                     if selected.len() == capacity {
                         selected.pop();
                         more = true;
                     }
-                    selected.insert(index, SelectedHit { source: Arc::clone(source), probe: fallback.cloned(), row, distance_m });
+                    selected.insert(index, PageHit {
+                        id, hit: SelectedHit { source: Arc::clone(source), probe: fallback.cloned(), row, distance_m },
+                    });
                 } else {
                     more = true;
                 }
                 Ok(())
         }).await?;
+    let selected: Vec<_> = selected.into_iter().map(|entry| entry.hit).collect();
     if matches!(request.page, PageOrder::NearestOnce) {
         more = false;
     }
@@ -686,7 +776,7 @@ impl PreparedRange {
         if !(1..=128).contains(&limit) {
             return Err(kernel::invalid("Invalid spatial page size or continuation"));
         }
-        let start = after.map(|after| self.matches.seek_after(after)).transpose()?.unwrap_or(0);
+        let start = after.map_or(0, |after| self.matches.seek_after(after));
         let end = (start + limit).min(self.matches.len());
         let _selection = context.memory.reserve(std::mem::size_of::<(EntityIdRef<'_>, Iid)>() * (end - start))?;
         let selection = (start..end)
@@ -709,6 +799,7 @@ pub(super) struct DocumentColumns {
     pub(super) geometry: String,
     pub(super) refined_geometry: bool,
     pub(super) partition: Vec<String>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 pub(super) async fn visit_matches(
@@ -826,14 +917,14 @@ pub(super) async fn visit_matches(
     }
     let geometry = (region.location.is_some() || matches!(projection, Projection::Documents))
         .then_some(definition.geometry.as_str());
-    let partition = definition.partition[..request.partition.len()].to_vec();
+    let partition = &definition.partition[..request.partition.len()];
     let iids = candidates.finish()?;
     let cursor = rtdb_query::open_owned_spatial_refinement(
         Arc::clone(&context),
         owner,
         relation,
         geometry,
-        &partition,
+        partition,
         request.valid_at,
         iids,
         projection,
@@ -842,7 +933,11 @@ pub(super) async fn visit_matches(
     .await?;
     let partition_start = 1 + usize::from(geometry.is_some());
     let refined_geometry = geometry.is_some();
-    let columns = DocumentColumns { geometry: definition.geometry, refined_geometry, partition };
+    let mut partition = definition.partition;
+    partition.truncate(request.partition.len());
+    let columns = DocumentColumns {
+        geometry: definition.geometry, refined_geometry, partition, _reservation: definition.reservation,
+    };
     let Some(rtdb_query::OwnedSpatialScan { mut cursor, document_columns }) = cursor else {
         return Ok((None, columns));
     };
@@ -921,21 +1016,21 @@ fn partition_matches(
     Ok(true)
 }
 
-fn selection_position(selected: &[SelectedHit], id: EntityIdRef<'_>, distance: Option<f64>) -> Result<usize> {
+fn selection_position(selected: &[PageHit], id: EntityIdRef<'_>, distance: Option<f64>) -> usize {
+    let mut integer = [0; 8];
+    let key = id.handle_parts(&mut integer);
     let mut lower = 0;
     let mut upper = selected.len();
     while lower < upper {
         let mid = lower + (upper - lower) / 2;
         let hit = &selected[mid];
-        let batch = hit.source.batch();
-        let previous = read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), hit.row)?;
-        let order = match (hit.distance_m, distance) {
-            (Some(left), Some(right)) => left.total_cmp(&right).then_with(|| previous.cmp(&id)),
-            _ => previous.cmp(&id),
+        let order = match (hit.hit.distance_m, distance) {
+            (Some(left), Some(right)) => left.total_cmp(&right).then_with(|| hit.id.cmp_parts(key)),
+            _ => hit.id.cmp_parts(key),
         };
         if order.is_lt() { lower = mid + 1; } else { upper = mid; }
     }
-    Ok(lower)
+    lower
 }
 
 struct Candidates {
@@ -1022,6 +1117,26 @@ mod tests {
     use rtdb_types::{LogicalType, Value};
 
     #[test]
+    fn a_small_nonempty_region_uses_its_observed_workspace_and_releases_it() -> Result<()> {
+        let memory = MemoryBudget::new(64 << 10);
+        let geometry = Geometry::new(
+            geometry::Kind::Point,
+            geometry::Coords::Point([1.0, 2.0]),
+            geometry::GeometrySpace::wgs84_xy(),
+        );
+        let mut tagged = vec![0];
+        tagged.extend_from_slice(&geometry.wkb());
+        let region = PreparedRegion::new(
+            &tagged, Predicate::Topology(geometry::predicates::TopologyPredicate::Disjoint), &memory,
+        )?;
+        assert!(matches!(&region.location, Some(RegionGeometry::Prepared(_))));
+        assert_eq!(memory.used_bytes(), region._reservation.bytes());
+        drop(region);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn spatial_candidate_handoff_releases_the_tree_allowance_at_the_cap() -> Result<()> {
         let memory = MemoryBudget::new(8 << 20);
         let mut candidates = Candidates::new(&memory)?;
@@ -1055,14 +1170,16 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![to_field("_id", &entity_id_type())?]));
         let batch = RecordBatch::try_new(schema, vec![ids]).unwrap();
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
-        let selected = [2.0, 2.0, 3.0].into_iter().enumerate().map(|(row, distance_m)| SelectedHit {
-            source: Arc::clone(&source), probe: None, row, distance_m: Some(distance_m),
-        }).collect::<Vec<_>>();
+        let batch = source.batch();
+        let selected = [2.0, 2.0, 3.0].into_iter().enumerate().map(|(row, distance_m)| Ok(PageHit {
+            id: EntityIdLocator::read_owned(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?,
+            hit: SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: Some(distance_m) },
+        })).collect::<Result<Vec<_>>>()?;
 
-        assert_eq!(selection_position(&selected, EntityIdRef::Keyword("same"), Some(2.0))?, 1);
-        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(1.0))?, 0);
-        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(2.0))?, 2);
-        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(4.0))?, 3);
+        assert_eq!(selection_position(&selected, EntityIdRef::Keyword("same"), Some(2.0)), 1);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(1.0)), 0);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(2.0)), 2);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(4.0)), 3);
         Ok(())
     }
 

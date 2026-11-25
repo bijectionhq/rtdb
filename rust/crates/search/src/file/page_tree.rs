@@ -9,13 +9,16 @@ use arrow_ipc::{MetadataVersion, reader::FileDecoder};
 use parking_lot::Mutex;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
-use rtdb_types::Result;
+use rtdb_types::{MemoryBudget, MemoryReservation, Result};
 use tokio::sync::OnceCell;
 
 use super::{corrupt, fault, layout::{AuthenticatedPage, PageRef, Table, Writer, schema, table}};
 
 const FANOUT: usize = 128;
 const MAX_HEIGHT: u8 = 8;
+
+pub(super) const DIRECTORY_WALK_BYTES: usize =
+    (1 + MAX_HEIGHT as usize * FANOUT) * size_of::<(PageRef, u8)>() + FANOUT * size_of::<DecodedChild>();
 
 #[derive(Clone, Copy)]
 pub(super) enum PageKind { Root, Directory, Terms, Rank, Postings, Documents, Visibility, PrimaryLayout }
@@ -240,6 +243,22 @@ pub(crate) struct PageCache { limit: usize, state: Mutex<CacheState> }
 impl PageCache {
     pub fn new(limit: usize) -> Self { Self { limit, state: Mutex::new(CacheState::default()) } }
 
+    fn reserve(&self, memory: &Arc<MemoryBudget>, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        loop {
+            let error = match memory.reserve(bytes) {
+                Ok(charge) => return Ok(charge),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" && bytes <= memory.limit_bytes() => error,
+                Err(error) => return Err(error),
+            };
+            let mut state = self.state.lock();
+            let Some(key) = state.entries.iter().filter(|(_, entry)| entry.fill.initialized())
+                .min_by_key(|(_, entry)| entry.touched).map(|(key, _)| CacheKey {
+                    pool: key.pool, object: key.object.clone(), page: key.page,
+                }) else { return Err(error); };
+            state.bytes -= state.entries.remove(&key).expect("cache entry held under its lock").bytes;
+        }
+    }
+
     pub fn invalidate(&self, storage: &Arc<BufferPool>, object: &ObjectKey) {
         let mut state = self.state.lock();
         state.entries.retain(|key, _| key.pool != Arc::as_ptr(storage) as usize || &key.object != object);
@@ -297,20 +316,28 @@ pub(super) struct TreeReader {
     length: u64,
     decoder: FileDecoder,
     packed: bool,
+    memory: Arc<MemoryBudget>,
 }
 
 impl TreeReader {
-    pub fn new(source: PageSource, length: u64, format: i32) -> Self {
-        Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(format)), MetadataVersion::V5), packed: format >= super::PACKED_FORMAT_VERSION }
+    pub fn new(source: PageSource, length: u64, format: i32, memory: Arc<MemoryBudget>) -> Self {
+        Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(format)), MetadataVersion::V5),
+            packed: format >= super::PACKED_FORMAT_VERSION, memory }
     }
 
     pub fn inline_page(&self, page: PageRef, bytes: bytes::Bytes) -> Result<RecordBatch> {
-        audience_work::decode_bytes(bytes.len())?;
-        page.decode(Buffer::from(bytes), &self.decoder)
+        self.decode(page.authenticate(Buffer::from(bytes))?, None, false, 0)
     }
 
-    pub fn authenticated_page(&self, page: AuthenticatedPage) -> Result<RecordBatch> {
-        page.decode(&self.decoder)
+    pub fn authenticated_page(&self, page: AuthenticatedPage, expanded: usize) -> Result<RecordBatch> {
+        self.decode(page, None, false, expanded)
+    }
+
+    fn decode(&self, page: AuthenticatedPage, cache: Option<&PageCache>, detach: bool, wire_credit: usize) -> Result<RecordBatch> {
+        page.decode_admitted(&self.decoder, |bytes| match cache {
+            Some(cache) => cache.reserve(&self.memory, bytes),
+            None => self.memory.reserve(bytes),
+        }, detach, wire_credit)
     }
 
     pub async fn page(&self, page: PageRef, kind: PageKind) -> Result<RecordBatch> {
@@ -321,15 +348,15 @@ impl TreeReader {
         match &self.source {
             PageSource::Local { bytes, owner } => {
                 let start = usize::try_from(range.start).map_err(fault)?;
-                let decode = |input| page.decode(input, &self.decoder);
+                let input = || page.authenticate(bytes.slice_with_length(start, len));
                 if let Some(owner) = owner {
                     let fill = owner.cache.entry(&owner.storage()?, &owner.object, page, len);
                     if let Some(batch) = fill.get() { observe_hit(); return Ok(batch.clone()); }
                     Ok(fill.get_or_try_init(|| async {
-                        decode(Buffer::from_slice_ref(&bytes.as_slice()[start..start + len]))
+                        self.decode(input()?, Some(&owner.cache), len <= owner.cache.limit, len)
                     }).await?.clone())
                 } else {
-                    decode(bytes.slice_with_length(start, len))
+                    self.decode(input()?, None, false, len)
                 }
             }
             PageSource::Remote(owner) => {
@@ -339,7 +366,8 @@ impl TreeReader {
                 let batch = fill.get_or_try_init(|| async {
                     observe_request(kind, range.end - range.start);
                     let lease = storage.get_scan_range(&owner.object, range).await?;
-                    page.decode(Buffer::from(bytes::Bytes::from_owner(lease)), &self.decoder)
+                    let page = page.authenticate(Buffer::from(bytes::Bytes::from_owner(lease)))?;
+                    self.decode(page, Some(&owner.cache), false, len)
                 }).await?;
                 Ok(batch.clone())
             }
@@ -397,12 +425,8 @@ impl TreeReader {
                     if start.checked_add(length).is_none_or(|end| end > bytes.len()) {
                         return Err(corrupt("Search planned range exceeds its returned bytes"));
                     }
-                    let input = if cache.limit == 0 || length == bytes.len() {
-                        bytes.slice_with_length(start, length)
-                    } else {
-                        Buffer::from_slice_ref(&bytes.as_slice()[start..start + length])
-                    };
-                    reference.decode(input, &self.decoder)
+                    let input = reference.authenticate(bytes.slice_with_length(start, length))?;
+                    self.decode(input, Some(cache), length <= cache.limit && length != bytes.len(), length)
                 }).await?;
                 result.push((reference, batch.clone()));
             }
@@ -502,15 +526,24 @@ impl TreeReader {
 
     pub async fn between(&self, directory: DirectoryRef, interval: Option<(&[u8], &[u8])>) -> Result<Vec<PageRef>> {
         let mut pages = Vec::new();
-        let mut todo = vec![(directory.page, directory.height)];
+        self.visit_leaves(directory, interval, |page| { pages.push(page); Ok(()) }).await?;
+        Ok(pages)
+    }
+
+    pub(super) async fn visit_leaves(&self, directory: DirectoryRef, interval: Option<(&[u8], &[u8])>,
+        mut visit: impl FnMut(PageRef) -> Result<()> + Send,
+    ) -> Result<()> {
+        let mut todo = Vec::with_capacity(1 + directory.height as usize * FANOUT);
+        todo.push((directory.page, directory.height));
         while let Some((page, height)) = todo.pop() {
-            if height == 0 { pages.push(page); continue; }
+            if height == 0 { visit(page)?; continue; }
             todo.extend(self.children(page).await?.iter().rev()
                 .filter(|child| interval.is_none_or(|(lower, upper)| child.upper.as_slice() >= lower && child.lower.as_slice() <= upper))
                 .map(|child| (child.page, height - 1)));
         }
-        Ok(pages)
+        Ok(())
     }
+
 }
 
 #[cfg(test)]
@@ -546,7 +579,7 @@ mod tests {
         store.put(&object, bytes.into()).await?;
         let pool = Arc::new(BufferPool::new(store, limit));
         let source = PageSource::Remote(PageOwner::new(&pool, object, Arc::new(PageCache::new(0))));
-        let reader = TreeReader::new(source, length, TREE_FORMAT_VERSION);
+        let reader = TreeReader::new(source, length, TREE_FORMAT_VERSION, MemoryBudget::new(1 << 20));
 
         let batch = reader.page(root, PageKind::Directory).await?;
         let fields = table(&batch, Table::Directory);

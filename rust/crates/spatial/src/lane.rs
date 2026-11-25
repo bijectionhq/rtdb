@@ -127,7 +127,7 @@ impl ArtefactBuilder for Builder {
                     if let Some((partition, iid, keys)) =
                         postings::event_keys(&events.borrow_event(row)?, &definition, &mut work)?
                     {
-                        postings.append(partition, iid, keys)?;
+                        postings.append(partition, iid, keys.as_slice())?;
                     }
                 }
             }

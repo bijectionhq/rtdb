@@ -835,9 +835,12 @@ impl ObjectStore for EncryptingStore {
         key: &ObjectKey,
         bytes: Bytes,
     ) -> crate::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        // An ordered checkpoint needs a receipt tied to the bytes verified by the retry.
+        let ordered = rtdb_format::keys::is_ordered_index_object(key.as_str());
         let sealed = if matches!(&self.keys, ObjectKeys::Units(_)) {
             match self.seal_missing(key, bytes.clone()).await? {
                 Some(sealed) => sealed,
+                None if ordered => return Ok(None),
                 None => return self.inner.retirement_publication(key).await,
             }
         } else {
@@ -845,7 +848,7 @@ impl ObjectStore for EncryptingStore {
         };
         match self.inner.put_with_publication(key, sealed).await {
             Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => {
-                self.inner.retirement_publication(key).await
+                if ordered { Ok(None) } else { self.inner.retirement_publication(key).await }
             }
             written => written,
         }

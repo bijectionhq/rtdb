@@ -46,6 +46,8 @@
 -- Native SQL, XTQL, and logical relation execution opens Arrow batches for the root operator.
 -- Semantic pages remain Arrow batches through downstream operators and transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Native cursor pages with a fixed result layout share one admitted Arrow schema.
+-- Result buffers that share operator backing carry its admission for as long as their Arrow views retain it.
 -- Arrow result layout adaptation reserves its scratch space against the client operation's budget.
 -- A Flight SQL world point reply retains a compatible selected Arrow value and publishes its concrete cell type.
 -- An Arrow client result union of one data leg and nullable null legs conforms to that leg's declared plain field by Arrow position.
@@ -108,6 +110,7 @@
 -- Computed VALUES and replayed literal pages admit their results column by column.
 -- Compatible XTQL literal pages build their Arrow columns during binding and retain the order and size of every page.
 -- System catalog scans build the requested columns in Arrow and apply filters to their batches.
+-- Flight SQL catalog metadata resolves visible names before building fields for selected tables requested with schemas.
 -- Relation name casts resolve against an identity map for the captured catalog.
 -- Column tables preserve one semantic page across the input list's batches.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
@@ -129,22 +132,27 @@
 -- Compatible computed cosine operands demand their elements in expression order before vector validation.
 -- The row-evaluated score projection builds a typed Arrow result with the scalar projection's observed nullability.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
--- Computed UNNEST gathers both original payload and evaluated child columns by Arrow position.
+-- Computed UNNEST repeats the original Arrow parent positions per list and retains compatible evaluated child spans.
 -- Its ordinal vector marks the synthetic outer row of an empty list as null.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
+-- Hash join fan-out retains Arrow probe payloads under their source owners and shares the repeated probe positions across columns.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Its Bloom and entity ID filters use those same build-side vectors.
 -- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
 -- Supported computed keys and integer residual comparisons retain the payload positions through match selection.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
+-- A complete Arrow probe page or an admissible consecutive span can supply semi and anti output directly.
 -- Their columnar output keeps the configured transport row limit.
 -- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
 -- A single equijoin fails when more than one build row matches a probe row.
--- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
+-- A columnar cross join retains its Arrow inputs and maps output positions in left-major order within each batch pair.
 -- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
--- Apply document fields retain compatible dependent Arrow selections through result conformance.
+-- Joined Apply retains dependent pages in order and uses the same outer position across each page.
+-- Apply documents retain compatible dependent fields and arrays in field-name order.
+-- A document Apply with no dependent rows returns null.
+-- A dependent row with zero fields contributes a present empty document.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
 -- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
@@ -449,6 +457,9 @@
 -- An interrupted response leaves the transaction outcome to the attempt marker and durable source observation.
 -- An ordinary authenticated Flight session may read a bound catalog projection through ScanCatalog.v1 under the SQL snapshot issued to the same principal and database.
 -- The held snapshot supplies the original read cut and clock, and each streamed Arrow result frame requires its delivery grant.
+-- Each result carries one complete IPC frame.
+-- The catalog scan sends the declared schema first and the stream terminator last.
+-- Catalog scan pages in the declared layout share its funded schema.
 -- The packed hosted decision accepts related Arrow runs in a shared stream and restores their scheduled order before the existing decision, control, and source admission.
 --
 -- == Boundaries ==

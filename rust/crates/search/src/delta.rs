@@ -106,16 +106,13 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
 pub(crate) struct Delta {
     batch: OwnedBatch,
     columns: BTreeMap<Column, Range<usize>>,
+    _column_grant: Arc<MemoryReservation>,
 }
 
 impl Delta {
     pub(crate) fn read(encoded: bytes::Bytes, write: &StagedWrite, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if encoded.len() > MAX_BYTES { return Err(invalid("Search delta exceeds its encoded allowance")); }
-        let mut charge = memory.reserve(16384 + encoded.len() * 12)?;
-        let batch = read_batch(Buffer::from(encoded))?;
-        let retained = rtdb_columnar::shared_allocation_size(&batch)?;
-        Arc::get_mut(&mut charge).expect("unpublished delta owns its reservation").shrink_to(retained)?;
-        Self::new(OwnedBatch::with_reservation(batch, charge)?, write)
+        Self::new(read_batch(Buffer::from(encoded), memory)?, write)
     }
 
     pub(crate) fn new(owned: OwnedBatch, write: &StagedWrite) -> Result<Self> {
@@ -131,11 +128,15 @@ impl Delta {
         let tables = batch.column(1).as_string::<i32>();
         let fields = batch.column(2).as_string::<i32>();
         let analyzers = batch.column(3).as_string::<i32>();
+        let mut column_grant = owned.reservation().budget().reserve(0)?;
         let mut columns = BTreeMap::new();
         let mut first = 0;
         while first < batch.num_rows() {
             let analyzer = rtdb_text::Analyzer::parse(analyzers.value(first)).ok_or_else(|| invalid("Search delta names an unknown analyzer"))?;
-            let key = (TableRef::new(schemas.value(first), tables.value(first)), fields.value(first).to_owned(), analyzer);
+            let (schema, table, field) = (schemas.value(first), tables.value(first), fields.value(first));
+            let grant = Arc::get_mut(&mut column_grant).expect("delta owns its column grant");
+            grant.grow_to(grant.bytes().saturating_add(256).saturating_add(schema.len()).saturating_add(table.len()).saturating_add(field.len()))?;
+            let key = (TableRef::new(schema, table), field.to_owned(), analyzer);
             let rows = write.tables().get(&key.0).map_or(0, |table| table.row_count());
             let last = first + rows;
             if rows == 0 || last > batch.num_rows() || (first..last).any(|row| schemas.value(row) != key.0.schema
@@ -145,7 +146,7 @@ impl Delta {
             }
             first = last;
         }
-        Ok(Self { batch: owned, columns })
+        Ok(Self { batch: owned, columns, _column_grant: column_grant })
     }
 
     pub(crate) fn columns(&self) -> impl Iterator<Item = &Column> { self.columns.keys() }
@@ -161,38 +162,62 @@ impl Delta {
     }
 }
 
-fn read_batch(buffer: Buffer) -> Result<RecordBatch> {
-    use arrow_ipc::{convert::fb_to_schema, root_as_footer};
+fn read_batch(buffer: Buffer, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    use arrow_ipc::{MetadataVersion, Type, convert::fb_to_schema, root_as_footer};
+
     let eof = || invalid("failed to fill whole buffer");
+    let profile = || invalid("Search delta has the wrong schema or page count");
     let tail = buffer.len().checked_sub(10).ok_or_else(eof)?;
     let footer = read_footer_length(buffer[tail..].try_into().expect("ten byte trailer")).map_err(invalid)?;
-    let start = tail.checked_sub(footer).ok_or_else(eof)?;
+    let start = tail.checked_sub(footer).filter(|&start| start >= 8).ok_or_else(eof)?;
+    if !buffer.starts_with(b"ARROW1") { return Err(profile()); }
     let footer = root_as_footer(&buffer[start..tail])
         .map_err(|error| invalid(format!("Parser error: Unable to get root as footer: {error:?}")))?;
     let blocks = footer.recordBatches().ok_or_else(|| invalid("Parser error: Unable to get record batches from IPC Footer"))?;
-    let source = footer.schema().ok_or_else(|| invalid("Search delta has the wrong schema or page count"))?;
+    let source = footer.schema().ok_or_else(profile)?;
     if !source.endianness().equals_to_target_endianness() {
         return Err(invalid("Ipc error: the endianness of the source system does not match the endianness of the target system."));
     }
-    let source = Arc::new(fb_to_schema(source));
-    let mut decoder = FileDecoder::new(Arc::clone(&source), footer.version());
-    let block_bytes = |block: &arrow_ipc::Block| {
-        let offset = usize::try_from(block.offset()).map_err(invalid)?;
-        let metadata = usize::try_from(block.metaDataLength()).map_err(invalid)?;
-        let body = usize::try_from(block.bodyLength()).map_err(invalid)?;
-        let length = metadata.checked_add(body).ok_or_else(eof)?;
-        if metadata < 8 || offset.checked_add(length).is_none_or(|end| end > buffer.len()) { return Err(eof()); }
-        Ok(buffer.slice_with_length(offset, length))
-    };
-    for block in footer.dictionaries().into_iter().flatten() {
-        decoder.read_dictionary(block, &block_bytes(block)?).map_err(invalid)?;
+    if blocks.len() != 1 || footer.version() != MetadataVersion::V5
+        || footer.dictionaries().is_some_and(|dictionaries| !dictionaries.is_empty()) {
+        return Err(profile());
     }
-    if *source != schema() || blocks.len() != 1 {
-        return Err(invalid("Search delta has the wrong schema or page count"));
+    let fields = source.fields().ok_or_else(profile)?;
+    let types = [Type::Utf8, Type::Utf8, Type::Utf8, Type::Utf8, Type::Bool, Type::LargeList];
+    if fields.len() != types.len() || fields.iter().zip(types).any(|(field, expected)| {
+        field.dictionary().is_some() || field.type_type() != expected || match expected {
+            Type::LargeList => field.children().is_none_or(|children| {
+                children.len() != 1 || {
+                    let child = children.get(0);
+                    child.type_type() != Type::Utf8 || child.dictionary().is_some()
+                        || child.children().is_some_and(|nested| !nested.is_empty())
+                }
+            }),
+            _ => field.children().is_some_and(|children| !children.is_empty()),
+        }
+    }) {
+        return Err(profile());
     }
     let block = blocks.get(0);
-    decoder.read_record_batch(block, &block_bytes(block)?).map_err(invalid)?
-        .ok_or_else(|| invalid("Search delta is empty"))
+    let offset = usize::try_from(block.offset()).map_err(invalid)?;
+    let metadata = usize::try_from(block.metaDataLength()).map_err(invalid)?;
+    let body = usize::try_from(block.bodyLength()).map_err(invalid)?;
+    let end = offset.checked_add(metadata).and_then(|end| end.checked_add(body))
+        .filter(|&end| end <= start && offset >= 8).ok_or_else(eof)?;
+    let encoded = buffer.slice_with_length(offset, end - offset);
+    let bound = crate::file::inspect_uncompressed_record(&encoded, metadata, body, 0..=MAX_ROWS).map_err(|error| {
+        if error.message.as_deref() == Some("Search page has an invalid row count") { invalid("Search delta has invalid rows") }
+        else { invalid(error) }
+    })?;
+    let schema_bytes = tail - start;
+    let mut charge = memory.reserve(bound.saturating_add(buffer.len()).saturating_add(schema_bytes.saturating_mul(16)))?;
+    let source = Arc::new(fb_to_schema(source));
+    if *source != schema() { return Err(profile()); }
+    let batch = FileDecoder::new(source, footer.version()).read_record_batch(block, &encoded).map_err(invalid)?
+        .ok_or_else(|| invalid("Search delta is empty"))?;
+    let retained = rtdb_columnar::shared_allocation_size(&batch)?.saturating_add(4096).saturating_add(schema_bytes.saturating_mul(4));
+    let batch_charge = Arc::get_mut(&mut charge).expect("unpublished delta owns its reservation").split_off(retained)?;
+    OwnedBatch::with_reservation(batch, batch_charge)
 }
 
 #[cfg(test)]
@@ -201,6 +226,25 @@ mod tests {
     use arrow_array::StringArray;
     use rtdb_index::{IndexBatch, StoredEvent, StoredOperation, TableWrite};
     use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, Timestamp, TransactionKey, TxId, Value};
+
+    #[test]
+    fn replay_rejects_oversized_row_declarations_before_decode_admission() {
+        let rows = MAX_ROWS + 1;
+        let schema = Arc::new(schema());
+        let strings = Arc::new(StringArray::from(vec![""; rows]));
+        let mut tokens = LargeListBuilder::new(StringBuilder::new()).with_field(Field::new("item", DataType::Utf8, false));
+        for _ in 0..rows { tokens.append(true); }
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![strings.clone(), strings.clone(), strings.clone(), strings,
+            Arc::new(BooleanArray::from(vec![false; rows])), Arc::new(tokens.finish())]).unwrap();
+        let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), &schema).unwrap();
+        writer.write(&batch).unwrap();
+        let encoded = Buffer::from_vec(writer.into_inner().unwrap());
+        let memory = MemoryBudget::new(0);
+        let error = read_batch(encoded, &memory).unwrap_err();
+        assert_eq!(error.code, "rtdb.search/invalid-delta");
+        assert_eq!(error.message.as_deref(), Some("Search delta has invalid rows"));
+        assert_eq!(memory.peak_bytes(), 0);
+    }
 
     #[test]
     fn fts_arrow_delta_preserves_ipc_bytes_and_commit_row_coverage() {

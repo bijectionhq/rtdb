@@ -8,7 +8,7 @@ mod store;
 pub use journal::{JournalDigest, inspect_retained, inspect_retained_with_prefix};
 use crate::local::LocalListener;
 
-use crate::protocol::{AUTHORITY_FRAME_BYTES, JournalIdentity, Request, RequestBody, Response, ResponseBody, encode_frame, read_bounded_frame, read_sized_frame};
+use crate::protocol::{AUTHORITY_FRAME_BYTES, FrameParts, WIRE_BATCH_FRAMES, JournalIdentity, Request, RequestBody, Response, ResponseBody, encode_frame, read_bounded_frame, read_sized_frame};
 use bytes::{Bytes, BytesMut};
 use journal::{Journal, MemberIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -323,12 +323,15 @@ async fn connection(
 }
 
 async fn write_replies(mut writer: impl AsyncWrite + Unpin, mut outbox: mpsc::UnboundedReceiver<Response>) {
-    let mut buffer = BytesMut::new();
+    let mut buffer = FrameParts::default();
     while let Some(reply) = outbox.recv().await {
-        encode_frame(&reply, &mut buffer);
-        while let Ok(reply) = outbox.try_recv() { encode_frame(&reply, &mut buffer); }
-        if writer.write_all(&buffer).await.is_err() { return; }
-        buffer.clear();
+        buffer.push_wire(&reply);
+        for _ in 1..WIRE_BATCH_FRAMES {
+            if buffer.wire_batch_full() { break; }
+            let Ok(reply) = outbox.try_recv() else { break };
+            buffer.push_wire(&reply);
+        }
+        if buffer.send_wire(&mut writer).await.is_err() { return; }
     }
     let _ = writer.shutdown().await;
 }

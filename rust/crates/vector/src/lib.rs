@@ -14,13 +14,8 @@ mod shortlist;
 mod rows;
 
 pub use accelerate::{PREDICATE, VectorAccelerator};
-pub use definition::{Approximate, DEFINITIONS, KIND, Method, VectorDefinition, definitions_in, owned_definition};
+pub use definition::{Approximate, CatalogDefinition, DEFINITIONS, Definitions, KIND, Method, VectorDefinition, definitions_in, owned_definition};
 pub use lane::{VectorArtefacts, stage_native_generation};
 pub use readiness::{committed_native_ready, mounted_native_definition, mounted_native_ready};
-pub use rows::Partition;
+pub use rows::{Partition, UnitProbe};
 pub use shortlist::{Budget, Cut, Round, Shortlist, declined};
-
-/// The unit vector of a probe, or none where its cosine distance is undefined.
-pub fn unit_probe(probe: &[f32]) -> Option<Vec<f32>> {
-    rows::unit_of(probe)
-}

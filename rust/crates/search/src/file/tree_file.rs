@@ -14,7 +14,7 @@ use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
 
 use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{AuthenticatedPage, PageRef, Table, Writer, item_of, list, table},
-    page_tree::{Child, DecodedChild, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
+    page_tree::{self, Child, DecodedChild, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
 
 #[cfg(test)]
 use super::layout::FooterLocator;
@@ -521,22 +521,27 @@ pub(crate) struct LogicalDocument {
 
 impl TreeFile {
     pub async fn remote(storage: Arc<BufferPool>, object: ObjectKey, cache: Arc<PageCache>, locator: &TreeLocator,
-        columns: &[String], identity: &str, version: i64, inline: Option<(&str, &Arc<MemoryBudget>)>) -> Result<Self> {
-        Self::open(PageSource::Remote(PageOwner::new(&storage, object, cache)), locator, columns, identity, version, inline).await
+        columns: &[String], identity: &str, version: i64, inline: Option<(&str, &Arc<MemoryBudget>)>, memory: Arc<MemoryBudget>) -> Result<Self> {
+        Self::open(PageSource::Remote(PageOwner::new(&storage, object, cache)), locator, columns, identity, version, inline, memory).await
     }
 
     pub async fn local(bytes: Buffer, cache: Option<(Arc<BufferPool>, ObjectKey, Arc<PageCache>)>, locator: &TreeLocator,
-        columns: &[String], identity: &str, version: i64, inline: Option<(&str, &Arc<MemoryBudget>)>) -> Result<Self> {
+        columns: &[String], identity: &str, version: i64, inline: Option<(&str, &Arc<MemoryBudget>)>, memory: Arc<MemoryBudget>) -> Result<Self> {
         if bytes.len() as u64 != locator.length { return Err(corrupt("Search root size disagrees with the object")); }
         let owner = cache.map(|(storage, object, cache)| PageOwner::new(&storage, object, cache));
-        Self::open(PageSource::Local { bytes, owner }, locator, columns, identity, version, inline).await
+        Self::open(PageSource::Local { bytes, owner }, locator, columns, identity, version, inline, memory).await
     }
 
     async fn open(source: PageSource, locator: &TreeLocator, columns: &[String], identity: &str, version: i64,
-        inline: Option<(&str, &Arc<MemoryBudget>)>) -> Result<Self> {
-        let reader = TreeReader::new(source, locator.length, locator.format);
+        inline: Option<(&str, &Arc<MemoryBudget>)>, memory: Arc<MemoryBudget>) -> Result<Self> {
+        let reader = TreeReader::new(source, locator.length, locator.format, memory);
         let root = if let Some((hex, memory)) = inline && let Some(page) = locator.admit_inline_root(hex, memory)? {
-            reader.authenticated_page(page)?
+            let wire = locator.page.metadata as usize + locator.page.body as usize;
+            match reader.authenticated_page(page, wire) {
+                Ok(root) => root,
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => reader.page(locator.page, PageKind::Root).await?,
+                Err(error) => return Err(error),
+            }
         } else if let Some(bytes) = &locator.inline_root {
             reader.inline_page(locator.page, bytes.clone())?
         } else {
@@ -592,7 +597,7 @@ impl TreeFile {
     }
 
     pub(crate) async fn exact(&self, columns: &[String], column: usize, queries: &[&rtdb_text::Query], all_runs: bool,
-        reservation: Arc<MemoryReservation>) -> Result<super::SearchFile> {
+        memory: &Arc<MemoryBudget>) -> Result<super::SearchFile> {
         use super::manifest::{Manifest, validate_term_blocks, window_count};
 
         if !matches!(self.format, TREE_FORMAT_VERSION | PACKED_FORMAT_VERSION) {
@@ -605,6 +610,13 @@ impl TreeFile {
         let documents = counts.column(0).as_primitive::<UInt32Type>().value(1);
         if documents >= super::NULL_DOC { return Err(corrupt("Search tree has too many documents")); }
 
+        let query_bytes = queries.iter().flat_map(|query| query.terms()).fold(4096usize, |bytes, term| {
+            bytes.saturating_add(512).saturating_add(term.len().saturating_mul(3))
+        });
+        let mut plan = memory.reserve(query_bytes)?;
+        let mut retained = memory.reserve(columns.iter().fold(4096usize, |bytes, name| bytes.saturating_add(128 + name.len()))
+            .saturating_add(table(&self.root, Table::Members).len().saturating_mul(32))
+            .saturating_add(table(&self.root, Table::Sections).len().saturating_mul(128)))?;
         let terms = queries.iter().flat_map(|query| query.terms()).cloned().collect::<BTreeSet<_>>()
             .into_iter().collect::<Vec<_>>();
         let term_pages = self.term_pages(column as u32, &terms).await?;
@@ -614,21 +626,28 @@ impl TreeFile {
         let mut slots = BTreeSet::new();
         for (name, page) in terms.into_iter().zip(term_pages) {
             let Some(page) = page else { continue; };
-            let Some(term) = self.exact_term(&page, column as u32, name, documents).await? else { continue; };
+            let Some(term) = self.exact_term(&page, column as u32, name, documents, &mut retained).await? else { continue; };
+            grow_exact(&mut plan, term.blocks.len().saturating_mul(128))?;
             validate_term_blocks(&term.blocks, term.frequency, window_count(documents), &mut slots)?;
             let positions = queries.iter().any(|query| super::needs_positions(query, &term.name));
             for block in &term.blocks {
-                posting_ordinals.insert(block.page);
-                if positions { posting_ordinals.insert(block.page + 1); }
+                plan_ordinal(&mut posting_ordinals, block.page, &mut plan)?;
+                if positions { plan_ordinal(&mut posting_ordinals, block.page + 1, &mut plan)?; }
                 if !all_runs {
-                    document_ordinals.extend(block.impacts.iter().map(|impact| {
-                        (document_range(impact.window).0 as usize / DOCUMENT_ROWS) * DOCUMENT_ROWS
-                    }));
+                    for impact in &block.impacts {
+                        let page = (document_range(impact.window).0 as usize / DOCUMENT_ROWS) * DOCUMENT_ROWS;
+                        plan_ordinal(&mut document_ordinals, page, &mut plan)?;
+                    }
                 }
             }
             selected.push(term);
         }
-        if all_runs { document_ordinals.extend((0..documents as usize).step_by(DOCUMENT_ROWS)); }
+        if all_runs {
+            for page in (0..documents as usize).step_by(DOCUMENT_ROWS) {
+                plan_ordinal(&mut document_ordinals, page, &mut plan)?;
+            }
+        }
+        grow_exact(&mut retained, posting_ordinals.len().saturating_add(document_ordinals.len()).saturating_mul(256))?;
         let postings = self.find_ordinals(POSTING, posting_ordinals.clone()).await?;
         let runs = self.find_ordinals(DOCUMENT, document_ordinals.clone()).await?;
         if !postings.keys().copied().eq(posting_ordinals) || !runs.keys().copied().eq(document_ordinals) {
@@ -636,14 +655,30 @@ impl TreeFile {
         }
 
         // Other tries use these events to cut visibility, even when this tree has no queried term.
-        let events = self.all(VISIBILITY).await?;
+        let mut references = Vec::new();
+        let walk = memory.reserve(page_tree::DIRECTORY_WALK_BYTES)?;
+        self.reader.visit_leaves(self.directories[&VISIBILITY], None, |page| {
+            grow_exact(&mut plan, 512)?;
+            references.push(page);
+            Ok(())
+        }).await?;
+        drop(walk);
+        grow_exact(&mut retained, references.len().saturating_mul(256))?;
+        let mut pages = self.reader.pages(references.clone(), PageKind::Visibility).await?;
+        let events = references.into_iter()
+            .map(|reference| pages.remove(&reference).ok_or_else(|| corrupt("Search page was omitted")))
+            .collect::<Result<Vec<_>>>()?;
         let primary = self.find(PAGE_ROWS, &ordinal(0)).await?.ok_or_else(|| corrupt("Search tree has no primary page starts"))?;
         let manifest = Manifest::read_tree(&self.root, &primary, documents, column, selected, events, runs)?;
         let reader = super::layout::Reader::from_sparse_checked_batches(postings, self.format);
-        Ok(super::SearchFile::with_manifest(reader, columns, manifest).with_reservation(reservation))
+        Ok(super::SearchFile::with_manifest(reader, columns, manifest).with_reservation(retained))
     }
 
-    async fn exact_term(&self, page: &RecordBatch, column: u32, name: String, documents: u32) -> Result<Option<super::manifest::ScopedTerm>> {
+    async fn exact_term(&self, page: &RecordBatch, column: u32, name: String, documents: u32,
+        retained: &mut Arc<MemoryReservation>,
+    ) -> Result<Option<super::manifest::ScopedTerm>> {
+        use futures::TryStreamExt;
+
         let terms = table(page, Table::Terms);
         let columns = terms.column(0).as_primitive::<UInt32Type>();
         let names = terms.column(1).as_string::<i32>();
@@ -654,20 +689,24 @@ impl TreeFile {
         if entries.next().is_some() || !(1..=documents).contains(&frequency) {
             return Err(corrupt("Search tree term directory is invalid"));
         }
+        grow_exact(retained, 256usize.saturating_add(name.capacity()))?;
         let node = rank_tree::node_at(&table(page, Table::RankNodes), row)?;
         let mut blocks = Vec::new();
         if node.page.is_some() {
-            for leaf in rank_tree::leaves(&self.reader, node, node.first, node.last).await? {
+            let _walk = retained.budget().reserve(rank_tree::TRAVERSAL_BYTES)?;
+            let leaves = rank_tree::leaf_stream(&self.reader, node, node.first, node.last);
+            futures::pin_mut!(leaves);
+            while let Some(leaf) = leaves.try_next().await? {
                 let (table, _) = rank_tree::leaf_arrays(&self.reader, leaf).await?;
                 let entries = table.column(0).as_list::<i64>();
                 if entries.len() != 1 || entries.is_null(0) { return Err(corrupt("Search term has an invalid rank leaf")); }
-                blocks.extend(super::paged::blocks(entries, 0));
+                append_exact_blocks(&mut blocks, entries, 0, retained)?;
             }
         } else {
             let table = table(page, Table::Blocks);
             let entries = table.column(0).as_list::<i64>();
             if row >= entries.len() || entries.is_null(row) { return Err(corrupt("Search term has no inline blocks")); }
-            blocks = super::paged::blocks(entries, row);
+            append_exact_blocks(&mut blocks, entries, row, retained)?;
         }
         Ok(Some(super::manifest::ScopedTerm { name, frequency, blocks }))
     }
@@ -891,6 +930,32 @@ impl TreeFile {
     }
 }
 
+fn grow_exact(reservation: &mut Arc<MemoryReservation>, bytes: usize) -> Result<()> {
+    let reservation = Arc::get_mut(reservation).expect("the unfinished exact view owns its reservation");
+    reservation.grow_to(reservation.bytes().saturating_add(bytes))
+}
+
+fn plan_ordinal(ordinals: &mut BTreeSet<usize>, ordinal: usize, plan: &mut Arc<MemoryReservation>) -> Result<()> {
+    if !ordinals.contains(&ordinal) {
+        grow_exact(plan, 512)?;
+        ordinals.insert(ordinal);
+    }
+    Ok(())
+}
+
+fn append_exact_blocks(blocks: &mut Vec<super::paged::Block>, entries: &arrow_array::LargeListArray, row: usize,
+    retained: &mut Arc<MemoryReservation>,
+) -> Result<()> {
+    let rows = entries.value(row);
+    let impacts = rows.as_struct().column(3).as_list::<i64>().value_offsets();
+    let impact_count = (impacts[impacts.len() - 1] - impacts[0]) as usize;
+    grow_exact(retained, rows.len().saturating_mul(2 * size_of::<super::paged::Block>())
+        .saturating_add(impact_count.saturating_mul(size_of::<super::postings::Impact>())))?;
+    let _staging = retained.budget().reserve(rows.len().saturating_mul(size_of::<super::paged::Block>()))?;
+    blocks.extend(super::paged::blocks(entries, row));
+    Ok(())
+}
+
 fn direct_reference(children: &[DecodedChild], key: &[u8]) -> Option<PageRef> {
     let index = children.partition_point(|child| child.upper.as_slice() < key);
     children.get(index).filter(|child| child.lower.as_slice() <= key).map(|child| child.page)
@@ -945,16 +1010,24 @@ mod tests {
         Limits { provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 0, decode_bytes }
     }
 
+    fn root_decode_bytes(bytes: &[u8], range: std::ops::Range<usize>, run: &SearchRun) -> Result<usize> {
+        let locator = TreeLocator::decode_route(std::str::from_utf8(run.locator()).unwrap()).unwrap();
+        let wire = range.len();
+        let page = locator.page.authenticate(Buffer::from_slice_ref(&bytes[range]))?;
+        Ok(page.decode_bound()?.max(wire))
+    }
+
     #[tokio::test]
     async fn logical_inline_root_spends_one_decode_and_warm_reuse_checks_identity() -> Result<()> {
         let columns = ["body".to_owned()];
-        let (slug, mut run, _, range) = logical_run(&columns)?;
+        let (slug, mut run, bytes, range) = logical_run(&columns)?;
+        let work = root_decode_bytes(&bytes, range, &run)?;
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let runtime = crate::SearchRuntime::with_logical_search(1 << 20);
 
-        let denied = audience_work::within(Some(root_work(range.len() - 1)), runtime.logical_file(&storage, &slug, &run, &columns)).await;
+        let denied = audience_work::within(Some(root_work(work - 1)), runtime.logical_file(&storage, &slug, &run, &columns)).await;
         assert_eq!(denied.err().unwrap().code, "rtdb.storage/audience-work-limit");
-        let opened = audience_work::within(Some(root_work(range.len())), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        let opened = audience_work::within(Some(root_work(work)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
         let warm = audience_work::within(Some(root_work(0)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
         assert!(Arc::ptr_eq(&opened, &warm));
         run.rebuild = Some(1);
@@ -967,6 +1040,7 @@ mod tests {
     async fn logical_fresh_and_unusable_inline_roots_read_the_persisted_root() -> Result<()> {
         let columns = ["body".to_owned()];
         let (slug, mut run, bytes, range) = logical_run(&columns)?;
+        let work = root_decode_bytes(&bytes, range.clone(), &run)?;
         let store = Arc::new(MemoryStore::default());
         let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
         let runtime = crate::SearchRuntime::with_logical_search(1 << 20);
@@ -981,16 +1055,16 @@ mod tests {
         drop(opened);
         store.delete(&key).await?;
         store.put(&key, bytes.clone().into()).await?;
-        audience_work::within(Some(root_work(range.len())), runtime.open_logical(&storage, &slug, &run, &columns, true)).await?;
+        audience_work::within(Some(root_work(work)), runtime.open_logical(&storage, &slug, &run, &columns, true)).await?;
 
         let constrained = crate::SearchRuntime::with_logical_search(0);
-        audience_work::within(Some(root_work(range.len())), constrained.logical_file(&storage, &slug, &run, &columns)).await?;
+        audience_work::within(Some(root_work(work)), constrained.logical_file(&storage, &slug, &run, &columns)).await?;
 
         let mut wrong_root = bytes[range.clone()].to_vec();
         wrong_root[0] ^= 1;
         let (prefix, _) = std::str::from_utf8(run.locator()).unwrap().rsplit_once(':').unwrap();
         run.locator = Some(format!("{prefix}:{}", encode_hex(&lz4_flex::block::compress(&wrong_root))).into_bytes());
-        audience_work::within(Some(root_work(range.len() * 2)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        audience_work::within(Some(root_work(work + range.len())), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
         Ok(())
     }
 
@@ -1011,7 +1085,7 @@ mod tests {
         let pool = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), length));
         let owner = PageOwner::new(&pool, ObjectKey::new("search/corrupt-term-directory")?, Arc::new(PageCache::new(length)));
         let source = PageSource::Local { bytes: Buffer::from_vec(bytes), owner: Some(owner) };
-        let reader = TreeReader::new(source, length as u64, TREE_FORMAT_VERSION);
+        let reader = TreeReader::new(source, length as u64, TREE_FORMAT_VERSION, MemoryBudget::new(1 << 20));
         reader.page(root, PageKind::Directory).await?;
         let tree = TreeFile {
             reader,
@@ -1112,7 +1186,7 @@ mod tests {
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
-        let tree = Arc::new(TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "tree", 42, None).await.unwrap());
+        let tree = Arc::new(TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "tree", 42, None, MemoryBudget::new(64 << 20)).await.unwrap());
         let found = tree.events(rows[900].iid).await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].system_from, 1);
@@ -1136,7 +1210,7 @@ mod tests {
             .map(|(doc, score)| (doc.iid, score.to_bits())).collect::<BTreeMap<_, _>>();
         assert_eq!(actual.len(), rows.len());
         assert_eq!(actual, expected);
-        let exact = tree.exact(&columns, 0, &[&matching, &scoring], false, MemoryBudget::new(32 << 20).reserve(16 << 20).unwrap()).await.unwrap();
+        let exact = tree.exact(&columns, 0, &[&matching, &scoring], false, &MemoryBudget::new(32 << 20)).await.unwrap();
         let scored = exact.scored("body", &matching, &scoring, None, bounds).unwrap().into_iter()
             .map(|(doc, score)| (doc.iid, score.to_bits())).collect::<BTreeMap<_, _>>();
         assert_eq!(scored, expected);
@@ -1166,13 +1240,13 @@ mod tests {
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
-        let tree = TreeFile::local(Buffer::from_vec(bytes.clone()), None, &locator, &columns, "sparse", 1, None).await?;
+        let tree = TreeFile::local(Buffer::from_vec(bytes.clone()), None, &locator, &columns, "sparse", 1, None, MemoryBudget::new(64 << 20)).await?;
         let skipped = tree.page_reference_for_test(DOCUMENT, &ordinal(DOCUMENT_ROWS)).await?.unwrap();
         bytes[skipped.range()?.start as usize] ^= 1;
-        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "sparse", 1, None).await?;
+        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "sparse", 1, None, MemoryBudget::new(64 << 20)).await?;
         let query = Query::parse("\"overdue invoice\"");
         let memory = MemoryBudget::new(16 << 20);
-        let exact = Arc::new(tree.exact(&columns, 0, &[&query], false, memory.reserve(4 << 20)?).await?);
+        let exact = Arc::new(tree.exact(&columns, 0, &[&query], false, &memory).await?);
         let bounds = TemporalBounds { valid_time: Interval::at(Timestamp(2))?, system_time: Interval::at(Timestamp(2))? };
         assert_eq!(exact.matches("body", &query, bounds)?.iter().map(|doc| doc.iid).collect::<Vec<_>>(), [iid(0)]);
         assert_eq!(exact.events(&iid(1024))?.len(), 1);
@@ -1183,7 +1257,11 @@ mod tests {
         assert_eq!(member.value(0, 1)?, Some(false));
         assert_eq!(member.value(0, 1024)?, Some(false));
         assert_eq!(member.value(0, 1025)?, None);
-        let corpus = tree.exact(&columns, 0, &[&query], true, memory.reserve(4 << 20)?).await;
+        let absent = Query::parse("missing");
+        let visibility = tree.exact(&columns, 0, &[&absent], false, &memory).await?;
+        assert_eq!(visibility.events(&iid(1024))?.len(), 1);
+        assert!(visibility.matches("body", &absent, bounds)?.is_empty());
+        let corpus = tree.exact(&columns, 0, &[&query], true, &memory).await;
         assert_eq!(corpus.err().unwrap().code, "rtdb.search/corrupt-file");
         Ok(())
     }
@@ -1233,9 +1311,9 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         let bytes = Buffer::from_vec(bytes);
-        let tree = TreeFile::local(bytes.clone(), None, &locator, &columns, "pack", 1, None).await.unwrap();
+        let tree = TreeFile::local(bytes.clone(), None, &locator, &columns, "pack", 1, None, MemoryBudget::new(64 << 20)).await.unwrap();
         tree.verify().await.unwrap();
-        TreeFile::local(bytes, None, &fallback, &columns, "pack", 1, None).await.unwrap().verify().await.unwrap();
+        TreeFile::local(bytes, None, &fallback, &columns, "pack", 1, None, MemoryBudget::new(64 << 20)).await.unwrap().verify().await.unwrap();
         let first = Iid([1; 16]);
         let second = Iid([9; 16]);
         let queried = BTreeSet::from([first, second, Iid([5; 16])]);
@@ -1298,7 +1376,7 @@ mod tests {
             file.rewind().map_err(fault)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(fault)?;
-            let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, columns, "history", 1, None).await?;
+            let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, columns, "history", 1, None, MemoryBudget::new(64 << 20)).await?;
             tree.verify().await?;
             let page_sizes = tree.all(VISIBILITY).await?.iter().map(|batch| table(batch, Table::Events).len()).collect::<Vec<_>>();
             assert_eq!(page_sizes, [EVENT_ROWS, 2]);

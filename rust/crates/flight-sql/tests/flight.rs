@@ -586,6 +586,69 @@ async fn bulk_ingestion_uses_each_arrow_batch_and_catalog_metadata_uses_dense_un
 }
 
 #[tokio::test]
+async fn table_metadata_preserves_flight_filters_order_and_selected_schemas() {
+    use arrow_array::cast::AsArray;
+    use arrow_flight::sql::CommandGetDbSchemas;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO doc_b (_id, label) VALUES (1, 'b')", None).await;
+    client.update("INSERT INTO doc_a (_id, amount) VALUES (1, 42)", None).await;
+    client.update("INSERT INTO docxa (_id) VALUES (1)", None).await;
+    client.update("INSERT INTO doc_more (_id) VALUES (1)", None).await;
+
+    let filter = CommandGetTables {
+        catalog: Some("xtdb".into()),
+        db_schema_filter_pattern: Some("p_bl%".into()),
+        table_name_filter_pattern: Some(r"doc\__".into()),
+        table_types: vec!["VIEW".into(), "TABLE".into()],
+        include_schema: true,
+    };
+    for (command, matches) in [
+        (filter.clone(), true),
+        (CommandGetTables { include_schema: false, ..filter.clone() }, true),
+        (CommandGetTables { catalog: Some("XTDB".into()), ..filter.clone() }, false),
+        (CommandGetTables { catalog: Some(String::new()), ..filter.clone() }, false),
+        (CommandGetTables { table_types: vec!["table".into()], ..filter }, false),
+    ] {
+        let include_schema = command.include_schema;
+        let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+        let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+        let batch = &client.redeem(&info).await[0];
+        assert_eq!(batch.schema().as_ref(), &info.try_decode_schema().unwrap());
+        assert_eq!(batch.num_columns(), if include_schema { 5 } else { 4 });
+        if matches {
+            assert_eq!(batch.column(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("xtdb"), Some("xtdb")]);
+            assert_eq!(batch.column(1).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("public"), Some("public")]);
+            assert_eq!(batch.column(2).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("doc_a"), Some("doc_b")]);
+            assert_eq!(batch.column(3).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("TABLE"), Some("TABLE")]);
+            if include_schema {
+                let encoded = batch.column(4).as_binary::<i32>();
+                let first = rtdb_format::ipc::read_schema_message(encoded.value(0)).unwrap();
+                let second = rtdb_format::ipc::read_schema_message(encoded.value(1)).unwrap();
+                assert!(first.field_with_name("amount").is_ok());
+                assert!(first.field_with_name("label").is_err());
+                assert!(second.field_with_name("label").is_ok());
+                assert!(second.field_with_name("amount").is_err());
+            }
+        } else {
+            assert_eq!(batch.num_rows(), 0);
+        }
+    }
+
+    let command = CommandGetDbSchemas {
+        catalog: Some("xtdb".into()),
+        db_schema_filter_pattern: Some("p%".into()),
+    };
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let batch = &client.redeem(&info).await[0];
+    assert_eq!(batch.column(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("xtdb"), Some("xtdb")]);
+    assert_eq!(batch.column(1).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("pg_catalog"), Some("public")]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn bulk_ingest_preserves_nested_arrow_lists_with_signed_execution_values() {
     use arrow_array::{Array, ListArray, types::UInt64Type};
 
@@ -3364,6 +3427,16 @@ async fn catalog_scan_returns_bound_binary_at_the_original_snapshot() {
     let result = reader.client.do_action(request).await.unwrap();
     assert_eq!(result.metadata().get("x-rtdb-owned-ipc").unwrap(), "stream-v1");
     let frames: Vec<_> = result.into_inner().try_collect().await.unwrap();
+    let (eos, messages) = frames.split_last().unwrap();
+    assert_eq!(eos.body.as_ref(), &[255, 255, 255, 255, 0, 0, 0, 0]);
+    for (index, frame) in messages.iter().enumerate() {
+        assert_eq!(&frame.body[..4], &[255; 4]);
+        let metadata = u32::from_le_bytes(frame.body[4..8].try_into().unwrap()) as usize;
+        let header = arrow_ipc::root_as_message(&frame.body[8..8 + metadata]).unwrap();
+        assert_eq!(frame.body.len(), 8 + metadata + header.bodyLength() as usize);
+        let kind = if index == 0 { arrow_ipc::MessageHeader::Schema } else { arrow_ipc::MessageHeader::RecordBatch };
+        assert_eq!(header.header_type(), kind);
+    }
     let ipc = frames.into_iter().flat_map(|frame| frame.body.to_vec()).collect::<Vec<_>>();
     let rows = StreamReader::try_new(ipc.as_slice(), None).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
     assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);

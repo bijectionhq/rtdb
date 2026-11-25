@@ -25,6 +25,7 @@ pub(super) struct MatchBuilder {
     iids: Vec<u8>,
     reservation: Arc<MemoryReservation>,
     retention: Retention,
+    ordered: bool,
 }
 
 impl MatchBuilder {
@@ -40,6 +41,7 @@ impl MatchBuilder {
             iids: Vec::new(),
             reservation,
             retention,
+            ordered: true,
         })
     }
 
@@ -48,17 +50,12 @@ impl MatchBuilder {
         if self.retention == Retention::Probe && next_count > MAX_PROBE_MATCHES {
             return Err(work_limit());
         }
-        let integer;
-        let (tag, payload): (u8, &[u8]) = match &id {
-            EntityIdRef::String(value) => (0, value.as_bytes()),
-            EntityIdRef::Keyword(value) => (1, value.as_bytes()),
-            EntityIdRef::Integer(value) => {
-                integer = ((*value as u64) ^ (1 << 63)).to_be_bytes();
-                (2, &integer)
-            }
-            EntityIdRef::Uuid(value) => (3, value),
-            EntityIdRef::Binary(value) => (4, value),
-        };
+        let mut integer = [0; 8];
+        let (tag, payload) = id.handle_parts(&mut integer);
+        let ordered = self.ordered && (next_count == 1 || {
+            let previous = &self.keys[self.offsets[next_count - 2] as usize..];
+            (previous[0], &previous[1..]) < (tag, payload)
+        });
         let end = self.keys.len().checked_add(1)
             .and_then(|len| len.checked_add(payload.len()))
             .ok_or_else(work_limit)?;
@@ -68,10 +65,11 @@ impl MatchBuilder {
             Retention::Range => (size_of::<i64>(), usize::MAX),
             Retention::Probe => (PROBE_MATCH_OVERHEAD, MAX_PROBE_MATCH_BYTES),
         };
-        let fixed = overhead + rows_capacity * ROW_BYTES;
+        let layout = overhead + rows_capacity * ROW_BYTES;
+        let fixed = if ordered { layout - rows_capacity * size_of::<u32>() } else { layout };
         let current = self.keys.capacity();
         let minimum = current.max(end);
-        let limit = byte_limit.checked_sub(fixed)
+        let limit = byte_limit.checked_sub(layout)
             .filter(|&limit| minimum <= limit)
             .ok_or_else(work_limit)?;
         let preferred = if end > current {
@@ -98,60 +96,71 @@ impl MatchBuilder {
         self.keys.extend_from_slice(payload);
         self.offsets.push(offset);
         self.iids.extend_from_slice(iid.as_bytes());
+        self.ordered = ordered;
         Ok(())
     }
 
     pub(super) fn finish(self, check: impl Fn() -> Result<()>) -> Result<RetainedMatches> {
         check()?;
-        let Self { keys, offsets, iids, reservation, .. } = self;
+        let Self { keys, offsets, iids, reservation, ordered, .. } = self;
         let count = u32::try_from(offsets.len() - 1).map_err(|_| work_limit())?;
         let keys = LargeBinaryArray::new(
             OffsetBuffer::new(offsets.into()), Buffer::from_vec(keys), None,
         );
         let iids = FixedSizeBinaryArray::new(IID_BYTES as i32, Buffer::from_vec(iids), None);
-        let mut order = (0..count).collect::<Vec<_>>();
-        // The handle tag and sign-biased integer payload preserve typed identity order bytewise.
-        order.sort_unstable_by(|&left, &right| keys.value(left as usize).cmp(keys.value(right as usize)));
+        let order = (!ordered).then(|| {
+            let mut order = (0..count).collect::<Vec<_>>();
+            order.sort_unstable_by(|&left, &right| keys.value(left as usize).cmp(keys.value(right as usize)));
+            UInt32Array::from(order)
+        });
         check()?;
-        Ok(RetainedMatches { keys, iids, order: UInt32Array::from(order), _reservation: reservation })
+        Ok(RetainedMatches { keys, iids, order, _reservation: reservation })
     }
 }
 
 pub(super) struct RetainedMatches {
     keys: LargeBinaryArray,
     iids: FixedSizeBinaryArray,
-    order: UInt32Array,
+    order: Option<UInt32Array>,
     _reservation: Arc<MemoryReservation>,
 }
 
 impl RetainedMatches {
     pub(super) fn len(&self) -> usize {
-        self.order.len()
+        self.keys.len()
+    }
+
+    fn row(&self, position: usize) -> usize {
+        self.order.as_ref().map_or(position, |order| order.value(position) as usize)
+    }
+
+    fn key(&self, position: usize) -> &[u8] {
+        self.keys.value(self.row(position))
     }
 
     pub(super) fn has_ties(&self) -> bool {
-        self.order.values().windows(2).any(|rows| {
-            self.keys.value(rows[0] as usize) == self.keys.value(rows[1] as usize)
-        })
+        (1..self.len()).any(|position| self.key(position - 1) == self.key(position))
     }
 
-    pub(super) fn seek_after(&self, after: EntityIdRef<'_>) -> Result<usize> {
+    pub(super) fn seek_after(&self, after: EntityIdRef<'_>) -> usize {
+        let mut integer = [0; 8];
+        let bound = after.handle_parts(&mut integer);
         let mut lower = 0;
         let mut upper = self.len();
         while lower < upper {
             let mid = lower + (upper - lower) / 2;
-            let row = self.order.value(mid) as usize;
-            if EntityIdRef::from_handle_bytes(self.keys.value(row))? <= after {
+            let key = self.key(mid);
+            if (key[0], &key[1..]) <= bound {
                 lower = mid + 1;
             } else {
                 upper = mid;
             }
         }
-        Ok(lower)
+        lower
     }
 
     pub(super) fn get(&self, position: usize) -> Result<(EntityIdRef<'_>, Iid)> {
-        let row = self.order.value(position) as usize;
+        let row = self.row(position);
         let id = EntityIdRef::from_handle_bytes(self.keys.value(row))?;
         let iid = Iid::from_slice(self.iids.value(row))?;
         Ok((id, iid))
@@ -179,10 +188,10 @@ mod tests {
         assert!(!matches.has_ties());
         for (position, row) in [5, 3, 1, 6, 4, 0, 2].into_iter().enumerate() {
             assert_eq!(matches.get(position)?, (ids[row], Iid([row as u8; 16])));
-            assert_eq!(matches.seek_after(ids[row])?, position + 1);
+            assert_eq!(matches.seek_after(ids[row]), position + 1);
         }
-        assert_eq!(matches.seek_after(String(""))?, 0);
-        assert_eq!(matches.seek_after(Integer(0))?, 5);
+        assert_eq!(matches.seek_after(String("")), 0);
+        assert_eq!(matches.seek_after(Integer(0)), 5);
         assert!(memory.used_bytes() > 0);
         drop(matches);
         assert_eq!(memory.used_bytes(), 0);
@@ -199,7 +208,7 @@ mod tests {
 
         let matches = builder.finish(|| Ok(()))?;
         assert!(matches.has_ties());
-        assert_eq!(matches.seek_after(String("same"))?, 2);
+        assert_eq!(matches.seek_after(String("same")), 2);
         assert_eq!(matches.get(2)?, (Keyword("same"), Iid::MIN));
         Ok(())
     }
@@ -232,7 +241,7 @@ mod tests {
 
     #[test]
     fn match_buffers_can_grow_to_exact_need_under_memory_pressure() -> Result<()> {
-        let limit = size_of::<i64>() + 8 * ROW_BYTES + 8;
+        let limit = size_of::<i64>() + 8 * (ROW_BYTES - size_of::<u32>()) + 8;
         let memory = MemoryBudget::new(limit);
         let mut builder = MatchBuilder::new(&memory, Retention::Range)?;
         builder.push(String("abcde"), Iid::MIN)?;
@@ -242,6 +251,7 @@ mod tests {
 
         let matches = builder.finish(|| Ok(()))?;
         assert_eq!(matches.len(), 2);
+        assert!(matches.order.is_none());
         assert_eq!(matches.get(1)?, (String("z"), Iid::MAX));
         Ok(())
     }

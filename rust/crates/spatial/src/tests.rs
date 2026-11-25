@@ -121,7 +121,7 @@ fn canonical_geometry_preserves_work_and_tagged_wkb_results() {
     }
     let mut work = GeometryWork::default();
     let value = bijection_geometry::decode(&image, &mut work).unwrap();
-    let geometry = geometry::admit_view_with_work(value, &DECLARATION, &mut work).unwrap();
+    let geometry = geometry::admit_view_with_work(value.value(), &DECLARATION, &mut work).unwrap();
     let Coords::Point(coords) = geometry.coords else {
         panic!("expected a point");
     };
@@ -134,8 +134,8 @@ fn canonical_geometry_preserves_work_and_tagged_wkb_results() {
     .unwrap()
     .unwrap();
     assert_eq!(
-        location.keys(&mut work).unwrap(),
-        wkb.keys(&mut work).unwrap()
+        location.keys(&mut work).unwrap().as_slice(),
+        wkb.keys(&mut work).unwrap().as_slice()
     );
     let exact = Predicate::WithinDistance(0.0);
     assert_eq!(
@@ -163,7 +163,7 @@ fn canonical_collections_and_position_accuracy_keep_their_typed_values() {
     );
     let mut work = GeometryWork::default();
     let value = bijection_geometry::decode(&image, &mut work).unwrap();
-    let geometry = geometry::admit_view_with_work(value, &DECLARATION, &mut work).unwrap();
+    let geometry = geometry::admit_view_with_work(value.value(), &DECLARATION, &mut work).unwrap();
     let Coords::Collection(members) = geometry.coords else {
         panic!("expected a collection");
     };
@@ -182,7 +182,7 @@ fn canonical_collections_and_position_accuracy_keep_their_typed_values() {
             ("point", canonical_point(1.0, 2.0)),
         ]);
         let value = bijection_geometry::decode(&image, &mut work).unwrap();
-        let position = geometry::admit_position_view_with_work(value, &DECLARATION, &mut work).unwrap();
+        let position = geometry::admit_position_view_with_work(value.value(), &DECLARATION, &mut work).unwrap();
         assert_eq!(position.point, [1.0, 2.0]);
         assert_eq!(position.accuracy_m.map(f64::to_bits), bits);
 
@@ -201,8 +201,8 @@ fn canonical_collections_and_position_accuracy_keep_their_typed_values() {
         tagged.extend_from_slice(&point(1.0, 2.0)[1..]);
         let legacy = Location::decode(&tagged, &mut work).unwrap();
         assert_eq!(
-            location.keys(&mut work).unwrap(),
-            legacy.keys(&mut work).unwrap()
+            location.keys(&mut work).unwrap().as_slice(),
+            legacy.keys(&mut work).unwrap().as_slice()
         );
     }
     for encoding in [
@@ -211,6 +211,33 @@ fn canonical_collections_and_position_accuracy_keep_their_typed_values() {
     ] {
         assert!(Location::decode_stored(&[2], encoding, &mut work).unwrap().is_none());
     }
+}
+
+#[test]
+fn spatial_preparation_moves_the_decoded_coordinates_and_returns_them_on_refusal() {
+    let build = || Geometry::new(
+        Kind::LineString,
+        Coords::Points(vec![[0.0, 0.0], [1.0, 1.0]]),
+        GeometrySpace::wgs84_xy(),
+    );
+    let origin = build();
+    let Coords::Points(points) = &origin.coords else { unreachable!() };
+    let original = points.as_ptr();
+    let predicate = Predicate::WithinDistance(100.0);
+    let mut work = GeometryWork::default();
+    let prepared = predicate.prepare_geometry(origin, &mut work, |_, _| Ok(())).unwrap();
+    let Coords::Points(points) = &prepared.coords else { unreachable!() };
+    assert_eq!(points.as_ptr(), original);
+
+    let origin = build();
+    let Coords::Points(points) = &origin.coords else { unreachable!() };
+    let original = points.as_ptr();
+    let mut work = GeometryWork::default();
+    let error = predicate.prepare_geometry(origin, &mut work, |_, _| Err(postings::work_limit()));
+    let Err((returned, error)) = error else { panic!("expected preparation refusal") };
+    let Coords::Points(points) = returned.coords else { unreachable!() };
+    assert_eq!(points.as_ptr(), original);
+    assert_eq!(error.code, postings::work_limit().code);
 }
 
 #[test]
@@ -279,16 +306,16 @@ async fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_ex
             radius.evaluate(&row, &origin.geometry, None, &mut work).unwrap(),
             Some(None)
         );
-        let prepared = radius.prepare_geometry(&origin.geometry, &mut work).unwrap();
+        let prepared = radius.prepare_geometry(origin.geometry, &mut work, |_, _| Ok(())).unwrap();
         let cover = radius.cover(&prepared, &mut work).unwrap().unwrap();
         let selected = Partition::of([b"east".as_slice()]);
         let elsewhere = Partition::of([b"west".as_slice()]);
         let wanted = Iid([1; 16]);
         let memory = MemoryBudget::new(4 << 20);
         let mut file = Postings::new(&memory).unwrap();
-        file.append(selected, wanted, row.keys(&mut work).unwrap())
+        file.append(selected, wanted, row.keys(&mut work).unwrap().as_slice())
             .unwrap();
-        file.append(elsewhere, Iid([2; 16]), row.keys(&mut work).unwrap())
+        file.append(elsewhere, Iid([2; 16]), row.keys(&mut work).unwrap().as_slice())
             .unwrap();
         let output = tempfile::NamedTempFile::new().unwrap();
         let (length, stats) = file
@@ -364,11 +391,11 @@ async fn spatial_arrow_postings_seek_across_page_boundaries() {
     let partition = Partition::of([b"area".as_slice()]);
     let iid = Iid([9; 16]);
     let boundary = 16_384;
-    let write = |keys, duplicates| {
+    let write = |keys: Vec<_>, duplicates| {
         let mut postings = Postings::new(&memory).unwrap();
-        postings.append(partition, iid, keys).unwrap();
+        postings.append(partition, iid, &keys).unwrap();
         if duplicates {
-            postings.append(partition, iid, vec![boundary, boundary - 1]).unwrap();
+            postings.append(partition, iid, &[boundary, boundary - 1]).unwrap();
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         let (_, stats) = postings.write(
@@ -421,8 +448,8 @@ fn spatial_arrow_bijection_images_borrow_fields_and_preserve_coordinate_bits() {
     image.extend_from_slice(b"\0\0type\0\x01\x09Point\0\x01\0\0");
     let mut work = GeometryWork::default();
     let decoded = super::bijection_geometry::decode(&image, &mut work).unwrap();
-    assert!(matches!(decoded.field("type").unwrap().text(), Some(std::borrow::Cow::Borrowed("Point"))));
-    assert!(matches!(decoded.field("coordinates").unwrap().array().unwrap().next().unwrap().scalar(),
+    assert!(matches!(decoded.value().field("type").unwrap().text(), Some(std::borrow::Cow::Borrowed("Point"))));
+    assert!(matches!(decoded.value().field("coordinates").unwrap().array().unwrap().next().unwrap().scalar(),
         Scalar::Float(value) if value.to_bits() == longitude.to_bits()));
     let loc = Location::decode_stored(&image, SpatialGeometryEncoding::BijectionGeometry, &mut work)
         .unwrap().unwrap();

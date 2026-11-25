@@ -176,8 +176,7 @@ impl Builder {
             sections: BTreeMap::new(), window_ids: Vec::new(), format, mode,
             revisions: (0..if mode == BuildMode::History { columns } else { 0 }).map(|_| FixedSizeBinaryBuilder::new(33)).collect(),
             doc_columns: Vec::new(), doc_revisions: FixedSizeBinaryBuilder::new(32),
-            doc_tokens: arrow_array::builder::LargeListBuilder::new(StringBuilder::new())
-                .with_field(item_of(&Table::TokenSequences.fields()[2])),
+            doc_tokens: arrow_array::builder::LargeListBuilder::new(StringBuilder::new()),
             doc_system_from: Vec::new(), doc_commit_positions: Vec::new(),
             doc_event_positions: FixedSizeBinaryBuilder::new(EventPosition::WIDTH), erases: BTreeMap::new(),
         }
@@ -395,8 +394,11 @@ impl Builder {
                     Some(self.revisions.into_iter().map(|mut values| values.finish()).collect())
                 } else { None };
                 let documents = if self.mode == BuildMode::Postings {
+                    let (_, offsets, values, nulls) = self.doc_tokens.finish().into_parts();
+                    let tokens = arrow_array::LargeListArray::try_new(item_of(&Table::TokenSequences.fields()[2]),
+                        offsets, values, nulls).map_err(fault)?;
                     Some(Table::TokenSequences.array(vec![Arc::new(UInt32Array::from(self.doc_columns)), Arc::new(self.doc_revisions.finish()),
-                        Arc::new(self.doc_tokens.finish()), Arc::new(Int64Array::from(self.doc_system_from)),
+                        Arc::new(tokens), Arc::new(Int64Array::from(self.doc_system_from)),
                         Arc::new(UInt32Array::from(self.doc_commit_positions)), Arc::new(self.doc_event_positions.finish())])?)
                 } else { None };
                 let erases = if !self.erases.is_empty() {

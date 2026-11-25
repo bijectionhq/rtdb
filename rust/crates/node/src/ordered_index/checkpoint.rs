@@ -9,7 +9,7 @@ use arrow_array::{
 };
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, retain_buffer_with_owner};
 use rtdb_storage::{Error, IoRegion, ObjectKey, cache::BufferPool};
 use rtdb_types::Result;
 use serde::{Deserialize, Serialize};
@@ -291,7 +291,8 @@ pub(super) async fn latest(
     let store = storage.object_store();
     let head = key(directory, format_args!("{MANIFESTS}/{through:016x}"))?;
     let observed = match store.observe_head(&head).await {
-        Ok(object) => object,
+        Ok(object) if object.value.key == head => object,
+        Ok(_) => return Err(format_error("Ordered index manifest address changed")),
         Err(Error::MissingObject(_)) => {
             let listed = store
                 .list(Some(&key(directory, MANIFESTS)?))
@@ -310,25 +311,31 @@ pub(super) async fn latest(
     };
     let object = observed.value;
     let size = usize::try_from(object.size).map_err(format_error)?;
-    let decode_bound = size.saturating_mul(8).saturating_add(4096);
+    let decode_bound = size.saturating_mul(7).saturating_add(4096);
     let input = store.exact_object_allocation(&object.key, size)?;
-    let read_bound = input.retained_bytes.saturating_add(input.scratch_bytes);
-    let allocation = memory.reserve(decode_bound.max(read_bound))?;
+    let retained_bytes = input.retained_bytes.max(size);
+    let read_bound = retained_bytes.saturating_add(input.scratch_bytes);
+    let mut opening = Arc::into_inner(memory.reserve(decode_bound.saturating_add(read_bound))?)
+        .expect("a fresh manifest reservation has one owner");
+    let retained = opening.split_off(retained_bytes)?;
+    let read_scratch = opening.split_off(input.scratch_bytes)?;
     let read = IoRegion::retaining(
-        Arc::clone(&allocation),
+        Arc::new((Arc::clone(&retained), read_scratch)),
         store.observe_fresh_exact(&object.key, size),
     )
-    .await?;
+    .await.map_err(|error| match error {
+        Error::ImmutableLength { .. } => format_error("Ordered index manifest length changed"),
+        error => error.into(),
+    })?;
     if read.value.len() != size {
         return Err(format_error("Ordered index manifest length changed"));
     }
     if observed.version.is_some() && observed.version != read.version {
         return Err(format_error("Ordered index manifest version changed"));
     }
-    let mut opening = Arc::try_unwrap(allocation)
-        .map_err(|_| format_error("Ordered index manifest read still owns its opening grant"))?;
     let mut checkpoint = if read.value.starts_with(&ipc::CONTINUATION) {
-        let backing = Buffer::from(read.value);
+        // A pointer can keep an Arrow fence slice after the manifest is decoded.
+        let backing = retain_buffer_with_owner(&Buffer::from(read.value), retained);
         decode_manifest(ipc::decode_buffer(backing.clone(), 1)?, &backing, &mut opening)?
     } else if store.ordered_index_arrow_only() {
         return Err(format_error("The installed ordered index checkpoint requires Arrow IPC"));
@@ -424,7 +431,12 @@ pub(super) async fn publish(
     checkpoint.manifest_bytes = encoded.len() as u64;
     let store = tree.storage.object_store();
     let publication = IoRegion::retaining(scratch, store.put_with_publication(&manifest, encoded.into())).await?;
-    if publication.is_some() {
+    if let Some(publication) = publication
+        && let Some(visible) = store.retirement_publication(&manifest).await?
+    {
+        if visible != publication {
+            return Err(format_error("Published checkpoint identity changed"));
+        }
         checkpoint.validate(&manifest)?;
         return Ok(checkpoint);
     }
@@ -543,13 +555,13 @@ fn decode_manifest(batch: RecordBatch, backing: &Buffer, opening: &mut MemoryRes
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Range, path::Path};
+    use std::{ops::Range, path::Path, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
 
     use arrow_array::StringArray;
     use bytes::Bytes;
     use rtdb_columnar::MemoryBudget;
-    use rtdb_storage::{MemoryStore, ObjectStore, StoredObject, cache::BufferPool};
-    use rtdb_types::{Iid, Interval, TableRef, Timestamp};
+    use rtdb_storage::{MemoryStore, ObjectObservation, ObjectStore, StoredObject, cache::BufferPool};
+    use rtdb_types::{Iid, Interval, PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TableRef, Timestamp};
 
     use crate::ordered_index::{
         Definition,
@@ -560,7 +572,21 @@ mod tests {
 
     use super::*;
 
-    struct InstalledStore(Arc<MemoryStore>);
+    struct InstalledStore(Arc<MemoryStore>, Option<Arc<ManifestEvidence>>);
+
+    #[derive(Default)]
+    struct ManifestEvidence {
+        reads: AtomicUsize,
+        replace_on_read: AtomicBool,
+    }
+
+    fn version(key: &ObjectKey, version: &str) -> PhysicalObjectVersion {
+        PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: "evidence".into(), endpoint: None, region: None },
+            key: key.to_string(),
+            version: version.into(),
+        }
+    }
 
     #[async_trait::async_trait]
     impl ObjectStore for InstalledStore {
@@ -570,14 +596,32 @@ mod tests {
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
             self.0.head(key).await
         }
+        async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+            Ok(ObjectObservation { value: self.0.head(key).await?, version: self.1.as_ref().map(|_| version(key, "original")) })
+        }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
             self.0.get(key).await
+        }
+        async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+            let value = self.0.get_fresh_exact(key, length).await?;
+            let version = self.1.as_ref().map(|evidence| {
+                evidence.reads.fetch_add(1, Ordering::Relaxed);
+                version(key, if evidence.replace_on_read.load(Ordering::Relaxed) { "replacement" } else { "original" })
+            });
+            Ok(ObjectObservation { value, version })
         }
         async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
             self.0.get_range(key, range).await
         }
         async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
             self.0.put(key, bytes).await
+        }
+        async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
+            self.put(key, bytes).await?;
+            self.retirement_publication(key).await
+        }
+        async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
+            Ok(self.1.as_ref().map(|_| PhysicalObjectPublication::Version(version(key, "original"))))
         }
         async fn put_file(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<()> {
             self.0.put_file(key, path).await
@@ -610,7 +654,7 @@ mod tests {
     async fn installed_checkpoint_refuses_shared_json_manifests_and_subtrees() -> Result<()> {
         let store = Arc::new(MemoryStore::default());
         let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
-        let installed = Arc::new(BufferPool::new(Arc::new(InstalledStore(store.clone())), 1 << 20));
+        let installed = Arc::new(BufferPool::new(Arc::new(InstalledStore(store.clone(), None)), 1 << 20));
         let memory = MemoryBudget::new(32 << 20);
         let directory = ObjectKey::new("index")?;
         let mut tree = Tree::new(&storage, &directory, &memory, 0).await?;
@@ -674,7 +718,7 @@ mod tests {
     async fn installed_arrow_checkpoint_rebuilds_at_the_same_frontier_and_preserves_page_reads() -> Result<()> {
         let store = Arc::new(MemoryStore::default());
         let shared = Arc::new(BufferPool::new(store.clone(), 1 << 20));
-        let installed = Arc::new(BufferPool::new(Arc::new(InstalledStore(store.clone())), 1 << 20));
+        let installed = Arc::new(BufferPool::new(Arc::new(InstalledStore(store.clone(), None)), 1 << 20));
         let memory = MemoryBudget::new(32 << 20);
         let token = CancellationToken::new();
         let definition = Definition {
@@ -769,6 +813,26 @@ mod tests {
         assert_eq!(reader_memory.used_bytes(), pointer.owned_backing_bytes());
         drop(roots);
         assert_eq!(reader_memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn published_manifest_uses_its_receipt_and_an_existing_read_checks_its_version() -> Result<()> {
+        let evidence = Arc::new(ManifestEvidence::default());
+        let store = InstalledStore(Arc::new(MemoryStore::default()), Some(Arc::clone(&evidence)));
+        let storage = Arc::new(BufferPool::new(Arc::new(store), 1 << 20));
+        let directory = ObjectKey::new("index")?;
+        let memory = MemoryBudget::new(8 << 20);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let token = CancellationToken::new();
+        let checkpoint = publish(&tree, 0, 1, None, &token).await?;
+        assert!(checkpoint.manifest_bytes > 0);
+        assert_eq!(evidence.reads.load(Ordering::Relaxed), 0);
+
+        evidence.replace_on_read.store(true, Ordering::Relaxed);
+        let error = latest(&storage, &directory, &memory, 0).await.err().unwrap();
+        assert_eq!(error.message.as_deref(), Some("Ordered index manifest version changed"));
+        assert_eq!(evidence.reads.load(Ordering::Relaxed), 1);
         Ok(())
     }
 

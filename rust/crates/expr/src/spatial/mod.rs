@@ -1,18 +1,18 @@
 #[doc(hidden)]
 pub mod bijection_geometry;
 
+mod sql;
+pub(crate) use sql::call;
+
 use geometry::predicates::{
     self, CoverPredicate, TopologyPredicate,
     prepared::{Preparation, PreparedGeometry},
 };
-use geometry::spatial_index::{candidate_ranges, point_key, shape_keys};
+use geometry::spatial_index::{candidate_ranges, empty_key, point_key, shape_keys};
 use geometry::{
     Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, KeyRange, Kind, Scalar, Size, ValueView,
 };
 use rtdb_types::{Anomaly, Result, SpatialGeometryEncoding};
-
-mod sql;
-pub(crate) use sql::call;
 
 pub const WORK_STEPS: usize = 10_000_000;
 pub const WORK_BYTES: usize = 8 << 20;
@@ -20,6 +20,20 @@ pub const WORK_BYTES: usize = 8 << 20;
 pub struct Location {
     pub geometry: Geometry,
     position_accuracy: Option<Option<f64>>,
+}
+
+pub enum PostingKeys {
+    One(i64),
+    Cover(Vec<i64>),
+}
+
+impl PostingKeys {
+    pub fn as_slice(&self) -> &[i64] {
+        match self {
+            Self::One(key) => std::slice::from_ref(key),
+            Self::Cover(keys) => keys,
+        }
+    }
 }
 
 impl Location {
@@ -68,7 +82,8 @@ impl Location {
         if encoding == SpatialGeometryEncoding::TaggedWkb {
             return Self::decode(bytes, work).map(Some);
         }
-        let value = bijection_geometry::decode(bytes, work)?;
+        let decoded = bijection_geometry::decode(bytes, work)?;
+        let value = decoded.value();
         if matches!(value.scalar(), Scalar::Null) {
             return Ok(None);
         }
@@ -89,12 +104,13 @@ impl Location {
         Ok(Some(Self { geometry, position_accuracy: None }))
     }
 
-    pub fn keys(&self, work: &mut GeometryWork) -> Result<Vec<i64>> {
+    pub fn keys(&self, work: &mut GeometryWork) -> Result<PostingKeys> {
         match &self.geometry.coords {
             Coords::Point(coords) => point_key(coords, self.position_accuracy.unwrap_or(Some(0.0)))
-                .map(|key| vec![key])
+                .map(PostingKeys::One)
                 .map_err(|error| invalid(error.to_string())),
-            _ => shape_keys(&self.geometry, work).map_err(geometry_error),
+            _ if self.geometry.is_empty() => Ok(PostingKeys::One(empty_key())),
+            _ => shape_keys(&self.geometry, work).map(PostingKeys::Cover).map_err(geometry_error),
         }
     }
 }
@@ -175,14 +191,28 @@ impl Predicate {
         })
     }
 
-    pub fn prepare_geometry(self, region: &Geometry, work: &mut GeometryWork) -> Result<PreparedGeometry> {
-        let mut prepared = PreparedGeometry::new(region.clone(), Preparation::Topology, work)
-            .map_err(geometry_error)?;
-        if matches!(self, Self::Topology(_) | Self::WithinDistance(_) | Self::Nearest { .. }) {
+    pub fn prepare_geometry(
+        self, region: Geometry, work: &mut GeometryWork, mut account_references: impl FnMut(usize, usize) -> Result<()>,
+    ) -> std::result::Result<PreparedGeometry, (Geometry, Anomaly)> {
+        let mut prepared = PreparedGeometry::try_new(region, Preparation::Topology, work)
+            .map_err(|(region, error)| (region, geometry_error(error)))?;
+        let points = matches!(self, Self::Topology(_) | Self::WithinDistance(_) | Self::Nearest { .. });
+        let segments = matches!(self, Self::WithinDistance(_) | Self::Nearest { .. } | Self::Classification(_));
+        let mut reference = 0usize;
+        if points { reference = prepared.reference_points_bound(); }
+        if segments { reference = reference.saturating_add(prepared.reference_segments_bound()); }
+        if let Err(error) = account_references(0, reference) {
+            return Err((prepared.into_geometry(), error));
+        }
+        let before = prepared.retained_bytes();
+        if points {
             prepared.prepare_reference_points();
         }
-        if matches!(self, Self::WithinDistance(_) | Self::Nearest { .. } | Self::Classification(_)) {
+        if segments {
             prepared.prepare_reference_segments();
+        }
+        if let Err(error) = account_references(reference, prepared.retained_bytes() - before) {
+            return Err((prepared.into_geometry(), error));
         }
         Ok(prepared)
     }
@@ -263,6 +293,14 @@ impl Predicate {
 
 pub fn invalid(message: impl Into<String>) -> Anomaly {
     Anomaly::incorrect("rtdb.spatial/invalid", message)
+}
+
+pub fn work_limit() -> Anomaly {
+    Anomaly::new(
+        rtdb_types::AnomalyCategory::Unavailable,
+        "rtdb.spatial/work-limit",
+        "Spatial read or build exceeds its bounded work allowance",
+    )
 }
 
 pub fn geometry_error(error: geometry::GeometryRefusal) -> Anomaly {

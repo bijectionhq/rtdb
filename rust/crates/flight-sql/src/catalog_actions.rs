@@ -6,7 +6,10 @@ use arrow_array::{
 };
 use arrow_buffer::Buffer;
 use arrow_flight::Result as ActionResult;
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::{
+    MetadataVersion,
+    writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions, write_message},
+};
 use arrow_schema::{DataType, Schema};
 use bytes::Bytes;
 use prost::Message;
@@ -28,6 +31,45 @@ pub(crate) const WATCH_RELATION: &str = "rtdb.owned.WatchRelation.v1";
 const MAX_BODY: usize = 32 << 20;
 const INSERT_ROWS: usize = 128;
 const WATCH_SPAN: Duration = Duration::from_secs(20);
+const IPC_ALIGNMENT: usize = 64;
+const IPC_EOS: &[u8] = &[255, 255, 255, 255, 0, 0, 0, 0];
+
+struct CatalogIpcEncoder {
+    options: IpcWriteOptions,
+    dictionaries: DictionaryTracker,
+    compression: CompressionContext,
+}
+
+impl CatalogIpcEncoder {
+    fn new(schema: &Schema, charge: Arc<MemoryReservation>) -> Result<(Self, ActionResult), Status> {
+        let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5).map_err(arrow)?;
+        let mut dictionaries = DictionaryTracker::new(false);
+        let message = IpcDataGenerator::default()
+            .schema_to_bytes_with_dictionary_tracker(schema, &mut dictionaries, &options);
+        let frame = catalog_ipc_frame(message, &options, charge)?;
+        Ok((Self { options, dictionaries, compression: CompressionContext::default() }, frame))
+    }
+
+    fn page(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<ActionResult>, Status> {
+        let (dictionaries, record) = IpcDataGenerator::default()
+            .encode(batch, &mut self.dictionaries, &self.options, &mut self.compression)
+            .map_err(arrow)?;
+        dictionaries.into_iter().chain([record]).map(|message| {
+            catalog_ipc_frame(message, &self.options, Arc::clone(&charge))
+        }).collect()
+    }
+}
+
+fn catalog_ipc_frame(
+    message: EncodedData, options: &IpcWriteOptions, charge: Arc<MemoryReservation>,
+) -> Result<ActionResult, Status> {
+    let metadata = wire::add(IPC_EOS.len(), message.ipc_message.len())?
+        .checked_next_multiple_of(IPC_ALIGNMENT)
+        .ok_or_else(|| invalid("Flight allocation size overflow"))?;
+    let mut frame = Vec::with_capacity(wire::add(metadata, message.arrow_data.len())?);
+    write_message(&mut frame, message, options).map_err(arrow)?;
+    Ok(ActionResult { body: wire::retain(frame, charge) })
+}
 
 #[derive(Message)]
 struct Publication {
@@ -215,20 +257,18 @@ impl Service {
         let mut cursor = call.cancellation.run_until_cancelled(open)
             .await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         let memory = Arc::clone(call.memory());
-        let schema = wire::plan_schema(cursor.runtime_schema(), &memory)?;
-        let schema_bound = wire::schema_bound(&schema)?;
+        let schema = wire::plan_schema(cursor.runtime_schema(), &memory)?.into_declared();
+        let schema_bound = wire::schema_bound(schema.schema())?;
         let schema_charge = call.reserve(schema_bound)?;
-        let mut writer = StreamWriter::try_new(Vec::new(), &schema).map_err(arrow)?;
+        let (mut encoder, schema_frame) = CatalogIpcEncoder::new(schema.schema(), schema_charge)?;
         let first = cursor.delivery_grant().await.map_err(status)?;
         let (mut headers, cutoff) = call.delivery_headers(&first, true)?;
         headers.insert(crate::actions::OWNED_IPC_HEADER, tonic::metadata::MetadataValue::from_static("stream-v1"));
         let max_message = self.0.config.maximum_message_bytes;
         let output: Output<ActionResult> = Box::pin(async_stream::try_stream! {
             let mut left = MAX_BODY;
-            let schema_bytes = std::mem::take(writer.get_mut());
-            left = left.checked_sub(schema_bytes.len())
+            left = left.checked_sub(schema_frame.body.len())
                 .ok_or_else(|| Status::resource_exhausted("Catalog scan schema exceeds its reply bound"))?;
-            let schema_frame = ActionResult { body: wire::retain(schema_bytes, schema_charge) };
             if schema_frame.encoded_len() > max_message {
                 Err(Status::resource_exhausted("Catalog scan schema exceeds the Flight message limit"))?;
             }
@@ -236,19 +276,18 @@ impl Service {
             yield schema_frame;
             loop {
                 let next = cursor.encode_next_batch(|batch| {
-                    let batch = rtdb_columnar::conform_batch(batch.clone(), &schema, &memory).map_err(status)?;
+                    let batch = schema.conform(batch.clone(), &memory).map_err(status)?;
                     let bytes = wire::mul(batch.batch().get_array_memory_size(), 6)?;
                     let charge = call.reserve(wire::add(bytes, schema_bound)?)?;
-                    writer.write(batch.batch()).map_err(arrow)?;
-                    Ok::<_, Status>(wire::retain(std::mem::take(writer.get_mut()), charge))
+                    encoder.page(batch.batch(), charge)
                 });
                 let Some(encoded) = call.cancellation.run_until_cancelled(next)
                     .await.ok_or_else(cancelled)?.map_err(status)? else { break };
                 let encoded = encoded.inspect_err(|_| cursor.record_consumer_error())?;
-                left = left.checked_sub(encoded.len())
+                let bytes = encoded.iter().try_fold(0, |bytes, frame| wire::add(bytes, frame.body.len()))?;
+                left = left.checked_sub(bytes)
                     .ok_or_else(|| Status::resource_exhausted("Catalog scan exceeds its reply bound"))?;
-                for frame in crate::actions::IpcFrames(encoded) {
-                    let frame = frame?;
+                for frame in encoded {
                     if frame.encoded_len() > max_message {
                         Err(Status::resource_exhausted("Catalog scan frame exceeds the Flight message limit"))?;
                     }
@@ -256,13 +295,12 @@ impl Service {
                     yield frame;
                 }
             }
-            writer.finish().map_err(arrow)?;
-            if writer.get_ref().len() > left {
+            if IPC_EOS.len() > left {
                 Err(Status::resource_exhausted("Catalog scan exceeds its reply bound"))?;
             }
             let charge = call.reserve(256)?;
             call.handoff_action(cursor.delivery_grant().await.map_err(status)?, cutoff)?;
-            yield ActionResult { body: wire::retain(std::mem::take(writer.get_mut()), charge) };
+            yield ActionResult { body: wire::retain(Bytes::from_static(IPC_EOS), charge) };
         });
         let mut response = Response::new(output);
         *response.metadata_mut() = headers;
@@ -525,9 +563,88 @@ mod tests {
     use super::*;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_buffer::OffsetBuffer;
+    use arrow_ipc::writer::StreamWriter;
     use arrow_schema::Field;
     use rtdb_tx::prepare_submission;
     use rtdb_types::Value;
+
+    #[test]
+    fn catalog_ipc_frames_match_stream_writer_with_dictionary_replacements() {
+        let batch = |values: Vec<&str>| {
+            let keys = Int32Array::from(vec![Some(0), None, Some(1)]);
+            let dictionary = DictionaryArray::try_new(keys, Arc::new(StringArray::from(values))).unwrap();
+            RecordBatch::try_from_iter([("label", Arc::new(dictionary) as ArrayRef)]).unwrap()
+        };
+        let batches = [
+            batch(vec!["alpha", "beta"]),
+            batch(vec!["alpha", "beta"]),
+            batch(vec!["alpha", "beta", "gamma"]),
+            batch(vec!["beta", "alpha"]),
+        ];
+        let schema = batches[0].schema_ref();
+        let memory = MemoryBudget::new(1 << 20);
+        let charge = memory.reserve(65_536).unwrap();
+        let (mut encoder, initial) = CatalogIpcEncoder::new(schema, Arc::clone(&charge)).unwrap();
+        let mut reference = StreamWriter::try_new(Vec::new(), schema).unwrap();
+        assert_eq!(initial.body.as_ref(), std::mem::take(reference.get_mut()).as_slice());
+        let mut frames = vec![initial];
+        for (batch, expected_frames) in batches.iter().zip([2, 1, 2, 2]) {
+            reference.write(batch).unwrap();
+            let expected = std::mem::take(reference.get_mut());
+            let page = encoder.page(batch, Arc::clone(&charge)).unwrap();
+            assert_eq!(page.len(), expected_frames);
+            let mut remaining = expected.as_slice();
+            for frame in &page {
+                let metadata = u32::from_le_bytes(frame.body[4..8].try_into().unwrap()) as usize;
+                let header = arrow_ipc::root_as_message(&frame.body[8..8 + metadata]).unwrap();
+                assert_eq!(frame.body.len(), 8 + metadata + header.bodyLength() as usize);
+                if let Some(dictionary) = header.header_as_dictionary_batch() {
+                    assert!(!dictionary.isDelta());
+                }
+                let (prefix, rest) = remaining.split_at(frame.body.len());
+                assert_eq!(frame.body.as_ref(), prefix);
+                remaining = rest;
+            }
+            assert!(remaining.is_empty());
+            frames.extend(page);
+        }
+        reference.finish().unwrap();
+        assert_eq!(reference.get_ref().as_slice(), IPC_EOS);
+        drop(charge);
+        assert_eq!(memory.used_bytes(), 65_536);
+        drop(frames);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn catalog_conformance_reuses_exact_schema_with_no_scratch_and_funds_adaptation() {
+        let schema = Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+        let memory = MemoryBudget::new(1 << 20);
+        let key = Arc::new(Int64Array::from(vec![1]));
+        let exact = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![key.clone(), Arc::new(StringArray::from(vec!["original"]))],
+        ).unwrap();
+        let exact = OwnedBatch::new(exact, &memory).unwrap();
+        let narrow = RecordBatch::try_from_iter([("key", key as ArrayRef)]).unwrap();
+        let narrow = OwnedBatch::new(narrow, &memory).unwrap();
+        let declared = wire::OwnedSchema::build(8192, &memory, || Ok(schema)).unwrap().into_declared();
+
+        let full = memory.reserve(memory.available_bytes()).unwrap();
+        let page = declared.conform(exact, &memory).unwrap();
+        assert!(Arc::ptr_eq(page.declared_schema(), declared.schema()));
+        assert_eq!(page.batch().column(1).as_any().downcast_ref::<StringArray>().unwrap().value(0), "original");
+        assert!(declared.conform(narrow.clone(), &memory).is_err());
+        drop(full);
+
+        let adapted = declared.conform(narrow, &memory).unwrap();
+        assert!(Arc::ptr_eq(adapted.declared_schema(), declared.schema()));
+        assert_eq!(adapted.batch().schema_ref(), declared.schema());
+        assert!(adapted.batch().column(1).is_null(0));
+    }
 
     #[test]
     fn catalog_arrow_bindings_preserve_order_and_the_sql_source() {

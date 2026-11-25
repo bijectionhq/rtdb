@@ -648,6 +648,34 @@ async fn apply_binds_per_row_parameters_and_scalar_empty_returns_null() {
 }
 
 #[tokio::test]
+async fn left_apply_keeps_dependent_page_order_and_pads_an_unmatched_outer_row() {
+    let input = numbers(0, "outer", &[1, 0, 1]);
+    let first = numbers(1, "dependent", &[8, 6]);
+    let second = numbers(1, "dependent", &[7]);
+    let pages = Arc::new(Relation::new(first.schema().clone(), RelationNode::Set {
+        left: first, right: second, operator: SetOperator::Union, all: true,
+    }).unwrap());
+    let enabled = Expr::binary(BinaryOp::Eq, Expr::Parameter { index: 0, data_type: scalar(ScalarType::I64) },
+        Expr::Literal(Value::I64(1)));
+    let dependent = Arc::new(pages.filter(enabled).unwrap());
+    let schema = input.schema().concat(&dependent.schema().nullable().unwrap()).unwrap();
+    let arguments = vec![(0, input.schema().fields()[0].expression())];
+    let plan = Arc::new(Relation::new(schema, RelationNode::Apply {
+        input, dependent, arguments, kind: ApplyKind::Left, output: None,
+    }).unwrap());
+    let rows = collect(plan, query_context(QueryOptions { batch_rows: 2, ..Default::default() })).await.unwrap();
+    assert_eq!(rows, [
+        vec![Value::I64(1), Value::I64(8)],
+        vec![Value::I64(1), Value::I64(6)],
+        vec![Value::I64(1), Value::I64(7)],
+        vec![Value::I64(0), Value::Null],
+        vec![Value::I64(1), Value::I64(8)],
+        vec![Value::I64(1), Value::I64(6)],
+        vec![Value::I64(1), Value::I64(7)],
+    ]);
+}
+
+#[tokio::test]
 async fn single_join_preserves_probe_rows_and_checks_cardinality_in_memory_and_on_disk() {
     for join_build_rows in [0, i64::MAX] {
         for build in [&[2, 3][..], &[2, 2][..]] {
@@ -687,12 +715,83 @@ async fn scalar_apply_rejects_multiple_rows_and_pull_many_distinguishes_empty_do
     }
 }
 
+#[tokio::test]
+async fn pull_many_keeps_document_field_order_offsets_and_array_custody() {
+    use arrow_array::{Array, cast::AsArray};
+
+    let integer = scalar(ScalarType::I64);
+    let keyword = scalar(ScalarType::Keyword);
+    let x = Value::Keyword(rtdb_types::Keyword::parse("test/x").unwrap());
+    let y = Value::Keyword(rtdb_types::Keyword::parse("test/y").unwrap());
+    let fields = Schema::new(vec![field(1, "z", integer.clone()), field(2, "a", keyword.clone())]).unwrap();
+    let dependent = Arc::new(Relation::new(fields, RelationNode::Values { rows: vec![
+        vec![Expr::Literal(Value::I64(2)), Expr::Literal(x.clone())],
+        vec![Expr::Literal(Value::I64(3)), Expr::Literal(y.clone())],
+    ] }).unwrap());
+    let enabled = Expr::binary(BinaryOp::Eq, Expr::Parameter { index: 0, data_type: integer.clone() },
+        Expr::Literal(Value::I64(1)));
+    let dependent = Arc::new(dependent.filter(enabled).unwrap());
+    let doc = LogicalType::Struct(StructFields::from([("a".into(), keyword.clone()), ("z".into(), integer)]));
+    let output = field(3, "docs", LogicalType::list(doc).maybe());
+
+    let context = query_context(QueryOptions::default());
+    let baseline = context.memory.used_bytes();
+    for (last, offsets, expected) in [
+        (0, [0, 2, 2, 2], vec![x.clone(), y.clone()]),
+        (1, [0, 2, 2, 4], vec![x.clone(), y.clone(), x, y]),
+    ] {
+        let input = numbers(0, "outer", &[1, 0, last]);
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        let arguments = vec![(0, input.schema().fields()[0].expression())];
+        let plan = Arc::new(Relation::new(schema, RelationNode::Apply {
+            input, dependent: Arc::clone(&dependent), arguments, kind: ApplyKind::PullMany, output: Some(output.clone()),
+        }).unwrap());
+        let mut cursor = PreparedQuery::new(plan).unwrap().execute_columns(Arc::clone(&context), vec![]).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let retained = Arc::clone(page.batch().column(1));
+        drop(page);
+        drop(cursor);
+        assert!(context.memory.used_bytes() > baseline);
+        let lists = retained.as_list::<i32>();
+        assert_eq!(lists.value_offsets(), &offsets);
+        assert_eq!((lists.is_valid(0), lists.is_valid(1), lists.is_valid(2)), (true, false, last == 1));
+        let docs = lists.values().as_struct();
+        assert_eq!(docs.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["a", "z"]);
+        assert_eq!(rtdb_columnar::from_field(&docs.fields()[0]).unwrap(), keyword);
+        let actual = (0..docs.len()).map(|row| read_value(&docs.fields()[0], docs.column(0).as_ref(), row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        drop(retained);
+        assert_eq!(context.memory.used_bytes(), baseline);
+    }
+}
+
 #[test]
 fn catalog_bindings_reserve_before_enumeration_and_clones_retain_the_charge() {
     let context = query_context(Default::default()); let memory = MemoryBudget::new(8 << 20);
     let tables = context.catalog.tables_reserved("xtdb", &memory).unwrap(); assert!(!tables.rows().is_empty()); let used = memory.used_bytes(); assert!(used > 0);
     let retained = tables.clone(); drop(tables); assert_eq!(memory.used_bytes(), used); drop(retained); assert_eq!(memory.used_bytes(), 0);
     let exhausted = MemoryBudget::new(1); assert!(context.catalog.tables_reserved("xtdb", &exhausted).is_err()); assert_eq!(exhausted.used_bytes(), 0);
+}
+
+#[test]
+fn table_names_and_one_selected_binding_fit_without_funding_the_whole_catalog() {
+    use rtdb_plan::QualifiedTable;
+    use rtdb_types::TableRef;
+
+    let context = query_context(Default::default());
+    let memory = MemoryBudget::new(1 << 16);
+    assert!(context.catalog.tables_reserved("xtdb", &memory).is_err());
+    let names = context.catalog.table_names_reserved("xtdb", &memory).unwrap();
+    let table = TableRef::new("pg_catalog", "pg_views");
+    assert!(names.rows().binary_search(&table).is_ok());
+    let name = QualifiedTable { database: "xtdb".into(), table };
+    let (binding, charge) = context.catalog.table_binding_reserved(&name, &memory).unwrap().unwrap();
+    assert_eq!(binding.name, name);
+    assert!(binding.columns.contains_key("viewname"));
+    drop(binding);
+    drop(charge);
+    drop(names);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[tokio::test]

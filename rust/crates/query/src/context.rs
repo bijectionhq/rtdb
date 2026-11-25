@@ -76,7 +76,7 @@ pub(crate) enum OwnedSelection {
     Relation,
     Point(rtdb_types::EntityId),
     Artefacts(Arc<OwnedArtefactKeys>),
-    SpatialCandidates(crate::CandidateIids),
+    Candidates(crate::CandidateIids),
 }
 
 pub(crate) struct OwnedArtefactKeys {
@@ -178,6 +178,56 @@ impl CatalogSnapshot {
         Ok(())
     }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
+
+    /// Lists visible table identities in schema and table order under a name-only reservation.
+    pub fn table_names_reserved(&self, database: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_plan::CatalogRows<TableRef>> {
+        let overflow = || invalid("catalog-size", "Table identities exceed addressable memory");
+        let bytes = self.table_name_sources(database)?.try_fold(4096usize, |bytes, (schema, table)| {
+            bytes.checked_add(schema.len()).and_then(|n| n.checked_add(table.len()))
+                .and_then(|n| n.checked_add(512)).ok_or_else(overflow)
+        })?;
+        let reservation = memory.reserve(bytes)?;
+        let names = self.table_name_sources(database)?.collect::<BTreeSet<_>>();
+        let rows = names.into_iter().map(|(schema, table)| TableRef::new(schema, table)).collect();
+        Ok(rtdb_plan::CatalogRows::new(rows, reservation))
+    }
+
+    fn table_name_sources<'a>(&'a self, database: &'a str) -> Result<impl Iterator<Item = (&'a str, &'a str)>> {
+        let snapshot = self.database(database)?;
+        let ordinary = self.owned_relation.is_none();
+        let stored = snapshot.partitions.iter().filter(move |_| ordinary).flat_map(Snapshot::table_names)
+            .filter(|name| !TableRef::owned_schema(&name.schema))
+            .map(|name| (name.schema.as_str(), name.table.as_str()));
+        let system = crate::system_schema::DEFINITIONS.iter().filter(move |_| ordinary)
+            .map(|definition| -> (&'a str, &'a str) { (definition.schema, definition.name) });
+        let owned = self.owned_relation.iter()
+            .filter(move |(admitted, _)| {
+                admitted.database == database && (crate::system_schema::definition(&admitted.table).is_some()
+                    || snapshot.partitions.iter().any(|part| part.contains_table(&admitted.table)))
+            })
+            .map(|(admitted, _)| (admitted.table.schema.as_str(), admitted.table.table.as_str()));
+        Ok(stored.chain(system).chain(owned))
+    }
+
+    /// Funds the logical field tree and join scratch for just this table.
+    pub fn table_binding_reserved(&self, name: &QualifiedTable, memory: &Arc<MemoryBudget>) -> Result<Option<(TableBinding, Arc<MemoryReservation>)>> {
+        if !self.permits_table(name) { return Ok(None); }
+        let snapshot = self.database(&name.database)?;
+        let overflow = || invalid("catalog-size", "Table metadata allocation exceeds addressable memory");
+        let base = [name.database.len(), name.table.schema.len(), name.table.table.len()]
+            .into_iter().try_fold(4096usize, |bytes, len| bytes.checked_add(len).ok_or_else(overflow))?;
+        let bytes = if let Some(definition) = crate::system_schema::definition(&name.table) {
+            base.checked_add(definition.allocation_bound(&name.database)?).ok_or_else(overflow)?
+        } else {
+            snapshot.partitions.iter().filter(|part| part.contains_table(&name.table))
+                .try_fold(base, |bytes, part| {
+                    bytes.checked_add(part.table_schema_allocation_bound(&name.database, &name.table)?).ok_or_else(overflow)
+                })?
+        };
+        let reservation = memory.reserve(bytes)?;
+        Ok(self.table(name)?.map(|binding| (binding, reservation)))
+    }
+
     /// Reserves schema enumeration and joins before creating the returned table bindings.
     /// Clones of the result share its retained allocation charge.
     pub fn tables_reserved(&self, database: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_plan::CatalogRows<TableBinding>> {
@@ -206,9 +256,9 @@ impl CatalogSnapshot {
             _ => None,
         }
     }
-    pub(crate) fn owned_spatial_candidates(&self, name: &QualifiedTable) -> Option<&crate::CandidateIids> {
+    pub(crate) fn owned_candidates(&self, name: &QualifiedTable) -> Option<&crate::CandidateIids> {
         match self.owned_relation.as_ref() {
-            Some((table, OwnedSelection::SpatialCandidates(iids))) if table == name => Some(iids),
+            Some((table, OwnedSelection::Candidates(iids))) if table == name => Some(iids),
             _ => None,
         }
     }
@@ -254,9 +304,10 @@ impl Catalog for CatalogSnapshot {
                 Ok(Vec::new())
             };
         }
-        let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).filter(|table| !TableRef::owned_schema(&table.schema)).collect();
-        let names: BTreeSet<_> = names.into_iter().chain(crate::system_schema::DEFINITIONS.iter().map(|definition| TableRef::new(definition.schema, definition.name))).collect();
-        names.iter().map(|table| self.binding(database, table)?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))).collect()
+        let names = self.table_name_sources(database)?.collect::<BTreeSet<_>>();
+        names.into_iter().map(|(schema, table)| {
+            self.binding(database, &TableRef::new(schema, table))?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))
+        }).collect()
     }
     fn transaction_scoped(&self) -> bool { self.transaction_scoped }
 }
@@ -471,6 +522,15 @@ impl QueryContext {
 
     pub(crate) fn for_owned_relation(self: Arc<Self>, table: QualifiedTable, id: Option<rtdb_types::EntityId>) -> Arc<Self> {
         self.for_owned_selection(table, id.map_or(OwnedSelection::Relation, OwnedSelection::Point))
+    }
+
+    /// Restricts an ordinary ranked verifier to one visible table and its funded candidate IIDs.
+    /// Requires a catalog without any prior relation selection.
+    pub fn for_ranked_candidates(self: Arc<Self>, table: QualifiedTable, iids: crate::CandidateIids) -> Result<Arc<Self>> {
+        if self.catalog.owned_relation.is_some() || !self.catalog.permits_table(&table) {
+            return Err(invalid("scan-iid-scope", "Ranked candidates require an ordinary table in the held catalog"));
+        }
+        Ok(self.for_owned_selection(table, OwnedSelection::Candidates(iids)))
     }
 
     pub(crate) fn for_owned_selection(mut self: Arc<Self>, table: QualifiedTable, selection: OwnedSelection) -> Arc<Self> {
@@ -798,4 +858,30 @@ fn catalog_relation_identities_are_built_once_and_charged_to_the_catalog() {
     }
     assert_eq!(memory.used_bytes(), used);
     assert_eq!(catalog.relation_name(oid, &scope).unwrap().as_deref(), Some("pg_class"));
+}
+
+#[test]
+fn ranked_candidates_keep_the_held_guard_and_cannot_replace_a_narrower_scope() -> Result<()> {
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
+        partitions: vec![],
+        storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+    })]), false)?;
+    let memory = MemoryBudget::new(1 << 20);
+    let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC",
+        QueryOptions::default(), &CancellationToken::new())?;
+    let context = context.with_owned_read_guard(Arc::new(|| Err(invalid("test-read-guard", "Held read closed"))));
+    let table = QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "ranked") };
+    let other = QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "other") };
+    let owned = QualifiedTable { database: "xtdb".into(), table: rtdb_types::OwnedRelation::new("ranked")?.table("alice") };
+    let iid = rtdb_types::Iid([1; 16]);
+    let candidates = crate::CandidateIids::from_sorted(&[iid], &memory)?;
+
+    let ranked = Arc::clone(&context).for_ranked_candidates(table.clone(), candidates.clone())?;
+    assert!(ranked.catalog.owned_candidates(&table).unwrap().contains(iid));
+    assert!(!ranked.catalog.permits_table(&other));
+    assert!(ranked.check_cancelled().is_err());
+    assert!(Arc::clone(&context).for_ranked_candidates(owned, candidates.clone()).is_err());
+    let point = context.for_owned_relation(table.clone(), Some(rtdb_types::EntityId::Uuid([2; 16])));
+    assert!(point.for_ranked_candidates(table, candidates).is_err());
+    Ok(())
 }

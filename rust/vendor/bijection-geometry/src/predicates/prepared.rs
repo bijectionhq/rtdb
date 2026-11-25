@@ -52,25 +52,19 @@ impl PreparedGeometry {
         preparation: Preparation,
         work: &mut GeometryWork,
     ) -> Result<Self, GeometryRefusal> {
-        geometry.space.validate_kernel()?;
+        Self::try_new(geometry, preparation, work).map_err(|(_, error)| error)
+    }
+
+    /// Returns the original geometry if its derived representation cannot be built.
+    pub fn try_new(
+        geometry: Geometry,
+        preparation: Preparation,
+        work: &mut GeometryWork,
+    ) -> Result<Self, (Geometry, GeometryRefusal)> {
         let before = work.allocated_bytes;
-        let topology = if geometry.space.is_ground()
-            && geometry.heights.is_none()
-            && (preparation == Preparation::Topology || super::is_area(&geometry))
-        {
-            Some(crate::topology::relation::PreparedTopology::new(
-                &geometry, work,
-            )?)
-        } else {
-            None
-        };
-        let index = match topology {
-            Some(_) => None,
-            None => Some(PackedEdges::new(
-                super::segments(&geometry),
-                &geometry.space.frame,
-                work,
-            )?),
+        let (topology, index) = match Self::derive(&geometry, preparation, work) {
+            Ok(derived) => derived,
+            Err(error) => return Err((geometry, error)),
         };
         let retained_bytes = work.allocated_bytes - before
             + geometry.retained_bytes()
@@ -86,6 +80,37 @@ impl PreparedGeometry {
             retained_bytes,
             reference_segments: None,
         })
+    }
+
+    fn derive(
+        geometry: &Geometry,
+        preparation: Preparation,
+        work: &mut GeometryWork,
+    ) -> Result<(Option<crate::topology::relation::PreparedTopology>, Option<PackedEdges>), GeometryRefusal> {
+        geometry.space.validate_kernel()?;
+        let topology = if geometry.space.is_ground()
+            && geometry.heights.is_none()
+            && (preparation == Preparation::Topology || super::is_area(geometry))
+        {
+            Some(crate::topology::relation::PreparedTopology::new(
+                geometry, work,
+            )?)
+        } else {
+            None
+        };
+        let index = match topology {
+            Some(_) => None,
+            None => Some(PackedEdges::new(
+                super::segments(geometry),
+                &geometry.space.frame,
+                work,
+            )?),
+        };
+        Ok((topology, index))
+    }
+
+    pub fn into_geometry(self) -> Geometry {
+        self.geometry
     }
 
     /// Conservative accounting includes the admitted geometry and topology.
@@ -225,6 +250,17 @@ impl PreparedGeometry {
         if let Some(topology) = &mut self.topology {
             self.retained_bytes += topology.retain_points(&self.geometry);
         }
+    }
+
+    pub fn reference_points_bound(&self) -> usize {
+        self.topology.as_ref().map_or(0, |topology| topology.reference_points_bound(&self.geometry))
+    }
+
+    pub fn reference_segments_bound(&self) -> usize {
+        self.geometry.position_count().saturating_mul(128)
+            .saturating_add(self.geometry.ring_count().saturating_mul(32))
+            .saturating_add(self.geometry.component_count().saturating_mul(32))
+            .saturating_add(256)
     }
 
     /// Retains the reference traversal order for exact distance and classification.

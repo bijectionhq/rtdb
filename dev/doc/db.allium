@@ -2240,6 +2240,7 @@ surface QueryAccess {
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
+        -- Hash join fan-out shares one charged run per contributing probe row across the retained Arrow probe columns.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget.
@@ -2249,10 +2250,11 @@ surface QueryAccess {
         -- Direct floating-point list comparisons in a shared mark preserve SQL unknown results across candidate pages.
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
         -- Outer joins track unmatched build positions through partition replay.
-        -- A correlated query retains its outer Arrow row position and gathers its output from the selected dependent positions.
-        -- Apply gathers compatible dependent Arrow fields into its document layout.
+        -- Correlated Apply retains dependent Arrow pages as ordered spans with an outer position for each span.
+        -- A left, single or scalar Apply with no match retains one outer position with a missing dependent row.
+        -- Apply builds its document from funded child arrays when their physical fields are admitted.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
-        -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
+        -- UNNEST over compatible Arrow lists retains each selected child span under its source owner and repeats the corresponding parent position for its elements.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.

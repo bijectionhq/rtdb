@@ -128,7 +128,7 @@ impl HeldVectorOverlay {
         &mut self, partition: usize, id: EntityIdRef<'_>, vector: Option<&[f32]>,
         filters: impl ExactSizeIterator<Item = Option<&'a [u8]>>, query: &NearestQuery,
     ) -> Result<()> {
-        self.reserve_shadow(id, id.owned_payload_bytes())?;
+        self.reserve_shadow(id)?;
         if self.rows.len() == MAX_NEAREST_SHADOWS { return Err(overlay_invalid()); }
         let id = id.into_owned();
         self.register_shadow(partition, &id)?;
@@ -153,15 +153,18 @@ impl HeldVectorOverlay {
         &mut self, partition: usize, selected: &NearestPartition, id: EntityId, row: Option<&RecordBatch>, query: &NearestQuery,
     ) -> Result<()> {
         let row = row.filter(|row| row.num_rows() != 0);
+        let memory = Arc::clone(self._retained.budget());
         let vector = row.and_then(|row| ArrowCell::named(row, &selected.vector, 0))
-            .map(|cell| read_vector(cell, query)).transpose()?.flatten();
-        let filters = selected.filters.iter().map(|name| match row.and_then(|row| ArrowCell::named(row, name, 0)) {
-            Some(cell) => rtdb_columnar::binary_cell(cell.field, cell.array, cell.row),
-            None => Ok(None),
-        }).collect::<Result<Vec<_>>>()?;
-        let payload_bytes = (vector.as_ref().map_or(0, VectorCell::len) * 8)
-            .saturating_add(filters.iter().flatten().map(|filter| filter.len()).sum());
-        self.reserve_shadow(EntityIdRef::from(&id), payload_bytes)?;
+            .map(|cell| read_vector(cell, query, Some(&memory))).transpose()?.flatten();
+        let _filters = memory.reserve(selected.filters.len().saturating_mul(size_of::<Option<&[u8]>>()))?;
+        let mut filters = Vec::with_capacity(selected.filters.len());
+        for name in &selected.filters {
+            filters.push(match row.and_then(|row| ArrowCell::named(row, name, 0)) {
+                Some(cell) => rtdb_columnar::binary_cell(cell.field, cell.array, cell.row)?,
+                None => None,
+            });
+        }
+        self.reserve_shadow(EntityIdRef::from(&id))?;
         self.register_shadow(partition, &id)?;
         let distance = match vector {
             Some(vector) if query.admits(filters.into_iter()) => vector.distance(query),
@@ -175,9 +178,7 @@ impl HeldVectorOverlay {
         &mut self, partition: usize, id: EntityId, vector: impl ExactSizeIterator<Item = f32>,
         filters: &[Option<&[u8]>], query: &NearestQuery,
     ) -> Result<()> {
-        let payload_bytes = (vector.len() * 8)
-            .saturating_add(filters.iter().flatten().map(|key| key.len()).sum());
-        self.reserve_shadow(EntityIdRef::from(&id), payload_bytes)?;
+        self.reserve_shadow(EntityIdRef::from(&id))?;
         self.register_shadow(partition, &id)?;
         let distance = if query.admits(filters.iter().copied()) {
             query.distance(vector.map(f64::from))
@@ -188,9 +189,9 @@ impl HeldVectorOverlay {
         Ok(())
     }
 
-    fn reserve_shadow(&mut self, id: EntityIdRef<'_>, additional_bytes: usize) -> Result<()> {
+    fn reserve_shadow(&mut self, id: EntityIdRef<'_>) -> Result<()> {
         let bytes = identity_charge(id)
-            .saturating_add(additional_bytes)
+            .saturating_add(id.owned_payload_bytes())
             .saturating_add(256);
         let retained = Arc::get_mut(&mut self._retained).expect("exclusive overlay reservation");
         retained.grow_to(retained.bytes().saturating_add(bytes))
@@ -308,7 +309,7 @@ impl NearestWindow {
             size.checked_add(identity_charge(EntityIdRef::from(&hit.id)).saturating_mul(4).saturating_add(128))
                 .ok_or_else(|| Anomaly::fault("rtdb.search/nearest-output", "Nearest output size overflow"))
         })?;
-        let reservation = self.memory.budget().reserve(bound)?;
+        let mut reservation = self.memory.budget().reserve(bound)?;
         let ids = rtdb_columnar::entity_id_array(self.hits.iter().map(|hit| EntityIdRef::from(&hit.id)))?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", ids.data_type().clone(), false),
@@ -319,7 +320,12 @@ impl NearestWindow {
         let partition = Arc::new(UInt64Array::from_iter_values(self.hits.iter().map(|hit| hit.partition as u64)));
         let output = RecordBatch::try_new(schema, vec![ids, distance, partition])
             .map_err(|error| Anomaly::fault("rtdb.search/nearest-output", error.to_string()))?;
-        Ok(OwnedSearchBatch { hits: OwnedBatch::with_reservation(output, reservation)?, total: self.total })
+        let retained = rtdb_columnar::shared_allocation_size(&output)?;
+        let output_reservation = Arc::get_mut(&mut reservation)
+            .expect("nearest output owns its construction reservation")
+            .split_off(retained)?;
+        let hits = OwnedBatch::with_reservation(output, output_reservation)?;
+        Ok(OwnedSearchBatch { hits, total: self.total })
     }
 }
 
@@ -384,7 +390,7 @@ async fn approximate_partition(
 ) -> Result<bool> {
     let table = partition.relation.table(owner);
     let Some(definition) = rtdb_vector::owned_definition(Arc::clone(context), &table, &partition.vector).await? else { return Ok(false) };
-    let Some(probe) = rtdb_vector::unit_probe(&query.probe) else { return Ok(false) };
+    let Some(probe) = rtdb_vector::UnitProbe::from_slice(&query.probe, &context.memory)? else { return Ok(false) };
     let Some(mut shortlist) = rtdb_vector::Shortlist::open(cut, &definition, probe, query.k, None, None, rtdb_vector::Budget::default()).await? else {
         return Ok(false);
     };
@@ -392,7 +398,7 @@ async fn approximate_partition(
         let Some(rtdb_vector::Round { candidates, complete }) = shortlist.round(cut, None).await? else { return Ok(false) };
         let mut settled = NearestWindow::new(&context.memory, query.k)?;
         if !candidates.is_empty() && let Some(cursor) = rtdb_query::open_owned_root_projection_of(
-            Arc::clone(context), owner, &partition.relation, valid, columns, candidates.into_iter().collect(),
+            Arc::clone(context), owner, &partition.relation, valid, columns, candidates,
         ).await? {
             rank_rows(context, cursor, partition, query, shadows, ordinal, &mut settled, None).await?;
         }
@@ -438,7 +444,7 @@ async fn rank_rows(
             // Keep the same admission and refusal point for borrowed and decoded cells.
             let bytes = rtdb_columnar::estimate_read_value_bytes(vector_field, vectors, row)?;
             let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
-            let Some(vector) = read_vector(ArrowCell { field: vector_field, array: vectors, row }, query)? else { continue; };
+            let Some(vector) = read_vector(ArrowCell { field: vector_field, array: vectors, row }, query, None)? else { continue; };
             let Some(distance) = vector.distance(query)? else { continue; };
             let id = match admitted_id {
                 Some(id) => id,
@@ -458,19 +464,10 @@ enum VectorCell<'a> {
     F32(&'a [f32]),
     F64(&'a [f64]),
     Numeric(NumericSpan<'a>),
-    Decoded { length: usize, distance: Distance },
+    Decoded(Distance),
 }
 
 impl VectorCell<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::F32(values) => values.len(),
-            Self::F64(values) => values.len(),
-            Self::Numeric(values) => values.len(),
-            Self::Decoded { length, .. } => *length,
-        }
-    }
-
     fn distance(self, query: &NearestQuery) -> Distance {
         match self {
             Self::F32(values) => query.distance(values.iter().copied().map(f64::from)),
@@ -484,7 +481,7 @@ impl VectorCell<'_> {
                 NumericCell::I64(value) => value as f64,
                 _ => unreachable!("admitted vector component"),
             })),
-            Self::Decoded { distance, .. } => distance,
+            Self::Decoded(distance) => distance,
         }
     }
 }
@@ -521,7 +518,9 @@ fn packed_vector_element(field: &Field) -> bool {
     }
 }
 
-fn read_vector<'a>(cell: ArrowCell<'a>, query: &NearestQuery) -> Result<Option<VectorCell<'a>>> {
+fn read_vector<'a>(cell: ArrowCell<'a>, query: &NearestQuery, fallback_memory: Option<&Arc<MemoryBudget>>)
+    -> Result<Option<VectorCell<'a>>>
+{
     let ArrowCell { field, array, row } = cell;
     if array.is_null(row) { return Ok(None); }
     if let Some(list) = plain_vector_list(cell)
@@ -552,13 +551,17 @@ fn read_vector<'a>(cell: ArrowCell<'a>, query: &NearestQuery) -> Result<Option<V
             return Ok(Some(VectorCell::Numeric(span)));
         }
     }
+    let _fallback = fallback_memory.map(|memory| {
+        let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
+        memory.reserve(bytes.saturating_mul(2))
+    }).transpose()?;
     let value = rtdb_columnar::read_value(field, array, row)?;
     let list = match &value {
         Value::Null | Value::Undefined => return Ok(None),
         Value::List(list) | Value::FixedSizeList(list) => list,
         _ => return Err(not_a_vector()),
     };
-    Ok(Some(VectorCell::Decoded { length: list.len(), distance: score_decoded_list(list, query)? }))
+    Ok(Some(VectorCell::Decoded(score_decoded_list(list, query)?)))
 }
 
 fn score_decoded_list(list: &ListValue, query: &NearestQuery) -> Result<Distance> {
@@ -660,10 +663,16 @@ mod tests {
         window.absorb(settled).unwrap();
         assert_eq!([payload(&window.hits[1]), payload(&window.hits[2])], source_payloads);
 
+        let construction = window.hits.iter().fold(4096, |bytes, hit| {
+            bytes + identity_charge(EntityIdRef::from(&hit.id)) * 4 + 128
+        });
         let page = window.finish().unwrap();
         assert_eq!(page.total, 8);
         let batch = page.hits.batch();
         assert_eq!(batch.num_rows(), 5);
+        assert_eq!(memory.used_bytes(), page.hits.reservation().bytes());
+        assert!(memory.used_bytes() >= rtdb_columnar::shared_allocation_size(batch).unwrap());
+        assert!(memory.used_bytes() < construction);
         let field = batch.schema_ref().field(0);
         assert_eq!(field, &rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type()).unwrap());
         let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
@@ -734,7 +743,7 @@ mod tests {
             (&doubles as &dyn Array, [-0.3, 0.125]),
         ] {
             let field = Field::new("vector", array.data_type().clone(), false);
-            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }, &nearest).unwrap().unwrap();
+            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }, &nearest, None).unwrap().unwrap();
             assert!(matches!(&cell, VectorCell::F32(_) | VectorCell::F64(_)));
             let mut dot = 0.0;
             let mut norm = 0.0;
@@ -752,7 +761,7 @@ mod tests {
         let array = ListArray::from_iter_primitive::<Float32Type, _, _>([Some([Some(f32::NAN), None, Some(1.0)])]);
         let field = Field::new("vector", array.data_type().clone(), false);
         let cell = ArrowCell { field: &field, array: &array, row: 0 };
-        assert_eq!(read_vector(cell, &query(Vec::new(), 1)).err(), Some(not_a_vector()));
+        assert_eq!(read_vector(cell, &query(Vec::new(), 1), None).err(), Some(not_a_vector()));
     }
 
     #[test]
@@ -787,7 +796,7 @@ mod tests {
             (&mixed as &dyn Array, [large as f64, f64::from(-0.3_f32), 0.125]),
         ] {
             let field = Field::new("vector", array.data_type().clone(), false);
-            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }, &nearest).unwrap().unwrap();
+            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }, &nearest, None).unwrap().unwrap();
             assert!(matches!(&cell, VectorCell::Numeric(_)));
             let expected = nearest.distance(expected.into_iter()).unwrap().unwrap();
             assert_eq!(cell.distance(&nearest).unwrap().unwrap().to_bits(), expected.to_bits());
@@ -795,8 +804,8 @@ mod tests {
 
         let field = Field::new("vector", mixed.data_type().clone(), false);
         let malformed = ArrowCell { field: &field, array: &mixed, row: 1 };
-        assert_eq!(read_vector(malformed, &nearest).err(), Some(not_a_vector()));
-        let nonfinite = read_vector(ArrowCell { row: 2, ..malformed }, &nearest).unwrap().unwrap();
+        assert_eq!(read_vector(malformed, &nearest, None).err(), Some(not_a_vector()));
+        let nonfinite = read_vector(ArrowCell { row: 2, ..malformed }, &nearest, None).unwrap().unwrap();
         assert!(nonfinite.distance(&nearest).is_err());
     }
 
@@ -806,7 +815,7 @@ mod tests {
         let field = Field::new("vector", array.data_type().clone(), false);
         let cell = ArrowCell { field: &field, array: &array, row: 0 };
         assert!(cell.numeric_list_span().is_some());
-        assert_eq!(read_vector(cell, &query(Vec::new(), 1)).err(), Some(not_a_vector()));
+        assert_eq!(read_vector(cell, &query(Vec::new(), 1), None).err(), Some(not_a_vector()));
     }
 
     #[test]

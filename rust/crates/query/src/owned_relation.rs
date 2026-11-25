@@ -314,7 +314,7 @@ pub async fn open_owned_root_projection(
 /// A Root projection of the visible rows of the named IIDs.
 pub async fn open_owned_root_projection_of(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str], iids: BTreeSet<Iid>,
+    valid: Timestamp, columns: &[&str], iids: CandidateIids,
 ) -> Result<Option<QueryCursor>> {
     if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
         return Err(address_unavailable());
@@ -349,13 +349,14 @@ pub async fn open_owned_root_prefix_projection(
 
 async fn open_constraint_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str], prefix: Option<EntityIdRef<'_>>, iids: Option<BTreeSet<Iid>>,
+    valid: Timestamp, columns: &[&str], prefix: Option<EntityIdRef<'_>>, iids: Option<CandidateIids>,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table: relation.table(owner),
     };
-    let context = context.for_owned_relation(name.clone(), None);
+    let selection = iids.map_or(OwnedSelection::Relation, OwnedSelection::Candidates);
+    let context = context.for_owned_selection(name.clone(), selection);
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
     let columns = columns.iter().enumerate().map(|(index, name)| Field {
         id: ColumnId(index as u32), name: (*name).into(), qualifier: None, qualified_only: false,
@@ -374,7 +375,7 @@ async fn open_constraint_projection(
             value: valid.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
         })),
         system_time: TemporalFilter::Default, clamp_valid_time: false,
-        iids, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
+        iids: None, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }
@@ -1180,7 +1181,7 @@ async fn open_spatial_scan(
     };
     let (selection, iids) = match iids {
         SpatialScanIids::Gather(iids) => (OwnedSelection::Relation, Some(iids)),
-        SpatialScanIids::Refine(iids) => (OwnedSelection::SpatialCandidates(iids), None),
+        SpatialScanIids::Refine(iids) => (OwnedSelection::Candidates(iids), None),
     };
     let mut context = context.for_owned_selection(name.clone(), selection);
     Arc::make_mut(&mut context).spatial_refinement = include_iid && !projection.has_documents();
