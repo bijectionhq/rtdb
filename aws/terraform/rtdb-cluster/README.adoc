@@ -55,3 +55,19 @@ Use the bundled `rust/release/cluster-multi.yaml` as the starting configuration 
 Configure the authentication provider that verifies the deployment administrator, and list its exact authenticated principal name under `deploymentAdminPrincipals`.
 Use `deploymentCreatePrincipals` for identities that need only `CreateDeployment`, such as an assigned cell provisioning new databases.
 The ECS execution role receives read access to the selected secret and needs access to its encryption key.
+
+=== Private Classic recovery relay
+
+Set `classic_candidate_ingress` for a Multi deployment that is receiving a Classic history through its enrolled Original recovery service.
+The object supplies `port`, `source_security_group_id` and `configuration_secret`.
+Choose a dedicated unprivileged TCP port and give the Classic recovery tasks the named source security group with egress to the native nodes on that port.
+The module opens this port directly on the private Multi nodes so the relay can follow a selected-writer redirect.
+Use the `classic_candidate_relay_target` output's `entry` and `port` in the Classic recovery configuration.
+Use a server name trusted by the Original relay and covered by the server certificate on every eligible native peer.
+The existing Flight load balancer serves ordinary clients.
+
+The ECS secret holds JSON with `certificate_pem`, `private_key_pem`, `approval_public_key` and `source_public_key`.
+The two public Ed25519 keys use distinct 32-element JSON byte arrays.
+The approval signer and Original source signer keep their private keys in their own custody.
+The ECS selector gives the native task only its candidate TLS identity and the two verifier keys.
+The deployment's journal client credentials keep their existing slot-based projection.

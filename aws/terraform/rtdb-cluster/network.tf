@@ -53,6 +53,15 @@ resource "aws_vpc_security_group_ingress_rule" "write_peers" {
   to_port                      = local.peer_port
 }
 
+resource "aws_vpc_security_group_ingress_rule" "classic_candidate" {
+  count                        = local.classic_candidate == null ? 0 : 1
+  security_group_id            = aws_security_group.node.id
+  referenced_security_group_id = local.classic_candidate.source_security_group_id
+  ip_protocol                  = "tcp"
+  from_port                    = local.classic_candidate.port
+  to_port                      = local.classic_candidate.port
+}
+
 resource "aws_vpc_security_group_egress_rule" "node" {
   security_group_id = aws_security_group.node.id
   ip_protocol       = "tcp"

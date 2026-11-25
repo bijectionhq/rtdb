@@ -489,6 +489,9 @@ The ordered catalog leaves the candidate closed to serving, workload Claim and o
 The Original reaper takes `--recovery-native-destination FILE` for relay configuration.
 The JSON file has `entry` (host), `port`, `server_name`, `ca_file` (PEM), `catalog` (native catalog UUID), `approval_public_key` and `source_signing_key_file` (Ed25519 PKCS#8 DER).
 Enrolled native runtimes take `RTDB_CLASSIC_CANDIDATE_INGRESS_FILE` with `port`, `certificate_file` and `private_key_file` (PEM), `approval_public_key` and `source_public_key`.
+The ECS cluster module instead supplies `RTDB_CLASSIC_CANDIDATE_INGRESS_PORT` and `RTDB_CLASSIC_CANDIDATE_INGRESS_CONFIG` together.
+The secret JSON holds `certificate_pem`, `private_key_pem`, `approval_public_key` and `source_public_key`.
+Select one configuration source for the native node.
 The TLS trust profile covers the ingress entry and eligible native peers on the configured private port so the Original relay can follow a selected-writer redirect within RTDB.
 Keep the Original recovery authority and source signing key on the Original owner.
 Keep the approval signing key under the independent migration approval authority.

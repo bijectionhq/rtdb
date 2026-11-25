@@ -5,9 +5,17 @@ locals {
   peer_port                  = 3001
   multi                      = var.mode == "multi"
   custom_multi_configuration = local.multi && var.multi_configuration_secret != null
+  classic_candidate          = local.multi ? var.classic_candidate_ingress : null
+  peer_discovery_host        = "node.${aws_service_discovery_private_dns_namespace.cluster.name}"
+  node_ports = concat(
+    [{ containerPort = local.flight_port, protocol = "tcp" }],
+    local.multi ? [{ containerPort = local.peer_port, protocol = "tcp" }] : [],
+    local.classic_candidate == null ? [] : [{ containerPort = local.classic_candidate.port, protocol = "tcp" }]
+  )
   secrets = merge(
     { RTDB_ROOT_PASSWORD = var.root_password_secret },
     local.custom_multi_configuration ? { RTDB_MULTI_CONFIG_YAML = var.multi_configuration_secret } : {},
+    local.classic_candidate == null ? {} : { RTDB_CLASSIC_CANDIDATE_INGRESS_CONFIG = local.classic_candidate.configuration_secret },
     merge({}, [
       for slot, credential in(var.journal_credentials == null ? {} : var.journal_credentials) : {
         "RTDB_JOURNAL_${slot}_CA_CERTIFICATE" = credential.ca_certificate
@@ -31,10 +39,12 @@ locals {
     RTDB_JOURNAL_SLOTS = tostring(var.node_count)
     RTDB_KEY_DIRECTORY = "/var/lib/rtdb/keys"
     RTDB_DATABASES     = jsonencode(var.databases == null ? { xtdb = uuidv5("dns", "${var.name}.${var.bucket}.rtdb") } : var.databases)
-    RTDB_PEERS         = "node.${aws_service_discovery_private_dns_namespace.cluster.name}"
+    RTDB_PEERS         = local.peer_discovery_host
     } : {
     RTDB_KAFKA_BOOTSTRAP = var.kafka_bootstrap
     RTDB_KAFKA_TOPIC     = var.kafka_topic
+    }, local.classic_candidate == null ? {} : {
+    RTDB_CLASSIC_CANDIDATE_INGRESS_PORT = tostring(local.classic_candidate.port)
   })
 }
 
@@ -105,7 +115,7 @@ resource "aws_ecs_task_definition" "node" {
     secrets         = [for name, value in local.secrets : { name = name, valueFrom = value }]
     mountPoints     = local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : []
     stopTimeout     = 90
-    portMappings    = concat([{ containerPort = local.flight_port, protocol = "tcp" }], local.multi ? [{ containerPort = local.peer_port, protocol = "tcp" }] : [])
+    portMappings    = local.node_ports
     linuxParameters = { capabilities = { drop = ["ALL"] } }
     logConfiguration = { logDriver = "awslogs", options = {
       awslogs-group         = aws_cloudwatch_log_group.node.name
@@ -129,6 +139,10 @@ resource "aws_ecs_task_definition" "node" {
     precondition {
       condition     = local.multi || var.multi_configuration_secret == null
       error_message = "A Multi configuration secret requires Multi mode."
+    }
+    precondition {
+      condition     = local.multi || var.classic_candidate_ingress == null
+      error_message = "Classic candidate ingress requires Multi mode."
     }
   }
   tags = var.tags
@@ -164,6 +178,7 @@ resource "aws_ecs_service" "node" {
     aws_lb_listener.flight,
     aws_vpc_security_group_ingress_rule.node,
     aws_vpc_security_group_ingress_rule.write_peers,
+    aws_vpc_security_group_ingress_rule.classic_candidate,
     aws_vpc_security_group_egress_rule.node,
     aws_iam_role_policy.objects,
     aws_iam_role_policy.secrets,

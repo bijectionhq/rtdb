@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     fs::File,
     io::Read,
     net::{IpAddr, SocketAddr},
@@ -30,6 +31,7 @@ use rtdb_node::{Clock, SystemClock};
 pub const MAX_CONTROL_BYTES: usize = 16 << 10;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 << 20;
 const MAX_GRANT_MICROS: i64 = 5 * 60 * 1_000_000;
+const MAX_CONFIG_BYTES: usize = 64 << 10;
 const IO_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 8;
 
@@ -249,6 +251,15 @@ struct Configuration {
     source_public_key: [u8; 32],
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretConfiguration {
+    certificate_pem: String,
+    private_key_pem: String,
+    approval_public_key: [u8; 32],
+    source_public_key: [u8; 32],
+}
+
 pub(super) struct Ingress {
     port: u16,
     tls: Arc<ServerConfig>,
@@ -258,29 +269,89 @@ pub(super) struct Ingress {
 
 impl Ingress {
     pub(super) fn installed() -> Result<Option<Arc<Self>>> {
-        let Some(path) = std::env::var_os("RTDB_CLASSIC_CANDIDATE_INGRESS_FILE") else {
-            return Ok(None);
-        };
+        Self::configured(
+            std::env::var_os("RTDB_CLASSIC_CANDIDATE_INGRESS_FILE"),
+            std::env::var_os("RTDB_CLASSIC_CANDIDATE_INGRESS_CONFIG"),
+            std::env::var_os("RTDB_CLASSIC_CANDIDATE_INGRESS_PORT"),
+        )
+    }
+
+    fn configured(
+        file: Option<OsString>,
+        secret: Option<OsString>,
+        port: Option<OsString>,
+    ) -> Result<Option<Arc<Self>>> {
+        match (file, secret, port) {
+            (None, None, None) => Ok(None),
+            (Some(path), None, None) => Self::from_file(Path::new(&path)).map(Some),
+            (None, Some(secret), Some(port)) => Self::from_secret(secret, port).map(Some),
+            _ => Err(invalid_configuration()),
+        }
+    }
+
+    fn from_file(path: &Path) -> Result<Arc<Self>> {
         let configuration: Configuration =
-            serde_json::from_slice(&read_file(Path::new(&path), MAX_CONTROL_BYTES)?)
+            serde_json::from_slice(&read_file(path, MAX_CONTROL_BYTES)?)
                 .map_err(|_| invalid_configuration())?;
-        if configuration.port == 0
-            || configuration.port == super::peer::PORT
-            || configuration.approval_public_key == [0; 32]
-            || configuration.source_public_key == [0; 32]
-            || configuration.approval_public_key == configuration.source_public_key
+        let certificate = read_file(&configuration.certificate_file, MAX_CONFIG_BYTES)?;
+        let key = zeroize::Zeroizing::new(read_file(
+            &configuration.private_key_file,
+            MAX_CONFIG_BYTES,
+        )?);
+        Self::from_identity(
+            configuration.port,
+            configuration.approval_public_key,
+            configuration.source_public_key,
+            &certificate,
+            &key,
+        )
+    }
+
+    fn from_secret(secret: OsString, port: OsString) -> Result<Arc<Self>> {
+        let secret =
+            zeroize::Zeroizing::new(secret.into_string().map_err(|_| invalid_configuration())?);
+        if secret.len() > MAX_CONFIG_BYTES {
+            return Err(invalid_configuration());
+        }
+        let configuration: SecretConfiguration =
+            serde_json::from_str(&secret).map_err(|_| invalid_configuration())?;
+        let key = zeroize::Zeroizing::new(configuration.private_key_pem);
+        let port = port
+            .to_str()
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port >= 1024 && *port != 3000)
+            .ok_or_else(invalid_configuration)?;
+        Self::from_identity(
+            port,
+            configuration.approval_public_key,
+            configuration.source_public_key,
+            configuration.certificate_pem.as_bytes(),
+            key.as_bytes(),
+        )
+    }
+
+    fn from_identity(
+        port: u16,
+        approval: [u8; 32],
+        source: [u8; 32],
+        certificate: &[u8],
+        key: &[u8],
+    ) -> Result<Arc<Self>> {
+        if port == 0
+            || port == super::peer::PORT
+            || approval == [0; 32]
+            || source == [0; 32]
+            || approval == source
         {
             return Err(invalid_configuration());
         }
-        let certificate = read_file(&configuration.certificate_file, 64 << 10)?;
-        let key = zeroize::Zeroizing::new(read_file(&configuration.private_key_file, 64 << 10)?);
-        let tls = crate::tls::from_pem_identity(&certificate, &key)?;
-        Ok(Some(Arc::new(Self {
-            port: configuration.port,
+        let tls = crate::tls::from_pem_identity(certificate, key)?;
+        Ok(Arc::new(Self {
+            port,
             tls: Arc::new(tls),
-            approval: configuration.approval_public_key,
-            source: configuration.source_public_key,
-        })))
+            approval,
+            source,
+        }))
     }
 
     pub(super) async fn serve(
@@ -627,6 +698,21 @@ mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use rtdb_types::TxId;
+
+    #[test]
+    fn candidate_listener_is_opt_in_and_requires_one_complete_configuration_source() {
+        assert!(matches!(Ingress::configured(None, None, None), Ok(None)));
+        assert!(Ingress::configured(None, None, Some("7443".into())).is_err());
+        assert!(Ingress::configured(None, Some("{}".into()), None).is_err());
+        assert!(
+            Ingress::configured(
+                Some("classic-ingress.json".into()),
+                Some("{}".into()),
+                Some("7443".into())
+            )
+            .is_err()
+        );
+    }
 
     fn binding() -> Binding {
         let destination = Uuid::from_bytes([4; 16]);

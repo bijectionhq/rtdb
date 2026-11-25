@@ -95,6 +95,31 @@ variable "multi_configuration_secret" {
   }
 }
 
+variable "classic_candidate_ingress" {
+  description = "Optional Multi-only ingress for an authorized Classic recovery relay."
+  type = object({
+    port                     = number
+    source_security_group_id = string
+    configuration_secret     = string
+  })
+  default = null
+  validation {
+    condition = var.classic_candidate_ingress == null || try(
+      var.classic_candidate_ingress.port == floor(var.classic_candidate_ingress.port) &&
+      var.classic_candidate_ingress.port >= 1024 &&
+      var.classic_candidate_ingress.port <= 65535 &&
+      !contains([3000, 3001], var.classic_candidate_ingress.port) &&
+      can(regex("^sg-([a-f0-9]{8}|[a-f0-9]{17})$", var.classic_candidate_ingress.source_security_group_id)) &&
+      can(regex(
+        "^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}(:[^:\\r\\n]*:([^:\\r\\n]*:|:[^:\\r\\n]*))?$",
+        var.classic_candidate_ingress.configuration_secret
+      )),
+      false
+    )
+    error_message = "Supply a separate TCP port, the Classic relay security group, and an ECS Secrets Manager selector."
+  }
+}
+
 variable "kafka_bootstrap" {
   description = "Comma-separated bootstrap endpoints for default mode."
   type        = string
