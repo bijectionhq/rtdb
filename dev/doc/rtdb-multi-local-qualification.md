@@ -380,6 +380,8 @@ payload limit can verify retained records and provides no timed append capacity.
 
 Use the matching keeper's commissioned original-clock authority and configure the independent receiver on the same attachment using the [native receiver installation](rtdb-native-runtime.adoc#funded-decision-clock-receiver).
 The keeper trust file and the receiver installation are supplied independently.
+Write the single top-level `fundedReceiverClock` mapping to a private YAML file, then add `--multi-receiver-clock "$receiver_profile"` to the local TLS StreamJournal command above.
+Use the exact original database incarnation for the receiver binding and keep the receiver socket and keeper clocks on the same commissioned scale.
 Confirm the original keeper signers cover the certificate's guarded journal clock scale and the configured payload limit.
 The RTDB adapter checks the original stream, epoch, LSN, sealed-payload digest, exclusive cutoff and certificate digest in the returned proof before the fold applies effects.
 

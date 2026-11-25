@@ -14,7 +14,7 @@ pub use admin::AdminOptions;
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME [--incarnation UUID]\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--multi-journal-url URL] [--multi-receiver-clock FILE] [--custody-provider-config FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -37,6 +37,7 @@ pub struct MultiDevTls {
     directory: PathBuf,
     authn: Option<PathBuf>,
     journal_url: Option<String>,
+    receiver_clock: Option<PathBuf>,
     custody_provider_config: Option<PathBuf>,
 }
 
@@ -213,6 +214,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         let mut tls_directory = None;
         let mut authn = None;
         let mut journal_url = None;
+        let mut receiver_clock = None;
         let mut custody_provider_config = None;
         let mut incarnation = None;
         while let Some(argument) = arguments.next() {
@@ -240,6 +242,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                         .ok_or_else(|| invalid("--multi-journal-url requires a Logkeeper TLS URL"))?;
                     journal_url = Some(url);
                 }
+                "--multi-receiver-clock" if receiver_clock.is_none() => {
+                    let file = arguments.next().filter(|file| !file.is_empty() && !file.starts_with('-'))
+                        .ok_or_else(|| invalid("--multi-receiver-clock requires a YAML file"))?;
+                    receiver_clock = Some(PathBuf::from(file));
+                }
                 "--custody-provider-config" if custody_provider_config.is_none() => {
                     let path = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
                         .ok_or_else(|| invalid("--custody-provider-config requires a YAML file"))?;
@@ -262,18 +269,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             }
         }
         if options.multi && pgwire_requested { return Err(invalid("Multi development serves Flight SQL; use --flight-sql-port")); }
-        options.multi_tls = match (tls_directory, incarnation, authn, journal_url, custody_provider_config) {
-            (None, None, None, None, None) => None,
-            (_, _, Some(_), _, Some(_)) => {
+        options.multi_tls = match (tls_directory, incarnation, authn, journal_url, receiver_clock, custody_provider_config) {
+            (None, None, None, None, None, None) => None,
+            (_, _, Some(_), _, _, Some(_)) => {
                 return Err(invalid("Development custody uses the loopback xtdb password profile"));
             }
-            (Some(directory), Some(incarnation), authn, journal_url, custody_provider_config)
+            (Some(directory), Some(incarnation), authn, journal_url, receiver_clock, custody_provider_config)
                 if options.multi && data_requested && options.flight_sql_port >= 0 =>
             {
-                Some(MultiDevTls { directory, incarnation, authn, journal_url, custody_provider_config })
+                Some(MultiDevTls { directory, incarnation, authn, journal_url, receiver_clock, custody_provider_config })
             }
-            (_, _, Some(_), _, _) | (_, _, _, Some(_), _) | (_, _, _, _, Some(_)) => {
-                return Err(invalid("Authentication, journal and custody options require the complete Multi TLS development profile"));
+            (_, _, Some(_), _, _, _) | (_, _, _, Some(_), _, _) | (_, _, _, _, Some(_), _) | (_, _, _, _, _, Some(_)) => {
+                return Err(invalid("Authentication, journal, receiver clock and custody options require the complete Multi TLS development profile"));
             }
             _ => return Err(invalid("--multi-tls-dir and --incarnation require --multi, explicit --data and an enabled Flight SQL listener")),
         };
@@ -391,6 +398,9 @@ impl DevOptions {
             None => ParsedConfiguration::from_yaml("", &ProcessEnvironment, &memory, false)?,
         };
         let config = parsed.configuration_mut();
+        if let Some(file) = self.multi_tls.as_ref().and_then(|tls| tls.receiver_clock.as_deref()) {
+            install_multi_dev_receiver_clock(config, file, &memory)?;
+        }
         let log = self.data.join("log");
         let storage = self.data.join("storage");
         let path = |path: PathBuf| path.into_os_string().into_string().map_err(|_| invalid("--data must be a UTF-8 path"));
@@ -410,6 +420,23 @@ impl DevOptions {
         config.flight_sql = Some(FlightSettings { port: self.flight_sql_port, custody_providers, ..Default::default() });
         Ok(parsed.with_object_sort(self.object_sort))
     }
+}
+
+fn install_multi_dev_receiver_clock(config: &mut NodeConfiguration, file: &Path, memory: &std::sync::Arc<MemoryBudget>) -> Result<()> {
+    use rtdb_format::config::Yaml;
+
+    let bytes = read_private_multi_input(file, 16 * 1024)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid("Multi development receiver clock requires UTF-8 YAML"))?;
+    let document = ParsedYamlDocument::from_yaml(text, &ProcessEnvironment, memory)?;
+    let Yaml::Mapping(fields) = document.value() else {
+        return Err(invalid("Multi development receiver clock requires a YAML mapping"));
+    };
+    if fields.len() != 1 || !fields.contains_key(Yaml::String("fundedReceiverClock".into())) {
+        return Err(invalid("Multi development receiver clock accepts only fundedReceiverClock"));
+    }
+    let mut parsed = document.into_node_configuration(&ProcessEnvironment, false)?;
+    config.funded_receiver_clock = parsed.configuration_mut().funded_receiver_clock.take();
+    Ok(())
 }
 
 fn load_multi_dev_authn(path: &Path, memory: &std::sync::Arc<MemoryBudget>) -> Result<ParsedConfiguration> {
