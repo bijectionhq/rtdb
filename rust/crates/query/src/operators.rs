@@ -1062,8 +1062,7 @@ impl BatchApplyPlan {
     }
 
     async fn documents(&self, batch: Arc<crate::columnar::ColumnBatch>, output: &rtdb_plan::Field) -> Result<crate::columnar::ColumnBatch> {
-        use arrow_array::{ArrayRef, StructArray};
-        use crate::columnar::{Column, ColumnBatch, gather_nullable_column, poll_nested_batch};
+        use crate::columnar::{apply::ApplyPages, poll_nested_batch};
 
         let context = &self.execution.context;
         let memory = &context.memory;
@@ -1074,108 +1073,68 @@ impl BatchApplyPlan {
         let order: BTreeMap<_, _> = fields.iter().enumerate().map(|(index, field)| (field.name.as_str(), index)).collect();
         let positions = order.values().copied().collect::<Vec<_>>();
         let schema = Schema::new(positions.iter().map(|&position| fields[position].clone()).collect())?;
-        let mut sources = Vec::new();
-        let mut picks = Vec::new();
-        let mut offsets = Vec::with_capacity(batch.len + 1);
-        let mut valid = Vec::with_capacity(batch.len);
-        let mut reservation = memory.reserve(apply_join_bytes(batch.len, 0)?)?;
-        offsets.push(0i32);
+        let mut pages = ApplyPages::new(memory)?;
+        let mut list = if many {
+            let bytes = batch.len.checked_mul(32).and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(|| invalid("row-size", "Apply list offsets overflow"))?;
+            let reservation = memory.reserve(bytes)?;
+            let mut offsets = Vec::with_capacity(batch.len + 1);
+            offsets.push(0i32);
+            Some((offsets, Vec::with_capacity(batch.len), reservation))
+        } else {
+            None
+        };
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
             let mut input = self.dependent_batches(&batch, row).await?;
-            let before = picks.len();
+            let before = pages.len();
             while let Some(page) = poll_nested_batch(input.as_mut()).await? {
                 if page.len == 0 { continue; }
                 page.validate_readable(context)?;
-                if !many && (picks.len() != before || page.len > 1) { return Err(crate::cardinality_violation()); }
-                let rows = picks.len().checked_add(page.len).filter(|rows| *rows <= i32::MAX as usize)
-                    .ok_or_else(|| invalid("row-size", "Apply document count exceeds the Arrow limit"))?;
-                let lease = Arc::get_mut(&mut reservation).expect("The apply documents own their result inventory");
-                lease.grow_to(apply_join_bytes(rows.max(batch.len), sources.len() + 1)?)?;
-                let projection = page.key_projection(&positions, memory)?;
-                let count = projection.len;
-                let (page, charge) = if let Some(physical) = projection.physical_record(&schema, memory)? {
-                    physical
-                } else {
-                    let output = crate::cursor::column_batch(&schema, memory, projection)?;
-                    (output.batch().clone(), Arc::clone(output.reservation()))
-                };
-                let record: ArrayRef = Arc::new(StructArray::try_new_with_length(page.schema_ref().fields().clone(),
-                    page.columns().to_vec(), None, count).map_err(|error| invalid("apply-document", error))?);
-                let field = Arc::new(arrow_schema::Field::new("doc", record.data_type().clone(), false));
-                let logical = rtdb_columnar::from_field(&field)?;
-                let doc = ColumnBatch::settled(vec![Column::Arrow { array: record, field, logical: Some(logical) }], count, charge)?;
-                picks.extend((0..count).map(|index| Some((sources.len(), index))));
-                sources.push(doc);
+                if !many && (pages.len() != before || page.len > 1) { return Err(crate::cardinality_violation()); }
+                pages.end_after(page.len)?;
+                let doc = page.apply_document(&positions, &schema, memory)?;
+                pages.push(row, Some(doc))?;
             }
-            let found = before < picks.len();
-            if many {
-                offsets.push(picks.len() as i32);
+            let found = before < pages.len();
+            if let Some((offsets, valid, _)) = &mut list {
+                offsets.push(pages.len() as i32);
                 valid.push(found);
             } else if !found {
-                picks.push(None);
+                pages.push(row, None)?;
             }
         }
-        let gathered = gather_nullable_column(|index| &sources[index], &picks, 0, memory)?;
-        let (column, charge) = if many {
-            let page = ColumnBatch::settled(vec![gathered.0], picks.len(), gathered.1)?;
-            page.collect_lists(offsets, valid, output, memory)?
-        } else {
-            gathered
-        };
+        context.check_cancelled()?;
         let mut batch = Arc::try_unwrap(batch).map_err(|_| invalid("apply-input", "Apply document input remains borrowed"))?;
-        batch.append_column(column, charge, memory)?;
+        if let Some((offsets, valid, reservation)) = list {
+            batch.append_apply_lists(&pages, offsets, valid, output, reservation, memory)?;
+        } else {
+            let (column, charge) = pages.dependent_column(0, memory)?;
+            batch.append_column(column, charge, memory)?;
+        }
         Ok(batch)
     }
 
     async fn joined(&self, batch: &Arc<crate::columnar::ColumnBatch>) -> Result<Option<crate::columnar::ColumnBatch>> {
-        use crate::columnar::{ColumnBatch, gather_nullable_column, poll_nested_batch};
+        use crate::columnar::{apply::ApplyPages, poll_nested_batch};
         let context = &self.execution.context;
-        let memory = &context.memory;
-        let width = self.dependent.schema().len();
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        let mut sources = Vec::new();
-        let mut reservation = memory.reserve(4096)?;
+        let mut pages = ApplyPages::new(&context.memory)?;
         let single = matches!(self.kind, ApplyKind::Single | ApplyKind::Scalar);
         for source_row in 0..batch.len {
             context.check_cancelled_at(source_row)?;
             let mut cursor = self.dependent_batches(batch, source_row).await?;
-            let before = left.len();
+            let before = pages.len();
             while let Some(output) = poll_nested_batch(cursor.as_mut()).await? {
                 if output.len == 0 { continue; }
                 output.validate_readable(context)?;
-                if single && (output.len > 1 || left.len() != before) { return Err(crate::cardinality_violation()); }
-                let rows = left.len().checked_add(output.len).filter(|rows| *rows <= i32::MAX as usize)
-                    .ok_or_else(|| invalid("row-size", "Apply output has too many rows"))?;
-                let bytes = apply_join_bytes(rows, sources.len() + 1)?;
-                Arc::get_mut(&mut reservation).expect("The apply join owns its result inventory").grow_to(bytes)?;
-                left.extend(std::iter::repeat_n((0, source_row), output.len));
-                right.extend((0..output.len).map(|row| Some((sources.len(), row))));
-                sources.push(output);
+                if single && (output.len > 1 || pages.len() != before) { return Err(crate::cardinality_violation()); }
+                pages.push(source_row, Some(output))?;
             }
-            if left.len() == before && (self.kind == ApplyKind::Left || single) {
-                let bytes = apply_join_bytes(left.len() + 1, sources.len())?;
-                Arc::get_mut(&mut reservation).expect("The apply join owns its result inventory").grow_to(bytes)?;
-                left.push((0, source_row));
-                right.push(None);
-            }
+            if pages.len() == before && (self.kind == ApplyKind::Left || single) { pages.push(source_row, None)?; }
         }
-        if left.is_empty() { return Ok(None); }
-        let _left_columns = memory.reserve(batch.columns.len().checked_mul(16).ok_or_else(|| invalid("row-size", "Apply width overflow"))?)?;
-        let columns = (0..batch.columns.len()).collect::<Vec<_>>();
-        let mut output = ColumnBatch::take_rows(&[batch.as_ref()], &left, &columns, memory)?;
-        for position in 0..width {
-            let (column, charge) = gather_nullable_column(|source| &sources[source], &right, position, memory)?;
-            output.append_column(column, charge, memory)?;
-        }
-        Ok(Some(output))
+        if pages.len() == 0 { return Ok(None); }
+        pages.joined(batch, self.dependent.schema().len(), context).map(Some)
     }
-}
-
-fn apply_join_bytes(rows: usize, sources: usize) -> Result<usize> {
-    rows.checked_mul(128).and_then(|bytes| bytes.checked_add(sources.checked_mul(512)?))
-        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("row-size", "Apply output allocation overflow"))
 }
 
 #[async_trait]

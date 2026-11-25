@@ -149,7 +149,10 @@
 -- A columnar cross join retains its Arrow inputs and maps output positions in left-major order within each batch pair.
 -- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
--- Apply document fields retain compatible dependent Arrow selections through result conformance.
+-- Joined Apply retains dependent pages in order and uses the same outer position across each page.
+-- Apply documents retain compatible dependent fields and arrays in field-name order.
+-- A document Apply with no dependent rows returns null.
+-- A dependent row with zero fields contributes a present empty document.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
 -- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.

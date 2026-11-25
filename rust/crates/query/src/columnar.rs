@@ -1,5 +1,6 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
+pub(crate) mod apply;
 pub(crate) mod float_vector;
 mod float_vectors;
 mod patch;
@@ -45,6 +46,7 @@ pub(crate) struct SelectedColumn {
 enum SelectedRows {
     Picks(Arc<Vec<(usize, usize)>>),
     Span(Range<usize>),
+    Apply(apply::ApplySelection),
     Expanded {
         expansion: RowExpansion,
         rows: Range<usize>,
@@ -59,6 +61,7 @@ struct ExpansionInput {
 
 #[derive(Clone)]
 enum RowExpansion {
+    ApplyOuter(Arc<apply::ApplySpans>),
     RepeatEach(usize),
     RepeatPage(usize),
     JoinProbe(Arc<crate::batch_join::ProbeRuns>),
@@ -70,6 +73,7 @@ enum RowExpansion {
 impl RowExpansion {
     fn get(&self, row: usize) -> (usize, usize) {
         match self {
+            Self::ApplyOuter(spans) => (0, spans.outer(row)),
             Self::RepeatEach(width) => (0, row / width),
             Self::RepeatPage(width) => (0, row % width),
             Self::JoinProbe(runs) => (0, runs.input_row(row)),
@@ -87,6 +91,7 @@ impl RowExpansion {
     fn contiguous(&self, rows: Range<usize>) -> Option<(usize, Range<usize>)> {
         let (source, start) = self.get(rows.start);
         match self {
+            Self::ApplyOuter(spans) => return spans.outer_range(rows).map(|rows| (0, rows)),
             Self::RepeatEach(1) => {}
             Self::RepeatPage(width) if rows.len() <= width - start => {}
             Self::JoinProbe(runs) if runs.contiguous(&rows) => {}
@@ -106,6 +111,7 @@ impl RowExpansion {
 
     fn owner(&self) -> Option<&Arc<MemoryReservation>> {
         match self {
+            Self::ApplyOuter(spans) => Some(spans.reservation()),
             Self::UnnestParents(runs) | Self::UnnestGroups(runs) | Self::UnnestChildren(runs) => Some(&runs.reservation),
             Self::JoinProbe(runs) => runs.owner(),
             Self::RepeatEach(_) | Self::RepeatPage(_) => None,
@@ -158,13 +164,18 @@ impl UnnestRows {
 
 impl SelectedRows {
     fn len(&self) -> usize {
-        match self { Self::Picks(cells) => cells.len(), Self::Span(rows) | Self::Expanded { rows, .. } => rows.len() }
+        match self {
+            Self::Picks(cells) => cells.len(),
+            Self::Span(rows) | Self::Expanded { rows, .. } => rows.len(),
+            Self::Apply(selection) => selection.len(),
+        }
     }
 
     fn get(&self, row: usize) -> Option<(usize, usize)> {
         match self {
             Self::Picks(cells) => cells.get(row).copied(),
             Self::Span(rows) => (row < rows.len()).then(|| (0, rows.start + row)),
+            Self::Apply(selection) => selection.get(row),
             Self::Expanded { expansion, rows, input } => {
                 if row >= rows.len() { return None; }
                 let cell = expansion.get(rows.start + row);
@@ -174,19 +185,22 @@ impl SelectedRows {
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        let (picks, span, expanded) = match self {
-            Self::Picks(cells) => (cells.as_slice(), 0..0, 0..0),
-            Self::Span(rows) => (&[][..], rows.clone(), 0..0),
-            Self::Expanded { rows, .. } => (&[][..], 0..0, 0..rows.len()),
+        let (picks, span, expanded, apply) = match self {
+            Self::Picks(cells) => (cells.as_slice(), 0..0, 0..0, None),
+            Self::Span(rows) => (&[][..], rows.clone(), 0..0, None),
+            Self::Expanded { rows, .. } => (&[][..], 0..0, 0..rows.len(), None),
+            Self::Apply(selection) => (&[][..], 0..0, 0..0, Some(selection)),
         };
         picks.iter().copied().chain(span.map(|row| (0, row)))
             .chain(expanded.map(|row| self.get(row).expect("The expansion covers the selection")))
+            .chain(apply.into_iter().flat_map(|selection| selection.iter()))
     }
 
     fn slice(&self, rows: Range<usize>) -> Self {
         match self {
             Self::Picks(cells) => Self::Picks(Arc::new(cells[rows].to_vec())),
             Self::Span(span) => Self::Span(span.start + rows.start..span.start + rows.end),
+            Self::Apply(selection) => Self::Apply(selection.slice(rows)),
             Self::Expanded { expansion, rows: span, input } => Self::Expanded {
                 expansion: expansion.clone(), rows: span.start + rows.start..span.start + rows.end, input: input.clone(),
             },
@@ -202,6 +216,7 @@ impl SelectedRows {
                 let end = start.checked_add(rows.len())?;
                 cells[rows].iter().copied().eq((start..end).map(|row| (source, row))).then_some((source, start..end))
             }
+            Self::Apply(selection) => selection.contiguous(rows),
             Self::Expanded { expansion, rows: span, input } => {
                 let (source, rows) = expansion.contiguous(span.start + rows.start..span.start + rows.end)?;
                 match input { Some(input) => input.rows.contiguous(rows), None => Some((source, rows)) }
@@ -216,7 +231,10 @@ impl SelectedRows {
         }).flat_map(|rows| match rows {
             Self::Expanded { expansion, input, .. } => [expansion.owner(), input.as_ref().map(|input| &input.owner)],
             _ => [None, None],
-        }.into_iter().flatten())
+        }.into_iter().flatten().chain(match rows {
+            Self::Apply(selection) => Some(selection),
+            _ => None,
+        }.into_iter().flat_map(|selection| selection.owners())))
     }
 }
 
@@ -495,6 +513,7 @@ impl Column {
                 let cells = match &column.cells {
                     SelectedRows::Picks(cells) => cells.capacity().checked_mul(std::mem::size_of::<(usize, usize)>()).ok_or_else(size_error)?,
                     SelectedRows::Span(_) | SelectedRows::Expanded { .. } => 0,
+                    SelectedRows::Apply(selection) => selection.retained_bytes()?,
                 };
                 let sources = column.sources.capacity().checked_mul(std::mem::size_of::<Option<StoredVector>>()).ok_or_else(size_error)?;
                 let base = cells.checked_add(sources).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
@@ -768,6 +787,10 @@ impl ColumnBatch {
             .ok_or_else(size_error)?;
         let lease = Arc::get_mut(&mut reservation).expect("An appended column owns its reservation");
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+        self.append_funded_column(column, reservation, memory)
+    }
+
+    fn append_funded_column(&mut self, column: Column, reservation: Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<()> {
         let old_columns = self.columns.len().checked_mul(size_of::<Column>()).ok_or_else(size_error)?;
         let old_leases = self.appended.len().checked_mul(size_of::<Arc<MemoryReservation>>()).ok_or_else(size_error)?;
         let _scratch = memory.reserve(old_columns.checked_add(old_leases).ok_or_else(size_error)?)?;
