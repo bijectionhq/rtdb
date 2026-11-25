@@ -81,6 +81,85 @@ async fn window_shift_keeps_identity_and_cross_page_spans_after_cursor_drop() {
 }
 
 #[tokio::test]
+async fn window_shifts_keep_compact_runs_and_unpolled_source_pages_alive() {
+    let execution = execution(1024);
+    let baseline = execution.context.memory.used_bytes();
+    let functions = [
+        WindowFunction::Lead { column: ColumnId(1), offset: 256 },
+        WindowFunction::Lag { column: ColumnId(1), offset: 65 },
+    ];
+    let pages = [0..2, 2..258, 258..322, 322..386, 386..450].into_iter()
+        .map(|rows| rows.map(|value| row(1, value)).collect()).collect();
+    let mut cursor = BatchWindow::new(
+        input(pages, &execution), schema(), &[], vec![], &expressions(&functions), false, execution.clone(),
+    ).unwrap();
+    let first = cursor.next_batch().await.unwrap().unwrap();
+    let shifted = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!((first.len, shifted.len), (2, 256));
+    let lag_source = Arc::downgrade(first.column_reservation(1));
+    for position in [2, 3] {
+        assert!(shifted.column_reservation(position).bytes() < 2048);
+    }
+    drop((first, cursor));
+    assert!(lag_source.upgrade().is_some());
+    let lead = &shifted.columns[2];
+    let lag = &shifted.columns[3];
+    for index in 0..shifted.len {
+        assert_eq!(lead.value(index).unwrap(), if index < 192 { Value::I64(258 + index as i64) } else { Value::Null });
+        assert_eq!(lag.value(index).unwrap(), if index < 63 { Value::Null } else { Value::I64(index as i64 - 63) });
+    }
+    drop(shifted);
+    assert!(lag_source.upgrade().is_none());
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn window_shifts_keep_both_partition_edges_within_one_output_page() {
+    let execution = execution(3);
+    let baseline = execution.context.memory.used_bytes();
+    let functions = [
+        WindowFunction::Lead { column: ColumnId(1), offset: 1 },
+        WindowFunction::Lag { column: ColumnId(1), offset: 1 },
+    ];
+    let pages = [0..3, 3..6, 6..9, 9..10].into_iter()
+        .map(|rows| rows.map(|value| row(value / 5, value)).collect()).collect();
+    let mut cursor = BatchWindow::new(
+        input(pages, &execution), schema(), &[ColumnId(0)], vec![], &expressions(&functions), false, execution.clone(),
+    ).unwrap();
+    let first = cursor.next_batch().await.unwrap().unwrap();
+    let boundary = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!((first.len, boundary.len), (3, 3));
+    let preceding = Arc::downgrade(first.column_reservation(1));
+    drop((first, cursor));
+    assert!(preceding.upgrade().is_some());
+    let values = |position: usize| (0..boundary.len).map(|row| boundary.columns[position].value(row).unwrap()).collect::<Vec<_>>();
+    assert_eq!(values(1), [Value::I64(3), Value::I64(4), Value::I64(5)]);
+    assert_eq!(values(2), [Value::I64(4), Value::Null, Value::I64(6)]);
+    assert_eq!(values(3), [Value::I64(2), Value::I64(3), Value::Null]);
+    drop(boundary);
+    assert!(preceding.upgrade().is_none());
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn window_shift_gathers_mixed_source_layouts_in_order() {
+    let execution = execution(4);
+    let functions = [WindowFunction::Lead { column: ColumnId(1), offset: 2 }];
+    let mut fields = schema().fields().to_vec();
+    fields[1].data_type = fields[1].data_type.join(&Value::Bool(true).logical_type());
+    let schema = Schema::new(fields).unwrap();
+    let mut shifts = expressions(&functions);
+    shifts[0].field.data_type = functions[0].result_type(&schema).unwrap();
+    let pages = vec![vec![row(1, 0), row(1, 1)], vec![row(1, 2)], vec![vec![Value::I64(1), Value::Bool(true)]]];
+    let mut cursor = BatchWindow::new(input(pages, &execution), schema, &[], vec![], &shifts, false, execution.clone()).unwrap();
+    let first = cursor.next_batch().await.unwrap().unwrap();
+    drop(cursor);
+    assert_eq!(first.len, 2);
+    assert_eq!(first.columns[2].value(0).unwrap(), Value::I64(2));
+    assert_eq!(first.columns[2].value(1).unwrap(), Value::Bool(true));
+}
+
+#[tokio::test]
 async fn columnar_window_validates_unprojected_bottom_cells_before_emitting_ordinals() {
     use arrow_array::NullArray;
     use crate::columnar::Column;
@@ -130,7 +209,7 @@ async fn window_columns_share_complete_partitioned_input_and_publish_once() {
 async fn later_window_column_overflow_discards_completed_prior_column_and_sorted_input() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
     let functions = [WindowFunction::RowNumber,WindowFunction::Lead { column: ColumnId(1),offset: i64::MAX as u64 }];
-    let mut cursor = BatchWindow::new(input(vec![vec![row(1,1),row(1,2)]],&execution),schema(), &[], vec![], &expressions(&functions), false, execution.clone()).unwrap();
+    let mut cursor = BatchWindow::new(input(vec![vec![row(1,1)],vec![row(1,2)]],&execution),schema(), &[], vec![], &expressions(&functions), false, execution.clone()).unwrap();
     assert_eq!(cursor.next_batch().await.err().unwrap().code,"rtdb.query/window-offset");
     assert!(cursor.next_batch().await.unwrap().is_none());drop(cursor);
     assert_eq!(execution.context.spill_bytes(),0);assert_eq!(execution.context.memory.used_bytes(),baseline);

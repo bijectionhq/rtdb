@@ -5,6 +5,7 @@ pub(crate) mod float_vector;
 mod float_vectors;
 mod patch;
 pub(crate) mod search;
+pub(crate) mod window;
 
 use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
@@ -66,6 +67,7 @@ enum RowExpansion {
     RepeatPage(usize),
     JoinProbe(Arc<crate::batch_join::ProbeRuns>),
     ListSpans(Arc<ListSpans>),
+    WindowSpans(Arc<window::WindowSpans>),
     UnnestParents(Arc<UnnestRows>),
     UnnestGroups(Arc<UnnestRows>),
     UnnestChildren(Arc<UnnestRows>),
@@ -79,6 +81,7 @@ impl RowExpansion {
             Self::RepeatPage(width) => (0, row % width),
             Self::JoinProbe(runs) => (0, runs.input_row(row)),
             Self::ListSpans(spans) => spans.position(row),
+            Self::WindowSpans(spans) => spans.position(row),
             Self::UnnestParents(runs) => (0, runs.groups[runs.group_at(row)].parent),
             Self::UnnestGroups(runs) => (0, runs.group_at(row)),
             Self::UnnestChildren(runs) => {
@@ -98,6 +101,7 @@ impl RowExpansion {
             Self::RepeatPage(width) if rows.len() <= width - start => {}
             Self::JoinProbe(runs) if runs.contiguous(&rows) => {}
             Self::ListSpans(spans) if rows.end <= spans.ends[source] => {}
+            Self::WindowSpans(spans) if spans.contains(source, rows.end) => {}
             Self::UnnestChildren(runs) if source != 0 => {
                 let first = runs.group_at(rows.start);
                 let last = runs.group_at(rows.end - 1);
@@ -116,6 +120,7 @@ impl RowExpansion {
         match self {
             Self::ApplyOuter(spans) => Some(spans.reservation()),
             Self::ListSpans(spans) => Some(&spans.reservation),
+            Self::WindowSpans(spans) => Some(spans.reservation()),
             Self::UnnestParents(runs) | Self::UnnestGroups(runs) | Self::UnnestChildren(runs) => Some(&runs.reservation),
             Self::JoinProbe(runs) => runs.owner(),
             Self::RepeatEach(_) | Self::RepeatPage(_) => None,
@@ -202,15 +207,19 @@ impl SelectedRows {
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        let (picks, span, expanded, apply) = match self {
-            Self::Picks(cells) => (cells.as_slice(), 0..0, 0..0, None),
-            Self::Span(rows) => (&[][..], rows.clone(), 0..0, None),
-            Self::Expanded { rows, .. } => (&[][..], 0..0, 0..rows.len(), None),
-            Self::Apply(selection) => (&[][..], 0..0, 0..0, Some(selection)),
+        let (picks, span, expanded, apply, window) = match self {
+            Self::Picks(cells) => (cells.as_slice(), 0..0, 0..0, None, None),
+            Self::Span(rows) => (&[][..], rows.clone(), 0..0, None, None),
+            Self::Expanded { expansion: RowExpansion::WindowSpans(spans), rows, input: None } => {
+                (&[][..], 0..0, 0..0, None, Some((spans, rows)))
+            }
+            Self::Expanded { rows, .. } => (&[][..], 0..0, 0..rows.len(), None, None),
+            Self::Apply(selection) => (&[][..], 0..0, 0..0, Some(selection), None),
         };
         picks.iter().copied().chain(span.map(|row| (0, row)))
             .chain(expanded.map(|row| self.get(row).expect("The expansion covers the selection")))
             .chain(apply.into_iter().flat_map(|selection| selection.iter()))
+            .chain(window.into_iter().flat_map(|(spans, rows)| spans.iter(rows.clone())))
     }
 
     fn slice(&self, rows: Range<usize>) -> Self {
@@ -825,16 +834,9 @@ impl ColumnBatch {
 
     pub(crate) fn lend_window_span(&self, position: usize, rows: Range<usize>, memory: &Arc<MemoryBudget>)
         -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-        let owner = self.column_reservation(position);
-        let (array, field, logical, owner, rows) = match &self.columns[position] {
-            Column::Arrow { array, field, logical } if rows.end <= array.len() => (array, field, logical, owner, rows),
-            Column::Selected(selection) => {
-                let Some(((array, field, logical, custody), rows)) = selection.contiguous_source(rows) else { return Ok(None); };
-                (array, field, logical, custody.as_ref().unwrap_or(owner), rows)
-            }
-            _ => return Ok(None),
+        let Some(((array, field, logical, owner), rows)) = self.window_span_source(position, rows) else {
+            return Ok(None);
         };
-        if array.data_type() == &DataType::Null { return Ok(None); }
         let bytes = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?
             .checked_add(512).ok_or_else(size_error)?;
         let reservation = memory.reserve(bytes)?;
