@@ -385,6 +385,23 @@ Use the exact original database incarnation for the receiver binding and keep th
 Confirm the original keeper signers cover the certificate's guarded journal clock scale and the configured payload limit.
 The RTDB adapter checks the original stream, epoch, LSN, sealed-payload digest, exclusive cutoff and certificate digest in the returned proof before the fold applies effects.
 
+For a fresh loopback-only trial, `rust/bench/v1_timed_original_fixture.py` can commission the signed receiver and keeper clock sockets using OpenSSL 3.
+Give it three fresh keeper configuration files from the preceding TLS fixture, the RTDB incarnation and a new short path for the Unix sockets.
+It writes new keeper profiles and keeps the original input files intact.
+
+```bash
+clock_fixture=/tmp/rt-clock-example
+python3 rust/bench/v1_timed_original_fixture.py --openssl "$OPENSSL3" initialize "$clock_fixture" \
+  --source "$id" --keeper "$work/keeper-1.json" --keeper "$work/keeper-2.json" --keeper "$work/keeper-3.json"
+python3 rust/bench/v1_timed_original_fixture.py --openssl "$OPENSSL3" serve "$clock_fixture"
+```
+
+Start Logkeeper with the three resulting `keeper-*.json` files after both Unix sockets are listening.
+Set `RTDB_TIMED_ORIGINAL_TRUST_FILE` to `timed-trust.json` in the fixture directory and pass its `receiver-profile.yaml` to `--multi-receiver-clock` when starting RTDB.
+Reuse the fixture directory when restarting its receiver so it retains the durably advanced sample sequence.
+This fixture exercises the actual signed transports and positive original-quorum path on the shared local clock.
+Deployed clock authorities use externally commissioned bounds and independent custody.
+
 Qualify the exact installed route with the following cases.
 
 - Check that `transact.decision-clock-offer` appears for the matching authenticated, writable attachment with a live receiver and commissioned timed journal.
