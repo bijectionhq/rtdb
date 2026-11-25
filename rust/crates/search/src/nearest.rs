@@ -154,10 +154,13 @@ impl HeldVectorOverlay {
         let vector = row.and_then(|row| ArrowCell::named(row, &selected.vector, 0))
             .map(|cell| read_vector(cell, query, Some(&memory))).transpose()?.flatten();
         let _filters = memory.reserve(selected.filters.len().saturating_mul(size_of::<Option<&[u8]>>()))?;
-        let filters = selected.filters.iter().map(|name| match row.and_then(|row| ArrowCell::named(row, name, 0)) {
-            Some(cell) => rtdb_columnar::binary_cell(cell.field, cell.array, cell.row),
-            None => Ok(None),
-        }).collect::<Result<Vec<_>>>()?;
+        let mut filters = Vec::with_capacity(selected.filters.len());
+        for name in &selected.filters {
+            filters.push(match row.and_then(|row| ArrowCell::named(row, name, 0)) {
+                Some(cell) => rtdb_columnar::binary_cell(cell.field, cell.array, cell.row)?,
+                None => None,
+            });
+        }
         self.reserve_shadow(EntityIdRef::from(&id))?;
         self.register_shadow(partition, &id)?;
         let distance = match vector {

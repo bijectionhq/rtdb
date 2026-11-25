@@ -46,10 +46,14 @@ fn hash_value_part(hasher: &mut Sha256, part: Option<&Value>) -> Result<()> {
         Some(Value::Utf8(text)) => hash_part(hasher, 4, text.as_bytes()),
         Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) => hash_part(hasher, 5, bytes),
         Some(Value::Uuid(bytes)) => hash_part(hasher, 6, bytes),
-        Some(_) => return Err(Anomaly::incorrect("rtdb.vector/partition-type",
-            "A vector index partition column holds booleans, integers, text, binary or UUIDs")),
+        Some(_) => return Err(partition_type()),
     }
     Ok(())
+}
+
+fn partition_type() -> Anomaly {
+    Anomaly::incorrect("rtdb.vector/partition-type",
+        "A vector index partition column holds booleans, integers, text, binary or UUIDs")
 }
 
 fn hash_part(hasher: &mut Sha256, tag: u8, bytes: &[u8]) {
@@ -64,25 +68,35 @@ fn hash_integer(hasher: &mut Sha256, value: i64) {
 
 fn arrow_partition(event: &EventRef<'_>, columns: &[String], memory: &Arc<MemoryBudget>) -> Result<Partition> {
     let mut hasher = Sha256::new();
-    let mut type_error = None;
+    let mut needs_execution_decode = false;
+    let mut deferred_bottom = None;
+    let mut invalid_type = false;
     for column in columns {
         let Some(PutColumn::Stored(field, array, row)) = event.put_column(column) else {
             hash_part(&mut hasher, 0, &[]);
             continue;
         };
-        if hash_arrow_part(&mut hasher, ArrowCell { field, array, row }).is_none() {
+        let cell = ArrowCell { field, array, row };
+        let borrowed = hash_arrow_part(&mut hasher, cell).is_some();
+        if borrowed && field.data_type() == &DataType::Null && !field.is_nullable() {
+            // The borrowed hash reads bottom as null; the execution decoder rejects it.
+            deferred_bottom = Some(cell);
+        }
+        if !borrowed || matches!(field.data_type(), DataType::FixedSizeBinary(_)) {
+            needs_execution_decode = true;
+        }
+        if needs_execution_decode && let Some(bottom) = deferred_bottom {
+            read_execution_value(bottom.field, bottom.array, bottom.row)?;
+        }
+        if !borrowed {
             let _scratch = reserve_decode(field, array, row, memory)?;
             let value = read_execution_value(field, array, row)?;
-            if let Err(error) = hash_value_part(&mut hasher, Some(&value)) {
-                // The former full-row decode reported later decode errors before a digest type error.
-                type_error.get_or_insert(error);
-            }
+            // A later cell's decode error precedes a digest type error.
+            invalid_type |= hash_value_part(&mut hasher, Some(&value)).is_err();
         }
     }
-    match type_error {
-        Some(error) => Err(error),
-        None => Ok(Partition(hasher.finalize().into())),
-    }
+    if invalid_type { return Err(partition_type()); }
+    Ok(Partition(hasher.finalize().into()))
 }
 
 fn reserve_decode(field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, memory: &Arc<MemoryBudget>)
@@ -228,13 +242,20 @@ fn admit_staging_row(rows: &mut Vec<IndexedRow>, units: &mut Vec<f32>, dimension
     let row_capacity = grow(rows.capacity(), rows.len().saturating_add(1));
     let unit_capacity = grow(units.capacity(), units.len().saturating_add(dimensions));
     if row_capacity == rows.capacity() && unit_capacity == units.capacity() { return Ok(()); }
-    staging.grow_to(row_capacity.saturating_mul(size_of::<IndexedRow>())
-        .saturating_add(unit_capacity.saturating_mul(size_of::<f32>())))?;
+    let old_rows = rows.capacity().saturating_mul(size_of::<IndexedRow>());
+    let old_units = units.capacity().saturating_mul(size_of::<f32>());
+    let new_rows = row_capacity.saturating_mul(size_of::<IndexedRow>());
+    let new_units = unit_capacity.saturating_mul(size_of::<f32>());
+    let row_growth = if new_rows > old_rows { old_rows.saturating_add(new_rows) } else { old_rows };
+    let unit_growth = if new_units > old_units { old_units.saturating_add(new_units) } else { old_units };
+    staging.grow_to(row_growth.saturating_add(old_units).max(new_rows.saturating_add(unit_growth)))?;
     let allocation_error = |error: std::collections::TryReserveError| {
         Anomaly::fault("rtdb.vector/staging", error.to_string())
     };
     rows.try_reserve_exact(row_capacity - rows.len()).map_err(allocation_error)?;
     units.try_reserve_exact(unit_capacity - units.len()).map_err(allocation_error)?;
+    staging.shrink_to(rows.capacity().saturating_mul(size_of::<IndexedRow>())
+        .saturating_add(units.capacity().saturating_mul(size_of::<f32>())))?;
     Ok(())
 }
 
