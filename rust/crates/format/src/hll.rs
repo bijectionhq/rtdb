@@ -4,7 +4,7 @@ use std::ops::Range;
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use arrow_schema::{DataType, Field};
 use rtdb_columnar::ColumnPresence;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, MemoryReservation, Result};
 
 pub const DEFAULT_REGISTER_COUNT: usize = 1024;
 
@@ -90,39 +90,83 @@ pub fn from_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>> {
     let mut hll = Hll::default();
     let reader = ColumnPresence::new(field)?;
     if !reader.is_bottom() {
-        for row in 0..array.len() { add_cell(&mut hll, &reader, field, array, row)?; }
+        for row in 0..array.len() {
+            if let Some(hash) = cell_hash(&reader, field, array, row)? { hll.insert_hash(hash); }
+        }
     }
     Ok(hll.into_bytes())
 }
 
 pub fn from_event_batch(batch: &RecordBatch, rows: Range<usize>) -> Result<BTreeMap<String, Vec<u8>>> {
+    event_sketches([(batch, rows)], |_| Ok(()))
+}
+
+pub fn from_event_batches<'a>(
+    batches: impl IntoIterator<Item = (&'a RecordBatch, Range<usize>)>,
+    reservation: &mut MemoryReservation,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    event_sketches(batches, |name| {
+        let bytes = reservation.bytes().checked_add(DEFAULT_REGISTER_COUNT * 4 + 256)
+            .and_then(|bytes| bytes.checked_add(name.len()))
+            .ok_or_else(|| invalid("HLL allocation exceeds addressable memory"))?;
+        reservation.grow_to(bytes)
+    })
+}
+
+fn event_sketches<'a>(
+    batches: impl IntoIterator<Item = (&'a RecordBatch, Range<usize>)>,
+    mut admit_column: impl FnMut(&str) -> Result<()>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut sketches = BTreeMap::<String, (usize, Hll)>::new();
+    for (batch, rows) in batches {
+        fold_event_batch(batch, rows, &mut sketches, &mut admit_column)?;
+    }
+    Ok(sketches.into_iter().map(|(name, (_, sketch))| (name, sketch.into_bytes())).collect())
+}
+
+fn fold_event_batch(
+    batch: &RecordBatch,
+    rows: Range<usize>,
+    sketches: &mut BTreeMap<String, (usize, Hll)>,
+    admit_column: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     if rows.start > rows.end || rows.end > batch.num_rows() { return Err(invalid("HLL event range exceeds batch length")); }
     let schema = batch.schema();
     let op_index = schema.index_of("op").map_err(invalid)?;
     let op = batch.column(op_index).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Event operations must be a union"))?;
     let DataType::Union(fields, _) = op.data_type() else { return Err(invalid("Event operation union has no fields")); };
-    let Some((put_id, put_field)) = fields.iter().find(|(_, field)| field.name() == "put") else { return Ok(BTreeMap::new()); };
+    let Some((put_id, put_field)) = fields.iter().find(|(_, field)| field.name() == "put") else { return Ok(()); };
     let put = op.child(put_id).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Put operations must contain a struct"))?;
     let DataType::Struct(fields) = put_field.data_type() else { return Err(invalid("Put schema must be a struct")); };
-    let mut result = BTreeMap::new();
+
+    // Every duplicate child still runs its read and hash checks in physical order.
+    // Only the last child contributes registers.
     for (index, field) in fields.iter().enumerate() {
-        let mut hll = Hll::default();
+        if let Some((last, _)) = sketches.get_mut(field.name()) {
+            *last = index;
+        } else {
+            admit_column(field.name())?;
+            sketches.insert(field.name().clone(), (index, Hll::default()));
+        }
+    }
+    for (index, field) in fields.iter().enumerate() {
         let reader = ColumnPresence::new(field)?;
-        if !reader.is_bottom() {
-            for row in rows.clone() {
-                if op.type_id(row) == put_id { add_cell(&mut hll, &reader, field, put.column(index).as_ref(), op.value_offset(row))?; }
+        if reader.is_bottom() { continue; }
+        let (last, hll) = sketches.get_mut(field.name()).expect("PUT field has a sketch");
+        for row in rows.clone().filter(|&row| op.type_id(row) == put_id) {
+            if let Some(hash) = cell_hash(&reader, field, put.column(index).as_ref(), op.value_offset(row))? {
+                if *last == index { hll.insert_hash(hash); }
             }
         }
-        result.insert(field.name().clone(), hll.into_bytes());
-    }
-    Ok(result)
-}
-
-fn add_cell(hll: &mut Hll, reader: &ColumnPresence<'_>, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
-    if reader.is_present(array, row)? {
-        hll.insert_hash(rtdb_columnar::hash_cell(field, array, row, 0)?);
     }
     Ok(())
+}
+
+fn cell_hash(reader: &ColumnPresence<'_>, field: &Field, array: &dyn Array, row: usize) -> Result<Option<i32>> {
+    if reader.is_present(array, row)? {
+        return rtdb_columnar::hash_cell(field, array, row, 0).map(Some);
+    }
+    Ok(None)
 }
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
@@ -145,4 +189,51 @@ fn union_and_run_end_nulls_do_not_add_hll_registers() {
         let array = rtdb_columnar::build_array(&ty, &values).unwrap();
         assert_eq!(from_column(&field, array.as_ref()).unwrap(), expected.bytes);
     }
+}
+
+#[test]
+fn event_chunks_keep_last_named_child_and_fold_only_selected_puts() {
+    use std::sync::Arc;
+    use arrow_array::{ArrayRef, Int64Array, NullArray};
+    use arrow_schema::{Schema, UnionFields};
+    use rtdb_types::{MemoryBudget, Value};
+
+    let batch = |fields: Vec<Field>, columns: Vec<ArrayRef>| {
+        let document = rtdb_columnar::build_struct_array(fields.into(), &columns, 2, None).unwrap();
+        let legs = UnionFields::try_new([0, 1], [
+            Field::new("delete", DataType::Null, true),
+            Field::new("put", document.data_type().clone(), false),
+        ]).unwrap();
+        let op = UnionArray::try_new(legs, vec![1, 0, 1].into(), Some(vec![1, 0, 0].into()),
+            vec![Arc::new(NullArray::new(1)), document]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("op", op.data_type().clone(), false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(op)]).unwrap()
+    };
+    let ints = |values| Arc::new(Int64Array::from(values)) as ArrayRef;
+    let v = Field::new("v", DataType::Int64, true);
+    let bottom = Field::new("bottom", DataType::Null, false);
+    let first = batch(vec![v.clone(), v.clone(), bottom], vec![
+        ints(vec![Some(10), Some(11)]), ints(vec![Some(23), Some(29)]), Arc::new(NullArray::new(2)),
+    ]);
+    let empty_range = batch(vec![Field::new("empty", DataType::Int64, true)], vec![ints(vec![Some(5), None])]);
+    let last = batch(vec![v], vec![ints(vec![None, Some(31)])]);
+
+    let memory = MemoryBudget::new(16 * 1024);
+    let mut reservation = memory.reserve(0).unwrap();
+    let sketches = from_event_batches([(&first, 1..3), (&empty_range, 0..0), (&last, 0..3)],
+        Arc::get_mut(&mut reservation).unwrap()).unwrap();
+    let mut expected = Hll::default();
+    for value in [23, 31] {
+        expected.insert_hash(rtdb_columnar::hash_value(&Value::I64(value), 0).unwrap());
+    }
+    assert_eq!(sketches, BTreeMap::from([
+        ("bottom".to_owned(), Hll::default().into_bytes()),
+        ("empty".to_owned(), Hll::default().into_bytes()),
+        ("v".to_owned(), expected.into_bytes()),
+    ]));
+    assert_eq!(from_event_batch(&first, 0..4).unwrap_err().code, "rtdb.format/invalid-hll");
+    assert!(reservation.bytes() >= sketches.values().map(Vec::len).sum::<usize>());
+    drop(sketches);
+    drop(reservation);
+    assert_eq!(memory.used_bytes(), 0);
 }

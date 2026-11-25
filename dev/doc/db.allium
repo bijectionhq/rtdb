@@ -917,6 +917,7 @@ config {
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.
 --      Per-table cardinality sketches hash the captured live Arrow cells in physical field order and exclude logical nulls.
+--      Native block preparation retains one funded sketch per observed put column, including bottom columns and columns whose selected cells are all absent.
 --      Block GC's per-table sweep depends on this — see block-gc.allium, EveryTableBlockAtCurrentIndex.
 --   4. Build and persist the block file, carrying the boundary's term and its position within that term, which are what seed a restarted node's fence and term position, and stamp the database's last-upload time.
 --   5. Append the upload to the replica log and await it.

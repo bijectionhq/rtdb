@@ -160,8 +160,8 @@ impl SqlErasureSource {
                 )?,
                 None => TrieCatalog::default(),
             };
-            let table_block = rebuilt
-                .block_metadata()?
+            let (metadata, _hll_reservation) = rebuilt.block_metadata()?;
+            let table_block = metadata
                 .to_block(catalog.partitions(&entry.table)?)?
                 .with_retired_as_of(retired.map(|instant| instant.0));
             let bytes = table_block.encode();
@@ -692,7 +692,7 @@ mod tests {
             declarations.clone(),
             &CancellationToken::new(),
         )?;
-        let metadata = live.block_metadata()?;
+        let (metadata, _hll_reservation) = live.block_metadata()?;
         assert_eq!(metadata.declared_columns, declarations);
         assert!(!metadata.column_types.contains_key("erase_only"));
         assert!(metadata.column_types.contains_key("survives"));

@@ -527,17 +527,18 @@ impl LiveTable {
         };
         Ok(BlockPages { table: self, sources, schema, include_origins, memory: Arc::clone(memory), _reservation, _schema_reservation })
     }
-    pub fn block_metadata(&self) -> Result<TableMeta> {
-        let mut hlls: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for (_, batch) in &self.chunks {
-            for (name, delta) in rtdb_format::hll::from_event_batch(batch.arrow(), 0..batch.len())? {
-                let combined = match hlls.get(&name) {
-                    Some(previous) => rtdb_format::hll::combine(previous, &delta)?, None => delta,
-                };
-                hlls.insert(name, combined);
-            }
-        }
-        Ok(TableMeta { column_types: self.column_types.clone(), declared_columns: self.declared_columns.clone(), row_count: i64::from(self.row_count), hlls })
+    pub fn block_metadata(&self) -> Result<(TableMeta, Option<Arc<MemoryReservation>>)> {
+        let (hlls, reservation) = if let Some((_, first)) = self.chunks.first() {
+            let budget = first.arrow_reservation().budget();
+            let mut reservation = budget.snapshot_budget().unwrap_or(budget).reserve(0)?;
+            let batches = self.batches().map(|batch| (batch.arrow(), 0..batch.len()));
+            let hlls = rtdb_format::hll::from_event_batches(batches, Arc::get_mut(&mut reservation).expect("HLL fold owns its reservation"))?;
+            (hlls, Some(reservation))
+        } else {
+            (BTreeMap::new(), None)
+        };
+        let metadata = TableMeta { column_types: self.column_types.clone(), declared_columns: self.declared_columns.clone(), row_count: i64::from(self.row_count), hlls };
+        Ok((metadata, reservation))
     }
 }
 
@@ -986,9 +987,6 @@ impl LiveIndex {
     }
     pub fn next_block(&self) -> Result<Self> {
         Ok(Self::new(BlockIndex(self.block_index.0.checked_add(1).ok_or_else(|| invalid("Block index overflow"))?), self.latest_completed_tx, self.config))
-    }
-    pub fn block_metadata(&self) -> Result<BTreeMap<TableRef, TableMeta>> {
-        self.tables.iter().map(|(table, rows)| Ok((table.clone(), rows.block_metadata()?))).collect()
     }
 }
 
