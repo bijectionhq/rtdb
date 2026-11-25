@@ -523,12 +523,8 @@ fn next_row_bytes(handle: u64) -> Result<Option<(u64, RtdbSlice)>> {
             })
         })?;
         let mut reservation = memory.reserve(bound)?;
-        let mut bytes = vec![b'['];
-        for row in 0..batch.num_rows() {
-            if row > 0 { bytes.push(b','); }
-            rtdb_format::transit::write_arrow_row_json(&mut bytes, batch, row)?;
-        }
-        bytes.push(b']');
+        let mut bytes = Vec::new();
+        rtdb_format::transit::write_arrow_batch_json(&mut bytes, batch, memory)?;
         if bytes.capacity() > reservation.bytes() { return Err(invalid("Transit result exceeded its allocation bound")); }
         Arc::get_mut(&mut reservation).expect("cursor encoding owns its reservation").shrink_to(bytes.capacity())?;
         let value = rtdb_tx::RetainedBytes::with_reservation(bytes, reservation)?;

@@ -1106,9 +1106,13 @@ fn arrow_transit_rows_preserve_nested_types_and_null_omission() {
     let record = rtdb_columnar::copy_array(&ty, std::slice::from_ref(&row)).unwrap();
     let record = record.as_any().downcast_ref::<StructArray>().unwrap();
     let batch = RecordBatch::from(record.clone());
+    let expected = transit::encode_row(&row).unwrap();
     let mut direct = Vec::new();
     rtdb_format::transit::write_arrow_row_json(&mut direct, &batch, 0).unwrap();
-    assert_eq!(direct, transit::encode_row(&row).unwrap());
+    assert_eq!(direct, expected);
+    direct.clear();
+    rtdb_format::transit::write_arrow_batch_json(&mut direct, &batch, &MemoryBudget::new(0)).unwrap();
+    assert_eq!(direct, [b"[".as_slice(), &expected, b"]"].concat());
 }
 
 
@@ -1117,18 +1121,48 @@ fn arrow_transit_rows_keep_the_last_value_of_a_duplicate_column_name() {
     use rtdb_types::Value;
 
     let field = |name| Field::new(name, DataType::Int64, true);
-    let schema = Arc::new(Schema::new(vec![field("x"), field("y"), field("x")]));
+    let schema = Arc::new(Schema::new(vec![
+        field("z"), field("a"), field("z"), Field::new("z", DataType::Int16, true),
+    ]));
     let record = RecordBatch::try_new(schema, vec![
         Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
         Arc::new(Int64Array::from(vec![Some(10), Some(20)])),
-        Arc::new(Int64Array::from(vec![Some(30), None])),
+        Arc::new(Int64Array::from(vec![Some(3), Some(4)])),
+        Arc::new(arrow_array::Int16Array::from(vec![Some(30), None])),
     ]).unwrap();
-    for (row, last, other) in [(0, Value::I64(30), Value::I64(10)), (1, Value::Null, Value::I64(20))] {
-        let expected = Value::Struct(StructFields::from([("x".into(), last), ("y".into(), other)]));
-        let mut output = Vec::new();
-        rtdb_format::transit::write_arrow_row_json(&mut output, &record, row).unwrap();
-        assert_eq!(output, transit::encode_row(&expected).unwrap());
-    }
+    let expected = |last, other| transit::encode_row(&Value::Struct(StructFields::from([
+        ("z".into(), last), ("a".into(), other),
+    ]))).unwrap();
+    let first = expected(Value::I16(30), Value::I64(10));
+    let second = expected(Value::Null, Value::I64(20));
+    let mut output = Vec::new();
+    let error = rtdb_format::transit::write_arrow_batch_json(&mut output, &record, &MemoryBudget::new(0)).unwrap_err();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert!(output.is_empty());
+
+    let memory = MemoryBudget::new(1024);
+    rtdb_format::transit::write_arrow_batch_json(&mut output, &record, &memory).unwrap();
+    assert_eq!(output, [b"[".as_slice(), &first, b",", &second, b"]"].concat());
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn arrow_transit_batches_preserve_empty_shapes_without_routing_scratch() {
+    use arrow_array::RecordBatchOptions;
+    use rtdb_format::transit::write_arrow_batch_json;
+
+    let field = Field::new("x", DataType::Int64, true);
+    let zero_rows = RecordBatch::new_empty(Arc::new(Schema::new(vec![field.clone(), field])));
+    let zero_columns = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()), vec![], &RecordBatchOptions::new().with_row_count(Some(2)),
+    ).unwrap();
+    let memory = MemoryBudget::new(0);
+    let mut output = Vec::new();
+    write_arrow_batch_json(&mut output, &zero_rows, &memory).unwrap();
+    assert_eq!(output, b"[]");
+    output.clear();
+    write_arrow_batch_json(&mut output, &zero_columns, &memory).unwrap();
+    assert_eq!(output, br#"[["~#rtdb/struct",["^ "]],["~#rtdb/struct",["^ "]]]"#);
 }
 
 #[test]

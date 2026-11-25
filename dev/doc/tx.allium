@@ -69,6 +69,7 @@
 -- Embedded Transit deletes and erases bind string, keyword, UUID and signed integer IDs from typed Arrow columns.
 -- A mixed ID column retains the ID types in the order they first appear in the request.
 -- An embedded Clojure cursor writes Transit leaves from Arrow cell positions and lends the encoded batch to the row reader for the duration of decoding.
+-- The embedded Transit batch writer reuses one top-level column selection across rows, emitting each name at its first position with its last column's value and omitting a null winner.
 -- Clojure callers can set the connection await token and the read-only transaction settings through typed session calls.
 -- Embedded ADBC metadata builds its catalog, schema, table, and column arrays with the declared ADBC field order and list validity.
 -- JSON Bind preserves the spelling of numeric tokens through native type inference.

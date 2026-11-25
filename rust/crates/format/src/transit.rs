@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD;
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 
 mod arrow_json;
-pub use arrow_json::{write_arrow_json, write_arrow_row_json};
+pub use arrow_json::{write_arrow_batch_json, write_arrow_json, write_arrow_row_json};
 
 const CACHE_LIMIT: usize = 44 * 44;
 
