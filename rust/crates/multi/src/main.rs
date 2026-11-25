@@ -46,7 +46,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH [--keys PATH] --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE] [--classic-retained-flight-key FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--classic-retained-flight-key FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--classic-retained-flight-key FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES] [--shutdown-grace SECONDS]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -687,6 +687,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             options.maximum_connections = arguments.number("max-connections", options.maximum_connections)?;
             options.maximum_connections_per_deployment = arguments.number("max-connections-per-deployment", options.maximum_connections_per_deployment)?;
             options.maximum_buffered_bytes = arguments.number("max-buffered-bytes", options.maximum_buffered_bytes)?;
+            options.shutdown_grace = Duration::from_secs(arguments.number("shutdown-grace", 0u64)?);
             if let (Some(cell), Some(map)) = (arguments.optional("cell"), arguments.optional("cell-map")) {
                 let map = cell_map(map).await?;
                 let advertised = arguments.optional("advertise").map(str::to_owned).unwrap_or(listener.local_addr().map_err(io)?.to_string());
@@ -703,9 +704,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let flight = async {
                 match flight {
                     Some(flight) => rtdb_multi::flight_gateway::serve(flight, Arc::clone(&directory), options.clone(), cancellation.clone()).await,
-                    None => std::future::pending().await,
+                    None => Ok(()),
                 }
             };
+            let serving = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone());
             let audience = if let Some(((address, audience), holder_port)) = audience.zip(holder_port) {
                 let listener = tokio::net::TcpListener::bind(address).await.map_err(io)?;
                 eprintln!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
@@ -715,7 +717,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 match audience {
                     Some((listener, audience, holder_port)) => rtdb_multi::flight_gateway::serve_audience(listener,
                         Arc::clone(&directory), options.clone(), audience, holder_port, cancellation.clone()).await,
-                    None => std::future::pending().await,
+                    None => Ok(()),
                 }
             };
             if arguments.present("install-listen") {
@@ -737,19 +739,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     None => installer,
                 };
                 let installs = tokio::net::TcpListener::bind(arguments.address("install-listen", "127.0.0.1:0")?).await.map_err(io)?;
-                tokio::select! {
-                    gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
-                    flight = flight => flight,
-                    audience_flight = audience_flight => audience_flight,
-                    installation = rtdb_multi::install::serve(installs, tls, directory.clone(), Arc::new(installer), cancellation.clone()) => installation,
-                }
+                let installation = rtdb_multi::install::serve(installs, tls, directory.clone(), Arc::new(installer), cancellation.clone());
+                tokio::try_join!(serving, flight, audience_flight, installation)?;
             } else {
-                tokio::select! {
-                    gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
-                    flight = flight => flight,
-                    audience_flight = audience_flight => audience_flight,
-                }
+                tokio::try_join!(serving, flight, audience_flight)?;
             }
+            Ok(())
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;

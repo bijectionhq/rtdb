@@ -148,12 +148,25 @@ impl MemberLease {
         }
     }
 
+    /// Withdraws this node from new placements while it keeps serving what it holds.
+    pub(crate) async fn begin_drain(&self) -> Result<()> {
+        crate::admin::drain(self.directory.as_ref(), &self.id()).await
+    }
+
     /// Leaves the cell: a retired member holds nothing and is never live again.
     pub async fn retire(&self) -> Result<()> {
-        let current = self.record();
-        let mut next = current.clone();
-        next.state = MemberState::Retired;
-        if let Cas::Applied(stored) = self.directory.replace_member(next, current.version).await? { *self.record.lock() = stored; }
-        Ok(())
+        let mut current = self.record();
+        for _ in 0..8 {
+            let mut next = current.clone();
+            next.state = MemberState::Retired;
+            match self.directory.replace_member(next, current.version).await? {
+                Cas::Applied(stored) => { *self.record.lock() = stored; return Ok(()); }
+                // A drain moved a node's record after this lease last read it.
+                Cas::Conflict(Some(stored)) if stored.role != MemberRole::Logkeeper
+                    && !matches!(stored.state, MemberState::Dead | MemberState::Retired) => current = stored,
+                Cas::Conflict(_) => return Ok(()),
+            }
+        }
+        Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/retire-contended", "The member's lease could not be retired"))
     }
 }

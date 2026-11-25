@@ -1398,6 +1398,7 @@ entity Subscription {
 entity Session {
     -- A client session, held by a gateway.
     -- Everything a session needs is reconstructible from the client, so a gateway is stateless in the sense that matters: losing one loses connections, never data.
+    -- A stopping pgwire gateway admits no new connection and lets established sessions finish within its shutdown grace before closing them.
     gateway: MemberId
     deployment: DeploymentId
     capability: Capability
@@ -2590,6 +2591,8 @@ rule DrainMember {
     -- The source's identity and epoch still match when the drain reserves a handoff.
     -- A draining member runs one handoff at a time.
     -- A recent holding stays on its source while the placement pool has no eligible destination.
+    -- A node shutting down marks itself draining, parks its holdings with bounded concurrency, and retires its lease once they are parked or its drain budget runs out.
+    -- A holding still on the node when it retires recovers through a fresh writer epoch, as after a lease expiry.
     when: member: MemberRecord.state becomes draining
 
     ensures:

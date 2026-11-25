@@ -438,6 +438,50 @@ async fn the_pgwire_holder_refuses_a_gateway_with_a_stale_installation_route() {
     cell.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_withdrawal_keeps_admitted_pgwire_sessions_until_they_finish() {
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let options = rtdb_multi::gateway::GatewayOptions {
+        shutdown_grace: Duration::from_secs(5), capabilities: Some(secret()), ..Default::default()
+    };
+    let gateway = tokio::spawn(rtdb_multi::gateway::serve(listener, cell.directory.clone(), options, cancel.clone()));
+    let client = connect(&address.to_string(), "shop").await;
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while tokio::net::TcpStream::connect(address).await.is_ok() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(!gateway.is_finished());
+    assert_eq!(values(&client, "SELECT 42").await, ["42"]);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(1), gateway).await.unwrap().unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graceful_node_scale_in_retires_its_lease_and_preserves_accepted_writes() {
+    let mut cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 56)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let node = cell.nodes[holder].take().unwrap();
+    let id = node.lease.id();
+    drop(client);
+
+    node.shutdown().await.unwrap();
+    assert_eq!(cell.directory.member(&id).await.unwrap().unwrap().state, rtdb_directory::MemberState::Retired);
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["56"]);
+    assert_eq!(cell.holder("shop").await.unwrap(), 1 - holder);
+    drop(client);
+    cell.stop().await;
+}
+
 #[tokio::test]
 async fn failed_disposal_reuses_the_fence_on_retry() {
     let directory = MemoryDirectory::new();

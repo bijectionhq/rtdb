@@ -28,6 +28,8 @@ use crate::logs::LogkeeperLogFactory;
 pub(crate) const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const PLACED_FLUSH_INTERVAL_LIMIT: Duration = Duration::from_secs(15 * 60);
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const NODE_DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
+const NODE_RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct NodeSettings {
     pub configuration: NodeConfiguration,
@@ -249,11 +251,15 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
 }
 
 impl RunningNode {
-    /// Parks every deployment it holds, leaves the cell and stops.
+    /// Withdraws from placement, parks its holdings within a drain budget, leaves the cell and stops.
     pub async fn shutdown(mut self) -> Result<()> {
-        for name in self.agent.held().into_keys() { let _ = self.agent.park(&name).await; }
-        self.agent.park_resident_holdings().await;
-        let _ = self.lease.retire().await;
+        let _ = tokio::time::timeout(NODE_DRAIN_TIMEOUT, async {
+            self.lease.begin_drain().await?;
+            self.agent.park_for_shutdown().await;
+            Ok::<(), Anomaly>(())
+        }).await;
+        self.lease_cancellation.cancel();
+        let _ = tokio::time::timeout(NODE_RETIRE_TIMEOUT, self.lease.retire()).await;
         self.stop().await
     }
 

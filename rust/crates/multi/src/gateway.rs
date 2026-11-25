@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, rustls};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::control::{self, Request, Response};
 
@@ -48,6 +48,8 @@ pub struct GatewayOptions {
     /// When set, every frontend must negotiate TLS before startup.
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub startup_timeout: Duration,
+    /// How long established sessions may finish after the listener stops admitting connections.
+    pub shutdown_grace: Duration,
     pub maximum_connections: usize,
     pub maximum_connections_per_deployment: usize,
     pub maximum_buffered_bytes: usize,
@@ -61,7 +63,7 @@ pub struct GatewayOptions {
 impl Default for GatewayOptions {
     fn default() -> Self {
         Self {
-            cells: None, installed_journals: None, installed_cell: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
+            cells: None, installed_journals: None, installed_cell: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN, shutdown_grace: Duration::ZERO,
             control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
             maximum_connections: 4096, maximum_connections_per_deployment: 256,
             maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None,
@@ -123,9 +125,13 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
     let deployments = Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment));
     let heartbeats = Arc::new(Heartbeats::default());
     let mut connection_index = 0usize;
+    let tasks = TaskTracker::new();
+    let sessions = CancellationToken::new();
+    let _cancel_sessions = sessions.clone().drop_guard();
     loop {
         let (client, _) = tokio::select! {
-            _ = cancellation.cancelled() => return Ok(()),
+            biased;
+            _ = cancellation.cancelled() => break,
             accepted = listener.accept() => accepted.map_err(io)?,
         };
         let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
@@ -135,10 +141,10 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         let directory = Arc::clone(&directory);
         let options = options.clone();
         let heartbeats = Arc::clone(&heartbeats);
-        let cancellation = cancellation.child_token();
+        let cancellation = sessions.child_token();
         let index = connection_index;
         connection_index = connection_index.wrapping_add(1);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = permit;
             tokio::select! {
                 _ = cancellation.cancelled() => {}
@@ -146,6 +152,14 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
             }
         });
     }
+    drop(listener);
+    tasks.close();
+    if !options.shutdown_grace.is_zero() && tokio::time::timeout(options.shutdown_grace, tasks.wait()).await.is_ok() {
+        return Ok(());
+    }
+    sessions.cancel();
+    tasks.wait().await;
+    Ok(())
 }
 
 const RELAY_ANSWER_DEADLINE_PARAMETER: &str = "rtdb.relay_answer_deadline";

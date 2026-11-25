@@ -1310,13 +1310,23 @@ impl NodeAgent {
         }
     }
 
-    pub(crate) async fn park_resident_holdings(&self) {
-        if self.options.resident_idle_after.is_none() { return; }
-        if let Ok(records) = self.directory.deployments_held_by(&self.member()).await {
+    pub(crate) async fn park_for_shutdown(self: &Arc<Self>) {
+        let mut parking = tokio::task::JoinSet::new();
+        for name in self.held().into_keys() {
+            if parking.len() >= DRAIN_HANDOFFS_PER_PASS { let _ = parking.join_next().await; }
+            let agent = Arc::clone(self);
+            parking.spawn(async move { let _ = agent.park(&name).await; });
+        }
+        if self.options.resident_idle_after.is_some()
+            && let Ok(records) = self.directory.deployments_held_by(&self.member()).await
+        {
             for record in records.into_iter().filter(DeploymentRecord::is_resident_idle) {
-                let _ = self.park_if_resident(&record).await;
+                if parking.len() >= DRAIN_HANDOFFS_PER_PASS { let _ = parking.join_next().await; }
+                let agent = Arc::clone(self);
+                parking.spawn(async move { let _ = agent.park_if_resident(&record).await; });
             }
         }
+        while parking.join_next().await.is_some() {}
     }
 
     async fn park_if_resident(&self, expected: &DeploymentRecord) -> Result<Response> {
@@ -1950,8 +1960,9 @@ impl NodeAgent {
                     for name in names { self.stop_running(&name).await; }
                 }
                 _ = ticker.tick() => {
-                    if directory_lease { self.reconcile().await; }
-                    else { self.reconcile_ordered().await; }
+                    let reconciled = if directory_lease { cancellation.run_until_cancelled(self.reconcile()).await }
+                        else { cancellation.run_until_cancelled(self.reconcile_ordered()).await };
+                    if reconciled.is_none() { return; }
                 },
             }
         }
