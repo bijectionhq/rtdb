@@ -47,8 +47,8 @@ pub(super) struct Peer {
 
 #[derive(PartialEq, Eq)]
 pub(super) struct WorkloadProfile {
-    point: workload::Point,
-    identity: [u8; 32],
+    pub(super) point: workload::Point,
+    pub(super) identity: [u8; 32],
 }
 
 impl WorkloadProfile {
@@ -255,7 +255,7 @@ impl Peer {
                 let attached = node.catalog().database(name)?;
                 let serving = attached.serving_driver().ok_or_else(unavailable)?;
                 if serving.incarnation() != frame.incarnation { return Err(unavailable()); }
-                let writer = runtime.ready_driver(name, incarnation).await?;
+                let writer = runtime.workload_driver(name, incarnation).await?;
                 if !std::ptr::addr_eq(serving, writer.as_ref() as &dyn ServingDriver) {
                     return Err(unavailable());
                 }

@@ -537,9 +537,46 @@ Status with a different readiness selector refuses after a hold commits.
 Renewal or expiry of a grant leaves the recorded hold intact, and a fresh exact status returns the original `recorded_at` and ready value.
 
 The held row keeps attach, workload Claim and application writes closed.
-Bijection owns the guarded route CAS and stamps the accepted placement with its applied catalog history and sequence.
-Opening requires a separate trusted verifier and native transition that positively observe the exact applied and still-current Bijection decision for the same Begin, held-ready receipt, endpoint, installation and placement.
 The readiness actions carry prepublication authority only.
+
+#### Ordered native opening
+
+Bijection's guarded route CAS orders the selected placement and the exact pending native opening interlock together.
+The interlock holds the selected route and holder until Bijection's installed reconciler receives an exact ordered native terminal.
+RTDB verifies the decision through `/bijection.native.v1.Administration/VerifyHostedHistoryOpening`, a unary gRPC call with raw UTF-8 JSON messages over mutually authenticated TLS.
+RTDB sends `{format:1,history_id,target,expected:decision}` to the commissioned Bijection node and checks the reply's `format`, `history_id`, `source` and exact `hosted_history_opening_current` decision and held-ready record.
+The `decision` fields are `scope` (`domain` and `authority` UUID), `attempt` (`command_id` and `command_digest`), `begin_sha256`, `applied_at` (`history_id` and `sequence`) and `decision_sha256`.
+The `target` is the commissioned `AdministrationEndpoint.node` value.
+Refused, unknown and unavailable answers leave the candidate closed.
+
+Use `RTDB_CLASSIC_OPENING_INGRESS_FILE` to commission a separate private mTLS listener on enrolled native peers.
+Its JSON fields are `port`, `certificate_file`, `private_key_file`, `client_ca_file`, `reconciler_certificate_sha256`, optional `operator_certificate_sha256` and optional `verifier`.
+Certificate and key files are PEM, and each caller digest is the SHA-256 of its leaf certificate DER bytes, encoded as a 32-byte JSON array.
+An opening operator requires a distinct certificate digest and a `verifier` with `endpoint`, `history_id`, `target`, `ca_file`, `client_certificate_file` and `client_private_key_file`.
+The outbound client certificate must be installed in Bijection's dedicated opening verifier role.
+A status-only peer can omit both the operator and verifier configuration.
+The operator follows any selected-writer redirect over the same commissioned TLS trust profile.
+The Bijection reconciler uses its distinct read-only credential and neither peer operation consumes the Original recovery bearer.
+
+The private request and reply each frame one UTF-8 JSON object with a big-endian 32-bit length and a 16 KiB limit.
+Requests have `operation`, the complete `decision`, and `held_ready`.
+
+- `open_classic_migration_destination` verifies the live interlock and orders an opening reservation against the exact closed held-ready Basis.
+  The selected native writer reopens the imported stream and checks the closed Classic application row at the exact mapped cut.
+  It installs the initial native fence at the commissioned `public.bj_installation` authority point for the held assignment and epoch, then the native catalog orders `opened`.
+  The mounted assignment issuer profile is held through native ordering and compared again at attachment.
+- `exclude_classic_migration_opening` verifies the same live interlock and orders `excluded` only while the held-ready row still has no opening reservation.
+  Opening and exclusion contend on that row and its ordered Basis.
+  A reserved opening remains unresolved until the same operation completes.
+- `classic_migration_opening_status` reads the exact historical terminal over the read-only credential.
+  It does not call the live verifier, and returns `unresolved` while no positive terminal can be read for this selection.
+
+Positive terminals carry `outcome`, `decision`, `held_ready` and the stable `ordered_at` native catalog Basis.
+`opened` also carries `workload_fence` with `placement` and the exact native `applied` receipt coordinate from the selected stream.
+An identical open retry can recover a lost data-stream append before ordering the native catalog terminal.
+Historical status after loss or Bijection settlement reports that ordered outcome and carries no live authorization.
+Only the exact initial workload fence admits native workload claims and effects on the imported candidate.
+Ordinary SQL, ordinary v1 writes and generic provisioning remain closed for this candidate, and the old Original keeps its independent close and retained receipt authority.
 
 The literal projection covers positioned clear puts and deletes with unambiguous physical addresses.
 It preserves valid intervals, system times and original written transaction identity.

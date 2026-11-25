@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::classic_ingress::{HeldReady, ReadySelection};
+use super::classic_opening::{self, Phase as OpeningPhase, Record as OpeningRecord, Transition as OpeningTransition, Witness as OpeningWitness};
 
 pub(super) struct Catalog {
     database: Mutex<MultiDatabase>,
@@ -35,6 +36,7 @@ pub(super) enum Status {
         request: [u8; 32],
         projection: [u8; 32],
         held: Option<Box<ReadySelection>>,
+        opening: Option<Box<OpeningRecord>>,
     },
     TransferPending(Transfer),
     TransferReady {
@@ -208,7 +210,7 @@ impl Catalog {
     pub(super) async fn reserve_classic_candidate(
         &self, name: &str, database: Uuid, request: [u8; 32], projection: [u8; 32],
     ) -> Result<Deployment> {
-        let status = Status::ClassicCandidate { request, projection, held: None };
+        let status = Status::ClassicCandidate { request, projection, held: None, opening: None };
         let selected = self.reserve_status(name, database, status).await?;
         if !matches!(&selected.status,
             Status::ClassicCandidate { request: prior, projection: original, .. }
@@ -227,24 +229,74 @@ impl Catalog {
         }
         let mut control = self.database.lock().await;
         let mut selected = check_identity(find(&mut control, name).await?, database)?;
-        if let Status::ClassicCandidate { request, projection, held: None } = &selected.status
+        if let Status::ClassicCandidate { request, projection, held: None, opening: None } = &selected.status
             && *request == binding && selected.written == ready.reserved_at
         {
             if !record { return Ok(None); }
             let status = Status::ClassicCandidate {
-                request: binding, projection: *projection, held: Some(Box::new(ready.clone())),
+                request: binding, projection: *projection, held: Some(Box::new(ready.clone())), opening: None,
             };
             write(self, &mut control, name, database, status, Version::Written(selected.written)).await?;
             selected = check_identity(find(&mut control, name).await?, database)?;
         }
         match selected.status {
-            Status::ClassicCandidate { request, held: Some(prior), .. }
+            Status::ClassicCandidate { request, held: Some(prior), opening: None, .. }
                 if request == binding && prior.as_ref() == ready => Ok(Some(HeldReady {
                     binding_sha256: binding,
                     ready: *prior,
                     recorded_at: selected.written,
                 })),
             _ => Err(conflict()),
+        }
+    }
+
+    pub(super) async fn classic_opening(
+        &self, witness: &OpeningWitness, transition: OpeningTransition,
+    ) -> Result<Option<(OpeningRecord, Basis)>> {
+        if !witness.valid(self.incarnation) { return Err(classic_opening::denied()); }
+        let name = witness.name();
+        let database = witness.database();
+        let mut control = self.database.lock().await;
+        let selected = check_identity(find(&mut control, name).await?, database)?;
+        let Status::ClassicCandidate { request, projection, held: Some(held), opening } = selected.status
+            else { return Err(classic_opening::denied()); };
+        if request != witness.held_ready.binding_sha256 || *held != witness.held_ready.ready {
+            return Err(classic_opening::denied());
+        }
+        let next = if let Some(prior) = opening {
+            if &prior.witness != witness { return Err(classic_opening::denied()); }
+            match (transition, &prior.phase) {
+                (OpeningTransition::Finish { profile, fence }, OpeningPhase::Opening { profile: retained })
+                    if profile == *retained && witness.valid_fence(&fence) => {
+                    OpeningPhase::Opened { profile, workload_fence: fence }
+                }
+                (OpeningTransition::Finish { profile, fence }, OpeningPhase::Opened { profile: retained, workload_fence })
+                    if profile == *retained && &fence == workload_fence => {
+                    return Ok(Some((*prior, selected.written)));
+                }
+                (OpeningTransition::Reserve(profile), OpeningPhase::Opening { profile: retained })
+                    if profile == *retained => return Ok(Some((*prior, selected.written))),
+                (OpeningTransition::Observe, _)
+                | (OpeningTransition::Reserve(_) | OpeningTransition::Exclude, OpeningPhase::Excluded)
+                | (OpeningTransition::Reserve(_), OpeningPhase::Opened { .. }) => return Ok(Some((*prior, selected.written))),
+                _ => return Err(classic_opening::denied()),
+            }
+        } else {
+            if selected.written != witness.held_ready.recorded_at { return Err(classic_opening::denied()); }
+            match transition {
+                OpeningTransition::Observe => return Ok(None),
+                OpeningTransition::Reserve(profile) if profile != [0; 32] => OpeningPhase::Opening { profile },
+                OpeningTransition::Exclude => OpeningPhase::Excluded,
+                _ => return Err(classic_opening::denied()),
+            }
+        };
+        let expected = OpeningRecord { witness: witness.clone(), phase: next };
+        let status = Status::ClassicCandidate { request, projection, held: Some(held), opening: Some(Box::new(expected.clone())) };
+        write(self, &mut control, name, database, status, Version::Written(selected.written)).await?;
+        let selected = check_identity(find(&mut control, name).await?, database)?;
+        match selected.status {
+            Status::ClassicCandidate { opening: Some(record), .. } if *record == expected => Ok(Some((*record, selected.written))),
+            _ => Err(classic_opening::denied()),
         }
     }
 
@@ -593,6 +645,19 @@ async fn read(control: &mut MultiDatabase) -> Result<BTreeMap<String, Deployment
         {
             return Err(invalid_catalog());
         }
+        if let Status::ClassicCandidate { request, held, opening: Some(opening), .. } = &status {
+            let catalog = Uuid::from_bytes(row.cut.basis.incarnation());
+            let witness = &opening.witness;
+            if !witness.valid(catalog) || witness.name() != name || *witness.database().as_bytes() != *database
+                || witness.held_ready.binding_sha256 != *request
+                || held.as_deref() != Some(&witness.held_ready.ready)
+                || witness.held_ready.recorded_at >= row.cut.basis
+                || matches!(&opening.phase, OpeningPhase::Opening { profile } | OpeningPhase::Opened { profile, .. } if *profile == [0; 32])
+                || matches!(&opening.phase, OpeningPhase::Opened { workload_fence, .. } if !witness.valid_fence(workload_fence))
+            {
+                return Err(invalid_catalog());
+            }
+        }
         if let Status::ManagedTransferReady { transfer, .. } = &status {
             let reserved_at = transfer.reservation.reserved_at;
             if reserved_at.incarnation() != row.cut.basis.incarnation() || reserved_at >= row.cut.basis {
@@ -634,7 +699,12 @@ fn decode_status(ready: bool, database: [u8; 16], cells: &StructFields<Value>) -
             Some(Value::Binary(bytes)) => Some(serde_json::from_slice(bytes).map_err(|_| invalid_catalog())?),
             _ => return Err(invalid_catalog()),
         };
-        return Ok(Status::ClassicCandidate { request, projection, held });
+        let opening = match cells.get("classic_opening") {
+            None => None,
+            Some(Value::Binary(bytes)) => Some(serde_json::from_slice(bytes).map_err(|_| invalid_catalog())?),
+            _ => return Err(invalid_catalog()),
+        };
+        return Ok(Status::ClassicCandidate { request, projection, held, opening });
     }
     if let Some(request) = cells.get("transfer_request") {
         let Value::Binary(request) = request else {
@@ -813,13 +883,24 @@ async fn write(
     let phase = match status {
         Status::Reserved => b"reserve".to_vec(),
         Status::Ready => b"ready".to_vec(),
-        Status::ClassicCandidate { request, projection, held } => {
+        Status::ClassicCandidate { request, projection, held, opening } => {
             cells.insert("classic_request".into(), Cell::Value(Value::Binary(request.to_vec())));
             cells.insert("classic_projection".into(), Cell::Value(Value::Binary(projection.to_vec())));
             if let Some(held) = held {
                 let bytes = serde_json::to_vec(&held).map_err(|_| invalid_catalog())?;
                 cells.insert("classic_held_ready".into(), Cell::Value(Value::Binary(bytes)));
-                b"classic-held-ready".to_vec()
+                if let Some(opening) = opening {
+                    let phase = match opening.phase {
+                        OpeningPhase::Opening { .. } => b"classic-opening".as_slice(),
+                        OpeningPhase::Opened { .. } => b"classic-opened".as_slice(),
+                        OpeningPhase::Excluded => b"classic-open-excluded".as_slice(),
+                    };
+                    let bytes = serde_json::to_vec(&opening).map_err(|_| invalid_catalog())?;
+                    cells.insert("classic_opening".into(), Cell::Value(Value::Binary(bytes)));
+                    phase.to_vec()
+                } else {
+                    b"classic-held-ready".to_vec()
+                }
             } else {
                 b"classic-candidate".to_vec()
             }

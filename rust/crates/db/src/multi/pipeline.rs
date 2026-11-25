@@ -748,6 +748,41 @@ impl MultiDatabase {
         result
     }
 
+    pub async fn open_classic_placement(
+        &mut self, binding: [u8; 32], install: &super::ClassicInstallation,
+        placement: &workload::ImportedPlacement,
+    ) -> Result<workload::Fence> {
+        self.refresh().await?;
+        self.require_active()?;
+        let now = (self.clock)();
+        let origin = self.state().coordinates.origin.ok_or_else(workload::denied)?;
+        if origin.digest != binding || origin.source.is_some() || origin.through != install.basis.position()
+            || install.basis.incarnation() != self.incarnation()
+        {
+            return Err(workload::denied());
+        }
+        if let Some(fence) = placement.recover(self.durable_transactions(), now)? {
+            return check_classic_placement(fence, install);
+        }
+        if self.classic_checkpoint_status(binding).await?.as_ref() != Some(install) {
+            return Err(workload::denied());
+        }
+        let lease = self.authority()?;
+        let generation = self.state().generation;
+        let coordinates = self.state().coordinates;
+        let claims = self.tokens.verify_claims_in(std::iter::empty(), None).await;
+        let decision_time = now.max(self.durable_transactions().index().head().system_time.next()?);
+        let (transaction, admission) = placement.prepare(self.durable_transactions(), decision_time)?;
+        let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
+            .decide_workload(&transaction, now, FEATURES, &claims, &admission)?;
+        if let Planned::Append(write) = plan(decision, lease, generation, coordinates)? {
+            self.commit_one(lease, write).await?;
+        }
+        let fence = placement.recover(self.durable_transactions(), (self.clock)())?
+            .ok_or_else(workload::denied)?;
+        check_classic_placement(fence, install)
+    }
+
     async fn managed_workload_serial(&mut self, request: &workload::Request) -> Result<workload::Reply> {
         self.refresh().await?;
         self.require_active()?;
@@ -1026,6 +1061,16 @@ impl MultiDatabase {
             writer.pipeline.withdraw();
         }
     }
+}
+
+fn check_classic_placement(fence: workload::Fence, install: &super::ClassicInstallation) -> Result<workload::Fence> {
+    let basis = Basis::from_bytes(&fence.applied.basis)?;
+    if basis.incarnation() != install.basis.incarnation() || basis <= install.basis
+        || fence.applied.system_time_micros < install.system_time.0
+    {
+        return Err(workload::denied());
+    }
+    Ok(fence)
 }
 
 fn plan(decision: Decision, lease: Lease, generation: u64, coordinates: JournalCoordinates) -> Result<Planned> {

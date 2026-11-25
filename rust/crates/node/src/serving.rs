@@ -163,6 +163,7 @@ pub struct FundingSubmission {
 pub trait ServingDriver: Send + Sync {
     fn incarnation(&self) -> [u8; 16];
     fn features(&self) -> &[&str];
+    fn classic_workload_fence(&self) -> Option<&rtdb_tx::transact::workload::Fence> { None }
     fn token_authority(&self) -> Option<TokenAuthority> { None }
     fn uses_database_tokens(&self) -> bool { false }
 

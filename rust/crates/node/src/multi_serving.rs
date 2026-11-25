@@ -55,6 +55,7 @@ pub struct MultiServing {
     features: Vec<&'static str>,
     memory: Arc<MemoryBudget>,
     route: Option<Arc<dyn MultiWriteRoute>>,
+    classic_workload_fence: Option<workload::Fence>,
     ranked_schedule: Mutex<Option<Instant>>,
 }
 
@@ -306,6 +307,7 @@ impl MultiServing {
             writes,
             memory,
             route: None,
+            classic_workload_fence: None,
             ranked_schedule: Mutex::new(None),
         }
     }
@@ -315,11 +317,17 @@ impl MultiServing {
         self
     }
 
+    pub fn with_classic_workload_fence(mut self, fence: workload::Fence) -> Self {
+        self.classic_workload_fence = Some(fence);
+        self
+    }
+
     /// Applies the authorized request only under this node's active writer lease.
     /// Peer ingress calls this entry point and cannot submit a second forwarding attempt.
     pub async fn transact_local(
         &self, mut request: Transact, scope: Option<ServingScope>,
     ) -> Result<Receipt> {
+        if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
         require_ordinary_request(&request)?;
         if let Some(scope) = scope {
             return self.writes.transact_scoped(request, scope.labels, scope.receipt_namespace).await;
@@ -347,12 +355,27 @@ impl MultiServing {
     }
 
     /// Accepts only the narrow ordered response-release command from an admitted peer.
-    pub async fn managed_workload_local(&self, request: workload::Request) -> Result<workload::Reply> {
+    pub async fn managed_workload_local(&self, mut request: workload::Request) -> Result<workload::Reply> {
+        if let Some(expected) = &self.classic_workload_fence {
+            if let workload::Operation::Status { key, family } = &request.operation {
+                request.operation = workload::Operation::ImportedStatus {
+                    key: key.clone(), family: *family, after: Basis::from_bytes(&expected.applied.basis)?,
+                };
+                return self.writes.workload(request).await;
+            }
+            let covered = match &request.operation {
+                workload::Operation::Submit { authority, .. } => authority.matches_imported_fence(expected),
+                workload::Operation::Observe(fence) | workload::Operation::ReadRoot { fence, .. }
+                | workload::Operation::ReadCustody { fence, .. } => fence == expected,
+                _ => false,
+            };
+            if !covered { return Err(workload::denied()); }
+        }
         self.writes.workload(request).await
     }
 
     pub async fn submit_response_local(&self, request: Transact) -> Result<Receipt> {
-        if !request.is_response_release() {
+        if self.classic_workload_fence.is_some() || !request.is_response_release() {
             return Err(crate::serving::custody_release::release_unavailable());
         }
         self.writes.transact(request).await
@@ -385,6 +408,7 @@ impl MultiServing {
 
 #[async_trait]
 impl ServingDriver for MultiServing {
+    fn classic_workload_fence(&self) -> Option<&workload::Fence> { self.classic_workload_fence.as_ref() }
     fn incarnation(&self) -> [u8; 16] {
         self.incarnation
     }
@@ -491,6 +515,7 @@ impl ServingDriver for MultiServing {
         &self, request: Transact, scope: Option<ServingScope>, funding: FundingSubmission,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
+        if self.classic_workload_fence.is_some() { return Err(workload::denied()); }
         let scope = scope.map(|scope| (scope.labels, scope.receipt_namespace));
         cancellation.run_until_cancelled(self.writes.transact_funded(
             request, scope, funding.owner, funding.command, funding.clock,

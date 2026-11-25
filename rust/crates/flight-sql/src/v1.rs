@@ -447,6 +447,7 @@ impl Service {
             .await
             .map_err(error::map_status)?;
         let database = self.0.node.catalog().database(&call.database).map_err(error::anomaly)?;
+        call.require_imported_workload(&database)?;
         if scoped {
             let driver = database.serving_driver().ok_or_else(|| error::unsupported(ROW_VISIBILITY))?;
             self.serving_scope(call, driver)?;
@@ -497,6 +498,7 @@ impl Service {
     }
 
     fn check_attachment(&self, call: &Call, database: &Arc<Database>) -> Result<(), Status> {
+        call.require_imported_workload(database)?;
         if let Some(scope) = call.session.caller.principal.label_scope() {
             scope.revalidate(self.0.node.now()).map_err(error::anomaly)?;
         }

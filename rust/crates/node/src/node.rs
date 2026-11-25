@@ -388,6 +388,9 @@ impl Node {
         if matches!(self.factory.options.membership, Membership::Placed) && self.catalog.database(database).is_err() {
             return Err(lost_placement(database));
         }
+        if let Ok(local) = self.catalog.database(database) {
+            require_ordinary_attachment(&local)?;
+        }
         identity.authorize_database(database, access)
     }
 
@@ -407,6 +410,7 @@ impl Node {
         self.ensure_open()?;
         identity.authorize_database(&database, DatabaseAccess::Read)?;
         let local = self.catalog.database(&database)?;
+        require_ordinary_attachment(&local)?;
         let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
         let audience_storage = if let Some((source, cache)) = audience {
             let storage = local.audience_storage.as_ref().filter(|storage| storage.source == source)
@@ -4359,6 +4363,13 @@ impl NativeSession {
         drop(_metadata);
         query.execute_arrow_pages(context, batch.clone(), arguments.types()).await
     }
+}
+
+fn require_ordinary_attachment(database: &Database) -> Result<()> {
+    if database.serving_driver().is_some_and(|driver| driver.classic_workload_fence().is_some()) {
+        return Err(rtdb_tx::transact::workload::denied());
+    }
+    Ok(())
 }
 
 pub(crate) struct NativeSessionService {

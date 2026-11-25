@@ -115,6 +115,18 @@ impl Drop for Call {
     fn drop(&mut self) { self.cancellation.cancel(); self._lease.take(); }
 }
 impl Call {
+    pub(crate) fn require_imported_workload(&self, database: &rtdb_node::Database) -> Result<(), Status> {
+        let Some(driver) = database.serving_driver() else { return Ok(()); };
+        let Some(fence) = driver.classic_workload_fence() else { return Ok(()); };
+        let caller = &self.session.caller;
+        let allowed = caller.verified_credential && caller.principal.workload_grant()
+            .and_then(|grant| grant.assignment(&self.database, driver.incarnation(), self.service.0.node.now()).ok())
+            .is_some_and(|(authority, _, _)| authority.matches_imported_fence(fence)
+                || matches!(self.kind, CallKind::Handshake | CallKind::TxStatus)
+                    && matches!(authority, rtdb_tx::transact::workload::Authority::ReceiptRecovery { .. }));
+        if allowed { Ok(()) } else { Err(Status::permission_denied("This deployment requires its exact imported workload assignment")) }
+    }
+
     pub(crate) fn audience_io_owner(&self) -> Option<Arc<dyn Send + Sync>> {
         capture_audience_io_owner!(self)
     }
@@ -545,6 +557,11 @@ impl Service {
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
             egress: transport.map(|transport| transport.egress.clone()),
             routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward") };
+        if self.0.node.catalog().is_managed()
+            && let Ok(attached) = self.0.node.catalog().database(&call.database)
+        {
+            call.require_imported_workload(&attached)?;
+        }
         self.publish(); Ok(call)
     }
     async fn reserve_audience_seat(&self, database: Weak<rtdb_node::Database>, index: usize,

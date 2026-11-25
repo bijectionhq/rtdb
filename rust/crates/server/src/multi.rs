@@ -40,6 +40,7 @@ pub use rtdb_flight_sql::NativeFollowerAssignment;
 mod catalog;
 pub mod classic_ingress;
 mod classic_migration;
+mod classic_opening;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
 mod native_checkpoint;
@@ -105,6 +106,7 @@ pub struct MultiRuntime {
     managed_operations: TaskTracker,
     follower: Option<NativeFollowerAssignment>,
     classic_ingress: Option<Arc<classic_ingress::Ingress>>,
+    classic_opening_ingress: Option<Arc<classic_opening::Ingress>>,
 }
 
 impl MultiRuntime {
@@ -314,6 +316,7 @@ impl MultiRuntime {
         if runtime.follower.is_none() {
             runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
             runtime.classic_ingress = classic_ingress::Ingress::installed()?;
+            runtime.classic_opening_ingress = classic_opening::Ingress::installed()?;
         }
         Ok(runtime)
     }
@@ -423,6 +426,7 @@ impl MultiRuntime {
             managed_operations: TaskTracker::new(),
             follower,
             classic_ingress: None,
+            classic_opening_ingress: None,
         })
     }
 
@@ -521,6 +525,31 @@ impl MultiRuntime {
             .filter(|entry| entry.status.ready() && entry.database == database)
             .ok_or_else(unknown_deployment)?;
         self.ensure_driver(name, entry.database).await
+    }
+
+    async fn workload_driver(&self, name: &str, database: Uuid) -> Result<Arc<MultiServing>> {
+        let entry = self.catalog.read().await?.remove(name).filter(|entry| entry.database == database)
+            .ok_or_else(unknown_deployment)?;
+        if let Status::ClassicCandidate { opening: Some(record), .. } = &entry.status
+            && let classic_opening::Phase::Opened { profile, workload_fence } = &record.phase
+        {
+            self.require_opening_profile(profile)?;
+            self.ensure_driver_for(name, database, Some(workload_fence)).await
+        } else if entry.status.ready() {
+            self.ensure_driver(name, database).await
+        } else {
+            Err(unknown_deployment())
+        }
+    }
+
+    fn require_opening_profile(&self, expected: &[u8; 32]) -> Result<()> {
+        if self.peer.as_ref().and_then(|peer| peer.workload_profile())
+            .is_some_and(|profile| &profile.identity == expected)
+        {
+            Ok(())
+        } else {
+            Err(classic_opening::denied())
+        }
     }
 
     async fn transfer(
@@ -903,6 +932,8 @@ impl MultiRuntime {
             result = self.drive_databases(node, stop) => result,
             result = async { self.classic_ingress.as_ref().expect("Classic ingress enabled").serve(self, stop).await },
                 if self.classic_ingress.is_some() => result,
+            result = async { self.classic_opening_ingress.as_ref().expect("Classic opening ingress enabled").serve(self, stop).await },
+                if self.classic_opening_ingress.is_some() => result,
             result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
             result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },
                 if self.peer.is_some() => result,
@@ -997,6 +1028,15 @@ impl MultiRuntime {
     ) -> Result<()> {
         match &entry.status {
             Status::Reserved if !writer => return Ok(()),
+            Status::ClassicCandidate { opening: Some(record), .. } => {
+                if let classic_opening::Phase::Opened { profile, workload_fence } = &record.phase
+                    && self.require_opening_profile(profile).is_ok()
+                {
+                    self.ensure_driver_for(name, entry.database, Some(workload_fence)).await?;
+                    self.attach(node, name).await?;
+                }
+                return Ok(());
+            }
             Status::ClassicCandidate { .. } => return Ok(()),
             Status::TransferPending(pending) if matches!(pending.export, TransferExport::Managed { .. }) => return Ok(()),
             Status::TransferPending(pending) => {
@@ -1053,6 +1093,12 @@ impl MultiRuntime {
     }
 
     async fn ensure_driver(&self, name: &str, id: Uuid) -> Result<Arc<MultiServing>> {
+        self.ensure_driver_for(name, id, None).await
+    }
+
+    async fn ensure_driver_for(&self, name: &str, id: Uuid,
+        fence: Option<&rtdb_tx::transact::workload::Fence>,
+    ) -> Result<Arc<MultiServing>> {
         if let Some(driver) = self
             .databases
             .read()
@@ -1060,6 +1106,7 @@ impl MultiRuntime {
             .get(name)
         {
             check_incarnation(driver, id)?;
+            if driver.classic_workload_fence() != fence { return Err(catalog::conflict()); }
             return Ok(Arc::clone(driver));
         }
         let mut database = open_database(&self.backends, &self.kms, id, DatabaseOpen::Required).await?;
@@ -1069,8 +1116,20 @@ impl MultiRuntime {
         let mut databases = self.databases.write().expect("Multi serving catalog");
         let driver = databases
             .entry(name.to_owned())
-            .or_insert_with(|| serving_driver(database, name, &self.memory, self.peer.as_ref()));
+            .or_insert_with(|| {
+                if let Some(fence) = fence {
+                    let driver = MultiServing::new(database, Arc::clone(&self.memory))
+                        .with_classic_workload_fence(fence.clone());
+                    Arc::new(match &self.peer {
+                        Some(peer) => driver.with_write_route(peer.database(name)),
+                        None => driver,
+                    })
+                } else {
+                    serving_driver(database, name, &self.memory, self.peer.as_ref())
+                }
+            });
         check_incarnation(driver, id)?;
+        if driver.classic_workload_fence() != fence { return Err(catalog::conflict()); }
         Ok(Arc::clone(driver))
     }
 

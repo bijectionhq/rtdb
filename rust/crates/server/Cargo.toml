@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:ring"]
+multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:ring", "dep:tonic"]
 kafka = ["rtdb-node/kafka", "dep:rtdb-kafka", "rtdb-metrics/kafka"]
 kafka-connect = ["kafka", "rtdb-node/kafka-connect"]
 s3 = ["rtdb-node/s3", "dep:rtdb-s3"]
@@ -72,6 +72,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 url.workspace = true
 tokio-rustls = "=0.26.6"
+tonic = { version = "=0.14.5", features = ["tls-ring"], optional = true }
 zeroize = "1.8"
 futures.workspace = true
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }

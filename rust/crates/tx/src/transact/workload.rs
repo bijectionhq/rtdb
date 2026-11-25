@@ -57,6 +57,13 @@ pub struct Fence {
     pub applied: Applied,
 }
 
+pub struct ImportedPlacement {
+    point: Point,
+    placement: Placement,
+    decision: [u8; 32],
+    application_cut: BranchCut,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Predecessor {
@@ -149,6 +156,17 @@ pub enum Authority {
 }
 
 impl Authority {
+    pub fn matches_imported_fence(&self, expected: &Fence) -> bool {
+        match self {
+            Self::ClaimWriter { fence } | Self::ReadRoot { fence, .. }
+            | Self::ReadCustody { fence, .. } | Self::Write { fence, .. }
+            | Self::CustodyWrite { fence, .. } | Self::CloseWriter { fence, .. }
+            | Self::CloseWriterGuarded { fence, .. } | Self::CloseEmptyAssignment { fence, .. }
+            | Self::ObservePlacement { fence } => fence == expected,
+            _ => false,
+        }
+    }
+
     pub fn valid(&self, incarnation: [u8; 16]) -> bool {
         let applied = |value: &Applied| {
             valid_key(&value.key)
@@ -326,6 +344,11 @@ pub enum Operation {
         key: Vec<u8>,
         family: Family,
     },
+    ImportedStatus {
+        key: Vec<u8>,
+        family: Family,
+        after: Basis,
+    },
     Observe(Fence),
     ReadRoot {
         fence: Fence,
@@ -364,8 +387,14 @@ pub struct PredecessorEvidence {
 
 pub struct Admission {
     pub namespace: [u8; 32],
-    cutoff: Option<Timestamp>,
+    ordering: Ordering,
     commitment: Commitment,
+}
+
+enum Ordering {
+    Timed(Timestamp),
+    Settle,
+    ImportedPlacement,
 }
 
 pub enum Prepared {
@@ -376,6 +405,74 @@ pub enum Prepared {
     },
 }
 
+impl ImportedPlacement {
+    pub fn new(point: Point, placement: Placement, decision: [u8; 32], basis: Basis, system_time: Timestamp) -> Self {
+        Self { point, placement, decision, application_cut: BranchCut { basis, system_time } }
+    }
+
+    fn namespace(&self) -> [u8; 32] {
+        Sha256::digest(b"rtdb.multi/classic-imported-placement/v1").into()
+    }
+
+    fn commitment(&self) -> Result<Commitment> {
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.multi/classic-imported-placement/fence/v1\0");
+        digest.update(serde_json::to_vec(&(&self.point, &self.placement, self.decision, self.application_cut)).map_err(|_| denied())?);
+        Ok(Commitment { family: Family::AdvancePlacement, digest: digest.finalize().into() })
+    }
+
+    pub fn recover(&self, state: &TransactState, now: Timestamp) -> Result<Option<Fence>> {
+        let namespace = self.namespace();
+        let Some(receipt) = state.recover_workload(namespace, &self.decision, self.commitment()?)? else {
+            return Ok(None);
+        };
+        let fence = Fence {
+            placement: self.placement.clone(),
+            applied: Applied {
+                namespace, key: self.decision.to_vec(), basis: receipt.basis.to_bytes(),
+                system_time_micros: receipt.system_time.0,
+            },
+        };
+        self.point.fence(state, &fence, now.max(receipt.system_time))?;
+        Ok(Some(fence))
+    }
+
+    pub fn prepare(&self, state: &TransactState, now: Timestamp) -> Result<(Transact, Admission)> {
+        if self.decision == [0; 32] || !self.placement.valid() || self.placement.assignment.is_none()
+            || now < self.point.valid_at || state.has_applied_workload_placement()
+        {
+            return Err(denied());
+        }
+        let view = state.index.view(MAIN_BRANCH, At::Latest, Layer::Local, now)?;
+        if view.table(&self.point.table).is_some_and(|table| table.ttl_micros.is_some()
+            || table.visibility.is_some() || table.dropped)
+        {
+            return Err(denied());
+        }
+        let prior = state.index.view(MAIN_BRANCH, At::Exactly(self.application_cut.basis), Layer::Local, now)?;
+        let row = view.row(&self.point.table, &self.point.id, self.point.valid_at).ok_or_else(denied)?;
+        let original = prior.row(&self.point.table, &self.point.id, self.point.valid_at);
+        let image = row.image_at(self.point.valid_at).ok_or_else(denied)?;
+        let cells = &image.cells;
+        let incarnation = state.index.head().basis.incarnation();
+        let original_epoch = self.placement.epoch.checked_sub(1).ok_or_else(denied)?;
+        if prior.cut() != self.application_cut || original != Some(row) || original_epoch == 0
+            || image.custody_group.is_some() || image.custody_payload.is_some()
+            || cells.get("incarnation") != Some(&Value::Binary(incarnation.to_vec()))
+            || cells.get("kind") != Some(&Value::Utf8("hosted".into()))
+            || cells.get("placement_epoch") != Some(&Value::Utf8(format!("{original_epoch:020}")))
+            || !matches!(cells.get("placement_assignment"), Some(Value::Binary(assignment)) if assignment.len() == 16 && assignment.as_slice() != [0; 16].as_slice())
+            || cells.get("writer") != Some(&Value::Utf8(String::new()))
+        {
+            return Err(denied());
+        }
+        let mut transaction = empty_transaction(self.decision.to_vec());
+        self.point.write_placement(&mut transaction, incarnation,
+            &self.placement, Cell::TxBasis, String::new(), None)?;
+        Ok((transaction, Admission { namespace: self.namespace(), ordering: Ordering::ImportedPlacement, commitment: self.commitment()? }))
+    }
+}
+
 impl Request {
     pub fn prepare(&self, state: &TransactState, now: Timestamp) -> Result<Prepared> {
         self.check_expiry(now)?;
@@ -383,6 +480,15 @@ impl Request {
             Operation::Status { key, family } => {
                 let stored = state.workload_receipt(self.namespace, key)?;
                 if stored.workload != Some(*family) {
+                    return Err(super::unknown_receipt());
+                }
+                Ok(Prepared::Answer(Reply::Receipt(replay(&stored.receipt))))
+            }
+            Operation::ImportedStatus { key, family, after } => {
+                let stored = state.workload_receipt(self.namespace, key)?;
+                if stored.workload != Some(*family) || stored.receipt.basis.incarnation() != after.incarnation()
+                    || stored.receipt.basis <= *after
+                {
                     return Err(super::unknown_receipt());
                 }
                 Ok(Prepared::Answer(Reply::Receipt(replay(&stored.receipt))))
@@ -443,7 +549,7 @@ impl Request {
                     transaction: empty_transaction(key.clone()),
                     admission: Admission {
                         namespace: self.namespace,
-                        cutoff: None,
+                        ordering: Ordering::Settle,
                         commitment,
                     },
                 })
@@ -484,7 +590,7 @@ impl Request {
                     transaction,
                     admission: Admission {
                         namespace: self.namespace,
-                        cutoff: Some(cutoff),
+                        ordering: Ordering::Timed(cutoff),
                         commitment,
                     },
                 })
@@ -631,7 +737,13 @@ impl Point {
         if transaction.is_some() && !matches!(authority, Authority::CloseWriterGuarded { .. }) {
             return Err(denied());
         }
-        let incarnation = state.index.head().basis.incarnation();
+        self.write_placement(&mut control, state.index.head().basis.incarnation(), &placement, fence_basis, writer, retirement)?;
+        Ok(control)
+    }
+
+    fn write_placement(&self, control: &mut Transact, incarnation: [u8; 16], placement: &Placement,
+        fence_basis: Cell, writer: String, retirement: Option<Basis>,
+    ) -> Result<()> {
         let mut cells = StructFields::from_iter([
             ("incarnation".into(), binary_cell(incarnation)),
             ("kind".into(), text_cell("hosted".into())),
@@ -684,7 +796,7 @@ impl Point {
             rows: vec![row],
             if_absent: false,
         });
-        Ok(control)
+        Ok(())
     }
 
     fn check_write(&self, index: &BranchIndex, request: &Transact, custody: bool) -> Result<()> {
@@ -1016,7 +1128,10 @@ impl TransactState {
 
 impl Admission {
     pub fn cutoff(&self) -> Option<Timestamp> {
-        self.cutoff
+        match self.ordering {
+            Ordering::Timed(until) => Some(until),
+            Ordering::Settle | Ordering::ImportedPlacement => None,
+        }
     }
 
     pub fn family(&self) -> Family {
@@ -1028,7 +1143,7 @@ impl Admission {
     }
 
     pub(super) fn settlement(&self) -> Option<Outcome> {
-        self.cutoff.is_none().then(|| Outcome::Refused {
+        matches!(self.ordering, Ordering::Settle).then(|| Outcome::Refused {
             error: Anomaly::new(
                 AnomalyCategory::Conflict,
                 "rtdb/managed-workload-attempt-settled",

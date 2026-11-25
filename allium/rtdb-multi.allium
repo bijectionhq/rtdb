@@ -640,6 +640,11 @@ contract LogService {
         -- A fresh exact readiness status returns the same held coordinates and catalog basis after a lost append response.
         -- Grant expiry leaves a committed hold intact.
         -- Opening the held candidate requires independently authenticated evidence of the exact applied and current Bijection route decision.
+        -- Bijection holds that route and holder until an authenticated terminal resolves the pending native opening.
+        -- Native opening and exclusion contend for the exact closed held-ready version, and an ordered opening reservation prevents later exclusion.
+        -- The native writer recovers or installs the exact initial workload fence at the mapped application cut before the native catalog orders opening.
+        -- Opening admits only the matching commissioned workload, holder, assignment and epoch, and the Original remains closed.
+        -- Historical readback returns the exact ordered opening or exclusion independently of current authority.
 
     @invariant InstalledJournalErasureCommit
         -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.
