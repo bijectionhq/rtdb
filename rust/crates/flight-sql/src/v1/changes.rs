@@ -99,11 +99,39 @@ impl ReservedRow {
         schema: &SchemaRef,
         encoder: &mut wire::Encoder,
     ) -> Result<Vec<FlightData>, Status> {
-        let batch = pack_batch(Arc::clone(schema), std::slice::from_ref(&self)).map_err(batch_error)?;
-        let Self { images, charge, .. } = self;
-        drop(images);
+        let Self {
+            table,
+            time,
+            opened,
+            images: [key, before, after],
+            charge,
+        } = self;
+        let images = [
+            singleton_image_array(key).map_err(batch_error)?,
+            singleton_image_array(before).map_err(batch_error)?,
+            singleton_image_array(after).map_err(batch_error)?,
+        ];
+        let (values_capacity, values_len) = images
+            .iter()
+            .try_fold((0, 0), |(capacity, length), image| {
+                let values = image.values();
+                Ok((
+                    wire::add(capacity, values.capacity())?,
+                    wire::add(length, values.len())?,
+                ))
+            })
+            .map_err(error::map_status)?;
+        let batch =
+            outer_row(Arc::clone(schema), &table, time, opened, images).map_err(batch_error)?;
+        let bound = (|| {
+            // Arrow's uncompressed IPC writer grows its body Vec from the used value bytes.
+            let arrays = wire::mul(batch.get_array_memory_size() - values_capacity, 4)?;
+            let values = wire::add(values_capacity, wire::mul(values_len, 2)?)?;
+            wire::add(wire::schema_bound(schema)?, wire::add(arrays, values)?)
+        })()
+        .map_err(error::map_status)?;
         encoder
-            .reserved_batch(&batch, charge)
+            .reserved_singleton(batch, charge, bound)
             .map_err(error::map_status)
     }
 
@@ -1302,9 +1330,6 @@ fn pack_rows(
 
 fn pack_batch(schema: SchemaRef, rows: &[ReservedRow]) -> Result<RecordBatch, ArrowError> {
     let [key, before, after] = [image_array(rows, 0)?, image_array(rows, 1)?, image_array(rows, 2)?];
-    if let [row] = rows {
-        return outer_row(schema, &row.table, row.time, row.opened, [key, before, after]);
-    }
     let tables = rows.iter().map(|row| row.table.as_ref());
     let times = rows.iter().map(|row| row.time.0);
     let opened = rows.iter().map(|row| row.opened);
@@ -1319,6 +1344,25 @@ fn pack_batch(schema: SchemaRef, rows: &[ReservedRow]) -> Result<RecordBatch, Ar
             Arc::new(after),
         ],
     )
+}
+
+fn singleton_image_array(image: Option<Image>) -> Result<BinaryArray, ArrowError> {
+    match image {
+        Some(Image::Binary(bytes)) => {
+            let len = bytes.len();
+            let end = i32::try_from(len).map_err(|_| ArrowError::OffsetOverflowError(len))?;
+            BinaryArray::try_new(
+                OffsetBuffer::new(vec![0, end].into()),
+                Buffer::from_vec(bytes),
+                None,
+            )
+        }
+        Some(Image::Shared { stream, row }) => {
+            shared_image_array(&stream, std::iter::once(&row), 1)
+        }
+        None => Ok(BinaryArray::new_null(1)),
+        Some(Image::Deferred(_)) => unreachable!("singleton images have been encoded"),
+    }
 }
 
 fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, ArrowError> {
@@ -1336,20 +1380,29 @@ fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, Arrow
         Image::Shared { row, .. } => row,
         _ => unreachable!("packed rows use the same encoded image carrier"),
     });
-    let len = stream.encoder.schema_frame().len()
+    shared_image_array(stream, messages, rows.len())
+}
+
+fn shared_image_array<'a>(
+    stream: &ImageStream,
+    messages: impl Iterator<Item = &'a PreparedStreamRow> + Clone,
+    rows: usize,
+) -> Result<BinaryArray, ArrowError> {
+    let schema_frame = stream.encoder.schema_frame();
+    let len = schema_frame.len()
         + messages.clone().map(PreparedStreamRow::framed_len).sum::<usize>()
         + IMAGE_END.len();
     let end = i32::try_from(len).map_err(|_| ArrowError::OffsetOverflowError(len))?;
     let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(stream.encoder.schema_frame());
+    bytes.extend_from_slice(schema_frame);
     for message in messages {
         message.append_to(&mut bytes);
     }
     bytes.extend_from_slice(&IMAGE_END);
-    let mut offsets = vec![end; rows.len() + 1];
+    let mut offsets = vec![end; rows + 1];
     offsets[0] = 0;
-    let nulls = (rows.len() > 1).then(|| {
-        let mut valid = vec![false; rows.len()];
+    let nulls = (rows > 1).then(|| {
+        let mut valid = vec![false; rows];
         valid[0] = true;
         NullBuffer::from(valid)
     });
@@ -2120,14 +2173,29 @@ mod tests {
         let time = Timestamp(1);
         let table: Arc<str> = Arc::from("public.rows");
         let base = singleton_base(&schema, &table).unwrap();
+        let bytes = vec![0xab; 2049];
+        let images = [
+            BinaryArray::from(vec![Some(bytes.as_slice())]),
+            BinaryArray::from(vec![None::<&[u8]>]),
+            BinaryArray::from(vec![Some(&[][..])]),
+        ];
+        let reference = outer_row(Arc::clone(&schema), &table, time, true, images).unwrap();
+        let expected = wire::Encoder::new(&schema, &memory)
+            .unwrap()
+            .batch(&reference, &memory)
+            .unwrap();
+        let bound = singleton_bound(base, [Some(bytes.len()), None, Some(0)]).unwrap();
+        assert_eq!(bound, wire::batch_bound(&reference).unwrap());
         let rows = (0..2)
             .map(|_| {
-                let charge = memory.reserve(singleton_bound(base, [None; 3]).unwrap()).unwrap();
+                let charge = memory.reserve(bound).unwrap();
+                let mut key = Vec::with_capacity(2 * (bytes.len() + IMAGE_END.len()));
+                key.extend_from_slice(&bytes);
                 let row = ReservedRow {
                     table: Arc::clone(&table),
                     time,
                     opened: true,
-                    images: [None, None, None],
+                    images: [Some(Image::Binary(key)), None, Some(Image::Binary(Vec::new()))],
                     charge,
                 };
                 (0, row)
@@ -2144,14 +2212,21 @@ mod tests {
             MAX_PACKED_BYTES,
         )
         .unwrap();
-        assert_eq!(frames.len(), 2);
-        assert!(
-            frames
-                .iter()
-                .all(|(reader, frames)| *reader == 0 && frames.len() == 1)
-        );
+        assert_eq!(frames, vec![(0, expected.clone()), (0, expected)]);
         drop((frames, filler));
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_binary_singleton_uses_the_original_values_allocation() {
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(b"image payload");
+        let pointer = bytes.as_ptr();
+        let capacity = bytes.capacity();
+        let array = singleton_image_array(Some(Image::Binary(bytes))).unwrap();
+        assert_eq!(array.values().as_ptr(), pointer);
+        assert_eq!(array.values().capacity(), capacity);
+        assert_eq!(array.value(0), b"image payload");
     }
 
     #[test]
