@@ -156,3 +156,34 @@ async fn partition_hash_precedes_cross_unit_timestamp_equality() {
     }
     assert_eq!(ranks, [Value::I64(1), Value::I64(1)]);
 }
+
+#[tokio::test]
+async fn window_assigns_nullable_composite_partitions_in_first_seen_order() {
+    let execution = execution(2);
+    let baseline = execution.context.memory.used_bytes();
+    let pages = vec![
+        vec![vec![Value::I64(7), Value::Null], row(8, 4)],
+        vec![row(7, 4), vec![Value::I64(7), Value::Null], row(8, 4)],
+    ];
+    let mut fields = schema().fields().to_vec();
+    fields[1].data_type = fields[1].data_type.clone().maybe();
+    let schema = Schema::new(fields).unwrap();
+    let mut cursor = BatchWindow::new(
+        input(pages, &execution), schema, &[ColumnId(1), ColumnId(0)], vec![],
+        &expressions(&[WindowFunction::RowNumber]), false, execution.clone(),
+    ).unwrap();
+    let mut actual = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        actual.extend((0..batch.len).map(|row| batch.columns.iter()
+            .map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+    }
+    assert_eq!(actual, [
+        vec![Value::I64(7), Value::Null, Value::I64(1)],
+        vec![Value::I64(7), Value::Null, Value::I64(2)],
+        vec![Value::I64(8), Value::I64(4), Value::I64(1)],
+        vec![Value::I64(8), Value::I64(4), Value::I64(2)],
+        vec![Value::I64(7), Value::I64(4), Value::I64(1)],
+    ]);
+    drop(cursor);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}

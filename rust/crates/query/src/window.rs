@@ -4,7 +4,7 @@ use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType};
 use crate::{context::Execution, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, ordinal_column_by, poll_nested_batch};
-use crate::{scalar_key::ScalarKey, set_keys::BatchKeyIndex};
+use crate::{scalar_key::ScalarKey, set_keys::{BatchKeyIndex, KeyColumns}};
 
 pub(crate) struct BatchWindow {
     input: Option<BoxBatchCursor>,
@@ -167,9 +167,9 @@ impl BatchCursor for PartitionBatches {
             if batch.len == 0 { continue; }
             let bytes = batch.len.checked_mul(std::mem::size_of::<i64>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(window_size)?;
             let reservation = memory.reserve(bytes)?;
-            let keys = batch.key_projection(&self.positions, memory)?;
+            let keys = KeyColumns::projection(&batch, &self.positions);
             let mut groups = Vec::with_capacity(batch.len);
-            self.index.identify(&keys, self.projected, &self.context, &self.keys, |_, group, _| {
+            self.index.identify(keys, self.projected, &self.context, &self.keys, |_, group, _| {
                 groups.push(i64::try_from(group).map_err(|_| invalid("window-count", "Window partition count overflow"))?);
                 Ok(())
             })?;
