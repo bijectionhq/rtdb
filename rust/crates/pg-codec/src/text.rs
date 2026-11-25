@@ -13,40 +13,68 @@ mod json_input;
 use json_input::read_json;
 
 /// The caller covers decoding allocations and the returned value with its own reservation.
-/// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
+/// Unknown OIDs remain UTF-8 strings.
 pub fn read_text(oid: u32, text: &str) -> Result<Value> {
-    if rtdb_types::PgType::from_oid(oid as i32).is_none() { return Ok(Value::Utf8(text.to_owned())); }
-    Ok(match oid {
-        16 => Value::Bool(parse_boolean(text)?),
-        21 => Value::I16(text.parse().map_err(invalid)?), 23 => Value::I32(text.parse().map_err(invalid)?), 20 => Value::I64(text.parse().map_err(invalid)?),
-        700 => Value::F32(float32(text)?), 701 => Value::F64(float(text)?),
-        1700 => decimal(text)?,
-        17 => Value::Binary(bytea(text)?.into_owned()),
-        2950 => Value::Uuid(parse_uuid(text)?),
-        1082 => Value::calendar_date(rtdb_types::CivilDate::parse_iso(text)?, rtdb_types::DateUnit::Day),
-        1083 => Value::Time { value: rtdb_types::parse_iso_local_time(text)? as i64, unit: TimeUnit::Nanosecond, bit_width: 64 },
-        1114 => Value::Timestamp { value: local_timestamp_micros(text)?, unit: TimeUnit::Microsecond, timezone: None },
-        1184 => timestamp(text)?,
-        1186 => {
+    match text_value_reader(oid) {
+        Some(read) => read(text),
+        None => Ok(Value::Utf8(text.to_owned())),
+    }
+}
+
+/// Returns no reader when the input text is the UTF-8 value.
+pub fn text_value_reader(oid: u32) -> Option<fn(&str) -> Result<Value>> {
+    Some(match oid {
+        16 => |text| parse_boolean(text).map(Value::Bool),
+        21 => |text| text.parse().map(Value::I16).map_err(invalid),
+        23 => |text| text.parse().map(Value::I32).map_err(invalid),
+        20 => |text| text.parse().map(Value::I64).map_err(invalid),
+        700 => |text| float32(text).map(Value::F32),
+        701 => |text| float(text).map(Value::F64),
+        1700 => decimal,
+        17 => |text| bytea(text).map(|bytes| Value::Binary(bytes.into_owned())),
+        2950 => |text| parse_uuid(text).map(Value::Uuid),
+        1082 => |text| Ok(Value::calendar_date(rtdb_types::CivilDate::parse_iso(text)?, rtdb_types::DateUnit::Day)),
+        1083 => |text| Ok(Value::Time { value: rtdb_types::parse_iso_local_time(text)? as i64, unit: TimeUnit::Nanosecond, bit_width: 64 }),
+        1114 => |text| Ok(Value::Timestamp { value: local_timestamp_micros(text)?, unit: TimeUnit::Microsecond, timezone: None }),
+        1184 => timestamp,
+        1186 => |text| {
             let (months, days, nanoseconds) = interval(text)?;
-            match interval_type(days, nanoseconds) {
+            Ok(match interval_type(days, nanoseconds) {
                 ScalarType::Interval(IntervalUnit::YearMonth) => Value::IntervalYearMonth(months),
                 ScalarType::IntervalMonthDayMicro => Value::IntervalMonthDayMicro { months, days, nanoseconds },
                 _ => Value::IntervalMonthDayNano { months, days, nanoseconds },
-            }
+            })
         },
-        11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
-        1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; let mut list = rtdb_types::ListBuilder::with_capacity(0); visit_array(text, |value| { list.push(value.map_or(Ok(Value::Null), |text| read_text(element, &text))?); Ok(()) })?; Value::List(list.finish()) },
-        114 | 3802 => read_json(text)?,
-        3910 => match read_tstzrange(text)? {
+        11112 => |text| Ok(Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond }),
+        1007 => |text| read_value_array(23, text),
+        1016 => |text| read_value_array(20, text),
+        1009 => |text| read_value_array(25, text),
+        114 | 3802 => read_json,
+        3910 => |text| Ok(match read_tstzrange(text)? {
             Some((lower, upper)) => Value::TimestampTzRange { lower, upper },
             None => Value::Null,
-        },
-        26 | 2205 | 24 => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-text-type", format!("Pinned PgType has no text reader for OID {oid}"))),
-        16384 => transit_input::decode_json(text.as_bytes())?,
-        _ => Value::Utf8(text.to_owned()),
+        }),
+        26 => |_| Err(unsupported_text_type(26)),
+        2205 => |_| Err(unsupported_text_type(2205)),
+        24 => |_| Err(unsupported_text_type(24)),
+        16384 => |text| transit_input::decode_json(text.as_bytes()),
+        _ => return None,
     })
 }
+
+fn read_value_array(element: u32, text: &str) -> Result<Value> {
+    let mut list = rtdb_types::ListBuilder::with_capacity(0);
+    visit_array(text, |value| {
+        list.push(value.map_or(Ok(Value::Null), |text| read_text(element, &text))?);
+        Ok(())
+    })?;
+    Ok(Value::List(list.finish()))
+}
+
+fn unsupported_text_type(oid: u32) -> Anomaly {
+    Anomaly::unsupported("xtdb.postgres/unsupported-text-type", format!("Pinned PgType has no text reader for OID {oid}"))
+}
+
 fn parse_boolean(text: &str) -> Result<bool> { Ok(match text.trim().to_ascii_lowercase().as_str() { "tr" | "yes" | "tru" | "true" | "on" | "ye" | "t" | "y" | "1" => true, "f" | "fa" | "fal" | "fals" | "false" | "no" | "n" | "off" | "0" => false, _ => return Err(invalid("Invalid PostgreSQL boolean")) }) }
 pub(crate) fn float32(text: &str) -> Result<f32> { Ok(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }) }
 pub(crate) fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }

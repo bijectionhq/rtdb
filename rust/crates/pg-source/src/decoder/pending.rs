@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, hash::{DefaultHasher, Hash, Hasher}, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, hash::{DefaultHasher, Hash, Hasher}, ops::Range, sync::Arc};
 
 use arrow_array::{
     ArrayRef, FixedSizeListArray, NullArray, RecordBatch, RecordBatchOptions,
@@ -120,6 +120,7 @@ impl PendingBatch {
 
 pub(super) enum DecodedCell<'a> {
     Scalar(Value),
+    Text(Cow<'a, str>),
     Nested(ArrayRef),
     List(WalListRow<'a>),
     ArrayText(&'a str),
@@ -136,8 +137,9 @@ impl DecodedCell<'_> {
         let bound = rtdb_columnar::estimate_builder_bytes(&logical, std::slice::from_ref(&value))?;
         let _scratch = memory.reserve(bound)?;
         let cell = match value {
+            Value::Utf8(text) => Self::Text(Cow::Owned(text)),
             Value::Null | Value::Bool(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) |
-            Value::F32(_) | Value::F64(_) | Value::Utf8(_) | Value::Binary(_) | Value::Transit(_) |
+            Value::F32(_) | Value::F64(_) | Value::Binary(_) | Value::Transit(_) |
             Value::Uuid(_) | Value::Timestamp { .. } => Self::Scalar(value),
             _ => Self::Nested(rtdb_columnar::copy_array(&logical, &[value])?),
         };
@@ -146,11 +148,11 @@ impl DecodedCell<'_> {
 
     pub fn retained(&self) -> Result<usize> {
         let bytes = match self {
-            Self::Scalar(Value::Utf8(text)) => text.len(),
             Self::Scalar(Value::Binary(bytes) | Value::Transit(bytes)) => bytes.len(),
             Self::Scalar(_) => 0,
             Self::Nested(array) => array.get_array_memory_size(),
             Self::List(row) => row.builder_bytes()?,
+            Self::Text(text) => text.len(),
             Self::ArrayText(text) => text.len(),
             Self::Range(bounds) => std::mem::size_of_val(bounds),
         };
@@ -168,6 +170,7 @@ macro_rules! columns {
         enum ColumnValues {
             $($variant($builder),)+
             Null,
+            Text(StringBuilder),
             Uuid(FixedSizeBinaryBuilder),
             Timestamp(Vec<i64>),
             Nested(Vec<ArrayRef>),
@@ -180,6 +183,7 @@ macro_rules! columns {
             fn new(field: &Field, cell: &DecodedCell<'_>) -> Self {
                 match cell {
                     $(DecodedCell::Scalar($(Value::$value(_))|+) => Self::$variant($new),)+
+                    DecodedCell::Text(_) => Self::Text(StringBuilder::with_capacity(0, 0)),
                     DecodedCell::Scalar(Value::Null) => Self::Null,
                     DecodedCell::Scalar(Value::Uuid(_)) => Self::Uuid(FixedSizeBinaryBuilder::with_capacity(0, 16)),
                     DecodedCell::Scalar(Value::Timestamp { .. }) => Self::Timestamp(Vec::new()),
@@ -194,6 +198,7 @@ macro_rules! columns {
             fn accepts(&self, cell: &DecodedCell<'_>) -> bool {
                 matches!((self, cell),
                     $((Self::$variant(_), DecodedCell::Scalar($(Value::$value(_))|+)) |)+
+                    (Self::Text(_), DecodedCell::Text(_)) |
                     (Self::Null, DecodedCell::Scalar(Value::Null)) |
                     (Self::Uuid(_), DecodedCell::Scalar(Value::Uuid(_))) |
                     (Self::Timestamp(_), DecodedCell::Scalar(Value::Timestamp { .. })) |
@@ -220,6 +225,7 @@ macro_rules! columns {
             fn push(&mut self, cell: DecodedCell<'_>) {
                 match (self, cell) {
                     $((Self::$variant(builder), DecodedCell::Scalar($(Value::$value(value))|+)) => builder.append_value(value),)+
+                    (Self::Text(builder), DecodedCell::Text(text)) => builder.append_value(text.as_ref()),
                     (Self::Null, DecodedCell::Scalar(Value::Null)) => {},
                     (Self::Uuid(builder), DecodedCell::Scalar(Value::Uuid(uuid))) => {
                         builder.append_value(uuid).expect("UUID has the column width");
@@ -241,7 +247,7 @@ macro_rules! columns {
                     Self::Uuid(mut builder) => Ok(Arc::new(builder.finish())),
                     Self::Timestamp(values) => timestamp_column(field, values),
                     Self::List(builder) => builder.finish(field),
-                    Self::ArrayText(mut builder) => Ok(Arc::new(builder.finish())),
+                    Self::Text(mut builder) | Self::ArrayText(mut builder) => Ok(Arc::new(builder.finish())),
                     Self::Range(values) => range_column(field, values),
                     Self::Nested(mut cells) if cells.len() == 1 => Ok(cells.remove(0)),
                     Self::Nested(cells) => {
@@ -261,7 +267,6 @@ columns!(
     Int64(Int64Builder, Int64Builder::with_capacity(0), I64),
     Float32(Float32Builder, Float32Builder::with_capacity(0), F32),
     Float64(Float64Builder, Float64Builder::with_capacity(0), F64),
-    Text(StringBuilder, StringBuilder::with_capacity(0, 0), Utf8),
     Bytes(BinaryBuilder, BinaryBuilder::with_capacity(0, 0), Binary | Transit),
 );
 

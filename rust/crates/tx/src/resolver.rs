@@ -846,9 +846,7 @@ impl<'a> OpenTransaction<'a> {
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;
-        if is_replay_table(&table) || table == receipts_table() || is_bounded_receipts_table(&table) || TableRef::owned_schema(&table.schema) {
-            check_table(&table)?;
-        }
+        check_writer_table(&table)?;
         self.buffer.append(table, event)
     }
     /// Stages a source's Arrow documents in their input order under this transaction's system time.
@@ -856,9 +854,45 @@ impl<'a> OpenTransaction<'a> {
         &mut self, table: &TableRef, documents: arrow_array::ArrayRef, headers: &[EventHeader],
     ) -> Result<()> {
         self.context.check_cancelled()?;
-        if is_replay_table(table) || *table == receipts_table() || is_bounded_receipts_table(table) || TableRef::owned_schema(&table.schema) { check_table(table)?; }
+        check_writer_table(table)?;
         let batch = rtdb_format::data::owned_put_batch(documents, headers, None, &self.context.memory)?;
         self.buffer.append_batch(table, batch)
+    }
+    /// Stages one bounded page of source deletes under this transaction's system time.
+    /// The IID iterator must produce the same identities when retried.
+    pub fn append_arrow_deletes(
+        &mut self, table: &TableRef, iids: impl ExactSizeIterator<Item = Result<Iid>> + Clone,
+    ) -> Result<()> {
+        if iids.len() == 0 { return Ok(()); }
+        let system_from = self.tx_key().system_time;
+        let mut checked_rows = 0;
+        if !table.is_owned_event_data() && let Ok(valid_time) = Interval::new(system_from, Timestamp::MAX)
+            && check_writer_table(table).is_ok()
+        {
+            let iids = iids.clone().map(|iid| {
+                let iid = iid?;
+                self.context.check_cancelled()?;
+                checked_rows += 1;
+                Ok(iid)
+            });
+            let batch = rtdb_format::data::owned_delete_batch(iids, system_from, valid_time, &self.context.memory);
+            if batch.and_then(|batch| self.buffer.append_batch(table, batch)).is_ok() {
+                return Ok(());
+            }
+        }
+        // Batch admission leaves positions untouched on failure. Keep the cancellation checks
+        // the prefix already passed so a later cancelled row cannot mask an earlier append error.
+        for (row, iid) in iids.enumerate() {
+            let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None,
+                iid: iid?, system_from, valid_time: Interval::new(system_from, Timestamp::MAX)?,
+                operation: StoredOperation::Delete, recency: None };
+            if row < checked_rows {
+                self.buffer.append_to(table, event)?;
+            } else {
+                self.append(table.clone(), event)?;
+            }
+        }
+        Ok(())
     }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
 
@@ -4244,6 +4278,13 @@ fn document_table(operation: &Operation) -> Option<&TableRef> {
     }
 }
 
+fn check_writer_table(table: &TableRef) -> Result<()> {
+    if is_replay_table(table) || *table == receipts_table() || is_bounded_receipts_table(table) || TableRef::owned_schema(&table.schema) {
+        check_table(table)?;
+    }
+    Ok(())
+}
+
 fn check_table(table: &TableRef) -> Result<()> {
     if is_reserved_write_schema(&table.schema) {
         return Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}", table_name(table)))
@@ -6086,6 +6127,61 @@ mod tests {
         let mut buffer = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
         stage_mutation_tombstones(&mut buffer, &table, &page, MutationKind::Erase, key.system_time, &memory)?;
         assert_eq!(buffer.stage()?.tables()[&table].batch().unwrap().len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn source_delete_pages_keep_the_valid_prefix_and_first_row_error() -> Result<()> {
+        let memory = MemoryBudget::new(256 << 10);
+        let context = ResolveContext {
+            decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
+            owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(), cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let table = TableRef::new("public", "items");
+        let base = rtdb_index::PartitionState::empty(Default::default())?;
+        let options = SubmitOptions::default();
+        let mut tx = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+        tx.append_arrow_deletes(&table, (0u8..64).map(|id| Ok(Iid([id; 16]))))?;
+
+        let bad_page = (64u8..67).map(|id| {
+            if id == 65 { Err(Anomaly::incorrect("xtdb/invalid-id", "Invalid source ID")) }
+            else { Ok(Iid([id; 16])) }
+        });
+        let hold = memory.reserve(memory.limit_bytes() - memory.used_bytes() - 1024)?;
+        let error = tx.append_arrow_deletes(&table, bad_page.clone()).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        drop(hold);
+        let error = tx.append_arrow_deletes(&table, bad_page).unwrap_err();
+        assert_eq!(error.code, "xtdb/invalid-id");
+
+        let owned = OwnedRelation::new("items")?.table("owner");
+        assert!(owned.is_owned_event_data());
+        let error = tx.append_arrow_deletes(&owned, std::iter::once(Ok(Iid([65; 16])))).unwrap_err();
+        assert_eq!(error.code, "xtdb/forbidden-table");
+
+        let cancelling_page = (65u8..68).map(|id| {
+            if id == 66 { context.cancellation.cancel(); }
+            Ok(Iid([id; 16]))
+        });
+        let error = tx.append_arrow_deletes(&table, cancelling_page).unwrap_err();
+        assert_eq!(error.code, "xtdb/transaction-cancelled");
+
+        let writes = tx.buffer.stage()?;
+        let events = writes.tables()[&table].batch().unwrap();
+        assert_eq!(events.len(), 66);
+        for id in 0..66u8 {
+            let event = events.header(usize::from(id))?;
+            assert_eq!(event.position.unwrap().ordinal, u64::from(id));
+            assert_eq!(event.iid, Iid([id; 16]));
+            assert_eq!(event.op, EventOp::Delete);
+            assert_eq!(event.valid_time, Interval::new(key.system_time, Timestamp::MAX)?);
+        }
         Ok(())
     }
 
