@@ -803,7 +803,7 @@ The author commands and execution keys stay with the Original reader.
 
 ### Flight wire
 
-The same v4 session sends `rtdb.v1.OriginalFamilyLanding` with the following JSON object:
+The same v4 session sends `rtdb.v1.OriginalFamilyLanding` using this JSON shape.
 
 ```json
 {
@@ -874,6 +874,8 @@ Both author objects have fields `receipt` (the exact author selector from the ac
 The command, business receipt and slot are literal Text IDs in the commissioned v5 relations.
 The mapping digest is for the existing v5 `body` projection.
 The command, business outcome and both ciphertext digests are checked at the exact author Then cut, alongside the native contributor pair.
+These co-written points use valid time zero and the interval `[0, i64::MAX)`.
+The independent approval publisher also retains the commissioned v5 positive author settlement for each author.
 First-only acquisition uses identical author objects and selectors.
 The selected cursor matches the reviewed cut.
 
@@ -881,7 +883,7 @@ The completion authority publishes a positive comparison after the exact claimed
 Its comparison digest commits that evidence, and its expiry must cover the hold cutoff.
 The disposition authority publishes a positive terminal after the exact reader and its execution custody have settled.
 Use `released` for a disposed reader whose completed handoff can proceed, or `cancelled` to fence the hold.
-Neither completion, consumption nor expiry settles the reader for family drain.
+Family drain waits for this disposition even after completion, consumption or expiry.
 The installed evidence publisher must retain the exact disposition for recovery and preserve current authorization through the final acceptance while its evidence still applies.
 
 The paired lane owns the v3 credential issuer, the independently retained application authorization and its invalidation, the comparison and reader disposition publishers, and the private runner.

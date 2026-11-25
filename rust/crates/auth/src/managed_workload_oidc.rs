@@ -611,6 +611,7 @@ mod tests {
         for (name, operation, other) in [
             ("release", OriginalCustodyOperation::Release, OriginalCustodyOperation::Dispose),
             ("dispose", OriginalCustodyOperation::Dispose, OriginalCustodyOperation::Release),
+            ("private-replay", OriginalCustodyOperation::PrivateReplay, OriginalCustodyOperation::Release),
         ] {
             let claim = json!({
                 "version": 3, "audience": "cell", "database": "db", "incarnation": authority.incarnation,
@@ -625,6 +626,7 @@ mod tests {
             assert!(principal.authorize_database("db", DatabaseAccess::Write).is_err());
             let grant = principal.workload_grant().unwrap();
             assert!(grant.is_original_custody_control());
+            assert_eq!(grant.is_original_private_replay(), operation == OriginalCustodyOperation::PrivateReplay);
             assert!(!grant.is_assignment());
             assert!(grant.assignment("db", authority.incarnation, Timestamp(0)).is_err());
             assert_eq!(grant.admit_original_custody("db", authority, operation, Timestamp(0)).unwrap(), Timestamp(800_000));

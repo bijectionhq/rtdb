@@ -504,6 +504,7 @@ impl FamilyCall<'_> {
         authors: &RetainedAuthoring,
     ) -> Result<VerifiedRetainedReview, Status> {
         if review.cut.branch != managed.scope.branch
+            || review.cut.basis.incarnation() != managed.scope.authority.incarnation
             || review.cut.basis < managed.created()?
             || review.cut.basis > managed.head
             || record.group != review.group

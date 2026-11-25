@@ -131,6 +131,7 @@ pub(super) struct ReplayHold {
     query: RetainedReviewQuery,
     session_sha256: [u8; 32],
     key_generation: u64,
+    author_placements: [[u8; 16]; 2],
     expires_at: Timestamp,
     phase: ReplayPhase,
     disposition: Option<Disposition>,
@@ -349,6 +350,24 @@ impl ReplayHold {
             return Err(denied());
         }
         self.check_current_review(&index, reserved)?;
+        let layout = route.family_readback_layout.as_ref().ok_or_else(denied)?;
+        for (placement, author) in self
+            .author_placements
+            .into_iter()
+            .zip([&self.authorization.original, &self.authorization.selected])
+        {
+            super::super::original_family_readback::verify_replay_author(
+                &index,
+                layout,
+                &self.review,
+                self.created,
+                placement,
+                author,
+                basis(&author.receipt.basis)?,
+                author.receipt.system_time_micros,
+                SystemClock.now(),
+            )?;
+        }
         let approvals = route.private_replay.as_ref().ok_or_else(denied)?;
         let (_, digest) = approvals
             .read::<Authorization>(nonzero(&self.reference.hold)?, "authorize")
@@ -464,7 +483,6 @@ impl FamilyCall<'_> {
         let authorization_sha256 = nonzero(&authorization_sha256)?;
         let route = managed.route;
         let approvals = route.private_replay.as_ref().ok_or_else(denied)?;
-        let layout = route.family_readback_layout.as_ref().ok_or_else(denied)?;
         let lock = self
             .vault
             .lock(self.authority, self.family)
@@ -537,10 +555,7 @@ impl FamilyCall<'_> {
         if SystemClock.now() >= expires_at || !call.session.holds_attachment(&managed.database) {
             return Err(denied());
         }
-        for (author, expected) in [
-            (first, &authorization.original),
-            (winner, &authorization.selected),
-        ] {
+        for expected in [&authorization.original, &authorization.selected] {
             for commitment in [
                 &expected.sealed_replay_sha256,
                 &expected.request_fingerprint_sha256,
@@ -548,15 +563,6 @@ impl FamilyCall<'_> {
             ] {
                 nonzero::<32>(commitment)?;
             }
-            super::super::original_family_readback::verify_replay_author(
-                &index,
-                layout,
-                &author.order,
-                expected,
-                basis(&expected.receipt.basis)?,
-                expected.receipt.system_time_micros,
-                SystemClock.now(),
-            )?;
         }
         let key_generation = verified.proof.key_generation.ok_or_else(denied)?;
         let imported = driver.classic_workload_fence().cloned();
@@ -591,6 +597,7 @@ impl FamilyCall<'_> {
             query: verified.query,
             session_sha256: super::super::custody::session_binding(call),
             key_generation,
+            author_placements: [first.order.placement, winner.order.placement],
             expires_at,
             phase: ReplayPhase::Held {},
             disposition: None,

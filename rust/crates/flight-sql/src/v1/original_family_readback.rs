@@ -789,7 +789,9 @@ impl Readback<'_> {
 pub(super) fn verify_replay_author(
     index: &BranchIndex,
     layout: &OriginalFamilyReadbackLayout,
-    order: &rtdb_node::serving::custody_release::NativeAuthoring,
+    review: &rtdb_node::serving::custody_release::NativeLandingReview,
+    created: Basis,
+    placement: [u8; 16],
     evidence: &super::original_family_landing::private_replay::AuthorEvidence,
     written: Basis,
     system_time_micros: i64,
@@ -797,12 +799,17 @@ pub(super) fn verify_replay_author(
 ) -> Result<(), Status> {
     use super::original_family_landing::wire::nonzero;
     let cut = index.exact(written).map_err(error::anomaly)?;
-    if cut.system_time.0 != system_time_micros || order.target.table != layout.carrier {
+    let entry = index.custody_placement_at(review.group, placement, written)
+        .map_err(error::anomaly)?.ok_or_else(denied)?;
+    if cut.system_time.0 != system_time_micros || !entry.occurrence.is_some_and(|occurrence| {
+        occurrence.written == written && occurrence.target.table == layout.carrier
+            && occurrence.target.branch == review.cut.branch
+    }) {
         return Err(denied());
     }
-    let mapping_id = EntityId::String(format!("{}:{}", encode_hex(&order.group), encode_hex(&order.placement)));
+    let mapping_id = EntityId::String(format!("{}:{}", encode_hex(&review.group), encode_hex(&placement)));
     let mapping = index.receipt_written_local_point(
-        &order.target.branch, order.branch_created, written, &layout.member_mapping, &mapping_id,
+        &review.cut.branch, created, written, &layout.member_mapping, &mapping_id,
     ).map_err(error::anomaly)?.ok_or_else(denied)?;
     committed_body(mapping, "body", &nonzero(&evidence.mapping_sha256)?)?;
     let view = index.view(MAIN_BRANCH, At::Exactly(written), Layer::Merged, now).map_err(error::anomaly)?;
