@@ -158,25 +158,8 @@ impl Reservation {
             return Err(invalid());
         }
         let source: proto::CustodyReviewedSource = decode_proto(&reviewed_source_b64)?;
-        let cut = source.cut.as_ref().ok_or_else(invalid)?;
-        let original = source.original.as_ref().ok_or_else(invalid)?;
-        let selected = source.selected.as_ref().ok_or_else(invalid)?;
-        let group = original.group.as_slice().try_into().map_err(|_| invalid())?;
-        let original_commitment = original.occurrence.as_slice().try_into().map_err(|_| invalid())?;
-        let selected_commitment = selected.occurrence.as_slice().try_into().map_err(|_| invalid())?;
         let order = NativeLandingOrder {
-            review: NativeLandingReview {
-                group,
-                original: original_commitment,
-                selected: selected_commitment,
-                cut: CustodyReview {
-                    branch: cut.branch.clone(),
-                    basis: Basis::from_bytes(&cut.basis.as_ref().ok_or_else(invalid)?.value)
-                        .map_err(error::anomaly)?,
-                    valid_at: rtdb_types::Timestamp(cut.valid_at_micros),
-                    inventory_sha256: cut.inventory_sha256.as_slice().try_into().map_err(|_| invalid())?,
-                },
-            },
+            review: native_review(&source)?,
             reserve_key,
             accept_key,
             destination,
@@ -187,6 +170,8 @@ impl Reservation {
             receipt,
             proof,
         };
+        let original = source.original.as_ref().ok_or_else(invalid)?;
+        let selected = source.selected.as_ref().ok_or_else(invalid)?;
         let landing = Landing {
             assertion,
             order,
@@ -206,6 +191,23 @@ impl Reservation {
         };
         Ok((landing, source))
     }
+}
+
+fn native_review(source: &proto::CustodyReviewedSource) -> Result<NativeLandingReview, Status> {
+    let cut = source.cut.as_ref().ok_or_else(invalid)?;
+    let original = source.original.as_ref().ok_or_else(invalid)?;
+    let selected = source.selected.as_ref().ok_or_else(invalid)?;
+    Ok(NativeLandingReview {
+        group: original.group.as_slice().try_into().map_err(|_| invalid())?,
+        original: original.occurrence.as_slice().try_into().map_err(|_| invalid())?,
+        selected: selected.occurrence.as_slice().try_into().map_err(|_| invalid())?,
+        cut: CustodyReview {
+            branch: cut.branch.clone(),
+            basis: Basis::from_bytes(&cut.basis.as_ref().ok_or_else(invalid)?.value).map_err(error::anomaly)?,
+            valid_at: rtdb_types::Timestamp(cut.valid_at_micros),
+            inventory_sha256: cut.inventory_sha256.as_slice().try_into().map_err(|_| invalid())?,
+        },
+    })
 }
 
 impl FamilyCall<'_> {

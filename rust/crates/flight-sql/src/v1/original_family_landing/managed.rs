@@ -27,11 +27,18 @@ pub(in crate::v1) const MANAGED_FEATURE: &str = "row-custody.managed-original-fa
 pub(in crate::v1) const REGISTERED_AUTHORING: &str = "row-custody.managed-registered-authoring";
 pub(in crate::v1) const RETAINED_AUTHORING_REVIEW: &str = "row-custody.managed-retained-authoring-review";
 
-struct RetainedAuthoring {
-    original: AuthorReceipt,
-    selected: AuthorReceipt,
-    read_proof: String,
-    claim: String,
+pub(super) struct RetainedAuthoring {
+    pub(super) original: AuthorReceipt,
+    pub(super) selected: AuthorReceipt,
+    pub(super) read_proof: String,
+    pub(super) claim: String,
+}
+
+pub(super) struct VerifiedRetainedReview {
+    pub(super) proof: CustodyReadProof,
+    pub(super) query: RetainedReviewQuery,
+    pub(super) original_frame: Vec<u8>,
+    pub(super) selected_frame: Option<Vec<u8>>,
 }
 
 pub(in crate::v1) struct ManagedFamily<'a> {
@@ -41,8 +48,8 @@ pub(in crate::v1) struct ManagedFamily<'a> {
     pub scope: &'a OriginalFamilyGrant,
     pub head: Basis,
     pub expires_at: Timestamp,
-    namespace: [u8; 32],
-    point: &'a Point,
+    pub(super) namespace: [u8; 32],
+    pub(super) point: &'a Point,
 }
 
 impl ManagedFamily<'_> {
@@ -442,9 +449,30 @@ impl FamilyCall<'_> {
         let lock = self.vault.lock(self.authority, self.family).await.map_err(error::anomaly)?;
         let record = lock.family().map_err(error::anomaly)?.clone();
         record.live().map_err(error::anomaly)?;
-        let review = &landing.order.review;
-        if !matches_landing(managed.scope, &landing) || review.cut.basis > managed.head
+        let verified = self.verify_retained_review(managed, call, &record, &landing.order.review, evidence, &authors).await?;
+        landing.retained_query = Some(verified.query);
+        self.reserve(
+            lock, record, landing, evidence, &verified.original_frame,
+            verified.selected_frame.as_deref().unwrap_or(&verified.original_frame),
+        ).await.map_err(error::anomaly)?;
+        self.check_retained_review_delivery(managed, call, &verified.proof).await?;
+        Ok(ok())
+    }
+
+    pub(super) async fn verify_retained_review(
+        &self,
+        managed: &ManagedFamily<'_>,
+        call: &Call,
+        record: &Family,
+        review: &NativeLandingReview,
+        evidence: &proto::CustodyReviewedSource,
+        authors: &RetainedAuthoring,
+    ) -> Result<VerifiedRetainedReview, Status> {
+        if review.cut.branch != managed.scope.branch
+            || review.cut.basis < managed.created()?
+            || review.cut.basis > managed.head
             || record.group != review.group
+            || record.group != managed.scope.group
         {
             return Err(denied());
         }
@@ -507,12 +535,12 @@ impl FamilyCall<'_> {
         } else {
             Some(self.retained_authoring_frame(managed, call, &record, &authors.selected, selected).await?)
         };
-        landing.retained_query = Some(RetainedReviewQuery { proof: hash(&read_proof), claim: hash(claim.as_bytes()) });
-        self.reserve(
-            lock, record, landing, evidence, &original_frame, selected_frame.as_deref().unwrap_or(&original_frame),
-        ).await.map_err(error::anomaly)?;
-        self.check_retained_review_delivery(managed, call, &proof).await?;
-        Ok(ok())
+        Ok(VerifiedRetainedReview {
+            proof,
+            query: RetainedReviewQuery { proof: hash(&read_proof), claim: hash(claim.as_bytes()) },
+            original_frame,
+            selected_frame,
+        })
     }
 
     async fn check_retained_review_delivery(
@@ -604,7 +632,7 @@ impl FamilyCall<'_> {
         self.retained_placement_in(managed, call, record, key).await
     }
 
-    async fn retained_placement_in(
+    pub(super) async fn retained_placement_in(
         &self,
         managed: &ManagedFamily<'_>,
         call: &Call,
