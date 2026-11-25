@@ -81,19 +81,20 @@ impl Encoder {
         if batch.declared_schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
         self.encode_reserved(batch.batch(), reserve_batch(batch.batch(), memory)?)
     }
-    pub(crate) fn reserved_batch(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
+    pub(crate) fn reserved_singleton(&mut self, batch: RecordBatch, charge: Arc<MemoryReservation>, bound: usize) -> Result<Vec<FlightData>, Status> {
         if batch.schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
-        if charge.bytes() < batch_bound(batch)? { return Err(invalid("Flight batch exceeds its reservation")); }
+        if charge.bytes() < bound { return Err(invalid("Flight batch exceeds its reservation")); }
         self.encode_reserved(batch, charge)
     }
-    fn encode_reserved(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
+    fn encode_reserved(&mut self, batch: impl std::borrow::Borrow<RecordBatch>, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
         use std::{mem::size_of, sync::OnceLock};
 
         let mut charge = Arc::try_unwrap(charge)
             .map_err(|_| Status::internal("Flight batch encoding requires an exclusive reservation"))?;
         let (dictionaries, data) = IpcDataGenerator::default()
-            .encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression)
+            .encode(batch.borrow(), &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression)
             .map_err(arrow)?;
+        drop(batch);
 
         let reservation = Arc::new(OnceLock::new());
         let mut frames = Vec::with_capacity(add(dictionaries.len(), 1)?);

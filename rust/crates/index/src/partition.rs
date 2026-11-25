@@ -88,14 +88,20 @@ impl CheckpointTries {
 #[derive(Clone, Debug)]
 pub struct BlockPreparation {
     captured: Arc<PartitionValue>,
-    metadata: BTreeMap<TableRef, TableMeta>,
+    metadata: Arc<PreparedBlockMetadata>,
+}
+
+#[derive(Debug, Default)]
+struct PreparedBlockMetadata {
+    tables: BTreeMap<TableRef, TableMeta>,
+    hll_reservations: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
 impl BlockPreparation {
     pub fn block_index(&self) -> BlockIndex { self.captured.live.block_index() }
     pub fn value(&self) -> &Arc<PartitionValue> { &self.captured }
-    pub fn metadata(&self) -> &BTreeMap<TableRef, TableMeta> { &self.metadata }
-    pub fn table_catalog(&self) -> Result<TableCatalog> { self.captured.table_catalog.fold(&self.metadata) }
+    pub fn metadata(&self) -> &BTreeMap<TableRef, TableMeta> { &self.metadata.tables }
+    pub fn table_catalog(&self) -> Result<TableCatalog> { self.captured.table_catalog.fold(self.metadata()) }
     pub fn table_blocks(&self, tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<BTreeMap<TableRef, TableBlock>> {
         let mut trie_catalog = self.captured.trie_catalog.as_ref().clone();
         for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
@@ -441,8 +447,13 @@ impl PartitionState {
     }
     pub fn prepare_block(&self) -> Result<BlockPreparation> {
         let captured = self.value();
-        let metadata = captured.live.block_metadata()?;
-        Ok(BlockPreparation { captured, metadata })
+        let mut metadata = PreparedBlockMetadata::default();
+        for (table, live) in captured.live.tables() {
+            let (table_metadata, hll_reservation) = live.block_metadata()?;
+            metadata.tables.insert(table.clone(), table_metadata);
+            metadata.hll_reservations.extend(hll_reservation);
+        }
+        Ok(BlockPreparation { captured, metadata: Arc::new(metadata) })
     }
 
     /// Installs the full catalog from an independently rewritten recovery block.
@@ -496,7 +507,7 @@ impl PartitionState {
             CatalogPublication::Suspended if epoch > old_epoch && epoch == value.trie_catalog.naming_epoch() => CatalogPublication::Untracked,
             publication => publication,
         };
-        let table_catalog = value.table_catalog.adopt(block, &prepared.metadata)?;
+        let table_catalog = value.table_catalog.adopt(block, prepared.metadata())?;
         if !table_catalog.tables().keys().eq(table_blocks.keys()) {
             return Err(invalid("Table blocks do not match the adopted checkpoint registry"));
         }

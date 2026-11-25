@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 use arrow_array::{Array, cast::AsArray};
 use arrow_schema::Field;
@@ -23,9 +23,17 @@ impl BloomFilter {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(self.bitmap.serialized_size());
-        self.bitmap.serialize_into(&mut output).map_err(invalid)?;
+        let mut output = Vec::with_capacity(self.serialized_size());
+        self.write_bytes(&mut output)?;
         Ok(output)
+    }
+
+    pub(crate) fn serialized_size(&self) -> usize {
+        self.bitmap.serialized_size()
+    }
+
+    pub(crate) fn write_bytes(&self, output: impl Write) -> Result<()> {
+        self.bitmap.serialize_into(output).map_err(invalid)
     }
 
     /// Adds bit positions in bulk; sorted and de-duplicated first, they enter the bitmap as one union.
@@ -84,7 +92,11 @@ impl BloomFilter {
     }
 
     pub fn contains_hashes(&self, hash1: i32, hash2: i32) -> bool {
-        hashes(hash1, hash2).into_iter().all(|hash| self.bitmap.contains(hash))
+        self.contains_positions(&hashes(hash1, hash2))
+    }
+
+    pub fn contains_positions(&self, positions: &[u32; BLOOM_K as usize]) -> bool {
+        positions.iter().all(|&position| self.bitmap.contains(position))
     }
 
     pub fn contains_cell(&self, field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
@@ -94,8 +106,13 @@ impl BloomFilter {
 
     /// Whether a byte-backed value's persisted-column hashes are all present.
     pub fn contains_value(&self, value: &Value) -> Result<bool> {
+        Ok(self.contains_positions(&Self::byte_value_positions(value)?))
+    }
+
+    /// The positions to probe in a persisted column Bloom filter for a byte-backed value.
+    pub fn byte_value_positions(value: &Value) -> Result<[u32; BLOOM_K as usize]> {
         let (first, second) = byte_hashes(value)?;
-        Ok(self.contains_hashes(first, second))
+        Ok(hashes(first, second))
     }
 
     pub fn intersects(&self, other: &Self) -> bool { !self.bitmap.is_disjoint(&other.bitmap) }

@@ -1,10 +1,10 @@
-use std::io::Write;
+use std::{io::Write, mem::size_of, sync::Arc};
 
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, cast::AsArray, types::*};
 use arrow_schema::{DataType, TimeUnit as ArrowTimeUnit};
 use base64::write::EncoderWriter;
 use rtdb_columnar::ArrowCell;
-use rtdb_types::{ListKind, Result, TimeUnit};
+use rtdb_types::{ListKind, MemoryBudget, Result, TimeUnit};
 
 use super::{MAX_DEPTH, STANDARD, TransitValue as T, invalid, stringable, value_to_transit};
 use crate::temporal_text::{TimestampText, date_text, interval_text, nanos, time_text, timestamp_text};
@@ -22,16 +22,90 @@ pub fn write_arrow_row_json(output: &mut impl Write, batch: &RecordBatch, row: u
     write_struct(output, cells, true, 0)
 }
 
+/// Writes a batch as an array of embedded typed Transit rows.
+/// The memory budget covers routing scratch. The caller owns the output buffer and its admission.
+pub fn write_arrow_batch_json(
+    output: &mut impl Write,
+    batch: &RecordBatch,
+    memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    if batch.num_rows() == 0 {
+        return bytes(output, b"[]");
+    }
+    let fields = batch.schema_ref().fields();
+    let count = fields.len();
+    if fields.windows(2).all(|pair| pair[0].name() < pair[1].name())
+        || (count <= 8 && fields.iter().enumerate().all(|(index, field)| {
+            fields[..index].iter().all(|previous| previous.name() != field.name())
+        }))
+    {
+        return write_rows(output, batch, 0..count);
+    }
+
+    let scratch = count.checked_mul(size_of::<(usize, usize)>())
+        .ok_or_else(|| invalid("Transit column routing exceeds addressable memory"))?;
+    let reservation = memory.reserve(scratch)?;
+    let mut routes = Vec::new();
+    routes.try_reserve_exact(count).map_err(invalid)?;
+    routes.extend((0..count).map(|index| (index, index)));
+    routes.sort_unstable_by(|&(left, _), &(right, _)| {
+        fields[left].name().cmp(fields[right].name()).then_with(|| left.cmp(&right))
+    });
+    routes.dedup_by(|&mut (next, _), (first, last)| {
+        if fields[next].name() == fields[*first].name() {
+            *last = next;
+            true
+        } else {
+            false
+        }
+    });
+    if routes.len() == count {
+        drop(routes);
+        drop(reservation);
+        return write_rows(output, batch, 0..count);
+    }
+    routes.sort_unstable_by_key(|&(first, _)| first);
+    write_rows(output, batch, routes.iter().map(|&(_, last)| last))
+}
+
+fn write_rows(
+    output: &mut impl Write,
+    batch: &RecordBatch,
+    indices: impl Iterator<Item = usize> + Clone,
+) -> Result<()> {
+    let fields = batch.schema_ref().fields();
+    bytes(output, b"[")?;
+    for row in 0..batch.num_rows() {
+        if row > 0 {
+            bytes(output, b",")?;
+        }
+        let cells = indices.clone().map(|index| ArrowCell {
+            field: &fields[index],
+            array: batch.column(index).as_ref(),
+            row,
+        });
+        write_struct_fields(output, cells, true, 0)?;
+    }
+    bytes(output, b"]")
+}
+
 fn bytes(output: &mut impl Write, data: &[u8]) -> Result<()> {
     output.write_all(data).map_err(invalid)
 }
 
 fn text(output: &mut impl Write, value: &str) -> Result<()> {
     if value.starts_with(['~', '^', '`']) {
-        serde_json::to_writer(output, &format!("~{value}")).map_err(invalid)
+        prefixed_text(output, "~", value)
     } else {
         serde_json::to_writer(output, value).map_err(invalid)
     }
+}
+
+fn prefixed_text(output: &mut impl Write, prefix: &str, value: &str) -> Result<()> {
+    serde::Serializer::collect_str(
+        &mut serde_json::Serializer::new(output),
+        &format_args!("{prefix}{value}"),
+    ).map_err(invalid)
 }
 
 fn write_struct<'a>(output: &mut impl Write, cells: impl Iterator<Item = ArrowCell<'a>>, typed_structs: bool, depth: usize) -> Result<()> {
@@ -330,7 +404,7 @@ fn write_typed_leaf(output: &mut impl Write, cell: ArrowCell<'_>, key: bool, dep
         (DataType::Utf8, Some("xt/clj-keyword" | "uri")) => {
             let value = array.as_string::<i32>().value(row);
             let prefix = if extension == Some("uri") { rtdb_types::UriParts::parse(value)?; "~r" } else { "~:" };
-            quoted(output, top, |output| json(output, &format!("{prefix}{value}")))?;
+            quoted(output, top, |output| prefixed_text(output, prefix, value))?;
             return Ok(true);
         }
         (DataType::Int32, Some(tag @ ("xt/oid" | "xt/regclass" | "xt/regproc"))) => {

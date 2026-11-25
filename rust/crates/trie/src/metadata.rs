@@ -47,10 +47,18 @@ pub struct PruningOptions {
 /// A false result means no put in the page can match.
 /// With temporal pruning bypassed or any IID-compatible page missing temporal bounds or recency, returns all IID-compatible pages in input order and skips the predicate.
 pub fn select_pages<'a>(pages: &'a [PageSummary], options: PruningOptions, content_matches: impl FnMut(&PageSummary) -> bool) -> Vec<&'a PageSummary> {
+    select_pages_from_iter(pages.iter(), options, content_matches)
+}
+
+/// Applies the selection rules of [`select_pages`] to summaries borrowed from the caller's storage.
+#[doc(hidden)]
+pub fn select_pages_from_iter<'a>(
+    pages: impl Iterator<Item = &'a PageSummary>, options: PruningOptions, content_matches: impl FnMut(&PageSummary) -> bool,
+) -> Vec<&'a PageSummary> {
     let mut eligible = Vec::new();
     let mut emitted = Vec::new();
     let mut dependent = Vec::new();
-    select_pages_with_scratch(pages, options, content_matches, &mut eligible, &mut emitted, &mut dependent);
+    select_pages_impl(pages, options, content_matches, &mut eligible, &mut emitted, &mut dependent);
     emitted
 }
 
@@ -60,13 +68,20 @@ pub fn select_pages<'a>(pages: &'a [PageSummary], options: PruningOptions, conte
 /// Capacity for one reference per page in each worklist avoids growth during selection.
 #[doc(hidden)]
 pub fn select_pages_with_scratch<'a>(
-    pages: &'a [PageSummary], options: PruningOptions, mut content_matches: impl FnMut(&PageSummary) -> bool,
+    pages: &'a [PageSummary], options: PruningOptions, content_matches: impl FnMut(&PageSummary) -> bool,
+    eligible: &mut Vec<&'a PageSummary>, emitted: &mut Vec<&'a PageSummary>, dependent: &mut Vec<&'a PageSummary>,
+) {
+    select_pages_impl(pages.iter(), options, content_matches, eligible, emitted, dependent);
+}
+
+fn select_pages_impl<'a>(
+    pages: impl Iterator<Item = &'a PageSummary>, options: PruningOptions, mut content_matches: impl FnMut(&PageSummary) -> bool,
     eligible: &mut Vec<&'a PageSummary>, emitted: &mut Vec<&'a PageSummary>, dependent: &mut Vec<&'a PageSummary>,
 ) {
     eligible.clear();
     emitted.clear();
     dependent.clear();
-    eligible.extend(pages.iter().filter(|page| match (options.iid, page.iid_range) {
+    eligible.extend(pages.filter(|page| match (options.iid, page.iid_range) {
         (Some(iid), Some((lower, upper))) => lower <= iid && iid <= upper,
         _ => true,
     }));
@@ -140,6 +155,49 @@ mod tests {
         select_pages_with_scratch(&pages, PruningOptions { bypass_temporal_pruning: true, ..options },
             |_| panic!("Bypassed pruning must skip content checks"), &mut eligible, &mut emitted, &mut dependent);
         assert_eq!(emitted, [&pages[0], &pages[1], &pages[2]]);
+    }
+
+    #[test]
+    fn borrowed_selection_preserves_candidate_identity_and_order() {
+        let page = |page_index| PageSummary {
+            page_index,
+            temporal: Some(TemporalSummary {
+                min_valid_from: Timestamp(10), max_valid_to: Timestamp(20),
+                min_system_from: Timestamp(5), max_system_from: Timestamp(5),
+            }),
+            recency: Some(Timestamp(100)),
+            iid_range: None,
+        };
+        let pages = [
+            page(8),
+            page(3),
+            PageSummary { temporal: Some(TemporalSummary {
+                min_valid_from: Timestamp::MIN, max_valid_to: Timestamp::MAX,
+                min_system_from: Timestamp(50), max_system_from: Timestamp(50),
+            }), ..page(5) },
+            PageSummary { temporal: None, recency: None, iid_range: Some((Iid::MIN, Iid::MIN)), ..page(2) },
+            PageSummary { recency: None, ..page(6) },
+        ];
+        let options = PruningOptions {
+            bounds: TemporalBounds {
+                valid_time: Interval::new(Timestamp(10), Timestamp(30)).unwrap(),
+                system_time: Interval::new(Timestamp(0), Timestamp(10)).unwrap(),
+            },
+            projects_temporal_columns: true, clamp_valid_time: false, bypass_temporal_pruning: false,
+            iid: Some(Iid([9; 16])),
+        };
+        let mut visited = Vec::new();
+        let selected = select_pages_from_iter([2, 0, 3, 1].into_iter().map(|index| &pages[index]), options, |page| {
+            visited.push(page.page_index);
+            std::ptr::eq(page, &pages[0])
+        });
+        assert_eq!(visited, [8, 3]);
+        assert_eq!(selected.len(), 3);
+        assert!(selected.into_iter().zip([0, 2, 1]).all(|(page, index)| std::ptr::eq(page, &pages[index])));
+
+        let selected = select_pages_from_iter([2, 0, 3, 1, 4].into_iter().map(|index| &pages[index]), options,
+            |_| panic!("Missing recency must skip content checks"));
+        assert_eq!(selected, [&pages[2], &pages[0], &pages[1], &pages[4]]);
     }
 }
 

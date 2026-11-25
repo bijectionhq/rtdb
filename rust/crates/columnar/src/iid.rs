@@ -72,6 +72,13 @@ fn validate_values(values: &FixedSizeBinaryArray) -> Result<()> {
     } else { Ok(()) }
 }
 
+pub fn iid_data_type(encoding: Option<RunEndWidth>) -> Result<DataType> {
+    let Some(width) = encoding else { return Ok(DataType::FixedSizeBinary(16)); };
+    let value = Box::new(LogicalType::Scalar(ScalarType::FixedSizeBinary(16)));
+    let field = crate::to_field("_iid", &LogicalType::RunEndEncoded { width, value })?;
+    Ok(field.data_type().clone())
+}
+
 /// Encodes consecutive equal IIDs as runs when a width is supplied.
 /// Logical length must fit the selected signed run-end width.
 pub fn build_iids(iids: &[Iid], encoding: Option<RunEndWidth>) -> Result<ArrayRef> {
@@ -103,10 +110,7 @@ pub fn build_iids(iids: &[Iid], encoding: Option<RunEndWidth>) -> Result<ArrayRe
         }
         None => return Err(Anomaly::fault("rtdb/iid-encoding", "Plain IID encoding was not handled")),
     };
-    let width = encoding.ok_or_else(|| Anomaly::fault("rtdb/iid-encoding", "Run-end width was not supplied"))?;
-    let logical = LogicalType::RunEndEncoded { width, value: Box::new(LogicalType::Scalar(ScalarType::FixedSizeBinary(16))) };
-    let field = crate::to_field("_iid", &logical)?;
-    let data = runs.to_data().into_builder().data_type(field.data_type().clone()).build().map_err(super::arrow_error)?;
+    let data = runs.to_data().into_builder().data_type(iid_data_type(encoding)?).build().map_err(super::arrow_error)?;
     Ok(make_array(data))
 }
 

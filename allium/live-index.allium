@@ -244,6 +244,7 @@ entity StagedTxTable {
     -- A typed staging copy reserves its selected positions and output arrays under the transaction memory budget.
     -- Staging packs row-backed writes and collects their positions alongside the existing Arrow event positions in command order.
     -- Native SQL puts can stage compatible document columns directly from the mutation query batch.
+    -- Compatible SQL tombstone pages receive the same transaction ordinals as row-backed writes in command order.
     -- A run of puts from one Arrow struct layout retains its schema and event order across the union legs that supply it.
     -- Puts from different struct layouts can share one Arrow batch while retaining the declarations of their original layouts.
     -- Staging preserves event assembly when a batch from different struct layouts is combined with other writes.
@@ -741,6 +742,7 @@ rule FinishBlock {
     -- Triggered when the boundary is read back: by the leader at its own term, or by a follower reading a durable one.
     -- By log order the live index now holds exactly this block's transactions, so its durable contents are written to block storage.
     -- Rows remain in memory until NextBlock.
+    -- The native block preparation holds the table cardinality sketches and their register reservations together until the preparation is released.
     --
     -- Because resolution paused at the boundary and stays paused until the block is adopted, nothing was staged and applied in between — so a durable L0 block never contains rows from a later block.
     when: FinishBlock(index, block_idx)

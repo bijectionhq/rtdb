@@ -38,6 +38,15 @@ pub(crate) type ArrowVector = (ArrayRef, Arc<ArrowField>, Option<LogicalType>);
 type StoredVector = (ArrayRef, Arc<ArrowField>, Option<LogicalType>, Option<Arc<MemoryReservation>>);
 type FragmentVector<'a> = (&'a ArrayRef, &'a Arc<ArrowField>, &'a Option<LogicalType>, &'a Arc<MemoryReservation>);
 
+#[derive(Clone, Copy)]
+pub(crate) struct FundedArrowCell<'a> {
+    pub array: &'a ArrayRef,
+    pub field: &'a Arc<ArrowField>,
+    pub logical: Option<&'a LogicalType>,
+    pub owner: &'a Arc<MemoryReservation>,
+    pub row: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct SelectedColumn {
     sources: Arc<Vec<Option<StoredVector>>>,
@@ -474,6 +483,17 @@ fn arrow_value_bound(array: &dyn Array, field: &ArrowField, logical: Option<&Log
 }
 
 impl Column {
+    pub(crate) fn funded_arrow_cell<'a>(&'a self, row: usize, owner: &'a Arc<MemoryReservation>)
+        -> Option<Option<FundedArrowCell<'a>>> {
+        match self {
+            Self::Arrow { array, field, logical } => Some(Some(FundedArrowCell { array, field, logical: logical.as_ref(), owner, row })),
+            Self::Selected(column) => Some(column.source(row).ok()?.map(|((array, field, logical, custody), row)| {
+                FundedArrowCell { array, field, logical: logical.as_ref(), owner: custody.as_ref().unwrap_or(owner), row }
+            })),
+            Self::Values(_) => None,
+        }
+    }
+
     pub(crate) fn arrow_cell(&self, row: usize) -> Option<Option<(&dyn Array, &ArrowField, Option<&LogicalType>, usize)>> {
         match self {
             Self::Arrow { array, field, logical } => Some(Some((array.as_ref(), field, logical.as_ref(), row))),
@@ -2212,11 +2232,13 @@ pub(crate) fn gather_with_funded_columns(rows: &[ResolvedRow<(u32, u32)>], sourc
         cells.push((source, op.value_offset(position)));
     }
     let cells = Arc::new(cells);
-    // How much a gathered column holds depends on which cells it picks, so each is charged as soon as it is built.
-    let mut reservation = memory.reserve(256)?;
+    let base = columns.len().checked_mul(size_of::<Column>())
+        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+    let mut reservation = memory.reserve(base)?;
     let mut output = Vec::with_capacity(columns.len());
+    let mut appended = Vec::new();
     for (position, field) in columns.iter().enumerate() {
-        let (column, _charge) = if let Some(derived) = derived(position)? {
+        let (column, charge) = if let Some(derived) = derived(position)? {
             derived
         } else {
             let column = match field.name.as_str() {
@@ -2235,10 +2257,53 @@ pub(crate) fn gather_with_funded_columns(rows: &[ResolvedRow<(u32, u32)>], sourc
             (column, None)
         };
         let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-        lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+        match charge {
+            Some(charge) => {
+                if appended.is_empty() {
+                    let trailing = columns.len() - position;
+                    let bytes = trailing.checked_mul(size_of::<Arc<MemoryReservation>>())
+                        .and_then(|bytes| lease.bytes().checked_add(bytes)).ok_or_else(size_error)?;
+                    lease.grow_to(bytes)?;
+                    appended.reserve_exact(trailing);
+                }
+                appended.push(charge);
+            }
+            None if appended.is_empty() => {
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+            }
+            None => appended.push(memory.reserve(column.retained_bytes()?)?),
+        }
         output.push(column);
     }
-    ColumnBatch::settled(output, rows.len(), reservation)
+    Ok(ColumnBatch { columns: output, len: rows.len(), reservation, appended })
+}
+
+#[test]
+fn a_funded_gather_keeps_the_original_charge_through_replay() {
+    let memory = MemoryBudget::new(1 << 20);
+    let fields = ["_valid_from", "funded", "_system_to"].into_iter().enumerate().map(|(i, name)| Field {
+        id: rtdb_plan::ColumnId(i as u32), name: name.into(), qualifier: None,
+        qualified_only: false, unnamed: false, data_type: LogicalType::Null,
+    }).collect::<Vec<_>>();
+    let owner = memory.reserve(8192).unwrap();
+    let original = Arc::downgrade(&owner);
+    let mut funded = Some((Column::Arrow {
+        array: Arc::new(NullArray::new(0)), field: Arc::new(ArrowField::new("funded", DataType::Null, true)),
+        logical: Some(LogicalType::Null),
+    }, Some(owner)));
+    let output = gather_with_funded_columns(&[], &[], &fields, &memory, |i| {
+        Ok(if i == 1 { funded.take() } else { None })
+    }).unwrap();
+
+    assert_eq!(Arc::as_ptr(output.column_reservation(1)), original.as_ptr());
+    assert_eq!(memory.used_bytes(), 8192 + 256 + 3 * size_of::<Column>() + 2 * size_of::<Arc<MemoryReservation>>()
+        + output.columns[0].retained_bytes().unwrap() + output.columns[2].retained_bytes().unwrap());
+    let replay = output.duplicate_for_replay(&memory).unwrap();
+    drop(output);
+    assert_eq!(Arc::as_ptr(replay.column_reservation(1)), original.as_ptr());
+    drop(replay);
+    assert!(original.upgrade().is_none());
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 /// A temporal column as microsecond UTC timestamps; an upper bound at the end of time reads as null.
@@ -3090,7 +3155,7 @@ impl SelectedColumn {
     }
 }
 
-fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {
+pub(crate) fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {
     stable_values(logical) && rtdb_columnar::execution_type(logical) == *logical && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == *logical)
 }
 

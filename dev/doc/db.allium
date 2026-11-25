@@ -1015,6 +1015,7 @@ config {
 --      Each L0 page retains Arrow statistics for the metadata file and releases temporary allocations for scanning that page.
 --      The metadata writer aligns those arrays to the joined schema and writes the existing node tags and page order.
 --      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
+--      The native live trie writer declares its event fields under a schema reservation before gathering any leaf.
 --      The live trie writer aligns compatible Arrow chunk layouts to the captured schema before gathering the leaf's selected positions.
 --      An encoded document column gathers physical run positions and coalesces consecutive values with identical stored representations.
 --      A selected named union leg can use its logical field over compatible stored Arrow buffers.
@@ -1024,6 +1025,7 @@ config {
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.
 --      Per-table cardinality sketches hash the captured live Arrow cells in physical field order and exclude logical nulls.
+--      Native block preparation retains one funded sketch per observed put column, including bottom columns and columns whose selected cells are all absent.
 --      Block GC's per-table sweep depends on this — see block-gc.allium, EveryTableBlockAtCurrentIndex.
 --   4. Build and persist the block file, carrying the boundary's term and its position within that term, which are what seed a restarted node's fence and term position, and stamp the database's last-upload time.
 --   5. Append the upload to the replica log and await it.
@@ -1224,6 +1226,9 @@ rule LeaderProcessesTx {
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
+        -- Ordinary SQL delete and erase stage compatible Arrow selections as event pages in selection order.
+        -- Each SQL erase page is staged before its rows drive receipt metadata retirement in selection order.
+        -- Receipt retirement derives the canonical erasure IID from the selected receipt identity.
         -- A SQL put can retain a complete scalar Arrow column when it encodes the same document bytes as canonical staging.
         -- An ordered put run retains a common Arrow struct layout across the dense union legs that supply its documents.
         -- Alternating put runs admit each Arrow source once and admit payload by the selected row positions.
@@ -2214,6 +2219,9 @@ surface QueryAccess {
         -- The projection admits its own copied values, descriptors, and validity storage.
         -- System catalog and inspection scans batch their produced rows at the scan boundary.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- Transaction metadata projection selects compatible receipt or original event payloads by Arrow position and keeps their backing charged while the selection is held.
+        -- A transaction metadata projection requiring value reads owns its decoded results under a separate charge.
+        -- Archive history and owned event projections write resolved transaction bounds, physical timestamps and assertion coordinates into typed Arrow columns.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- It emits a null where every operand is null.
         -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
