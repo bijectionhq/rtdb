@@ -1970,7 +1970,7 @@ mod tests {
     async fn vacant_range_covers_future_matching_activation_and_expiry() -> Result<()> {
         use rtdb_storage::{MemoryStore, ObjectKey, cache::BufferPool};
 
-        use super::super::tree::{Address, Item, Key, KeyRow};
+        use super::super::{postings::KeyRow, tree::{Address, Item, Key}};
 
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let memory = MemoryBudget::new(16 << 20);
