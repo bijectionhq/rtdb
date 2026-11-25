@@ -1698,6 +1698,9 @@ rule ConsumeIntake {
 -- A child of that retained view pins the same Root and Held positions under its own retention.
 -- Ordering checks the immediate source's standing and unchanged archive binding.
 -- The ordered registration checks the source Held generation and binds both prepared positions to the new child.
+-- A provisional fork pin belongs to its original directory reservation in one incarnation and log epoch.
+-- Release on ordered refusal requires confirmation of the original transaction in the same history and an exact directory comparison.
+-- A committed fork alternative determines registration at its original source coordinate. An inconsistent read leaves the provisional pin held.
 -- A point on the retained child reads the archived Held replacement or tombstone first and consults the pinned Root only for an unshadowed identity.
 -- When the winning event carries an assertion ordinal, the point reply carries it with the winning line and event revision.
 -- For a positioned Held winner, the point certifies the clock published with that event.

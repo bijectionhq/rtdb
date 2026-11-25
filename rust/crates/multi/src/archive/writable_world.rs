@@ -4,7 +4,7 @@ use arrow_array::{ArrayRef, NullArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, WorldForkReservation, now_ms};
-use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldRegistrationOutcome, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::{AppliedReadFloor, NativeSession, OwnedReadSession, OwnedWorldRegistrationOutcome, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, OwnedWorldAssertion, PlacedAttemptScope, Result, StructFields,
     Timestamp, TransactionKey, Value, WorldClockMode, WorldSchemas, WorldShadow,
@@ -18,7 +18,9 @@ use super::{
 };
 use crate::admin::update_installation;
 
+mod fork_pin;
 mod held;
+use fork_pin::{ForkDisposition, ForkPin, ForkPinWrite, select_pin_write};
 pub(crate) use held::{HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 
 fn now() -> Timestamp {
@@ -1031,44 +1033,81 @@ async fn register_fork_pin(
     let unavailable = OwnedWorld::unavailable;
     let pin = Uuid::from_bytes(world.pin.0);
     let binding = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
+    let WorldForkReservation::Registering(token) = reservation else { return Err(unavailable()); };
+    let owns_pin = binding.fork_reservation == Some(reservation);
     let has_alternative = fork.root.as_ref().is_some_and(|root| !root.refusal.is_empty());
     let outcome = match admit_session(session, installed, &binding.owner) {
         Ok(()) => session.register_owned_world_checked(world, fork).await?,
         Err(error) => OwnedWorldRegistrationOutcome::Refused(error),
     };
-    let disposition = match outcome {
-        OwnedWorldRegistrationOutcome::Refused(error) => Err(error),
-        OwnedWorldRegistrationOutcome::Ordered(outcome) if !outcome.committed() =>
-            Err(outcome.error().cloned().unwrap_or_else(unavailable)),
+    let (result, disposition) = match outcome {
+        OwnedWorldRegistrationOutcome::Refused(error) => (Err(error), ForkDisposition::NeverSubmitted),
         OwnedWorldRegistrationOutcome::Ordered(outcome) => {
             let key = outcome.tx_key();
-            let registered = !has_alternative || session.open_owned_read().await?.registered_world_at(world, key).await?;
-            Ok((key, registered))
+            let floor = owns_pin.then(|| {
+                let history = Uuid::parse_str(deployment).map_err(|_| unavailable())?;
+                AppliedReadFloor::new(history, vec![key])
+            }).transpose()?;
+            let inspect_world = outcome.committed() && has_alternative;
+            let (registered, certified) = match (floor.as_ref(), inspect_world) {
+                (Some(floor), true) => {
+                    let held = session.open_applied_owned_read(floor).await?;
+                    (held.registered_world_at(world, key).await?, true)
+                }
+                (Some(floor), false) => {
+                    let confirmed = session.confirm_hosted_source_prefix(floor.history(), Some(floor)).await?;
+                    (outcome.committed(), confirmed.is_some())
+                }
+                (None, true) => (session.open_owned_read().await?.registered_world_at(world, key).await?, false),
+                (None, false) => (outcome.committed(), false),
+            };
+            if owns_pin && !certified { return Err(unavailable()); }
+            let result = if outcome.committed() {
+                Ok((key, registered))
+            } else {
+                Err(outcome.error().cloned().unwrap_or_else(unavailable))
+            };
+            (result, ForkDisposition::Ordered { registered, certified })
         }
     };
-    if binding.fork_reservation == Some(reservation) {
-        let registered = disposition.as_ref().is_ok_and(|&(_, registered)| registered);
-        update_installation(directory, deployment, |current| {
-            if current.incarnation != installed.incarnation || current.log_epoch != installed.log_epoch {
-                return Ok(());
-            }
-            settle_fork_pin(current, pin, binding, registered);
+    if owns_pin {
+        let original = fork_pin_key(installed, pin, token);
+        let settled = update_installation(directory, deployment, |current| {
+            settle_fork_pin(current, original, binding, disposition);
             Ok(())
         }).await?;
+        if settled.checkpoint_worlds.get(&pin).is_some_and(|binding| binding.fork_reservation == Some(reservation)) {
+            return Err(unavailable());
+        }
     }
-    disposition
+    result
+}
+
+fn fork_pin_key(installation: &DeploymentRecord, pin: Uuid, token: Uuid) -> ForkPin {
+    ForkPin {
+        incarnation: installation.incarnation,
+        log_epoch: installation.log_epoch,
+        pin: pin.as_u128(),
+        reservation: token.as_u128(),
+    }
 }
 
 fn settle_fork_pin(
-    current: &mut DeploymentRecord, pin: Uuid, expected: &CheckpointWorldRetention, registered: bool,
+    current: &mut DeploymentRecord, original: ForkPin, expected: &CheckpointWorldRetention,
+    disposition: ForkDisposition,
 ) {
-    if current.checkpoint_worlds.get(&pin) != Some(expected) { return; }
-    if registered {
-        if let Some(binding) = current.checkpoint_worlds.get_mut(&pin) {
-            binding.fork_reservation = None;
+    let pin = Uuid::from_u128(original.pin);
+    let Some(binding) = current.checkpoint_worlds.get(&pin) else { return; };
+    let Some(WorldForkReservation::Registering(token)) = binding.fork_reservation else { return; };
+    let observed = fork_pin_key(current, pin, token);
+    match select_pin_write(original, observed, binding == expected, disposition) {
+        Some(ForkPinWrite::Publish(pin)) => {
+            if let Some(binding) = current.checkpoint_worlds.get_mut(&Uuid::from_u128(pin)) {
+                binding.fork_reservation = None;
+            }
         }
-    } else {
-        current.checkpoint_worlds.remove(&pin);
+        Some(ForkPinWrite::Release(pin)) => { current.checkpoint_worlds.remove(&Uuid::from_u128(pin)); }
+        None => {}
     }
 }
 
@@ -1422,7 +1461,8 @@ mod tests {
     fn refusing_a_fork_releases_only_its_own_directory_reservation() -> Result<()> {
         let mut installation = DeploymentRecord::new("application", "org", Vec::new(), 0);
         let pin = Uuid::new_v4();
-        let token = WorldForkReservation::Registering(Uuid::new_v4());
+        let token = Uuid::new_v4();
+        let reservation = WorldForkReservation::Registering(token);
         let binding = CheckpointWorldRetention {
             fork_reservation: None, world: pin, ancestors: Vec::new(), owner: "owner".into(),
             capture: Uuid::new_v4(), manifest_sha256: "manifest".into(), schema_digest: [0; 32],
@@ -1431,18 +1471,28 @@ mod tests {
         };
         let predecessor = Uuid::new_v4();
         installation.checkpoint_worlds.insert(predecessor, binding.clone());
-        reserve_fork_pin(&mut installation, pin, &binding, token, false)?;
+        reserve_fork_pin(&mut installation, pin, &binding, reservation, false)?;
         let held = installation.checkpoint_worlds[&pin].clone();
+        let original = fork_pin_key(&installation, pin, token);
         assert!(reserve_fork_pin(&mut installation, pin, &binding,
             WorldForkReservation::Registering(Uuid::new_v4()), false).is_err());
 
-        settle_fork_pin(&mut installation, pin, &held, false);
+        let unconfirmed = ForkDisposition::Ordered { registered: false, certified: false };
+        let refused = ForkDisposition::Ordered { registered: false, certified: true };
+        let registered = ForkDisposition::Ordered { registered: true, certified: true };
+        settle_fork_pin(&mut installation, original, &held, unconfirmed);
+        assert_eq!(installation.checkpoint_worlds[&pin], held);
+        let mut replacement = installation.clone();
+        replacement.incarnation += 1;
+        settle_fork_pin(&mut replacement, original, &held, refused);
+        assert_eq!(replacement.checkpoint_worlds[&pin], held);
+        settle_fork_pin(&mut installation, original, &held, refused);
         assert!(!installation.checkpoint_worlds.contains_key(&pin));
         assert_eq!(installation.checkpoint_worlds[&predecessor], binding);
 
-        reserve_fork_pin(&mut installation, pin, &binding, token, false)?;
-        settle_fork_pin(&mut installation, pin, &held, true);
-        settle_fork_pin(&mut installation, pin, &held, false);
+        reserve_fork_pin(&mut installation, pin, &binding, reservation, false)?;
+        settle_fork_pin(&mut installation, original, &held, registered);
+        settle_fork_pin(&mut installation, original, &held, refused);
         assert_eq!(installation.checkpoint_worlds[&pin], binding);
 
         let prepared = Uuid::new_v4();
@@ -1450,9 +1500,10 @@ mod tests {
         child.fork_reservation = Some(WorldForkReservation::Prepared);
         child.world = prepared;
         installation.checkpoint_worlds.insert(prepared, child.clone());
-        reserve_fork_pin(&mut installation, prepared, &child, token, true)?;
+        reserve_fork_pin(&mut installation, prepared, &child, reservation, true)?;
         let held = installation.checkpoint_worlds[&prepared].clone();
-        settle_fork_pin(&mut installation, prepared, &held, false);
+        let original = fork_pin_key(&installation, prepared, token);
+        settle_fork_pin(&mut installation, original, &held, ForkDisposition::NeverSubmitted);
         assert!(!installation.checkpoint_worlds.contains_key(&prepared));
         Ok(())
     }
