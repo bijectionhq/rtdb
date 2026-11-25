@@ -1733,6 +1733,7 @@ mod retained_release_tests {
         operations.push(Operation::Public(TxOp::OwnedCheckRange {
             relation: relation.clone(), basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(3), system_time: Timestamp(4) },
             scope, frontier: 0, until: Timestamp(100), region: None,
+            revealed: None,
         }));
         let local_window = TxOp::OwnedCheckWorldPurge {
             relation: local.clone(), pin, frontier: 0, local_frontier: Some(0),

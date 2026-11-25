@@ -2586,7 +2586,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 continue;
             }
-            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, region }) = operation {
+            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, region, revealed }) = operation {
                 let base = self.buffer.base_snapshot();
                 let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",
                     "Owned range witness is no longer admissible");
@@ -2601,15 +2601,23 @@ impl<'a> OpenTransaction<'a> {
                 let head = base.relation_event_frontier(&relation.table(owner))?;
                 if head != *frontier {
                     let exact = async {
-                        let Some(region) = region.as_deref() else { return Ok(false); };
                         let context = self.context.query_context(
                             base.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
                         )?;
-                        match region {
-                            rtdb_types::OwnedRangeEvidence::FixedPath(evidence) =>
-                                rtdb_query::verify_owned_fixed_range(&context, &base, owner, relation, *basis, *frontier, head, evidence).await,
-                            rtdb_types::OwnedRangeEvidence::Entity { anchor, region } =>
-                                rtdb_query::verify_owned_entity_region(&context, &base, owner, relation, *basis, *frontier, head, *anchor, region).await,
+                        let exact = match region.as_deref() {
+                            None => false,
+                            Some(rtdb_types::OwnedRangeEvidence::FixedPath(evidence)) =>
+                                rtdb_query::verify_owned_fixed_range(&context, &base, owner, relation, *basis, *frontier, head, evidence).await?,
+                            Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) =>
+                                rtdb_query::verify_owned_entity_region(&context, &base, owner, relation, *basis, *frontier, head, *anchor, region).await?,
+                        };
+                        // A change that leaves everything the reader revealed
+                        // unchanged does not abort it, so a hidden write is
+                        // never disclosed by the abort.
+                        match revealed {
+                            Some(revealed) if !exact =>
+                                rtdb_query::verify_owned_revealed_range(&context, &base, owner, relation, *basis, *frontier, head, revealed).await,
+                            _ => Ok(exact),
                         }
                     }.await.unwrap_or(false);
                     if !exact {
@@ -2646,24 +2654,48 @@ impl<'a> OpenTransaction<'a> {
                 }
                 continue;
             };
-            // A revealed read holds over its clock interval, from its valid
-            // instant through acceptance. An unchanged version at an instant
-            // acceptance has not passed needs no further read.
+            let stale = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering");
+            let undetermined = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/undetermined-point",
+                "The owned point changes inside the observation's clock interval");
+            // The decision's clock interval, or else the read's valid instant
+            // through acceptance. A read whose projection changes inside it
+            // is undetermined.
             let accepted = self.decision_time();
-            if same_version && accepted <= observed {
+            let interval = match revealed.clock {
+                Some(clock) if accepted >= clock.upper() => return Err(undetermined()),
+                Some(clock) => Interval::new(observed.min(clock.lower()), clock.upper().max(upper))?,
+                None => Interval::new(observed, accepted.max(observed).0.checked_add(1).map(Timestamp)
+                    .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's clock interval has no following microsecond"))?)?,
+            };
+            if same_version && interval == Interval::new(observed, upper)? {
                 continue;
             }
-            let through = accepted.max(observed).0.checked_add(1).map(Timestamp)
-                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's clock interval has no following microsecond"))?;
-            if !rtdb_query::owned_point_reveals(context, owner, relation, id, Interval::new(observed, through)?, *revealed).await? {
-                return Err(if same_version {
-                    // The values changed at an instant inside the reader's
-                    // clock interval, so the read is undetermined.
-                    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/undetermined-point",
-                        "The owned point changes inside the observation's clock interval")
-                } else {
-                    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering")
-                });
+            let current = rtdb_query::owned_revealed_timeline(context, owner, relation, id, interval, &revealed.hidden).await?
+                .and_then(|timeline| rtdb_query::owned_revealed_constant(&timeline, interval));
+            // An unchanged winner is what the reader saw; it only has to hold
+            // throughout the interval.
+            if same_version {
+                if current.is_some_and(|current| current.is_some() == expected.is_some()) { continue; }
+                return Err(undetermined());
+            }
+            // What the reader saw: absence, or its winner's projection at the
+            // winner's own system time.
+            let original = match expected {
+                None => Some(None),
+                Some(version) => {
+                    let at = self.context.query_context(
+                        self.buffer.base_snapshot(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+                    )?;
+                    let at = at.with_owned_system_cut(version.history, &at.cancellation).map_err(|_| stale())?;
+                    rtdb_query::owned_revealed_timeline(at, owner, relation, id, interval, &revealed.hidden).await?
+                        .and_then(|timeline| rtdb_query::owned_revealed_constant(&timeline, interval))
+                        .filter(|projection| projection.is_some())
+                },
+            };
+            match (original, current) {
+                (Some(original), Some(current)) if original == current => {},
+                (Some(_), Some(_)) => return Err(stale()),
+                _ => return Err(undetermined()),
             }
         }
         self.check_shared_column_retirement(owner, operations, archive_replay).await?;

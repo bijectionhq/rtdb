@@ -1275,6 +1275,7 @@ async fn owned_range_witness_checks_only_its_relation_before_mutation() {
     let check = |witness_scope, until| TxOp::OwnedCheckRange {
         relation: watched.clone(), basis: initial.result().tx_key(), scope: witness_scope, frontier: 1, until: Timestamp(until),
         region: None,
+        revealed: None,
     };
     let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put(&other)]), &context).await.unwrap();
@@ -1338,6 +1339,7 @@ async fn entity_region_refuses_a_shadowed_phantom_and_allows_disjoint_assertions
         region: Some(Arc::new(OwnedRangeEvidence::Entity {
             anchor: 1, region: OwnedEntityRegion { id: id.clone(), valid },
         })),
+        revealed: None,
     };
     let disjoint = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put("other", 425, 475), put("wanted", 500, 600)]), &context).await.unwrap();
@@ -1401,6 +1403,7 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
     let check = |basis, frontier, revision| TxOp::OwnedCheckRange {
         relation: relation.clone(), basis, scope, frontier, until: Timestamp(200),
         region: Some(Arc::new(rtdb_types::OwnedRangeEvidence::FixedPath(FixedRangeEvidence { rule: rule.clone(), revision, lower: Some(lower.clone()), upper: Some(upper.clone()) }))),
+        revealed: None,
     };
     let other = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put("zz", 5, 400, 500), put("middle", 8, 500, 550)]), &context).await.unwrap();

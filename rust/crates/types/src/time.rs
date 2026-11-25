@@ -189,32 +189,68 @@ pub struct OwnedPointVersion {
     pub history: Timestamp,
 }
 
-/// What a reader saw of an owned point at its clock: absence, or a present
-/// winner's revealed columns committed by `rtdb_query::owned_revealed_digest`.
-/// A check carrying it is validated by these values, not by the version: a
-/// change the reader could not see keeps it valid, and the values must hold
-/// at every instant from the read's valid instant to acceptance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OwnedRevealed {
-    Absent,
-    Present([u8; 32]),
+/// The projection a reader revealed of what it observed. A check carrying
+/// it compares that projection, not the version: every stored column except
+/// system time, validity endpoints, private RTDB metadata and `hidden` (the
+/// columns the reader could not open). The projection must be the same at the
+/// reader's cut and at acceptance, and constant over the clock interval the
+/// decision depends on: `clock`, or else the read's valid instant through
+/// acceptance. A change inside that interval leaves the read undetermined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedRevealed {
+    pub hidden: Vec<String>,
+    pub clock: Option<Interval>,
 }
 
 impl OwnedRevealed {
-    /// The commit wire form: empty for absence, the 32-byte digest otherwise.
+    pub const MAX_HIDDEN: usize = 64;
+
+    /// `[flags][lower, upper: i64 BE if flags & 1][count: u16 BE][len: u16 BE, UTF-8 name]*`.
     pub fn from_wire(bytes: &[u8]) -> Option<Self> {
-        match bytes.len() {
-            0 => Some(Self::Absent),
-            32 => Some(Self::Present(bytes.try_into().ok()?)),
-            _ => None,
+        let (&flags, mut rest) = bytes.split_first()?;
+        let clock = match flags {
+            0 => None,
+            1 => {
+                let (lower, tail) = rest.split_first_chunk::<8>()?;
+                let (upper, tail) = tail.split_first_chunk::<8>()?;
+                rest = tail;
+                let clock = Interval::new(Timestamp(i64::from_be_bytes(*lower)), Timestamp(i64::from_be_bytes(*upper))).ok()?;
+                if clock.is_empty() { return None; }
+                Some(clock)
+            }
+            _ => return None,
+        };
+        let (count, mut rest) = rest.split_first_chunk::<2>()?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if count > Self::MAX_HIDDEN { return None; }
+        let mut hidden = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (length, tail) = rest.split_first_chunk::<2>()?;
+            let (name, tail) = tail.split_at_checked(usize::from(u16::from_be_bytes(*length)))?;
+            rest = tail;
+            let name = std::str::from_utf8(name).ok()?;
+            if name.is_empty() || hidden.last().is_some_and(|previous: &String| previous.as_str() >= name) { return None; }
+            hidden.push(name.to_owned());
         }
+        rest.is_empty().then_some(Self { hidden, clock })
     }
 
-    pub fn to_wire(self) -> Vec<u8> {
-        match self {
-            Self::Absent => Vec::new(),
-            Self::Present(digest) => digest.to_vec(),
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut bytes = vec![u8::from(self.clock.is_some())];
+        if let Some(clock) = self.clock {
+            bytes.extend(clock.lower().0.to_be_bytes());
+            bytes.extend(clock.upper().0.to_be_bytes());
         }
+        bytes.extend((self.hidden.len() as u16).to_be_bytes());
+        for name in &self.hidden {
+            bytes.extend((name.len() as u16).to_be_bytes());
+            bytes.extend(name.as_bytes());
+        }
+        bytes
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        64 + self.hidden.iter().map(|name| name.len() + 24).sum::<usize>()
     }
 }
 

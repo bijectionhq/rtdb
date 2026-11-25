@@ -1779,9 +1779,11 @@ pub enum TxOp {
         relation: rtdb_types::OwnedRelation, basis: rtdb_types::TransactionKey,
         scope: rtdb_types::PlacedAttemptScope, frontier: i64, until: Timestamp,
         region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
+        /// After the frontier moved, accept changes that leave what the reader revealed unchanged.
+        revealed: Option<rtdb_types::OwnedRevealed>,
     },
-    /// Revalidate one point. With `revealed`, the reader's revealed values
-    /// (or absence) must hold at every instant from `valid_at` to acceptance;
+    /// Revalidate one point. With `revealed`, the reader's revealed projection
+    /// (or absence) must be unchanged and constant over its clock interval;
     /// the version is only the fast path. Without it, the version must match.
     OwnedCheck {
         relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp,

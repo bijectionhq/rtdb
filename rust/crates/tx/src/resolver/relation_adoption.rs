@@ -696,6 +696,7 @@ mod tests {
                 ops.push(TxOp::OwnedCheck { relation: publications.clone(), id, valid_at: Timestamp(200), expected, revealed: None });
                 ops.push(TxOp::OwnedCheckRange {
                     relation: relation.clone(), basis: key(3, 200), scope, frontier, until: Timestamp(900), region: None,
+                    revealed: None,
                 });
             }
             Ok(SourceTransaction::new(ops, options.clone(), &memory)?.with_placed_seed(Some(scope.issue())))

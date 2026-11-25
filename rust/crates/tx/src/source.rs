@@ -892,8 +892,9 @@ fn operation_value<'a>(
             body.insert("rule".into(), rule.to_value());
             "rtdb-owned-fixed-range-v1"
         }
-        Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, region }) => {
+        Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, region, revealed }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("revealed".into(), revealed.as_ref().map_or(Value::Null, |revealed| Value::Binary(revealed.to_wire())));
             body.insert("basis_id".into(), Value::I64(basis.tx_id.0));
             body.insert("basis_time".into(), Value::I64(basis.system_time.0));
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
@@ -902,16 +903,16 @@ fn operation_value<'a>(
             match region.as_deref() {
                 Some(rtdb_types::OwnedRangeEvidence::FixedPath(fixed)) => {
                     body.insert("fixed".into(), fixed.to_value());
-                    "rtdb-owned-check-range-v2"
+                    "rtdb-owned-check-range-v5"
                 },
                 Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) => {
                     body.insert("anchor".into(), Value::I64(*anchor));
                     body.insert("entity".into(), region.id.as_value());
                     body.insert("valid_from".into(), Value::I64(region.valid.lower().0));
                     body.insert("valid_to".into(), Value::I64(region.valid.upper().0));
-                    "rtdb-owned-check-range-v3"
+                    "rtdb-owned-check-range-v6"
                 },
-                None => "rtdb-owned-check-range-v1",
+                None => "rtdb-owned-check-range-v4",
             }
         }
         Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, attempt, fingerprint, root }) => {
@@ -1026,7 +1027,7 @@ fn operation_value<'a>(
             body.insert("valid_at".into(), Value::I64(valid_at.0));
             body.insert("expected_history".into(), expected.map_or(Value::Null, |version| Value::I64(version.history.0)));
             body.insert("expected_position".into(), expected.map_or(Value::Null, |version| Value::Binary(version.position.to_bytes().to_vec())));
-            body.insert("expected_revealed".into(), revealed.map_or(Value::Null, |revealed| Value::Binary(revealed.to_wire())));
+            body.insert("expected_revealed".into(), revealed.as_ref().map_or(Value::Null, |revealed| Value::Binary(revealed.to_wire())));
             "rtdb-owned-check-v3"
         }
         Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, expiry, scope }) => {
@@ -2515,9 +2516,9 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-world-purge-v3" => &["relation", "pin", "frontier", "local_frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
             "rtdb-owned-check-world-clock-v1" => &["scope", "world", "pin", "before"],
-            "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
-            "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
-            "rtdb-owned-check-range-v3" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "anchor", "entity", "valid_from", "valid_to"],
+            "rtdb-owned-check-range-v4" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "revealed"],
+            "rtdb-owned-check-range-v5" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed", "revealed"],
+            "rtdb-owned-check-range-v6" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "anchor", "entity", "valid_from", "valid_to", "revealed"],
             "rtdb-owned-check-v3" => &["relation", "id", "valid_at", "expected_history", "expected_position", "expected_revealed"],
             "rtdb-owned-erase-v2" => &["relation", "id"],
             "rtdb-owned-sweep-expired-v2" => &["relation", "id", "created", "expiry", "scope"],
@@ -2738,7 +2739,7 @@ impl SourceOperationReader<'_> {
                     rule: rtdb_types::FixedRangeRule::from_value(&value("rule")?)?,
                 }
             }
-            "rtdb-owned-check-range-v1" | "rtdb-owned-check-range-v2" | "rtdb-owned-check-range-v3" => {
+            "rtdb-owned-check-range-v4" | "rtdb-owned-check-range-v5" | "rtdb-owned-check-range-v6" => {
                 let (Value::Utf8(relation), Value::I64(basis_id), Value::I64(basis_time),
                     Value::Binary(scope), Value::I64(frontier), Value::I64(until)) =
                     (value("relation")?, value("basis_id")?, value("basis_time")?, value("scope")?, value("frontier")?, value("until")?)
@@ -2749,10 +2750,10 @@ impl SourceOperationReader<'_> {
                     scope: rtdb_types::PlacedAttemptScope::decode(&scope)?,
                     frontier, until: Timestamp(until),
                     region: match name.as_str() {
-                        "rtdb-owned-check-range-v2" => Some(Arc::new(rtdb_types::OwnedRangeEvidence::FixedPath(
+                        "rtdb-owned-check-range-v5" => Some(Arc::new(rtdb_types::OwnedRangeEvidence::FixedPath(
                             rtdb_types::FixedRangeEvidence::from_value(&value("fixed")?)?,
                         ))),
-                        "rtdb-owned-check-range-v3" => {
+                        "rtdb-owned-check-range-v6" => {
                             let (Value::I64(anchor), Value::I64(from), Value::I64(to)) =
                                 (value("anchor")?, value("valid_from")?, value("valid_to")?)
                             else { return Err(invalid("Owned entity range witness has invalid bounds")); };
@@ -2767,6 +2768,7 @@ impl SourceOperationReader<'_> {
                         },
                         _ => None,
                     },
+                    revealed: read_revealed(value("revealed")?)?,
                 }
             }
             "rtdb-owned-check-world-scope-v1" | "rtdb-owned-check-world-clock-v1" => {
@@ -2904,12 +2906,7 @@ impl SourceOperationReader<'_> {
                         }
                         _ => return Err(invalid("Owned observation has an invalid revision")),
                     };
-                    let revealed = match value("expected_revealed")? {
-                        Value::Null => None,
-                        Value::Binary(bytes) => Some(rtdb_types::OwnedRevealed::from_wire(&bytes)
-                            .ok_or_else(|| invalid("Owned observation has an invalid revealed commitment"))?),
-                        _ => return Err(invalid("Owned observation has an invalid revealed commitment")),
-                    };
+                    let revealed = read_revealed(value("expected_revealed")?)?;
                     TxOp::OwnedCheck { relation, id, valid_at: Timestamp(valid_at), expected, revealed }
                 } else {
                     TxOp::OwnedDelete { relation, id, valid_from: optional_timestamp(value("_valid_from")?)?, valid_to: optional_timestamp(value("_valid_to")?)? }
@@ -3216,6 +3213,15 @@ fn read_relative_period(body: &StructArray, row: usize) -> Result<OwnedRelativeP
         offset("to_offset_micros")?,
     )
     .ok_or_else(|| invalid("Invalid original relative period bounds"))
+}
+
+fn read_revealed(value: Value) -> Result<Option<rtdb_types::OwnedRevealed>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Binary(bytes) => rtdb_types::OwnedRevealed::from_wire(&bytes).map(Some)
+            .ok_or_else(|| invalid("Owned observation has an invalid revealed projection")),
+        _ => Err(invalid("Owned observation has an invalid revealed projection")),
+    }
 }
 
 fn optional_timestamp(value: Value) -> Result<Option<Timestamp>> {

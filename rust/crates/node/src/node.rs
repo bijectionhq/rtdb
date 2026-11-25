@@ -1505,17 +1505,27 @@ pub struct OwnedRangeWitness {
     frontier: i64,
     until: Timestamp,
     region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
+    /// What the committing reader revealed, supplied with the witness at commit.
+    revealed: Option<rtdb_types::OwnedRevealed>,
 }
 
 impl OwnedRangeWitness {
     pub fn operation(self) -> TxOp {
         TxOp::OwnedCheckRange {
             relation: self.relation, basis: self.basis, scope: self.scope, frontier: self.frontier, until: self.until, region: self.region,
+            revealed: self.revealed,
         }
+    }
+
+    /// Validate this range by the reader's revealed projection once its frontier moves.
+    pub fn revealing(mut self, revealed: Option<rtdb_types::OwnedRevealed>) -> Self {
+        self.revealed = revealed;
+        self
     }
 
     pub fn retained_bytes(&self) -> usize {
         self.region.as_ref().map_or(0, |region| region.retained_bytes())
+            + self.revealed.as_ref().map_or(0, rtdb_types::OwnedRevealed::retained_bytes)
     }
 
     pub fn same_range(&self, other: &Self) -> bool { self.region == other.region && self.until == other.until }
@@ -3137,6 +3147,7 @@ impl OwnedReadSession {
         Ok(Some(OwnedRangeWitness {
             relation: relation.clone(), basis: self.present, scope, frontier,
             until: expiry.map_or(self.witness_until, |expiry| expiry.min(self.witness_until)), region: None,
+            revealed: None,
         }))
     }
 
