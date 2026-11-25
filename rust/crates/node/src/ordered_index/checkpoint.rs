@@ -9,7 +9,7 @@ use arrow_array::{
 };
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, retain_buffer_with_owner};
 use rtdb_storage::{Error, IoRegion, ObjectKey, cache::BufferPool};
 use rtdb_types::Result;
 use serde::{Deserialize, Serialize};
@@ -313,12 +313,14 @@ pub(super) async fn latest(
     let size = usize::try_from(object.size).map_err(format_error)?;
     let decode_bound = size.saturating_mul(7).saturating_add(4096);
     let input = store.exact_object_allocation(&object.key, size)?;
-    let read_bound = input.retained_bytes.max(size).saturating_add(input.scratch_bytes);
+    let retained_bytes = input.retained_bytes.max(size);
+    let read_bound = retained_bytes.saturating_add(input.scratch_bytes);
     let mut opening = Arc::into_inner(memory.reserve(decode_bound.saturating_add(read_bound))?)
         .expect("a fresh manifest reservation has one owner");
-    let input = opening.split_off(read_bound)?;
+    let retained = opening.split_off(retained_bytes)?;
+    let read_scratch = opening.split_off(input.scratch_bytes)?;
     let read = IoRegion::retaining(
-        Arc::clone(&input),
+        Arc::new((Arc::clone(&retained), read_scratch)),
         store.observe_fresh_exact(&object.key, size),
     )
     .await.map_err(|error| match error {
@@ -332,7 +334,8 @@ pub(super) async fn latest(
         return Err(format_error("Ordered index manifest version changed"));
     }
     let mut checkpoint = if read.value.starts_with(&ipc::CONTINUATION) {
-        let backing = Buffer::from(read.value);
+        // A pointer can keep an Arrow fence slice after the manifest is decoded.
+        let backing = retain_buffer_with_owner(&Buffer::from(read.value), retained);
         decode_manifest(ipc::decode_buffer(backing.clone(), 1)?, &backing, &mut opening)?
     } else if store.ordered_index_arrow_only() {
         return Err(format_error("The installed ordered index checkpoint requires Arrow IPC"));
