@@ -41,6 +41,7 @@ mod fixed_range;
 pub(crate) mod ordered_micros;
 mod replay_constraints;
 mod replay_worlds;
+mod replay_rank;
 mod owned_capacity;
 use crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS;
 use owned_capacity::OwnedCapacityChanges;
@@ -755,6 +756,7 @@ pub struct OpenTransaction<'a> {
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
     search_erasure_admitted: bool,
+    replay_rank_erases: Option<replay_rank::ReplayRankErases>,
     placed_attempt: Option<PlacedAttempt>,
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
@@ -762,7 +764,7 @@ pub struct OpenTransaction<'a> {
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, replay_rank_erases: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -794,6 +796,11 @@ impl<'a> OpenTransaction<'a> {
         if let Some(prepared) = prepared {
             writes.install_prepared_generation(prepared, &self.context.memory)?;
         }
+        if let Some(replay) = self.hosted_replay.as_ref().filter(|_| result.committed()) {
+            crate::hosted_control::replay_rank::verify(
+                replay.rank(), writes.tables(), result.tx_key(), &self.context.memory,
+            )?;
+        }
         ResolvedTx::new(writes, result, input, None, None, self.context)
     }
 
@@ -803,6 +810,7 @@ impl<'a> OpenTransaction<'a> {
         if let Some(replay) = &self.hosted_replay {
             replay.require_constraints_matched()?;
             replay.require_expiries_matched()?;
+            if self.replay_rank_erases.as_ref().is_some_and(|erases| !erases.is_empty()) { return Err(purge_path_uncovered()); }
         }
         self.check_final_constraints(operations).await?;
         self.check_spatial_readiness(operations).await
@@ -2851,7 +2859,18 @@ impl<'a> OpenTransaction<'a> {
         } else { kind };
         // The admitted erasure names every selector and writes the held
         // search revocation marker and the relation's purge frontier.
-        if !(self.search_erasure_admitted && crate::hosted_control::family_root_erase(relation)) {
+        let archived_rank_erase = self.hosted_replay.is_some()
+            && crate::hosted_control::replay_rank::rank_base(relation.name()).is_some();
+        let admitted = if archived_rank_erase {
+            let EntityId::Binary(address) = id else { return Err(purge_path_uncovered()); };
+            if !self.replay_rank_erases.as_mut().is_some_and(|erases| erases.take(relation.name(), address)) {
+                return Err(purge_path_uncovered());
+            }
+            true
+        } else {
+            self.search_erasure_admitted && crate::hosted_control::family_root_erase(relation)
+        };
+        if !admitted {
             let search = OwnedRelation::search_catalog(owner);
             if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
                 while let Some(batch) = rows.next_batch().await? {

@@ -362,6 +362,10 @@ fn verify_archive_replay(
     {
         return Err(mismatch());
     }
+    let rank = binding(&replay.rank_locator())?.map(|body| {
+        crate::hosted_control::replay_rank::ReplayRank::decode(&body, &replay)
+    }).transpose()?;
+    crate::hosted_control::replay_rank::verify(rank.as_ref(), tables, key, memory)?;
     let mut positions: BTreeSet<_> = replay.commit_positions().iter().copied().collect();
     if let Some(omissions) = binding(&replay.world_omissions_locator())? {
         if omissions.is_empty() || omissions.len() / 20 > positions.len() {

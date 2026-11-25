@@ -220,6 +220,10 @@
 -- Purge floors compare complete typed handles inside protected buckets. Digest collisions share a bucket without sharing a floor.
 -- The exact floor index covers the same ordered relation erase frontier. Missing coverage refuses historical release.
 -- Owned erase refuses governed paths and another mutation of the same identity in the commit.
+-- Held Original rank replay orders a bounded exact effect commitment with the archive and destination receipt.
+-- The commitment binds the archive, Original transaction and frozen transaction fingerprint to each effect's full key, validity, assertion position and typed payload or residue origin.
+-- An indexed Original rank erase consumes its complete relation and Binary key once under a co-ordered retirement fence or the exact held shared inventory and fence.
+-- The ordered destination and its replicas match the committed effect inventory and exact purge floors before accepting the replay effects.
 -- Owned point reads compare the complete stored identity before yielding any row.
 -- A private Binary identity retains its full byte string in the typed handle, point, change and replay paths.
 -- Binary key order compares unsigned bytes lexicographically, with a prefix preceding its extensions.

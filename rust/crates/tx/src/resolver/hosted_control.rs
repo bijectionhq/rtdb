@@ -245,7 +245,10 @@ impl OpenTransaction<'_> {
     ) -> Result<()> {
         use rtdb_types::{RootRowCarrier, SEALED_SEARCH_UNIT_ROWS, is_rank_row_address, sealed_search_inventory_row};
 
-        if replay || operations.iter().any(|operation| matches!(operation,
+        if replay {
+            return self.check_replayed_rank_erasure(owner, operations).await;
+        }
+        if operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()
         )) || !operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::OwnedErase { relation, .. }) if crate::hosted_control::family_root_erase(relation)
@@ -485,7 +488,7 @@ impl OpenTransaction<'_> {
         Ok(rows)
     }
 
-    async fn root_point(
+    pub(super) async fn root_point(
         &self, owner: &str, relation: &OwnedRelation, id: &EntityId, at: Timestamp,
         invalid: fn() -> Anomaly,
     ) -> Result<OwnedBatch> {
@@ -666,7 +669,10 @@ impl OpenTransaction<'_> {
                 return Err(unavailable());
             }
             let direct = operations.iter().filter(|operation| operation.direct_archive_relation().is_some());
-            if direct.clone().count() != replay.direct_effect_count()
+            let rank_count = direct.clone().filter(|operation| operation.direct_archive_relation()
+                .is_some_and(|relation| crate::hosted_control::replay_rank::is_rank_relation(relation.name()))).count();
+            if replay.rank().map_or(0, |rank| rank.count()) != rank_count
+                || direct.clone().count() != replay.direct_effect_count()
                 || direct.filter_map(Operation::owned_documents).any(|(_, rows)| rows != 1)
             {
                 return Err(unavailable());
