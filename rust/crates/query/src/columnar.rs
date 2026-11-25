@@ -611,13 +611,57 @@ impl ColumnBatch {
         Ok(Self { columns, len, reservation, appended: Vec::new() })
     }
     pub(crate) fn duplicate_for_replay(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let base = self.columns.len().checked_mul(size_of::<Column>())
+        let width = self.columns.len();
+        let base = width.checked_mul(size_of::<Column>() + size_of::<Arc<MemoryReservation>>())
             .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
         let bytes = self.columns.iter().try_fold(base, |bytes, column| {
-            bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error)
+            let copied = match column {
+                Column::Arrow { logical, .. } => logical.as_ref().map_or(Ok(0), |logical| {
+                    logical.retained_bytes()?.checked_sub(size_of::<LogicalType>()).ok_or_else(size_error)
+                })?,
+                Column::Selected(_) => 0,
+                Column::Values(values) => values.iter().try_fold(0usize, |bytes, value| {
+                    let shared = Self::replay_value_backing(value)?;
+                    let owned = value.retained_bytes()?.checked_sub(shared).ok_or_else(size_error)?;
+                    bytes.checked_add(owned).ok_or_else(size_error)
+                })?,
+            };
+            bytes.checked_add(copied).ok_or_else(size_error)
         })?;
         let reservation = memory.reserve(bytes)?;
-        Self::settled(self.columns.iter().map(Column::duplicate).collect(), self.len, reservation)
+        let mut columns = Vec::with_capacity(width);
+        let mut appended = Vec::with_capacity(width);
+        for (position, column) in self.columns.iter().enumerate() {
+            let shares_storage = match column {
+                Column::Arrow { .. } | Column::Selected(_) => true,
+                Column::Values(values) => values.iter().try_fold(false, |shared, value| {
+                    Ok::<_, rtdb_types::Anomaly>(shared || Self::replay_value_backing(value)? != 0)
+                })?,
+            };
+            let owner = if shares_storage { self.column_reservation(position) } else { &reservation };
+            columns.push(column.duplicate());
+            appended.push(Arc::clone(owner));
+        }
+        Ok(Self { columns, len: self.len, reservation, appended })
+    }
+
+    fn replay_value_backing(value: &Value) -> Result<usize> {
+        fn sum<'a>(mut values: impl Iterator<Item = &'a Value>) -> Result<usize> {
+            values.try_fold(0usize, |bytes, value| {
+                bytes.checked_add(ColumnBatch::replay_value_backing(value)?).ok_or_else(size_error)
+            })
+        }
+
+        match value {
+            Value::List(list) | Value::FixedSizeList(list) => match list.view() {
+                rtdb_types::ListView::Values(values) => sum(values.iter()),
+                _ => list.retained_payload_bytes(),
+            },
+            Value::Set(values) => sum(values.iter()),
+            Value::Map { entries, .. } => sum(entries.iter().flat_map(|(key, value)| [key, value])),
+            Value::Struct(fields) => sum(fields.values()),
+            _ => Ok(0),
+        }
     }
 
     fn collect_charges(&self, owners: &mut HashSet<*const MemoryReservation>) -> usize {

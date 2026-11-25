@@ -340,15 +340,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returned_replay_page_survives_cursor_and_factory_close() {
-        let context = context(1);let definition = definition();
-        let input = Box::new(Pages { pages: VecDeque::from([vec![1,2]]),polls: Arc::new(AtomicUsize::new(0)),memory: Arc::clone(&context.memory) });
-        let scope = BindingScope::columns(Arc::clone(&definition),input,definition.relation.schema().clone(),None,Arc::clone(&context)).unwrap();
-        let mut cursor = scope.open_columns(&definition).await.unwrap();
-        let page = cursor.next_batch().await.unwrap().unwrap();
-        drop(cursor);drop(scope);assert_eq!(context.spill_bytes(),0);assert!(context.memory.used_bytes() > 0);
-        assert_eq!(page.columns[0].value(0).unwrap(),Value::I64(1));assert_eq!(page.columns[0].value(1).unwrap(),Value::I64(2));
-        drop(page);assert_eq!(context.memory.used_bytes(),0);
+    async fn replayed_arrow_pages_share_funding_after_both_readers_and_the_binding_close() {
+        use arrow_array::{ArrayRef, Int64Array};
+        use arrow_schema::{DataType, Field as ArrowField};
+        use crate::columnar::SelectedColumn;
+
+        let rows = 1024;
+        for selected in [false, true] {
+            let context = context(1);
+            let memory = &context.memory;
+            let definition = definition();
+            let array: ArrayRef = Arc::new(Int64Array::from_iter_values((0..rows).map(|row| row as i64)));
+            let array_bytes = array.get_array_memory_size();
+            let field = Arc::new(ArrowField::new("n", DataType::Int64, false));
+            let logical = Some(LogicalType::Scalar(ScalarType::I64));
+            let (column, shared_bytes) = if selected {
+                let owner = memory.reserve(array_bytes).unwrap();
+                let picks = (0..rows).rev().map(|row| (0, row)).collect::<Vec<_>>();
+                let shared_bytes = array_bytes + picks.len() * std::mem::size_of::<(usize, usize)>();
+                let selection = SelectedColumn::new(
+                    vec![Some((array, field, logical, Some(owner)))], Arc::new(picks),
+                );
+                (Column::Selected(selection), shared_bytes)
+            } else {
+                (Column::Arrow { array, field, logical }, array_bytes)
+            };
+            let mut batch = ColumnBatch::settled(vec![], rows, memory.reserve(256).unwrap()).unwrap();
+            batch.append_column(column, memory.reserve(shared_bytes).unwrap(), memory).unwrap();
+            let input = crate::columnar::single_batch(Some(batch), Arc::clone(&context));
+            let scope = BindingScope::columns(
+                Arc::clone(&definition), input, definition.relation.schema().clone(), None, Arc::clone(&context),
+            ).unwrap();
+            let mut first = scope.open_columns(&definition).await.unwrap();
+            let mut second = scope.open_columns(&definition).await.unwrap();
+            assert_eq!(context.spill_bytes(), 0);
+
+            let pressure = memory.reserve(memory.available_bytes() - 4096).unwrap();
+            let first_page = first.next_batch().await.unwrap().unwrap();
+            let last_page = second.next_batch().await.unwrap().unwrap();
+            assert_eq!((first_page.len, last_page.len), (rows, rows));
+            assert!(first.next_batch().await.unwrap().is_none());
+            assert!(second.next_batch().await.unwrap().is_none());
+            drop((pressure, first, second, scope, first_page));
+
+            assert!(memory.used_bytes() >= shared_bytes);
+            assert_eq!(last_page.working_set_bytes(memory).unwrap(), memory.used_bytes());
+            let expected = if selected { (rows - 1) as i64 } else { 0 };
+            assert_eq!(last_page.columns[0].value(0).unwrap(), Value::I64(expected));
+            drop(last_page);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn replay_admits_value_copies_and_retains_packed_children() {
+        use arrow_array::Float32Array;
+        use rtdb_types::{ListValue, StructFields};
+
+        for packed in [false, true] {
+            let memory = MemoryBudget::new(1 << 20);
+            let source = memory.scope();
+            let mut fields = StructFields::from([("text".into(), Value::Utf8("x".repeat(2048)))]);
+            if packed {
+                let list = ListValue::from_f32(Float32Array::from(vec![1.0; 16384]));
+                fields.insert("list".into(), Value::List(list));
+            }
+            let value = Value::Struct(fields);
+            let batch = ColumnBatch::settled(
+                vec![Column::Values(vec![value.clone()])], 1, source.reserve(0).unwrap(),
+            ).unwrap();
+            let too_small = memory.scope_with_limit(1024);
+            let error = batch.duplicate_for_replay(&too_small).err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert_eq!(too_small.used_bytes(), 0);
+
+            let copies = memory.scope_with_limit(8192);
+            let replayed = batch.duplicate_for_replay(&copies).unwrap();
+            drop(batch);
+            assert_eq!(source.used_bytes() > 0, packed);
+            assert!(copies.used_bytes() >= 2048);
+            assert_eq!(replayed.working_set_bytes(&memory).unwrap(), memory.used_bytes());
+            assert_eq!(replayed.columns[0].value(0).unwrap(), value);
+            drop(value);
+            drop(replayed);
+            assert_eq!(memory.used_bytes(), 0);
+        }
     }
 
     #[tokio::test]

@@ -88,7 +88,9 @@
 -- A materialized relation evaluates on its first reached reference and preserves the order of its pages.
 -- Native execution holds its pages within the materialization row and memory bounds.
 -- When either bound is crossed it replays all pages through one query-scoped spill file, using the column spill format.
--- Every reference has its own replay position and every outstanding page retains its own memory.
+-- Every reference has its own replay position.
+-- References to an in-memory page share the query budget charge for its Arrow backing and pay for their copied values and metadata.
+-- Every outstanding page keeps the memory it uses charged until it is released.
 -- Measured operators reserve against sibling scopes of the same query budget.
 -- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
 -- EXPLAIN renders packed floating-point literals from their Arrow children at the original float width.
