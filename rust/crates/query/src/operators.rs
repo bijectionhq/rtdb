@@ -974,20 +974,16 @@ impl crate::columnar::BatchCursor for BatchUnnest {
 
 impl BatchUnnest {
     async fn expand_expression(&mut self, batch: &crate::columnar::ColumnBatch) -> Result<Option<crate::columnar::ColumnBatch>> {
-        use arrow_array::{Array, Int32Array};
-        use arrow_schema::{DataType, Field};
-        use crate::columnar::{BatchRow, Column, ColumnBatch, gather_column_rows, gather_nullable_column};
+        use crate::columnar::{BatchRow, Column, ColumnBatch, UnnestRows, pack_evaluated_column};
 
         let context = &self.execution.context;
         let memory = &context.memory;
         let too_large = || invalid("unnest-size", "Unnest output exceeds addressable memory");
         let scope = self.execution.scope()?;
         let invocation = self.execution.prepare_expression(&self.expr, &self.schema, &scope)?;
-        let mut selection = memory.reserve(256)?;
-        let mut parents = Vec::new();
+        let mut runs = UnnestRows::new(memory)?;
+        let mut inventory = memory.reserve(256)?;
         let mut children = Vec::new();
-        let mut picks = Vec::new();
-        let mut ordinals = Vec::new();
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
             let evaluation = self.execution.scope()?;
@@ -996,58 +992,33 @@ impl BatchUnnest {
                 &evaluation, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
             ).await?;
             let count = elements.len();
-            let appended = if self.outer { count.max(1) } else { count };
-            if appended == 0 { continue; }
-            let row_bytes = 2 * (std::mem::size_of::<(usize, usize)>() + std::mem::size_of::<Option<(usize, usize)>>()
-                + std::mem::size_of::<Option<i32>>());
-            let bytes = appended.checked_mul(row_bytes).and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<ColumnBatch>()))
-                .ok_or_else(too_large)?;
-            let lease = Arc::get_mut(&mut selection).expect("Unnest owns its selection");
-            lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(too_large)?)?;
             if count == 0 {
-                parents.push((0, row));
-                picks.push(None);
-                if self.ordinality.is_some() { ordinals.push(None); }
+                if self.outer { runs.push(row, None, self.ordinality.is_some(), memory)?; }
                 continue;
+            }
+            runs.push(row, Some((children.len() + 1, 0..count)), self.ordinality.is_some(), memory)?;
+            if children.len() == children.capacity() {
+                let capacity = children.capacity().checked_mul(2).ok_or_else(too_large)?.max(1);
+                let bytes = capacity.checked_mul(std::mem::size_of::<ColumnBatch>())
+                    .and_then(|bytes| bytes.checked_add(256)).ok_or_else(too_large)?;
+                let charge = memory.reserve(bytes)?;
+                children.reserve_exact(capacity - children.len());
+                inventory = charge;
             }
             let (column, custody) = if let Some((field, array)) = elements.arrow_column(&evaluation)? {
                 let bytes = array.get_array_memory_size().checked_add(field.size()).ok_or_else(too_large)?;
                 (Column::Arrow { array, field, logical: None }, memory.reserve(bytes)?)
             } else {
                 let values = elements.scalar_values().expect("non-Arrow list has evaluated cells");
-                crate::columnar::pack_evaluated_column(values, memory)?
+                pack_evaluated_column(values, memory)?
             };
-            let source = children.len();
             let mut child = ColumnBatch::settled(Vec::new(), count, memory.reserve(256)?)?;
             child.append_column(column, custody, memory)?;
             children.push(child);
-            for index in 0..count {
-                context.check_cancelled_at(index)?;
-                parents.push((0, row));
-                picks.push(Some((source, index)));
-                if self.ordinality.is_some() {
-                    let ordinal = i32::try_from(index).ok().and_then(|index| index.checked_add(1))
-                        .ok_or_else(|| invalid("ordinality-overflow", "List ordinal exceeds signed32 bits"))?;
-                    ordinals.push(Some(ordinal));
-                }
-            }
         }
-        if parents.is_empty() { return Ok(None); }
-        let mut output = ColumnBatch::settled(Vec::new(), parents.len(), memory.reserve(256)?)?;
-        for column in 0..batch.columns.len() {
-            let (column, reservation) = gather_column_rows(|_| batch, &parents, column, memory)?;
-            output.append_column(column, reservation, memory)?;
-        }
-        let (elements, custody) = gather_nullable_column(|source| &children[source], &picks, 0, memory)?;
-        output.append_column(elements, custody, memory)?;
-        if let Some(name) = self.ordinality.as_deref() {
-            let bytes = output.len.checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(too_large)?;
-            let custody = memory.reserve(bytes)?;
-            let array = Arc::new(Int32Array::from(ordinals));
-            let field = Arc::new(Field::new(name, DataType::Int32, self.outer));
-            output.append_column(Column::Arrow { array, field, logical: None }, custody, memory)?;
-        }
-        Ok(Some(output))
+        let output = batch.expand_evaluated_lists(runs, &children, self.ordinality.as_deref(), self.outer, context);
+        drop((children, inventory));
+        output
     }
 }
 

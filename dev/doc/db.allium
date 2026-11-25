@@ -2145,7 +2145,7 @@ surface QueryAccess {
         -- A correlated query retains its outer Arrow row position and gathers its output from the selected dependent positions.
         -- Apply gathers compatible dependent Arrow fields into its document layout.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
-        -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
+        -- UNNEST over compatible Arrow lists retains each selected child span under its source owner and repeats the corresponding parent position for its elements.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.

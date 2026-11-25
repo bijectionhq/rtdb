@@ -130,7 +130,7 @@
 -- Compatible computed cosine operands demand their elements in expression order before vector validation.
 -- The row-evaluated score projection builds a typed Arrow result with the scalar projection's observed nullability.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
--- Computed UNNEST gathers both original payload and evaluated child columns by Arrow position.
+-- Computed UNNEST repeats the original Arrow parent positions per list and retains compatible evaluated child spans.
 -- Its ordinal vector marks the synthetic outer row of an empty list as null.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
@@ -142,7 +142,7 @@
 -- Their columnar output keeps the configured transport row limit.
 -- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
 -- A single equijoin fails when more than one build row matches a probe row.
--- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
+-- A columnar cross join retains its Arrow inputs and maps output positions in left-major order within each batch pair.
 -- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
 -- Apply document fields retain compatible dependent Arrow selections through result conformance.

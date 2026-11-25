@@ -30,6 +30,135 @@ fn rows(batch: &ColumnBatch) -> Vec<Vec<Value>> {
 }
 fn numbers(values: &[i64]) -> Vec<Vec<Value>> { values.iter().map(|value| vec![Value::I64(*value)]).collect() }
 
+#[test]
+fn direct_unnest_borrows_variable_and_fixed_child_ranges_with_their_original_custody() {
+    use arrow_array::{Array, ArrayRef, FixedSizeListArray, Int64Array, ListArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::{Column, SelectedColumn};
+
+    let execution = execution(1);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    let item = Arc::new(ArrowField::new("item", DataType::Int64, true));
+    let variable_values: ArrayRef = Arc::new(Int64Array::from(vec![Some(70), Some(11), None, Some(99)]));
+    let fixed_values: ArrayRef = Arc::new(Int64Array::from(vec![90, 91, 33, 44]));
+    let variable = ListArray::new(Arc::clone(&item), OffsetBuffer::new(vec![0_i32, 1, 3, 3, 4].into()),
+        Arc::clone(&variable_values), Some(NullBuffer::from(vec![true, true, true, false])));
+    let fixed = FixedSizeListArray::new(item, 2, Arc::clone(&fixed_values), None);
+    let vector = |array: ArrayRef| {
+        let field = Arc::new(ArrowField::new("xs", array.data_type().clone(), array.is_nullable()));
+        let ty = rtdb_columnar::from_field(&field).unwrap();
+        Some((array, field, Some(ty), None))
+    };
+    let list = Column::Selected(SelectedColumn::new(vec![vector(Arc::new(variable)), vector(Arc::new(fixed))],
+        Arc::new(vec![(0, 1), (0, 2), (0, 3), (1, 1)])));
+    let (parent, _charge) = crate::columnar::pack_evaluated_column(&[10, 20, 30, 40].map(Value::I64), memory).unwrap();
+    let input = ColumnBatch::settled(vec![parent, list], 4, memory.reserve(8192).unwrap()).unwrap();
+    drop(_charge);
+    let output = input.expand_list(1, Some("n"), true, context).unwrap().unwrap();
+    drop(input);
+
+    let Column::Selected(elements) = &output.columns[2] else { panic!("Expected borrowed child spans"); };
+    for (output_rows, source, child_rows) in [(0..2, variable_values, 1..3), (4..6, fixed_values, 2..4)] {
+        let ((array, _, _), span) = elements.fragment_source(output_rows).unwrap();
+        assert!(Arc::ptr_eq(&array, &source));
+        assert_eq!(span, child_rows);
+    }
+    assert_eq!(output.working_set_bytes(memory).unwrap(), memory.used_bytes() - baseline);
+    let selected = output.select(&[true, true, true, true, false, true], memory).unwrap();
+    let selected = selected.slice(1, 4, memory).unwrap();
+    let actual = rows(&selected).into_iter().map(|row| [row[0].clone(), row[2].clone(), row[3].clone()]).collect::<Vec<_>>();
+    assert_eq!(actual, [
+        [Value::I64(10), Value::Null, Value::I32(2)],
+        [Value::I64(20), Value::Null, Value::Null],
+        [Value::I64(30), Value::Null, Value::Null],
+        [Value::I64(40), Value::I64(44), Value::I32(2)],
+    ]);
+    drop(selected);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
+fn computed_unnest_keeps_compatible_child_spans_and_gathers_mixed_children_in_order() {
+    use crate::columnar::{Column, UnnestRows, pack_evaluated_column};
+
+    let execution = execution(1);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    for first in [[Value::I64(7), Value::I64(8)], [Value::I64(7), Value::Bool(true)]] {
+        let batch = |values: &[Value]| {
+            let (column, custody) = pack_evaluated_column(values, memory).unwrap();
+            let mut batch = ColumnBatch::settled(Vec::new(), values.len(), memory.reserve(256).unwrap()).unwrap();
+            batch.append_column(column, custody, memory).unwrap();
+            batch
+        };
+        let parent = batch(&[Value::I64(1), Value::I64(2), Value::I64(3)]);
+        let children = [batch(&first), batch(&[Value::I64(9)])];
+        let mut runs = UnnestRows::new(memory).unwrap();
+        runs.push(0, Some((1, 0..2)), true, memory).unwrap();
+        runs.push(1, None, true, memory).unwrap();
+        runs.push(2, Some((2, 0..1)), true, memory).unwrap();
+        let output = parent.expand_evaluated_lists(runs, &children, Some("n"), true, context).unwrap().unwrap();
+        if let Column::Arrow { array, .. } = &children[0].columns[0] {
+            let Column::Selected(elements) = &output.columns[1] else { panic!("Expected borrowed child spans"); };
+            let ((source, _, _), span) = elements.fragment_source(0..2).unwrap();
+            assert!(Arc::ptr_eq(&source, array));
+            assert_eq!(span, 0..2);
+        }
+        drop((parent, children));
+        assert_eq!(rows(&output), [
+            vec![Value::I64(1), first[0].clone(), Value::I32(1)],
+            vec![Value::I64(1), first[1].clone(), Value::I32(2)],
+            vec![Value::I64(2), Value::Null, Value::Null],
+            vec![Value::I64(3), Value::I64(9), Value::I32(1)],
+        ]);
+        drop(output);
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[test]
+fn unnest_descriptors_scale_with_the_number_of_lists() {
+    use arrow_array::{Array, Int64Array, ListArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::Column;
+
+    let execution = execution(1);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    let count = 16_384_i32;
+    let values = Arc::new(Int64Array::from_iter_values(0..i64::from(count)));
+    let item = Arc::new(ArrowField::new("item", DataType::Int64, false));
+    let array = Arc::new(ListArray::new(item, OffsetBuffer::new(vec![0, count].into()), values, None));
+    let field = Arc::new(ArrowField::new("xs", array.data_type().clone(), false));
+    let logical = Some(rtdb_columnar::from_field(&field).unwrap());
+    let charge = memory.reserve(array.get_array_memory_size() + 1024).unwrap();
+    let input = ColumnBatch::settled(vec![Column::Arrow { array, field, logical }], 1, charge).unwrap();
+    let before = memory.used_bytes();
+    let output = input.expand_list(0, None, false, context).unwrap().unwrap();
+    assert_eq!(output.len, count as usize);
+    assert!(memory.used_bytes() - before < 16 * 1024);
+    drop(input);
+    assert_eq!(output.columns[1].value(count as usize - 1).unwrap(), Value::I64(i64::from(count) - 1));
+    drop(output);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
+fn unnest_checks_ordinal_and_output_width_overflow_from_group_lengths() {
+    let memory = MemoryBudget::new(4096);
+    let mut runs = crate::columnar::UnnestRows::new(&memory).unwrap();
+    let error = runs.push(0, Some((1, 0..(i32::MAX as usize + 1))), true, &memory).unwrap_err();
+    assert_eq!(error.code, "rtdb.query/ordinality-overflow");
+    runs.push(0, Some((1, 0..usize::MAX)), false, &memory).unwrap();
+    assert_eq!(runs.push(1, None, false, &memory).unwrap_err().code, "rtdb.query/column-size");
+}
+
 #[tokio::test]
 async fn list_pages_preserve_the_reference_batch_boundaries_independently_of_client_batches() {
     for batch_rows in [1, 2048] {
