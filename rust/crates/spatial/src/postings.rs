@@ -23,7 +23,7 @@ use rtdb_format::{
 use rtdb_types::{Anomaly, AnomalyCategory, EventOp, Iid, Result};
 use sha2::{Digest, Sha256};
 
-use crate::{definition::Definition, kernel::Location};
+use crate::{definition::Definition, kernel::{Location, PostingKeys}};
 
 const ROW_BYTES: usize = 32 + 8 + 16;
 const BATCH_ROWS: usize = 16_384;
@@ -81,7 +81,7 @@ pub(crate) fn event_keys(
     event: &EventRef<'_>,
     definition: &Definition,
     work: &mut GeometryWork,
-) -> Result<Option<(Partition, Iid, Vec<i64>)>> {
+) -> Result<Option<(Partition, Iid, PostingKeys)>> {
     let header = event.header();
     if header.op != EventOp::Put {
         return Ok(None);
@@ -91,10 +91,10 @@ pub(crate) fn event_keys(
         Some(binary) => work.scoped(|work| {
             match Location::decode_stored(binary, definition.encoding, work)? {
                 Some(location) => location.keys(work),
-                None => Ok(vec![i64::MIN]),
+                None => Ok(PostingKeys::One(i64::MIN)),
             }
         })?,
-        None => vec![i64::MIN],
+        None => PostingKeys::One(i64::MIN),
     };
     Ok(Some((partition, header.iid, keys)))
 }
@@ -116,7 +116,7 @@ impl Postings {
         })
     }
 
-    pub(crate) fn append(&mut self, partition: Partition, iid: Iid, keys: Vec<i64>) -> Result<()> {
+    pub(crate) fn append(&mut self, partition: Partition, iid: Iid, keys: &[i64]) -> Result<()> {
         let length = self
             .cells
             .len()
@@ -129,7 +129,7 @@ impl Postings {
                 .expect("builder owns its reservation")
                 .grow_to(capacity * ROW_BYTES)?;
         }
-        for cell in keys {
+        for &cell in keys {
             self.partitions.append_value(partition.0).map_err(corrupt)?;
             self.cells.append_value(cell);
             self.iids.append_value(iid.0).map_err(corrupt)?;
@@ -147,45 +147,61 @@ impl Postings {
         let partitions = self.partitions.finish();
         let cells = self.cells.finish();
         let iids = self.iids.finish();
-        let _order = memory.reserve(cells.len() * std::mem::size_of::<u32>())?;
-        let mut order = (0..cells.len() as u32).collect::<Vec<_>>();
-        let key = |row: u32| {
-            let row = row as usize;
+        let check = || if cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) };
+        let key = |row: usize| {
             (partitions.value(row), cells.value(row), iids.value(row))
         };
-        order.sort_unstable_by_key(|&row| key(row));
-        order.dedup_by_key(|row| key(*row));
-        let order = UInt32Array::from(order);
-        let page_count = order.len().div_ceil(BATCH_ROWS);
+        let mut canonical = true;
+        for row in 1..cells.len() {
+            if row % 1024 == 0 { check()?; }
+            if key(row - 1) >= key(row) {
+                canonical = false;
+                break;
+            }
+        }
+        let (_order_reservation, order) = if canonical {
+            (None, None)
+        } else {
+            let reservation = memory.reserve(cells.len() * size_of::<u32>())?;
+            let mut order = (0..cells.len() as u32).collect::<Vec<_>>();
+            order.sort_unstable_by_key(|&row| key(row as usize));
+            order.dedup_by_key(|row| key(*row as usize));
+            (Some(reservation), Some(UInt32Array::from(order)))
+        };
+        let count = order.as_ref().map_or(cells.len(), |order| order.len());
+        let page_count = count.div_ceil(BATCH_ROWS);
         let directory_bytes = page_count * PAGE_ENTRY_BYTES;
-        let _fences = memory.reserve(page_count * std::mem::size_of::<PageFence>())?;
-        let mut fences = Vec::with_capacity(page_count);
+        let _pages = memory.reserve(page_count * size_of::<Page>())?;
+        let mut pages = Vec::with_capacity(page_count);
         let mut writer = ArrowFileWriter::new_bounded_reserved(
             file, &schema, MAX_FILE_BYTES - directory_bytes as u64, memory,
         )?;
-        let check = || if cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) };
-        for start in (0..order.len()).step_by(BATCH_ROWS) {
+        for start in (0..count).step_by(BATCH_ROWS) {
             check()?;
-            let rows = order.slice(start, (order.len() - start).min(BATCH_ROWS));
-            let _scratch = memory.reserve(rows.len() * ROW_BYTES * 4 + (64 << 10))?;
-            let first = rows.value(0) as usize;
-            let contiguous = rows.values().iter().enumerate()
-                .all(|(index, &row)| row as usize == first + index);
+            let length = (count - start).min(BATCH_ROWS);
+            let rows = order.as_ref().map(|order| order.slice(start, length));
+            let first = rows.as_ref().map_or(start, |rows| rows.value(0) as usize);
+            let gather = rows.as_ref().filter(|rows| {
+                !rows.values().iter().enumerate().all(|(index, &row)| row as usize == first + index)
+            });
+            let copies = if gather.is_some() { 4 } else { 3 };
+            let _scratch = memory.reserve(length * ROW_BYTES * copies + (64 << 10))?;
             let columns = [&partitions as &dyn Array, &cells, &iids]
                 .into_iter()
                 .map(|array| {
-                    if contiguous {
-                        Ok(array.slice(first, rows.len()))
+                    if let Some(rows) = gather {
+                        arrow_select::take::take(array, rows, None).map_err(corrupt)
                     } else {
-                        arrow_select::take::take(array, &rows, None).map_err(corrupt)
+                        Ok(array.slice(first, length))
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(corrupt)?;
-            fences.push(PostingColumns::new(&batch)?.fence(&check)?);
-            writer.write(&batch)?;
+            let fence = PostingColumns::new(&batch)?.fence(&check)?;
+            let (range, digest) = writer.write_hashed_page(&batch)?;
+            pages.push(Page { range, fence, digest });
         }
-        write_directory(writer.finish()?, &fences, memory, &check)
+        write_directory(writer.finish()?, &pages, memory, &check)
     }
 }
 
@@ -237,14 +253,14 @@ struct PageFence {
 }
 
 impl PageFence {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(&(self.rows as u32).to_le_bytes());
-        for (partition, cell) in [self.first, self.last] {
-            bytes.extend_from_slice(&partition.0);
-            bytes.extend_from_slice(&cell.to_le_bytes());
+    fn encode(&self, bytes: &mut [u8]) {
+        bytes[..4].copy_from_slice(&(self.rows as u32).to_le_bytes());
+        for (start, (partition, cell)) in [(4, self.first), (44, self.last)] {
+            bytes[start..start + 32].copy_from_slice(&partition.0);
+            bytes[start + 32..start + 40].copy_from_slice(&cell.to_le_bytes());
         }
-        bytes.extend_from_slice(&self.min_cell.to_le_bytes());
-        bytes.extend_from_slice(&self.max_cell.to_le_bytes());
+        bytes[84..92].copy_from_slice(&self.min_cell.to_le_bytes());
+        bytes[92..100].copy_from_slice(&self.max_cell.to_le_bytes());
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
@@ -370,11 +386,20 @@ impl<'a> PostingColumns<'a> {
                 }
             }
         } else {
+            let mut previous_partition = None;
+            let mut first = 0;
             for (row, &cell) in self.cells.values().iter().enumerate() {
                 if row % 1024 == 0 {
                     check()?;
                 }
-                let first = ranges.partition_point(|range| range.end < cell);
+                let partition = self.partitions.value(row);
+                if previous_partition != Some(partition) {
+                    previous_partition = Some(partition);
+                    first = 0;
+                }
+                if ranges.get(first).is_some_and(|range| range.end < cell) {
+                    first += ranges[first..].partition_point(|range| range.end < cell);
+                }
                 if ranges.get(first).is_some_and(|range| range.start <= cell) {
                     insert(iid_at(row))?;
                 }
@@ -408,7 +433,7 @@ fn posting_decoder(footer: &[u8], data_end: u64) -> Result<PageDecoder> {
 
 fn write_directory(
     mut file: File,
-    fences: &[PageFence],
+    pages: &[Page],
     memory: &Arc<MemoryBudget>,
     check: &impl Fn() -> Result<()>,
 ) -> Result<(u64, Vec<u8>)> {
@@ -418,48 +443,43 @@ fn write_directory(
     let mut trailer = [0; TRAILER_BYTES];
     file.read_exact(&mut trailer).map_err(corrupt)?;
     let footer_bytes = footer_length(&trailer)?;
-    let directory_bytes = fences.len() * PAGE_ENTRY_BYTES;
+    let directory_bytes = pages.len() * PAGE_ENTRY_BYTES;
     let tail_bytes = directory_bytes + footer_bytes + TRAILER_BYTES;
     if tail_bytes > MAX_TAIL_BYTES {
         return Err(work_limit());
     }
     let start = end.checked_sub((footer_bytes + TRAILER_BYTES) as u64)
         .ok_or_else(|| corrupt("Spatial posting footer offset exceeds its file"))?;
-    let _scratch = memory.reserve(tail_bytes + footer_bytes * 16 + (64 << 10) + HASH_CHUNK_BYTES)?;
+    let _scratch = memory.reserve(footer_bytes * 17 + (64 << 10) + PAGE_ENTRY_BYTES)?;
     let mut footer = vec![0; footer_bytes];
     file.seek(SeekFrom::Start(start)).map_err(corrupt)?;
     file.read_exact(&mut footer).map_err(corrupt)?;
     let decoder = posting_decoder(&footer, start)?;
-    if decoder.page_count() != fences.len() {
+    if decoder.page_count() != pages.len() {
         return Err(corrupt("Spatial posting writer page count differs from its fences"));
     }
-
-    let mut directory = Vec::with_capacity(directory_bytes);
-    let mut scratch = vec![0; HASH_CHUNK_BYTES];
-    for (page, fence) in fences.iter().enumerate() {
-        let range = decoder.page_range(page).map_err(corrupt)?;
-        file.seek(SeekFrom::Start(range.start)).map_err(corrupt)?;
-        let mut hasher = Sha256::new();
-        let mut remaining = (range.end - range.start) as usize;
-        while remaining != 0 {
-            check()?;
-            let chunk = remaining.min(scratch.len());
-            file.read_exact(&mut scratch[..chunk]).map_err(corrupt)?;
-            hasher.update(&scratch[..chunk]);
-            remaining -= chunk;
+    for (index, page) in pages.iter().enumerate() {
+        if decoder.page_range(index).map_err(corrupt)? != page.range {
+            return Err(corrupt("Spatial posting writer page range differs from its footer"));
         }
-        fence.encode(&mut directory);
-        directory.extend_from_slice(&hasher.finalize());
     }
-    let digest = Sha256::new().chain_update(&directory).chain_update(&footer).chain_update(trailer).finalize().into();
 
     // Insert the directory before the Arrow footer so the footer and its trailer stay at the end.
     file.seek(SeekFrom::Start(start)).map_err(corrupt)?;
-    file.write_all(&directory).map_err(corrupt)?;
+    let mut hash = Sha256::new();
+    let mut entry = [0; PAGE_ENTRY_BYTES];
+    for page in pages {
+        check()?;
+        page.fence.encode(&mut entry[..FENCE_BYTES]);
+        entry[FENCE_BYTES..].copy_from_slice(&page.digest);
+        file.write_all(&entry).map_err(corrupt)?;
+        hash.update(entry);
+    }
     file.write_all(&footer).map_err(corrupt)?;
     file.write_all(&trailer).map_err(corrupt)?;
     file.flush().map_err(corrupt)?;
     check()?;
+    let digest = hash.chain_update(&footer).chain_update(trailer).finalize().into();
     let root = Root { start, length: tail_bytes as u32, digest };
     Ok((root.range().end, root.encode()))
 }
@@ -498,7 +518,7 @@ pub(crate) async fn candidates<F: Future<Output = Result<Bytes>> + Send>(
     let footer_bytes = footer_length(&tail[trailer_start..])?;
     let footer_start = trailer_start.checked_sub(footer_bytes)
         .ok_or_else(|| corrupt("Spatial posting Arrow footer lies outside its directory"))?;
-    let _layout = memory.reserve(footer_bytes * 16 + (64 << 10) + MAX_PAGES * std::mem::size_of::<Page>())?;
+    let mut layout = memory.reserve(footer_bytes * 16 + (64 << 10))?;
     let decoder = posting_decoder(&tail[footer_start..trailer_start], root.start)?;
     if footer_start != decoder.page_count() * PAGE_ENTRY_BYTES {
         return Err(corrupt("Spatial posting directory and Arrow footer disagree on page count"));
@@ -506,8 +526,9 @@ pub(crate) async fn candidates<F: Future<Output = Result<Bytes>> + Send>(
 
     let mut total = 0;
     let mut previous: Option<(u64, PostingKey)> = None;
-    let mut pages = Vec::with_capacity(decoder.page_count());
-    for (page, entry) in tail[..footer_start].chunks_exact(PAGE_ENTRY_BYTES).enumerate() {
+    let mut selected = 0;
+    let entries = tail[..footer_start].chunks_exact(PAGE_ENTRY_BYTES);
+    for (page, entry) in entries.clone().enumerate() {
         let fence = PageFence::decode(&entry[..FENCE_BYTES])?;
         let range = decoder.page_range(page).map_err(corrupt)?;
         let length = range.end - range.start;
@@ -521,17 +542,32 @@ pub(crate) async fn candidates<F: Future<Output = Result<Bytes>> + Send>(
             return Err(corrupt("Invalid spatial posting page inventory"));
         }
         previous = Some((range.end, fence.last));
-        pages.push(Page { range, fence, digest: entry[FENCE_BYTES..].try_into().expect("page digest width") });
+        if fence.overlaps(partition, ranges) {
+            selected += 1;
+        }
     }
     if previous.is_some_and(|(end, _)| end + 4 != root.start) {
         return Err(corrupt("Spatial posting pages do not reach the Arrow end marker"));
     }
-    drop(tail);
-
-    for (page, Page { range, fence, digest }) in pages.into_iter().enumerate() {
-        if !fence.overlaps(partition, ranges) {
-            continue;
+    let _selected = memory.reserve(selected * size_of::<(usize, Page)>())?;
+    let mut pages = Vec::with_capacity(selected);
+    if selected != 0 {
+        for (page, entry) in entries.enumerate() {
+            let fence = PageFence::decode(&entry[..FENCE_BYTES])?;
+            if fence.overlaps(partition, ranges) {
+                pages.push((page, Page {
+                    range: decoder.page_range(page).map_err(corrupt)?,
+                    fence,
+                    digest: entry[FENCE_BYTES..].try_into().expect("page digest width"),
+                }));
+            }
         }
+    }
+    drop(tail);
+    Arc::get_mut(&mut layout).expect("reader owns its footer decoder")
+        .shrink_to((4 << 10) + decoder.block_inventory_bytes())?;
+
+    for (page, Page { range, fence, digest }) in pages {
         check()?;
         let length = (range.end - range.start) as usize;
         let bytes = fetch(range).await?;
@@ -614,9 +650,9 @@ mod tests {
 
     fn write_fixture(memory: &Arc<MemoryBudget>) -> (Vec<u8>, Root, Vec<Range<u64>>) {
         let mut postings = Postings::new(memory).unwrap();
-        postings.append(SELECTED, Iid([1; 16]), (0..SELECTED_CELL).collect()).unwrap();
-        postings.append(SELECTED, WANTED, (SELECTED_CELL..2 * SELECTED_CELL).collect()).unwrap();
-        postings.append(OTHER, Iid([2; 16]), vec![SELECTED_CELL]).unwrap();
+        postings.append(SELECTED, Iid([1; 16]), &(0..SELECTED_CELL).collect::<Vec<_>>()).unwrap();
+        postings.append(SELECTED, WANTED, &(SELECTED_CELL..2 * SELECTED_CELL).collect::<Vec<_>>()).unwrap();
+        postings.append(OTHER, Iid([2; 16]), &[SELECTED_CELL]).unwrap();
         let file = tempfile::NamedTempFile::new().unwrap();
         let (length, stats) = postings.write(file.reopen().unwrap(), &CancellationToken::new()).unwrap();
         let bytes = std::fs::read(file.path()).unwrap();
@@ -626,8 +662,37 @@ mod tests {
         let start = trailer - footer_length(&bytes[trailer..]).unwrap();
         let decoder = posting_decoder(&bytes[start..trailer], root.start).unwrap();
         assert_eq!(decoder.page_count(), 3);
-        let pages = (0..decoder.page_count()).map(|page| decoder.page_range(page).unwrap()).collect();
+        let pages = (0..decoder.page_count()).map(|page| {
+            let range = decoder.page_range(page).unwrap();
+            let digest = sha256(&bytes[range.start as usize..range.end as usize], &|| Ok(())).unwrap();
+            let start = root.start as usize + page * PAGE_ENTRY_BYTES + super::FENCE_BYTES;
+            assert_eq!(&bytes[start..start + digest.len()], &digest);
+            range
+        }).collect();
         (bytes, root, pages)
+    }
+
+    #[tokio::test]
+    async fn unpartitioned_scan_reuses_cell_ranges_across_iids_and_resets_at_each_partition() {
+        let memory = MemoryBudget::new(4 << 20);
+        let mut postings = Postings::new(&memory).unwrap();
+        postings.append(SELECTED, Iid::MIN, &[1, 5, 9]).unwrap();
+        postings.append(SELECTED, WANTED, &[9]).unwrap();
+        postings.append(OTHER, Iid::MAX, &[1, 5, 9]).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (length, stats) = postings.write(file.reopen().unwrap(), &CancellationToken::new()).unwrap();
+        let root = Root::decode(&stats, length).unwrap();
+        let bytes = Bytes::from(std::fs::read(file.path()).unwrap());
+        let ranges = [
+            KeyRange { start: 1, end: 1 },
+            KeyRange { start: 3, end: 3 },
+            KeyRange { start: 9, end: 9 },
+        ];
+        let mut found = Vec::new();
+        candidates(root, None, &ranges, &memory, || Ok(()), |range| {
+            std::future::ready(Ok(bytes.slice(range.start as usize..range.end as usize)))
+        }, |iid| { found.push(iid); Ok(()) }).await.unwrap();
+        assert_eq!(found, [Iid::MIN, Iid::MIN, WANTED, Iid::MAX, Iid::MAX]);
     }
 
     #[tokio::test]

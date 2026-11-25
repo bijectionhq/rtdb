@@ -39,11 +39,12 @@ entity SpatialPostings {
 -- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.
 -- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.
 -- The builder decodes the geometry and partition children of a put where the IPC layout allows projection.
--- The builder appends covering keys to typed Arrow columns and sorts their row positions.
+-- The builder appends covering keys to typed Arrow columns and sorts and deduplicates their row positions when the input is not strictly ordered.
 -- A posting page whose sorted selection is contiguous reuses source Arrow slices.
 -- The completed posting object is published immutably before the catalog records its directory receipt.
 -- The receipt authenticates the directory and Arrow footer at the end of the posting object.
 -- Each directory entry binds an Arrow page's encoded bytes, row count, ordered partition and cell endpoints, and page-wide cell bounds.
+-- The writer hashes each page's emitted file bytes and writes directory entries in page order before the footer.
 -- A held read authenticates the directory before using its fences to select page ranges.
 -- It authenticates each selected range and checks its page contents against the directory before visiting candidates.
 -- A posting read admits each selected range and provider scratch before fetching its bytes.

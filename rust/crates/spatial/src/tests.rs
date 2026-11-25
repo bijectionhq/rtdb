@@ -134,8 +134,8 @@ fn canonical_geometry_preserves_work_and_tagged_wkb_results() {
     .unwrap()
     .unwrap();
     assert_eq!(
-        location.keys(&mut work).unwrap(),
-        wkb.keys(&mut work).unwrap()
+        location.keys(&mut work).unwrap().as_slice(),
+        wkb.keys(&mut work).unwrap().as_slice()
     );
     let exact = Predicate::WithinDistance(0.0);
     assert_eq!(
@@ -201,8 +201,8 @@ fn canonical_collections_and_position_accuracy_keep_their_typed_values() {
         tagged.extend_from_slice(&point(1.0, 2.0)[1..]);
         let legacy = Location::decode(&tagged, &mut work).unwrap();
         assert_eq!(
-            location.keys(&mut work).unwrap(),
-            legacy.keys(&mut work).unwrap()
+            location.keys(&mut work).unwrap().as_slice(),
+            legacy.keys(&mut work).unwrap().as_slice()
         );
     }
     for encoding in [
@@ -286,9 +286,9 @@ async fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_ex
         let wanted = Iid([1; 16]);
         let memory = MemoryBudget::new(4 << 20);
         let mut file = Postings::new(&memory).unwrap();
-        file.append(selected, wanted, row.keys(&mut work).unwrap())
+        file.append(selected, wanted, row.keys(&mut work).unwrap().as_slice())
             .unwrap();
-        file.append(elsewhere, Iid([2; 16]), row.keys(&mut work).unwrap())
+        file.append(elsewhere, Iid([2; 16]), row.keys(&mut work).unwrap().as_slice())
             .unwrap();
         let output = tempfile::NamedTempFile::new().unwrap();
         let (length, stats) = file
@@ -364,11 +364,11 @@ async fn spatial_arrow_postings_seek_across_page_boundaries() {
     let partition = Partition::of([b"area".as_slice()]);
     let iid = Iid([9; 16]);
     let boundary = 16_384;
-    let write = |keys, duplicates| {
+    let write = |keys: Vec<_>, duplicates| {
         let mut postings = Postings::new(&memory).unwrap();
-        postings.append(partition, iid, keys).unwrap();
+        postings.append(partition, iid, &keys).unwrap();
         if duplicates {
-            postings.append(partition, iid, vec![boundary, boundary - 1]).unwrap();
+            postings.append(partition, iid, &[boundary, boundary - 1]).unwrap();
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         let (_, stats) = postings.write(

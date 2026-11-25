@@ -2,7 +2,7 @@ use geometry::predicates::{
     self, CoverPredicate, TopologyPredicate,
     prepared::{Preparation, PreparedGeometry},
 };
-use geometry::spatial_index::{candidate_ranges, point_key, shape_keys};
+use geometry::spatial_index::{candidate_ranges, empty_key, point_key, shape_keys};
 use geometry::{
     Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, KeyRange, Kind, Scalar, Size, ValueView,
 };
@@ -14,6 +14,20 @@ pub(crate) const WORK_BYTES: usize = 8 << 20;
 pub(crate) struct Location {
     pub(crate) geometry: Geometry,
     position_accuracy: Option<Option<f64>>,
+}
+
+pub(crate) enum PostingKeys {
+    One(i64),
+    Cover(Vec<i64>),
+}
+
+impl PostingKeys {
+    pub(crate) fn as_slice(&self) -> &[i64] {
+        match self {
+            Self::One(key) => std::slice::from_ref(key),
+            Self::Cover(keys) => keys,
+        }
+    }
 }
 
 impl Location {
@@ -83,12 +97,13 @@ impl Location {
         Ok(Some(Self { geometry, position_accuracy: None }))
     }
 
-    pub(crate) fn keys(&self, work: &mut GeometryWork) -> Result<Vec<i64>> {
+    pub(crate) fn keys(&self, work: &mut GeometryWork) -> Result<PostingKeys> {
         match &self.geometry.coords {
             Coords::Point(coords) => point_key(coords, self.position_accuracy.unwrap_or(Some(0.0)))
-                .map(|key| vec![key])
+                .map(PostingKeys::One)
                 .map_err(|error| invalid(error.to_string())),
-            _ => shape_keys(&self.geometry, work).map_err(geometry_error),
+            _ if self.geometry.is_empty() => Ok(PostingKeys::One(empty_key())),
+            _ => shape_keys(&self.geometry, work).map(PostingKeys::Cover).map_err(geometry_error),
         }
     }
 }
