@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use rtdb_index::branches::RankedIndexDeclaration;
+use rtdb_plan::Catalog;
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef, Timestamp, rtdb_v1::RANKED_IVF};

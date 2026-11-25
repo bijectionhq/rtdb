@@ -39,9 +39,11 @@ impl DefaultServing {
     ) -> Result<Snapshot> {
         use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 
-        let indexes = || branch.tables().flat_map(|(table, definition)| definition.ranked_indexes.iter()
-            .map(move |(name, declaration)| (table, name, declaration)));
-        let count = indexes().count();
+        // Collected so the awaiting loop below holds plain references, not a lifetime-generic closure
+        // that the `Send` check of the async-trait query cannot prove general enough.
+        let indexes = branch.tables().flat_map(|(table, definition)| definition.ranked_indexes.iter()
+            .map(move |(name, declaration)| (table, name, declaration))).collect::<Vec<_>>();
+        let count = indexes.len();
         if count == 0 {
             return rtdb_query::branch_snapshot(branch, &self.memory);
         }
@@ -59,7 +61,7 @@ impl DefaultServing {
             "UTC", QueryOptions::default(), cancellation)?;
         let _ready = self.memory.reserve(count.saturating_mul(128))?;
         let mut ready = BTreeSet::new();
-        for (table, name, declaration) in indexes() {
+        for (table, name, declaration) in indexes {
             let verified = match &declaration.definition.kind {
                 RankedIndexKind::Spatial { .. } => rtdb_spatial::committed_native_ready(Arc::clone(&context), table, name, declaration).await,
                 RankedIndexKind::Ivf { .. } => rtdb_vector::committed_native_ready(Arc::clone(&context), table, name, declaration).await,

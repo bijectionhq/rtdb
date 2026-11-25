@@ -1143,6 +1143,7 @@ fn interrupted() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use journal_contract::{Identity, reference::MemoryJournal};
+    use rtdb_tx::transact::TRANSACT_REQUIRES;
     use rtdb_crypt::LocalKms;
     use rtdb_db::MultiOptions;
     use rtdb_query::{

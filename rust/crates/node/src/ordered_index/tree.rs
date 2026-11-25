@@ -46,9 +46,9 @@ struct RetainedAddressBytes<T> {
     _memory: Arc<MemoryReservation>,
 }
 
-impl<T: AsRef<[u8]>> AsRef<[u8]> for RetainedAddressBytes<T> {
+impl<T: std::ops::Deref<Target = [u8]>> AsRef<[u8]> for RetainedAddressBytes<T> {
     fn as_ref(&self) -> &[u8] {
-        self.bytes.as_ref()
+        &self.bytes
     }
 }
 
@@ -78,7 +78,7 @@ impl Address {
         Self { iid, key, retained: false }
     }
 
-    pub fn retain_bytes<T: AsRef<[u8]> + Send + 'static>(bytes: T, memory: Arc<MemoryReservation>) -> Bytes {
+    pub fn retain_bytes<T: std::ops::Deref<Target = [u8]> + Send + 'static>(bytes: T, memory: Arc<MemoryReservation>) -> Bytes {
         Bytes::from_owner(RetainedAddressBytes { bytes, _memory: memory })
     }
 
