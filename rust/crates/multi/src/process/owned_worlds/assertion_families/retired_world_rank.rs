@@ -1,4 +1,4 @@
-//! Founding World-rank succession at the authenticated retired Original.
+//! Archived rank custody at the authenticated retired Original.
 
 use std::sync::Arc;
 
@@ -17,10 +17,11 @@ use crate::{
     capability::CellSecret,
     family_custody::{WORLD_RANK_CUSTODY_GRANT_BYTES, WorldRankCustodyGrant, framed_digest, grant_id},
     keys::{
-        AssertionFamilies, CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, KeyService, WorldRowSlot,
+        AssertionFamilies, CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, KeyService,
+        RankTransferAgreement, RankTransferMember,
         FamilyReleaseObservation, FamilyReleaseRegistration, WorldRankDestinationCustody, WorldRankFrame,
-        WorldRankSourceCensus, WorldRankSourceDrain, WorldRankTransfer, WorldRankTransferAuthority,
-        WorldRankTransferBinding, WorldRankTransferContributor, WorldRankTransferDestination,
+        WorldRankSourceCensus, WorldRankSourceDrain, WorldRankTransferAuthority,
+        WorldRankTransferBinding, WorldRankTransferDestination,
         WorldRankTransferRead, WorldRankTransferSource, WorldRankTransferState,
     },
 };
@@ -130,7 +131,7 @@ impl OriginalRankJournal {
     }
 
     async fn release(
-        &self, scope: &Scope, families: &AssertionFamilies<'_>, agreement: &WorldRankTransfer,
+        &self, scope: &Scope, families: &AssertionFamilies<'_>, agreement: &RankTransferAgreement,
         request: FamilyReleaseRequest,
     ) -> Result<FamilyReply> {
         let registration = |wire| {
@@ -138,11 +139,15 @@ impl OriginalRankJournal {
             self.require_registration(agreement, registration)?;
             Ok::<_, rtdb_types::Anomaly>(registration)
         };
+        if matches!(agreement, RankTransferAgreement::Landed(_))
+            && !matches!(&request, FamilyReleaseRequest::Cancel(_) | FamilyReleaseRequest::Dispose(_))
+        {
+            families.require_landed_rank_release(agreement, self).await?;
+        }
         match request {
             FamilyReleaseRequest::Prepare { family, part, cutoff, input } => {
-                let member = member(agreement, family)?;
-                let selected = selection(member)?;
-                require_wire_input(scope, member, &input)?;
+                let selected = agreement.member(family)?.release_input()?;
+                require_wire_input(scope, selected, &input)?;
                 let r = families.prepare_family_release(family, selected, release::part(part)?, cutoff).await?;
                 let mut body = Vec::with_capacity(252);
                 body.extend_from_slice(&r.origin());
@@ -152,9 +157,9 @@ impl OriginalRankJournal {
             }
             FamilyReleaseRequest::Stage { registration: wire, input } => {
                 let r = registration(wire)?;
-                let member = member(agreement, r.client_family())?;
-                require_wire_input(scope, member, &input)?;
-                families.stage_family_release(r, selection(member)?).await?;
+                let selected = agreement.member(r.client_family())?.release_input()?;
+                require_wire_input(scope, selected, &input)?;
+                families.stage_family_release(r, selected).await?;
             }
             FamilyReleaseRequest::Promote(wire) => families.promote_family_release(registration(wire)?).await?,
             FamilyReleaseRequest::Check(wire) => families.require_family_release(registration(wire)?).await?,
@@ -164,12 +169,12 @@ impl OriginalRankJournal {
         Ok(FamilyReply::Done)
     }
 
-    fn require_registration(&self, agreement: &WorldRankTransfer, registration: FamilyReleaseRegistration) -> Result<()> {
+    fn require_registration(&self, agreement: &RankTransferAgreement, registration: FamilyReleaseRegistration) -> Result<()> {
         if registration.owner() != self.identity {
             return Err(OwnedWorld::unavailable());
         }
         let family = registration.client_family();
-        registration.require_input(family, selection(member(agreement, family)?)?)
+        registration.require_input(family, agreement.member(family)?.release_input()?)
     }
 }
 
@@ -246,36 +251,22 @@ fn after(key: TransactionKey, floor: TransactionKey) -> bool {
     key.tx_id > floor.tx_id && key.system_time > floor.system_time
 }
 
-fn member(agreement: &WorldRankTransfer, family: Uuid) -> Result<&WorldRankTransferContributor> {
-    let index = agreement.contributors.binary_search_by_key(&family, |member| member.family)
-        .map_err(|_| OwnedWorld::unavailable())?;
-    Ok(&agreement.contributors[index])
-}
-
-fn selection(member: &WorldRankTransferContributor) -> Result<FamilyReleaseInput<'_>> {
-    let unavailable = OwnedWorld::unavailable;
-    Ok(FamilyReleaseInput::WorldDerived {
-        member: member.occurrence,
-        stage: member.rank.capability.ok_or_else(unavailable)?,
-        slot: WorldRowSlot {
-            world: member.rank.world.ok_or_else(unavailable)?,
-            relation: &member.rank.relation,
-            key: &member.rank.key,
-        },
-    })
-}
-
-fn require_wire_input(scope: &Scope, member: &WorldRankTransferContributor, wire: &FamilyReleaseInputWire) -> Result<()> {
-    let unavailable = OwnedWorld::unavailable;
-    let FamilyReleaseInputWire::WorldDerived { member: occurrence, stage, world, relation, key } = wire
-        else { return Err(unavailable()); };
-    if scope.occurrence(*occurrence)? != member.occurrence
-        || Some(scope.stage(*stage)?) != member.rank.capability || Some(*world) != member.rank.world
-        || *relation != member.rank.relation || *key != member.rank.key
-    {
-        return Err(unavailable());
-    }
-    Ok(())
+fn require_wire_input(scope: &Scope, selection: FamilyReleaseInput<'_>, wire: &FamilyReleaseInputWire) -> Result<()> {
+    let exact = match (selection, wire) {
+        (FamilyReleaseInput::WorldDerived { member, stage, slot },
+            FamilyReleaseInputWire::WorldDerived { member: occurrence, stage: capability, world, relation, key }) =>
+        {
+            scope.occurrence(*occurrence)? == member && scope.stage(*capability)? == stage
+                && *world == slot.world && relation.as_str() == slot.relation && key.as_slice() == slot.key
+        }
+        (FamilyReleaseInput::RootDerived { member, relation, key },
+            FamilyReleaseInputWire::RootDerived { member: occurrence, relation: ranked, key: selector }) =>
+        {
+            scope.occurrence(*occurrence)? == member && ranked.as_str() == relation && selector.as_slice() == key
+        }
+        _ => false,
+    };
+    if exact { Ok(()) } else { Err(OwnedWorld::unavailable()) }
 }
 
 pub(in crate::process::owned_worlds) async fn serve(
@@ -309,42 +300,59 @@ pub(in crate::process::owned_worlds) async fn serve(
     let families = keys.assertion_families(region).ok_or_else(unavailable)?
         .with_original_reader(&original, deployment, &cancellation);
     let agreement = Arc::new(if operation == 0 {
-        WorldRankTransfer::from_bytes(frame.payload(1 << 20)?)?
+        RankTransferAgreement::from_bytes(frame.payload(1 << 20)?)?
     } else {
         if operation != 3 && frame.take::<32>()? != grant.binding.agreement {
             return Err(unavailable());
         }
-        families.world_rank_transfer_agreement(grant.binding).await?
+        families.rank_transfer_agreement(grant.binding).await?
     });
-    let source = agreement.source;
+    let source = agreement.source();
+    let destination = agreement.destination();
     if source.original.deployment != deployment || source.original.installation != deployment
         || source.custody_incarnation.get() != record.incarnation || source.original.captured != grant.captured
-        || source.archive != grant.archive || agreement.destination.deployment != agreement.destination.installation
+        || source.archive != grant.archive || destination.deployment != destination.installation
         || agreement.binding()? != grant.binding || agreement.inventory()? != grant.inventory
     {
         return Err(unavailable());
+    }
+    let scope = Scope::new(deployment, record)?;
+    if let RankTransferAgreement::Landed(landed) = agreement.as_ref() {
+        if landed.member.landing.position.line_generation != scope.root_line {
+            return Err(unavailable());
+        }
     }
     drop(families);
     let creator = format!("fenced-world-rank-custody/{}", release::lower_hex(&request.address));
     let identity = release::carrier_identity(deployment, source.original.history, *source.original.installation.as_bytes(), &creator);
     let journal = Arc::new(OriginalRankJournal {
-        original, cancellation, directory, source, destination: agreement.destination,
+        original, cancellation, directory, source, destination,
         grant, grant_id: id, enrollment, identity, creator,
     });
     journal.current().await?;
     let families = journal.families(keys.as_ref())?;
-    let scope = Scope::new(deployment, record)?;
     match operation {
         0 => {
             let key_service = keys.assertion_keys().ok_or_else(unavailable)?;
             let verify = IoRegion::new();
-            for member in &agreement.contributors {
-                let founder = frame.payload(1 << 20)?;
-                let rank = frame.payload(1 << 20)?;
-                member.authenticate_carriers(founder, rank, key_service, &verify).await?;
+            match agreement.as_ref() {
+                RankTransferAgreement::World(world) => {
+                    for member in &world.contributors {
+                        let founder = frame.payload(1 << 20)?;
+                        let rank = frame.payload(1 << 20)?;
+                        member.authenticate_carriers(founder, rank, key_service, &verify).await?;
+                    }
+                    frame.finish()?;
+                }
+                RankTransferAgreement::Landed(landed) => {
+                    let carrier = frame.payload(1 << 20)?;
+                    let rank = frame.payload(1 << 20)?;
+                    frame.finish()?;
+                    landed.member.require_payload(rank)?;
+                    landed.member.authenticate_carrier(carrier, key_service, &verify).await?;
+                }
             }
-            frame.finish()?;
-            let prepared = families.prepare_world_rank_transfer(&agreement, journal.as_ref()).await?;
+            let prepared = families.prepare_rank_transfer(&agreement, journal.as_ref()).await?;
             let mut reply = Vec::with_capacity(64);
             reply.extend_from_slice(&prepared.address);
             reply.extend_from_slice(&prepared.agreement);
@@ -352,7 +360,7 @@ pub(in crate::process::owned_worlds) async fn serve(
         }
         1 => {
             frame.finish()?;
-            families.record_world_rank_transfer_drain(&agreement, journal.as_ref()).await?;
+            families.record_rank_transfer_drain(&agreement, journal.as_ref()).await?;
             Ok(FamilyReply::Done)
         }
         2 => {
@@ -364,15 +372,22 @@ pub(in crate::process::owned_worlds) async fn serve(
             let registration = release::registration(registration)?;
             journal.require_registration(&agreement, registration)?;
             if registration.client_family() != family { return Err(unavailable()); }
-            let selected = member(&agreement, family)?;
-            let FamilyReleaseInput::WorldDerived { slot, .. } = selection(selected)?
-                else { return Err(unavailable()); };
             families.require_family_release(registration).await?;
-            let body = families.open_transferred_world_rank(
-                Arc::clone(&agreement),
-                WorldRankTransferRead { contributor: selected, carrier: &carrier, slot, replay, generation },
-                carrier.clone(), Arc::clone(&keys), journal.clone(),
-            ).await?;
+            let selected = agreement.member(family)?;
+            let body = match selected {
+                RankTransferMember::World(contributor) => {
+                    let FamilyReleaseInput::WorldDerived { slot, .. } = selected.release_input()?
+                        else { return Err(unavailable()); };
+                    families.open_transferred_world_rank(
+                        Arc::clone(&agreement),
+                        WorldRankTransferRead { contributor, carrier: &carrier, slot, replay, generation },
+                        carrier.clone(), Arc::clone(&keys), journal.clone(),
+                    ).await?
+                }
+                RankTransferMember::Landed(_) => families.open_transferred_landed_rank(
+                    Arc::clone(&agreement), replay, generation, carrier, Arc::clone(&keys), journal.clone(),
+                ).await?,
+            };
             families.require_family_release(registration).await?;
             let check = framed_digest(b"rtdb.multi/retired-world-rank-part/v1\0", &[
                 &journal.grant_id, &registration.attempt(), &registration.address(),
@@ -389,7 +404,7 @@ pub(in crate::process::owned_worlds) async fn serve(
         }
         4 => {
             frame.finish()?;
-            families.revoke_world_rank_transfer_delivery(&agreement).await?;
+            families.revoke_rank_transfer_delivery(&agreement).await?;
             Ok(FamilyReply::Done)
         }
         _ => Err(unavailable()),
@@ -405,6 +420,52 @@ mod tests {
     use rtdb_types::{SourcePosition, StorageEpoch};
 
     use super::*;
+
+    #[test]
+    fn retired_landed_rank_release_rejects_a_point_input_and_selector_substitutions() -> Result<()> {
+        use rtdb_flight_sql::{FamilyOccurrenceWire, FamilyStage};
+        use rtdb_types::{AssertionId, Position, RootFamilyDerivativeId, RootLandingBinding, RootLandingTarget, RootRowCarrier};
+
+        let record = DeploymentRecord::new("original", "example", vec![], 0);
+        let deployment = Uuid::parse_str(&record.id).unwrap();
+        let scope = Scope::new(deployment, &record)?;
+        let family = Uuid::from_bytes([1; 16]);
+        let assertion = AssertionId::from_bytes([2; 32]);
+        let stage = FamilyStage { deployment, incarnation: scope.incarnation, stage: Uuid::from_bytes([3; 16]) };
+        let position = Position { line_generation: scope.root_line, publication: 40, ordinal: NonZeroU64::MIN };
+        let occurrence = FamilyOccurrenceWire { position, assertion, capability: stage };
+        let mut address = RootRowCarrier::table_prefix(&[4; 16]).to_vec();
+        address.extend_from_slice(&[0, 255, 0, 255]);
+        address.extend_from_slice(&[5; 64]);
+        address.extend_from_slice(&[0, 1]);
+        let key = [RootFamilyDerivativeId::PREFIX, family.as_bytes(), &assertion.to_bytes(), &address].concat();
+        let relation = format!("fact_{}_search", "a".repeat(64));
+        let selected = FamilyReleaseInput::RootDerived {
+            member: scope.occurrence(occurrence)?, relation: &relation, key: &key,
+        };
+        require_wire_input(&scope, selected, &FamilyReleaseInputWire::RootDerived {
+            member: occurrence, relation: relation.clone(), key: key.clone(),
+        })?;
+        let binding = RootLandingBinding {
+            position, assertion, stage: *stage.stage.as_bytes(),
+            target: RootLandingTarget { receipt: [6; 32], review_slot: 0, address_extent: [7; 32], disclosure: [8; 32] },
+            payload_digest: [9; 32], link_digest: [10; 32],
+        };
+        assert!(require_wire_input(&scope, selected, &FamilyReleaseInputWire::RootLanding {
+            member: occurrence, binding,
+        }).is_err());
+        assert!(require_wire_input(&scope, selected, &FamilyReleaseInputWire::RootDerived {
+            member: occurrence, relation: relation.clone(), key: address,
+        }).is_err());
+        assert!(require_wire_input(&scope, selected, &FamilyReleaseInputWire::RootDerived {
+            member: occurrence, relation: format!("fact_{}_search", "b".repeat(64)), key: key.clone(),
+        }).is_err());
+        let wrong_stage = FamilyStage { stage: Uuid::from_bytes([11; 16]), ..stage };
+        assert!(require_wire_input(&scope, selected, &FamilyReleaseInputWire::RootDerived {
+            member: FamilyOccurrenceWire { capability: wrong_stage, ..occurrence }, relation: relation.clone(), key: key.clone(),
+        }).is_err());
+        Ok(())
+    }
 
     #[test]
     fn ordered_state_requires_the_controller_and_both_positive_drains() -> Result<()> {
