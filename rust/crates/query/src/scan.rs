@@ -831,9 +831,9 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        let restricted_iids = context.catalog.owned_spatial_candidates(&scan.table.name);
+        let restricted_iids = context.catalog.owned_candidates(&scan.table.name);
         if restricted_iids.is_some() && scan.iids.is_some() {
-            return Err(invalid("scan-iid-scope", "An owned spatial candidate scan already has a fixed IID scope"));
+            return Err(invalid("scan-iid-scope", "An owned candidate scan already has a fixed IID scope"));
         }
         Self::over_with_queries(scan, execution, pushdowns, &database.partitions, &database.storage,
             true, None, &SearchQueries::default(), restricted_iids).await

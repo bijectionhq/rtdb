@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EncodedEvent, EventBatch}, ipc::{ArrowFile, inspect_file_reserved}};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
-use rtdb_query::{IidScope, visit_projected_data_events};
+use rtdb_query::{CandidateIids, IidScope, OrderedIidBuffer, visit_projected_data_events};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TemporalBounds};
 use tokio_util::sync::CancellationToken;
@@ -18,7 +18,7 @@ use crate::{
     definition::{self, VectorDefinition},
     file::{Block, Cluster, Directory, Locator},
     probe,
-    rows::{self, Partition},
+    rows::{self, Partition, UnitProbe},
 };
 
 /// Where and at which cut a shortlist reads (vector.allium: ApproximateRead).
@@ -41,7 +41,7 @@ impl Default for Budget {
 }
 
 /// One round of the shortlist: distinct candidates in IID order, and whether every eligible row has been considered.
-pub struct Round { pub candidates: Vec<Iid>, pub complete: bool }
+pub struct Round { pub candidates: CandidateIids, pub complete: bool }
 
 /// An opened generation and its clusters eligible under the partition filter, nearest centroid first.
 struct Opened {
@@ -74,7 +74,7 @@ impl Opened {
 /// Each round probes further clusters; the caller resolves the candidates at its cut and widens the shortlist
 /// until enough of them pass its filter, every row has been considered, or the budget is spent.
 pub struct Shortlist {
-    probe: Vec<f32>,
+    probe: UnitProbe,
     plan: probe::Plan,
     budget: Budget,
     partition: Option<Partition>,
@@ -85,15 +85,15 @@ pub struct Shortlist {
 impl Shortlist {
     /// Opens the generations at the cut and ranks the frontier, or `None` where the frontier exceeds the budget,
     /// the cut is not a pair of points, or the generations disagree with the definition.
-    pub async fn open(cut: Cut<'_>, definition: &VectorDefinition, probe: Vec<f32>, limit: usize, partition: Option<Partition>,
+    pub async fn open(cut: Cut<'_>, definition: &VectorDefinition, probe: UnitProbe, limit: usize, partition: Option<Partition>,
         scope: Option<IidScope<'_>>, budget: Budget) -> Result<Option<Self>> {
         let bounds = cut.bounds;
         if !(bounds.valid_time.is_point() && bounds.system_time.is_point()) || cut.snapshot.has_overlays() { return Ok(None); }
-        if probe.len() != definition.dimensions { return Ok(None); }
+        if probe.values().len() != definition.dimensions { return Ok(None); }
         let Some(sources) = sources(cut, definition, budget) else { return Ok(None) };
         let mut scores = Scores::new(cut.memory, budget.max_candidates)?;
         FrontierRanker {
-            definition, probe: &probe, partition, scope, bounds, unit: Vec::new(), scores: &mut scores,
+            definition, probe: probe.values(), partition, scope, bounds, scores: &mut scores,
         }.rank(cut, &sources).await?;
         if scores.overflowed { return Ok(None); }
         let mut opened = Vec::new();
@@ -102,7 +102,7 @@ impl Shortlist {
             let lease = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
             let directory = Directory::read(lease, locator, cut.memory)?;
             if directory.dimensions != definition.dimensions { return Ok(None); }
-            if let Some(generation) = Opened::rank(key, &directory, &probe, partition, cut.memory)? {
+            if let Some(generation) = Opened::rank(key, &directory, probe.values(), partition, cut.memory)? {
                 opened.push(generation);
             }
         }
@@ -112,7 +112,7 @@ impl Shortlist {
     /// Probes the clusters the current plan reaches and returns the nearest distinct IIDs, or `None` past the candidate budget.
     pub async fn round(&mut self, cut: Cut<'_>, scope: Option<IidScope<'_>>) -> Result<Option<Round>> {
         let bounds = cut.bounds;
-        let dimensions = self.probe.len();
+        let dimensions = self.probe.values().len();
         for generation in &mut self.opened {
             let probes = self.plan.probes(generation.clusters.len());
             let start = generation.probed.min(probes);
@@ -133,11 +133,11 @@ impl Shortlist {
                     let iid = block.iid(row)?;
                     let (valid_from, valid_to, system_from) = block.extent(row);
                     if scope.is_some_and(|scope| !scope.contains(&iid)) || !may_be_visible(valid_from, valid_to, system_from, bounds) { continue; }
-                    self.scores.add(iid, rows::unit_distance(&self.probe, block.unit(row)))?;
+                    self.scores.add(iid, rows::unit_distance(self.probe.values(), block.unit(row)))?;
                 }
             }
         }
-        let Some((candidates, truncated)) = self.scores.nearest(self.plan.target()) else { return Ok(None) };
+        let Some((candidates, truncated)) = self.scores.nearest(self.plan.target(), cut.memory)? else { return Ok(None) };
         let complete = !truncated && self.opened.iter().all(|generation| generation.probed >= generation.clusters.len());
         Ok(Some(Round { candidates, complete }))
     }
@@ -181,7 +181,6 @@ struct FrontierRanker<'a> {
     partition: Option<Partition>,
     scope: Option<IidScope<'a>>,
     bounds: TemporalBounds,
-    unit: Vec<f32>,
     scores: &'a mut Scores,
 }
 
@@ -195,7 +194,7 @@ impl FrontierRanker<'_> {
         }
         for segment in cut.snapshot.iter_segments(&definition.table) {
             for batch in segment.batches() {
-                self.rank_batch(batch.view())?;
+                self.rank_batch(batch.view(), cut.memory)?;
             }
         }
         Ok(())
@@ -208,7 +207,7 @@ impl FrontierRanker<'_> {
         };
         if cut.storage.object_store().supports_scan_ranges(data) {
             let visit = visit_projected_data_events(cut.storage, data, cut.memory, columns, check_cancelled,
-                |events| self.rank_batch(events));
+                |events| self.rank_batch(events, cut.memory));
             return cut.cancellation.run_until_cancelled(visit).await.ok_or_else(crate::kmeans::cancelled)?;
         }
 
@@ -218,28 +217,25 @@ impl FrontierRanker<'_> {
             check_cancelled()?;
             let (batch, _page) = reader.read_event_page_reserved(page, columns, cut.memory)?;
             let events = EventBatch::new(batch)?;
-            self.rank_batch(&events)?;
+            self.rank_batch(&events, cut.memory)?;
         }
         Ok(())
     }
 
-    fn rank_batch(&mut self, events: &EventBatch) -> Result<()> {
-        let dimensions = self.definition.dimensions;
+    fn rank_batch(&mut self, events: &EventBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
         for row in 0..events.len() {
             let event = events.borrow_event(row)?;
-            self.unit.clear();
-            // A put outside the requested cut can still fail vector or partition decoding.
-            let Some(partition) = rows::append_indexable_event_unit(&event, self.definition, dimensions, &mut self.unit)? else { continue };
             let header = event.header();
-            if self.partition.is_none_or(|expected| partition == expected)
+            let eligible = |partition| self.partition.is_none_or(|expected| partition == expected)
                 && self.scope.is_none_or(|scope| scope.contains(&header.iid))
-                && may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, self.bounds)
-            {
-                self.scores.add(header.iid, rows::unit_distance(self.probe, &self.unit))?;
+                && may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, self.bounds);
+            if let Some(distance) = rows::frontier_distance(&event, self.definition, self.probe, memory, eligible)? {
+                self.scores.add(header.iid, distance)?;
             }
         }
         Ok(())
     }
+
 }
 
 fn open_frontier_file(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
@@ -291,31 +287,41 @@ impl Scores {
         }
         if self.by_iid.len() == self.admitted {
             let admitted = self.admitted.saturating_add(256).min(self.limit);
-            // The grant covers the score tree, the selection heap and one IID round, including the held projection's set.
             Arc::get_mut(&mut self.allocation).expect("Scores own their allocation")
-                .grow_to(admitted.saturating_mul(192))?;
+                .grow_to(admitted.saturating_mul(128))?;
             self.admitted = admitted;
         }
         self.by_iid.insert(iid, distance);
         Ok(())
     }
 
-    fn nearest(&self, target: usize) -> Option<(Vec<Iid>, bool)> {
-        if self.overflowed { return None; }
-        if self.by_iid.len() <= target {
-            return Some((self.by_iid.keys().copied().collect(), false));
-        }
-        let mut scores = self.by_iid.iter().map(|(&iid, &distance)| ScoredIid { iid, distance });
-        let mut nearest = BinaryHeap::from(scores.by_ref().take(target).collect::<Vec<_>>());
-        for candidate in scores {
-            if let Some(mut worst) = nearest.peek_mut() && candidate < *worst {
-                *worst = candidate;
+    fn nearest(&self, target: usize, memory: &Arc<MemoryBudget>) -> Result<Option<(CandidateIids, bool)>> {
+        if self.overflowed { return Ok(None); }
+        let count = self.by_iid.len().min(target);
+        let mut selection = OrderedIidBuffer::with_capacity(count, memory)?;
+        let truncated = count < self.by_iid.len();
+        if !truncated {
+            for &iid in self.by_iid.keys() {
+                selection.push(iid);
+            }
+        } else {
+            let _heap = memory.reserve(count.saturating_mul(size_of::<ScoredIid>()))?;
+            let mut best = BinaryHeap::with_capacity(count);
+            for (&iid, &distance) in &self.by_iid {
+                let candidate = ScoredIid { iid, distance };
+                if best.len() < count {
+                    best.push(candidate);
+                } else if let Some(mut worst) = best.peek_mut() && candidate < *worst {
+                    *worst = candidate;
+                }
+            }
+            for score in best {
+                selection.push(score.iid);
             }
         }
-        let mut candidates: Vec<_> = nearest.into_iter().map(|score| score.iid).collect();
-        candidates.sort_unstable();
-        Some((candidates, true))
+        Ok(Some((selection.into_sorted_membership()?, truncated)))
     }
+
 }
 
 /// A version can be visible only if its valid interval meets the read's and it was written by the read's system instant.
@@ -382,6 +388,11 @@ mod tests {
         assert_eq!(limited.used_bytes(), 0);
     }
 
+    fn nearest_iids(scores: &Scores, target: usize) -> Option<(Vec<Iid>, bool)> {
+        scores.nearest(target, scores.allocation.budget()).unwrap()
+            .map(|(iids, truncated)| (iids.iter().collect(), truncated))
+    }
+
     fn definition() -> VectorDefinition {
         VectorDefinition {
             name: "neighbors".into(), table: TableRef::new("public", "documents"), column: "embedding".into(),
@@ -412,7 +423,7 @@ mod tests {
         let point = Interval::at(Timestamp(10)).unwrap();
         FrontierRanker {
             definition, probe: &[1.0, 0.0], partition, scope: Some(IidScope::Set(scope)),
-            bounds: TemporalBounds { valid_time: point, system_time: point }, unit: Vec::new(), scores,
+            bounds: TemporalBounds { valid_time: point, system_time: point }, scores,
         }
     }
 
@@ -422,16 +433,17 @@ mod tests {
         let scope = BTreeSet::from([Iid([1; 16]), Iid([2; 16]), Iid([3; 16]), Iid([4; 16]), Iid([5; 16])]);
         let tenant = |name: &str| Value::Utf8(name.into());
         let partition = Partition::of([Some(std::borrow::Cow::Owned(tenant("a")))])?;
-        let mut scores = Scores::new(&MemoryBudget::new(8192), 8)?;
+        let memory = MemoryBudget::new(8192);
+        let mut scores = Scores::new(&memory, 8)?;
         let mut ranker = frontier(&definition, &scope, Some(partition), &mut scores);
         let mut expired = put(3, [1.0, 0.0], tenant("a"));
         expired.valid_time = Interval::from_micros(0, 10)?;
         let mut future = put(4, [1.0, 0.0], tenant("a"));
         future.system_from = Timestamp(11);
-        ranker.rank_batch(&batch(&[put(1, [3.0, 4.0], tenant("a")), expired, future], ScalarType::Utf8)?)?;
+        ranker.rank_batch(&batch(&[put(1, [3.0, 4.0], tenant("a")), expired, future], ScalarType::Utf8)?, &memory)?;
         ranker.rank_batch(&batch(&[
             put(2, [1.0, 0.0], tenant("a")), put(5, [1.0, 0.0], tenant("b")), put(6, [1.0, 0.0], tenant("a")),
-        ], ScalarType::Utf8)?)?;
+        ], ScalarType::Utf8)?, &memory)?;
         assert_eq!(ranker.scores.by_iid, BTreeMap::from([(Iid([1; 16]), 1.0 - f64::from(0.6_f32)), (Iid([2; 16]), 0.0)]));
         Ok(())
     }
@@ -440,11 +452,12 @@ mod tests {
     fn frontier_reports_partition_errors_only_for_indexable_vectors_even_outside_the_scope() -> Result<()> {
         let definition = definition();
         let scope = BTreeSet::new();
-        let mut scores = Scores::new(&MemoryBudget::new(8192), 8)?;
+        let memory = MemoryBudget::new(8192);
+        let mut scores = Scores::new(&memory, 8)?;
         let mut ranker = frontier(&definition, &scope, None, &mut scores);
-        ranker.rank_batch(&batch(&[put(1, [0.0, -0.0], Value::F64(1.0))], ScalarType::F64)?)?;
+        ranker.rank_batch(&batch(&[put(1, [0.0, -0.0], Value::F64(1.0))], ScalarType::F64)?, &memory)?;
         let batch = batch(&[put(1, [1.0, 0.0], Value::F64(1.0))], ScalarType::F64)?;
-        assert_eq!(ranker.rank_batch(&batch).unwrap_err().code, "rtdb.vector/partition-type");
+        assert_eq!(ranker.rank_batch(&batch, &memory).unwrap_err().code, "rtdb.vector/partition-type");
         Ok(())
     }
 
@@ -486,21 +499,22 @@ mod tests {
         let cut = Cut { snapshot: &snapshot, storage: &storage, memory: &memory, cancellation: &cancellation,
             bounds: TemporalBounds { valid_time: point, system_time: point } };
         let mut shortlist = Shortlist {
-            probe: vec![1.0, 0.0], plan: probe::Plan::new(0.9, 1), budget, partition: None, scores, opened: Vec::new(),
+            probe: UnitProbe::from_slice(&[1.0, 0.0], &memory)?.unwrap(), plan: probe::Plan::new(0.9, 1), budget, partition: None, scores, opened: Vec::new(),
         };
         let first = shortlist.round(cut, None).await?.unwrap();
-        assert_eq!(first.candidates, (1..=64).map(iid).collect::<Vec<_>>());
+        assert_eq!(first.candidates.iter().collect::<Vec<_>>(), (1..=64).map(iid).collect::<Vec<_>>());
         assert!(!first.complete);
         drop(first);
 
         assert!(shortlist.widen());
         let final_round = shortlist.round(cut, None).await?.unwrap();
-        assert_eq!(final_round.candidates, (1..=70).map(iid).collect::<Vec<_>>());
+        assert_eq!(final_round.candidates.iter().collect::<Vec<_>>(), (1..=70).map(iid).collect::<Vec<_>>());
         assert!(final_round.complete);
         assert!(!shortlist.widen());
-        drop(final_round);
-        assert!(memory.used_bytes() > 0);
         drop(shortlist);
+        assert!(memory.used_bytes() > 0);
+        assert_eq!(final_round.candidates.len(), 70);
+        drop(final_round);
         assert_eq!(memory.used_bytes(), 0);
         Ok(())
     }
@@ -508,12 +522,13 @@ mod tests {
     #[test]
     fn the_truncated_shortlist_breaks_distance_ties_by_iid() -> Result<()> {
         let iid = |byte| Iid([byte; 16]);
-        let mut scores = Scores::new(&MemoryBudget::new(8192), 8)?;
+        let memory = MemoryBudget::new(8192);
+        let mut scores = Scores::new(&memory, 8)?;
         for (id, distance) in [(1, 2.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 0.0), (6, -0.0)] {
             scores.add(iid(id), distance)?;
         }
-        assert_eq!(scores.nearest(3), Some((vec![iid(2), iid(5), iid(6)], true)));
-        assert_eq!(scores.nearest(1), Some((vec![iid(6)], true)));
+        assert_eq!(nearest_iids(&scores, 3), Some((vec![iid(2), iid(5), iid(6)], true)));
+        assert_eq!(nearest_iids(&scores, 1), Some((vec![iid(6)], true)));
         Ok(())
     }
 
@@ -524,10 +539,10 @@ mod tests {
         scores.add(first, 2.0)?;
         scores.add(first, 1.0)?;
         assert_eq!(scores.by_iid[&first], 1.0);
-        assert_eq!(scores.nearest(1), Some((vec![first], false)));
+        assert_eq!(nearest_iids(&scores, 1), Some((vec![first], false)));
         scores.add(Iid([2; 16]), 0.0)?;
         assert_eq!(scores.by_iid.len(), 1);
-        assert!(scores.nearest(1).is_none());
+        assert!(nearest_iids(&scores, 1).is_none());
         Ok(())
     }
 }

@@ -262,6 +262,7 @@ impl WorldProjectionCustody {
                 let Some(path) = unique(paths)? else {
                     return shadows.shadow_row(partition, selected, id, None, query);
                 };
+                let _filters = memory.reserve(selected.filters.len().saturating_mul(size_of::<Option<&[u8]>>()))?;
                 let filters = selected.filters.iter().map(|column| {
                     Ok(unique(path.filters.iter().filter(|(name, _)| *name == column.as_str()))?
                         .map(|(_, key)| *key))

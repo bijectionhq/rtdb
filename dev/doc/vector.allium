@@ -71,10 +71,13 @@ entity ProbePlan {
 -- The directory is validated in place, including ascending partition order.
 -- A partition filter seeks its contiguous directory row range.
 -- The read reserves ranking scratch before retaining the eligible cluster descriptions.
+-- The shortlist retains admitted normalized probe components and scores eligible borrowed frontier cells in component order.
+-- Fallback vector and partition cells use individually admitted decode scratch.
 -- The shortlist keeps the nearest distinct IIDs by unit-vector distance across generations and the frontier.
 -- One funded score per distinct IID stays available for subsequent rounds, including IIDs omitted from a narrower round.
 -- The scan uses exact ranking if another distinct IID would exceed the funded score bound.
--- The scan's verifier resolves the shortlist at the read cut and applies every predicate of the scan.
+-- A round hands its funded Arrow IID membership to the exact verifier.
+-- The verifier resolves the shortlist at the read cut and applies every predicate of the scan.
 -- Fewer visible candidates than the limit double the probe fraction and the shortlist until the limit is met, every cluster and row has been considered, or the shortlist would exceed its budget and the scan ranks exactly.
 -- The scan reads only the shortlisted IIDs, resolves their visible versions and computes the exact COSINE_DISTANCE on their stored vectors.
 -- An erased, deleted or superseded version never reaches a result, because resolution at the read cut decides visibility.

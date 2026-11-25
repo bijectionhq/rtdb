@@ -15,10 +15,5 @@ mod rows;
 pub use accelerate::{PREDICATE, VectorAccelerator};
 pub use definition::{Approximate, DEFINITIONS, KIND, Method, VectorDefinition, definitions_in, owned_definition};
 pub use lane::VectorArtefacts;
-pub use rows::Partition;
+pub use rows::{Partition, UnitProbe};
 pub use shortlist::{Budget, Cut, Round, Shortlist, declined};
-
-/// The unit vector of a probe, or none where its cosine distance is undefined.
-pub fn unit_probe(probe: &[f32]) -> Option<Vec<f32>> {
-    rows::unit_of(probe)
-}

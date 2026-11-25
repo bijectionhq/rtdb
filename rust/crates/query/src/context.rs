@@ -75,7 +75,7 @@ pub(crate) enum OwnedSelection {
     Relation,
     Point(rtdb_types::EntityId),
     Artefacts(Arc<OwnedArtefactKeys>),
-    SpatialCandidates(crate::CandidateIids),
+    Candidates(crate::CandidateIids),
 }
 
 pub(crate) struct OwnedArtefactKeys {
@@ -237,9 +237,9 @@ impl CatalogSnapshot {
             _ => None,
         }
     }
-    pub(crate) fn owned_spatial_candidates(&self, name: &QualifiedTable) -> Option<&crate::CandidateIids> {
+    pub(crate) fn owned_candidates(&self, name: &QualifiedTable) -> Option<&crate::CandidateIids> {
         match self.owned_relation.as_ref() {
-            Some((table, OwnedSelection::SpatialCandidates(iids))) if table == name => Some(iids),
+            Some((table, OwnedSelection::Candidates(iids))) if table == name => Some(iids),
             _ => None,
         }
     }

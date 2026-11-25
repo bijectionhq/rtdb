@@ -8,7 +8,7 @@ use rtdb_types::{Iid, Result, Value};
 
 use crate::{
     definition::{self, VectorDefinition},
-    rows::{self, Partition},
+    rows::{Partition, UnitProbe},
     shortlist::{Budget, Cut, Round, Shortlist, declined},
 };
 
@@ -35,7 +35,7 @@ impl Default for VectorAccelerator {
 }
 
 /// What the scan asked of the approximate route.
-struct Asked { definition: VectorDefinition, probe: Vec<f32>, limit: usize }
+struct Asked { definition: VectorDefinition, probe: UnitProbe, limit: usize }
 
 #[async_trait]
 impl ScanAccelerator for VectorAccelerator {
@@ -67,10 +67,7 @@ impl VectorAccelerator {
         let budget = Budget { max_uncovered_bytes: self.max_uncovered_bytes, max_candidates: self.max_candidates };
         let Some(mut shortlist) = Shortlist::open(cut, &asked.definition, asked.probe, asked.limit, partition, scope, budget).await? else { return Ok(None) };
         loop {
-            let (candidates, complete) = {
-                let Some(Round { candidates, complete }) = shortlist.round(cut, scope).await? else { return Ok(None) };
-                (CandidateIids::from_sorted(&candidates, request.memory)?, complete)
-            };
+            let Some(Round { candidates, complete }) = shortlist.round(cut, scope).await? else { return Ok(None) };
             let Some(visible) = request.verifier.retain_visible(&candidates).await? else { return Ok(Some(candidates)) };
             if visible.len() >= asked.limit || complete { return Ok(Some(visible)); }
             // Too few candidates passed the filter: widen the probe and the shortlist until it is satisfied or the budget is spent.
@@ -104,7 +101,7 @@ impl VectorAccelerator {
                 .into_iter().find(|definition| &definition.table == table && definition.column == column)
         };
         let Some(definition) = definition else { return Ok(None) };
-        let Some(probe) = rows::value_unit(&probe, definition.dimensions) else { return Ok(None) };
+        let Some(probe) = UnitProbe::from_value(&probe, definition.dimensions, request.memory)? else { return Ok(None) };
         Ok(Some(Asked { definition, probe, limit }))
     }
 }
