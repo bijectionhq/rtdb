@@ -298,6 +298,16 @@ fn collect_buffers(data: &ArrayData, buffers: &mut BTreeMap<usize, usize>) {
     }
 }
 
+/// Measure distinct backing retained by a decoded batch outside its input block.
+pub fn new_buffer_backing_bytes(batch: &RecordBatch, input: &Buffer) -> Option<usize> {
+    let mut buffers = BTreeMap::new();
+    for column in batch.columns() {
+        collect_buffers(&column.to_data(), &mut buffers);
+    }
+    buffers.remove(&(input.data_ptr().as_ptr() as usize));
+    buffers.into_values().try_fold(0usize, usize::checked_add)
+}
+
 /// Returns a conservative count of distinct buffer bytes visible through the Arrow views.
 /// Unsupported payloads receive zero credit, and out-of-bounds ranges return `None`.
 pub fn visible_buffer_bytes(columns: &[ArrayRef]) -> Option<usize> {
