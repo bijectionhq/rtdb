@@ -95,6 +95,7 @@
 -- A materialized relation evaluates on its first reached reference and preserves the order of its pages.
 -- Native execution holds its pages within the materialization row and memory bounds.
 -- When either bound is crossed it replays all pages through one query-scoped spill file, using the column spill format.
+-- For a column spill page with a payload, the spill quota admits the marker and payload together before either is appended.
 -- Every reference has its own replay position.
 -- References to an in-memory page share the query budget charge for its Arrow backing and pay for their copied values and metadata.
 -- Every outstanding page keeps the memory it uses charged until it is released.
