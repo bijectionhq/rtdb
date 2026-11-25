@@ -19,6 +19,24 @@ struct ArrowKey<'a> {
     projected: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct KeyColumns<'a> {
+    batch: &'a ColumnBatch,
+    positions: Option<&'a [usize]>,
+}
+
+impl<'a> KeyColumns<'a> {
+    pub fn projection(batch: &'a ColumnBatch, positions: &'a [usize]) -> Self {
+        Self { batch, positions: Some(positions) }
+    }
+}
+
+impl<'a> From<&'a ColumnBatch> for KeyColumns<'a> {
+    fn from(batch: &'a ColumnBatch) -> Self {
+        Self { batch, positions: None }
+    }
+}
+
 pub(crate) struct Key<'a> {
     source: ArrowKey<'a>,
     positions: Option<&'a [usize]>,
@@ -186,8 +204,9 @@ impl<'a> Key<'a> {
         }
     }
 
-    fn bind(batch: &'a ColumnBatch, row: usize, projected: bool, context: &QueryContext, hashing: KeyHash) -> Result<(u32, Self)> {
-        let key = Self::read(ArrowKey { columns: &batch.columns, row, projected }, None, context)?;
+    fn bind(columns: impl Into<KeyColumns<'a>>, row: usize, projected: bool, context: &QueryContext, hashing: KeyHash) -> Result<(u32, Self)> {
+        let KeyColumns { batch, positions } = columns.into();
+        let key = Self::read(ArrowKey { columns: &batch.columns, row, projected }, positions, context)?;
         let hash = match hashing {
             KeyHash::Set => (0..key.len()).fold(0, |hash, index| {
                 let cell = match key.cached(index) {
@@ -211,9 +230,9 @@ impl<'a> Key<'a> {
         })
     }
 
-    fn equals(&self, other: ArrowKey<'_>, context: &QueryContext) -> Result<bool> {
-        if self.len() != other.columns.len() { return Ok(false); }
-        let right = Key::read(other, None, context)?;
+    fn equals(&self, other: ArrowKey<'_>, positions: Option<&[usize]>, context: &QueryContext) -> Result<bool> {
+        if self.len() != positions.map_or(other.columns.len(), <[usize]>::len) { return Ok(false); }
+        let right = Key::read(other, positions, context)?;
         // URI preflight can raise a hash error in a later cell even if an earlier cell compares unequal.
         if self.has_uri || right.has_uri {
             let _scratch = context.memory.reserve(4096)?;
@@ -459,7 +478,7 @@ impl BatchKeyIndex {
         let batches = &self.batches;
         self.positions.find(u64::from(hash), all, context, |position| {
             let (batch, projected) = &batches[position.batch];
-            key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected: *projected }, context)
+            key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected: *projected }, None, context)
         })
     }
 
@@ -514,24 +533,24 @@ impl BatchKeyIndex {
         })
     }
 
-    pub fn identify(
+    pub fn identify<'a>(
         &mut self,
-        batch: &ColumnBatch,
+        columns: impl Into<KeyColumns<'a>>,
         projected: bool,
         context: &QueryContext,
         schema: &rtdb_plan::Schema,
         mut visit: impl FnMut(usize, usize, bool) -> Result<()>,
     ) -> Result<()> {
+        let columns = columns.into();
+        let KeyColumns { batch, positions } = columns;
+        if positions.is_some_and(|positions| positions.iter().any(|&position| position >= batch.columns.len())) {
+            return Err(invalid("column-gather", "Row position is outside its source batch"));
+        }
+        let width = positions.map_or(batch.columns.len(), <[usize]>::len);
         let bytes = batch
             .len
             .checked_mul(size_of::<(usize, usize)>() + size_of::<u32>())
-            .and_then(|bytes| {
-                batch
-                    .columns
-                    .len()
-                    .checked_mul(size_of::<usize>())
-                    .and_then(|columns| bytes.checked_add(columns))
-            })
+            .and_then(|bytes| width.checked_mul(size_of::<usize>()).and_then(|columns| bytes.checked_add(columns)))
             .ok_or_else(size_error)?;
         let _scratch = context.memory.reserve(
             bytes
@@ -544,7 +563,7 @@ impl BatchKeyIndex {
         let mut hashes = Vec::with_capacity(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let (hash, key) = Key::bind(batch, row, projected, context, self.hashing)?;
+            let (hash, key) = Key::bind(columns, row, projected, context, self.hashing)?;
             if row == 0 {
                 crate::operators::validate_distinct_types(schema)?;
             }
@@ -553,7 +572,7 @@ impl BatchKeyIndex {
                 continue;
             }
             let known = current.find(u64::from(hash), false, context, |position| {
-                key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected }, context)
+                key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected }, positions, context)
             })?;
             let index = previous
                 .checked_add(known.unwrap_or(current.rows.len()))
@@ -568,9 +587,9 @@ impl BatchKeyIndex {
         if picks.is_empty() {
             return Ok(());
         }
-        let compact = match self.hashing {
-            KeyHash::Set => batch.select_keys(&picks, &context.memory)?,
-            KeyHash::Vector => batch.compact_group_keys(&picks, &context.memory)?,
+        let compact = match (positions, self.hashing) {
+            (None, KeyHash::Set) => batch.select_keys(&picks, &context.memory)?,
+            _ => batch.compact_group_key_columns(&picks, positions, &context.memory)?,
         };
         self.append(compact, projected, &hashes)
     }
@@ -811,7 +830,7 @@ mod tests {
         assert_eq!(hash, crate::operators::equality_hash(&expected, &context.timezone));
         assert_eq!(first.vector_hash().unwrap(), crate::join_storage::hash_values(&expected).unwrap());
         assert_eq!(first.equal_at(&second, 0, false, &context, None).unwrap(), Some(true));
-        assert!(!first.equals(ArrowKey { columns: &batch.columns, row: 1, projected: false }, &context).unwrap());
+        assert!(!first.equals(ArrowKey { columns: &batch.columns, row: 1, projected: false }, None, &context).unwrap());
         assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).unwrap().0, (
             rtdb_columnar::hash_value(&expected[0], 0).unwrap(),
             rtdb_columnar::hash_value_murmur3(&expected[0], 0).unwrap(),

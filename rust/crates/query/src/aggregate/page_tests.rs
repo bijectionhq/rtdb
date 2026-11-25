@@ -117,6 +117,38 @@ async fn grouping_wide_arrow_lists_reuses_the_input_reservation() {
 }
 
 #[tokio::test]
+async fn grouping_materialized_keys_only_packs_representatives() {
+    let execution = execution(64);
+    let memory = &execution.context.memory;
+    let key_type = LogicalType::Scalar(ScalarType::Utf8).maybe();
+    let schema = Schema::new(vec![field(0, LogicalType::Scalar(ScalarType::I64)), field(1, key_type.clone())]).unwrap();
+    let group = NamedExpr { field: field(2, key_type), expr: schema.fields()[1].expression() };
+    let aggregate = count(3, None);
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let output = Schema::new(vec![group.field.clone(), aggregate.field.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input, groups: vec![group.clone()], aggregates: vec![aggregate.clone()],
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let key = Value::Utf8("x".repeat(1 << 14));
+    let mut keys = vec![key.clone(); 64];
+    keys[0] = Value::Null;
+    keys[63] = Value::Null;
+    let batch = ColumnBatch::settled(
+        vec![Column::Values((0..64).map(Value::I64).collect()), Column::Values(keys)], 64, memory.reserve(1 << 21).unwrap(),
+    ).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false, schema,
+        vec![group], vec![aggregate], runtime, execution.clone()).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - (1 << 19)).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.len, 2);
+    assert_eq!(batch_row(&result, 0), [Value::Null, Value::I64(2)]);
+    assert_eq!(batch_row(&result, 1), [key, Value::I64(62)]);
+    drop((pressure, cursor));
+    assert!(memory.used_bytes() < 1 << 19);
+}
+
+#[tokio::test]
 async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     use arrow_array::{Float64Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};

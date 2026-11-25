@@ -859,10 +859,15 @@ impl ColumnBatch {
     }
 
     pub(crate) fn compact_group_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let _positions = memory.reserve(self.columns.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(size_error)?)?;
-        let positions: Vec<_> = (0..self.columns.len()).collect();
-        let picked = Self::take_rows_with_custody(&[self], rows, &positions, true, memory)?;
-        picked.project_keys(&positions, true, memory)
+        self.compact_group_key_columns(rows, None, memory)
+    }
+
+    pub(crate) fn compact_group_key_columns(&self, rows: &[(usize, usize)], positions: Option<&[usize]>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let width = positions.map_or(self.columns.len(), <[usize]>::len);
+        let _positions = memory.reserve(width.checked_mul(std::mem::size_of::<usize>()).ok_or_else(size_error)?)?;
+        let output_positions: Vec<_> = (0..width).collect();
+        let picked = Self::take_rows_with_custody(&[self], rows, positions.unwrap_or(&output_positions), true, memory)?;
+        picked.project_keys(&output_positions, true, memory)
     }
 
     fn project_keys(&self, positions: &[usize], detach: bool, memory: &Arc<MemoryBudget>) -> Result<Self> {

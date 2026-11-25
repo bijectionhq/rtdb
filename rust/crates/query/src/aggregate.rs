@@ -12,7 +12,7 @@ use crate::context::Execution;
 use crate::columnar::{BatchCursor, Column, ColumnBatch};
 use crate::cursor::OwnedRow;
 use crate::runtime_schema::{EmissionMode, EmittedRelation};
-use crate::set_keys::BatchKeyIndex;
+use crate::set_keys::{BatchKeyIndex, KeyColumns};
 use crate::invalid;
 
 #[derive(Clone, Copy)]
@@ -227,21 +227,15 @@ impl AggregateCursor {
             if batch.len == 0 { continue; }
             let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>())
                 .ok_or_else(|| invalid("aggregate-size", "Group mapping exceeds addressable memory"))?)?;
-            let keys = {
-                let _rows = memory.reserve(batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
-                    .ok_or_else(|| invalid("aggregate-size", "Group key positions exceed addressable memory"))?)?;
-                let rows = (0..batch.len).map(|row| (0, row)).collect::<Vec<_>>();
-                ColumnBatch::take_rows_with_custody(&[&batch], &rows, group_positions, true, memory)?
-            };
+            let keys = KeyColumns::projection(&batch, group_positions);
             let mut mapping = Vec::with_capacity(batch.len);
-            index.identify(&keys, projected, context, &key_schema, |_, ordinal, _| {
+            index.identify(keys, projected, context, &key_schema, |_, ordinal, _| {
                 if ordinal >= i32::MAX as usize {
                     return Err(invalid("group-count", "Aggregate group count exceeds the reference vector limit"));
                 }
                 mapping.push(ordinal);
                 Ok(())
             })?;
-            drop(keys);
             if self.accepts_typed_aggregates(&batch)? {
                 self.reduce_typed(&batch, &mapping, index.len(), &mut columns)?;
                 continue;
