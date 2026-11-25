@@ -475,6 +475,7 @@ pub struct QueryContext {
     plaintext: Option<Arc<PlaintextView>>,
     delivery_guard: Option<Arc<dyn QueryDeliveryGuard>>,
     pub(crate) spatial_refinement: bool,
+    shared_plans: Option<Arc<crate::SharedPlans>>,
 }
 
 #[async_trait::async_trait]
@@ -496,7 +497,7 @@ impl QueryContext {
             options.spill_limit_bytes = 0;
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None, delivery_guard: None, spatial_refinement: false }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None, delivery_guard: None, spatial_refinement: false, shared_plans: None }))
     }
 
     pub fn with_delivery_owner(mut self: Arc<Self>, owner: Arc<dyn Send + Sync>, deadline: std::time::Instant) -> Arc<Self> {
@@ -538,6 +539,12 @@ impl QueryContext {
         }
         self
     }
+
+    pub fn with_shared_plans(mut self: Arc<Self>, plans: Arc<crate::SharedPlans>) -> Arc<Self> {
+        Arc::make_mut(&mut self).shared_plans = Some(plans);
+        self
+    }
+    pub fn shared_plans(&self) -> Option<&Arc<crate::SharedPlans>> { self.shared_plans.as_ref() }
 
     pub fn with_query_cpu(mut self: Arc<Self>, counter: Option<Arc<crate::QueryCpu>>) -> Arc<Self> {
         if let Some(counter) = counter { Arc::make_mut(&mut self).query_cpu = Some(counter); }

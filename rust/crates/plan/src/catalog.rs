@@ -224,6 +224,34 @@ enum Lookup {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogLookups(Vec<Lookup>);
 impl CatalogLookups {
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let overflow = || Anomaly::incorrect("rtdb.plan/catalog-size", "Catalog lookup storage exceeds addressable memory");
+        let name_bytes = |name: &QualifiedTable| name.database.capacity().saturating_add(name.table.schema.capacity()).saturating_add(name.table.table.capacity());
+        let table_bytes = |table: &TableBinding| -> Result<usize> {
+            let mut size = name_bytes(&table.name);
+            for (name, ty) in &table.columns {
+                size = size.checked_add(name.capacity()).and_then(|n| n.checked_add(256)).and_then(|n| n.checked_add(ty.retained_bytes().ok()?)).ok_or_else(overflow)?;
+            }
+            Ok(size)
+        };
+        let mut bytes = self.0.capacity().checked_mul(std::mem::size_of::<Lookup>()).ok_or_else(overflow)?;
+        for lookup in &self.0 {
+            let size = match lookup {
+                Lookup::DefaultDatabase(database) => database.capacity(),
+                Lookup::Databases(databases) => databases.iter().try_fold(0usize, |size, database| size.checked_add(database.capacity()).and_then(|n| n.checked_add(128))).ok_or_else(overflow)?,
+                Lookup::Table(name, table) => name_bytes(name).checked_add(table.as_ref().map(table_bytes).transpose()?.unwrap_or(0)).ok_or_else(overflow)?,
+                Lookup::Tables(database, tables) => {
+                    let mut size = tables.capacity().checked_mul(std::mem::size_of::<TableBinding>()).and_then(|n| n.checked_add(database.capacity())).ok_or_else(overflow)?;
+                    for table in tables { size = size.checked_add(table_bytes(table)?).ok_or_else(overflow)?; }
+                    size
+                }
+                Lookup::TransactionScoped(_) => 0,
+            };
+            bytes = bytes.checked_add(size).ok_or_else(overflow)?;
+        }
+        Ok(bytes)
+    }
+
     pub fn replay(&self, catalog: &dyn Catalog) -> Result<bool> {
         for lookup in &self.0 {
             let same = match lookup {

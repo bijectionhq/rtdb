@@ -45,6 +45,8 @@ mod system;
 mod inspection;
 mod trace;
 mod settings;
+mod shared_plans;
+pub use shared_plans::{SharedPlan, SharedPlanKey, SharedPlans};
 pub use settings::{SnapshotAdmission, SnapshotTokenIssuer, SqlSnapshotView};
 mod pages;
 mod analysis;

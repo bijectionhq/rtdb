@@ -425,15 +425,15 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
   - plan cache (`XC/query.clj` `->query-source`, `PlanCacheKey`);
   - emit cache per plan (`emit-query`);
   - DML skeleton cache and `table-chains-cache` (`XC/sql.clj:3388`).
-- **RTDB: none.**
-  - `PreparedSql` (`R/node/src/statement.rs:27`) keeps only the text, options, parameter types and result schema.
-  - Every `open_query_typed` re-parses, binds and optimizes (`prepare_query`, `statement.rs:216` → `rtdb_sql::prepare_in` → `PreparedQuery::from_prepared` → `optimize::prepare`). `QueryPlan::open` then emits twice (`R/query/src/cursor.rs:192, 207`).
-  - So a pgwire simple query costs about 2 parses, 2 binds, 2 optimizations and 3 emits; a Flight SQL `GetFlightInfo` + `DoGet` about 3 parse/plan passes (`R/flight-sql/src/execute.rs:16, 69, 127`).
-  - The parser is a port of ANTLR's adaptive prediction (`R/sql/src/parser/prediction/`), so a parse is not cheap.
-- **Impact:** high for every short query and every DML Execute. It is a constant per query and does not grow with data size, which is why RTDB still wins point lookups at 100k rows despite it.
+- **RTDB:**
+  - `PreparedSql` (`R/node/src/statement.rs`) keeps its last optimized `PreparedQuery` and reuses it while its planning options and catalog lookups replay the same.
+  - The node's `SharedPlans` (`R/query/src/shared_plans.rs`) shares query plans between sessions: preparing or rebinding a statement reuses a plan with the same source and planning options whose recorded catalog lookups replay the same answers, so a new pgwire Parse or Flight request for a known query skips binding and optimization.
+  - It holds 128 plans in a budget of 1/64 of the execution budget, capped at 16 MiB; DML, `EXPLAIN` and transaction-resolver plans are not shared.
+  - Each statement is still parsed once per preparation; there is no parse cache keyed by SQL text, and no emit cache.
+- **Impact:** medium for short queries prepared afresh per request; parsing remains a per-preparation constant.
 - **Recommendation:**
-  - keep the optimized `PreparedQuery` inside `PreparedSql`, and re-plan only when parameter types change or the existing stale-plan check (`cursor.rs:179-186`) fails;
-  - add a node-wide plan cache keyed by (SQL text, default database, search path, timezone, parameter types, catalog generation).
+  - share DML plans prepared once per (SQL text, argument types) through the transaction resolver;
+  - cache parsed syntax by SQL text ahead of the plan cache.
 
 ### Result encoding
 
@@ -528,7 +528,7 @@ Ranking is impact × breadth, judged from the code and the benchmark pattern (in
 | --: | --- | --- | --- | --- |
 | 1 | Point-lookup scan walks every row of each candidate leaf through a heap and the full polygon resolver, per file: no in-page IID binary search, no as-of early exit | Point lookups, UPDATE/DELETE by `_id`, read-your-write; grows with files and versions. Not the measured 1M-row gap: `buffer_task` binary-searches each page to its task's IID range and drops rows outside `scan.iids` before resolving, so the per-row cost is the heap | Port `SingleIidSelector`/`MultiIidSelector` and `AsOfResolver`; skip leaves with no candidate IID before loading | `R/query/src/scan.rs` (`buffer_task`, `initialize`), `R/temporal/src/lib.rs` (`HistoryResolver`); ref `XK/operator/scan/ScanCursor.kt`, `SingleIidSelector.kt`, `EntityResolver.kt` |
 | 2 | `BufferPool::get` reads the whole object into heap memory, then pages are copied again and cached a second time decoded | Cold reads over L1/L2 files (100 MB target against a 256 MB pool), cache thrash, memory | Footer/layout cache plus per-page range reads (pread/mmap/`get_range`); single decoded-page tier | `R/storage/src/cache.rs`, `R/format/src/ipc.rs` (`read_block`), `R/query/src/scan.rs` (`load`, `metadata_cache`), `R/storage/src/disk_cache.rs` |
-| 3 | No parse/plan/emit cache; prepared statements re-plan per execute; DML re-parses and re-plans per argument row and rebuilds the tx snapshot per row | Every short query, every pgwire Execute and Flight DoGet, batched DML | Keep `PreparedQuery` in `PreparedSql`; node-wide plan cache; prepare mutations once per (SQL, arg types) | `R/node/src/statement.rs`, `R/pgwire/src/protocol.rs`, `R/flight-sql/src/execute.rs`, `R/tx/src/resolver.rs:285-370`, `R/index/src/live.rs` (`TransactionBuffer::snapshot`) |
+| 3 | No parse or emit cache, and query plans are shared between sessions only through `SharedPlans`; DML re-parses and re-plans per argument row and rebuilds the tx snapshot per row | Every short query, every pgwire Execute and Flight DoGet, batched DML | Parse cache; prepare mutations once per (SQL, arg types) | `R/node/src/statement.rs`, `R/pgwire/src/protocol.rs`, `R/flight-sql/src/execute.rs`, `R/tx/src/resolver.rs:285-370`, `R/index/src/live.rs` (`TransactionBuffer::snapshot`) |
 | 4 | Row-at-a-time `Value` operators: joins, aggregates, distinct, window, set ops, unnest all copy `OwnedRow`s; `BatchJoin` covers a narrow case | Joins (0.43×, 4.5× at 1M), group-by, anything above a scan | Make the batch path the default for joins and aggregates: Arrow keys, group-id vectors, `take` outputs | `R/query/src/join.rs`, `join_storage.rs`, `batch_join.rs`, `aggregate.rs`, `operators.rs`, `cursor.rs` |
 | 5 | Interpreted expressions with per-call name lowering, type checking and allocations; kernels exclude unions with string legs, temporal and extension types; fallback materialises every column | Filters and projections over union `_id` (pgwire), temporal columns and functions | Resolve calls at prepare; borrow cells; materialise only read columns; cache DataFusion lowering; extend kernels to unions and timestamps | `R/expr/src/evaluate*.rs`, `functions.rs`, `R/query/src/columnar.rs` (`kernel`, `BatchFilter`), `vector.rs`, `context.rs` |
 | 6 | Compaction decodes every event to `Value`, re-encodes twice, and runs as futures on one tokio task (no parallelism) | Ingest throughput, worker stalls, L0 backlog that worsens #1 | Columnar index gather plus `interleave`; run jobs on a blocking pool sized by `compaction_threads` | `R/maintenance/src/merge.rs`, `merge/layout.rs`, `driver.rs`; ref `XK/compactor/SegmentMerge.kt`, `OutWriter.kt` |

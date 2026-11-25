@@ -203,6 +203,7 @@ pub struct Node {
     placement_slots: Option<Arc<Semaphore>>,
     sql_snapshots: Arc<crate::sql_snapshots::SqlSnapshots>,
     outcome_queries: Arc<[std::sync::Mutex<Option<PreparedSql>>; 4]>,
+    shared_plans: Arc<rtdb_query::SharedPlans>,
 }
 
 pub struct NodeDriver {
@@ -288,8 +289,9 @@ impl Node {
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
+        let shared_plans = Arc::new(rtdb_query::SharedPlans::new(&factory.memory));
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, placement_slots,
-            sql_snapshots: Arc::default(), outcome_queries: Default::default() };
+            sql_snapshots: Arc::default(), outcome_queries: Default::default(), shared_plans };
         node.sql_snapshots.start(node.cancellation.clone());
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
@@ -731,7 +733,8 @@ impl Node {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
             _ => self.factory.options.query.query_memory(&self.factory.memory),
         };
-        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
+        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+            .with_shared_plans(Arc::clone(&self.shared_plans));
         let context = if audience { context } else { context.with_accelerators(Arc::clone(&self.factory.accelerators)) };
         context
             .with_read_options(&basis.snapshot, basis.snapshot_time, basis.current_time)

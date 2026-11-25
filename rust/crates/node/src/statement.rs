@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryReservation, OwnedBatch, Selection};
-use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice};
-use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
+use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice, Statement};
+use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema, SharedPlan, SharedPlanKey};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
@@ -129,13 +129,22 @@ impl PreparedSql {
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let recording = RecordingCatalog::new(&context.catalog);
-                let prepared = parsed.bind(&recording, &options)?;
-                for (index, ty) in &prepared.parameter_types {
+                let (query, inferred, lookups) = match shared_plan(source, context, &options)? {
+                    Some(shared) => {
+                        notices.clone_from(&shared.notices);
+                        (shared.query.clone(), shared.parameter_types.clone(), Some(Arc::clone(&shared.lookups)))
+                    }
+                    None => {
+                        let recording = RecordingCatalog::new(&context.catalog);
+                        let prepared = parsed.bind(&recording, &options)?;
+                        let inferred = prepared.parameter_types.clone();
+                        notices = prepared.notices.clone();
+                        (PreparedQuery::from_prepared(prepared, &context.memory)?, inferred, recording.finish().map(Arc::new))
+                    }
+                };
+                for (index, ty) in &inferred {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
-                notices = prepared.notices.clone();
-                let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
                 let schema = if policy == ResultSignaturePolicy::PostgreSql && !dynamic_pg {
                     query.result_schema(context)?.schema().clone()
                 } else {
@@ -143,7 +152,7 @@ impl PreparedSql {
                 };
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
                 let result = PreparedResult::Query { schema, pg_types, parameter_projection: query.is_parameter_projection() };
-                cached = recording.finish().map(|lookups| CachedPlan { options: options.clone(), lookups: Arc::new(lookups), query });
+                cached = lookups.map(|lookups| CachedPlan { options: options.clone(), lookups, query });
                 result
             }
             StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
@@ -394,6 +403,13 @@ impl PreparedSql {
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
         let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref().filter(|plan| plan.options == options).map(|plan| (plan.lookups.clone(), plan.query.clone())));
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
+        if let Some(shared) = shared_plan(&self.0.source, context, &options)? {
+            let query = shared.query.recharged(&context.memory)?;
+            if let Ok(mut plan) = self.0.plan.lock() {
+                *plan = Some(CachedPlan { options, lookups: Arc::clone(&shared.lookups), query: shared.query.clone() });
+            }
+            return Ok(query);
+        }
         let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
         let budget = self.0._reservation.budget();
         let plan_in = |memory| {
@@ -430,6 +446,35 @@ impl PreparedSql {
 /// The last plan a statement bound, and what its planning read from the catalog: a snapshot that answers those
 /// lookups the same plans the statement the same way, so it reuses the plan.
 struct CachedPlan { options: PrepareOptions, lookups: Arc<CatalogLookups>, query: PreparedQuery }
+
+/// The node's shared plan for `source`, planning it into the node's cache on a miss.
+/// None where the context carries no cache, or where the statement is not a query the cache can keep; the caller then
+/// plans it itself, so a statement that fails to plan reports the caller's error.
+fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<Option<Arc<SharedPlan>>> {
+    let Some(plans) = context.shared_plans() else { return Ok(None); };
+    context.check_cancelled()?;
+    let PrepareOptions { search_path, parameter_types, default_timezone, generate_series_end_exclusive } = options;
+    let key = SharedPlanKey {
+        source: source.to_owned(), search_path: search_path.clone(), parameter_types: parameter_types.clone(),
+        timezone: default_timezone.clone(), generate_series_end_exclusive: *generate_series_end_exclusive,
+    };
+    if let Some(shared) = plans.get(&key) && shared.lookups.replay(&context.catalog)? { return Ok(Some(shared)); }
+    let Ok(Some((lookups, query, inferred, notices))) = plan_for_sharing(source, context, options, &plans.entry_budget()) else { return Ok(None); };
+    Ok(plans.insert(key, lookups, query, inferred, notices))
+}
+
+type SharablePlan = (Arc<CatalogLookups>, PreparedQuery, std::collections::BTreeMap<usize, LogicalType>, Vec<SqlNotice>);
+
+fn plan_for_sharing(source: &str, context: &QueryContext, options: &PrepareOptions, budget: &Arc<MemoryBudget>) -> Result<Option<SharablePlan>> {
+    let _syntax = admit_sql_syntax(source, budget)?;
+    let recording = RecordingCatalog::new(&context.catalog);
+    let mut prepared = rtdb_sql::prepare_in(source, &recording, options, budget)?;
+    if !matches!(&prepared.statement, Statement::Query(_)) { return Ok(None); }
+    let inferred = prepared.parameter_types.clone();
+    let notices = std::mem::take(&mut prepared.notices);
+    let query = PreparedQuery::from_prepared(prepared, budget)?;
+    Ok(recording.finish().map(|lookups| (Arc::new(lookups), query, inferred, notices)))
+}
 
 fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptions) -> Result<Arc<MemoryReservation>> {
     context.check_cancelled()?;
@@ -525,6 +570,32 @@ fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
     drop(bound);
     assert_eq!(query_budget.used_bytes(), 0);
     assert!(statement_budget.used_bytes() > 0);
+}
+
+#[test]
+fn statements_prepared_in_different_sessions_share_the_nodes_plan() {
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, SharedPlans};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+
+    let node_budget = MemoryBudget::new(1 << 24);
+    let plans = Arc::new(SharedPlans::new(&node_budget));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let session = || {
+        let catalog = CatalogSnapshot::new("xtdb", [("xtdb".into(), DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+        })].into_iter().collect(), false).unwrap();
+        QueryContext::new(catalog, MemoryBudget::new(1 << 20), rtdb_types::Timestamp(0), "UTC", QueryOptions::default(), &cancellation).unwrap()
+            .with_shared_plans(Arc::clone(&plans))
+    };
+    let sql = "SELECT 1 AS one";
+    let (first, second) = (session(), session());
+    let a = PreparedSql::prepare(sql, &first, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let b = PreparedSql::prepare(sql, &second, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let (a, b) = (a.bind(&first, &[], true).unwrap(), b.bind(&second, &[], true).unwrap());
+    assert!(Arc::ptr_eq(a.relation(), b.relation()));
+    drop((a, b));
+    assert!(node_budget.used_bytes() > 0);
 }
 
 #[cfg(test)]
