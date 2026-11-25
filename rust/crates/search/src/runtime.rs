@@ -550,6 +550,7 @@ pub struct SearchRuntime {
     trees: Mutex<Bounded<OpenedTreeKey, OpenedTree>>,
     routing: Mutex<Bounded<crate::accelerate::routing::RoutingKey, Arc<crate::accelerate::routing::TableRouting>>>,
     file_admission: Arc<MemoryBudget>,
+    tree_admission: Arc<MemoryBudget>,
     legacy_residency: Arc<MemoryBudget>,
     serving_admission: Arc<MemoryBudget>,
     serving_gaps: std::sync::atomic::AtomicU64,
@@ -600,10 +601,11 @@ impl SearchRuntime {
 
     fn with_admission(file_bytes: usize, write_format: i32, file_admission: Arc<MemoryBudget>) -> Arc<Self> {
         let legacy_residency = if file_bytes == 0 { Arc::clone(&file_admission) } else { MemoryBudget::new(file_bytes) };
+        let tree_admission = if file_admission.limit_bytes() == 0 { MemoryBudget::new(1 << 20) } else { Arc::clone(&file_admission) };
         Arc::new(Self { write_format, search_pages: Arc::new(crate::file::PageCache::new(file_bytes / 4)),
             trees: Mutex::new(Bounded::new(file_bytes.saturating_mul(8))),
             routing: Mutex::new(Bounded::new(file_bytes / 16)),
-            file_admission, legacy_residency, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
+            file_admission, tree_admission, legacy_residency, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
             logical_run_reads: Default::default(),
             definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
             live_residency: MemoryBudget::new(LIVE_POSTING_BYTES),
@@ -715,20 +717,21 @@ impl SearchRuntime {
         let fresh_locator = fresh.then(|| locator.without_inline_root());
         let locator = fresh_locator.as_ref().unwrap_or(locator);
         let inline = inline.filter(|_| !fresh).map(|hex| (hex, storage.prepaid_metadata_budget().unwrap_or(&self.file_admission)));
+        let memory = storage.prepaid_metadata_budget().unwrap_or(&self.tree_admission);
         let result: rtdb_types::Result<_> = async {
             let local = if remote { store.cached_local_file(key).await? } else { store.local_file(key).await? };
             if let Some(local) = local {
                 let bytes = bytes::Bytes::from_owner(crate::Source::mapped(local)?);
                 let weight = bytes.len().saturating_add(65_536);
-                let file = crate::file::TreeFile::local(bytes.into(), cache, locator, columns, identity, version, inline).await?;
+                let file = crate::file::TreeFile::local(bytes.into(), cache, locator, columns, identity, version, inline, Arc::clone(memory)).await?;
                 Ok((file, Some(weight)))
             } else if remote {
                 let pages = if share { Arc::clone(&self.search_pages) } else { Arc::new(crate::file::PageCache::new(0)) };
-                let file = crate::file::TreeFile::remote(Arc::clone(storage), key.clone(), pages, locator, columns, identity, version, inline).await?;
+                let file = crate::file::TreeFile::remote(Arc::clone(storage), key.clone(), pages, locator, columns, identity, version, inline, Arc::clone(memory)).await?;
                 Ok((file, Some(65_536)))
             } else {
                 let bytes = bytes::Bytes::from_owner(storage.get(key).await?);
-                let file = crate::file::TreeFile::local(bytes.into(), None, locator, columns, identity, version, inline).await?;
+                let file = crate::file::TreeFile::local(bytes.into(), None, locator, columns, identity, version, inline, Arc::clone(memory)).await?;
                 Ok((file, None))
             }
         }.await;
@@ -764,11 +767,9 @@ impl SearchRuntime {
         &self, storage: &Arc<BufferPool>, key: &ObjectKey, columns: &[String], identity: &str,
         version: i64, locator: &crate::file::TreeLocator, column: usize, queries: &[&rtdb_text::Query], all_runs: bool,
     ) -> std::result::Result<Arc<SearchFile>, FileError> {
-        let weight = usize::try_from(locator.length).unwrap_or(usize::MAX).saturating_mul(3);
         let memory = storage.prepaid_metadata_budget().unwrap_or(&self.file_admission);
-        let reservation = memory.reserve(weight).map_err(FileError::from_anomaly)?;
         let tree = self.tree_file(storage, key, locator, columns, identity, version, false).await?;
-        Box::pin(tree.exact(columns, column, queries, all_runs, reservation)).await
+        Box::pin(tree.exact(columns, column, queries, all_runs, memory)).await
             .map(Arc::new).map_err(FileError::from_anomaly)
     }
 

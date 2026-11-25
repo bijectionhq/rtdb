@@ -253,6 +253,8 @@ rule SearchJobRuns {
     -- On a cache miss, the reader admits inline expansion before allocating its buffers and authenticates the result before Arrow decode.
     -- An unusable inline root falls back to the persisted root.
     -- Fresh verification authenticates the persisted root directly.
+    -- A tree page is authenticated and its uncompressed Arrow record layout is inspected before decoding.
+    -- Exact tree views admit their selected posting and run pages, visibility pages, and retained manifest descriptors.
     -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
     -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.
     -- Its immutable pages authenticate rows and carry the maximum unit term score of each subtree.
@@ -582,6 +584,7 @@ contract SearchCorrectness {
         -- A committed native snapshot holds its admitted search postings alongside the primary live rows of that cut.
         -- A live posting page is admitted before construction and its reservation survives cache eviction while the page or its tokens remain in use.
         -- A live posting page can retain its token list as a slice of the accepted delta under the delta buffers' reservation.
+        -- Replay checks the single-record delta profile and row allowance before admitting Arrow decode.
         -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
         -- A partially admitted segment keeps its coverage frontier.
         -- Commit deltas and live postings read a selected text child once per Arrow batch and retain the existing input and page admission limits.

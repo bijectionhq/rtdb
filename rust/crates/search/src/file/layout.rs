@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 use arrow_array::{Array, ArrayRef, LargeListArray, RecordBatch, StructArray};
 use arrow_buffer::{Buffer, OffsetBuffer};
-use arrow_ipc::{Block, convert::fb_to_schema, reader::{FileDecoder, read_footer_length}, writer::FileWriter};
+use arrow_ipc::{Block, MetadataVersion, convert::fb_to_schema, reader::{FileDecoder, read_footer_length}, writer::FileWriter};
 use arrow_schema::{DataType as T, Field, FieldRef, Fields, Schema, SchemaRef};
 use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
@@ -336,7 +336,69 @@ impl PageRef {
     }
 }
 
+pub(crate) fn inspect_uncompressed_record(bytes: &[u8], metadata: usize, body: usize,
+    rows: RangeInclusive<usize>,
+) -> Result<usize> {
+    let bad = || corrupt("Search page has an invalid Arrow record layout");
+    if metadata.checked_add(body) != Some(bytes.len()) || !bytes.starts_with(&[0xff; 4]) {
+        return Err(bad());
+    }
+    let encoded = bytes.get(4..8).ok_or_else(bad)?;
+    let header = i32::from_le_bytes(encoded.try_into().expect("four metadata length bytes"));
+    if usize::try_from(header).ok() != metadata.checked_sub(8) || metadata < 8 {
+        return Err(bad());
+    }
+    let message = arrow_ipc::root_as_message(&bytes[8..metadata]).map_err(fault)?;
+    let record = message.header_as_record_batch().ok_or_else(bad)?;
+    if message.version() != MetadataVersion::V5 || usize::try_from(message.bodyLength()).ok() != Some(body)
+        || record.compression().is_some() || record.variadicBufferCounts().is_some_and(|counts| !counts.is_empty()) {
+        return Err(bad());
+    }
+    if !usize::try_from(record.length()).is_ok_and(|count| rows.contains(&count)) {
+        return Err(corrupt("Search page has an invalid row count"));
+    }
+    let nodes = record.nodes().ok_or_else(bad)?;
+    let buffers = record.buffers().ok_or_else(bad)?;
+    for node in nodes.iter() {
+        if node.length() < 0 || node.null_count() < 0 || node.null_count() > node.length() {
+            return Err(bad());
+        }
+    }
+    let descriptors = 8192usize.saturating_add(nodes.len().saturating_mul(512)).saturating_add(buffers.len().saturating_mul(256));
+    buffers.into_iter().try_fold(descriptors, |bound, buffer| {
+        let start = usize::try_from(buffer.offset()).map_err(fault)?;
+        let len = usize::try_from(buffer.length()).map_err(fault)?;
+        if start.checked_add(len).is_none_or(|end| end > body) { return Err(bad()); }
+        bound.checked_add(len).ok_or_else(bad)
+    })
+}
+
 impl AuthenticatedPage {
+    pub fn decode_bound(&self) -> Result<usize> {
+        inspect_uncompressed_record(&self.bytes, self.page.metadata as usize, usize::try_from(self.page.body).map_err(fault)?, 1..=1)
+    }
+
+    pub fn decode_admitted(mut self, decoder: &FileDecoder,
+        reserve: impl Fn(usize) -> Result<Arc<rtdb_types::MemoryReservation>>, detach: bool, wire_credit: usize,
+    ) -> Result<RecordBatch> {
+        let bound = self.decode_bound()?;
+        let wire = self.bytes.len();
+        rtdb_storage::audience_work::decode_bytes(bound.max(wire).saturating_sub(wire_credit))?;
+        let mut charge = reserve(bound)?;
+        if detach {
+            let copy = reserve(wire.next_multiple_of(64))?;
+            let bytes = Buffer::from_slice_ref(self.bytes.as_slice());
+            self.bytes = rtdb_columnar::retain_buffer(&bytes, &copy);
+        }
+        let backing = self.bytes.clone();
+        let batch = self.decode(decoder)?;
+        let resident = rtdb_columnar::shared_allocation_size_excluding(&batch, &backing)?;
+        let retained = Arc::get_mut(&mut charge).expect("decoded page reservation remains private").split_off(resident)?;
+        let columns = batch.columns().iter().map(|array| rtdb_columnar::retain_array(Arc::clone(array), &retained))
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(batch.schema(), columns).map_err(fault)
+    }
+
     pub fn decode(self, decoder: &FileDecoder) -> Result<RecordBatch> {
         let page = self.page;
         let block = Block::new(i64::try_from(page.offset).map_err(fault)?,
