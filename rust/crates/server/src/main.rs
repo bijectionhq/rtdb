@@ -40,6 +40,15 @@ async fn run() -> Result<()> {
                 writeln!(output)
             })
         }
+        Command::NativeDependentCustodyHelp => { print!("{}", cli::NATIVE_DEPENDENT_CUSTODY_HELP); Ok(()) }
+        #[cfg(feature = "multi")]
+        Command::NativeDependentCustody(options) => {
+            let terminal = options.run().await?;
+            write_report(std::io::stdout().lock(), |output| {
+                serde_json::to_writer(&mut *output, &terminal).map_err(std::io::Error::other)?;
+                writeln!(output)
+            })
+        }
         Command::Version => { println!("rtdb {}", rtdb_types::runtime_version()); Ok(()) }
         Command::BuildInfo => write_report(std::io::stdout().lock(), |output| {
             #[derive(serde::Serialize)]

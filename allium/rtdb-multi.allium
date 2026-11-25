@@ -614,6 +614,9 @@ contract LogService {
         -- The source orders a terminal only with positive reader and response-part closure for each enrolled key.
         -- The destination destroys its own keys and positively releases its references to keys under Original custody.
         -- The source group's release drain requires its own releases and every dependent disposition.
+        -- The installed source writer checks the commissioned destination owner and exact observation request before ordering a positive receipt.
+        -- The destination metadata reader authenticates the applied private restore and returns its reverse census and commissioned group metadata.
+        -- The source operator recovers a disposition only by its exact retained order and receipt.
         -- The native inherited attachment withholds plaintext until it has an exact destination response-release authority.
 
     @invariant ClassicMigrationSourceSeal

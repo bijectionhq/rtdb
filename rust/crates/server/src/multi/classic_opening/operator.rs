@@ -221,11 +221,9 @@ impl Connection {
             ServerIdentity::LeafSha256(digest) if *digest != [0; 32] => (
                 builder
                     .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(LeafVerifier {
-                        digest: *digest,
-                        roots,
-                        algorithms: provider.signature_verification_algorithms,
-                    })),
+                    .with_custom_certificate_verifier(Arc::new(LeafVerifier::new(
+                        *digest, roots, provider.signature_verification_algorithms,
+                    ))),
                 None,
             ),
             ServerIdentity::LeafSha256(_) => {
@@ -297,10 +295,18 @@ impl Connection {
 }
 
 #[derive(Debug)]
-struct LeafVerifier {
+pub(in crate::multi) struct LeafVerifier {
     digest: [u8; 32],
     roots: RootCertStore,
     algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl LeafVerifier {
+    pub(in crate::multi) fn new(
+        digest: [u8; 32], roots: RootCertStore, algorithms: WebPkiSupportedAlgorithms,
+    ) -> Self {
+        Self { digest, roots, algorithms }
+    }
 }
 
 impl ServerCertVerifier for LeafVerifier {

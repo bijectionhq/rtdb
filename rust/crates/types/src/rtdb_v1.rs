@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ring::{aead, digest, rand::{SecureRandom, SystemRandom}};
 use serde::{Deserialize, Serialize};
 
-use crate::{Anomaly, Iid, Interval, Result, TableRef, Timestamp};
+use crate::{Anomaly, EntityId, Iid, Interval, Result, TableRef, Timestamp};
 
 pub type Branch = String;
 pub const MAIN_BRANCH: &str = "main";
@@ -167,6 +167,34 @@ pub struct NativeCheckpointMember {
     pub occurrence: Option<[u8; 32]>,
     pub carrier_sha256: [u8; 32],
     pub link_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentCheckpointMember {
+    pub native: NativeCheckpointMember,
+    pub source_basis: Basis,
+    pub enrolled: Basis,
+    pub branch: String,
+    pub table: String,
+    pub target: EntityId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentCheckpointRow {
+    pub branch: String,
+    pub id: String,
+    pub body: Vec<u8>,
+    pub written: Basis,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentCheckpointMetadata {
+    pub scope: NativeDependentCustodyScope,
+    pub members: Vec<NativeDependentCheckpointMember>,
+    pub rows: Vec<NativeDependentCheckpointRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

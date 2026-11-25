@@ -13,7 +13,7 @@ pub use rtdb_index::branches::{
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
     Term, TimeUnit, Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, valid_branch_name},
+    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, NativeDependentCustodyScope, valid_branch_name},
 };
 pub use rtdb_types::rtdb_v1::{ValidTime, ValidTimeBound};
 use serde::{Deserialize, Serialize, Serializer};
@@ -276,7 +276,14 @@ fn native_checkpoint_namespace() -> [u8; 32] {
 }
 
 fn dependent_custody_key(order: &NativeDependentCustodyOrder) -> Vec<u8> {
-    let scope = order.scope();
+    native_dependent_key(order.scope(), matches!(order, NativeDependentCustodyOrder::Dispose(_))).to_vec()
+}
+
+pub fn native_dependent_disposition_key(scope: NativeDependentCustodyScope) -> [u8; 32] {
+    native_dependent_key(scope, true)
+}
+
+fn native_dependent_key(scope: NativeDependentCustodyScope, disposition: bool) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"rtdb/v1/native-dependent-custody-command\0");
     hash.update(scope.reservation.source.basis.to_bytes());
@@ -288,8 +295,8 @@ fn dependent_custody_key(order: &NativeDependentCustodyOrder) -> Vec<u8> {
     hash.update(scope.source_enrolled_at.to_bytes());
     hash.update(scope.group);
     hash.update(scope.checkpoint_group_sha256);
-    hash.update([u8::from(matches!(order, NativeDependentCustodyOrder::Dispose(_)))]);
-    hash.finalize().to_vec()
+    hash.update([u8::from(disposition)]);
+    hash.finalize().into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -791,6 +798,17 @@ impl TransactState {
 
     pub fn require_native_custody_fence(&self, fence: &NativeCustodyFence) -> Result<()> {
         Self::check_native_custody_fence(&self.receipts, fence)
+    }
+
+    pub fn native_dependent_custody_status(&self, scope: NativeDependentCustodyScope, fence: &NativeCustodyFence) -> Result<Option<Receipt>> {
+        self.index.require_native_dependent_fence(scope, fence)?;
+        self.require_native_custody_fence(fence)?;
+        let Some((_, Some(terminal))) = self.index.native_dependent_custody(scope)? else { return Ok(None); };
+        if &terminal.fence != fence { return Err(native_custody_command_error()); }
+        let request = Transact::native_dependent_custody(NativeDependentCustodyOrder::Dispose(terminal.clone()));
+        let receipt = self.recover_exact(&request.key, Some(native_checkpoint_namespace()), request.logical_sha256()?)?;
+        if receipt.outcome != Outcome::Then { return Err(invalid_record()); }
+        Ok(Some(receipt))
     }
 
     fn check_native_custody_fence(receipts: &Receipts, fence: &NativeCustodyFence) -> Result<()> {

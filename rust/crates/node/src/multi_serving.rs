@@ -277,6 +277,10 @@ impl MultiServing {
         self.database.lock().await.require_native_dependent_fence(scope, fence).await
     }
 
+    pub async fn native_dependent_custody_status(&self, scope: NativeDependentCustodyScope, fence: &NativeCustodyFence) -> Result<Option<Receipt>> {
+        self.database.lock().await.native_dependent_custody_status(scope, fence).await
+    }
+
     pub async fn record_native_dependent_custody(&self, order: NativeDependentCustodyOrder) -> Result<Receipt> {
         self.database.lock().await.record_native_dependent_custody(order).await
     }

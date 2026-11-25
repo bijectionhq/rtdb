@@ -1,7 +1,8 @@
 use rtdb_types::rtdb_v1::{
     DependentCustodyReceipt, DependentKeyCustody, DependentKeyTerminal, NativeCheckpointMember,
-    NativeCustodyFence, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
-    NativeDependentCustodyScope,
+    NativeCustodyFence, NativeDependentCheckpointMember, NativeDependentCheckpointMetadata,
+    NativeDependentCheckpointRow, NativeDependentCustodyDisposition,
+    NativeDependentCustodyEnrollment, NativeDependentCustodyScope,
 };
 
 use super::*;
@@ -20,6 +21,17 @@ impl BranchIndex {
         scope: NativeDependentCustodyScope,
     ) -> Result<Vec<NativeCheckpointMember>> {
         self.native_dependent_forward(scope)?;
+        Ok(self
+            .native_checkpoint_members(scope)?
+            .into_iter()
+            .map(|member| member.native)
+            .collect())
+    }
+
+    fn native_checkpoint_members(
+        &self,
+        scope: NativeDependentCustodyScope,
+    ) -> Result<Vec<NativeDependentCheckpointMember>> {
         let group = &self.custody[&scope.group];
         let at = scope.reservation.source.basis;
         let mut members = Vec::new();
@@ -27,11 +39,23 @@ impl BranchIndex {
             .custody_placements(at)
             .filter(|entry| entry.group == scope.group)
         {
-            let (carrier_sha256, link_sha256) = match entry.occurrence {
-                Some(occurrence) => (occurrence.carrier_sha256, occurrence.link_sha256),
+            let (carrier_sha256, link_sha256, branch, table, target) = match entry.occurrence {
+                Some(occurrence) => (
+                    occurrence.carrier_sha256,
+                    occurrence.link_sha256,
+                    &occurrence.target.branch,
+                    &occurrence.target.table,
+                    &occurrence.target.id,
+                ),
                 None => {
                     let pending = &group.reservations[&entry.placement_id].reservation;
-                    (pending.carrier_sha256, Some(pending.link_sha256))
+                    (
+                        pending.carrier_sha256,
+                        Some(pending.link_sha256),
+                        &pending.target.branch,
+                        &pending.target.table,
+                        &pending.target.id,
+                    )
                 }
             };
             if members.len() == MAX_MEMBERS
@@ -41,21 +65,117 @@ impl BranchIndex {
             {
                 return Err(inventory_unavailable());
             }
-            members.push(NativeCheckpointMember {
-                placement: entry.placement_id,
-                reservation: entry.reservation,
-                occurrence: entry
+            members.push(NativeDependentCheckpointMember {
+                native: NativeCheckpointMember {
+                    placement: entry.placement_id,
+                    reservation: entry.reservation,
+                    occurrence: entry
+                        .occurrence
+                        .map(|occurrence| occurrence.commitment(scope.group)),
+                    carrier_sha256,
+                    link_sha256,
+                },
+                source_basis: entry
                     .occurrence
-                    .map(|occurrence| occurrence.commitment(scope.group)),
-                carrier_sha256,
-                link_sha256,
+                    .map_or(entry.enrolled, |occurrence| occurrence.written),
+                enrolled: entry.enrolled,
+                branch: branch.clone(),
+                table: table.to_string(),
+                target: target.clone(),
             });
         }
         if members.is_empty() {
             return Err(inventory_unavailable());
         }
-        members.sort_unstable_by_key(|member| member.placement);
+        members.sort_unstable_by_key(|member| member.native.placement);
         Ok(members)
+    }
+
+    pub fn native_dependent_checkpoint_metadata(
+        &self,
+        scope: NativeDependentCustodyScope,
+        relation: &TableRef,
+        body_column: &str,
+        max_body_bytes: usize,
+    ) -> Result<NativeDependentCheckpointMetadata> {
+        let custody = self.inherited_custody().ok_or_else(dependent_conflict)?;
+        if custody.reservation != scope.reservation
+            || custody.enrolled_at != scope.source_enrolled_at
+            || self.head.basis != scope.destination
+            || custody
+                .groups
+                .binary_search(&(scope.group, scope.checkpoint_group_sha256))
+                .is_err()
+        {
+            return Err(dependent_conflict());
+        }
+        let definition = self
+            .definition(relation, scope.destination)
+            .filter(|table| !table.dropped && table.visibility.is_none())
+            .ok_or_else(dependent_conflict)?;
+        let members = self.native_checkpoint_members(scope)?;
+        let prefix = format!("{:032x}:", u128::from_be_bytes(scope.group));
+        let prefix_id = EntityId::String(prefix.clone());
+        let mut rows = Vec::new();
+        let mut remaining = max_body_bytes;
+        for (branch, data) in &self.branches {
+            let Some(table) = data.tables.get(relation) else {
+                continue;
+            };
+            if table.erased.range(prefix_id.clone()..).next().is_some_and(
+                |(id, _)| matches!(id, EntityId::String(id) if id.starts_with(&prefix)),
+            ) {
+                return Err(inventory_unavailable());
+            }
+            for (id, history) in table.events.range(prefix_id.clone()..) {
+                let EntityId::String(id) = id else {
+                    break;
+                };
+                if !id.starts_with(&prefix) {
+                    break;
+                }
+                if id.len() > 255 {
+                    return Err(inventory_unavailable());
+                }
+                for (generation, event) in history.iter() {
+                    let image = event.image.as_ref().ok_or_else(inventory_unavailable)?;
+                    if image.custody_group.is_some()
+                        || image.custody_payload.is_some()
+                        || image.expires_at.is_some()
+                        || rows.len() == 2 * MAX_MEMBERS
+                        || event.written != WrittenVersion::Branch
+                        || *generation != definition.generation
+                    {
+                        return Err(inventory_unavailable());
+                    }
+                    let Some(Value::Binary(body) | Value::FixedSizeBinary(body)) =
+                        image.cells.get(body_column)
+                    else {
+                        return Err(inventory_unavailable());
+                    };
+                    if body.is_empty() {
+                        return Err(inventory_unavailable());
+                    }
+                    remaining = remaining
+                        .checked_sub(body.len())
+                        .ok_or_else(inventory_unavailable)?;
+                    rows.push(NativeDependentCheckpointRow {
+                        branch: branch.clone(),
+                        id: id.clone(),
+                        body: body.clone(),
+                        written: event.cut.basis,
+                    });
+                }
+            }
+        }
+        if rows.is_empty() {
+            return Err(inventory_unavailable());
+        }
+        Ok(NativeDependentCheckpointMetadata {
+            scope,
+            members,
+            rows,
+        })
     }
 
     pub fn native_dependent_custody(

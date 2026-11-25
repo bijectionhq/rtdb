@@ -295,6 +295,11 @@ impl MultiDatabase {
         state.require_native_custody_fence(fence)
     }
 
+    pub async fn native_dependent_custody_status(&mut self, scope: NativeDependentCustodyScope, fence: &NativeCustodyFence) -> Result<Option<Receipt>> {
+        self.require_managed_checkpoint_writer().await?;
+        self.durable_transactions().native_dependent_custody_status(scope, fence)
+    }
+
     pub async fn record_native_dependent_custody(&mut self, order: NativeDependentCustodyOrder) -> Result<Receipt> {
         self.require_managed_checkpoint_writer().await?;
         let state = self.durable_transactions();

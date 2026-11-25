@@ -51,6 +51,13 @@ impl MultiRuntime {
         fence: &NativeCustodyFence,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
+        let (source, scope) = self.native_dependent_source(destination, reservation, group).await?;
+        self.settle_native_dependent_scope(&source, scope, fence, cancellation).await
+    }
+
+    pub(super) async fn native_dependent_source(
+        &self, destination: &str, reservation: ManagedCheckpointReservation, group: [u8; 16],
+    ) -> Result<(Arc<MultiServing>, NativeDependentCustodyScope)> {
         let selected = self.managed_entry(destination, Uuid::from_bytes(reservation.target.incarnation)).await?;
         let transfer = selected.managed_transfer()?;
         if transfer.reservation != reservation
@@ -62,16 +69,21 @@ impl MultiRuntime {
         let Some((custody, Some(basis))) = source.native_checkpoint_forward(reservation).await? else {
             return Err(terminal_required());
         };
-        let scope = dependent_scope(&custody, basis, group)?;
+        Ok((source, dependent_scope(&custody, basis, group)?))
+    }
+
+    pub(super) async fn settle_native_dependent_scope(
+        &self, source: &MultiServing, scope: NativeDependentCustodyScope,
+        fence: &NativeCustodyFence, cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
         source.require_native_dependent_fence(scope, fence).await?;
+        if let Some(terminal) = source.native_dependent_custody_status(scope, fence).await? {
+            return Ok(terminal);
+        }
 
         let enrollment = match source.native_dependent_custody(scope).await? {
-            Some((_, Some(terminal))) => {
-                if &terminal.fence != fence { return Err(dependent_required()); }
-                return source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(terminal)).await;
-            }
-            Some((enrollment, None)) => enrollment,
-            None => self.enroll_native_dependent(&source, scope, cancellation).await?,
+            Some((enrollment, _)) => enrollment,
+            None => self.enroll_native_dependent(source, scope, cancellation).await?,
         };
         let authority = self.native_dependent_custody.as_deref().ok_or_else(dependent_required)?;
         let disposition = cancellation.run_until_cancelled(authority.observe_disposition(&enrollment, fence, cancellation))

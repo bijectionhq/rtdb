@@ -491,8 +491,52 @@ The distinct destination needs an installed application-key and response-registr
 Commission the exact destination installation, application key namespace, reader admission owner and durable response registry, and bind their retained receipts to the same scope.
 The Original retirement worker can continue using its current drain call once the trusted host drives each dependent settlement.
 Upgrade source journal readers and managed catalog publishers before enabling the new ordered records.
-The stock launcher has no destination authority mount for this contract.
 The private inherited read remains closed until a paired consumer supplies a current destination generation, exact slot and source occurrence, all contributing live fences and a durable registration through admitted response-part delivery and disposal.
+
+#### Stock private custody transport
+
+Set `RTDB_NATIVE_DEPENDENT_CUSTODY_FILE` on the installed Multi hosts that perform this work.
+Its JSON contains optional `observers` and `ingress` fields.
+Each observer has `source_incarnation` and `destination_incarnation` as UUID strings, a commissioned `owner` and `application_scope` as 32-byte arrays, and a `connection` profile.
+A connection has `endpoint` as a private HTTPS origin with no path or query, `ca_file`, `client_certificate_file`, `client_private_key_file` and `server_certificate_sha256`.
+The client requires both the dedicated CA chain and the pinned leaf DER SHA-256 before sending the request.
+The source selects the observer from the exact commissioned source and destination incarnation pair and verifies the returned owner and application scope.
+The destination commissions the dedicated RTDB source writer client leaf for that pair and independently recovers its durable owner record.
+
+The source sends `POST /rtdb/native-dependent-custody/v1/observe` with `application/json`.
+The request is `{"version":1,"observation":{...}}`.
+The observation carries `kind: "enrollment"`, the exact `scope` and sorted `native` roster, or `kind: "disposition"`, the exact accepted `enrollment` and applied `fence`.
+All private replies use HTTP 200 with `{"version":1,"request_sha256":[...],"result":{...}}`, where `request_sha256` is SHA-256 over the raw request body.
+The observation result carries `kind: "pending"`, `kind: "enrollment"` with `enrollment`, or `kind: "disposition"` with `disposition`.
+Only the matching positive result can order source evidence.
+A timeout or temporarily unavailable observer leaves the current obligation pending.
+Wrong identity, scope, reply binding, or result leaves it unresolved.
+Each request and response body is bounded to 1 MiB.
+Use the existing Rust serde field shapes, including `Basis` as `{"incarnation":[...],"position":n}` and bytes as JSON integer arrays.
+
+An ingress profile contains `port`, `certificate_file`, `private_key_file`, `client_ca_file`, and optional `metadata` and `operators` lists.
+Each list entry binds `client_certificate_sha256` to `source_incarnation` and `destination_incarnation`.
+Use separate client leaves for the metadata reader and the settlement operator.
+A metadata entry also commissions the exact destination catalog name in `destination`, `relation` as `{"schema":"public","table":"fact_custody_members"}` for Bijection, and `body_column` as `"body"`.
+The destination owner sends `POST /rtdb/native-dependent-custody/v1/metadata` with `{"version":1,"scope":{...}}` over that separate mTLS connection.
+The result is `kind: "pending"` before a committed restore or `kind: "ready"` with `metadata` containing `scope`, `members` and `rows`.
+The reader uses the exact authenticated native restore under its retained generation and can open a private `TransferPending` destination.
+It reports all reverse members sorted by native placement ID.
+Each member contains `native`, `source_basis` for the original written occurrence or pending reservation, `enrolled` for the original enrollment Basis, physical `branch`, qualified `table`, and typed `target` such as `{"String":"row-id"}`.
+The rows contain `branch`, string `id`, the original JSON bytes in `body`, and destination-coordinate `written` Basis.
+The scope's 16-byte group is encoded as 32 lowercase hex digits followed by `:` for the physical row ID prefix.
+The reader rejects missing, erased, tombstoned, protected, expired, or out-of-bound metadata and retains historical physical versions for the consumer to reconcile.
+The response includes the configured metadata JSON and reverse commitments.
+It excludes protected carrier bytes and provides no ordinary Query or new route readiness.
+
+Use `rtdb native-dependent-custody settle|status --connection-file PATH --request-file PATH` on the separately commissioned source operator ingress.
+The connection file uses the same TLS profile and points at the selected source writer.
+The request file contains `{"version":1,"settlement":{"destination":"...","scope":{...},"fence":{...}}}`.
+`settle` uses `POST /rtdb/native-dependent-custody/v1/settle` and can order the exact independently observed disposition.
+`status` uses the same request at `POST /rtdb/native-dependent-custody/v1/status` and recovers only the keyed source receipt.
+Results are `kind: "pending"` with the stable `key` or `kind: "settled"` with `key` and the applied source `basis`.
+After an uncertain settlement, submit the exact same request to status or retry it on the selected writer.
+The operator client rejects redirects and verifies the raw request digest, derived receipt key and positive receipt Basis.
 
 Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
 Qualify `managed_catalog_waits_for_confirmation_and_drains_and_recovers_a_lost_unpin_reply` for the private catalog and mounted destination attachment gates.

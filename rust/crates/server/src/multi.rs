@@ -41,6 +41,7 @@ mod catalog;
 pub mod classic_ingress;
 mod classic_migration;
 pub(crate) mod classic_opening;
+pub(crate) mod dependent_custody;
 mod timed_stream;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
@@ -106,6 +107,7 @@ pub struct MultiRuntime {
     managed_sources: Arc<BTreeMap<Uuid, Arc<dyn ManagedCheckpointSource>>>,
     native_checkpoint_source: Option<native_checkpoint::NativeCheckpointSource>,
     native_dependent_custody: Option<Arc<dyn NativeDependentCustodyAuthority>>,
+    native_dependent_ingress: Option<Arc<dependent_custody::Ingress>>,
     managed_operations: TaskTracker,
     follower: Option<NativeFollowerAssignment>,
     classic_ingress: Option<Arc<classic_ingress::Ingress>>,
@@ -325,6 +327,7 @@ impl MultiRuntime {
             runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
             runtime.classic_ingress = classic_ingress::Ingress::installed()?;
             runtime.classic_opening_ingress = classic_opening::Ingress::installed()?;
+            dependent_custody::install(&mut runtime)?;
         }
         Ok(runtime)
     }
@@ -432,6 +435,7 @@ impl MultiRuntime {
             managed_sources: Arc::default(),
             native_checkpoint_source: None,
             native_dependent_custody: None,
+            native_dependent_ingress: None,
             managed_operations: TaskTracker::new(),
             follower,
             classic_ingress: None,
@@ -943,6 +947,8 @@ impl MultiRuntime {
                 if self.classic_ingress.is_some() => result,
             result = async { self.classic_opening_ingress.as_ref().expect("Classic opening ingress enabled").serve(self, stop).await },
                 if self.classic_opening_ingress.is_some() => result,
+            result = async { self.native_dependent_ingress.as_ref().expect("Native dependent custody ingress enabled").serve(self, stop).await },
+                if self.native_dependent_ingress.is_some() => result,
             result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
             result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },
                 if self.peer.is_some() => result,

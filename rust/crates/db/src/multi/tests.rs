@@ -404,6 +404,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     source.create().await.unwrap();
     source.tick(&live(1)).await.unwrap();
+    let registry = TableRef::new("public", "custody_registry");
     let mut placements = Vec::new();
     for n in [1, 2] {
         let group = [n; 16];
@@ -427,6 +428,14 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
         };
         let mut write = request(n, Op::CreateCustodyGroup { group });
         write.ops.push(occurrence);
+        write.ops.push(Op::Put {
+            branch: MAIN_BRANCH.into(), table: registry.clone(), if_absent: true,
+            rows: vec![Row {
+                id: EntityId::String(format!("{:032x}:member", u128::from_be_bytes(group))),
+                valid: None, cells: StructFields::from([("body".into(), Value::Binary(br#"{"member":true}"#.to_vec()))]),
+                custody_group: None, protected_columns: Vec::new(), custody_payload: None,
+            }],
+        });
         let receipt = append_custody_fixture(&mut source, &write).await;
         assert_eq!(receipt.outcome, Outcome::Then);
         placements.push((group, receipt, envelope));
@@ -471,6 +480,23 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let (_, view, _) = follower.require_managed_checkpoint_restore(reservation).await.unwrap();
     assert_eq!(view.require_local_custody().unwrap_err().code, "rtdb/inherited-custody");
     assert!(view.custody_inventory(*group).is_none());
+    let scope = NativeDependentCustodyScope {
+        reservation, destination: installed, source_enrolled_at: claim.enrolled_at, group: *group,
+        checkpoint_group_sha256: claim.groups[0].1,
+    };
+    let metadata = view.native_dependent_checkpoint_metadata(scope, &registry, "body", 1024).unwrap();
+    assert_eq!(metadata.scope, scope);
+    assert_eq!(metadata.members.len(), 1);
+    assert_eq!(metadata.members[0].source_basis, original.basis);
+    assert_eq!(metadata.members[0].enrolled, original.basis);
+    assert_eq!(metadata.members[0].target, EntityId::Integer(1));
+    assert_eq!(metadata.rows.len(), 1);
+    assert_eq!(metadata.rows[0].body.as_slice(), br#"{"member":true}"#);
+    assert_eq!(metadata.rows[0].written, Basis::new(reservation.target.incarnation, original.basis.position()));
+    assert!(view.native_dependent_checkpoint_metadata(scope, &registry, "body", 1).is_err());
+    let mut wrong = scope;
+    wrong.checkpoint_group_sha256 = [0; 32];
+    assert!(view.native_dependent_checkpoint_metadata(wrong, &registry, "body", 1024).is_err());
     let (inherited, occurrence) = view.native_inherited_carrier(MAIN_BRANCH, &table(), &EntityId::Integer(1), envelope).unwrap();
     assert_eq!(inherited, *group);
     assert_eq!(view.native_inherited_carrier(MAIN_BRANCH, &table(), &EntityId::Integer(2), envelope).unwrap_err().code, "rtdb/native-checkpoint-binding");
@@ -529,6 +555,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
         receipt: DependentCustodyReceipt { key: [15; 32], evidence_sha256: [16; 32] },
         keys: Vec::new(),
     };
+    assert!(source.native_dependent_custody_status(disposition.scope, &disposition.fence).await.unwrap().is_none());
     assert!(source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(disposition.clone())).await.is_err());
     disposition.keys.push(DependentKeyDisposition {
         key: [14; 32], reader_drain_sha256: [17; 32], part_disposition_sha256: [18; 32],
@@ -543,6 +570,10 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let terminal = source.record_native_dependent_custody(order.clone()).await.unwrap();
     assert!(source.fresh_index().await.unwrap().custody_releases_drained(*other_group));
     source.checkpoint(Vec::new()).await.unwrap();
+    let NativeDependentCustodyOrder::Dispose(disposition) = &order else { unreachable!() };
+    let status = source.native_dependent_custody_status(disposition.scope, &disposition.fence).await.unwrap().unwrap();
+    assert_eq!(status.key, terminal.key);
+    assert_eq!(status.basis, terminal.basis);
     let recovered = source.record_native_dependent_custody(order).await.unwrap();
     assert_eq!(recovered.key, terminal.key);
     assert_eq!(recovered.basis, terminal.basis);
