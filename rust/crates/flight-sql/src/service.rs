@@ -41,6 +41,7 @@ pub(crate) struct Inner {
     pub owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
     pub owned_world_reads: Registry<Bytes, crate::owned_actions::OwnedWorldReadResource>,
     pub owned_read_slots: Arc<Semaphore>,
+    pub exact_reads: Registry<Uuid, crate::v1::exact_read::ExactRead>,
     pub audience: Option<AudienceAdmission>,
     auth: Authentication,
     permits: Arc<Semaphore>,
@@ -62,7 +63,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -70,7 +71,7 @@ impl CallKind {
     }
 
     fn serves_assigned_follower(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities | Self::V1ExactRead)
     }
 
     fn allows_workload_root_read(self) -> bool {
@@ -273,7 +274,8 @@ impl Service {
                 transport,
             })
         } else { None };
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))
+        let exact_reads = Registry::new(clock.clone(), memory.clone());
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), exact_reads, audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))
     }
     pub(crate) fn standalone_custody_owner(&self) -> Option<&'static str> {
         matches!(&self.0.binding, Binding::Standalone).then_some("xtdb")
@@ -304,6 +306,7 @@ impl Service {
         if session.audience_source().is_none() {
             self.0.owned_reads.close_where(|read| read.session == session.id);
             self.0.owned_world_reads.close_where(|read| read.session == session.id);
+            self.0.exact_reads.close_where(|read| read.session == session.id);
         }
     }
     pub fn sweep(&self) {
@@ -311,12 +314,14 @@ impl Service {
             audience.sessions.sweep();
         }
         self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.query_tickets.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
+        self.0.exact_reads.sweep();
         self.publish();
     }
     pub fn close(&self) {
         if let Some(audience) = &self.0.audience {
             audience.sessions.close();
         }
+        self.0.exact_reads.close();
         self.0.query_tickets.close(); self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
         self.publish();
     }
@@ -810,7 +815,7 @@ impl FlightService for Service {
         let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|name| self.supports_admin_action(&call, name)))
             .collect::<Vec<_>>();
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS.into_iter()
-            .filter(|name| *name != crate::v1::MANAGED_WORKLOAD))
+            .filter(|name| !matches!(*name, crate::v1::MANAGED_WORKLOAD | crate::v1::exact_read::OPEN | crate::v1::exact_read::CLOSE)))
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(hosted_carrier_actions.into_iter().filter(|_| hosted_upload.is_some()))
             .chain(crate::owned_actions::ROOT_RANK_ACTIONS.into_iter().filter(|_| root_rank))
@@ -875,6 +880,7 @@ impl FlightService for Service {
         if crate::v1::is_action(name) {
             let kind = match name {
                 crate::v1::CAPABILITIES => CallKind::V1Capabilities,
+                crate::v1::exact_read::OPEN | crate::v1::exact_read::CLOSE => CallKind::V1ExactRead,
                 crate::v1::MANAGED_CREATE => CallKind::ManagedCreate,
                 crate::v1::MANAGED_WORKLOAD => CallKind::ManagedWorkload,
                 crate::v1::TX_STATUS => CallKind::TxStatus,
@@ -927,7 +933,7 @@ fn classic_retained_refusal() -> Status {
 }
 
 fn follower_refusal() -> Status {
-    Status::permission_denied("The assigned follower serves only native Query and Capabilities")
+    Status::permission_denied("The assigned follower serves only native Query and its read actions")
 }
 
 pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
@@ -952,7 +958,7 @@ mod tests {
 
     #[test]
     fn follower_admission_has_a_positive_query_allowlist() {
-        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities] {
+        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities, CallKind::V1ExactRead] {
             assert!(kind.serves_assigned_follower());
         }
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {

@@ -39,7 +39,7 @@ use super::{
 };
 
 #[cfg(feature = "multi")]
-fn follower_progress(route: &crate::follower::FollowerRoute, progress: Option<rtdb_node::MultiFollowerProgress>)
+pub(super) fn follower_progress(route: &crate::follower::FollowerRoute, progress: Option<rtdb_node::MultiFollowerProgress>)
     -> Option<(u64, proto::FollowerProgress)> {
     progress.map(|progress| (progress.applied_position, proto::FollowerProgress {
         database: route.assignment.database.clone(),
@@ -49,6 +49,8 @@ fn follower_progress(route: &crate::follower::FollowerRoute, progress: Option<rt
         endpoint: route.endpoint.to_string(),
         writer_head: Some(progress.writer_head.into()),
         writer_head_position: progress.writer_head_position,
+        retained_from: Some(progress.retained_from.into()),
+        retained_from_position: progress.retained_from.position(),
     }))
 }
 
@@ -111,6 +113,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
         hash.update(Sha256::digest(review.encode_to_vec()));
     }
     if let Some(hold) = &query.scoped_hold { hash.update(b"scoped-hold"); hash.update(hold); }
+    if let Some(read) = &query.exact_read_scope { hash.update(b"exact-read"); hash.update(read); }
     if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
     if query.observe_applied_position { hash.update(b"observe-applied-position"); }
     if query.verify_ranked_artefacts { hash.update(b"ranked-artefact-readiness"); }
@@ -119,6 +122,21 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
         hash.update(Sha256::digest(ranked.encode_to_vec()));
     }
     hash.finalize().into()
+}
+
+#[cfg(test)]
+#[test]
+fn continuation_fingerprint_binds_the_exact_read_scope() {
+    let mut request = proto::QueryRequest {
+        sql: "SELECT _id FROM items ORDER BY _id".into(),
+        exact_read_scope: Some(vec![1; 16]),
+        ..Default::default()
+    };
+    let first = fingerprint(&request);
+    request.page = Some(proto::Page { limit: 1, after: vec![3] });
+    assert_eq!(first, fingerprint(&request));
+    request.exact_read_scope = Some(vec![2; 16]);
+    assert_ne!(first, fingerprint(&request));
 }
 
 struct OpenedQuery {
@@ -132,6 +150,7 @@ struct OpenedQuery {
     custody_groups: BTreeSet<CustodyGroupId>,
     key_generation: Option<u64>,
     scoped_hold_until: Option<Timestamp>,
+    exact_read: Option<Arc<super::exact_read::ExactRead>>,
 }
 
 impl Service {
@@ -180,7 +199,7 @@ impl Service {
         call: Call,
         request: proto::QueryRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
-        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg, custody_groups, key_generation, scoped_hold_until } = self
+        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg, custody_groups, key_generation, scoped_hold_until, exact_read } = self
             .open_v1_query(&call, request)
             .await
             .map_err(|status| call.error(status))?;
@@ -194,7 +213,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
             let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
-            service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
+            service.check_scoped_query_delivery(&call, &database, page.basis, key_generation, &custody_groups, exact_read.as_deref()).await?;
             service.check_attachment(&call, &database)?;
             service.check_hold_deadline(scoped_hold_until)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
@@ -223,7 +242,7 @@ impl Service {
                 for item in data {
                     if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
                     let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
-                    service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
+                    service.check_scoped_query_delivery(&call, &database, page.basis, key_generation, &custody_groups, exact_read.as_deref()).await?;
                     service.check_attachment(&call, &database)?;
                     service.check_hold_deadline(scoped_hold_until)?;
                     call.handoff(grant, cutoff).map_err(error::map_status)?;
@@ -239,7 +258,7 @@ impl Service {
             if skip != 0 { Err(cursor_expired())?; }
             if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
             let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
-            service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
+            service.check_scoped_query_delivery(&call, &database, page.basis, key_generation, &custody_groups, exact_read.as_deref()).await?;
             service.check_attachment(&call, &database)?;
             service.check_hold_deadline(scoped_hold_until)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
@@ -255,6 +274,23 @@ impl Service {
             return Err(super::scoped_hold::hold_unavailable());
         }
         Ok(())
+    }
+
+    async fn check_scoped_query_delivery(
+        &self, call: &Call, database: &Database, basis: Basis, generation: Option<u64>,
+        groups: &BTreeSet<CustodyGroupId>, read: Option<&super::exact_read::ExactRead>,
+    ) -> Result<(), Status> {
+        if let Some(read) = read {
+            read.check()?;
+            #[cfg(feature = "multi")]
+            if let Some(route) = self.follower() {
+                route.reader.check_retained_delivery(read.generation, &call.cancellation)
+                    .await.map_err(error::follower)?;
+                return read.check();
+            }
+            return Err(error::unsupported(super::exact_read::FEATURE));
+        }
+        self.check_query_delivery(call, database, basis, generation, groups).await
     }
 
     pub(super) async fn check_query_delivery(&self, call: &Call, database: &Database, _basis: Basis, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
@@ -301,6 +337,14 @@ impl Service {
         let selection = source.at.as_ref().and_then(|at| at.selection.as_ref());
         if source.at.is_some() && selection.is_none() {
             return Err(error::incorrect("Empty At selector"));
+        }
+        if request.exact_read_scope.is_some() && (
+            !self.follower_only() || !matches!(selection, Some(Selection::Exactly(_))) ||
+            request.scoped_hold.is_some() || request.observe_receiver_clock || request.custody_release_evidence ||
+            request.custody_review.is_some() || request.require_clear_rank_input ||
+            request.verify_ranked_artefacts || request.ranked_ivf.is_some()
+        ) {
+            return Err(error::unsupported(super::exact_read::FEATURE));
         }
         let workload = call.session.caller.principal.workload_grant();
         let managed_family = is_managed_family(call);
@@ -349,6 +393,8 @@ impl Service {
             Some(family) => Arc::clone(&family.database),
             None => self.wire_database(call, &source.branch, layer).await?,
         };
+        let exact_read = request.exact_read_scope.as_deref()
+            .map(|handle| self.exact_read(call, &database, handle)).transpose()?;
         let driver = database.serving_driver();
         let mut visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
         let scoped_hold = match request.scoped_hold.as_deref() {
@@ -489,7 +535,16 @@ impl Service {
         };
         let mut ranked_catalog = None;
         let mut family_region = None;
-        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, scoped_source_basis, follower_evidence) = if let Some(driver) = driver {
+        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, scoped_source_basis, follower_evidence) = if let Some(read) = &exact_read {
+            let (source, _, offset) = applied_source(source, claim_layer, selection, continuation, read.time)?;
+            let At::Exactly(basis) = source.at else {
+                return Err(error::unsupported(super::exact_read::FEATURE));
+            };
+            let context = read.page_context(basis, request.track, &call.cancellation)?;
+            let page = PageToken { basis, clock: read.time, offset, request: request_hash };
+            let progress = request.observe_applied_position.then(|| read.progress.clone());
+            (context, page, read.time, None, BTreeSet::new(), Some(read.generation), None, None, progress)
+        } else if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
@@ -667,7 +722,7 @@ impl Service {
             follower_progress,
             ranked_ivf: ranked_result,
         };
-        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation, scoped_hold_until: scoped_hold.map(|hold| hold.expires_at) })
+        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation, scoped_hold_until: scoped_hold.map(|hold| hold.expires_at), exact_read })
     }
 }
 

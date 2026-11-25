@@ -156,6 +156,13 @@ surface StatelessDatabase {
         -- The cell drains admitted reads before stopping the assigned listener and retiring the assignment.
         -- The installed follower confirms detach for the exact slot, database, incarnation, placement epoch, assignment and bound endpoint after its listener, node and resource owners finish.
 
+    @guarantee AssignedFollowerExactScope
+        -- An open on the assigned follower retains the selected exact view under the authenticated Flight session for at most two seconds.
+        -- All scoped pages use the original view, basis and tracking mode.
+        -- Delivery requires the attached assignment and its captured key generation.
+        -- A continuation identifies its exact scope and the request that issued it.
+        -- Closing or expiring the scope ends admission and cancels its active pages.
+
     @guarantee ReceiverClockObservation
         -- Where advertised, the first page includes a sample from the installed receiver clock when requested.
         -- The authenticated observation binds the sample, selected cut, query fingerprint and Flight session.

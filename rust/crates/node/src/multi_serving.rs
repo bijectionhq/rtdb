@@ -70,6 +70,7 @@ pub struct MultiFollower {
 
 pub struct MultiFollowerProgress {
     pub applied_position: u64,
+    pub retained_from: Basis,
     pub writer_head: Basis,
     pub writer_head_position: u64,
 }
@@ -107,11 +108,12 @@ impl MultiFollower {
             let mut database = self.serving.database.lock().await;
             let (index, _) = database.follower_view(&self.owner)?;
             let applied_position = index.applied_position(cut)?;
+            let retained_from = index.oldest_retained_cut().basis;
             let (writer_head, writer_head_position) = database.follower_writer_head(&self.owner).await?;
             if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
             }
-            Ok(Some(MultiFollowerProgress { applied_position, writer_head, writer_head_position }))
+            Ok(Some(MultiFollowerProgress { applied_position, retained_from, writer_head, writer_head_position }))
         }).await.ok_or_else(interrupted)?
     }
 
@@ -147,6 +149,15 @@ impl MultiFollower {
             let (index, _) = database.follower_view(&self.owner)?;
             require_plain_follower(&index)?;
             index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, At::Exactly(basis), Layer::Merged, now)?;
+            database.check_generation(generation).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    pub async fn check_retained_delivery(&self, generation: u64, cancellation: &CancellationToken) -> Result<()> {
+        cancellation.run_until_cancelled(async {
+            let database = self.serving.database.lock().await;
+            let (index, _) = database.follower_view(&self.owner)?;
+            require_plain_follower(&index)?;
             database.check_generation(generation).await
         }).await.ok_or_else(interrupted)?
     }

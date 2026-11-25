@@ -297,6 +297,13 @@ impl BranchIndex {
 
     pub fn head(&self) -> BranchCut { self.head }
 
+    pub fn oldest_retained_cut(&self) -> BranchCut {
+        let floor = self.classic_checkpoint.map_or(0, Basis::position);
+        let (&position, &system_time) = self.times.range(floor..).next()
+            .expect("The retained index contains its head");
+        BranchCut { basis: Basis::new(self.head.basis.incarnation(), position), system_time }
+    }
+
     pub fn applied_position(&self, cut: BranchCut) -> Result<u64> {
         self.require_incarnation(cut.basis)?;
         self.times.get_key_value(&cut.basis.position())
