@@ -1,11 +1,12 @@
 use std::{collections::BTreeMap, convert::Infallible, io, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue, Request, Response, Uri, header};
-use http_body_util::{Either, Empty};
+use http_body_util::{BodyExt, Either, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, service::service_fn};
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
+use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
 use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
@@ -19,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::{admin, capability::CellSecret, cipher::Cipher, control, gateway::{DeploymentConnection, DeploymentConnections, GatewayOptions, database_selector}};
+use crate::{admin, capability::CellSecret, cipher::Cipher, classic_flight, control, gateway::{DeploymentConnection, DeploymentConnections, GatewayOptions, database_selector}};
 
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
@@ -29,6 +30,7 @@ const HANDSHAKE: &str = "/arrow.flight.protocol.FlightService/Handshake";
 const DO_ACTION: &str = "/arrow.flight.protocol.FlightService/DoAction";
 const MAXIMUM_HEADER_BYTES: u32 = 8 * 1024;
 const MAXIMUM_ROUTE_BYTES: usize = 4096;
+const MAXIMUM_ACTION_FRAME_BYTES: usize = (64 << 20) + 5;
 
 #[derive(Serialize, Deserialize)]
 struct Target {
@@ -69,13 +71,15 @@ struct Router {
     control: control::ControlKey,
     secret: Arc<CellSecret>,
     routes: Cipher,
-    transport: Client<HttpConnector, Incoming>,
+    transport: Client<HttpConnector, RequestBody>,
     calls: Arc<Semaphore>,
     transport_bytes: Option<Arc<MemoryBudget>>,
     deployments: Option<Arc<DeploymentConnections>>,
     audience: Option<AudienceRoute>,
     options: GatewayOptions,
     timeout: Duration,
+    retained_key: Option<[u8; 32]>,
+    inspected_actions: Arc<MemoryBudget>,
 }
 
 struct RoutedBody {
@@ -120,6 +124,16 @@ impl Body for RoutedBody {
 }
 
 type ProxyBody = Either<Empty<Bytes>, RoutedBody>;
+type RequestBody = UnsyncBoxBody<Bytes, io::Error>;
+
+struct InspectedAction {
+    wire: Bytes,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl AsRef<[u8]> for InspectedAction {
+    fn as_ref(&self) -> &[u8] { &self.wire }
+}
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
     serve_listener(listener, directory, options, None, cancellation).await
@@ -166,11 +180,14 @@ async fn serve_listener(
         MemoryBudget::new(2 * limit * AUDIENCE_GATEWAY_TRANSPORT_BYTES)
     });
     let transport = client.build(connector);
+    let retained_key = if audience.is_none() {
+        options.classic_retained_flight_key.as_deref().map(classic_flight::read_retained_key).transpose()?
+    } else { None };
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
         secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience, transport_bytes,
         calls: Arc::new(Semaphore::new(limit)),
         deployments: audience.is_none().then(|| Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment))),
-        timeout: options.startup_timeout, options });
+        timeout: options.startup_timeout, options, retained_key, inspected_actions: MemoryBudget::new(8 * MAXIMUM_ACTION_FRAME_BYTES) });
     let connections = Arc::new(Semaphore::new(limit));
     loop {
         let (stream, remote) = tokio::select! {
@@ -244,14 +261,14 @@ impl Router {
         Ok(token)
     }
 
-    async fn first_target(&self, selector: &str, fresh: bool) -> std::result::Result<Target, Status> {
+    async fn first_target(&self, selector: &str, fresh: bool) -> std::result::Result<(Target, Option<DeploymentRecord>), Status> {
         let (name, installation) = database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?;
         if let Some(audience) = self.audience {
             if fresh { return Err(Status::permission_denied("The reserved audience has its own admission")); }
-            return self.audience_target(name, installation, audience).await;
+            return self.audience_target(name, installation, audience).await.map(|target| (target, None));
         }
         if fresh {
-            return self.fresh_target(name, installation).await;
+            return self.fresh_target(name, installation).await.map(|target| (target, None));
         }
         if let Some(installed) = self.options.ordered_placement(name).await.map_err(directory_error)? {
             if installation.is_some_and(|id| id != installed.deployment) {
@@ -267,8 +284,8 @@ impl Router {
             }).await.map_err(|_| moved())?;
             let target = Target { name: name.to_owned(), deployment: installed.deployment.to_string(),
                 holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment), replica: None, ordered_reader: None, fresh: false };
-            self.validate(&target).await?;
-            return Ok(target);
+            let classic = self.validate(&target).await?;
+            return Ok((target, classic));
         }
         if self.options.installed_cell.is_some() {
             return Err(Status::not_found("No matching installed Flight SQL deployment"));
@@ -286,7 +303,9 @@ impl Router {
         let reply = control::call(control, &control::Request::FlightEndpoint, self.timeout, &self.control).await
             .map_err(|_| Status::unavailable("The holder did not report a Flight SQL endpoint"))?;
         let control::Response::FlightEndpoint { address } = reply else { return Err(Status::unavailable("The holder has no Flight SQL endpoint")); };
-        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None, replica: None, ordered_reader: None, fresh: false })
+        let target = Target { name: current.name.clone(), deployment: current.id.clone(), holder, epoch: current.epoch,
+            address, enrollment: None, replica: None, ordered_reader: None, fresh: false };
+        Ok((target, rtdb_directory::classic_flight::excludes_unclassified(&current).then_some(current)))
     }
 
     /// Resolve an eligible subscriber and let the receiver establish its own cut.
@@ -313,7 +332,7 @@ impl Router {
                     address, enrollment: Some(grant.enrollment), replica: None, ordered_reader: None, fresh: true,
                 }
             };
-            self.validate(&target).await?;
+            let _ = self.validate(&target).await?;
             return Ok(target);
         }
         if self.options.installed_cell.is_some() {
@@ -358,7 +377,7 @@ impl Router {
             address: self.reported_flight_endpoint(control).await?, enrollment: None,
             replica: None, ordered_reader: None, fresh: true,
         };
-        self.validate(&target).await?;
+        let _ = self.validate(&target).await?;
         Ok(target)
     }
 
@@ -404,7 +423,7 @@ impl Router {
         Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None, replica: None, ordered_reader: None, fresh: false })
     }
 
-    async fn validate(&self, target: &Target) -> std::result::Result<(), Status> {
+    async fn validate(&self, target: &Target) -> std::result::Result<Option<DeploymentRecord>, Status> {
         if let Some(installed) = self.options.ordered_placement(&target.name).await.map_err(directory_error)? {
             let Some(enrollment) = target.enrollment.filter(|id| installed.endpoints.contains_key(id)) else { return Err(moved()); };
             let route = installed.journal.route().await.map_err(|_| moved())?;
@@ -413,7 +432,7 @@ impl Router {
             }
             return if target.ordered_reader.is_some_and(|scope| scope == route.placement)
                 || target.ordered_reader.is_none() && route.writer.grant.is_some_and(|grant| grant.enrollment == enrollment)
-            { Ok(()) } else { Err(moved()) };
+            { Ok(None) } else { Err(moved()) };
         }
         if self.options.installed_cell.is_some() { return Err(moved()); }
         if let Some(replica) = &target.replica {
@@ -428,17 +447,17 @@ impl Router {
             let members: BTreeMap<_, _> = self.directory.members().await.map_err(directory_error)?
                 .into_iter().map(|member| (member.id.clone(), member)).collect();
             return if crate::deployment::read_replicas(&record, &members, now_ms())
-                .iter().any(|member| member.id == target.holder) { Ok(()) } else { Err(moved()) };
+                .iter().any(|member| member.id == target.holder) { Ok(None) } else { Err(moved()) };
         }
         if target.enrollment.is_some() || target.ordered_reader.is_some() { return Err(moved()); }
         let (record, member) = tokio::try_join!(self.directory.deployment(&target.deployment), self.directory.member(&target.holder)).map_err(directory_error)?;
         if target.fresh && record.as_ref().is_some_and(rtdb_directory::classic_flight::excludes_unclassified) {
             return Err(classic_flight_refusal());
         }
-        let current = record.zip(member).is_some_and(|(record, member)| {
-            record.name == target.name && record.epoch == target.epoch && holder_is_current(&record, &member)
-        });
-        if current { Ok(()) } else { Err(moved()) }
+        let (record, _) = record.zip(member).filter(|(record, member)| {
+            record.name == target.name && record.epoch == target.epoch && holder_is_current(record, member)
+        }).ok_or_else(moved)?;
+        Ok(rtdb_directory::classic_flight::excludes_unclassified(&record).then_some(record))
     }
 
     async fn proxy(&self, mut request: Request<Incoming>, remote: IpAddr, egress: &FlightEgress) -> std::result::Result<Response<ProxyBody>, Status> {
@@ -510,13 +529,14 @@ impl Router {
                         }
                     }
                     // An audience route locates a socket. Serving authority is checked on the holder.
-                    if self.audience.is_none() { self.validate(&route.target).await?; }
-                    Ok((route.target, Some(route.session)))
+                    let classic = if self.audience.is_none() { self.validate(&route.target).await? } else { None };
+                    Ok((route.target, Some(route.session), classic))
                 }
-                None => self.first_target(selector.expect("a new session has a selector"), fresh).await.map(|target| (target, None)),
+                None => self.first_target(selector.expect("a new session has a selector"), fresh).await
+                    .map(|(target, classic)| (target, None, classic)),
             }
         };
-        let (target, session) = tokio::time::timeout(self.timeout, routing).await
+        let (target, session, classic) = tokio::time::timeout(self.timeout, routing).await
             .map_err(|_| Status::deadline_exceeded("Timed out resolving the Flight SQL route"))??;
         if audience.is_some_and(|profile| Uuid::parse_str(&target.deployment).ok() != Some(profile.source())) {
             return Err(Status::permission_denied("The Flight route belongs to another audience source"));
@@ -557,6 +577,13 @@ impl Router {
         let path = request.uri().path_and_query().ok_or_else(|| Status::invalid_argument("Invalid Flight SQL request path"))?.clone();
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
+        let (parts, body) = request.into_parts();
+        let body = match classic {
+            Some(record) if parts.uri.path() == DO_ACTION =>
+                self.inspect_classic_action(&record, &parts.headers, session, body).await?,
+            _ => body.map_err(io::Error::other).boxed_unsync(),
+        };
+        let request = Request::from_parts(parts, body);
         let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL attachment disconnected"))?;
         let deadline = single_header(response.headers(), GATEWAY_ANSWER_DEADLINE_HEADER)?
             .map(|header| header.parse::<u64>().ok().and_then(DeliveryDeadline::from_wire_nanos)
@@ -567,6 +594,47 @@ impl Router {
         }
         self.rewrite_response(response.headers_mut(), target, audience, seat)?;
         Ok(response.map(|body| Either::Right(RoutedBody { body, admission, _deployment: deployment, deadline })))
+    }
+
+    async fn inspect_classic_action(
+        &self, record: &DeploymentRecord, headers: &HeaderMap, session: Option<Uuid>, mut body: Incoming,
+    ) -> std::result::Result<RequestBody, Status> {
+        let proof = single_header(headers, classic_flight::RETAINED_PROOF_HEADER)?;
+        let inspected = tokio::time::timeout(self.timeout, async {
+            let mut wire = BytesMut::with_capacity(5);
+            let mut message = None;
+            while let Some(frame) = body.frame().await {
+                let mut data = frame.map_err(|_| invalid_classic_action())?
+                    .into_data().map_err(|_| invalid_classic_action())?;
+                if message.is_none() {
+                    let needed = (5 - wire.len()).min(data.len());
+                    wire.extend_from_slice(&data.split_to(needed));
+                    let Some(header) = wire.first_chunk::<5>() else { continue; };
+                    let length = classic_action_length(header)?;
+                    let memory = self.inspected_actions.reserve(4 * length.max(4096))
+                        .map_err(|_| Status::resource_exhausted("Classic Flight action inspection capacity reached"))?;
+                    wire.reserve(length - wire.len());
+                    message = Some((length, memory));
+                }
+                let (length, _) = message.as_ref().ok_or_else(invalid_classic_action)?;
+                if data.len() > *length - wire.len() { return Err(invalid_classic_action()); }
+                wire.extend_from_slice(&data);
+            }
+            let (_, memory) = message.filter(|(length, _)| *length == wire.len()).ok_or_else(invalid_classic_action)?;
+            Ok(InspectedAction { wire: wire.freeze(), _memory: memory })
+        }).await.map_err(|_| Status::deadline_exceeded("Timed out reading the Classic Flight action"))??;
+        let action = decode_classic_action(&inspected.wire)?;
+        if let Some(proof) = proof {
+            let key = self.retained_key.as_ref().filter(|_| {
+                session.is_some() && rtdb_flight_sql::classic_retained_action(&action.r#type)
+            }).ok_or_else(classic_retained_refusal)?;
+            classic_flight::verify_forwarded_retained(key, record, proof, &action.r#type, &action.body)
+                .map_err(|_| classic_retained_refusal())?;
+        } else if action.r#type == "rtdb.owned.OpenFreshRead.v2" {
+            return Err(classic_flight_refusal());
+        }
+        let wire = Bytes::from_owner(inspected);
+        Ok(Full::new(wire).map_err(|never| -> io::Error { match never {} }).boxed_unsync())
     }
 
     fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>, seat: Option<AudienceSeat>) -> std::result::Result<(), Status> {
@@ -631,5 +699,36 @@ fn header_value(value: &str) -> std::result::Result<HeaderValue, Status> {
 
 fn moved() -> Status { Status::unavailable("The Flight SQL placement changed. Establish a new session.") }
 fn classic_flight_refusal() -> Status { Status::failed_precondition("The Classic Original excludes unclassified FreshFlight") }
+fn classic_retained_refusal() -> Status { Status::permission_denied("The request lacks its exact Classic retained read authority") }
+fn invalid_classic_action() -> Status { Status::invalid_argument("Expected one bounded uncompressed Classic Flight action") }
+
+fn classic_action_length(header: &[u8; 5]) -> std::result::Result<usize, Status> {
+    let [compressed, a, b, c, d] = *header;
+    let length = u32::from_be_bytes([a, b, c, d]) as usize;
+    if compressed != 0 || length > MAXIMUM_ACTION_FRAME_BYTES - 5 { return Err(invalid_classic_action()); }
+    Ok(length + 5)
+}
+
+fn decode_classic_action(wire: &Bytes) -> std::result::Result<arrow_flight::Action, Status> {
+    let header = wire.first_chunk::<5>().ok_or_else(invalid_classic_action)?;
+    if classic_action_length(header)? != wire.len() { return Err(invalid_classic_action()); }
+    arrow_flight::Action::decode(wire.slice(5..)).map_err(|_| invalid_classic_action())
+}
+
+#[cfg(test)]
+#[test]
+fn classic_action_inspection_matches_the_receiver_action_type() {
+    let open = arrow_flight::Action { r#type: "rtdb.owned.OpenFreshRead.v2".to_owned(), body: Bytes::from_static(b"body") };
+    let mut frame = vec![0];
+    frame.extend_from_slice(&(open.encoded_len() as u32).to_be_bytes());
+    open.encode(&mut frame).unwrap();
+    assert_eq!(decode_classic_action(&Bytes::copy_from_slice(&frame)).unwrap(), open);
+    frame.push(0);
+    assert!(decode_classic_action(&Bytes::from(frame.clone())).is_err());
+    frame.pop();
+    frame[0] = 1;
+    assert!(decode_classic_action(&Bytes::from(frame)).is_err());
+}
+
 fn directory_error(_: Anomaly) -> Status { Status::unavailable("The Flight SQL directory is unavailable") }
 fn network(error: std::io::Error) -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/flight-gateway", error.to_string()) }

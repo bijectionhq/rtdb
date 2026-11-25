@@ -576,6 +576,8 @@ The ordinary selector requires a joined gateway generation and a joined receiver
 An old installation or one without commissioned coverage can fence and seal the source while ordinary status stays deferred.
 
 The installed gateway and subscriber refuse a Classic fresh route for the commissioned Original before opening a subscriber or forwarding a fresh handshake.
+On a generic holder route to that Original, the gateway inspects one bounded uncompressed DoAction frame before forwarding it.
+It rejects an unclassified fresh open there and verifies any retained read signature and exact body before forwarding.
 The receiver checks the directory for the exact placed attachment at the fresh handshake and the Owned fresh open, including direct and ordinary holder sessions.
 Owned actions on existing ordinary fresh handles and their derived handles repeat that exclusion check.
 The admission order does not settle work or delivery already in flight.
@@ -603,7 +605,7 @@ Delivery evidence includes downstream HTTP/2 and pending socket output, includin
 For a lost generation the transport owner must prove that the exact stopped generation can no longer deliver that output.
 Neither the recovery endpoint nor the directory can derive this evidence from a process lease, a stop request, absent counters, an expired handle, or a catalog drain.
 
-For live retained-only Flight, mount `--classic-retained-flight-key FILE` on the Original's placed holder.
+For live retained-only Flight, mount `--classic-retained-flight-key FILE` on the Original's placed holder and ordinary gateway.
 The file is a JSON array containing the 32-byte Ed25519 verification key of the independent Original read authority.
 The consumer uses an ordinary holder-directed placed handshake with verified credentials and omits the ordinary fresh-routing header.
 Each retained DoAction presents `x-rtdb-classic-retained-proof` as unpadded base64url of the compact grant JSON, a dot, and unpadded base64url of the 64-byte signature.

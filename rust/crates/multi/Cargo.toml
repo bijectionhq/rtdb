@@ -43,6 +43,7 @@ rtdb-tx.workspace = true
 rtdb-types.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
+arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -68,5 +69,4 @@ tracing = "=0.1.44"
 zeroize = "=1.9.1"
 
 [dev-dependencies]
-arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }
 tokio-postgres = "0.7"

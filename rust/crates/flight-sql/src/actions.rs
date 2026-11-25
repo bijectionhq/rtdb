@@ -84,7 +84,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | CLOSE_OWNED_READ_V1)
 }
 
-pub(crate) fn classic_retained_action(action: &str) -> bool {
+pub fn classic_retained_action(action: &str) -> bool {
     use crate::owned_actions::*;
     matches!(action, OPEN_FRESH_OWNED_READ_V2 | CLOSE_OWNED_READ_V1
         | OPEN_OWNED_SCOPED_READ_V2 | OPEN_OWNED_READ_AS_OF_V2 | OPEN_OWNED_READ_AT_PUBLICATION_V1

@@ -43,10 +43,10 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH [--keys PATH] --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH [--keys PATH] --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE] [--classic-retained-flight-key FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--classic-retained-flight-key FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -673,7 +673,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             } else {
                 None
             };
-            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), installed_journals, ..Default::default() };
+            let mut options = gateway::GatewayOptions {
+                capabilities: cell_secret(&arguments)?, tls: tls.clone(), installed_journals,
+                classic_retained_flight_key: arguments.optional("classic-retained-flight-key").map(PathBuf::from),
+                ..Default::default()
+            };
             if let Some(cell) = &installed_cell {
                 if options.capabilities.is_none() {
                     return Err(usage("--installed-cell requires --cell-secret".into()));
