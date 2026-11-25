@@ -19,7 +19,8 @@ pub use mounted::{
 };
 pub use original::{
     AttachedCustodyCarrierJournal, OriginalCarrierObservations, OriginalCarrierReceipt,
-    OriginalReceipt, OriginalWriterPoint, original_writer_commitment,
+    InheritedContributor, InheritedFamily, InheritedFamilyPoint, OriginalReceipt, OriginalWriterPoint,
+    original_writer_commitment, same_original_installation,
 };
 
 pub use rtdb_index::branches::{

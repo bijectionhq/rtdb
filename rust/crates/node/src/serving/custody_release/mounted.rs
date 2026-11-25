@@ -16,6 +16,7 @@ use crate::{
     serving::{QuerySource, QueryView},
 };
 
+mod inherited;
 mod reviewed_landing;
 pub use reviewed_landing::{NativeAuthoring, NativeAuthoringLine, NativeAuthoringRewrite, NativeLandingOrder, NativeLandingReview, NativeLandingWitness, VerifiedNativeLanding};
 

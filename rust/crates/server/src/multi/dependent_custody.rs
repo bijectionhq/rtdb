@@ -16,7 +16,7 @@ mod client;
 mod inherited;
 mod ingress;
 pub(crate) mod operator;
-pub use inherited::{InheritedReadProof, InheritedRegistration, InheritedRelease};
+pub use inherited::{InheritedAdmission, InheritedAdmissionRegistration, InheritedCarrierBinding, InheritedDisposition, InheritedReadProof, InheritedRegistration, InheritedRelease};
 pub(super) use ingress::Ingress;
 
 const VERSION: u32 = 1;
@@ -28,6 +28,9 @@ const METADATA: &str = "/rtdb/native-dependent-custody/v1/metadata";
 const ENROLLMENT_SOURCE: &str = "/rtdb/native-dependent-custody/v1/enrollment/source";
 const INHERITED_READ: &str = "/rtdb/native-dependent-custody/v1/inherited/read";
 const INHERITED_RELEASE: &str = "/rtdb/native-dependent-custody/v1/inherited/release";
+const INHERITED_CARRIER: &str = "/rtdb/native-dependent-custody/v1/inherited/carrier";
+const INHERITED_ADMIT: &str = "/rtdb/native-dependent-custody/v1/inherited/admit";
+const INHERITED_DISPOSE: &str = "/rtdb/native-dependent-custody/v1/inherited/dispose";
 const SETTLE: &str = "/rtdb/native-dependent-custody/v1/settle";
 const STATUS: &str = "/rtdb/native-dependent-custody/v1/status";
 

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}, time::Duration}
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
-use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentOriginal, PinnedExport, Role, WritePipeline};
+use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
     CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
@@ -305,11 +305,24 @@ impl MultiServing {
         read: &NativeDependentRead,
         writer: &CustodyWriterFence,
     ) -> Result<NativeDependentOriginal> {
+        self.require_native_copy_readable(custody).await?;
+        self.database.lock().await.native_dependent_original(custody, read, writer).await
+    }
+
+    pub async fn native_dependent_carrier(
+        &self, custody: &NativeCheckpointCustody, read: &NativeDependentRead,
+        writer: &CustodyWriterFence, binding: [u8; 32],
+    ) -> Result<NativeDependentCarrier> {
+        self.require_native_copy_readable(custody).await?;
+        self.database.lock().await.native_dependent_carrier(custody, read, writer, binding).await
+    }
+
+    async fn require_native_copy_readable(&self, custody: &NativeCheckpointCustody) -> Result<()> {
         let vault = self.tokens.custody_vault();
         for &(group, _) in &custody.groups {
             vault.check_readable(group).await?;
         }
-        self.database.lock().await.native_dependent_original(custody, read, writer).await
+        Ok(())
     }
 
     pub async fn native_checkpoint_forward(&self, reservation: ManagedCheckpointReservation) -> Result<Option<(NativeCheckpointCustody, Option<Basis>)>> {

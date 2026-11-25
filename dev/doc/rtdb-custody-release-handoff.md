@@ -646,7 +646,7 @@ The operation selects one physical winner at the exact native restore and checks
 The Original fold checks the complete reciprocal copy and every copied group's live fence and resolves the selected member's retained applied carrier receipt.
 The reply is `kind: "read"` with `proof` containing `read`, `owner`, `application_scope`, `enrollment`, `authority`, `original_writer`, `source_generation`, `original`, `carrier_receipt`, `carrier_sha256`, `link_sha256` and `envelope_sha256`.
 `original_writer` is the current Original writer's Basis, and `carrier_receipt` contains `key`, `basis` and `system_time`.
-Carrier extraction requires a separately commissioned same-cut opener and positive independent application-family generation and key-reader admission.
+The held carrier action below binds extraction to independent application-family generation and key-reader admission.
 
 `POST /rtdb/native-dependent-custody/v1/inherited/release` takes `{"version":1,"release":RELEASE}`.
 `RELEASE` contains `proof`, `part`, `frame_sha256` and `expires_at`.
@@ -660,9 +660,49 @@ An Original owner or journal generation move requires a fresh proof and correspo
 For actual delivery, the current Original authority must prepare, stage and promote the same registrations, then order the frame using `MountedResponseRelease::admit_registered_response`.
 The existing Flight action `rtdb.custody.v1.Release` takes `operation: "admit"`, `registrations`, `frame_sha256` and Original Flight `read_proofs`.
 Each registration contains `authority`, `group`, `original`, `occurrence`, `carrier_receipt_sha256`, `part` and `expires_at`.
-The inherited proof needs an adapter to the Original admission that exposes the exact destination registration through the independently authenticated Original response and carrier observations.
+Inherited carrier delivery uses the private ordered bridge below with the independently authenticated Original response and carrier observations.
 Use only fresh `admitted` for the one reserved enqueue before cutoff.
 The separate Original disposal caller submits `operation: "dispose"` and the same `registration` after the independent registry confirms the exact positive transport terminal.
+
+#### Held inherited carrier and ordered delivery
+
+Add `transport_client_certificate_sha256` to the same commissioned `inherited` ingress entry for the transport owner that calls `/inherited/admit` and `/inherited/dispose`.
+Use a leaf distinct from the carrier reader, metadata readers and settlement operators.
+The existing `client_certificate_sha256` authenticates the separate carrier reader.
+
+`POST /rtdb/native-dependent-custody/v1/inherited/carrier` takes `{"version":1,"proof":PROOF,"family":FAMILY}`.
+`FAMILY` contains the independent 32-byte application `generation`, its durable `receipt`, the exact independently admitted `reader` receipt and exclusive microsecond `expires_at`.
+Each receipt has `key` and `evidence_sha256`.
+The destination `/observe` authenticates a read-only `inherited_enrollment` with the exact `proof` by recovering the already retained witnessed enrollment.
+It returns `kind: "inherited_enrollment"` and `enrollment` equal to the exact retained receipt, or `kind: "pending"`.
+Ciphertext-only enrolled copies use the existing drain and disposition.
+
+The mounted Original provider's signed `inherited_family` observation takes `point` and `family` and independently recovers the same values.
+The point contains `authority`, `read`, `enrollment`, `original_writer`, `source_generation` and `contributors`.
+Each contributor contains `occurrence`, `placement`, `branch`, `table`, `id`, `valid`, `ordinal`, `receipt`, `carrier_sha256` and `link_sha256`.
+The complete list is sorted by occurrence commitment and includes the selected native occurrence, its linked source ancestry and the Original.
+The Original validates both copies of the selected occurrence, opens its single native envelope and verifies the exact sealed binary carrier and optional link commitments.
+The reply is `kind: "carrier"` with `row: {written,valid,carrier,link}` and `binding: {family,contributors,read_sha256}`.
+`written` is a destination Basis, `valid` has `lower` and `upper` in microseconds, and carrier and link bytes use JSON integer arrays with `null` for an absent link.
+Keep the returned `read_sha256` and binding verbatim.
+
+`POST /rtdb/native-dependent-custody/v1/inherited/admit` takes `{"version":1,"admission":ADMISSION}` from the transport leaf.
+`ADMISSION` contains the existing `release`, the complete returned `binding` and the exact nonzero 32-byte `nonce` from the one-use transport reservation.
+The release fixes the original `proof`, `part`, `frame_sha256` and `expires_at` within the held family's cutoff.
+Before orders, the source independently observes `inherited_admission` with the entire `admission` on the destination.
+The result contains `kind: "inherited_admission"` and `registration: {admission,receipt}` from the exact live durable registration, or `kind: "pending"`.
+The Original registry confirms the same frame, part, cutoff and contributors.
+Its `read_proofs_sha256` is SHA-256 over UTF-8 `rtdb/v1/native-dependent-admission`, a zero byte, `read_sha256` and the nonce, in that order.
+The Original stages and promotes the exact native receipt registrations before ordering the whole part.
+`kind: "admitted"` and `kind: "recorded"` each return `basis` and `registrations`.
+Only fresh `admitted` can consume the reserved nonce and enqueue that frame once before cutoff.
+
+`POST /rtdb/native-dependent-custody/v1/inherited/dispose` takes the same `admission` from the transport leaf.
+The source recovers `kind: "inherited_disposition"` and `disposition: {admission,registration,receipt,disposition_sha256}` from the destination's independent terminal registry.
+`registration` is the exact destination registration receipt, and `receipt` is the positive terminal receipt.
+The Original checks that each exact historical signed carrier observation reports the same `disposition_sha256`, and orders or recovers the matching terminal for every native contributor.
+If the Original writer identity has changed within the same installation, the current signed provider answers `inherited_disposed_carrier` with the current `authority` and historical `registration` and returns the ordinary carrier receipt and terminal shape.
+The source orders under the current writer fence and returns `kind: "disposed"` with the exact destination terminal `receipt` after all Original terminals are confirmed.
 
 Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
 Qualify `managed_catalog_waits_for_confirmation_and_drains_and_recovers_a_lost_unpin_reply` for the private catalog and mounted destination attachment gates.

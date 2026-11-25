@@ -248,6 +248,30 @@ impl Observer {
             _ => Err(refused()),
         }
     }
+
+    async fn observe_inherited(
+        &self,
+        proof: &InheritedReadProof,
+        observation: Observation<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<ObservationResult> {
+        let profile = self.select(proof.read.scope)?;
+        if (!profile.inherited_reads
+            && !matches!(&observation, Observation::InheritedDisposition { .. }))
+            || profile.owner != proof.owner
+            || profile.application_scope != proof.application_scope
+        {
+            return Err(refused());
+        }
+        let request = ObservationRequest {
+            version: VERSION,
+            observation,
+        };
+        cancellation
+            .run_until_cancelled(profile.connection.post(OBSERVE, &request))
+            .await
+            .ok_or_else(pending)?
+    }
 }
 
 #[derive(Serialize)]
@@ -272,6 +296,15 @@ enum Observation<'a> {
     InheritedRegistration {
         release: &'a InheritedRelease,
     },
+    InheritedAdmission {
+        admission: &'a InheritedAdmission,
+    },
+    InheritedDisposition {
+        admission: &'a InheritedAdmission,
+    },
+    InheritedEnrollment {
+        proof: &'a InheritedReadProof,
+    },
 }
 
 #[derive(Deserialize)]
@@ -286,6 +319,15 @@ enum ObservationResult {
     },
     InheritedRegistration {
         registration: InheritedRegistration,
+    },
+    InheritedAdmission {
+        registration: InheritedAdmissionRegistration,
+    },
+    InheritedDisposition {
+        disposition: InheritedDisposition,
+    },
+    InheritedEnrollment {
+        enrollment: rtdb_types::rtdb_v1::DependentCustodyReceipt,
     },
 }
 
@@ -354,23 +396,72 @@ impl NativeDependentCustodyAuthority for Observer {
         release: &InheritedRelease,
         cancellation: &CancellationToken,
     ) -> Result<InheritedRegistration> {
-        let profile = self.select(release.proof.read.scope)?;
-        if !profile.inherited_reads
-            || profile.owner != release.proof.owner
-            || profile.application_scope != release.proof.application_scope
-        {
-            return Err(refused());
-        }
-        let request = ObservationRequest {
-            version: VERSION,
-            observation: Observation::InheritedRegistration { release },
-        };
-        let result = cancellation
-            .run_until_cancelled(profile.connection.post(OBSERVE, &request))
-            .await
-            .ok_or_else(pending)??;
+        let result = self
+            .observe_inherited(
+                &release.proof,
+                Observation::InheritedRegistration { release },
+                cancellation,
+            )
+            .await?;
         match result {
             ObservationResult::InheritedRegistration { registration } => Ok(registration),
+            ObservationResult::Pending => Err(pending()),
+            _ => Err(refused()),
+        }
+    }
+
+    async fn observe_inherited_admission(
+        &self,
+        admission: &InheritedAdmission,
+        cancellation: &CancellationToken,
+    ) -> Result<InheritedAdmissionRegistration> {
+        let result = self
+            .observe_inherited(
+                &admission.release.proof,
+                Observation::InheritedAdmission { admission },
+                cancellation,
+            )
+            .await?;
+        match result {
+            ObservationResult::InheritedAdmission { registration } => Ok(registration),
+            ObservationResult::Pending => Err(pending()),
+            _ => Err(refused()),
+        }
+    }
+
+    async fn observe_inherited_enrollment(
+        &self,
+        proof: &InheritedReadProof,
+        cancellation: &CancellationToken,
+    ) -> Result<rtdb_types::rtdb_v1::DependentCustodyReceipt> {
+        let result = self
+            .observe_inherited(
+                proof,
+                Observation::InheritedEnrollment { proof },
+                cancellation,
+            )
+            .await?;
+        match result {
+            ObservationResult::InheritedEnrollment { enrollment } => Ok(enrollment),
+            ObservationResult::Pending => Err(pending()),
+            _ => Err(refused()),
+        }
+    }
+
+    async fn observe_inherited_disposition(
+        &self,
+        admission: &InheritedAdmission,
+        cancellation: &CancellationToken,
+    ) -> Result<InheritedDisposition> {
+        let result = self
+            .observe_inherited(
+                &admission.release.proof,
+                Observation::InheritedDisposition { admission },
+                cancellation,
+            )
+            .await?;
+        match result {
+            ObservationResult::InheritedDisposition { disposition } => Ok(disposition),
             ObservationResult::Pending => Err(pending()),
             _ => Err(refused()),
         }

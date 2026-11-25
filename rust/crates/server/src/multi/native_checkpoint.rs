@@ -54,6 +54,24 @@ pub trait NativeDependentCustodyAuthority: Send + Sync {
     ) -> Result<super::InheritedRegistration> {
         Err(dependent_required())
     }
+
+    async fn observe_inherited_admission(
+        &self, _admission: &super::InheritedAdmission, _cancellation: &CancellationToken,
+    ) -> Result<super::InheritedAdmissionRegistration> {
+        Err(dependent_required())
+    }
+
+    async fn observe_inherited_enrollment(
+        &self, _proof: &super::InheritedReadProof, _cancellation: &CancellationToken,
+    ) -> Result<rtdb_types::rtdb_v1::DependentCustodyReceipt> {
+        Err(dependent_required())
+    }
+
+    async fn observe_inherited_disposition(
+        &self, _admission: &super::InheritedAdmission, _cancellation: &CancellationToken,
+    ) -> Result<super::InheritedDisposition> {
+        Err(dependent_required())
+    }
 }
 
 impl MultiRuntime {

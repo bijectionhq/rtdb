@@ -19,7 +19,10 @@ use uuid::Uuid;
 
 use super::{
     client::{json_content_type, read_chain, read_key, read_roots},
-    inherited::{InheritedProfile, InheritedReadRequest, InheritedReleaseRequest},
+    inherited::{
+        InheritedAdmissionRequest, InheritedCarrierRequest, InheritedProfile, InheritedReadRequest,
+        InheritedReleaseRequest,
+    },
     *,
 };
 use crate::multi::{DatabaseOpen, open_database, retryable};
@@ -115,6 +118,7 @@ impl Ingress {
             }
         }
         let mut inherited = BTreeSet::new();
+        let mut transport = BTreeSet::new();
         for reader in &profile.inherited {
             let certificate = reader.client_certificate_sha256;
             if !valid_binding(
@@ -132,6 +136,22 @@ impl Ingress {
             {
                 return Err(invalid());
             }
+            if let Some(certificate) = reader.transport_client_certificate_sha256
+                && (certificate == [0; 32]
+                    || operators
+                        .iter()
+                        .chain(&metadata)
+                        .any(|(cert, _)| *cert == certificate)
+                    || !transport.insert((certificate, reader.destination_incarnation)))
+            {
+                return Err(invalid());
+            }
+        }
+        if inherited
+            .iter()
+            .any(|(reader, _)| transport.iter().any(|(sender, _)| reader == sender))
+        {
+            return Err(invalid());
         }
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -225,10 +245,10 @@ impl Ingress {
                 .metadata
                 .iter()
                 .any(|reader| reader.client_certificate_sha256 == certificate)
-            && !self
-                .inherited
-                .iter()
-                .any(|reader| reader.client_certificate_sha256 == certificate)
+            && !self.inherited.iter().any(|reader| {
+                reader.client_certificate_sha256 == certificate
+                    || reader.transport_client_certificate_sha256 == Some(certificate)
+            })
         {
             return;
         }
@@ -280,10 +300,11 @@ impl Ingress {
                 .operators
                 .iter()
                 .any(|operator| operator.client_certificate_sha256 == certificate),
-            ENROLLMENT_SOURCE | INHERITED_READ | INHERITED_RELEASE => self
+            ENROLLMENT_SOURCE | INHERITED_READ | INHERITED_RELEASE | INHERITED_CARRIER
+            | INHERITED_ADMIT | INHERITED_DISPOSE => self
                 .inherited
                 .iter()
-                .any(|reader| reader.client_certificate_sha256 == certificate),
+                .any(|reader| reader.authorizes(path, certificate)),
             _ => return empty(StatusCode::NOT_FOUND),
         };
         if !role {
@@ -342,7 +363,7 @@ impl Ingress {
             self.inherited
                 .iter()
                 .find(|profile| {
-                    profile.client_certificate_sha256 == certificate
+                    profile.authorizes(path, certificate)
                         && matches_scope(
                             profile.source_incarnation,
                             profile.destination_incarnation,
@@ -372,6 +393,25 @@ impl Ingress {
                 profile(request.version, request.release.proof.read.scope)?
                     .release(runtime, node, request.release, stop)
                     .await?
+            }
+            INHERITED_CARRIER => {
+                let request = serde_json::from_slice::<InheritedCarrierRequest>(body)
+                    .map_err(|_| refused())?;
+                profile(request.version, request.proof.read.scope)?
+                    .carrier(runtime, node, request.proof, request.family, stop)
+                    .await?
+            }
+            INHERITED_ADMIT | INHERITED_DISPOSE => {
+                let request = serde_json::from_slice::<InheritedAdmissionRequest>(body)
+                    .map_err(|_| refused())?;
+                let owner = profile(request.version, request.admission.release.proof.read.scope)?;
+                if path == INHERITED_ADMIT {
+                    owner.admit(runtime, node, request.admission, stop).await?
+                } else {
+                    owner
+                        .dispose(runtime, node, request.admission, stop)
+                        .await?
+                }
             }
             _ => return Err(refused()),
         };

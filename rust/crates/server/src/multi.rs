@@ -48,7 +48,7 @@ pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
 mod native_checkpoint;
 pub use native_checkpoint::NativeDependentCustodyAuthority;
-pub use dependent_custody::{InheritedReadProof, InheritedRegistration, InheritedRelease};
+pub use dependent_custody::{InheritedAdmission, InheritedAdmissionRegistration, InheritedCarrierBinding, InheritedDisposition, InheritedReadProof, InheritedRegistration, InheritedRelease};
 mod peer;
 use catalog::{Status, TransferExport};
 

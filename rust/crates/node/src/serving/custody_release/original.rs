@@ -1,4 +1,7 @@
-use rtdb_types::{EntityId, TableRef, Timestamp};
+use rtdb_types::{
+    EntityId, Interval, TableRef, Timestamp,
+    rtdb_v1::{DependentCustodyReceipt, NativeDependentRead, NativeDependentSourceGeneration},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,6 +41,69 @@ pub struct OriginalCarrierReceipt {
     pub observation: CarrierObservation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InheritedFamily {
+    pub generation: [u8; 32],
+    pub receipt: DependentCustodyReceipt,
+    pub reader: DependentCustodyReceipt,
+    pub expires_at: Timestamp,
+}
+
+impl InheritedFamily {
+    pub fn require_live(&self, now: Timestamp) -> Result<()> {
+        if [
+            self.generation,
+            self.receipt.key,
+            self.receipt.evidence_sha256,
+            self.reader.key,
+            self.reader.evidence_sha256,
+        ]
+        .contains(&[0; 32])
+            || !(1..=120_000_000).contains(&self.expires_at.0.saturating_sub(now.0))
+        {
+            return Err(release_unavailable());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InheritedContributor {
+    pub occurrence: [u8; 32],
+    pub placement: [u8; 16],
+    pub branch: String,
+    pub table: TableRef,
+    pub id: EntityId,
+    pub valid: Interval,
+    pub ordinal: u64,
+    pub receipt: OriginalReceipt,
+    pub carrier_sha256: [u8; 32],
+    pub link_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InheritedFamilyPoint {
+    pub authority: CustodyCarrierAuthority,
+    pub read: NativeDependentRead,
+    pub enrollment: DependentCustodyReceipt,
+    pub original_writer: Basis,
+    pub source_generation: NativeDependentSourceGeneration,
+    pub contributors: Vec<InheritedContributor>,
+}
+
+pub fn same_original_installation(
+    current: CustodyCarrierAuthority,
+    historical: CustodyCarrierAuthority,
+) -> bool {
+    CustodyCarrierAuthority {
+        original_writer: current.original_writer,
+        ..historical
+    } == current
+}
+
 /// The installed original provider reads its independent frontier and exact output registry.
 #[async_trait]
 pub trait OriginalCarrierObservations: Send + Sync {
@@ -59,6 +125,27 @@ pub trait OriginalCarrierObservations: Send + Sync {
         registration: CustodyReleaseRegistration,
         cancellation: &CancellationToken,
     ) -> Result<OriginalCarrierReceipt>;
+
+    async fn inherited_family(
+        &self,
+        _point: &InheritedFamilyPoint,
+        _family: &InheritedFamily,
+        _cancellation: &CancellationToken,
+    ) -> Result<(InheritedFamilyPoint, InheritedFamily)> {
+        Err(release_unavailable())
+    }
+
+    async fn inherited_disposed_carrier(
+        &self,
+        authority: CustodyCarrierAuthority,
+        registration: CustodyReleaseRegistration,
+        cancellation: &CancellationToken,
+    ) -> Result<OriginalCarrierReceipt> {
+        if registration.authority != authority {
+            return Err(release_unavailable());
+        }
+        self.registered_carrier(registration, cancellation).await
+    }
 }
 
 pub struct AttachedCustodyCarrierJournal<'a> {
@@ -116,6 +203,31 @@ impl<'a> AttachedCustodyCarrierJournal<'a> {
         }
         Ok(())
     }
+
+    pub(super) async fn confirm_carrier_observation(
+        &self,
+        registration: CustodyReleaseRegistration,
+        observed: OriginalCarrierReceipt,
+        cancellation: &CancellationToken,
+    ) -> Result<CarrierObservation> {
+        if observed.registration != registration
+            || observed.receipt.commitment() != registration.carrier_receipt_sha256
+        {
+            return Err(release_unavailable());
+        }
+        let receipt = self
+            .attachment
+            .original_custody_receipt(&observed.receipt.key, observed.receipt.basis, cancellation)
+            .await?;
+        self.confirm_receipt(&observed.receipt, &receipt)?;
+        let index = self.attachment.current_custody(cancellation).await?;
+        index.check_custody_carrier_receipt(
+            registration,
+            observed.receipt.basis,
+            &observed.receipt.key,
+        )?;
+        Ok(observed.observation)
+    }
 }
 
 pub fn original_writer_commitment(installation: [u8; 16], request_key: &[u8]) -> [u8; 32] {
@@ -170,17 +282,7 @@ impl CustodyCarrierJournal for AttachedCustodyCarrierJournal<'_> {
             .original
             .registered_carrier(registration, cancellation)
             .await?;
-        if observed.registration != registration
-            || observed.receipt.commitment() != registration.carrier_receipt_sha256
-        {
-            return Err(release_unavailable());
-        }
-        let receipt = self.attachment.original_custody_receipt(
-            &observed.receipt.key, observed.receipt.basis, cancellation,
-        ).await?;
-        self.confirm_receipt(&observed.receipt, &receipt)?;
-        let index = self.attachment.current_custody(cancellation).await?;
-        index.check_custody_carrier_receipt(registration, observed.receipt.basis, &observed.receipt.key)?;
-        Ok(observed.observation)
+        self.confirm_carrier_observation(registration, observed, cancellation)
+            .await
     }
 }

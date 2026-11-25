@@ -391,7 +391,7 @@ async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
 
 #[tokio::test]
 async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain() {
-    use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, CustodyWriterFence};
+    use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, CustodyWriterFence, DerivedCustodyReservation};
     use rtdb_types::rtdb_v1::{
         DependentApplicationKey, DependentCustodyReceipt, DependentKeyCustody, DependentKeyDisposition,
         DependentKeyTerminal, NativeCustodyFence, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
@@ -422,12 +422,38 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
                 custody_payload: Some(CustodyPayload { binding, envelope: envelope.clone() }),
             },
             placement: CustodyPlacement {
-                placement_id: group, reservation: None, carrier_column: "carrier".into(), link_column: None,
+                placement_id: group, reservation: None, derived: None, carrier_column: "carrier".into(), link_column: None,
                 commitments: Some(CustodyPlacementCommitments { carrier_sha256: Sha256::digest(carrier).into(), link_sha256: None }),
             },
         };
         let mut write = request(n, Op::CreateCustodyGroup { group });
         write.ops.push(occurrence);
+        if n == 1 {
+            let carrier = vec![3; 12];
+            let link = vec![4; 12];
+            let carrier_sha256 = Sha256::digest(&carrier).into();
+            let link_sha256 = Sha256::digest(&link).into();
+            let clear = serde_json::to_vec(&StructFields::from([
+                ("carrier".into(), Value::Binary(carrier)), ("link".into(), Value::Binary(link)),
+            ])).unwrap();
+            let binding = [3; 32];
+            let payload = vault.seal(group, binding, &clear).await.unwrap();
+            write.ops.push(Op::PlaceCustodyRow {
+                branch: MAIN_BRANCH.into(), table: table(),
+                row: Row {
+                    id: EntityId::Integer(3), valid: None, cells: StructFields::new(),
+                    custody_group: Some(group), protected_columns: vec!["carrier".into(), "link".into()],
+                    custody_payload: Some(CustodyPayload { binding, envelope: payload }),
+                },
+                placement: CustodyPlacement {
+                    placement_id: [3; 16], reservation: None, carrier_column: "carrier".into(), link_column: Some("link".into()),
+                    commitments: Some(CustodyPlacementCommitments { carrier_sha256, link_sha256: Some(link_sha256) }),
+                    derived: Some(DerivedCustodyReservation {
+                        original_placement_id: group, link: [4; 16], review_sha256: [5; 32], carrier_sha256, link_sha256,
+                    }),
+                },
+            });
+        }
         write.ops.push(Op::Put {
             branch: MAIN_BRANCH.into(), table: registry.clone(), if_absent: true,
             rows: vec![Row {
@@ -486,7 +512,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     };
     let metadata = view.native_dependent_checkpoint_metadata(scope, &registry, "body", 1024).unwrap();
     assert_eq!(metadata.scope, scope);
-    assert_eq!(metadata.members.len(), 1);
+    assert_eq!(metadata.members.len(), 2);
     assert_eq!(metadata.members[0].source_basis, original.basis);
     assert_eq!(metadata.members[0].enrolled, original.basis);
     assert_eq!(metadata.members[0].target, EntityId::Integer(1));
@@ -514,7 +540,13 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
         occurrence,
         application_key: [14; 32],
     };
-    assert_eq!(view.check_native_dependent_destination(&read, original.system_time).unwrap(), &claim);
+    let (copy, binding) = view.native_dependent_destination(&read, original.system_time).unwrap();
+    assert_eq!(copy, &claim);
+    let derived = NativeDependentRead {
+        placement: [3; 16], occurrence: metadata.members[1].native.occurrence.unwrap(),
+        id: EntityId::Integer(3), ..read.clone()
+    };
+    let (_, derived_binding) = view.native_dependent_destination(&derived, original.system_time).unwrap();
     let mut substituted = read.clone();
     substituted.placement = *other_group;
     assert!(view.check_native_dependent_destination(&substituted, original.system_time).is_err());
@@ -536,19 +568,24 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
             reservation, destination: installed, source_enrolled_at: claim.enrolled_at, group, checkpoint_group_sha256,
         };
         let roster = source.fresh_index().await.unwrap().native_dependent_custody_roster(scope).unwrap();
-        assert_eq!(roster.len(), 1);
+        assert_eq!(roster.len(), if group == *other_group { 1 } else { 2 });
         let mut enrollment = NativeDependentCustodyEnrollment {
             scope, owner: [11; 32], application_scope: [12; 32],
             receipt: DependentCustodyReceipt { key: checkpoint_group_sha256, evidence_sha256: [13; 32] },
             members: Vec::new(),
         };
         assert!(source.record_native_dependent_custody(NativeDependentCustodyOrder::Enroll(enrollment.clone())).await.is_err());
-        enrollment.members.push(NativeDependentCustodyMember {
-            native: roster[0],
-            application_keys: vec![DependentApplicationKey {
-                key: [14; 32], custody: DependentKeyCustody::OriginalReference, carriers: vec![roster[0].carrier_sha256],
-            }],
-        });
+        enrollment.members = roster.into_iter().map(|native| {
+            let mut carriers = vec![native.carrier_sha256];
+            carriers.extend(native.link_sha256);
+            carriers.sort_unstable();
+            NativeDependentCustodyMember {
+                native,
+                application_keys: vec![DependentApplicationKey {
+                    key: [14; 32], custody: DependentKeyCustody::OriginalReference, carriers,
+                }],
+            }
+        }).collect();
         let generation = source.native_dependent_source_generation(scope).await.unwrap();
         let mut stale_generation = generation;
         stale_generation.writer_epoch += 1;
@@ -569,6 +606,18 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let checked = source.native_dependent_original(&claim, &read, &writer).await.unwrap();
     assert_eq!(checked.receipt.key, original.key);
     assert_eq!(checked.source_generation, witness);
+    let evidence = source.native_dependent_carrier(&claim, &read, &writer, binding).await.unwrap();
+    assert_eq!(evidence.payload.envelope, *envelope);
+    let [(contributor, receipt)] = evidence.contributors.as_slice() else { panic!("one original contributor"); };
+    assert_eq!(contributor.placement_id, *group);
+    assert_eq!(contributor.commitment(*group), occurrence);
+    assert_eq!(receipt.basis, original.basis);
+    assert!(source.native_dependent_carrier(&claim, &read, &writer, [0; 32]).await.is_err());
+    let linked = source.native_dependent_carrier(&claim, &derived, &writer, derived_binding).await.unwrap();
+    let mut expected = vec![read.occurrence, derived.occurrence];
+    expected.sort_unstable();
+    assert_eq!(linked.contributors.iter().map(|(member, _)| member.commitment(*group)).collect::<Vec<_>>(), expected);
+    assert!(linked.contributors.iter().all(|(_, receipt)| receipt.basis == original.basis));
     let mut wrong_reader = read.clone();
     wrong_reader.application_key = [20; 32];
     assert!(source.native_dependent_original(&claim, &wrong_reader, &writer).await.is_err());
@@ -590,6 +639,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     assert_eq!(revoked.outcome, Outcome::Then);
     assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/erased-under-view");
     assert!(source.native_dependent_original(&claim, &read, &writer).await.is_err());
+    assert!(source.native_dependent_carrier(&claim, &read, &writer, binding).await.is_err());
     assert!(!source.fresh_index().await.unwrap().custody_releases_drained(*other_group));
 
     let enrollment = enrollments.iter().find(|enrollment| enrollment.scope.group == *other_group).unwrap();

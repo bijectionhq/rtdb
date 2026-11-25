@@ -17,6 +17,12 @@ pub(super) struct Dependent {
 
 impl BranchIndex {
     pub fn check_native_dependent_destination(&self, read: &NativeDependentRead, now: Timestamp) -> Result<&NativeCheckpointCustody> {
+        self.native_dependent_destination(read, now).map(|(custody, _)| custody)
+    }
+
+    pub fn native_dependent_destination(
+        &self, read: &NativeDependentRead, now: Timestamp,
+    ) -> Result<(&NativeCheckpointCustody, [u8; 32])> {
         let scope = read.scope;
         let custody = self.inherited_custody().ok_or_else(dependent_conflict)?;
         if custody.reservation != scope.reservation
@@ -27,8 +33,8 @@ impl BranchIndex {
         {
             return Err(dependent_conflict());
         }
-        self.native_dependent_point(read, scope.destination, now)?;
-        Ok(custody)
+        let (_, payload) = self.native_dependent_point(read, scope.destination, now)?;
+        Ok((custody, payload.binding))
     }
 
     pub fn native_dependent_original(
@@ -43,7 +49,7 @@ impl BranchIndex {
             return Err(dependent_conflict());
         };
         let pinned = scope.reservation.source.basis;
-        let selected = self.native_dependent_point(read, pinned, now)?;
+        let (selected, _) = self.native_dependent_point(read, pinned, now)?;
         let (original, occurrence) = self.custody_read_occurrence(pinned, scope.group, read.occurrence)?;
         let member = NativeCheckpointMember {
             placement: occurrence.placement_id,
@@ -67,7 +73,53 @@ impl BranchIndex {
         Ok((enrollment, original, occurrence))
     }
 
-    fn native_dependent_point(&self, read: &NativeDependentRead, pinned: Basis, now: Timestamp) -> Result<&CustodyOccurrence> {
+    pub fn native_dependent_contributors(&self, read: &NativeDependentRead) -> Result<BTreeMap<[u8; 32], &CustodyOccurrence>> {
+        let scope = read.scope;
+        let cut = scope.reservation.source.basis;
+        let group = self.live_custody(scope.group)?;
+        let Some((enrollment, None)) = self.native_dependent_custody(scope)? else {
+            return Err(dependent_conflict());
+        };
+        let mut contributors = BTreeMap::new();
+        let mut selected = read.occurrence;
+        let mut address_bytes = 64_usize * 1024;
+        loop {
+            let (original, occurrence) = self.custody_read_occurrence(cut, scope.group, selected)?;
+            let target = &occurrence.target;
+            let id_bytes = match &target.id {
+                EntityId::String(id) => id.len(),
+                EntityId::Keyword(id) => id.as_str().len(),
+                EntityId::Binary(id) => id.len(),
+                EntityId::Integer(_) | EntityId::Uuid(_) => 16,
+            };
+            address_bytes = address_bytes
+                .checked_sub(id_bytes + target.branch.len() + target.table.schema.len() + target.table.table.len())
+                .ok_or_else(dependent_conflict)?;
+            if contributors.len() == 32 || contributors.insert(selected, occurrence).is_some()
+                || !enrollment.members.iter().any(|member| {
+                    member.native.placement == occurrence.placement_id
+                        && member.native.occurrence == Some(selected)
+                })
+            {
+                return Err(dependent_conflict());
+            }
+            if selected == original {
+                if occurrence.reservation.is_some() { return Err(dependent_conflict()); }
+                return Ok(contributors);
+            }
+            let reservation = group.reservations.get(&occurrence.placement_id).ok_or_else(dependent_conflict)?;
+            if reservation.reservation.original != original || reservation.at > occurrence.written
+                || Some(reservation.commitment(cut.incarnation(), scope.group)) != occurrence.reservation
+            {
+                return Err(dependent_conflict());
+            }
+            selected = reservation.reservation.source;
+        }
+    }
+
+    fn native_dependent_point(
+        &self, read: &NativeDependentRead, pinned: Basis, now: Timestamp,
+    ) -> Result<(&CustodyOccurrence, &CustodyPayload)> {
         if read.branch_created.incarnation() != read.scope.destination.incarnation() {
             return Err(dependent_conflict());
         }
@@ -94,7 +146,7 @@ impl BranchIndex {
         {
             return Err(dependent_conflict());
         }
-        Ok(occurrence)
+        Ok((occurrence, envelope))
     }
 
     pub fn native_dependent_custody_roster(

@@ -18,6 +18,10 @@
 -- A separately authenticated source observation can bind the pinned source cut, current writer epoch and current journal generation into the destination enrollment receipt.
 -- A private inherited point proof binds the exact destination restore and generation, physical branch creation, placement, selected application key and Original receipt.
 -- Its release check observes the independently retained destination part and freshly verifies both attachments and the current Original writer fence.
+-- A held carrier action reopens the exact copied event under the Original vault after observing the witnessed destination enrollment and independent application-family reader.
+-- The opened projection holds the sealed carrier and link with all native contributor receipts from that point.
+-- A separate transport credential admits the exact reserved part and nonce against the independent destination registration and the current Original writer.
+-- Positive destination and Original terminal evidence disposes the same ordered registrations after revocation.
 
 external entity ConsumerClient {
     -- A caller with credentials for the selected database.

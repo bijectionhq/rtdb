@@ -2,7 +2,7 @@ use std::{ops::AsyncFnOnce, sync::Arc};
 
 use rtdb_crypt::{Kms, Plaintext, tokens::ExportTicket};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
-use rtdb_index::branches::{BranchCut, BranchIndex};
+use rtdb_index::branches::{BranchCut, BranchIndex, CustodyOccurrence, CustodyPayload};
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
 use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, Transact, TransactState};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, DependentCustodyReceipt, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, NativeDependentCustodyScope, NativeDependentRead, NativeDependentSourceGeneration, PinnedCheckpointIdentity}};
@@ -40,6 +40,12 @@ pub struct NativeDependentOriginal {
     pub link_sha256: Option<[u8; 32]>,
     pub envelope_sha256: [u8; 32],
     pub receipt: Receipt,
+}
+
+pub struct NativeDependentCarrier {
+    pub original: NativeDependentOriginal,
+    pub contributors: Vec<(CustodyOccurrence, Receipt)>,
+    pub payload: CustodyPayload,
 }
 
 impl NativeCheckpointInstallation {
@@ -517,6 +523,24 @@ impl MultiDatabase {
             envelope_sha256: occurrence.envelope_sha256,
             receipt,
         })
+    }
+
+    pub async fn native_dependent_carrier(
+        &mut self, custody: &NativeCheckpointCustody, read: &NativeDependentRead,
+        writer: &CustodyWriterFence, binding: [u8; 32],
+    ) -> Result<NativeDependentCarrier> {
+        let original = self.native_dependent_original(custody, read, writer).await?;
+        let transactions = self.durable_transactions();
+        let index = transactions.index();
+        let payload = index.custody_occurrence_payload(read.scope.reservation.source.basis, read.scope.group, read.occurrence)?;
+        if payload.binding != binding || payload.envelope.len() > 768 * 1024 {
+            return Err(native_terminal_required());
+        }
+        let contributors = index.native_dependent_contributors(read)?.into_values().map(|occurrence| {
+            let receipt = transactions.original_custody_receipt(&occurrence.receipt_key, occurrence.written)?;
+            Ok((occurrence.clone(), receipt))
+        }).collect::<Result<_>>()?;
+        Ok(NativeDependentCarrier { original, contributors, payload: payload.clone() })
     }
 
     pub async fn native_dependent_source_generation(

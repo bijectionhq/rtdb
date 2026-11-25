@@ -4037,6 +4037,16 @@ surface ScopedRowVisibility {
         -- The release proof rechecks the Original writer, journal epoch and key generation and the destination generation after observing the registered part.
         -- A transport enqueues protected data only under fresh ordered Original admission and retains the part through its positive disposition.
 
+    @guarantee NativeInheritedCarrierDelivery
+        -- The destination independently recovers its witnessed enrollment before carrier extraction.
+        -- The Original family authority confirms the current application generation, exact reader admission and complete linked occurrence receipts for the held point.
+        -- The exact destination event and its pinned Original event share one protected envelope identity.
+        -- The Original opens that envelope and releases the enrolled sealed carrier and link under the held reader.
+        -- The returned inventory includes the selected occurrence and its complete retained native source ancestry through the Original.
+        -- A dedicated transport owner reserves one part and nonce and durably registers the exact serialized frame and the held read commitment before admission.
+        -- The Original orders that frame against all promoted contributors under the current writer, and each contributor remains held through verified disposition.
+        -- A successor Original writer can dispose the exact historical registration under the same installation and positive terminal evidence from both custody authorities.
+
     @guarantee ScopedWrites
         -- The transaction resolver enforces the write scope and any SingleLabelPerTx declaration in both modes.
         -- dev/doc/tx.allium defines label checks, claim validation and guard outcomes.

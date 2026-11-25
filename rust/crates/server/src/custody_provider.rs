@@ -6,8 +6,9 @@ use rtdb_flight_sql::OriginalFamilyReadbackLayout;
 use rtdb_format::config::{Yaml, YamlFields};
 use rtdb_node::serving::custody_release::{
     CarrierObservation, CustodyCarrierAuthority, CustodyProviderInstallation,
-    CustodyReleaseRegistration, CustodyResponsePart, OriginalCarrierObservations,
-    OriginalCarrierReceipt, OriginalReceipt, OriginalWriterPoint, RegisteredCustodyResponse,
+    CustodyReleaseRegistration, CustodyResponsePart, InheritedFamily, InheritedFamilyPoint,
+    OriginalCarrierObservations, OriginalCarrierReceipt, OriginalReceipt, OriginalWriterPoint,
+    RegisteredCustodyResponse, same_original_installation,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Result, TableRef, Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -221,6 +222,14 @@ enum Observation {
         authority: CustodyCarrierAuthority,
         part: CustodyResponsePart,
     },
+    InheritedFamily {
+        point: InheritedFamilyPoint,
+        family: InheritedFamily,
+    },
+    InheritedDisposedCarrier {
+        authority: CustodyCarrierAuthority,
+        registration: CustodyReleaseRegistration,
+    },
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,6 +275,33 @@ struct Carrier {
     receipt: Receipt,
     state: CarrierState,
     evidence_sha256: Option<[u8; 32]>,
+}
+
+impl Carrier {
+    fn open(self, registration: CustodyReleaseRegistration) -> Result<OriginalCarrierReceipt> {
+        if self.registration != registration {
+            return Err(unavailable());
+        }
+        let observation = match (self.state, self.evidence_sha256) {
+            (CarrierState::Live, None) => CarrierObservation::Live,
+            (CarrierState::Disposed, Some(evidence_sha256)) if evidence_sha256 != [0; 32] => {
+                CarrierObservation::Disposed { evidence_sha256 }
+            }
+            _ => return Err(unavailable()),
+        };
+        Ok(OriginalCarrierReceipt {
+            registration,
+            receipt: self.receipt.open()?,
+            observation,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InheritedFamilyReply {
+    point: InheritedFamilyPoint,
+    family: InheritedFamily,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -409,21 +445,54 @@ impl OriginalCarrierObservations for Provider {
         let observed: Carrier = self
             .observe(Observation::Carrier { registration }, cancellation)
             .await?;
-        if observed.registration != registration {
+        observed.open(registration)
+    }
+
+    async fn inherited_family(
+        &self,
+        point: &InheritedFamilyPoint,
+        family: &InheritedFamily,
+        cancellation: &CancellationToken,
+    ) -> Result<(InheritedFamilyPoint, InheritedFamily)> {
+        if point.authority != self.authority {
             return Err(unavailable());
         }
-        let observation = match (observed.state, observed.evidence_sha256) {
-            (CarrierState::Live, None) => CarrierObservation::Live,
-            (CarrierState::Disposed, Some(evidence_sha256)) if evidence_sha256 != [0; 32] => {
-                CarrierObservation::Disposed { evidence_sha256 }
-            }
-            _ => return Err(unavailable()),
-        };
-        Ok(OriginalCarrierReceipt {
-            registration,
-            receipt: observed.receipt.open()?,
-            observation,
-        })
+        let observed: InheritedFamilyReply = self
+            .observe(
+                Observation::InheritedFamily {
+                    point: point.clone(),
+                    family: family.clone(),
+                },
+                cancellation,
+            )
+            .await?;
+        Ok((observed.point, observed.family))
+    }
+
+    async fn inherited_disposed_carrier(
+        &self,
+        authority: CustodyCarrierAuthority,
+        registration: CustodyReleaseRegistration,
+        cancellation: &CancellationToken,
+    ) -> Result<OriginalCarrierReceipt> {
+        if authority != self.authority
+            || !same_original_installation(authority, registration.authority)
+        {
+            return Err(unavailable());
+        }
+        if registration.authority == authority {
+            return self.registered_carrier(registration, cancellation).await;
+        }
+        let observed: Carrier = self
+            .observe(
+                Observation::InheritedDisposedCarrier {
+                    authority,
+                    registration,
+                },
+                cancellation,
+            )
+            .await?;
+        observed.open(registration)
     }
     async fn registered_response(
         &self,
