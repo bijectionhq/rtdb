@@ -4,7 +4,8 @@ use rtdb_directory::{CheckpointTransferTerminal, DeploymentRecord, Directory, Li
 use rtdb_server::multi::{
     ClassicCandidate,
     classic_ingress::{
-        Authorization, Binding, MAX_CHECKPOINT_BYTES, Operation as CandidateOperation, Response,
+        Authorization, Binding, HeldReady, MAX_CHECKPOINT_BYTES, Operation as CandidateOperation,
+        Response,
     },
 };
 
@@ -115,6 +116,10 @@ pub(super) enum Operation {
         classic_cut: Option<TransactionKey>,
         authorization: Option<Authorization>,
     },
+    HeldReady {
+        authorization: Authorization,
+        record: bool,
+    },
     OriginalReceipt {
         id: EntityId,
         coverage: Option<CoveragePoint>,
@@ -151,6 +156,8 @@ pub(super) struct Evidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     original_receipt_coverage: Option<ReceiptHistory>,
     mapped_cut: Option<(TransactionKey, rtdb_types::rtdb_v1::Basis)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held_ready: Option<Box<HeldReady>>,
 }
 
 impl RecoveryService {
@@ -216,6 +223,7 @@ impl RecoveryService {
             original_receipt: None,
             original_receipt_coverage: None,
             mapped_cut: None,
+            held_ready: None,
         };
         if let Operation::OriginalReceipt { id, coverage } = operation {
             let table = evidence
@@ -257,7 +265,7 @@ impl RecoveryService {
             Operation::Stage {
                 authorization: Some(authorization),
             } => {
-                relay.verify(&authorization, CandidateOperation::Stage)?;
+                relay.verify(&authorization, &CandidateOperation::Stage)?;
                 (
                     authorization.grant.binding.begin_sha256,
                     Some(authorization),
@@ -267,7 +275,7 @@ impl RecoveryService {
                 projection_sha256,
                 authorization: Some(authorization),
             } if projection_sha256 == authorization.grant.binding.projection_sha256 => {
-                relay.verify(&authorization, CandidateOperation::Install)?;
+                relay.verify(&authorization, &CandidateOperation::Install)?;
                 (
                     authorization.grant.binding.begin_sha256,
                     Some(authorization),
@@ -277,12 +285,50 @@ impl RecoveryService {
                 classic_cut,
                 authorization: Some(authorization),
             } => {
-                relay.verify(&authorization, CandidateOperation::Status { classic_cut })?;
+                relay.verify(&authorization, &CandidateOperation::Status { classic_cut })?;
                 if !evidence.matches_binding(&authorization.grant.binding) {
                     return Err(conflict());
                 }
                 evidence.candidate_binding = Some(authorization.grant.binding.clone());
                 evidence.observe_candidate(relay.forward(authorization, &[]).await?)?;
+                return Ok(Reply::ClassicMigrationDestination { evidence });
+            }
+            Operation::HeldReady {
+                authorization,
+                record,
+            } => {
+                let ready = match (&authorization.grant.operation, record) {
+                    (CandidateOperation::HoldReady { ready }, true)
+                    | (CandidateOperation::HeldReadyStatus { ready }, false) => ready.clone(),
+                    _ => return Ok(Reply::Refused),
+                };
+                if !evidence.matches_binding(&authorization.grant.binding) {
+                    return Err(conflict());
+                }
+                let binding = authorization.grant.binding.clone();
+                evidence.observe_candidate(relay.forward(authorization, &[]).await?)?;
+                if evidence.mapped_cut != Some((ready.classic_cut, ready.native_basis))
+                    || !evidence.candidate.as_ref().is_some_and(|candidate| {
+                        candidate.reserved_at == ready.reserved_at
+                            && candidate.installation.as_ref() == Some(&ready.installation)
+                    })
+                {
+                    return Err(conflict());
+                }
+                match &evidence.held_ready {
+                    Some(held)
+                        if &held.ready == ready.as_ref()
+                            && held.binding_sha256 == binding.identity()?
+                            && held.recorded_at.incarnation()
+                                == ready.reserved_at.incarnation()
+                            && held.recorded_at > ready.reserved_at =>
+                    {
+                        ()
+                    }
+                    None if !record => (),
+                    _ => return Err(conflict()),
+                }
+                evidence.candidate_binding = Some(binding);
                 return Ok(Reply::ClassicMigrationDestination { evidence });
             }
             _ => return Ok(Reply::Refused),
@@ -377,6 +423,7 @@ impl Evidence {
         let Response::Observed {
             candidate,
             mapped_cut,
+            held_ready,
             ..
         } = response
         else {
@@ -384,6 +431,7 @@ impl Evidence {
         };
         self.candidate = candidate;
         self.mapped_cut = mapped_cut;
+        self.held_ready = held_ready;
         Ok(())
     }
 }

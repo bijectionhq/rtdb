@@ -484,7 +484,7 @@ Grant expiry or an unavailable reply leaves the install outcome unresolved.
 The native proof reports the candidate's catalog reservation basis and the restore record's LSN, writer epoch, key generation, manifest address, ciphertext digest, and checkpoint state digest.
 The source and destination terminal times must agree.
 A native terminal establishes private installation only.
-The ordered catalog leaves the candidate closed to serving, workload claim and automatic attachment while Bijection establishes readiness and independently guards the route decision.
+The ordered catalog leaves the candidate closed to serving, workload Claim and ordinary attachment through the held-readiness step.
 
 The Original reaper takes `--recovery-native-destination FILE` for relay configuration.
 The JSON file has `entry` (host), `port`, `server_name`, `ca_file` (PEM), `catalog` (native catalog UUID), `approval_public_key` and `source_signing_key_file` (Ed25519 PKCS#8 DER).
@@ -506,8 +506,37 @@ Each domain ends in one zero byte.
 Expiry is in Unix microseconds and must be more than 250 ms and at most five minutes ahead of the verifier's clock.
 The ordered catalog and restore record bind `SHA-256("rtdb.multi/classic-candidate-binding/v1\0" || compact typed JSON(binding))`.
 The private relay request frames its `authorization` and `source_signature` JSON with a big-endian 32-bit length, then adds a big-endian 32-bit checkpoint length and the exact checkpoint bytes.
-Stage and status carry zero checkpoint bytes.
+Stage, status and held-readiness actions carry zero checkpoint bytes.
 The reply is a length-framed JSON outcome.
+
+#### Ordered held readiness
+
+Use `hold_classic_migration_destination_ready` with the same Original `selection` and a fresh `authorization` over the same full `candidate_binding`.
+The operator approves the exact Bijection destination and placement from the reobserved retained Begin, and the exact Classic application fence from its matched application-drain proof.
+Use `classic_migration_destination_ready_status` with the same `selection`, binding and readiness selector after a lost response.
+Both actions authenticate the Original fence and scratch bootstrap and relay through the commissioned catalog audience without replaying scratch.
+
+The signed operation is `{"operation":"hold_ready","ready":R}` or `{"operation":"held_ready_status","ready":R}`.
+`R` has fields `endpoint`, `placement`, `classic_cut`, `native_basis`, `reserved_at` and `installation` in signing order.
+`endpoint` is the exact expected managed Flight HTTPS origin from the retained Begin.
+`placement` has fields `epoch` as a JSON integer, then `assignment` and `holder` as 16-byte JSON arrays.
+Use the complete Classic application transaction key for `classic_cut` and its checked native `Basis` for `native_basis`.
+Use the original native catalog reservation Basis for `reserved_at`.
+`installation` uses the exact observed native checkpoint with fields `basis`, `system_time`, `checkpoint_lsn`, `checkpoint_writer_epoch`, `key_generation`, `checkpoint_sha256`, `manifest` and `manifest_ciphertext_sha256` in signing order.
+The registered endpoint is an approved Bijection placement coordinate, and the relay authenticates the native peer independently with its commissioned TLS profile and native catalog audience.
+
+The peer reopens the ordered native restore, checks the full physical installation and proves the application cut against the retained imported history.
+The hold compares the original catalog reservation version and orders a single selected readiness value in that same closed candidate row.
+The `classic_migration_destination` reply includes `candidate_binding`, `candidate`, `mapped_cut` and `held_ready` in `evidence`.
+`held_ready` contains `binding_sha256`, `ready` and `recorded_at`, where `recorded_at` is the catalog Basis that ordered the hold.
+An exact status before the hold commits omits `held_ready` and leaves the hold unresolved.
+Status with a different readiness selector refuses after a hold commits.
+Renewal or expiry of a grant leaves the recorded hold intact, and a fresh exact status returns the original `recorded_at` and ready value.
+
+The held row keeps attach, workload Claim and application writes closed.
+Bijection owns the guarded route CAS and stamps the accepted placement with its applied catalog history and sequence.
+Opening requires a separate trusted verifier and native transition that positively observe the exact applied and still-current Bijection decision for the same Begin, held-ready receipt, endpoint, installation and placement.
+The readiness actions carry prepublication authority only.
 
 The literal projection covers positioned clear puts and deletes with unambiguous physical addresses.
 It preserves valid intervals, system times and original written transaction identity.

@@ -99,9 +99,13 @@ impl Relay {
         self.catalog
     }
 
-    pub(super) fn verify(&self, authorization: &Authorization, operation: Operation) -> Result<()> {
+    pub(super) fn verify(
+        &self,
+        authorization: &Authorization,
+        operation: &Operation,
+    ) -> Result<()> {
         if authorization.grant.binding.catalog != self.catalog
-            || authorization.grant.operation != operation
+            || &authorization.grant.operation != operation
         {
             return Err(denied());
         }
@@ -113,9 +117,9 @@ impl Relay {
         authorization: Authorization,
         bytes: &[u8],
     ) -> Result<Response> {
-        let operation = authorization.grant.operation;
-        self.verify(&authorization, operation)?;
-        let expected = if operation == Operation::Install {
+        self.verify(&authorization, &authorization.grant.operation)?;
+        let install = authorization.grant.operation == Operation::Install;
+        let expected = if install {
             authorization.grant.binding.checkpoint_bytes as usize
         } else {
             0
@@ -155,10 +159,7 @@ impl Relay {
                     Response::Redirect {
                         writer,
                         binding_sha256,
-                    } if operation == Operation::Install
-                        && binding_sha256 == binding
-                        && directed != Some(writer) =>
-                    {
+                    } if install && binding_sha256 == binding && directed != Some(writer) => {
                         directed = Some(writer)
                     }
                     response @ Response::Observed { binding_sha256, .. }

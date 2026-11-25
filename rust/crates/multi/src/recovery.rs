@@ -169,6 +169,8 @@ enum Action {
     StageClassicMigrationDestination { selection: classic_destination::Selection, authorization: Option<CandidateAuthorization> },
     InstallClassicMigrationDestination { selection: classic_destination::Selection, projection_sha256: [u8; 32], authorization: Option<CandidateAuthorization> },
     ClassicMigrationDestinationStatus { selection: classic_destination::Selection, classic_cut: Option<rtdb_types::TransactionKey>, authorization: Option<CandidateAuthorization> },
+    HoldClassicMigrationDestinationReady { selection: classic_destination::Selection, authorization: CandidateAuthorization },
+    ClassicMigrationDestinationReadyStatus { selection: classic_destination::Selection, authorization: CandidateAuthorization },
     ReadClassicMigrationOriginalReceipt { selection: classic_destination::Selection, id: rtdb_types::EntityId, coverage: Option<classic_destination::CoveragePoint> },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
@@ -893,6 +895,12 @@ impl RecoveryService {
             Action::ClassicMigrationDestinationStatus { selection, classic_cut, authorization } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Status { classic_cut, authorization },
             )).await,
+            Action::HoldClassicMigrationDestinationReady { selection, authorization } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::HeldReady { authorization, record: true },
+            )).await,
+            Action::ClassicMigrationDestinationReadyStatus { selection, authorization } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::HeldReady { authorization, record: false },
+            )).await,
             Action::ReadClassicMigrationOriginalReceipt { selection, id, coverage } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection, classic_destination::Operation::OriginalReceipt { id, coverage },
             )).await,
@@ -1273,7 +1281,8 @@ pub async fn serve(
 fn admits_frame_size(action: &Action, bytes: usize) -> bool {
     let maximum = match action {
         Action::StageClassicMigrationDestination { .. } | Action::InstallClassicMigrationDestination { .. }
-        | Action::ClassicMigrationDestinationStatus { .. } => CANDIDATE_FRAME_BYTES,
+        | Action::ClassicMigrationDestinationStatus { .. } | Action::HoldClassicMigrationDestinationReady { .. }
+        | Action::ClassicMigrationDestinationReadyStatus { .. } => CANDIDATE_FRAME_BYTES,
         Action::ReadClassicMigrationOriginalReceipt { .. } => ORIGINAL_RECEIPT_FRAME_BYTES,
         _ => FRAME_BYTES,
     };

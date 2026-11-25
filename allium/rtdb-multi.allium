@@ -635,7 +635,11 @@ contract LogService {
         -- The retained replay, its covered relations and remaining Original custody remain distinguishable in the private proof.
         -- A fresh exact status grant reopens the same native manifest through the ordered restore terminal after an interrupted append or reply, using the retained Original selectors without replaying scratch.
         -- Expiry or an unavailable response leaves the ordered outcome to be resolved by exact status.
-        -- Route readiness and authority publication require the caller's separate guarded decision.
+        -- Held readiness requires the exact Begin, candidate binding, reopened physical installation, mapped application cut, expected endpoint and Bijection holder, assignment and epoch.
+        -- The ordered native catalog compares the original reservation and holds one immutable readiness record while ordinary attachment, workload claim and application writes stay closed.
+        -- A fresh exact readiness status returns the same held coordinates and catalog basis after a lost append response.
+        -- Grant expiry leaves a committed hold intact.
+        -- Opening the held candidate requires independently authenticated evidence of the exact applied and current Bijection route decision.
 
     @invariant InstalledJournalErasureCommit
         -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.

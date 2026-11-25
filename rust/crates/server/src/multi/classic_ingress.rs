@@ -9,7 +9,7 @@ use std::{
 };
 
 use ring::signature::{ED25519, UnparsedPublicKey};
-use rtdb_db::{classic_import_basis, discover_nodes, preferred};
+use rtdb_db::{ClassicInstallation, classic_import_basis, discover_nodes, preferred};
 use rtdb_tx::transact::TransactState;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, TransactionKey, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
@@ -95,12 +95,74 @@ impl Binding {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Stage,
     Install,
     Status { classic_cut: Option<TransactionKey> },
+    HoldReady { ready: Box<ReadySelection> },
+    HeldReadyStatus { ready: Box<ReadySelection> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadySelection {
+    pub endpoint: String,
+    pub placement: HeldAssignment,
+    pub classic_cut: TransactionKey,
+    pub native_basis: Basis,
+    pub reserved_at: Basis,
+    pub installation: ClassicInstallation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldAssignment {
+    pub epoch: u64,
+    pub assignment: [u8; 16],
+    pub holder: [u8; 16],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldReady {
+    pub binding_sha256: [u8; 32],
+    pub ready: ReadySelection,
+    pub recorded_at: Basis,
+}
+
+impl ReadySelection {
+    pub(super) fn valid_for(&self, catalog: Uuid, destination: Uuid) -> bool {
+        self.endpoint
+            .strip_prefix("https://")
+            .is_some_and(|authority| {
+                let host = authority.strip_suffix(":443").unwrap_or(authority);
+                !host.is_empty()
+                    && host.len() <= 253
+                    && host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            })
+            && self.placement.epoch != 0
+            && self.placement.assignment != [0; 16]
+            && self.placement.holder != [0; 16]
+            && self.reserved_at.incarnation() == *catalog.as_bytes()
+            && self.reserved_at.position() != 0
+            && self.installation.basis.incarnation() == *destination.as_bytes()
+            && self.native_basis <= self.installation.basis
+            && self.classic_cut.system_time <= self.installation.system_time
+            && classic_import_basis(*destination.as_bytes(), self.classic_cut.tx_id)
+                .is_ok_and(|basis| self.native_basis == basis)
+    }
+
+    fn matches_binding(&self, binding: &Binding) -> bool {
+        self.valid_for(binding.catalog, binding.destination)
+            && self.classic_cut.at_or_before(binding.terminal)
+            && self.installation.basis == binding.basis
+            && self.installation.system_time == binding.terminal.system_time
+            && self.installation.checkpoint_sha256 == binding.checkpoint_sha256
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,10 +192,19 @@ impl Authorization {
         let deadline = self.grant.expires_at_micros;
         if now.0.saturating_add(CLOCK_DRIFT_MICROS) >= deadline
             || deadline > now.0.saturating_add(MAX_GRANT_MICROS)
-            || matches!(self.grant.operation, Operation::Status { classic_cut: Some(cut) }
-                if !cut.at_or_before(self.grant.binding.terminal))
         {
             return Err(denied());
+        }
+        match &self.grant.operation {
+            Operation::Status {
+                classic_cut: Some(cut),
+            } if !cut.at_or_before(self.grant.binding.terminal) => return Err(denied()),
+            Operation::HoldReady { ready } | Operation::HeldReadyStatus { ready }
+                if !ready.matches_binding(&self.grant.binding) =>
+            {
+                return Err(denied());
+            }
+            _ => (),
         }
         verify(approval, &self.grant.signing_digest()?, &self.signature)
     }
@@ -157,6 +228,8 @@ pub enum Response {
         binding_sha256: [u8; 32],
         candidate: Option<ClassicCandidate>,
         mapped_cut: Option<(TransactionKey, Basis)>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        held_ready: Option<Box<HeldReady>>,
     },
     Redirect {
         writer: IpAddr,
@@ -327,7 +400,8 @@ impl Ingress {
             return Err(denied());
         }
         let mut mapped_cut = None;
-        let candidate = match grant.operation {
+        let mut held_ready = None;
+        let candidate = match &grant.operation {
             Operation::Stage => Some(
                 runtime
                     .stage_classic_candidate(
@@ -373,7 +447,7 @@ impl Ingress {
                 }
             }
             Operation::Status { classic_cut } => {
-                if let Some(cut) = classic_cut
+                if let Some(cut) = *classic_cut
                     && existing
                         .as_ref()
                         .is_some_and(|candidate| candidate.installation.is_some())
@@ -390,6 +464,26 @@ impl Ingress {
                 }
                 existing
             }
+            Operation::HoldReady { ready } | Operation::HeldReadyStatus { ready } => {
+                let candidate = existing.ok_or_else(denied)?;
+                let record = matches!(&grant.operation, Operation::HoldReady { .. });
+                if record && let Some(peer) = &runtime.peer {
+                    peer.observe(live);
+                }
+                held_ready = runtime
+                    .classic_held_ready(
+                        &binding.name,
+                        binding.destination,
+                        binding_sha256,
+                        &candidate,
+                        ready,
+                        record,
+                    )
+                    .await?
+                    .map(Box::new);
+                mapped_cut = Some((ready.classic_cut, ready.native_basis));
+                Some(candidate)
+            }
         };
         if candidate
             .as_ref()
@@ -401,6 +495,7 @@ impl Ingress {
             binding_sha256,
             candidate,
             mapped_cut,
+            held_ready,
         })
     }
 }
@@ -593,6 +688,88 @@ mod tests {
                 123, 145, 254, 225, 121, 226, 200, 37, 246, 164, 187, 252, 94
             ]
         );
+    }
+
+    #[test]
+    fn held_ready_approval_binds_placement_application_cut_install_and_operation() {
+        let binding = binding();
+        let ready = Box::new(ReadySelection {
+            endpoint: "https://managed.internal".into(),
+            placement: HeldAssignment {
+                epoch: 12,
+                assignment: [30; 16],
+                holder: [31; 16],
+            },
+            classic_cut: binding.terminal,
+            native_basis: binding.basis,
+            reserved_at: Basis::new(*binding.catalog.as_bytes(), 1),
+            installation: ClassicInstallation {
+                basis: binding.basis,
+                system_time: binding.terminal.system_time,
+                checkpoint_lsn: 2,
+                checkpoint_writer_epoch: 1,
+                key_generation: 1,
+                checkpoint_sha256: binding.checkpoint_sha256,
+                manifest: "manifest".into(),
+                manifest_ciphertext_sha256: [32; 32],
+            },
+        });
+        let approval = Ed25519KeyPair::from_seed_unchecked(&[50; 32]).unwrap();
+        let source = Ed25519KeyPair::from_seed_unchecked(&[51; 32]).unwrap();
+        let mut grant = Grant {
+            binding: binding.clone(),
+            operation: Operation::HoldReady {
+                ready: ready.clone(),
+            },
+            expires_at_micros: 5_000_000,
+        };
+        assert_eq!(
+            grant.signing_digest().unwrap(),
+            [
+                7, 236, 188, 219, 84, 117, 96, 135, 174, 17, 138, 232, 223, 174, 254, 195, 218, 5,
+                169, 201, 22, 172, 154, 191, 221, 240, 122, 17, 237, 84, 15, 241
+            ]
+        );
+        let check = |request: &Request| {
+            authenticate_request(
+                binding.catalog,
+                approval.public_key().as_ref().try_into().unwrap(),
+                source.public_key().as_ref().try_into().unwrap(),
+                request,
+                Timestamp(1_000_000),
+            )
+        };
+        assert!(check(&sign(grant.clone(), &approval, &source)).is_ok());
+        let changes: [fn(&mut ReadySelection); 6] = [
+            |ready| ready.endpoint = "https://other.internal".into(),
+            |ready| ready.placement.epoch += 1,
+            |ready| ready.placement.assignment[0] ^= 1,
+            |ready| ready.placement.holder[0] ^= 1,
+            |ready| ready.classic_cut.system_time.0 += 1,
+            |ready| ready.installation.manifest_ciphertext_sha256[0] ^= 1,
+        ];
+        for change in changes {
+            let mut request = sign(grant.clone(), &approval, &source);
+            let Operation::HoldReady { ready } = &mut request.authorization.grant.operation else {
+                unreachable!()
+            };
+            change(ready);
+            assert!(check(&request).is_err());
+        }
+        let mut switched = sign(grant.clone(), &approval, &source);
+        switched.authorization.grant.operation = Operation::HeldReadyStatus {
+            ready: ready.clone(),
+        };
+        assert!(check(&switched).is_err());
+        grant.operation = Operation::HeldReadyStatus { ready };
+        assert_eq!(
+            grant.signing_digest().unwrap(),
+            [
+                227, 38, 150, 195, 231, 172, 109, 47, 76, 134, 145, 108, 74, 192, 65, 136, 31, 255,
+                171, 252, 105, 217, 80, 82, 116, 134, 80, 162, 162, 128, 51, 193
+            ]
+        );
+        assert!(check(&sign(grant, &approval, &source)).is_ok());
     }
 
     #[test]

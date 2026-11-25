@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::classic_ingress::{HeldReady, ReadySelection};
+
 pub(super) struct Catalog {
     database: Mutex<MultiDatabase>,
     incarnation: Uuid,
@@ -29,7 +31,11 @@ pub(super) struct Deployment {
 pub(super) enum Status {
     Reserved,
     Ready,
-    ClassicCandidate { request: [u8; 32], projection: [u8; 32] },
+    ClassicCandidate {
+        request: [u8; 32],
+        projection: [u8; 32],
+        held: Option<Box<ReadySelection>>,
+    },
     TransferPending(Transfer),
     TransferReady {
         request: [u8; 32],
@@ -202,10 +208,44 @@ impl Catalog {
     pub(super) async fn reserve_classic_candidate(
         &self, name: &str, database: Uuid, request: [u8; 32], projection: [u8; 32],
     ) -> Result<Deployment> {
-        let status = Status::ClassicCandidate { request, projection };
-        let selected = self.reserve_status(name, database, status.clone()).await?;
-        if selected.status != status { return Err(conflict()); }
+        let status = Status::ClassicCandidate { request, projection, held: None };
+        let selected = self.reserve_status(name, database, status).await?;
+        if !matches!(&selected.status,
+            Status::ClassicCandidate { request: prior, projection: original, .. }
+                if *prior == request && *original == projection)
+        {
+            return Err(conflict());
+        }
         Ok(selected)
+    }
+
+    pub(super) async fn classic_held_ready(
+        &self, name: &str, database: Uuid, binding: [u8; 32], ready: &ReadySelection, record: bool,
+    ) -> Result<Option<HeldReady>> {
+        if !ready.valid_for(self.incarnation, database) {
+            return Err(conflict());
+        }
+        let mut control = self.database.lock().await;
+        let mut selected = check_identity(find(&mut control, name).await?, database)?;
+        if let Status::ClassicCandidate { request, projection, held: None } = &selected.status
+            && *request == binding && selected.written == ready.reserved_at
+        {
+            if !record { return Ok(None); }
+            let status = Status::ClassicCandidate {
+                request: binding, projection: *projection, held: Some(Box::new(ready.clone())),
+            };
+            write(self, &mut control, name, database, status, Version::Written(selected.written)).await?;
+            selected = check_identity(find(&mut control, name).await?, database)?;
+        }
+        match selected.status {
+            Status::ClassicCandidate { request, held: Some(prior), .. }
+                if request == binding && prior.as_ref() == ready => Ok(Some(HeldReady {
+                    binding_sha256: binding,
+                    ready: *prior,
+                    recorded_at: selected.written,
+                })),
+            _ => Err(conflict()),
+        }
     }
 
     pub(super) async fn reserve_transfer(
@@ -547,6 +587,12 @@ async fn read(control: &mut MultiDatabase) -> Result<BTreeMap<String, Deployment
             return Err(invalid_catalog());
         };
         let status = decode_status(*ready, *database, &image.cells)?;
+        if let Status::ClassicCandidate { held: Some(held), .. } = &status
+            && (!held.valid_for(Uuid::from_bytes(row.cut.basis.incarnation()), Uuid::from_bytes(*database))
+                || held.reserved_at >= row.cut.basis)
+        {
+            return Err(invalid_catalog());
+        }
         if let Status::ManagedTransferReady { transfer, .. } = &status {
             let reserved_at = transfer.reservation.reserved_at;
             if reserved_at.incarnation() != row.cut.basis.incarnation() || reserved_at >= row.cut.basis {
@@ -583,7 +629,12 @@ fn decode_status(ready: bool, database: [u8; 16], cells: &StructFields<Value>) -
         let request = request.as_slice().try_into().map_err(|_| invalid_catalog())?;
         let projection = projection.as_slice().try_into().map_err(|_| invalid_catalog())?;
         if request == [0; 32] || projection == [0; 32] { return Err(invalid_catalog()); }
-        return Ok(Status::ClassicCandidate { request, projection });
+        let held = match cells.get("classic_held_ready") {
+            None => None,
+            Some(Value::Binary(bytes)) => Some(serde_json::from_slice(bytes).map_err(|_| invalid_catalog())?),
+            _ => return Err(invalid_catalog()),
+        };
+        return Ok(Status::ClassicCandidate { request, projection, held });
     }
     if let Some(request) = cells.get("transfer_request") {
         let Value::Binary(request) = request else {
@@ -762,10 +813,16 @@ async fn write(
     let phase = match status {
         Status::Reserved => b"reserve".to_vec(),
         Status::Ready => b"ready".to_vec(),
-        Status::ClassicCandidate { request, projection } => {
+        Status::ClassicCandidate { request, projection, held } => {
             cells.insert("classic_request".into(), Cell::Value(Value::Binary(request.to_vec())));
             cells.insert("classic_projection".into(), Cell::Value(Value::Binary(projection.to_vec())));
-            b"classic-candidate".to_vec()
+            if let Some(held) = held {
+                let bytes = serde_json::to_vec(&held).map_err(|_| invalid_catalog())?;
+                cells.insert("classic_held_ready".into(), Cell::Value(Value::Binary(bytes)));
+                b"classic-held-ready".to_vec()
+            } else {
+                b"classic-candidate".to_vec()
+            }
         }
         Status::TransferPending(transfer) => {
             cells.insert(

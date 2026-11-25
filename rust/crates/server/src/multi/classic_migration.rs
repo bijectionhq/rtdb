@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::{
     DatabaseOpen, MultiRuntime,
     catalog::{Deployment, Status},
+    classic_ingress::{HeldReady, ReadySelection},
     open_database, validate_deployment_name,
 };
 
@@ -176,6 +177,29 @@ impl MultiRuntime {
             .basis)
     }
 
+    pub(super) async fn classic_held_ready(
+        &self,
+        name: &str,
+        incarnation: Uuid,
+        binding: [u8; 32],
+        candidate: &ClassicCandidate,
+        ready: &ReadySelection,
+        record: bool,
+    ) -> Result<Option<HeldReady>> {
+        if candidate.reserved_at != ready.reserved_at
+            || candidate.installation.as_ref() != Some(&ready.installation)
+            || self
+                .classic_candidate_cut(name, incarnation, binding, ready.classic_cut)
+                .await?
+                != ready.native_basis
+        {
+            return Err(conflict());
+        }
+        self.catalog
+            .classic_held_ready(name, incarnation, binding, ready, record)
+            .await
+    }
+
     async fn classic_candidate(
         &self,
         name: &str,
@@ -190,6 +214,7 @@ impl MultiRuntime {
             Status::ClassicCandidate {
                 request: prior,
                 projection,
+                ..
             } if selected.database == incarnation && prior == request => {
                 Ok(Some((selected, projection)))
             }
@@ -203,6 +228,12 @@ impl MultiRuntime {
         request: [u8; 32],
         projection: [u8; 32],
     ) -> Result<ClassicCandidate> {
+        let reserved_at = match &selected.status {
+            Status::ClassicCandidate {
+                held: Some(held), ..
+            } => held.reserved_at,
+            _ => selected.written,
+        };
         let installation = match self
             .backends
             .journal
@@ -229,7 +260,7 @@ impl MultiRuntime {
             }
         };
         Ok(ClassicCandidate {
-            reserved_at: selected.written,
+            reserved_at,
             projection_sha256: projection,
             installation,
         })
@@ -266,11 +297,12 @@ fn conflict() -> Anomaly {
 mod tests {
     use super::*;
     use crate::config::NodeConfiguration;
+    use crate::multi::classic_ingress::HeldAssignment;
     use rtdb_db::classic_import_basis;
     use rtdb_types::{MemoryBudget, Timestamp, TxId};
 
     #[tokio::test]
-    async fn installed_classic_candidate_stays_outside_normal_provisioning_and_serving()
+    async fn held_ready_classic_candidate_recovers_the_same_ordered_record_and_stays_closed()
     -> Result<()> {
         let files = tempfile::tempdir().unwrap();
         let mut configuration =
@@ -305,6 +337,16 @@ mod tests {
         };
         let mut transactions = TransactState::new(*incarnation.as_bytes());
         let mut index = transactions.index().clone();
+        let application_cut = TransactionKey {
+            tx_id: TxId(7),
+            system_time: Timestamp(5),
+        };
+        let application_basis =
+            classic_import_basis(*incarnation.as_bytes(), application_cut.tx_id)?;
+        let mut application = index.head();
+        application.basis = application_basis;
+        application.system_time = application_cut.system_time;
+        index.advance_classic(application)?;
         let basis = classic_import_basis(*incarnation.as_bytes(), cut.tx_id)?;
         let mut native_cut = index.head();
         native_cut.basis = basis;
@@ -330,6 +372,87 @@ mod tests {
                 .await?,
             basis
         );
+        let ready = ReadySelection {
+            endpoint: "https://managed.internal".into(),
+            placement: HeldAssignment {
+                epoch: 9,
+                assignment: [3; 16],
+                holder: [4; 16],
+            },
+            classic_cut: application_cut,
+            native_basis: application_basis,
+            reserved_at: installed.reserved_at,
+            installation: installed.installation.clone().unwrap(),
+        };
+        assert!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &selected, &ready, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &installed, &ready, false)
+                .await?
+                .is_none()
+        );
+        let mut wrong = ready.clone();
+        wrong.classic_cut.system_time.0 += 1;
+        assert!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &installed, &wrong, true)
+                .await
+                .is_err()
+        );
+        wrong = ready.clone();
+        wrong.installation.manifest_ciphertext_sha256[0] ^= 1;
+        assert!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &installed, &wrong, true)
+                .await
+                .is_err()
+        );
+        let ordered = runtime
+            .classic_held_ready("private", incarnation, [1; 32], &installed, &ready, true)
+            .await?
+            .unwrap();
+        assert_eq!(ordered.ready, ready);
+        assert!(ordered.recorded_at > ready.reserved_at);
+        runtime
+            .stage_classic_candidate("other", Uuid::new_v4(), [3; 32], [4; 32])
+            .await?;
+        let reopened = runtime
+            .classic_candidate_status("private", incarnation, [1; 32])
+            .await?
+            .unwrap();
+        assert_eq!(reopened.reserved_at, ready.reserved_at);
+        assert_eq!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &reopened, &ready, false)
+                .await?,
+            Some(ordered.clone())
+        );
+        assert_eq!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &reopened, &ready, true)
+                .await?,
+            Some(ordered)
+        );
+        wrong = ready;
+        wrong.placement.holder = [5; 16];
+        assert!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &reopened, &wrong, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .classic_held_ready("private", incarnation, [1; 32], &reopened, &wrong, false)
+                .await
+                .is_err()
+        );
+        assert!(!runtime.catalog.read().await?["private"].status.ready());
         assert!(
             runtime
                 .provision("private", Some(incarnation))
