@@ -5,7 +5,7 @@ use arrow_schema::Schema;
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
 use crate::{Lsn, read_text, vector_types::{VectorType, VectorTypes}, wire::{Column, Input, protocol}};
-use rtdb_pg_codec::{Format, WalArrayRow, read_source_binary, read_source_binary_column, read_source_text_column, read_wal_array};
+use rtdb_pg_codec::{Format, WalArrayRow, read_source_binary, read_source_binary_column, read_source_text_column, read_tstzrange, read_wal_array, tstzrange_field};
 
 mod pending;
 use pending::{DecodedCell, PendingTransaction, Run};
@@ -210,16 +210,23 @@ impl Decoder {
                     }
                     let bound = text.map(|text| text_bound(oid, text)).transpose()?.unwrap_or_default();
                     let mut charge = self.memory.reserve(bound.checked_add(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-                    let mut column = BatchBuilder::new(0, &self.memory)?;
-                    let typed = if matches!(oid, 3910 | 16384) {
-                        read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
-                    } else { None };
-                    let (field, cell) = match typed {
-                        Some((field, _)) if field.data_type() == &arrow_schema::DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
-                        Some((field, array)) => (field, DecodedCell::Nested(array)),
-                        None => {
-                            let value = text.map_or(Ok(Value::Null), |text| read_text(oid, text))?;
-                            DecodedCell::from_value(name, value, &self.memory)?
+                    let (field, cell) = if oid == 3910 {
+                        match text.map(read_tstzrange).transpose()?.flatten() {
+                            Some((lower, upper)) => (tstzrange_field(name, false)?, DecodedCell::Range([lower, upper])),
+                            None => (rtdb_columnar::to_field(name, &LogicalType::Null)?, DecodedCell::Scalar(Value::Null)),
+                        }
+                    } else {
+                        let mut column = BatchBuilder::new(0, &self.memory)?;
+                        let typed = if oid == 16384 {
+                            read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
+                        } else { None };
+                        match typed {
+                            Some((field, _)) if field.data_type() == &arrow_schema::DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
+                            Some((field, array)) => (field, DecodedCell::Nested(array)),
+                            None => {
+                                let value = text.map_or(Ok(Value::Null), |text| read_text(oid, text))?;
+                                DecodedCell::from_value(name, value, &self.memory)?
+                            }
                         }
                     };
                     let retained = cell.retained()?;
@@ -530,6 +537,58 @@ pub(crate) mod tests {
         let child = list.values().as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(list.value_offsets(), &[0, 2, 4, 6]);
         assert_eq!(child.values().as_ref(), &[1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+    }
+
+    #[test]
+    fn wal_ranges_keep_null_groups_endpoint_order_and_recovered_toast() {
+        use arrow_array::{Array, FixedSizeListArray, TimestampMicrosecondArray};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(&memory));
+        decoder.receive_decoded(&relation(1, "docs", &[("period", 3910)])).unwrap();
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+
+        let lower = "[2000-01-01 00:00:00+02:00,)";
+        let upper = "[,2000-01-01 00:00:00+00)";
+        for (tag, text) in [(b'I', Some(lower)), (b'I', None), (b'I', Some(upper)), (b'I', Some("empty")), (b'D', Some(lower))] {
+            decoder.receive_decoded(&row(tag, 1, &[text])).unwrap();
+        }
+        let held = memory.used_bytes();
+        let invalid = "[invalid,)";
+        assert_eq!(decoder.receive_decoded(&row(b'I', 1, &[Some(invalid)])).unwrap_err(), read_text(3910, invalid).unwrap_err());
+        assert_eq!(memory.used_bytes(), held);
+
+        let mut update = row(b'U', 1, &[Some("[,)")]);
+        update[5] = b'O';
+        update.extend_from_slice(b"N\0\x01u");
+        decoder.receive_decoded(&update).unwrap();
+
+        let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        assert_eq!(transaction.batches.iter().map(|change| change.rows.batch().num_rows()).collect::<Vec<_>>(), [3, 2, 1]);
+        let batch = transaction.batches[0].rows.batch();
+        assert_eq!(batch.schema_ref().field(0), &tstzrange_field("period", false).unwrap());
+        let ranges = batch.column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let endpoints = ranges.values().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert_eq!(ranges.null_count(), 0);
+        assert_eq!(endpoints.null_count(), 0);
+        assert_eq!(endpoints.timezone(), Some("UTC"));
+        assert_eq!(endpoints.values().as_ref(), &[PG_EPOCH_MICROS - 7_200_000_000, i64::MAX, i64::MIN, PG_EPOCH_MICROS, i64::MIN, i64::MAX]);
+
+        let rows = transaction.to_rows(&memory).unwrap();
+        let ordered = rows.operations.iter().map(|op| (op.kind, op.row["period"].clone())).collect::<Vec<_>>();
+        assert_eq!(ordered, [
+            (RowKind::Put, read_text(3910, lower).unwrap()),
+            (RowKind::Put, Value::Null),
+            (RowKind::Put, read_text(3910, upper).unwrap()),
+            (RowKind::Put, Value::Null),
+            (RowKind::Delete, read_text(3910, lower).unwrap()),
+            (RowKind::Put, Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }),
+        ]);
+        let detached = Arc::clone(ranges.values());
+        drop((decoder, transaction, rows));
+        assert!(memory.used_bytes() > 0);
+        drop(detached);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

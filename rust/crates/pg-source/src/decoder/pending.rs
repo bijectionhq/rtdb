@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, hash::{DefaultHasher, Hash, Hasher}, ops::Range, sync::Arc};
 
 use arrow_array::{
-    ArrayRef, NullArray, RecordBatch, RecordBatchOptions,
+    ArrayRef, FixedSizeListArray, NullArray, RecordBatch, RecordBatchOptions,
     TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder},
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_pg_codec::{WalListColumn, WalListRow};
+use rtdb_pg_codec::{WalListColumn, WalListRow, tstzrange_field};
 use rtdb_types::{LogicalType, Result, TableRef, Value};
 
 use super::{ArrowChanges, DecodedTransaction, RowKind, overflow};
@@ -123,10 +123,14 @@ pub(super) enum DecodedCell<'a> {
     Nested(ArrayRef),
     List(WalListRow<'a>),
     ArrayText(&'a str),
+    Range([i64; 2]),
 }
 
 impl DecodedCell<'_> {
     pub fn from_value(name: &str, value: Value, memory: &Arc<MemoryBudget>) -> Result<(Field, Self)> {
+        if let Value::TimestampTzRange { lower, upper } = &value {
+            return Ok((tstzrange_field(name, false)?, Self::Range([*lower, *upper])));
+        }
         let logical = LogicalType::join_all([&value.logical_type()]);
         let field = rtdb_columnar::to_field(name, &logical)?;
         let bound = rtdb_columnar::estimate_builder_bytes(&logical, std::slice::from_ref(&value))?;
@@ -148,6 +152,7 @@ impl DecodedCell<'_> {
             Self::Nested(array) => array.get_array_memory_size(),
             Self::List(row) => row.builder_bytes()?,
             Self::ArrayText(text) => text.len(),
+            Self::Range(bounds) => std::mem::size_of_val(bounds),
         };
         bytes.checked_mul(4).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)
     }
@@ -168,6 +173,7 @@ macro_rules! columns {
             Nested(Vec<ArrayRef>),
             List(WalListColumn),
             ArrayText(StringBuilder),
+            Range(Vec<i64>),
         }
 
         impl ColumnValues {
@@ -180,6 +186,7 @@ macro_rules! columns {
                     DecodedCell::Nested(_) => WalListColumn::new(field).map_or_else(|| Self::Nested(Vec::new()), Self::List),
                     DecodedCell::List(_) => Self::List(WalListColumn::new(field).expect("WAL list field has a builder")),
                     DecodedCell::ArrayText(_) => Self::ArrayText(StringBuilder::with_capacity(0, 0)),
+                    DecodedCell::Range(_) => Self::Range(Vec::new()),
                     _ => unreachable!("decoded WAL scalar has a column builder"),
                 }
             }
@@ -192,7 +199,8 @@ macro_rules! columns {
                     (Self::Timestamp(_), DecodedCell::Scalar(Value::Timestamp { .. })) |
                     (Self::Nested(_), DecodedCell::Nested(_)) |
                     (Self::List(_), DecodedCell::List(_) | DecodedCell::Nested(_)) |
-                    (Self::ArrayText(_), DecodedCell::ArrayText(_))
+                    (Self::ArrayText(_), DecodedCell::ArrayText(_)) |
+                    (Self::Range(_), DecodedCell::Range(_))
                 )
             }
 
@@ -221,6 +229,7 @@ macro_rules! columns {
                     (Self::List(builder), DecodedCell::List(row)) => builder.push(row),
                     (Self::List(builder), DecodedCell::Nested(array)) => builder.push_array(array.as_ref()),
                     (Self::ArrayText(builder), DecodedCell::ArrayText(text)) => builder.append_value(text),
+                    (Self::Range(values), DecodedCell::Range(bounds)) => values.extend_from_slice(&bounds),
                     _ => unreachable!("pending column accepts its decoded layout"),
                 }
             }
@@ -233,6 +242,7 @@ macro_rules! columns {
                     Self::Timestamp(values) => timestamp_column(field, values),
                     Self::List(builder) => builder.finish(field),
                     Self::ArrayText(mut builder) => Ok(Arc::new(builder.finish())),
+                    Self::Range(values) => range_column(field, values),
                     Self::Nested(mut cells) if cells.len() == 1 => Ok(cells.remove(0)),
                     Self::Nested(cells) => {
                         let arrays = cells.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
@@ -266,4 +276,13 @@ fn timestamp_column(field: &Field, values: Vec<i64>) -> Result<ArrayRef> {
         TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(timezone)),
         TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(timezone)),
     })
+}
+
+fn range_column(field: &Field, values: Vec<i64>) -> Result<ArrayRef> {
+    let DataType::FixedSizeList(child, 2) = field.data_type() else {
+        return Err(protocol("Range builder has a field other than a pair of timestamps"));
+    };
+    let values = timestamp_column(child, values)?;
+    let array = FixedSizeListArray::try_new(Arc::clone(child), 2, values, None).map_err(protocol)?;
+    Ok(Arc::new(array))
 }

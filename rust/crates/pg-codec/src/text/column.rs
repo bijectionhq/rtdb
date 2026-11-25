@@ -11,7 +11,7 @@ use rtdb_columnar::BatchBuilder;
 use rtdb_format::transit::{TransitValue, decode_json, encode_msgpack};
 use rtdb_types::{Anomaly, LogicalType, PgType, Result, ScalarType, TimeUnit};
 
-use super::{bytea, invalid, interval, interval_type, local_timestamp_micros, parse_boolean, parse_decimal, parse_uuid, range, float, float32, visit_array, zoned_timestamp_micros};
+use super::{bytea, invalid, interval, interval_type, local_timestamp_micros, parse_boolean, parse_decimal, parse_uuid, read_tstzrange, float, float32, visit_array, zoned_timestamp_micros};
 
 /// Decodes a PostgreSQL column using a fixed Arrow layout when supported.
 /// The caller admits input, output and scratch allocations.
@@ -391,7 +391,7 @@ fn ranges<'a>(
     let mut valid = NullBufferBuilder::new(count);
     let mut present = 0;
     for row in 0..count {
-        let bounds = cell(row)?.map(range).transpose()?.flatten();
+        let bounds = cell(row)?.map(read_tstzrange).transpose()?.flatten();
         valid.append(bounds.is_some());
         if let Some((lower, upper)) = bounds {
             values.append_value(lower);
@@ -402,12 +402,16 @@ fn ranges<'a>(
         }
     }
     if present == 0 { return null_column(name, count); }
-    let logical = PgType::TsTzRange.logical_type().expect("range type");
-    let field = rtdb_columnar::to_field(name, &nullable(logical, present != count))?;
+    let field = tstzrange_field(name, present != count)?;
     let DataType::FixedSizeList(item, width) = field.data_type() else { unreachable!() };
     let array = FixedSizeListArray::try_new(Arc::clone(item), *width, Arc::new(values.finish()), valid.finish())
         .map_err(invalid)?;
     Ok((field, Arc::new(array)))
+}
+
+pub fn tstzrange_field(name: &str, has_null: bool) -> Result<Field> {
+    let logical = PgType::TsTzRange.logical_type().expect("range type");
+    rtdb_columnar::to_field(name, &nullable(logical, has_null))
 }
 
 fn transit_column<'a>(
