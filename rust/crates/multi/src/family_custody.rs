@@ -216,8 +216,10 @@ impl WorldRankCustodyGrant {
     fn mac_input(&self, record: &DeploymentRecord, body: &[u8]) -> Result<[u8; 32]> {
         let deployment = Uuid::parse_str(&record.id).map_err(|_| OwnedWorld::unavailable())?;
         let (history, custody) = original_family_custody(record, deployment)?;
+        let world = WorldRankTransferBinding::archive_address(history, self.archive);
+        let landed = WorldRankTransferBinding::landed_archive_address(history, self.archive);
         if record.parent.is_some() || record.writer_pool().is_none()
-            || self.binding.address != WorldRankTransferBinding::archive_address(history, self.archive)
+            || (self.binding.address != world && self.binding.address != landed)
         {
             return Err(OwnedWorld::unavailable());
         }
@@ -310,6 +312,17 @@ mod tests {
         grant.verify(true, &digest, controller.as_ref())?;
         assert!(grant.verify(true, &digest, reader.as_ref()).is_err());
         assert!(grant.verify(false, &digest, controller.as_ref()).is_err());
+        let landed = WorldRankTransferBinding::landed_archive_address(history, archive);
+        assert_ne!(landed, address);
+        body[68..100].copy_from_slice(&landed);
+        assert!(WorldRankCustodyGrant::authenticate(&body, &secret, &record).is_err());
+        body.truncate(WORLD_RANK_CUSTODY_GRANT_BYTES);
+        let proof = WorldRankCustodyGrant::endorse(&secret, &record, capture, archive, checkpoint, &body)?;
+        body.extend_from_slice(&proof);
+        let grant = WorldRankCustodyGrant::authenticate(&body, &secret, &record)?;
+        assert_eq!(grant.binding.address, landed);
+        assert_eq!(grant.binding.agreement, [9; 32]);
+        assert_eq!(grant.inventory, [10; 32]);
         body[100] ^= 1;
         assert!(WorldRankCustodyGrant::authenticate(&body, &secret, &record).is_err());
         body[100] ^= 1;

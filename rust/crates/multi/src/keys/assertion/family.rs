@@ -4,7 +4,7 @@ mod release;
 mod root_landing;
 mod world_rank_transfer;
 
-pub(crate) use world_rank_transfer::WorldRankFrame;
+pub(crate) use world_rank_transfer::{RankTransferAgreement, RankTransferMember, WorldRankFrame};
 pub use world_rank_transfer::{
     AcceptedWorldRankReplay, WorldRankDestinationCustody, WorldRankSourceCensus, WorldRankSourceDrain,
     WorldRankTransfer, WorldRankTransferAuthority, WorldRankTransferBinding, WorldRankTransferContributor,
