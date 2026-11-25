@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, mem::size_of, sync::Arc};
 use postgres_protocol::authentication::{md5_hash, sasl::{ChannelBinding, ScramSha256}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_pg_codec::{Format, source_snapshot_format};
@@ -27,9 +27,16 @@ impl Row {
     }
     pub fn encoded_size(&self) -> usize { self.frame.bytes.len() }
 }
-pub(crate) struct QueryResult { pub columns: Vec<Column>, pub rows: Vec<Row>, _description: Option<Frame>, _charge: Arc<MemoryReservation> }
+pub(crate) struct QueryResult<'a> { pub columns: Cow<'a, [Column]>, pub rows: Vec<Row>, _description: Option<Frame>, _charge: Arc<MemoryReservation> }
 
-pub(crate) struct SnapshotFetch { bind: Vec<u8>, _charge: Arc<MemoryReservation> }
+pub(crate) struct SnapshotFetch {
+    bind: Vec<u8>,
+    columns: Vec<Column>,
+    _charge: Arc<MemoryReservation>,
+}
+
+#[derive(Clone, Copy)]
+enum QueryKind<'a> { Simple, Statement, Portal(&'a [Column]) }
 
 impl Connection {
     pub async fn open(remote: &Remote, replication: bool, memory: Arc<MemoryBudget>) -> Result<Self> {
@@ -130,11 +137,11 @@ impl Connection {
         let reading = std::mem::replace(&mut self.reading, Reading::new());
         Ok(Frame { tag: reading.header[0], bytes: reading.bytes, _charge: reading.charge.ok_or_else(|| protocol("Completed frame has no reservation"))? })
     }
-    pub async fn query(&mut self, query: &str) -> Result<QueryResult> {
+    pub async fn query(&mut self, query: &str) -> Result<QueryResult<'static>> {
         if query.contains('\0') { return Err(protocol("SQL query contains a zero byte")); }
         let charge = self.memory.reserve(query.len().checked_add(8192).ok_or_else(|| protocol("Query allocation overflow"))?)?;
         let mut body = query.as_bytes().to_vec(); body.push(0); self.send(b'Q', &body).await?;
-        self.read_query(charge, false).await
+        self.read_query(charge, QueryKind::Simple).await
     }
     pub async fn prepare_snapshot_fetch(&mut self) -> Result<SnapshotFetch> {
         let query = b"\0FETCH FORWARD 1000 FROM rtdb_rows\0\0\0";
@@ -142,52 +149,80 @@ impl Connection {
         self.send(b'P', query).await?;
         self.send(b'D', b"S\0").await?;
         self.send(b'S', b"").await?;
-        let statement = self.read_query(charge, true).await?;
-        let count = u16::try_from(statement.columns.len()).map_err(protocol)?;
+        let statement = self.read_query(charge, QueryKind::Statement).await?;
+        let Frame { bytes, _charge: mut charge, .. } = statement._description
+            .ok_or_else(|| protocol("Snapshot FETCH statement has no RowDescription"))?;
+        let mut columns = statement.columns.into_owned();
+        let count = u16::try_from(columns.len()).map_err(protocol)?;
         let len = 8 + 2 * usize::from(count);
-        let charge = self.memory.reserve(1024 + len)?;
+        let retained = columns.iter().try_fold(1024 + len + columns.capacity() * size_of::<Column>(), |size, column| {
+            size.checked_add(column.name.capacity()).ok_or_else(|| protocol("Snapshot description allocation size overflow"))
+        })?;
+        drop(bytes);
+        Arc::get_mut(&mut charge).expect("statement owns its RowDescription reservation").shrink_to(retained)?;
         let mut bind = Vec::with_capacity(len);
         bind.extend_from_slice(&[0; 6]);
         bind.extend_from_slice(&count.to_be_bytes());
-        for column in &statement.columns {
-            bind.extend_from_slice(&source_snapshot_format(column.oid).code().to_be_bytes());
+        // Both FETCH descriptions use the cursor's tuple descriptor. Bind supplies the portal formats.
+        for column in &mut columns {
+            column.format = source_snapshot_format(column.oid);
+            bind.extend_from_slice(&column.format.code().to_be_bytes());
         }
-        Ok(SnapshotFetch { bind, _charge: charge })
+        Ok(SnapshotFetch { bind, columns, _charge: charge })
     }
 
-    pub async fn snapshot_fetch(&mut self, statement: &SnapshotFetch) -> Result<QueryResult> {
+    pub async fn snapshot_fetch<'a>(&mut self, fetch: &'a SnapshotFetch) -> Result<QueryResult<'a>> {
         let charge = self.memory.reserve(8192)?;
-        self.send(b'B', &statement.bind).await?;
+        self.send(b'B', &fetch.bind).await?;
         self.send(b'D', b"P\0").await?;
         self.send(b'E', b"\0\0\0\0\0").await?;
         self.send(b'S', b"").await?;
-        self.read_query(charge, true).await
+        self.read_query(charge, QueryKind::Portal(&fetch.columns)).await
     }
 
-    async fn read_query(&mut self, charge: Arc<MemoryReservation>, extended: bool) -> Result<QueryResult> {
-        let mut columns = Vec::new(); let mut description = None; let mut rows = Vec::new(); let mut error = None;
+    async fn read_query<'a>(&mut self, charge: Arc<MemoryReservation>, kind: QueryKind<'a>) -> Result<QueryResult<'a>> {
+        let mut columns: Option<Cow<'a, [Column]>> = None;
+        let mut description = None;
+        let mut rows = Vec::new();
+        let mut error = None;
         loop {
             let frame = self.read().await?;
             match frame.tag {
-                b'T' => {
-                    columns = row_description(&frame.bytes)?;
-                    if !extended && columns.iter().any(|column| column.format != Format::Text) {
-                        return Err(protocol("Source query requires text result format"));
+                b'T' => match kind {
+                    QueryKind::Portal(expected) => {
+                        check_portal_description(&frame.bytes, expected)?;
+                        columns = Some(Cow::Borrowed(expected));
                     }
-                    description = Some(frame);
-                }
+                    QueryKind::Simple | QueryKind::Statement => {
+                        let fields = row_description(&frame.bytes)?;
+                        if matches!(kind, QueryKind::Simple) && fields.iter().any(|column| column.format != Format::Text) {
+                            return Err(protocol("Source query requires text result format"));
+                        }
+                        columns = Some(Cow::Owned(fields));
+                        description = Some(frame);
+                    }
+                },
                 b'D' => {
                     if rows.len() >= 1001 { return Err(protocol("Source query exceeded its bounded result-row limit")); }
+                    if matches!(kind, QueryKind::Portal(_)) && columns.is_none() {
+                        return Err(protocol("Snapshot FETCH portal has no RowDescription"));
+                    }
                     let mut input = Input::new(&frame.bytes); let count = usize::from(input.u16()?);
-                    if count != columns.len() { return Err(protocol("DataRow and RowDescription widths differ")); }
+                    if count != columns.as_deref().map_or(0, |fields| fields.len()) { return Err(protocol("DataRow and RowDescription widths differ")); }
                     let mut cells = Vec::with_capacity(count);
                     for _ in 0..count { let length = input.i32()?; if length == -1 { cells.push(None); } else { let length = usize::try_from(length).map_err(protocol)?; let start = input.position(); input.take(length)?; cells.push(Some(start..start + length)); } }
                     input.end()?; rows.push(Row { frame, cells });
                 }
                 b'E' => error = Some(server_error(&frame.bytes)?),
                 b'C' | b'I' | b'N' | b'S' => {},
-                b'1' | b'2' | b't' | b'n' if extended => {},
-                b'Z' => return match error { Some(error) => Err(error), None => Ok(QueryResult { columns, rows, _description: description, _charge: charge }) },
+                b'1' | b'2' | b't' | b'n' if !matches!(kind, QueryKind::Simple) => {},
+                b'Z' => {
+                    if let Some(error) = error { return Err(error); }
+                    if matches!(kind, QueryKind::Portal(_)) && columns.is_none() {
+                        return Err(protocol("Snapshot FETCH portal has no RowDescription"));
+                    }
+                    return Ok(QueryResult { columns: columns.unwrap_or_default(), rows, _description: description, _charge: charge });
+                }
                 _ => return Err(protocol("Unexpected message during a source SQL query")),
             }
         }
@@ -199,21 +234,44 @@ impl Connection {
 }
 
 fn row_description(bytes: &[u8]) -> Result<Vec<Column>> {
-    let mut input = Input::new(bytes); let count = usize::from(input.u16()?); let mut fields = Vec::with_capacity(count);
+    const MIN_COLUMN_DESCRIPTION_BYTES: usize = 19;
+    let mut input = Input::new(bytes);
+    let count = usize::from(input.u16()?);
+    if count > input.remaining() / MIN_COLUMN_DESCRIPTION_BYTES { return Err(protocol("Truncated PostgreSQL message")); }
+    let mut fields = Vec::with_capacity(count);
     for _ in 0..count {
-        let name = input.string()?.to_owned();
-        input.take(6)?;
-        let oid = input.u32()?;
-        input.take(2)?;
-        let typmod = input.i32()?;
-        let format = match input.u16()? {
-            0 => Format::Text,
-            1 => Format::Binary,
-            _ => return Err(protocol("Unknown source query result format")),
-        };
-        fields.push(Column { name, oid, typmod, format });
+        let (name, oid, typmod, format) = described_column(&mut input)?;
+        fields.push(Column { name: name.to_owned(), oid, typmod, format });
     }
-    input.end()?; Ok(fields)
+    input.end()?;
+    Ok(fields)
+}
+
+fn check_portal_description(bytes: &[u8], expected: &[Column]) -> Result<()> {
+    let mut input = Input::new(bytes);
+    if usize::from(input.u16()?) != expected.len() {
+        return Err(protocol("Snapshot FETCH portal width differs from its statement"));
+    }
+    for column in expected {
+        if described_column(&mut input)? != (column.name.as_str(), column.oid, column.typmod, column.format) {
+            return Err(protocol("Snapshot FETCH portal description differs from its bound layout"));
+        }
+    }
+    input.end()
+}
+
+fn described_column<'a>(input: &mut Input<'a>) -> Result<(&'a str, u32, i32, Format)> {
+    let name = input.string()?;
+    input.take(6)?;
+    let oid = input.u32()?;
+    input.take(2)?;
+    let typmod = input.i32()?;
+    let format = match input.u16()? {
+        0 => Format::Text,
+        1 => Format::Binary,
+        _ => return Err(protocol("Unknown source query result format")),
+    };
+    Ok((name, oid, typmod, format))
 }
 
 pub(crate) struct Input<'a> { bytes: &'a [u8], position: usize }
@@ -246,6 +304,85 @@ pub(crate) fn network(error: impl std::fmt::Display) -> Anomaly { Anomaly::new(r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_description_body(columns: &[(&str, u32, i32, Format)]) -> Vec<u8> {
+        let mut bytes = (columns.len() as u16).to_be_bytes().to_vec();
+        for &(name, oid, typmod, format) in columns {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&[0; 7]);
+            bytes.extend_from_slice(&oid.to_be_bytes());
+            bytes.extend_from_slice(&(-1i16).to_be_bytes());
+            bytes.extend_from_slice(&typmod.to_be_bytes());
+            bytes.extend_from_slice(&format.code().to_be_bytes());
+        }
+        bytes
+    }
+
+    async fn write_frame(server: &mut tokio::io::DuplexStream, tag: u8, bytes: &[u8]) {
+        server.write_u8(tag).await.unwrap();
+        server.write_u32((bytes.len() + 4) as u32).await.unwrap();
+        server.write_all(bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_fetch_borrows_one_funded_layout_after_each_portal_description() {
+        let memory = MemoryBudget::new(1 << 20);
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut connection = Connection { socket: Box::new(client), reading: Reading::new(), memory: Arc::clone(&memory), max_message: 1024 };
+        let mut fields = [("n", 23, -1, Format::Text), ("label", 1700, 655364, Format::Text)];
+        write_frame(&mut server, b'T', &row_description_body(&fields)).await;
+        write_frame(&mut server, b'Z', b"T").await;
+        let statement = connection.prepare_snapshot_fetch().await.unwrap();
+        let cursor_bytes = memory.used_bytes();
+        assert!(cursor_bytes > 0);
+        assert!(cursor_bytes < 4096);
+
+        fields[0].3 = Format::Binary;
+        let portal = row_description_body(&fields);
+        let row = [0, 2, 0, 0, 0, 4, 0, 0, 0, 7, 0, 0, 0, 1, b'2'];
+        for _ in 0..2 {
+            write_frame(&mut server, b'T', &portal).await;
+            write_frame(&mut server, b'D', &row).await;
+            write_frame(&mut server, b'Z', b"T").await;
+            let page = connection.snapshot_fetch(&statement).await.unwrap();
+            assert_eq!(page.columns.as_ptr(), statement.columns.as_ptr());
+            assert!(page._description.is_none());
+            assert_eq!(page.rows[0].cell_bytes(0).unwrap(), Some(7i32.to_be_bytes().as_slice()));
+            assert_eq!(page.rows[0].cell(1).unwrap(), Some("2"));
+        }
+        assert_eq!(memory.used_bytes(), cursor_bytes);
+
+        write_frame(&mut server, b'D', &row).await;
+        let error = connection.snapshot_fetch(&statement).await.err().unwrap();
+        assert_eq!(error.message.as_deref(), Some("Snapshot FETCH portal has no RowDescription"));
+        drop(statement);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn snapshot_portal_rejects_changed_and_malformed_descriptions() {
+        let field = ("n", 23, -1, Format::Binary);
+        let valid = row_description_body(&[field]);
+        let expected = row_description(&valid).unwrap();
+        assert!(check_portal_description(&valid, &expected).is_ok());
+        for different in [
+            ("other", 23, -1, Format::Binary),
+            ("n", 20, -1, Format::Binary),
+            ("n", 23, 9, Format::Binary),
+            ("n", 23, -1, Format::Text),
+        ] {
+            assert!(check_portal_description(&row_description_body(&[different]), &expected).is_err());
+        }
+        assert!(check_portal_description(&row_description_body(&[]), &expected).is_err());
+        assert!(check_portal_description(&valid[..valid.len() - 1], &expected).is_err());
+        let mut invalid_format = valid.clone();
+        *invalid_format.last_mut().unwrap() = 2;
+        assert!(check_portal_description(&invalid_format, &expected).is_err());
+        let mut trailing = valid;
+        trailing.push(0);
+        assert!(check_portal_description(&trailing, &expected).is_err());
+    }
+
     #[tokio::test]
     async fn cancellation_preserves_partial_backend_header_and_body() {
         let memory = MemoryBudget::new(1 << 20);

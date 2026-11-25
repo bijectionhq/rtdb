@@ -11,7 +11,7 @@ pub(crate) async fn publication_exists(remote: &Remote, config: &SourceConfig, m
 struct SnapshotTable { table: TableRef, fetch: SnapshotFetch }
 
 pub(crate) struct SnapshotReader {
-    _slot: Connection, query: Connection, vectors: VectorTypes, pub lsn: Lsn, ignored: BTreeSet<TableRef>, tables: VecDeque<TableRef>, table_page: Option<QueryResult>, table: Option<SnapshotTable>, tables_finished: bool, memory: Arc<MemoryBudget>,
+    _slot: Connection, query: Connection, vectors: VectorTypes, pub lsn: Lsn, ignored: BTreeSet<TableRef>, tables: VecDeque<TableRef>, table_page: Option<QueryResult<'static>>, table: Option<SnapshotTable>, tables_finished: bool, memory: Arc<MemoryBudget>,
 }
 impl SnapshotReader {
     pub async fn open(remote: &Remote, config: &SourceConfig, memory: Arc<MemoryBudget>) -> Result<Self> {
@@ -35,8 +35,13 @@ impl SnapshotReader {
         loop {
             if let Some(SnapshotTable { table, fetch }) = &self.table {
                 let result = self.query.snapshot_fetch(fetch).await?;
-                if result.rows.is_empty() { self.query.query("CLOSE rtdb_rows").await?; self.table = None; continue; }
-                let changes = snapshot_rows(table, &result.columns, &result.rows, &self.memory, &self.vectors)?;
+                if result.rows.is_empty() {
+                    drop(result);
+                    self.query.query("CLOSE rtdb_rows").await?;
+                    self.table = None;
+                    continue;
+                }
+                let changes = snapshot_rows(table, result.columns.as_ref(), &result.rows, &self.memory, &self.vectors)?;
                 return Ok(Some(DecodedTransaction::new(self.lsn, None, vec![changes])));
             }
             if self.tables.is_empty() && !self.tables_finished {
