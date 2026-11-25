@@ -5584,7 +5584,7 @@ mod tests {
         let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
         let mut pages = Vec::new();
         while let Some(page) = cursor.next_batch().await.unwrap() { pages.push(page); }
-        drop((cursor, state, write));
+        drop((cursor, state));
         let mut values = BTreeMap::new();
         for page in pages {
             assert_eq!(page.columns.len(), 2);

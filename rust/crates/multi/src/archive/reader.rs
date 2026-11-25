@@ -666,7 +666,7 @@ mod tests {
         ));
         assert!(store.put(&selected, bytes).await.is_err());
         assert!(store.delete(&selected).await.is_err());
-        let stage = VerifiedStage { store: Arc::new(store), contents: CheckpointContents::Replay, legacy_trie_data: true };
+        let stage = VerifiedStage { store: Arc::new(store), region: IoRegion::new(), contents: CheckpointContents::Replay, legacy_trie_data: true };
         assert!(stage.require_serving_envelope().is_err());
         Ok(())
     }

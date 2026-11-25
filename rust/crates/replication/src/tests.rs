@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::CURRENT_STORAGE_VERSION, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::TransactionBuffer;
-use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_storage::{LocalStore, MemoryStore, ObjectKey, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_trie::TrieConfig;
 use rtdb_tx::{Documents, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
 use rtdb_types::{Anomaly, BlockIndex, Interval, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};

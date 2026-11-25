@@ -93,7 +93,7 @@ fn rebase_list<T: ArrowNativeType>(data: ArrayData, memory: &Arc<MemoryBudget>) 
         data.buffers()[0].slice_with_length(start, length)
     } else {
         let start = offsets[0].as_usize();
-        funded_offsets(memory, offset_count, offsets.iter().map(|offset| offset.as_usize() - start))?
+        funded_offsets::<T>(memory, offset_count, offsets.iter().map(|offset| offset.as_usize() - start))?
     };
     data.into_builder().offset(0).buffers(vec![offsets]).child_data(vec![child]).build().map_err(invalid)
 }

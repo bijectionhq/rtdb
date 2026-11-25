@@ -290,10 +290,10 @@ impl BranchIndex {
         let source = record.occurrence(group, selected).ok_or_else(placement_conflict)?;
         let view = self.view(branch, At::Exactly(basis), Layer::Merged, self.head.system_time)?;
         let members = record.members.iter().filter(|member| member.written <= basis);
-        let mut occurrences = record.occurrences().filter(|occurrence| occurrence.written <= basis);
+        let occurrences = || record.occurrences().filter(|occurrence| occurrence.written <= basis);
         if original.written > basis || source.written > basis
-            || members.count() != occurrences.clone().count()
-            || occurrences.any(|occurrence| {
+            || members.count() != occurrences().count()
+            || occurrences().any(|occurrence| {
                 occurrence.receipt_key.is_empty() || occurrence.ordinal.checked_sub(1).is_none_or(|ordinal| {
                     !record.members.contains(&super::custody::CustodyMember {
                         branch: occurrence.target.branch.clone(), table: occurrence.target.table.clone(),

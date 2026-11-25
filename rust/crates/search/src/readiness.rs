@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rtdb_format::keys::ArtefactOwner;
 use rtdb_index::branches::{RankedIndexDeclaration, RankedIndexKind};
+use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Result, TableRef};

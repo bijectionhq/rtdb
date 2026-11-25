@@ -11,7 +11,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit as ArrowTimeUnit
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, MemoryReservation, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, iid_data_type, retain_array, retain_buffer, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, Timestamp, Value};
 
-#[cfg(test)]
 use arrow_array::cast::AsArray;
 
 #[derive(Clone, Debug, PartialEq)]

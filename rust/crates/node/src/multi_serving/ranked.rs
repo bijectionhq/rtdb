@@ -358,7 +358,7 @@ async fn stage(
             trie.artefacts.push(record);
         }
         inventory.push(Primary {
-            metadata: live.block_metadata()?.to_block(Vec::new())?.encode(),
+            metadata: live.block_metadata()?.0.to_block(Vec::new())?.encode(),
             trie: trie.to_proto(&table).encode_to_vec(),
             table,
             definitions,
@@ -597,6 +597,7 @@ impl ObjectStore for MountedStore {
                 key: key.to_string(),
                 start: range.start,
                 end: range.end,
+                length: bytes.len() as u64,
             });
         }
         Ok(bytes.slice(range.start as usize..range.end as usize))
@@ -612,6 +613,7 @@ impl ObjectStore for MountedStore {
                 key: key.to_string(),
                 start: 0,
                 end: length as u64,
+                length: bytes.len() as u64,
             });
         }
         Ok(ObjectObservation {

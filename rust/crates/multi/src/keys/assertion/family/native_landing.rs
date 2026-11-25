@@ -9,7 +9,7 @@ use rtdb_node::{
     },
 };
 use rtdb_types::{
-    OwnedWorld, RootLandingBinding, RootLandingTarget, Timestamp,
+    OwnedWorld, PlacedAttemptScope, RootLandingBinding, RootLandingTarget, Timestamp,
     rtdb_v1::{Basis, MAIN_BRANCH},
 };
 

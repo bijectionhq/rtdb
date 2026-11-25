@@ -107,7 +107,7 @@ fn decimal_parts(bytes: &mut &[u8]) -> Option<(i128, i8)> {
         2 => false,
         _ => return None,
     };
-    let plain = |byte| if negative { !byte } else { byte };
+    let plain = |byte: u8| if negative { !byte } else { byte };
     let power = plain(power);
     if !(1..=2 * DECIMAL_DIGITS).contains(&power) || plain(digits[0]) == 0 {
         return None;

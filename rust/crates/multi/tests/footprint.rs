@@ -33,7 +33,7 @@ async fn the_resident_cost_of_an_idle_deployment() {
         advertise_host: None,
         configuration: NodeConfiguration::from_yaml("server:\n  port: 0\n").unwrap(), allocation_limit_bytes: 4 << 30, control: "127.0.0.1:0".parse().unwrap(),
         availability_zone: "z0".into(), engine_version: None, agent: AgentOptions::new(CellStorage::Local { root: data.path().join("objects") }), lease, claim_wait: Duration::from_millis(2),
-        pool: MemberPool::General, keys: Arc::new(rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap()), cache_dir: data.path().join("cache"), local_compaction: true, capabilities: None,
+        pool: MemberPool::General, keys: Arc::new(rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap()), cache_dir: data.path().join("cache"), local_compaction: true, capabilities: None, classic_retained_flight_key: None,
     }).await.unwrap();
     for index in 0..count { admin::create_deployment(directory.as_ref(), &format!("d{index}"), "bench", 3).await.unwrap(); }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -117,7 +117,7 @@ async fn a_node_can_retain_one_hundred_thousand_idle_placements() {
         allocation_limit_bytes: 512 << 20, control: "127.0.0.1:0".parse().unwrap(),
         availability_zone: "z0".into(), engine_version: None, agent, lease, claim_wait: Duration::from_millis(2),
         pool: MemberPool::General, keys: Arc::new(rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap()),
-        cache_dir: data.path().join("cache"), local_compaction: false, capabilities: None,
+        cache_dir: data.path().join("cache"), local_compaction: false, capabilities: None, classic_retained_flight_key: None,
     }).await.unwrap();
 
     let member = node.lease.id();

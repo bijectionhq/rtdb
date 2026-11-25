@@ -435,7 +435,7 @@ mod tests {
             let before = corpus.retained.bytes();
             let key = id.clone();
             corpus.shadow(partition, id, Some("apples")).unwrap();
-            let matched = corpus.shadows[&partition][&key].as_ref().unwrap();
+            let matched = corpus.shadows[&partition][&EntityIdRef::from(&key) as &dyn ShadowIdentity].as_ref().unwrap();
             assert_eq!(corpus.retained.bytes() - before, expected + 192 + 256 + 4 * matched.frequencies.capacity());
         }
         let before = corpus.retained.bytes();

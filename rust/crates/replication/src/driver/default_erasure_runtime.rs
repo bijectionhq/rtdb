@@ -258,35 +258,40 @@ impl ReplicationDriver {
         Ok(())
     }
 
-    pub(super) async fn verify_default_erasure_upload(
-        &self,
-        catalog: &BlockCatalog,
-        boundary: &ReplicaRecord,
-        upload: &ReplicaRecord,
-    ) -> Result<Option<SelectedRewrite>> {
-        let Some(DefaultErasure::Applied(captured)) = &self.default_erasure else {
-            return Ok(None);
-        };
-        let authority = self
-            .serving
-            .as_ref()
-            .ok_or_else(serving::unavailable)?
-            .checkpoint_authority();
-        let mut selected = default_erasure::selected_rewrite(
-            authority,
-            &self.blocks,
-            &self.logs,
-            catalog,
-            &self.cancellation,
-        )
-        .await?
-        .ok_or_else(default_erasure::invalid)?;
-        if selected.evidence.cut != captured.cut
-            || selected.evidence.boundary != boundary.metadata.position
-        {
-            return Err(default_erasure::invalid());
+    /// Borrows only the fields it reads, so the future stays `Send` while the driver itself (holding its
+    /// partition tails) is not `Sync`.
+    pub(super) fn verify_default_erasure_upload<'a>(
+        &'a self,
+        catalog: &'a BlockCatalog,
+        boundary: &'a ReplicaRecord,
+        upload: &'a ReplicaRecord,
+    ) -> impl Future<Output = Result<Option<SelectedRewrite>>> + Send + 'a {
+        let (erasure, native, blocks, logs, cancellation) =
+            (&self.default_erasure, &self.serving, &self.blocks, &self.logs, &self.cancellation);
+        async move {
+            let Some(DefaultErasure::Applied(captured)) = erasure else {
+                return Ok(None);
+            };
+            let authority = native
+                .as_ref()
+                .ok_or_else(serving::unavailable)?
+                .checkpoint_authority();
+            let mut selected = default_erasure::selected_rewrite(
+                authority,
+                blocks,
+                logs,
+                catalog,
+                cancellation,
+            )
+            .await?
+            .ok_or_else(default_erasure::invalid)?;
+            if selected.evidence.cut != captured.cut
+                || selected.evidence.boundary != boundary.metadata.position
+            {
+                return Err(default_erasure::invalid());
+            }
+            selected.observe_upload(upload)?;
+            Ok(Some(selected))
         }
-        selected.observe_upload(upload)?;
-        Ok(Some(selected))
     }
 }

@@ -1154,11 +1154,11 @@ mod tests {
         let (journal, _, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = slot(&journal, "lost-sample");
         synced(&journal, &stream, 1);
-        let mut raw = BytesMut::new();
-        frame_record(Record {
+        let mut raw = FrameParts::default();
+        raw.push_durable(&Record {
             stream: stream.id, kind: Some(Kind::Append(Entry { guarded: true, ..entry(0) })),
             active_ensemble: Bytes::new(), original_append: Some(true), certified: false,
-        }, &mut raw);
+        });
         // Stop after persisting the raw append, before the second sync can publish its sample.
         journal.append(&mut journal.current.lock(), &raw, true).unwrap();
         drop(journal);

@@ -5,7 +5,7 @@ use prost::Message as _;
 use rtdb_auth::{OriginalCustodyOperation, VerifiedWorkloadGrant};
 use rtdb_crypt::tokens::CustodyReadProof;
 use rtdb_node::{
-    Database, DatabaseAccess, SystemClock,
+    Database, DatabaseAccess, SessionIdentity, SystemClock,
     serving::ServingDriver,
     serving::custody_release::{
         CustodyCarrierAuthority, CustodyContributors, CustodyProviderInstallation,
@@ -1106,7 +1106,7 @@ mod tests {
     #[test]
     fn custody_admit_has_a_distinct_operation_and_reply() {
         let response = serde_json::json!({
-            "operation": "admit", "registrations": [], "frame_sha256": [1; 32].to_vec(), "read_proofs": []
+            "operation": "admit", "registrations": [], "frame_sha256": ([1; 32].to_vec()), "read_proofs": []
         });
         assert!(matches!(
             serde_json::from_value::<Request>(response.clone()).unwrap(),

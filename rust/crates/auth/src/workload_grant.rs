@@ -554,7 +554,7 @@ mod tests {
         assert_eq!(authority["role"], "funded-appointment");
         let raw = |expires_at_micros| json!({
             "version": 2, "audience": "assignment", "database": "exact", "incarnation": incarnation,
-            "grant_id": [8; 16], "expires_at_micros": expires_at_micros, "authority": authority,
+            "grant_id": ([8; 16]), "expires_at_micros": expires_at_micros, "authority": authority,
         });
         let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
             raw, "https://assignment.example.invalid/", config, "funded", Timestamp(100), Timestamp(0),
@@ -571,7 +571,7 @@ mod tests {
         assert!(context.check_key(&[5; 32]).is_ok());
         assert!(context.check_key(&[6; 32]).is_err());
         let mut changed = raw(90);
-        changed["authority"]["writer"]["namespace"] = json!([9; 32]);
+        changed["authority"]["writer"]["namespace"] = json!(([9; 32]));
         assert_ne!(first.receipt_namespace(), verify(&changed, &enrolled).unwrap().receipt_namespace());
     }
 
@@ -593,7 +593,7 @@ mod tests {
         };
         let raw = |scope: &OriginalFamilyGrant| json!({
             "version": 4, "audience": "families", "database": "exact", "incarnation": incarnation,
-            "grant_id": [11; 16], "expires_at_micros": 100, "original_family": scope,
+            "grant_id": ([11; 16]), "expires_at_micros": 100, "original_family": scope,
         });
         let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
             raw, "https://family.example.invalid/", config, "owner", Timestamp(90), Timestamp(0),
@@ -609,7 +609,7 @@ mod tests {
         assert!(first.original_family("exact", authority, Timestamp(90)).is_err());
         assert!(verify(&json!({
             "version": 2, "audience": "families", "database": "exact", "incarnation": incarnation,
-            "grant_id": [11; 16], "expires_at_micros": 100,
+            "grant_id": ([11; 16]), "expires_at_micros": 100,
             "authority": { "role": "receipt-recovery", "original_namespace": first.receipt_namespace(),
                 "family": "original-family-write" },
         }), &assignment).is_err());
@@ -644,12 +644,12 @@ mod tests {
         let v5 = issuer.clone().for_original_family_readback(point);
         let mut raw = json!({
             "version": 5, "audience": "readback", "database": "exact", "incarnation": incarnation,
-            "grant_id": [11; 16], "expires_at_micros": 100,
+            "grant_id": ([11; 16]), "expires_at_micros": 100,
             "original_family_readback": {
-                "line": line, "generation": [12; 16], "creation_key": [13; 16],
+                "line": line, "generation": ([12; 16]), "creation_key": ([13; 16]),
                 "carrier": Point::new("app.protected_carriers", "selected".into(), Timestamp(20)).unwrap(),
                 "observation": Basis::new(incarnation, 4).to_bytes(),
-                "witness": { "receipt": applied(5), "placement": [14; 16], "projection": { "kind": "reserve" } },
+                "witness": { "receipt": applied(5), "placement": ([14; 16]), "projection": { "kind": "reserve" } },
             },
         });
         let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
