@@ -64,7 +64,7 @@ pub(super) fn plan_journal_placements(
 ) -> Vec<(usize, Vec<MemberId>)> {
     let eligible = |id: &MemberId| members.get(id).is_some_and(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Eligible && member.is_live(now));
     let draining = |id: &MemberId| members.get(id).is_some_and(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Draining);
-    let mut load: BTreeMap<&MemberId, usize> = members.keys().filter(|id| eligible(id)).map(|id| (id, 0)).collect();
+    let mut load: BTreeMap<&MemberId, usize> = members.keys().filter(|id| eligible(*id)).map(|id| (id, 0)).collect();
     let movable: Vec<usize> = (0..deployments.len()).filter(|&index| require_movable(&deployments[index]).is_ok()).collect();
     for &index in &movable {
         for id in planned_journals(&deployments[index]) {
@@ -80,7 +80,7 @@ pub(super) fn plan_journal_placements(
         if !next.iter().any(|id| draining(id)) { continue; }
         for slot in 0..next.len() {
             if !draining(&next[slot]) { continue; }
-            let mut candidates: Vec<_> = load.iter().filter(|(id, _)| !next.contains(id)).map(|(id, count)| (*count, *id)).collect();
+            let mut candidates: Vec<_> = load.iter().filter(|&(&id, _)| !next.contains(id)).map(|(id, count)| (*count, *id)).collect();
             candidates.sort();
             let replacement = candidates.into_iter().map(|(_, id)| id).find(|id| {
                 let mut trial = next.clone();
