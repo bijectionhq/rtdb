@@ -81,8 +81,8 @@ An invalid directory or page uses the held trie's bounded IID fallback.
 | Selection retains the source pages and winning positions.
 Identity-only and document responses gather the final Arrow row positions.
 Selection compares typed identity cells directly and returns the distances as an Arrow column.
-The response reuses the identifier buffers when their layout conforms to the existing wire schema.
-The legacy full-document action carries the identity in both locations defined by that version.
+The response borrows a canonical identifier array under its selected page's reservation.
+The legacy `SpatialHeld.v2` full-document action carries the identity in both locations required by Bijection's fallback decoder.
 
 | RTDB held document transport
 | Full document replies gathered and serialized geometry and index carriers that Bijection discarded on receipt.
