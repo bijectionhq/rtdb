@@ -611,7 +611,7 @@ async fn ipc_action_result_stream(
     frames: impl Iterator<Item = Result<ActionResult, Status>> + Send + 'static,
     plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
 ) -> Result<Response<Output<ActionResult>>, Status> {
-    let mut response = crate::service::handoff_action_results(call, frames, plaintext).await?;
+    let mut response = crate::service::handoff_action_results(call, frames, plaintext, true).await?;
     response.metadata_mut().insert(OWNED_IPC_HEADER, tonic::metadata::MetadataValue::from_static("stream-v1"));
     Ok(response)
 }

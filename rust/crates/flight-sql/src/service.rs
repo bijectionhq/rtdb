@@ -716,11 +716,11 @@ pub(crate) async fn action_result_stream(
     plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
 ) -> Result<Response<Output<flight::Result>>, Status> {
     if !values.iter().any(Result::is_ok) { return result_stream(call, values); }
-    handoff_action_results(call, values, plaintext).await
+    handoff_action_results(call, values, plaintext, false).await
 }
 
 pub(crate) async fn handoff_action_results<T, I>(
-    call: Call, values: I, plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
+    call: Call, values: I, plaintext: Arc<rtdb_storage::sealing::PlaintextView>, expose_cutoff: bool,
 ) -> Result<Response<Output<T>>, Status>
 where
     T: Send + 'static,
@@ -728,7 +728,11 @@ where
     I::IntoIter: Send + 'static,
 {
     let first = call.cancellation.run_until_cancelled(plaintext.grant()).await.ok_or_else(cancelled)?.map_err(status)?;
-    let (headers, cutoff) = call.delivery_headers(&first, false)?;
+    let (mut headers, cutoff) = call.delivery_headers(&first, false)?;
+    if expose_cutoff && let Some(deadline) = first.transport_deadline() {
+        let until = deadline.wire_nanos().ok_or_else(|| Status::unavailable("Owned reply cutoff cannot be routed"))?;
+        headers.insert("x-rtdb-owned-reply-until", until.to_string().parse().map_err(arrow)?);
+    }
     let stream: Output<T> = Box::pin(futures::stream::unfold(
         (call, values.into_iter(), plaintext, Some(first), false),
         move |(call, mut values, plaintext, mut first, stopped)| async move {

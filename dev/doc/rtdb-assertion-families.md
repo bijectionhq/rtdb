@@ -634,5 +634,6 @@ The rank projection also supplies the original event positions of the carrier, a
 The serving owner checks those positions against the current winners at the requested valid instant and checks the same active landing in the Original family vault.
 It checks the original applied transactions, exact current world registration, complete Binary-key purge floors and the ordered erasure marker for the rank relation.
 It repeats the checks during the existing plaintext delivery handoff and bounds the response by the retained pin's cutoff.
+The owned IPC response carries the resulting absolute cutoff in `x-rtdb-owned-reply-until` as epoch nanoseconds so the receiver can bound downstream custody.
 The scope is the exact retained parent publication in the same installation.
 Independent restores still require reciprocal destination evidence and dependent erasure projection and settlement under the Original family fence.
