@@ -98,7 +98,6 @@ impl Service {
         request: proto::OpenExactReadRequest,
     ) -> Result<proto::OpenExactReadResponse, Status> {
         use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
-        use rtdb_types::rtdb_v1::At;
 
         let route = self.follower().ok_or_else(|| error::unsupported(FEATURE))?;
         if !(1..=MAX_TTL_MILLIS).contains(&request.ttl_millis) {
@@ -119,14 +118,9 @@ impl Service {
         let basis = Basis::from_bytes(&basis.value).map_err(error::anomaly)?;
         let (database, cut, generation, context) = tokio::time::timeout_at(deadline, async {
             let database = route.current(&self.0.node).map_err(error::follower)?;
-            let (view, _) = route
+            let view = route
                 .reader
-                .query(
-                    At::Exactly(basis),
-                    self.0.node.now(),
-                    false,
-                    &call.cancellation,
-                )
+                .retained_view(basis, self.0.node.now(), &call.cancellation)
                 .await
                 .map_err(error::follower)?;
             if view.cut.basis != basis {
