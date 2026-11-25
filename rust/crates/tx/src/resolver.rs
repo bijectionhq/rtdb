@@ -2598,6 +2598,16 @@ impl<'a> OpenTransaction<'a> {
                 {
                     return Err(unavailable());
                 }
+                // A range a decision depends on over its clock interval is
+                // undetermined when acceptance falls outside that interval;
+                // its witness `until` already carries the earliest valid-time
+                // boundary among the matched rows and the covered absence.
+                if let Some(clock) = revealed.as_ref().and_then(|revealed| revealed.clock)
+                    && !clock.contains(self.decision_time())
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/undetermined-range",
+                        "Acceptance falls outside the range observation's clock interval"));
+                }
                 let head = base.relation_event_frontier(&relation.table(owner))?;
                 if head != *frontier {
                     let exact = async {
