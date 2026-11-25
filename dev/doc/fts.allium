@@ -611,6 +611,11 @@ contract SealedDerivedSearchSegments {
     -- A derived segment can be partially inverted back to its source text, so it carries its source's protection and is erased with it.
     -- Bijection writes the protected text of a labelled partition into its own derived search relation (`<partition>_search`), in the same commit as the sealed source row, and erases its rows with the source.
 
+    @invariant WorldRankOccurrence
+        -- Opening a protected World projection requires a registered derivative and its accepted member occurrence before and after the authenticated open.
+        -- A derivative shares the member's deployment and incarnation, with a distinct stage bound to the exact authoring world, relation and Binary key.
+        -- Transport still requires the current family release fence for each retained contributor.
+
     @invariant HeldOriginalRootRank
         -- Held replay preserves the ordinary Root derivative address and typed rank fields under destination storage custody.
         -- Each withdrawn derivative keeps only its certified Original residue and the complete erase floor and relation marker.
