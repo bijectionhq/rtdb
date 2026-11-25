@@ -54,7 +54,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--rebalance-write-bytes-per-second BYTES] [--rebalance-tail-bytes BYTES] [--rebalance-cache-bytes BYTES] [--rebalance-query-cpu-ms-per-second MS] [--read-sessions-per-node N --max-read-width N] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE [--recovery-native-destination FILE]]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE [--recovery-native-destination FILE] [--recovery-classic-application-layout FILE]]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -836,6 +836,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 )?;
                 let service = if arguments.present("recovery-native-destination") {
                     service.with_classic_destination(std::path::Path::new(arguments.required("recovery-native-destination")?))?
+                } else {
+                    service
+                };
+                let service = if arguments.present("recovery-classic-application-layout") {
+                    service.with_classic_application_layout(std::path::Path::new(arguments.required("recovery-classic-application-layout")?))?
                 } else {
                     service
                 };

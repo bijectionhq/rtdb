@@ -1,8 +1,14 @@
 use std::sync::Arc;
 
+mod application;
+mod layout;
 mod outcomes;
+mod points;
 mod projection;
+pub(crate) use application::{ApplicationEvidence, ApplicationReadback};
+pub(crate) use layout::ApplicationLayout;
 pub(crate) use outcomes::{ReceiptHistory, ReceiptLookup, ReceiptLookups, ReceiptReadback};
+pub(crate) use points::{PointHistory, PointHistoryRead, PointSelector};
 pub(crate) use projection::{ClassicPrepared, ClassicProjection};
 use std::time::Duration;
 
@@ -131,6 +137,13 @@ pub(crate) enum ClassicRead {
     Inventory,
     Projection([u8; 32]),
     Receipt(ReceiptLookups),
+    Application {
+        request: [u8; 32],
+        begin: [u8; 32],
+        cut: rtdb_types::TransactionKey,
+        points: Option<PointHistoryRead>,
+        layout: Arc<ApplicationLayout>,
+    },
 }
 
 pub(crate) async fn read_classic_migration(
@@ -149,6 +162,7 @@ pub(crate) async fn read_classic_migration(
         ));
     }
     let source_directory = Arc::clone(&directory);
+    let check_retention = !matches!(&read, ClassicRead::Application { points: Some(_), .. });
     with_stage(
         directory,
         storage,
@@ -297,6 +311,11 @@ pub(crate) async fn read_classic_migration(
                 let (mut projection, mut receipt) = match read {
                     ClassicRead::Inventory => (None, None),
                     ClassicRead::Projection(request) => (Some(projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))), None),
+                    ClassicRead::Application { request, begin, cut, points, layout } if !serving_suffix => (Some(
+                        projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))
+                            .with_application(application::Application::new(layout, begin, cut, destination).with_points(points)),
+                    ), None),
+                    ClassicRead::Application { .. } => return Err(unavailable("Application closure lookup requires the complete canonical suffix replay")),
                     ClassicRead::Receipt(lookup) if !serving_suffix => (None, Some(lookup)),
                     ClassicRead::Receipt(_) => return Err(unavailable("Original receipt lookup requires the complete canonical suffix replay")),
                 };
@@ -312,10 +331,8 @@ pub(crate) async fn read_classic_migration(
                     &snapshot, &relations, &retained, &recovered, bootstrap, serving_suffix,
                 )).transpose()?;
                 authority.confirm(name).await?;
-                if RetainedInventory::of(
-                    &read_source(source_directory.as_ref(), bootstrap).await?,
-                    capture,
-                )? != retained
+                let confirmed = read_source(source_directory.as_ref(), bootstrap).await?;
+                if check_retention && RetainedInventory::of(&confirmed, capture)? != retained
                 {
                     return Err(unavailable(
                         "Classic migration retention changed during inspection",

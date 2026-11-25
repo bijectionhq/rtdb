@@ -444,6 +444,63 @@ An active retained World or replica suffix pin blocks this source fence.
 `discard_classic_migration_stage` accepts the same selector before fencing and reports the exact scratch disposal receipt once available.
 After fencing, recover the same attempt from its retained state.
 
+### Sealed application closure readback
+
+Send `read_classic_migration_application_closure` to the authenticated Original recovery listener with the existing migration `selection`, full retained `candidate_binding`, and the exact application `classic_cut` (`tx_id` and `system_time`).
+The Original listener checks the named tenant, capture, sealed fence, exact scratch stage and verified ciphertext, then reproduces the bound projection from the retained replay.
+The application reader requires the exact committed Classic transaction, the mounted closure point for the exact Begin, and the same selection under the SQL release cutoff for its old epoch.
+It compares the retained writer predecessor, closed writer and Original custody pin, and checks that the closure still holds at the sealed terminal.
+Keeper sealing alone supplies none of those application records.
+
+Commission the Original recovery listener with `--recovery-classic-application-layout FILE`.
+The trusted JSON file takes `format:1`, `closure`, `writer`, `custody`, `sql_cutoff_prefix`, `inventory` and `sql_release`.
+The three points use `table:{schema,table}` and a typed `id`.
+The cutoff uses the closure table and the mounted prefix followed by the old epoch as 20 decimal digits.
+`inventory` is an ordered array of distinct public table references that includes the closure table and each SQL release role.
+`sql_release` maps its distinct `grants`, `rows`, `execution_units`, `joined` and `stopped` roles to public table references.
+The file is bounded at 16 KiB and 64 inventory tables.
+Both readback actions refuse when the layout is absent.
+
+The success outcome `classic_migration_application_readback` contains `selection`, `candidate_binding` and `application`.
+The application value carries `classic_cut`, `source_epoch`, `source_assignment`, `custody_sha256`, `selection_sha256` (SHA-256 of the exact persisted Bijection closure selection bytes), `closure`, `sql_release_cutoff`, `closed_writer`, `predecessor_writer`, `custody_pin`, and `writer_acknowledged`.
+Each row stamp carries `written` (the Classic transaction key), `position` (an original transaction and ordinal where retained), `commit_position`, `valid_time` and `row_sha256` (SHA-256 of RTDB archive JSON for the exact row cells).
+The `inventory` lists the mounted public application control relations at the application cut.
+It returns a history digest where present and typed row identifiers with stamps, within 4096 rows per relation and 2 MiB of row entries.
+At that cut, the release-row and execution-unit inventories must be empty.
+A retained SQL release grant must be cancelled or match its exact ordered joined response or producer-stop receipt at or before the grant's written cut.
+Join locators use the slash-separated lowercase hex cell-history, usher, conductor and response IDs, and stop locators use the cell-history and usher IDs.
+A producer-stop receipt supplies its exact nonzero big-endian 64-bit `stopped_at` value.
+`retained` describes the separately observed fenced Classic directory inventory, including its digest.
+The request accepts no SQL, table or row selectors, and the response exposes no business receipt outcomes or control documents.
+Bijection must match the response to its independently retained writer selection and obtain each required reader, protected delivery and custody disposition from its authenticated owner.
+The read requires no native catalog connection and changes no source fence, Original obligation, or route.
+
+#### Literal point histories at the application cut
+
+The same authenticated Original envelope accepts `read_classic_migration_point_histories` with `selection`, `candidate_binding`, `classic_cut`, `valid_at` and `points`.
+Each point has `table` with `schema` and `table`, and an RTDB typed `id` such as `{"String":"authority"}`.
+For the application close, include both the mounted closure and writer points.
+Use the application fence's system time for `valid_at` when comparing with the retained PgWire observation.
+The action takes one or two distinct points from that mounted pair and one finite valid-time instant in signed Unix microseconds.
+The relation name is bounded at 255 bytes, a typed ID at 1024 encoded JSON bytes, and the complete newline-terminated request frame at 16 KiB.
+Each point permits up to 4096 events and 1 MiB of JSON-encoded event entries.
+
+The `classic_migration_point_histories` outcome echoes `selection`, `candidate_binding`, `classic_cut`, `valid_at` and `points` in request order.
+Each returned point has `table`, `id`, `events` and the zero-based `effective_event` index into `events`.
+An event contains `written` (`tx_id` and `system_time`), `header` (`position`, `iid`, `system_from`, `commit_position`, `valid_time` and `op`) and `document`.
+A positioned header carries `position:{"transaction":7,"ordinal":2}`, `iid` is a 16-byte JSON array, and `valid_time` has inclusive `lower` and exclusive `upper` in Unix microseconds.
+`document` is the literal RTDB `Value` object, with tagged fields such as `{"_id":{"Utf8":"authority"},"writer":{"Utf8":""}}` and `{"binding":{"Binary":[...]}}`.
+Historical deletes carry `op:"Delete"` and `document:null`.
+
+Events preserve certified system order through the inclusive application cut across all retained valid intervals for that point.
+An anchored historical event with no Original ordinal has `position:null`; it carries the authenticated transaction mapping in `written`.
+The effective event is the last event whose interval contains `valid_at`, and must match an unredacted positioned Put at the requested application transaction.
+Two co-written effective events have distinct Original ordinals.
+The reader refuses a missing, deleted, redacted, ambiguous, unpositioned or differently ordered effective image.
+It proves the same retained Begin and application close for the requested points in one certified replay.
+The consumer compares the literal binding bytes and the exact closed writer fields with its independently retained Bijection selection and fence.
+This outcome carries no Original obligation inventory or disposition and excludes the selected business receipt relation.
+
 ### Private native candidate
 
 The Original recovery owner authenticates the existing recovery envelope against the exact fenced Classic `name`, `authority` and `capture`.

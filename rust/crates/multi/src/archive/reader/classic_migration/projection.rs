@@ -20,12 +20,17 @@ use rtdb_types::{
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::{RelationInventory, RelationKind, RetainedInventory, inconsistent, is_transactions};
+use super::{
+    RelationInventory, RelationKind, RetainedInventory,
+    application::{Application, ApplicationEvidence},
+    inconsistent, is_transactions,
+};
 use crate::archive::{encode, sha256};
 
 pub(crate) struct ClassicPrepared {
     pub(crate) checkpoint: Option<bytes::Bytes>,
     pub(crate) proof: ClassicProjection,
+    pub(crate) application: Option<ApplicationEvidence>,
     _charges: Vec<Arc<MemoryReservation>>,
 }
 
@@ -71,6 +76,7 @@ pub(super) struct Projection {
     cuts: BTreeMap<TxId, Timestamp>,
     events: BTreeMap<TableRef, Vec<(StoredEvent, [u8; 32])>>,
     charges: Vec<Arc<MemoryReservation>>,
+    application: Option<Application>,
 }
 
 impl Projection {
@@ -88,7 +94,13 @@ impl Projection {
             cuts: BTreeMap::new(),
             events: BTreeMap::new(),
             charges: Vec::new(),
+            application: None,
         }
+    }
+
+    pub(super) fn with_application(mut self, application: Application) -> Self {
+        self.application = Some(application);
+        self
     }
 
     pub(super) fn observe(
@@ -102,6 +114,9 @@ impl Projection {
             self.cut(position.transaction, event.system_from)?;
         }
         if is_transactions(table) {
+            if let Some(application) = &mut self.application {
+                application.observe_transaction(&event, fingerprint)?;
+            }
             if let StoredOperation::Put(document) = &event.operation
                 && let (
                     Some(Value::I64(id)),
@@ -215,6 +230,9 @@ impl Projection {
                 system_time: time,
             })?;
             for (table, event) in effects.remove(&tx).into_iter().flatten() {
+                if let Some(application) = &mut self.application {
+                    application.observe_event(&table, tx, &event, &self.memory)?;
+                }
                 let written = event.position.map(|position| position.transaction);
                 index.apply_classic_event(&table, event, written)?;
             }
@@ -230,6 +248,9 @@ impl Projection {
                 })?;
             }
         }
+        let application = self.application.take()
+            .map(|application| application.finish(&index, retained, inventory, &self.memory))
+            .transpose()?;
         let mut transactions = TransactState::new(incarnation);
         transactions.replace_applied_index(index)?;
         let mut outstanding = Vec::new();
@@ -314,6 +335,7 @@ impl Projection {
         }
         Ok(ClassicPrepared {
             checkpoint,
+            application,
             proof: ClassicProjection {
                 sha256,
                 terminal: self.terminal,

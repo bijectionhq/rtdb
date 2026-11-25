@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use super::{RecoveryService, Reply, valid_manifest};
 use crate::archive::{
-    self, ClassicProjection, ClassicRead, ReceiptHistory, ReceiptLookup, ReceiptLookups,
-    StageSelector,
+    self, ApplicationEvidence, ClassicProjection, ClassicRead, PointHistoryRead, ReceiptHistory,
+    ReceiptLookup, ReceiptLookups, StageSelector,
 };
 
 #[derive(Deserialize, Serialize)]
@@ -123,6 +123,11 @@ pub(super) enum Operation {
     OriginalReceipt {
         id: EntityId,
         coverage: Option<CoveragePoint>,
+    },
+    Application {
+        candidate_binding: Binding,
+        classic_cut: TransactionKey,
+        points: Option<PointHistoryRead>,
     },
 }
 
@@ -256,6 +261,49 @@ impl RecoveryService {
             evidence.original_receipt = Some(readback.receipt);
             evidence.original_receipt_coverage = readback.coverage;
             return Ok(Reply::ClassicMigrationDestination { evidence });
+        }
+        if let Operation::Application { candidate_binding, classic_cut, points } = operation {
+            let Some(layout) = &self.classic_application_layout else {
+                return Ok(Reply::Refused);
+            };
+            if !evidence.matches_binding(&candidate_binding)
+                || candidate_binding.begin_sha256 == [0; 32]
+                || candidate_binding.catalog.is_nil()
+                || candidate_binding.catalog == authority
+                || self.classic_destination.as_ref().is_some_and(|relay| relay.catalog() != candidate_binding.catalog)
+                || !classic_cut.at_or_before(evidence.terminal)
+                || points.as_ref().is_some_and(|points| !layout.admits(points)
+                    || evidence.selection.original_receipt_table.as_ref().is_some_and(|table| points.selects(table)))
+            {
+                return Err(conflict());
+            }
+            let (_, prepared, _) = Box::pin(archive::read_classic_migration(
+                directory, &self.storage, self.keys.as_ref(), self.classic_stage_selector(&evidence),
+                authority, evidence.selection.ciphertext_sha256, self.hosted_task.clone(),
+                ClassicRead::Application {
+                    request: request_sha256, begin: candidate_binding.begin_sha256, cut: classic_cut,
+                    points, layout: Arc::clone(layout),
+                },
+            )).await?;
+            let prepared = prepared.ok_or_else(conflict)?;
+            let checkpoint = prepared.checkpoint.as_ref().ok_or_else(conflict)?;
+            if prepared.proof.sha256 != candidate_binding.projection_sha256
+                || prepared.proof.checkpoint_sha256 != Some(candidate_binding.checkpoint_sha256)
+                || prepared.proof.native_basis != candidate_binding.basis
+                || checkpoint.len() != candidate_binding.checkpoint_bytes as usize
+                || checkpoint.len() > MAX_CHECKPOINT_BYTES
+            {
+                return Err(conflict());
+            }
+            return Ok(match prepared.application.ok_or_else(conflict)? {
+                ApplicationEvidence::Closure(application) => Reply::ClassicMigrationApplicationReadback {
+                    selection: evidence.selection, candidate_binding, application,
+                },
+                ApplicationEvidence::Points(histories) => Reply::ClassicMigrationPointHistories {
+                    selection: evidence.selection, candidate_binding, classic_cut,
+                    valid_at: histories.valid_at, points: histories.points,
+                },
+            });
         }
         let Some(relay) = self.classic_destination.as_ref() else {
             return Ok(Reply::Refused);

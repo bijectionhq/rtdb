@@ -7,7 +7,7 @@ use rtdb_directory::{
     CheckpointCaptureRetirement, CheckpointStageIntent, CheckpointSuffixCustody, ClassicMigration, ClassicMigrationSource,
     DeploymentRecord, Directory, DisposalReceipt, HostedTask, ServingInventory,
 };
-use rtdb_server::multi::classic_ingress::Authorization as CandidateAuthorization;
+use rtdb_server::multi::classic_ingress::{Authorization as CandidateAuthorization, Binding as CandidateBinding};
 use rtdb_storage::sealing::DeliveryIo;
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
 use serde::{Deserialize, Serialize};
@@ -172,6 +172,18 @@ enum Action {
     HoldClassicMigrationDestinationReady { selection: classic_destination::Selection, authorization: CandidateAuthorization },
     ClassicMigrationDestinationReadyStatus { selection: classic_destination::Selection, authorization: CandidateAuthorization },
     ReadClassicMigrationOriginalReceipt { selection: classic_destination::Selection, id: rtdb_types::EntityId, coverage: Option<classic_destination::CoveragePoint> },
+    ReadClassicMigrationApplicationClosure {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        classic_cut: rtdb_types::TransactionKey,
+    },
+    ReadClassicMigrationPointHistories {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        classic_cut: rtdb_types::TransactionKey,
+        valid_at: rtdb_types::Timestamp,
+        points: Vec<archive::PointSelector>,
+    },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
         stage_operation: Uuid,
@@ -329,6 +341,18 @@ enum Reply {
         bootstrap: rtdb_directory::CheckpointTransferBootstrap,
     },
     ClassicMigrationDestination { evidence: classic_destination::Evidence },
+    ClassicMigrationApplicationReadback {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        application: archive::ApplicationReadback,
+    },
+    ClassicMigrationPointHistories {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        classic_cut: rtdb_types::TransactionKey,
+        valid_at: rtdb_types::Timestamp,
+        points: Vec<archive::PointHistory>,
+    },
     ClassicMigrationInventoryInspected {
         inventory: archive::ClassicMigrationInventory,
     },
@@ -362,6 +386,7 @@ pub struct RecoveryService {
     control: ControlKey,
     memory: Arc<MemoryBudget>,
     classic_destination: Option<classic_destination::Relay>,
+    classic_application_layout: Option<Arc<archive::ApplicationLayout>>,
 }
 
 impl RecoveryService {
@@ -386,11 +411,17 @@ impl RecoveryService {
             control,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
+            classic_application_layout: None,
         })
     }
 
     pub fn with_classic_destination(mut self, configuration: &Path) -> Result<Self> {
         self.classic_destination = Some(classic_destination::Relay::from_file(configuration)?);
+        Ok(self)
+    }
+
+    pub fn with_classic_application_layout(mut self, configuration: &Path) -> Result<Self> {
+        self.classic_application_layout = Some(archive::ApplicationLayout::installed(configuration)?);
         Ok(self)
     }
 
@@ -904,6 +935,16 @@ impl RecoveryService {
             Action::ReadClassicMigrationOriginalReceipt { selection, id, coverage } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection, classic_destination::Operation::OriginalReceipt { id, coverage },
             )).await,
+            Action::ReadClassicMigrationApplicationClosure { selection, candidate_binding, classic_cut } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection,
+                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None },
+            )).await,
+            Action::ReadClassicMigrationPointHistories { selection, candidate_binding, classic_cut, valid_at, points } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection,
+                classic_destination::Operation::Application {
+                    candidate_binding, classic_cut, points: Some(archive::PointHistoryRead::new(valid_at, points)?),
+                },
+            )).await,
             Action::InspectClassicMigrationInventory { destination, stage_operation, staged_manifest_sha256, ciphertext_sha256 } => {
                 if installation.checkpoint_stage.is_some() || destination.is_nil() || stage_operation.is_nil()
                     || !valid_manifest(&staged_manifest_sha256)
@@ -1282,7 +1323,9 @@ fn admits_frame_size(action: &Action, bytes: usize) -> bool {
     let maximum = match action {
         Action::StageClassicMigrationDestination { .. } | Action::InstallClassicMigrationDestination { .. }
         | Action::ClassicMigrationDestinationStatus { .. } | Action::HoldClassicMigrationDestinationReady { .. }
-        | Action::ClassicMigrationDestinationReadyStatus { .. } => CANDIDATE_FRAME_BYTES,
+        | Action::ClassicMigrationDestinationReadyStatus { .. }
+        | Action::ReadClassicMigrationApplicationClosure { .. }
+        | Action::ReadClassicMigrationPointHistories { .. } => CANDIDATE_FRAME_BYTES,
         Action::ReadClassicMigrationOriginalReceipt { .. } => ORIGINAL_RECEIPT_FRAME_BYTES,
         _ => FRAME_BYTES,
     };
@@ -1362,6 +1405,7 @@ mod tests {
             token: Token::new(&token)?, org: "cell".into(), broker: None, hosted_task: None,
             control: ControlKey::default(), memory: MemoryBudget::new(1 << 20),
             classic_destination: None,
+            classic_application_layout: None,
             storage: CellStorage::Local { root: temporary.path().join("serving") },
             archive: CellStorage::Local { root: temporary.path().join("archive") },
             keys: Arc::new(crate::keys::LocalKeyService::new(&temporary.path().join("keys"))?),
@@ -1448,6 +1492,8 @@ mod tests {
             )?),
             control: ControlKey(Some(Arc::new(crate::capability::CellSecret::new(&[3; 32])?))),
             memory: MemoryBudget::new(4096),
+            classic_destination: None,
+            classic_application_layout: None,
         };
         let manifest = URL_SAFE_NO_PAD.encode([4; 32]);
         installation.checkpoint_captures.insert(capture, rtdb_directory::CheckpointCapture {
@@ -1515,6 +1561,7 @@ mod tests {
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
+            classic_application_layout: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local { root: temporary.path().join("serving") },
@@ -1606,6 +1653,7 @@ mod tests {
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
+            classic_application_layout: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local { root: temporary.path().join("serving") },
@@ -1719,6 +1767,7 @@ mod tests {
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
+            classic_application_layout: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {

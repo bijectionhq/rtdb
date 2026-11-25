@@ -617,6 +617,10 @@ contract LogService {
         -- The verifier can retain independently sealed replay frames and detached bodies under the exact scratch stage with the terminal transaction and lifetime floors preserved.
         -- An import inventory reader authenticates the staged checkpoint, every replay segment and detached body, and the ordered replay commitment before reporting the exact source relation inventory.
         -- The reader holds scratch storage while examining the replay and observes the original fence and retained obligations without acquiring original journal or object write authority.
+        -- The authenticated Original can reopen the independent application writer closure at its exact committed cut from the selected sealed replay.
+        -- The Original installed application layout fixes the closure and writer points and the disposition relations before any retained read.
+        -- The same replay proves the matching SQL release cutoff, closed authority row and fixed application disposition census while external Original obligations remain under their owners.
+        -- A separate bounded point-history read returns only selected literal co-written application rows from that certified replay, preserving their typed addresses, valid intervals and Original event order.
         -- The migration scratch stage stays private and cannot seed a Classic target writer.
 
     @invariant ClassicMigrationNativeCandidate
