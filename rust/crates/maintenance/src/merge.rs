@@ -17,7 +17,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_schema, copy_compaction_batch}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_index::{PartitionValue, TrieState};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
+use rtdb_storage::{HeldView, IoRegion, LocalFile, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -324,6 +324,25 @@ async fn open_metadata(
     Ok(InputMetadata { file: MetadataFile::read_file(file)?, _reservation: reservation })
 }
 
+/// An object already on this node's disk, read in place; the open file keeps its contents through a concurrent delete.
+pub(crate) struct LocalInput(LocalFile);
+
+impl Read for LocalInput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> { let mut file = self.0.file(); file.read(buf) }
+}
+
+impl Seek for LocalInput {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> { let mut file = self.0.file(); file.seek(position) }
+}
+
+fn open_local_metadata(local: LocalFile, memory: &Arc<MemoryBudget>) -> Result<InputMetadata> {
+    let mut file = LocalInput(local);
+    let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
+    let reservation = memory.reserve(layout.full_allocation_bound()?)?;
+    let file = ArrowFile::from_inspected_reader(file, None, layout)?;
+    Ok(InputMetadata { file: MetadataFile::read_file(file)?, _reservation: reservation })
+}
+
 pub fn open_input(
     mut file: impl Read + Seek + Send + 'static,
     memory: &Arc<MemoryBudget>,
@@ -341,6 +360,7 @@ pub(crate) struct PrimaryReader {
 
 pub(crate) enum PrimaryData {
     File(File),
+    Local(LocalFile),
     Retained { bytes: Bytes, spill: PathBuf },
 }
 
@@ -375,6 +395,10 @@ impl PrimaryData {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let file = match self {
             Self::File(file) => file,
+            Self::Local(local) => {
+                let (reader, opening) = open_input(LocalInput(local), memory)?;
+                return consume(PrimaryReader { reader, _opening: opening });
+            }
             Self::Retained { bytes, spill } => {
                 let inspected = inspect_file_reserved(&mut Cursor::new(bytes.as_ref()), |bytes| memory.reserve(bytes));
                 if let Some(layout) = if_memory_available(inspected)?
@@ -607,17 +631,25 @@ impl SegmentCompactor {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let data_key = ObjectKey::new(slug.data_key(key)).map_err(crate::invalid)?;
             let meta_key = ObjectKey::new(slug.metadata_key(key)).map_err(crate::invalid)?;
-            let data_size = self.store.head(&data_key).await.map_err(crate::invalid)?.size;
-            let metadata_size = self.store.head(&meta_key).await.map_err(crate::invalid)?.size;
+            let data_local = self.store.cached_local_file(&data_key).await.map_err(crate::invalid)?;
+            let metadata_local = self.store.cached_local_file(&meta_key).await.map_err(crate::invalid)?;
+            let data_size = if data_local.is_some() { 0 } else { self.store.head(&data_key).await.map_err(crate::invalid)?.size };
+            let metadata_size = if metadata_local.is_some() { 0 } else { self.store.head(&meta_key).await.map_err(crate::invalid)?.size };
             input_bytes = input_bytes.checked_add(data_size).and_then(|bytes| bytes.checked_add(metadata_size))
                 .ok_or_else(|| crate::invalid("Input file size overflow"))?;
             if input_bytes > self.config.temporary_byte_limit {
                 return Err(crate::invalid("Compaction temporary disk budget exceeded"));
             }
-            let data = PrimaryData::stored(self.store.as_ref(), &data_key, directory.join(format!("input-{index}.arrow")),
-                data_size, &self.memory, retained_data, cancellation).await?;
-            metadata.push(open_metadata(self.store.as_ref(), &meta_key, &directory.join(format!("meta-{index}.arrow")),
-                metadata_size, &self.memory, retained_metadata, cancellation).await?);
+            let data = match data_local {
+                Some(local) => PrimaryData::Local(local),
+                None => PrimaryData::stored(self.store.as_ref(), &data_key, directory.join(format!("input-{index}.arrow")),
+                    data_size, &self.memory, retained_data, cancellation).await?,
+            };
+            metadata.push(match metadata_local {
+                Some(local) => open_local_metadata(local, &self.memory)?,
+                None => open_metadata(self.store.as_ref(), &meta_key, &directory.join(format!("meta-{index}.arrow")),
+                    metadata_size, &self.memory, retained_metadata, cancellation).await?,
+            });
             let data = data.read(&self.memory, cancellation, Ok)?;
             inputs.push(InputSegment { key: key.clone(), data });
         }
