@@ -12,6 +12,8 @@ pub enum Error {
     InvalidRange { key: String, start: u64, end: u64, length: u64 },
     #[error("different bytes already occupy immutable object {0}")]
     ConflictingObject(String),
+    #[error("storage task failed: Immutable object {key} has a different length from {length}")]
+    ImmutableLength { key: String, length: usize },
     #[error("I/O at {path}: {source}")]
     Io { path: PathBuf, #[source] source: std::io::Error },
     #[error("invalid local log at {path}, byte {offset}: {reason}")]
@@ -83,7 +85,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::GuardedAppendUnsupported => (Category::Unsupported, "rtdb.storage/guarded-append-unsupported", serde_json::json!({})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
             Error::AudienceWorkLimit => (Category::Busy, "rtdb.storage/audience-work-limit", serde_json::json!({})),
-            Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
+            Error::Task(_) | Error::ImmutableLength { .. } => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
             Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),
             Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),

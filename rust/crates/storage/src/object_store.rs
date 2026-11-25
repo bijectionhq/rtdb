@@ -417,7 +417,7 @@ pub trait ObjectStore: Send + Sync {
 }
 
 pub(crate) fn wrong_size(key: &ObjectKey, length: usize) -> Error {
-    Error::Task(format!("Immutable object {key} has a different length from {length}"))
+    Error::ImmutableLength { key: key.to_string(), length }
 }
 
 /// Returns the unsupported anomaly for a store attachment with no recoverable search staging owner.
