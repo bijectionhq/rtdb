@@ -1,5 +1,5 @@
 use super::*;
-use crate::{columnar::{BatchCursor, BatchExpressions, BatchFilter, ColumnBatch}, cursor::OwnedRow, pages::{OwnedPage, PageBuilder, PageCursor}};
+use crate::{columnar::{BatchCursor, BatchExpressions, BatchFilter, BatchProject, ColumnBatch}, cursor::OwnedRow, pages::{OwnedPage, PageBuilder, PageCursor}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{BinaryOp,ColumnId,Field};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
@@ -117,6 +117,140 @@ async fn projection_publishes_complete_rows_with_retained_cell_charges() {
         assert_eq!(values, [Value::I64(value), Value::Utf8("text".into())]);
     }
     drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);
+}
+
+#[tokio::test]
+async fn passthrough_aliases_reuse_selections_and_charge_value_copies() {
+    use arrow_array::StringArray;
+    use crate::columnar::{Column, SelectedColumn, single_batch};
+
+    let execution = execution();
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let ty = LogicalType::Scalar(ScalarType::Utf8);
+    let field = Arc::new(rtdb_columnar::to_field("source", &ty).unwrap());
+    let payload = "s".repeat(1 << 17);
+    let selected = Column::Selected(SelectedColumn::new(
+        vec![Some((Arc::new(StringArray::from(vec![payload.as_str()])), Arc::clone(&field), Some(ty), None))],
+        Arc::new(vec![(0, 0)]),
+    ));
+    let mut batch = ColumnBatch::settled(Vec::new(), 1, memory.reserve(256).unwrap()).unwrap();
+    batch.append_column(selected, memory.reserve(0).unwrap(), memory).unwrap();
+    let copied = "v".repeat(4096);
+    batch.append_column(Column::Values(vec![Value::Utf8(copied.clone())]), memory.reserve(0).unwrap(), memory).unwrap();
+    let kept = memory.used_bytes();
+    batch.append_column(Column::Values(vec![Value::Utf8("unused".repeat(1 << 14))]), memory.reserve(0).unwrap(), memory).unwrap();
+
+    let pressure = memory.reserve(memory.available_bytes() - (16 << 10)).unwrap();
+    let input = single_batch(Some(batch), Arc::clone(&execution.context));
+    let mut project = BatchProject::new(input, vec![1, 0, 0, 1], Arc::clone(memory));
+    let page = project.next_batch().await.unwrap().unwrap();
+    drop(pressure);
+    assert!(memory.used_bytes() >= kept + copied.len());
+    assert!(memory.used_bytes() < kept + (16 << 10));
+    assert_eq!(page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>(), [
+        Value::Utf8(copied.clone()), Value::Utf8(payload.clone()), Value::Utf8(payload), Value::Utf8(copied),
+    ]);
+
+    let input = single_batch(Some(page), Arc::clone(&execution.context));
+    let mut project = BatchProject::new(input, Vec::new(), Arc::clone(memory));
+    let empty = project.next_batch().await.unwrap().unwrap();
+    assert_eq!(empty.len, 1);
+    assert!(empty.columns.is_empty());
+    drop(empty);
+
+    let zero_rows = ColumnBatch::empty_with_width(1, memory).unwrap();
+    let input = single_batch(Some(zero_rows), Arc::clone(&execution.context));
+    let mut project = BatchProject::new(input, vec![0, 0], Arc::clone(memory));
+    let empty = project.next_batch().await.unwrap().unwrap();
+    assert_eq!((empty.len, empty.columns.len()), (0, 2));
+    drop(empty);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn expression_structs_retain_each_source_charge_across_aliases() {
+    use arrow_array::{StringArray, StructArray};
+    use crate::columnar::{Column, single_batch};
+
+    let execution = execution();
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let ty = LogicalType::Scalar(ScalarType::Utf8);
+    let left = field(0, ty.clone());
+    let right = field(1, ty.clone());
+    let schema = Schema::new(vec![left.clone(), right.clone()]).unwrap();
+    let mut batch = ColumnBatch::settled(Vec::new(), 1, memory.reserve(256).unwrap()).unwrap();
+    for (source, text) in [(&left, "a"), (&right, "b")] {
+        let column = Column::Arrow {
+            array: Arc::new(StringArray::from(vec![text.repeat(1 << 17)])),
+            field: Arc::new(rtdb_columnar::to_field(&source.name, &ty).unwrap()),
+            logical: Some(ty.clone()),
+        };
+        batch.append_column(column, memory.reserve(0).unwrap(), memory).unwrap();
+    }
+    let record = Expr::Struct(vec![("right".into(), right.expression()), ("left".into(), left.expression()), ("again".into(), right.expression())]);
+    let rows = Expr::RowCopy(vec![right.clone(), left.clone()]);
+    let projections = vec![right.expression(), left.expression(), record, rows, int(9)];
+    let pressure = memory.reserve(memory.available_bytes() - (16 << 10)).unwrap();
+    let input = single_batch(Some(batch), Arc::clone(&execution.context));
+    let mut project = BatchExpressions::new(input, schema, projections, execution.clone());
+    let page = project.next_batch().await.unwrap().unwrap();
+    drop(pressure);
+    assert_eq!(page.working_set_bytes(memory).unwrap(), memory.used_bytes() - baseline);
+    let [Column::Arrow { array: right_array, .. }, Column::Arrow { array: left_array, .. },
+        Column::Arrow { array: assembled, .. }, Column::Arrow { array: copied, .. }, constant] = page.columns.as_slice()
+    else { panic!("Expected shared Arrow children and a computed constant"); };
+    let assembled = assembled.as_any().downcast_ref::<StructArray>().unwrap();
+    let copied = copied.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(assembled.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["right", "left", "again"]);
+    assert_eq!(copied.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), [right.name.as_str(), left.name.as_str()]);
+    for record in [assembled, copied] {
+        assert!(Arc::ptr_eq(record.column(0), right_array));
+        assert!(Arc::ptr_eq(record.column(1), left_array));
+    }
+    assert!(Arc::ptr_eq(assembled.column(2), right_array));
+    assert_eq!(constant.value(0).unwrap(), Value::I64(9));
+    drop(page);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn nullable_struct_projection_admits_validity_and_keeps_child_payload() {
+    use arrow_array::{Array, StringArray, StructArray};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::{Column, single_batch};
+
+    let execution = execution();
+    let memory = &execution.context.memory;
+    let payload = "x".repeat(1 << 17);
+    let values = Arc::new(StringArray::from(vec![Some("keep"), Some(payload.as_str()), None]));
+    let address = values.value_data().as_ptr();
+    let struct_array = StructArray::new(
+        vec![ArrowField::new("child", DataType::Utf8, true)].into(), vec![values],
+        Some(NullBuffer::from(vec![true, false, true])),
+    );
+    let physical = Arc::new(ArrowField::new("record", struct_array.data_type().clone(), true));
+    let logical = rtdb_columnar::from_field(&physical).unwrap();
+    let input_field = field(0, logical.clone());
+    let schema = Schema::new(vec![input_field.clone()]).unwrap();
+    let expr = Expr::Field {
+        expr: Box::new(input_field.expression()), name: "child".into(), data_type: LogicalType::Scalar(ScalarType::Utf8).maybe(),
+    };
+    let batch = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(struct_array), field: physical, logical: Some(logical) }],
+        3, memory.reserve(0).unwrap()).unwrap();
+    let pressure = memory.reserve(memory.available_bytes() - (8 << 10)).unwrap();
+    let input = single_batch(Some(batch), Arc::clone(&execution.context));
+    let mut project = BatchExpressions::new(input, schema, vec![expr], execution.clone());
+    let page = project.next_batch().await.unwrap().unwrap();
+    drop(pressure);
+    let Column::Arrow { array, field, logical } = &page.columns[0] else { panic!("Expected an Arrow child"); };
+    assert!(field.is_nullable());
+    assert_eq!(*logical, Some(LogicalType::Scalar(ScalarType::Utf8).maybe()));
+    let child = array.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(child.value_data().as_ptr(), address);
+    assert_eq!(child.iter().collect::<Vec<_>>(), [Some("keep"), None, None]);
 }
 
 #[tokio::test]

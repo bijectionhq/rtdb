@@ -2100,6 +2100,8 @@ surface QueryAccess {
 
     @guarantee ColumnarScanProjection
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.
+        -- A projection that shares input buffers retains their original charges through aliases, struct children, and assembled records.
+        -- The projection admits its own copied values, descriptors, and validity storage.
         -- System catalog and inspection scans batch their produced rows at the scan boundary.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
