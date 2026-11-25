@@ -2939,18 +2939,13 @@ fn scalar_layout(data_type: &DataType) -> bool {
 fn size_error() -> rtdb_types::Anomaly { invalid("column-size", "Column page exceeds addressable memory") }
 
 pub(crate) fn fragment_column(array: ArrayRef, field: Arc<ArrowField>, logical: Option<LogicalType>,
-    memory: &Arc<MemoryBudget>, metadata: &mut MemoryReservation) -> Result<Column> {
+    owner: &Arc<MemoryReservation>) -> Column {
     if !nested_layout(array.data_type()) {
-        metadata.grow_to(metadata.bytes().checked_add(array.get_array_memory_size()).ok_or_else(size_error)?)?;
-        return Ok(Column::Arrow { array, field, logical });
+        return Column::Arrow { array, field, logical };
     }
-    let bytes = array.len().checked_mul(std::mem::size_of::<(usize, usize)>()).and_then(|bytes| bytes.checked_add(512))
-        .and_then(|bytes| bytes.checked_add(field.size())).ok_or_else(size_error)?;
-    metadata.grow_to(metadata.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
-    let size = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
-    let reservation = memory.reserve(size)?;
-    let cells = (0..array.len()).map(|row| (0, row)).collect();
-    Ok(Column::Selected(SelectedColumn::new(vec![Some((array, field, logical, Some(reservation)))], Arc::new(cells))))
+    let cells = SelectedRows::Span(0..array.len());
+    let sources = Arc::new(vec![Some((array, field, logical, Some(Arc::clone(owner))))]);
+    Column::Selected(SelectedColumn { sources, cells })
 }
 
 pub(crate) fn nested_layout(data_type: &DataType) -> bool {
