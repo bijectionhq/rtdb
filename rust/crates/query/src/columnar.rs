@@ -611,16 +611,63 @@ impl ColumnBatch {
         Ok(Self { columns, len, reservation, appended: Vec::new() })
     }
     pub(crate) fn duplicate_for_replay(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let base = self.columns.len().checked_mul(size_of::<Column>())
+        let width = self.columns.len();
+        let base = width.checked_mul(size_of::<Column>() + size_of::<Arc<MemoryReservation>>())
             .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
         let bytes = self.columns.iter().try_fold(base, |bytes, column| {
-            bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error)
+            let copied = match column {
+                Column::Arrow { logical, .. } => logical.as_ref().map_or(Ok(0), |logical| {
+                    logical.retained_bytes()?.checked_sub(size_of::<LogicalType>()).ok_or_else(size_error)
+                })?,
+                Column::Selected(_) => 0,
+                Column::Values(values) => values.iter().try_fold(0usize, |bytes, value| {
+                    let shared = Self::replay_value_backing(value)?;
+                    let owned = value.retained_bytes()?.checked_sub(shared).ok_or_else(size_error)?;
+                    bytes.checked_add(owned).ok_or_else(size_error)
+                })?,
+            };
+            bytes.checked_add(copied).ok_or_else(size_error)
         })?;
         let reservation = memory.reserve(bytes)?;
-        Self::settled(self.columns.iter().map(Column::duplicate).collect(), self.len, reservation)
+        let mut columns = Vec::with_capacity(width);
+        let mut appended = Vec::with_capacity(width);
+        for (position, column) in self.columns.iter().enumerate() {
+            let shares_storage = match column {
+                Column::Arrow { .. } | Column::Selected(_) => true,
+                Column::Values(values) => values.iter().try_fold(false, |shared, value| {
+                    Ok::<_, rtdb_types::Anomaly>(shared || Self::replay_value_backing(value)? != 0)
+                })?,
+            };
+            let owner = if shares_storage { self.column_reservation(position) } else { &reservation };
+            columns.push(column.duplicate());
+            appended.push(Arc::clone(owner));
+        }
+        Ok(Self { columns, len: self.len, reservation, appended })
     }
 
-    fn charged(&self) -> usize { self.appended.iter().fold(self.reservation.bytes(), |bytes, lease| bytes.saturating_add(lease.bytes())) }
+    fn replay_value_backing(value: &Value) -> Result<usize> {
+        fn sum<'a>(mut values: impl Iterator<Item = &'a Value>) -> Result<usize> {
+            values.try_fold(0usize, |bytes, value| {
+                bytes.checked_add(ColumnBatch::replay_value_backing(value)?).ok_or_else(size_error)
+            })
+        }
+
+        match value {
+            Value::List(list) | Value::FixedSizeList(list) => match list.view() {
+                rtdb_types::ListView::Values(values) => sum(values.iter()),
+                _ => list.retained_payload_bytes(),
+            },
+            Value::Set(values) => sum(values.iter()),
+            Value::Map { entries, .. } => sum(entries.iter().flat_map(|(key, value)| [key, value])),
+            Value::Struct(fields) => sum(fields.values()),
+            _ => Ok(0),
+        }
+    }
+
+    fn collect_charges(&self, owners: &mut HashSet<*const MemoryReservation>) -> usize {
+        let appended = self.appended.iter().filter(|lease| !Arc::ptr_eq(lease, &self.reservation));
+        self.reservation.bytes().saturating_add(distinct_charges(appended, owners))
+    }
 
     pub(crate) fn validate_readable(&self, context: &crate::QueryContext) -> Result<()> {
         for row in 0..self.len {
@@ -638,14 +685,14 @@ impl ColumnBatch {
         let sources = selections.clone().try_fold(0usize, |size, column| {
             size.checked_add(column.sources.len()).ok_or_else(size_error)
         })?;
-        let _scratch = memory.reserve(sources.checked_mul(64).ok_or_else(size_error)?)?;
+        let slots = sources.checked_add(self.appended.len()).ok_or_else(size_error)?;
+        let _scratch = memory.reserve(slots.checked_mul(64).ok_or_else(size_error)?)?;
         let mut allocations = HashSet::new();
-        let mut bytes = self.charged();
+        let mut bytes = self.collect_charges(&mut allocations);
         for selected in selections {
             for (_, _, _, owner) in selected.sources.iter().flatten() {
                 let held = match owner {
-                    Some(owner) if Arc::ptr_eq(owner, &self.reservation) || self.appended.iter().any(|lease| Arc::ptr_eq(owner, lease)) => 0,
-                    Some(owner) if allocations.insert(Arc::as_ptr(owner)) => owner.bytes(),
+                    Some(owner) if !Arc::ptr_eq(owner, &self.reservation) && allocations.insert(Arc::as_ptr(owner)) => owner.bytes(),
                     _ => 0,
                 };
                 bytes = bytes.checked_add(held).ok_or_else(size_error)?;
@@ -815,6 +862,59 @@ impl ColumnBatch {
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {
         Self::take_rows_with_custody(sources, rows, positions, false, memory)
+    }
+
+    pub(crate) fn take_sorted_span(&self, rows: Range<usize>, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        use std::mem::size_of;
+
+        if rows.is_empty() || rows.end > self.len { return Ok(None); }
+        let mut metadata = positions.len().checked_mul(size_of::<Column>() + size_of::<Arc<MemoryReservation>>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        for &position in positions {
+            let Some(Column::Arrow { array, field, logical }) = self.columns.get(position) else { return Ok(None); };
+            if rows.end > array.len() || array.data_type() != field.data_type()
+                || !scalar_layout(array.data_type()) || array.data_type() == &DataType::Null
+            {
+                return Ok(None);
+            }
+            if array.null_count() != 0 && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary) {
+                for row in rows.clone() {
+                    if array.is_null(row) && flat_copy_bytes(field, array.as_ref(), row)? != 0 { return Ok(None); }
+                }
+            }
+            let descriptor = array.get_array_memory_size().saturating_sub(array.get_buffer_memory_size());
+            let logical = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?;
+            metadata = metadata.checked_add(descriptor).and_then(|bytes| bytes.checked_add(logical)).ok_or_else(size_error)?;
+        }
+        let reservation = memory.reserve(metadata)?;
+        let scratch = positions.len().checked_mul(256).ok_or_else(size_error)?;
+        let _scratch = memory.reserve(scratch)?;
+        let mut columns = Vec::with_capacity(positions.len());
+        let mut appended = Vec::with_capacity(positions.len());
+        let mut views = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let Column::Arrow { array, .. } = &self.columns[position] else { unreachable!("The sort projection was admitted") };
+            let view = if rows.len() == array.len() { Arc::clone(array) } else { array.slice(rows.start, rows.len()) };
+            views.push(view);
+            appended.push(Arc::clone(self.column_reservation(position)));
+        }
+        let visible = rtdb_columnar::visible_buffer_bytes(&views).unwrap_or(0);
+        // A row can be small even when its view pins a large variable-width or shared page allocation.
+        let backing = distinct_charges(&appended, &mut HashSet::new())
+            .max(views.iter().map(|array| array.get_buffer_memory_size()).max().unwrap_or(0));
+        let compact = backing > visible.saturating_mul(2).saturating_add(4096);
+        for (index, (&position, view)) in positions.iter().zip(views).enumerate() {
+            let Column::Arrow { array, field, logical } = &self.columns[position] else { unreachable!("The sort projection was admitted") };
+            let array = if compact {
+                let (array, owner) = compact_arrow_rows(array.as_ref(), field, rows.clone(), memory)?;
+                appended[index] = owner;
+                array
+            } else {
+                view
+            };
+            columns.push(Column::Arrow { array, field: Arc::clone(field), logical: logical.clone() });
+        }
+        Ok(Some(Self { columns, len: rows.len(), reservation, appended }))
     }
 
     pub(crate) fn select_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -1000,6 +1100,11 @@ impl ColumnBatch {
     }
 }
 
+fn distinct_charges<'a>(leases: impl IntoIterator<Item = &'a Arc<MemoryReservation>>, owners: &mut HashSet<*const MemoryReservation>) -> usize {
+    leases.into_iter().filter(|lease| owners.insert(Arc::as_ptr(lease)))
+        .fold(0usize, |bytes, lease| bytes.saturating_add(lease.bytes()))
+}
+
 pub(crate) fn ordinal_column(len: usize, start: i64, name: &str, context: &crate::QueryContext)
     -> Result<(Column, Arc<MemoryReservation>)> {
     ordinal_column_by(len, name, context, |index| start + index as i64)
@@ -1081,7 +1186,7 @@ fn shifted_columns_share_the_input_reservations_across_appends() {
             batch.append_column(column, reservation, &memory).unwrap();
         }
     }
-    assert_eq!(batch.working_set_bytes(&memory).unwrap(), batch.charged());
+    assert_eq!(batch.working_set_bytes(&memory).unwrap(), batch.collect_charges(&mut HashSet::new()));
     assert!(memory.used_bytes() < bytes * 2 + 64 * 1024);
     drop(batch);
     assert_eq!(memory.used_bytes(), 0);
@@ -1740,12 +1845,12 @@ fn ordered_gather_composes_previous_selections_and_keeps_arrow_custody() {
     assert_eq!(output.buffers()[1].as_ptr(), data);
     assert_eq!(row, 0);
     assert!(memory.used_bytes() >= 1 << 20);
-    let payload = gathered.working_set_bytes(&memory).unwrap() - gathered.charged();
+    let payload = gathered.working_set_bytes(&memory).unwrap() - gathered.collect_charges(&mut HashSet::new());
     assert!(payload >= 1 << 20);
     let duplicate = ColumnBatch::settled(
         vec![gathered.columns[0].duplicate(), gathered.columns[0].duplicate()], 5, memory.reserve(256).unwrap(),
     ).unwrap();
-    assert_eq!(duplicate.working_set_bytes(&memory).unwrap() - duplicate.charged(), payload);
+    assert_eq!(duplicate.working_set_bytes(&memory).unwrap() - duplicate.collect_charges(&mut HashSet::new()), payload);
     assert_eq!((0..5).map(|row| gathered.columns[0].value(row).unwrap()).collect::<Vec<_>>(),
         [narrow.clone(), wide.clone(), Value::Null, narrow, wide]);
     drop(duplicate);
@@ -2447,7 +2552,11 @@ impl ColumnBatch {
         if selected == self.len { return Ok(self); }
         let spans = self.columns.iter().filter(|column| matches!(column, Column::Selected(SelectedColumn { cells: SelectedRows::Span(_), .. }))).count();
         let picks = spans.checked_mul(selected).and_then(|cells| cells.checked_mul(std::mem::size_of::<(usize, usize)>())).ok_or_else(size_error)?;
-        let reservation = memory.reserve(self.charged().saturating_add(mask.len()).saturating_add(picks))?;
+        let bytes = {
+            let _owners = memory.reserve(self.appended.len().checked_mul(64).ok_or_else(size_error)?)?;
+            self.collect_charges(&mut HashSet::new())
+        };
+        let reservation = memory.reserve(bytes.saturating_add(mask.len()).saturating_add(picks))?;
         let predicate = arrow_array::BooleanArray::from(mask.to_vec());
         let columns = self.columns.into_iter().map(|column| Ok(match column {
             Column::Arrow { array, field, logical } => Column::Arrow { array: arrow_select::filter::filter(array.as_ref(), &predicate).map_err(|error| invalid("column-filter", error))?, field, logical },

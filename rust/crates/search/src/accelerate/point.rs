@@ -167,21 +167,33 @@ impl PackedVisibility {
         let file = rtdb_query::HistoryObject::open(request, key, record.file_size()).await?;
         let bytes = file.read(root.range()).await?;
         let _directory = request.memory.reserve(bytes.as_slice().len().saturating_mul(2).saturating_add(4096))?;
+        let _selection = request.memory.reserve(rows.len().saturating_mul(128).saturating_add(4096))?;
         let iids = rows.iter().map(|row| row.version.iid).collect();
+        let mut selected = Vec::with_capacity(rows.len());
+        for (ordinal, row) in rows.iter().enumerate() {
+            if let SearchRowLocation::Persisted { page, row, .. } = row.location {
+                selected.push((page, row, ordinal));
+            }
+        }
+        selected.sort_unstable();
         let ranges = entity_history::ranges(bytes.as_slice(), root, entity_history::forward_owner(&table.slug, trie, &id, definition.version), Some(&iids))?;
         let mut result = BTreeMap::new();
+        let mut remaining = selected.as_mut_slice();
         for range in ranges {
             if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-            let selected: Vec<_> = rows.iter().filter_map(|row| match row.location {
-                SearchRowLocation::Persisted { page, row: index, .. } if page == range.page
-                    && index >= range.first_row && index - range.first_row < range.rows => Some((row, index - range.first_row)),
-                _ => None,
-            }).collect();
+            let first = remaining.partition_point(|&(page, row, _)| (page, row) < (range.page, range.first_row));
+            let last = remaining.partition_point(|&(page, row, _)| (page, row) < (range.page, range.first_row + range.rows));
+            let (through_range, later) = remaining.split_at_mut(last);
+            remaining = later;
+            let selected = &mut through_range[first..];
             if selected.is_empty() { continue; }
+            selected.sort_unstable_by_key(|&(_, _, ordinal)| ordinal);
             let bytes = file.read(range.range()).await?;
             let page = range.read_forward(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)),
                 definition.columns.len(), self.column, request.memory)?;
-            for (row, index) in selected {
+            for &(_, index, ordinal) in selected.iter() {
+                let row = &rows[ordinal];
+                let index = index - range.first_row;
                 let iid = row.version.iid;
                 if let Some(revision) = page.revision(index as usize, iid, row.origin.expect("stable forward event"))? {
                     result.insert(iid, revision);

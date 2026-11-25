@@ -11,12 +11,13 @@ use arrow_ipc::{
     MetadataVersion,
     reader::read_record_batch,
     root_as_message,
-    writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions},
+    writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
 };
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 #[cfg(test)]
 use bytes::Bytes;
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{MemoryReservation, RetainedArray};
+use rtdb_format::ipc::RecordSpans;
 use rtdb_types::{Iid, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
 
@@ -266,32 +267,51 @@ impl Layout {
         ))
     }
 
-    fn build(self, field: &Field, cells: Vec<AtomRef<'_>>, bytes: usize) -> Result<ArrayRef> {
-        if let Some(kind) = self.plain() {
-            return kind.build(cells.into_iter(), bytes);
+    fn build<'a>(
+        slot: usize,
+        cells: impl ExactSizeIterator<Item = AtomRef<'a>> + Clone,
+    ) -> Result<(Self, ArrayRef)> {
+        let mut counts = [0usize; KINDS.len()];
+        let mut payloads = [0usize; KINDS.len()];
+        let mut mask = 0;
+        let mut bytes = 0usize;
+        for cell in cells.clone() {
+            let kind = Kind::of(cell);
+            mask |= kind.bit();
+            counts[kind as usize] += 1;
+            let payload = cell.retained_bytes();
+            payloads[kind as usize] = payloads[kind as usize].saturating_add(payload);
+            bytes = bytes.saturating_add(payload);
         }
+        if bytes > i32::MAX as usize {
+            return Err(invalid());
+        }
+        let layout = Self(mask);
+        if let Some(kind) = layout.plain() {
+            return Ok((layout, kind.build(cells, bytes)?));
+        }
+
+        let field = layout.field(slot)?;
         let DataType::Union(fields, UnionMode::Dense) = field.data_type() else {
             return Err(invalid());
         };
-        let mut legs: [Vec<_>; KINDS.len()] = std::array::from_fn(|_| Vec::new());
-        let mut payloads = [0usize; KINDS.len()];
+        let children = layout.kinds().map(|kind| {
+            let leg = kind as usize;
+            kind.build(LegCells { cells: cells.clone(), kind, remaining: counts[leg] }, payloads[leg])
+        }).collect::<Result<Vec<_>>>()?;
+
+        let mut positions = [0usize; KINDS.len()];
         let mut ids = Vec::with_capacity(cells.len());
         let mut offsets = Vec::with_capacity(cells.len());
         for cell in cells {
             let kind = Kind::of(cell) as usize;
             ids.push(kind as i8);
-            offsets.push(i32::try_from(legs[kind].len()).map_err(format_error)?);
-            payloads[kind] = payloads[kind].saturating_add(cell.retained_bytes());
-            legs[kind].push(cell);
+            offsets.push(i32::try_from(positions[kind]).map_err(format_error)?);
+            positions[kind] += 1;
         }
-        let children = self
-            .kinds()
-            .map(|kind| kind.build(legs[kind as usize].iter().copied(), payloads[kind as usize]))
-            .collect::<Result<_>>()?;
-        Ok(Arc::new(
-            UnionArray::try_new(fields.clone(), ids.into(), Some(offsets.into()), children)
-                .map_err(format_error)?,
-        ))
+        let union = UnionArray::try_new(fields.clone(), ids.into(), Some(offsets.into()), children)
+            .map_err(format_error)?;
+        Ok((layout, Arc::new(union)))
     }
 
     fn interleave(
@@ -436,6 +456,32 @@ impl Layout {
     }
 }
 
+struct LegCells<I> {
+    cells: I,
+    kind: Kind,
+    remaining: usize,
+}
+
+impl<'a, I: Iterator<Item = AtomRef<'a>>> Iterator for LegCells<I> {
+    type Item = AtomRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let kind = self.kind;
+        let cell = self.cells.find(|&cell| Kind::of(cell) == kind);
+        self.remaining -= 1;
+        cell
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<'a, I: Iterator<Item = AtomRef<'a>>> ExactSizeIterator for LegCells<I> {}
+
 fn interleave_array(arrays: &[&dyn Array], indices: &[(usize, usize)]) -> Result<ArrayRef> {
     arrow_select::interleave::interleave(arrays, indices).map_err(|error| match error {
         arrow_schema::ArrowError::OffsetOverflowError(_) => invalid(),
@@ -502,8 +548,13 @@ fn compact_slice(array: &dyn Array, start: usize, len: usize) -> Result<Option<A
     .then_some(slice))
 }
 
-#[derive(Debug)]
-pub(super) struct Postings(KeyBatch);
+pub(super) struct Postings(KeyBatch, Vec<RetainedArray>);
+
+impl std::fmt::Debug for Postings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, formatter)
+    }
+}
 
 impl Postings {
     pub fn build(keys: &[(Bucket, Tuple<'_>, AddressRef<'_>)]) -> Result<Self> {
@@ -543,7 +594,7 @@ impl Postings {
                 Arc::new(identities.finish()),
             ],
         )
-        .map(Self)
+        .map(|batch| Self(batch, Vec::new()))
     }
 
     pub fn interleave(rows: &[(&Self, usize)]) -> Result<Self> {
@@ -556,7 +607,25 @@ impl Postings {
             batch,
             BatchKind::Posting.prefix(),
             true,
-        )?))
+        )?, Vec::new()))
+    }
+
+    pub fn fund_new<'a>(
+        &mut self,
+        grant: &mut MemoryReservation,
+        sources: impl Iterator<Item = &'a Self> + Clone,
+    ) -> Result<usize> {
+        let batch = &mut self.0.batch;
+        self.1 = batch.columns().iter().map(|column| {
+            RetainedArray::new(column.clone(), grant, |identity| {
+                sources.clone().any(|source| source.1.iter().any(|array| array.funds(identity)))
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        *batch = RecordBatch::try_new(
+            batch.schema(), self.1.iter().map(|array| array.array().clone()).collect(),
+        ).map_err(format_error)?;
+        Ok(self.1.capacity().saturating_mul(size_of::<RetainedArray>())
+            .saturating_add(self.0.layouts.len().saturating_mul(256)))
     }
 
     pub fn len(&self) -> usize {
@@ -595,22 +664,23 @@ impl Postings {
         self.0.batch.columns().get(self.0.prefix + slot)
     }
 
-    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
-        self.0.stage(header, suffix_len)
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize, grant: &Arc<MemoryReservation>) -> Result<KeyBatchEncoding<'a>> {
+        self.0.stage(header, suffix_len, grant)
     }
 
     #[cfg(test)]
     fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
-        let encoding = self.stage(header, suffix.len())?;
+        let grant = rtdb_columnar::MemoryBudget::new(32 << 20).reserve(32 << 20)?;
+        let encoding = self.stage(header, suffix.len(), &grant)?;
         let mut bytes = Vec::with_capacity(encoding.encoded_len());
-        encoding.append_batch(&mut bytes);
+        encoding.append_batch(&mut bytes)?;
         bytes.extend_from_slice(suffix);
         Ok(bytes)
     }
 
     pub fn decode(bytes: Buffer, max_rows: usize) -> Result<(Self, Buffer)> {
         let (batch, suffix) = KeyBatch::decode(bytes, max_rows, BatchKind::Posting)?;
-        let postings = Self(batch);
+        let postings = Self(batch, Vec::new());
         for row in 0..postings.len() {
             let (bucket, _, address) = postings.at(row);
             if (!address.key.is_empty()
@@ -785,11 +855,7 @@ impl SelectedColumn<'_> {
                 Ok((layout, selected))
             }
             Self::Typed(_, None, _) => unreachable!("a missing column has null type"),
-            Self::Cells(cells) => {
-                let layout = Layout(cells.iter().fold(0, |mask, &cell| mask | Kind::of(cell).bit()));
-                let values = layout.build(&layout.field(slot)?, cells, bytes)?;
-                Ok((layout, values))
-            }
+            Self::Cells(cells) => Layout::build(slot, cells.iter().copied()),
         }
     }
 }
@@ -884,9 +950,15 @@ pub(super) struct KeyBatchEncoding<'a> {
     header: &'a [u8],
     lengths: [u32; 3],
     layouts: &'a [Layout],
-    data: EncodedData,
+    metadata: Vec<u8>,
+    body: KeyBatchBody,
     body_start: usize,
     len: usize,
+}
+
+enum KeyBatchBody {
+    Spans(RecordSpans),
+    Staged(Vec<u8>),
 }
 
 impl KeyBatchEncoding<'_> {
@@ -894,7 +966,7 @@ impl KeyBatchEncoding<'_> {
         self.len
     }
 
-    pub fn append_batch(self, bytes: &mut Vec<u8>) {
+    pub fn append_batch(self, bytes: &mut Vec<u8>) -> Result<()> {
         let start = bytes.len();
         bytes.extend_from_slice(self.header);
         for length in self.lengths {
@@ -903,9 +975,13 @@ impl KeyBatchEncoding<'_> {
         for layout in self.layouts {
             bytes.extend_from_slice(&layout.0.to_le_bytes());
         }
-        bytes.extend_from_slice(&self.data.ipc_message);
+        bytes.extend_from_slice(&self.metadata);
         bytes.resize(start + self.body_start, 0);
-        bytes.extend_from_slice(&self.data.arrow_data);
+        match self.body {
+            KeyBatchBody::Spans(spans) => spans.write_body(bytes).map_err(format_error)?,
+            KeyBatchBody::Staged(body) => bytes.extend_from_slice(&body),
+        }
+        Ok(())
     }
 }
 
@@ -995,27 +1071,13 @@ impl KeyBatch {
         {
             return Err(invalid());
         }
-        let layouts = (0..width)
-            .map(|slot| {
-                Layout(
-                    tuples
-                        .iter()
-                        .fold(0, |mask, tuple| mask | Kind::of(tuple.cell(slot)).bit()),
-                )
-            })
-            .collect::<Vec<_>>();
-        let schema = schema(kind, &layouts)?;
-        for (slot, layout) in layouts.iter().enumerate() {
-            let cells: Vec<_> = tuples.iter().map(|tuple| tuple.cell(slot)).collect();
-            let bytes = cells
-                .iter()
-                .map(AtomRef::retained_bytes)
-                .fold(0usize, usize::saturating_add);
-            if bytes > i32::MAX as usize {
-                return Err(invalid());
-            }
-            arrays.push(layout.build(schema.field(slot + kind.prefix()), cells, bytes)?);
+        let mut layouts = Vec::with_capacity(width);
+        for slot in 0..width {
+            let (layout, values) = Layout::build(slot, tuples.iter().map(|tuple| tuple.cell(slot)))?;
+            arrays.push(values);
+            layouts.push(layout);
         }
+        let schema = schema(kind, &layouts)?;
         let batch = RecordBatch::try_new(schema, arrays).map_err(format_error)?;
         Self::new(layouts, batch, kind.prefix(), true)
     }
@@ -1032,19 +1094,9 @@ impl KeyBatch {
         let prefix = fields.len();
         let mut layouts = Vec::with_capacity(width);
         for slot in 0..width {
-            let cells = tuples
-                .iter()
-                .map(|tuple| tuple.cell(slot))
-                .collect::<Vec<_>>();
-            let layout = Layout(
-                cells
-                    .iter()
-                    .fold(0, |mask, &cell| mask | Kind::of(cell).bit()),
-            );
-            let name = format!("{slot}_{:x}", layout.0);
-            let field = layout.field(slot)?.with_name(name);
-            let bytes = cells.iter().map(AtomRef::retained_bytes).fold(0, usize::saturating_add);
-            arrays.push(layout.build(&field, cells, bytes)?);
+            let (layout, values) = Layout::build(slot, tuples.iter().map(|tuple| tuple.cell(slot)))?;
+            let field = layout.field(slot)?.with_name(format!("{slot}_{:x}", layout.0));
+            arrays.push(values);
             fields.push(field);
             layouts.push(layout);
         }
@@ -1119,23 +1171,25 @@ impl KeyBatch {
     }
 
     // One schema-bound IPC record batch. The short layout prefix identifies its typed columns.
-    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
-        let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)
-            .map_err(format_error)?;
-        let (dictionaries, data) = IpcDataGenerator::default()
-            .encode(
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize, grant: &Arc<MemoryReservation>) -> Result<KeyBatchEncoding<'a>> {
+        let (metadata, body_len, body) = if let Some(spans) = RecordSpans::ordered_leaf(&self.batch, Arc::clone(grant))? {
+            let (metadata, body_len) = spans.metadata()?;
+            (metadata, body_len, KeyBatchBody::Spans(spans))
+        } else {
+            let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)
+                .map_err(format_error)?;
+            let (dictionaries, data) = IpcDataGenerator::default().encode(
                 &self.batch,
                 &mut DictionaryTracker::new(false),
                 &options,
                 &mut CompressionContext::default(),
-            )
-            .map_err(format_error)?;
-        if !dictionaries.is_empty() {
-            return Err(invalid());
-        }
+            ).map_err(format_error)?;
+            if !dictionaries.is_empty() { return Err(invalid()); }
+            (data.ipc_message, data.arrow_data.len(), KeyBatchBody::Staged(data.arrow_data))
+        };
         let lengths = [
             u32::try_from(self.layouts.len()).map_err(format_error)?,
-            u32::try_from(data.ipc_message.len()).map_err(format_error)?,
+            u32::try_from(metadata.len()).map_err(format_error)?,
             u32::try_from(suffix_len).map_err(format_error)?,
         ];
         let layouts_bytes = self.layouts.len()
@@ -1144,11 +1198,11 @@ impl KeyBatch {
         let body_start = header.len()
             .checked_add(size_of_val(&lengths))
             .and_then(|len| len.checked_add(layouts_bytes))
-            .and_then(|len| len.checked_add(data.ipc_message.len()))
+            .and_then(|len| len.checked_add(metadata.len()))
             .and_then(|len| len.checked_next_multiple_of(ALIGNMENT))
             .ok_or_else(invalid)?;
         let len = body_start
-            .checked_add(data.arrow_data.len())
+            .checked_add(body_len)
             .and_then(|len| len.checked_add(suffix_len))
             .filter(|&len| len <= isize::MAX as usize)
             .ok_or_else(invalid)?;
@@ -1156,7 +1210,8 @@ impl KeyBatch {
             header,
             lengths,
             layouts: &self.layouts,
-            data,
+            metadata,
+            body,
             body_start,
             len,
         })
@@ -1451,9 +1506,19 @@ mod tests {
     use super::*;
 
     fn encode_keys(keys: &KeyBatch) -> Vec<u8> {
-        let encoding = keys.stage(&[], 0).unwrap();
+        let grant = rtdb_columnar::MemoryBudget::new(32 << 20).reserve(32 << 20).unwrap();
+        let encoding = keys.stage(&[], 0, &grant).unwrap();
+        let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5).unwrap();
+        let (dictionaries, original) = IpcDataGenerator::default().encode(
+            keys.batch(), &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
+        ).unwrap();
+        assert!(dictionaries.is_empty());
+        assert!(matches!(&encoding.body, KeyBatchBody::Spans(_)));
+        assert_eq!(encoding.metadata, original.ipc_message);
+        let body = encoding.body_start;
         let mut bytes = Vec::with_capacity(encoding.encoded_len());
-        encoding.append_batch(&mut bytes);
+        encoding.append_batch(&mut bytes).unwrap();
+        assert_eq!(&bytes[body..], original.arrow_data.as_slice());
         bytes
     }
 
@@ -1710,13 +1775,19 @@ mod tests {
                 Tuple::Cells(&mixed[1]),
             ],
             BatchKind::Correction,
-            prefix,
+            prefix.clone(),
         )
         .unwrap();
+        let combined = KeyBatch::gather(
+            &[Tuple::Arrow(&mixed_keys, 1), Tuple::Cells(&plain), Tuple::Arrow(&mixed_keys, 1)],
+            BatchKind::Correction,
+            prefix,
+        ).unwrap();
         assert_eq!(
             encode_keys(&typed),
             encode_keys(&canonical)
         );
+        assert_eq!(encode_keys(&combined), encode_keys(&canonical));
     }
 
     #[test]

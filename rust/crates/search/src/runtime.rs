@@ -35,8 +35,11 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
             self.evict_oldest();
         }
     }
-    fn evict_oldest(&mut self) -> bool {
-        let Some(oldest) = self.entries.iter().min_by_key(|(_, (_, used, _))| *used).map(|(key, _)| key.clone()) else { return false; };
+    fn evict_oldest(&mut self) -> bool { self.evict_oldest_except(None) }
+
+    fn evict_oldest_except(&mut self, excluded: Option<&K>) -> bool {
+        let Some(oldest) = self.entries.iter().filter(|(key, _)| excluded != Some(*key))
+            .min_by_key(|(_, (_, used, _))| *used).map(|(key, _)| key.clone()) else { return false; };
         self.remove(&oldest);
         true
     }
@@ -45,6 +48,7 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
 }
 
 const LIVE_POSTING_BYTES: usize = 64 << 20;
+const MATCH_SET_BYTES: usize = 64 << 20;
 const LIVE_PAGE_ROWS: u32 = 1024;
 
 type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
@@ -133,20 +137,31 @@ impl LivePostingPage {
 
     fn from_rows(segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer, from: u32, to: u32,
         available: usize, cancellation: &CancellationToken,
-        prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>) -> Result<Option<Self>> {
+        prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>,
+        admit: impl FnOnce(usize) -> Option<Arc<MemoryReservation>>,
+    ) -> Result<Option<Self>> {
         let mut texts = [None; LIVE_PAGE_ROWS as usize];
-        let mut estimated = 4096 + (to - from) as usize * 32;
+        let mut estimated = 16_384 + (to - from) as usize * 128;
         let complete = visit_live_rows(segment, from, to, column, |row, column, offset| {
             if cancellation.is_cancelled() { return Ok(false); }
             if let (event, PutText::Utf8(text)) = column.read(offset)? {
-                estimated = estimated.saturating_add(text.len().saturating_mul(48));
+                estimated = estimated.saturating_add(text.len().saturating_mul(96));
                 if estimated > available { return Ok(false); }
                 texts[(row - from) as usize] = Some(LiveText { text, integer_id: crate::lane::integer_sql_id(&event) });
             }
             Ok(true)
         })?;
-        if !complete { return Ok(None); }
-        Self::from_text(from, &texts[..(to - from) as usize], analyzer, available, cancellation, prepared)
+        if !complete || estimated > available { return Ok(None); }
+        let Some(mut reservation) = admit(estimated) else { return Ok(None); };
+        let Some(mut page) = Self::from_text(from, &texts[..(to - from) as usize], analyzer, estimated, cancellation, prepared)?
+            else { return Ok(None); };
+        let retained = page.bytes();
+        if retained > reservation.bytes() { return Ok(None); }
+        Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").shrink_to(retained)?;
+        let tokens = rtdb_columnar::retain_array(Arc::new(page.tokens), &reservation)?;
+        page.tokens = tokens.as_list::<i64>().clone();
+        page._reservation = Some(reservation);
+        Ok(Some(page))
     }
 
     fn from_text(from: u32, texts: &[Option<LiveText<'_>>], analyzer: rtdb_text::Analyzer,
@@ -414,25 +429,12 @@ impl ServingPostings {
                 if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
                 let from = postings.rows;
                 let to = from.saturating_add(LIVE_PAGE_ROWS).min(segment.row_count());
-                let mut bytes = 16_384 + (to - from) as usize * 128;
-                let mut texts = [None; LIVE_PAGE_ROWS as usize];
-                visit_live_rows(segment, from, to, column, |row, column, offset| {
-                    if let (event, PutText::Utf8(text)) = column.read(offset)? {
-                        bytes = bytes.saturating_add(text.len().saturating_mul(96));
-                        texts[(row - from) as usize] = Some(LiveText { text, integer_id: crate::lane::integer_sql_id(&event) });
-                    }
-                    Ok(true)
-                })?;
-                let Ok(mut reservation) = budget.reserve(bytes) else { break; };
                 let prepared = commit.map(|(delta, _)| delta.page(&key, (from - first) as usize..(to - first) as usize));
-                let Some(mut page) = LivePostingPage::from_text(from, &texts[..(to - from) as usize], *analyzer, bytes, cancellation, prepared)? else { break; };
-                let retained = page.bytes();
-                if retained > bytes { break; }
-                Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").shrink_to(retained)?;
-                page._reservation = Some(reservation);
+                let Some(page) = LivePostingPage::from_rows(segment, column, *analyzer, from, to, usize::MAX,
+                    cancellation, prepared, |bytes| budget.reserve(bytes).ok())? else { break; };
+                postings.bytes += page._reservation.as_ref().expect("admitted page").bytes();
                 postings.pages.push(Arc::new(page));
                 postings.rows = to;
-                postings.bytes += retained;
             }
             let column = ServingColumn { segment: Arc::downgrade(segment), postings };
             indexed.insert(key, column);
@@ -474,14 +476,15 @@ struct LivePostings {
 }
 
 impl LivePostings {
-    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer, cancellation: &CancellationToken) -> Result<()> {
+    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer, cancellation: &CancellationToken,
+        mut admit: impl FnMut(usize) -> Option<Arc<MemoryReservation>>,
+    ) -> Result<()> {
         let mut from = self.rows;
         while from < segment.row_count() {
             let to = from.saturating_add(LIVE_PAGE_ROWS).min(segment.row_count());
             let remaining = LIVE_POSTING_BYTES.saturating_sub(self.bytes);
-            let Some(page) = LivePostingPage::from_rows(segment, column, analyzer, from, to, remaining, cancellation, None)? else { break; };
-            let bytes = page.bytes();
-            if bytes > remaining { break; }
+            let Some(page) = LivePostingPage::from_rows(segment, column, analyzer, from, to, remaining, cancellation, None, &mut admit)? else { break; };
+            let bytes = page._reservation.as_ref().expect("admitted page").bytes();
             self.pages.push(Arc::new(page));
             self.bytes += bytes;
             from = to;
@@ -553,12 +556,14 @@ pub struct SearchRuntime {
     logical_run_reads: std::sync::atomic::AtomicU64,
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<LivePostings>>>,
+    live_residency: Arc<MemoryBudget>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Arc<Mutex<BuiltFiles>>,
     /// Builds in progress, which a second query for the same file awaits rather than repeats.
     building: Mutex<BTreeMap<(usize, String, String), Arc<tokio::sync::OnceCell<Arc<SearchFile>>>>>,
     mapped: Mutex<Bounded<(String, String), OpenedFile>>,
     match_sets: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchSet>)>>,
+    match_residency: Arc<MemoryBudget>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
     suspect_runs: Mutex<BTreeSet<(String, rtdb_types::TableRef, [u8; 32])>>,
     suspect_term_directories: Mutex<BTreeSet<(String, rtdb_types::TableRef, String, i64)>>,
@@ -601,9 +606,11 @@ impl SearchRuntime {
             file_admission, legacy_residency, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
             logical_run_reads: Default::default(),
             definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
+            live_residency: MemoryBudget::new(LIVE_POSTING_BYTES),
             files: Mutex::new(Bounded::new(file_bytes)), built: Arc::new(Mutex::new(BuiltFiles::new(file_bytes / 2))),
             mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(),
-            match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), suspect_runs: Default::default(),
+            match_sets: Mutex::new(Bounded::new(MATCH_SET_BYTES)), match_residency: MemoryBudget::new(MATCH_SET_BYTES),
+            suspects: Default::default(), suspect_runs: Default::default(),
             suspect_term_directories: Default::default(),
             reported: Default::default() })
     }
@@ -867,22 +874,35 @@ impl SearchRuntime {
 
     /// MATCH of a query on every document of a trie's file, kept for as long as the file is the one this node holds under its identity.
     pub fn match_set(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query) -> Result<Arc<crate::file::MatchSet>> {
-        self.match_set_for_scan(database, trie, column, query, None)
+        self.match_set_for_scan(database, trie, column, query, None, &self.file_admission)
     }
 
-    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query, iids: Option<rtdb_query::IidScope<'_>>) -> Result<Arc<crate::file::MatchSet>> {
+    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query,
+        iids: Option<rtdb_query::IidScope<'_>>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Arc<crate::file::MatchSet>> {
         let cache_key = (database.to_string(), trie.identity.clone(), column.to_string(), query.clone());
         if let Some((opened, set)) = self.match_sets.lock().get(&cache_key) {
             if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, &trie.file)) { return Ok(set); }
         }
         if let Some(iids) = iids.filter(|iids| iids.len() <= 128) {
-            return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids)?));
+            return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids, memory)?));
         }
-        let set = Arc::new(trie.file.match_set(column, query)?);
-        if trie.file.cache_match_sets() {
-            self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());
+        let bytes = trie.file.match_all_bytes();
+        if trie.file.cache_match_sets() && bytes <= MATCH_SET_BYTES {
+            let reservation = {
+                let mut cache = self.match_sets.lock();
+                loop {
+                    if let Ok(reservation) = self.match_residency.reserve(bytes) { break Some(reservation); }
+                    if !cache.evict_oldest() { break None; }
+                }
+            };
+            if let Some(reservation) = reservation {
+                let set = Arc::new(trie.file.match_set(column, query, reservation)?);
+                self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), bytes);
+                return Ok(set);
+            }
         }
-        Ok(set)
+        Ok(Arc::new(trie.file.match_set(column, query, memory.reserve(bytes)?)?))
     }
 
     /// A search file built on this node from the data file of a trie the lane has not indexed; a data file is immutable, so a kept one is never stale.
@@ -964,7 +984,14 @@ impl SearchRuntime {
         let mut next = cached.as_deref().filter(|cached| cached.lineage.as_ref().is_some_and(|prefix| prefix.is_prefix_of(lineage)))
             .cloned().unwrap_or_default();
         if next.rows >= segment.row_count() { return Ok(()); }
-        next.extend(segment, column, analyzer, cancellation)?;
+        drop(cached);
+        next.extend(segment, column, analyzer, cancellation, |bytes| {
+            let mut live = self.live.lock();
+            loop {
+                if let Ok(reservation) = self.live_residency.reserve(bytes) { return Some(reservation); }
+                if !live.evict_oldest_except(Some(&key)) { return None; }
+            }
+        })?;
         if cancellation.is_cancelled() || next.rows == 0 { return Ok(()); }
         let weight = next.bytes.max(1);
         let mut live = self.live.lock();
@@ -1135,7 +1162,8 @@ mod tests {
         let key = (table, "body".into(), rtdb_text::Analyzer::Simple);
         let input = delta.page(&key, 1..3);
         let child = input.1.values().as_string::<i32>().value_data().as_ptr();
-        let page = LivePostingPage::from_rows(segment, "body", rtdb_text::Analyzer::Simple, 1, 3, 1 << 20, &cancellation, Some(input)).unwrap().unwrap();
+        let page = LivePostingPage::from_rows(segment, "body", rtdb_text::Analyzer::Simple, 1, 3, 1 << 20, &cancellation, Some(input),
+            |bytes| memory.reserve(bytes).ok()).unwrap().unwrap();
         drop(delta);
         drop(encoded.encoded);
         assert_eq!(page.tokens.values().as_string::<i32>().value_data().as_ptr(), child);
@@ -1145,7 +1173,10 @@ mod tests {
         assert_eq!(page.frequencies.values(), &[2, 1]);
         assert!(rtdb_text::Query::parse(r#""report audit""#).matches_arrow(&page.tokens(2)));
         assert!(delta_memory.used_bytes() > 0);
+        let escaped_tokens = page.tokens(2);
         drop(page);
+        assert!(delta_memory.used_bytes() > 0);
+        drop(escaped_tokens);
         assert_eq!(delta_memory.used_bytes(), 0);
     }
 

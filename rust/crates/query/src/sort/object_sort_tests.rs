@@ -135,3 +135,66 @@ async fn arrow_wave4_sort_matches_scalar_keys_for_decimals_in_memory_and_spill()
         }
     }
 }
+
+#[tokio::test]
+async fn sorted_output_keeps_equal_key_order_and_memory_and_spill_page_sizes() {
+    use async_trait::async_trait;
+    use rtdb_plan::{ColumnId, Field};
+    use rtdb_types::ScalarType;
+    use std::collections::VecDeque;
+    use crate::{columnar::{BatchCursor, Column, ColumnBatch}, context::OuterRows, parameters::BoundParameters};
+
+    struct Batches(VecDeque<ColumnBatch>);
+    #[async_trait]
+    impl BatchCursor for Batches {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.pop_front()) }
+    }
+
+    for (sort_memory_bytes, preserving_pages, page_sizes) in [
+        (usize::MAX, false, &[2, 2, 2][..]),
+        (1, false, &[2, 1, 2, 1][..]),
+        (usize::MAX, true, &[6][..]),
+        (1, true, &[6][..]),
+    ] {
+        let mut context = context(ObjectSort::TimSort);
+        let options = &mut Arc::get_mut(&mut context).unwrap().options;
+        options.batch_rows = 2;
+        options.sort_memory_bytes = sort_memory_bytes;
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::infer(vec![], &context.memory).unwrap()),
+            outer: OuterRows::empty(&context.memory).unwrap(),
+            context: Arc::clone(&context), bindings: None, analysis: None,
+        };
+        let baseline = context.memory.used_bytes();
+        let logical = LogicalType::Scalar(ScalarType::I64);
+        let fields = ["key", "ordinal"].into_iter().enumerate().map(|(id, name)| Field {
+            id: ColumnId(id as u32), name: name.into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: logical.clone(),
+        }).collect();
+        let schema = Schema::new(fields).unwrap();
+        let order = vec![SortExpr { expr: schema.fields()[0].expression(), descending: false, nulls_first: false }];
+        let make_page = |first: i64| {
+            let columns = [vec![1; 3], (first..first + 3).collect()].into_iter().zip(schema.fields()).map(|(values, field)| Column::Arrow {
+                array: Arc::new(arrow_array::Int64Array::from(values)),
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &logical).unwrap()),
+                logical: Some(logical.clone()),
+            }).collect();
+            ColumnBatch::settled(columns, 3, context.memory.reserve(4096).unwrap()).unwrap()
+        };
+        let input = Batches(VecDeque::from([make_page(0), make_page(3)]));
+        let sort = batches::BatchSort::new(Box::new(input), schema, order, execution.clone(), false, 0, u64::MAX).unwrap();
+        let mut sort = if preserving_pages { sort.preserving_pages() } else { sort };
+        let mut actual = Vec::new();
+        let mut sizes = Vec::new();
+        while let Some(page) = sort.next_batch().await.unwrap() {
+            sizes.push(page.len);
+            actual.extend((0..page.len).map(|row| page.columns[1].value(row).unwrap()));
+        }
+        assert_eq!(sizes.as_slice(), page_sizes);
+        assert_eq!(actual, (0..6).map(Value::I64).collect::<Vec<_>>());
+        assert_eq!(context.spill_peak_bytes() > 0, sort_memory_bytes == 1);
+        drop(sort);
+        assert_eq!(context.spill_bytes(), 0);
+        assert_eq!(context.memory.used_bytes(), baseline);
+    }
+}

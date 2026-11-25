@@ -7,7 +7,7 @@ use rtdb_query::{OrderedIndexInventory, OrderedIndexStorage, QueryContext};
 use rtdb_types::{OwnedRelation, Result, TableRef};
 
 use super::{
-    DefinitionSet, checkpoint, definition_allocation_overflow, definitions, format_error,
+    Definition, DefinitionSet, checkpoint, definition_allocation_overflow, definitions, format_error,
     maintenance::source_frontier, tree::Tree,
 };
 
@@ -67,7 +67,6 @@ impl OrderedIndexInventory for Inventory {
         context: &QueryContext,
     ) -> Result<CatalogRows<OrderedIndexStorage>> {
         let database = context.catalog.database(name)?;
-        let mut allocations = Vec::new();
         let mut indexes = BTreeMap::new();
         for snapshot in &database.partitions {
             context.check_cancelled()?;
@@ -86,29 +85,49 @@ impl OrderedIndexInventory for Inventory {
                 continue;
             };
             for definition in definitions.iter() {
+                let through = source_frontier(snapshot, &definition.table);
+                if let Some((current, _)) = indexes.get_mut(definition) {
+                    *current = i64::max(*current, through);
+                    continue;
+                }
                 let bytes = definition.payload_bytes_for(&definition.table)?
                     .checked_add(1024).ok_or_else(definition_allocation_overflow)?;
-                allocations.push(context.memory.reserve(bytes)?);
-                let through = source_frontier(snapshot, &definition.table);
-                let current = indexes.entry(definition.clone()).or_insert(through);
-                *current = (*current).max(through);
+                let allocation = context.memory.reserve(bytes)?;
+                indexes.insert(definition.clone(), (through, allocation));
             }
         }
 
+        let mut allocation = context.memory.reserve(256)?;
         let mut rows = Vec::new();
-        for (definition, through) in indexes {
+        while let Some((definition, (through, payload))) = indexes.pop_first() {
             context.check_cancelled()?;
             let Some((through_block, bytes)) = checkpoint_file_bytes(context, &database.storage, &definition, through).await? else {
                 continue;
             };
+            let Definition { table, name, version, columns } = definition;
+            drop(columns);
+            let mut payload = Arc::into_inner(payload).expect("the inventory owns the definition");
+            payload.shrink_to(name.capacity() + table.schema.capacity() + table.table.capacity())?;
+            let owner = Arc::get_mut(&mut allocation).expect("the inventory owns its rows");
+            owner.absorb(&mut payload)?;
+            let capacity = rows.capacity();
+            if rows.len() == capacity {
+                let next = capacity.checked_mul(2).ok_or_else(definition_allocation_overflow)?.max(1);
+                let row_size = size_of::<OrderedIndexStorage>();
+                let admitted = next.checked_mul(row_size).and_then(|bytes| owner.bytes().checked_add(bytes))
+                    .ok_or_else(definition_allocation_overflow)?;
+                owner.grow_to(admitted)?;
+                rows.try_reserve_exact(next - capacity).map_err(format_error)?;
+                owner.shrink_to(admitted - capacity * row_size)?;
+            }
             rows.push(OrderedIndexStorage {
-                table: definition.table,
-                name: definition.name,
-                version: definition.version,
+                table,
+                name,
+                version,
                 through_block,
                 bytes,
             });
         }
-        Ok(CatalogRows::new(rows, Arc::new(allocations)))
+        Ok(CatalogRows::new(rows, allocation))
     }
 }

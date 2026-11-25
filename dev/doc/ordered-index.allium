@@ -27,6 +27,7 @@ entity Checkpoint {
 -- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
+-- Revision replay funds its span and edit storage and carries each retained span allocation with its correction group.
 -- Plain scalar keys project from selected positions in the source Arrow columns.
 -- Retained projected tuples own compact key batches and their memory reservations.
 -- A contiguous, all-valid selection may share compact, layout-compatible Arrow buffers whose backing capacity is known.
@@ -36,7 +37,10 @@ entity Checkpoint {
 -- Leaf edits and correction writes select key slots from their Arrow columns across plain and dense-union layouts.
 -- Each rebuilt slot derives its layout from selected rows and assigns dense-union offsets in selection order.
 -- Compact contiguous selections may share the backing allocations of index-owned Arrow keys.
+-- A rebuilt leaf transfers its construction grant to new backing and retains the existing owners of shared buffers.
 -- A correction page serializes just the Arrow key rows for the validity spans it owns.
+-- Ordered leaf publication writes canonical IPC body buffers into the final page allocation.
+-- A decoded correction group shares the admitted page backing with its validity spans.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A snapshot may reuse decoded index definitions for the same catalog read time.
 -- A snapshot may reuse projected tail changes from the same definition and captured source block.
@@ -55,6 +59,7 @@ entity Checkpoint {
 -- Maintenance builds the runtime-installed layout from captured sources when its checkpoint is absent.
 -- A reader validates immutable page size and digest before interpreting the page's format.
 -- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.
+-- One Arrow reference row binds the pointer identity once and carries its first and last typed fences separately.
 -- An Arrow posting fence can share its address bytes under the reservation already held by its key tuple.
 -- Every immutable page reference binds its exact subtree entry count and full fences.
 -- A covered held count subtracts the full-key boundary ranks in each bucket containing the requested valid instant.
@@ -66,6 +71,8 @@ entity Checkpoint {
 -- A negotiated standalone held range reply emits complete Arrow IPC messages under the original witness and lifetime release checks.
 -- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
 -- A seek evaluates each bound expression once for its comparison keys.
+-- A held range compares variable-width selector values within their caller's lifetime.
+-- A point scan funds merge heads by bucket count, tree frames as paths grow, and result staging by batch size.
 -- A candidate scope has one sorted Arrow IID column for membership and range intersection.
 -- Filtering and output use the same resolved payload batches.
 -- Gathering nested payloads preserves their source Arrow vectors and composes their selected positions in index order.
@@ -81,6 +88,8 @@ entity Checkpoint {
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- Replay can retain decoded input pages through erase discovery and key projection within its memory budget.
+-- Replay validates every input row's event controls before projecting selected rows in bounded chunks.
+-- Revisions assembled in the same replay share each complete identity's retained bytes and reservation.
 -- When retention is declined, replay can read exact IPC blocks from the held source in file order.
 -- Each range agrees with the observed file identity, and the replay releases its backing after key projection.
 -- A checkpoint's page scope is zero before the first captured erase, and one past the last source block containing an erase afterward.

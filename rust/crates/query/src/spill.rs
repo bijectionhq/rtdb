@@ -200,11 +200,16 @@ impl SpillReader {
         Ok(())
     }
     pub fn rewind(&mut self) -> Result<()> { self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; Ok(()) }
-    pub fn read_frame(&mut self, expansion: usize) -> Result<Option<(Vec<u8>, Arc<MemoryReservation>)>> {
+    fn read_frame_length(&mut self) -> std::io::Result<Option<u64>> {
         let mut prefix = [0u8; 8];
-        match self.file.read(&mut prefix[..1]).map_err(io_error)? { 0 => return Ok(None), _ => {} }
-        self.file.read_exact(&mut prefix[1..]).map_err(io_error)?;
-        let length = usize::try_from(u64::from_le_bytes(prefix)).map_err(io_error)?;
+        if self.file.read(&mut prefix[..1])? == 0 { return Ok(None); }
+        self.file.read_exact(&mut prefix[1..])?;
+        Ok(Some(u64::from_le_bytes(prefix)))
+    }
+
+    pub fn read_frame(&mut self, expansion: usize) -> Result<Option<(Vec<u8>, Arc<MemoryReservation>)>> {
+        let Some(length) = self.read_frame_length().map_err(io_error)? else { return Ok(None); };
+        let length = usize::try_from(length).map_err(io_error)?;
         if length as u64 > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill", "Spill row exceeds its file")); }
         let bound = length.checked_mul(expansion).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("row-size", "Decoded spill size overflow"))?;
         let reservation = self.memory.reserve(bound)?;
@@ -237,7 +242,12 @@ impl SpillReader {
     }
 
     pub fn read_columns(&mut self, width: usize) -> Result<Option<ColumnBatch>> {
-        let Some((marker, _charge)) = self.read_frame(1)? else { return Ok(None); };
+        let Some(length) = self.read_frame_length()
+            .map_err(|error| io_error(format_args!("Reading spill page marker length: {error}")))? else { return Ok(None); };
+        if length != 1 { return Err(invalid("invalid-spill", "Spill page marker must be one byte")); }
+        let mut marker = [0];
+        self.file.read_exact(&mut marker)
+            .map_err(|error| io_error(format_args!("Reading spill page marker: {error}")))?;
         self.read_columns_frame(&marker, width)
     }
 
@@ -304,6 +314,48 @@ impl SpillReader {
 fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("join-spill", error) }
 
 fn io_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { rtdb_types::Anomaly::fault("rtdb.query/spill-io", error.to_string()) }
+
+#[test]
+fn empty_spill_page_needs_only_its_output_reservation() {
+    let memory = MemoryBudget::new(256);
+    let spill = Arc::new(SpillRegion::new(9).unwrap());
+    let batch = ColumnBatch::empty_with_width(0, &memory).unwrap();
+    let mut writer = spill.create().unwrap();
+    writer.write_columns(&batch, &rtdb_plan::Schema::default(), &memory).unwrap();
+    drop(batch);
+
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let page = reader.read_columns(0).unwrap().unwrap();
+    assert_eq!(page.len, 0);
+    assert!(page.columns.is_empty());
+    assert!(reader.read_columns(0).unwrap().is_none());
+    drop(page);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn malformed_column_spill_markers_fail_before_body_admission() {
+    let memory = MemoryBudget::new(0);
+    let spill = Arc::new(SpillRegion::new(64).unwrap());
+    let missing_marker = 1u64.to_le_bytes();
+    let zero_width = 0u64.to_le_bytes();
+    let wide_marker = u64::MAX.to_le_bytes();
+    let unknown_marker = [1, 0, 0, 0, 0, 0, 0, 0, 3];
+    for (bytes, code, message) in [
+        (&missing_marker[..1], "rtdb.query/spill-io", "Reading spill page marker length"),
+        (&missing_marker[..], "rtdb.query/spill-io", "Reading spill page marker:"),
+        (&zero_width[..], "rtdb.query/invalid-spill", "Spill page marker must be one byte"),
+        (&wide_marker[..], "rtdb.query/invalid-spill", "Spill page marker must be one byte"),
+        (&unknown_marker[..], "rtdb.query/invalid-spill", "Invalid spill page header"),
+    ] {
+        let mut writer = spill.create().unwrap();
+        writer.file.write_all(bytes).unwrap();
+        let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+        let error = reader.read_columns(0).err().unwrap();
+        assert_eq!(error.code, code);
+        assert!(error.message.as_deref().unwrap().starts_with(message));
+    }
+}
 
 #[test]
 fn arrow_records_share_one_schema_across_spill_offsets() {

@@ -1,3 +1,4 @@
+use futures::TryStreamExt;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ struct Term {
 }
 
 impl Term {
-    fn read(page: Option<arrow_array::RecordBatch>, column: u32, text: &str) -> Result<Option<Self>> {
+    fn read(page: Option<arrow_array::RecordBatch>, column: u32, text: &str, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let Some(page) = page else { return Ok(None); };
         let terms = table(&page, Table::Terms);
         let columns = terms.column(0).as_primitive::<UInt32Type>();
@@ -29,7 +30,7 @@ impl Term {
         let inline = if node.page.is_none() {
             let blocks = table(&page, Table::Blocks);
             let ids = table(&page, Table::ImpactIds);
-            Some(Arc::new(RankLeaf::read(blocks.column(0).as_list::<i64>(), ids.column(0).as_list::<i64>(), row, None)?))
+            Some(Arc::new(RankLeaf::read(blocks.column(0).as_list::<i64>(), ids.column(0).as_list::<i64>(), row, memory)?))
         } else { None };
         Ok(Some(Self { node, inline, frequency: terms.column(4).as_primitive::<UInt32Type>().value(row) }))
     }
@@ -54,7 +55,7 @@ impl LeafCache {
         if reuse && self.entries.len() == MAX_CACHED_LEAVES { self.entries.pop_front(); }
         let blocks = blocks.column(0).as_list::<i64>();
         let ids = ids.column(0).as_list::<i64>();
-        let leaf = self.admit(|memory| RankLeaf::read(blocks, ids, 0, Some(memory)))?;
+        let leaf = self.admit(|memory| RankLeaf::read(blocks, ids, 0, memory))?;
         let leaf = Arc::new(leaf);
         if reuse { self.entries.push_back((page, Arc::clone(&leaf))); }
         Ok(leaf)
@@ -140,6 +141,8 @@ pub(crate) struct TreeRanked {
     phrases: Vec<Vec<usize>>,
     scorer: RankScorer,
     ready: BinaryHeap<Work>,
+    ready_charge: Arc<MemoryReservation>,
+    _plan: Arc<MemoryReservation>,
     leaves: LeafCache,
     members: Vec<MemberStart>,
     documents: u32,
@@ -164,11 +167,18 @@ pub(crate) struct TreeCandidate {
 impl TreeRanked {
     pub async fn open(file: Arc<TreeFile>, column: usize, matching: &Query, scoring: &RankScorer,
         bounds: TemporalBounds, order: TreeRankOrder, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let term_bytes = matching.terms().iter().chain(scoring.scorer().query().terms())
+            .fold(4096usize, |bytes, term| bytes.saturating_add(256).saturating_add(term.len().saturating_mul(4)));
+        let phrase_bytes = matching.phrases().iter()
+            .fold(0usize, |bytes, phrase| bytes.saturating_add(128).saturating_add(phrase.len().saturating_mul(size_of::<usize>())));
+        let members = table(file.root(), Table::Members);
+        let plan = memory.reserve(term_bytes.saturating_add(phrase_bytes)
+            .saturating_add(members.len().saturating_mul(size_of::<MemberStart>())))?;
         let term_ids: BTreeMap<_, _> = matching.terms().iter().chain(scoring.scorer().query().terms())
             .collect::<BTreeSet<_>>().into_iter().enumerate().map(|(index, term)| (term.as_str(), index)).collect();
         let names = term_ids.keys().map(|term| term.to_string()).collect::<Vec<_>>();
         let pages = file.term_pages(column as u32, &names).await?;
-        let terms = pages.into_iter().zip(names).map(|(page, term)| Term::read(page, column as u32, &term)).collect::<Result<Vec<_>>>()?;
+        let terms = pages.into_iter().zip(names).map(|(page, term)| Term::read(page, column as u32, &term, memory)).collect::<Result<Vec<_>>>()?;
         let phrases: Vec<Vec<usize>> = matching.phrases().iter()
             .map(|phrase| phrase.iter().map(|term| term_ids[term.as_str()]).collect()).collect();
         let matching: Vec<_> = matching.terms().iter().map(|term| term_ids[term.as_str()]).collect();
@@ -176,7 +186,6 @@ impl TreeRanked {
         let pages = table(file.root(), Table::Pages);
         if pages.len() != 2 { return Err(corrupt("Search root omits its document count")); }
         let documents = pages.column(0).as_primitive::<UInt32Type>().value(1);
-        let members = table(file.root(), Table::Members);
         let pages = members.column(0).as_primitive::<UInt32Type>();
         let starts = members.column(1).as_primitive::<UInt32Type>();
         if members.is_empty() || starts.value(0) != 0 || starts.values().windows(2).any(|ids| ids[0] > ids[1])
@@ -190,11 +199,11 @@ impl TreeRanked {
         let sparse = file.format() == super::LOGICAL_FORMAT_VERSION && (matching.len() > 1 || !phrases.is_empty())
             && leading.is_some_and(|index| terms[index].as_ref().is_some_and(|term| term.frequency <= 1024));
         let mut rank = Self { file, terms, leading, matching, scoring: score_terms, phrases, scorer: scoring.clone(),
-            ready: BinaryHeap::new(), leaves: LeafCache { entries: VecDeque::new(), memory: Arc::clone(memory) }, members, documents, bounds, order,
+            ready: BinaryHeap::new(), ready_charge: memory.reserve(0)?, _plan: plan, leaves: LeafCache { entries: VecDeque::new(), memory: Arc::clone(memory) }, members, documents, bounds, order,
             checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new(), sparse };
         if let Some(leading) = leading {
             let node = rank.terms[leading].as_ref().expect("leading term is present").node;
-            let floors = rank.uuid_floors(std::iter::once(node.first)).await?;
+            let (floors, _scratch) = rank.uuid_floors(std::iter::once(node.first), 1).await?;
             rank.push_node(leading, node, floors.get(&node.first).copied())?;
         }
         Ok(rank)
@@ -221,6 +230,7 @@ impl TreeRanked {
         let integer = if self.scoring.as_slice() == [leading] && self.scorer.scorer().uses_unit_term_scores() {
             node.peak.or(node.minimum)
         } else { node.minimum };
+        Self::admit_frontier(&mut self.ready, &mut self.ready_charge, 1)?;
         self.ready.push(Work { key: self.key(score, integer, floor), first: node.first, job: Job::Node(node) });
         Ok(())
     }
@@ -228,8 +238,9 @@ impl TreeRanked {
     async fn open_node(&mut self, node: RankNode) -> Result<()> {
         let leading = self.leading.expect("only matching sources enter the rank frontier");
         if node.height != 0 {
+            let _children = self.leaves.admit(|memory| memory.reserve(4096))?;
             let children = rank_tree::children(self.file.reader(), node).await?;
-            let floors = self.uuid_floors(children.iter().map(|child| child.first)).await?;
+            let (floors, _scratch) = self.uuid_floors(children.iter().map(|child| child.first), children.len()).await?;
             for child in children { self.push_node(leading, child, floors.get(&child.first).copied())?; }
             return Ok(());
         }
@@ -239,11 +250,16 @@ impl TreeRanked {
         let start = leading_leaf.windows.partition_point(|entry| entry.window < node.first);
         let end = leading_leaf.windows.partition_point(|entry| entry.window <= node.last);
         let leading_windows = &leading_leaf.windows[start..end];
+        let scratch_bytes = rank_tree::TRAVERSAL_BYTES.saturating_add(
+            self.terms.len().saturating_mul(128usize.saturating_add(leading_windows.len().saturating_mul(256))));
+        let _intersection = self.leaves.admit(|memory| memory.reserve(scratch_bytes))?;
         let mut windows = Vec::with_capacity(self.terms.len());
         for (index, term) in self.terms.iter().enumerate() {
             let mut selected = BTreeMap::new();
             if index != leading && let Some(term) = term {
-                for leaf in rank_tree::leaves(self.file.reader(), term.node, node.first, node.last).await? {
+                let leaves = rank_tree::leaf_stream(self.file.reader(), term.node, node.first, node.last);
+                futures::pin_mut!(leaves);
+                while let Some(leaf) = leaves.try_next().await? {
                     let leaf = if let Some(inline) = &term.inline { Arc::clone(inline) }
                         else { self.leaves.read(&self.file, leaf, true).await? };
                     append_windows(&mut selected, &leaf, leading_windows);
@@ -256,7 +272,8 @@ impl TreeRanked {
             .filter(|entry| matching.iter().all(|&term| term == leading || windows[term].contains_key(&entry.window)));
         let count = matching_windows().count();
         if count == 0 { return Ok(()); }
-        let floors = self.uuid_floors(matching_windows().map(|entry| entry.window)).await?;
+        let (floors, _scratch) = self.uuid_floors(matching_windows().map(|entry| entry.window), count).await?;
+        Self::admit_frontier(&mut self.ready, &mut self.ready_charge, count)?;
         let bytes = 256usize.saturating_add(count.saturating_mul(self.terms.len()).saturating_mul(size_of::<Option<BlockRef>>()));
         let reservation = self.leaves.admit(|memory| memory.reserve(bytes))?;
         for lead in matching_windows() {
@@ -292,13 +309,25 @@ impl TreeRanked {
         }
     }
 
-    async fn uuid_floors(&self, windows: impl Iterator<Item = u32>) -> Result<BTreeMap<u32, Iid>> {
-        if self.order != TreeRankOrder::Uuid { return Ok(BTreeMap::new()); }
+    fn admit_frontier(ready: &mut BinaryHeap<Work>, charge: &mut Arc<MemoryReservation>, extra: usize) -> Result<()> {
+        let required = ready.len().saturating_add(extra);
+        if required <= ready.capacity() { return Ok(()); }
+        let capacity = required.max(ready.capacity().saturating_mul(2)).max(8);
+        let charge = Arc::get_mut(charge).expect("rank frontier owns its reservation");
+        charge.grow_to(capacity.saturating_add(ready.capacity()).saturating_mul(size_of::<Work>()))?;
+        ready.try_reserve_exact(capacity - ready.len()).map_err(super::fault)?;
+        charge.shrink_to(ready.capacity().saturating_mul(size_of::<Work>()))
+    }
+
+    async fn uuid_floors(&self, windows: impl Iterator<Item = u32>, count: usize)
+        -> Result<(BTreeMap<u32, Iid>, Option<Arc<MemoryReservation>>)> {
+        if self.order != TreeRankOrder::Uuid { return Ok((BTreeMap::new(), None)); }
+        let scratch = self.leaves.memory.reserve(4096usize.saturating_add(count.saturating_mul(256)))?;
         let documents = windows.map(|window| (window, document_range(window).0)).collect::<Vec<_>>();
         let pages = self.pages(DOCUMENT, documents.iter().map(|&(_, doc)| document_page(doc)).collect()).await?;
         // A published tree writes all documents in nondecreasing IID order, including across members.
         // The first document of the first window bounds every posting that can enter the work item.
-        documents.into_iter().map(|(window, doc)| {
+        let floors = documents.into_iter().map(|(window, doc)| {
             let expected = document_page(doc);
             let batch = &pages[&expected];
             let starts = table(batch, Table::Pages);
@@ -307,7 +336,8 @@ impl TreeRanked {
                 return Err(corrupt("Search UUID floor has an invalid document page"));
             }
             Ok((window, Document::iid_at(&table(batch, Table::Runs), (doc - start.value(0)) as usize)?))
-        }).collect()
+        }).collect::<Result<_>>()?;
+        Ok((floors, Some(scratch)))
     }
 
     async fn pages(&self, kind: u8, pages: BTreeSet<usize>) -> Result<BTreeMap<usize, RecordBatch>> {
@@ -319,9 +349,11 @@ impl TreeRanked {
             let node = *node;
             self.ready.pop();
             if self.sparse {
-                for leaf in rank_tree::leaves(self.file.reader(), node, node.first, node.last).await? {
-                    self.open_node(leaf).await?;
-                }
+                let _traversal = self.leaves.admit(|memory| memory.reserve(rank_tree::TRAVERSAL_BYTES))?;
+                let file = Arc::clone(&self.file);
+                let leaves = rank_tree::leaf_stream(file.reader(), node, node.first, node.last);
+                futures::pin_mut!(leaves);
+                while let Some(leaf) = leaves.try_next().await? { self.open_node(leaf).await?; }
             } else {
                 self.open_node(node).await?;
             }

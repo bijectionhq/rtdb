@@ -70,6 +70,8 @@ That profile derives a fresh ordered-index directory per definition so the first
 Ordered-index storage paths and cleanup use the existing definition and erase-scope fences.
 The shared-layout YAML preference applies only to shared-format publication.
 Arrow references preserve complete key fences, entry counts, and measured subtree coefficients.
+Each Arrow reference row binds its pointer metadata once and carries both typed fences.
+The one-row reference layout derives new addresses for both storage profiles and rebuilds from captured sources when the new address has no checkpoint.
 Correction spans refer to rows of index-owned Arrow key batches.
 A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.
 Branch fences and the revision directory carry the remaining tree metadata.

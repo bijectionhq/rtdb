@@ -37,6 +37,19 @@ pub(super) struct Address {
         deserialize_with = "Address::deserialize_key"
     )]
     key: Bytes,
+    #[serde(skip)]
+    retained: bool,
+}
+
+struct RetainedAddressBytes<T> {
+    bytes: T,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for RetainedAddressBytes<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,7 +75,19 @@ impl AddressRef<'_> {
 
 impl Address {
     pub fn new(iid: Iid, key: Bytes) -> Self {
-        Self { iid, key }
+        Self { iid, key, retained: false }
+    }
+
+    pub fn retain_bytes<T: AsRef<[u8]> + Send + 'static>(bytes: T, memory: Arc<MemoryReservation>) -> Bytes {
+        Bytes::from_owner(RetainedAddressBytes { bytes, _memory: memory })
+    }
+
+    pub fn from_retained(iid: Iid, key: Bytes) -> Self {
+        Self { iid, key, retained: true }
+    }
+
+    fn owned_backing_bytes(&self) -> usize {
+        if self.retained { 0 } else { self.key.len() }
     }
 
     pub fn view(&self) -> AddressRef<'_> {
@@ -162,7 +187,7 @@ impl Key {
         match self {
             Self::Posting { tuple: KeyRow::Arrow(..), .. } | Self::Revision(_) => 0,
             Self::Posting { tuple: KeyRow::Fence(atoms), address, .. } => {
-                let initial = ARC_HEADER_BYTES.saturating_add(address.key.len());
+                let initial = ARC_HEADER_BYTES.saturating_add(address.owned_backing_bytes());
                 atoms.iter().fold(initial, |bytes, atom| {
                     let payload = match atom {
                         Atom::Text(value) => value.capacity(),
@@ -172,7 +197,7 @@ impl Key {
                     bytes.saturating_add(size_of::<Atom>()).saturating_add(payload)
                 })
             }
-            Self::Row(address) => address.key.len(),
+            Self::Row(address) => address.owned_backing_bytes(),
         }
     }
 
@@ -181,6 +206,15 @@ impl Key {
             Self::Posting { tuple: KeyRow::Arrow(..), .. } => self.clone(),
             _ => self.view().owned(),
         }
+    }
+
+    fn pointer_backing_bytes(&self) -> usize {
+        let detached = match self {
+            Self::Row(address) | Self::Posting { tuple: KeyRow::Fence(_), address, .. }
+                if address.retained => address.key.len(),
+            _ => 0,
+        };
+        self.owned_backing_bytes().saturating_add(detached)
     }
 }
 
@@ -225,10 +259,44 @@ pub(super) struct Span {
     pub tuple: KeyRow,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct Spans(Option<Arc<SpanAllocation>>);
+
+#[derive(Debug)]
+struct SpanAllocation {
+    values: Vec<Span>,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl Spans {
+    pub fn allocation_bytes(capacity: usize) -> usize {
+        capacity.saturating_mul(size_of::<Span>())
+            .saturating_add(size_of::<SpanAllocation>() + ARC_HEADER_BYTES)
+    }
+
+    pub fn new(values: Vec<Span>, memory: Arc<MemoryReservation>) -> Self {
+        Self((!values.is_empty()).then(|| Arc::new(SpanAllocation { values, _memory: memory })))
+    }
+}
+
+impl AsRef<[Span]> for Spans {
+    fn as_ref(&self) -> &[Span] {
+        self.0.as_ref().map_or(&[][..], |allocation| allocation.values.as_slice())
+    }
+}
+
+impl std::ops::Deref for Spans {
+    type Target = [Span];
+
+    fn deref(&self) -> &[Span] {
+        self.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum Item {
     Posting,
-    Row(Arc<[Span]>),
+    Row(Spans),
     Revision(Option<Arc<Pointer>>),
 }
 
@@ -243,6 +311,7 @@ pub(super) struct Entry {
 #[derive(Clone, Copy)]
 struct EntryView<'a> {
     key: KeyRef<'a>,
+    owned_key: Option<&'a Key>,
     item: &'a Item,
     posting: Option<(&'a Postings, usize)>,
 }
@@ -272,8 +341,12 @@ impl EntryView<'_> {
     }
 
     fn owned(self) -> Entry {
+        let key = match self.owned_key {
+            Some(Key::Row(address)) if address.retained => Key::Row(address.clone()),
+            _ => self.key.owned(),
+        };
         Entry {
-            key: self.key.owned(),
+            key,
             item: self.item.clone(),
         }
     }
@@ -283,6 +356,7 @@ impl Entry {
     fn view(&self) -> EntryView<'_> {
         EntryView {
             key: self.key.view(),
+            owned_key: Some(&self.key),
             item: &self.item,
             posting: None,
         }
@@ -518,12 +592,7 @@ impl Page {
                     .map(|postings| postings.heap_bytes_excluding(backing))
                     .transpose()?
                     .unwrap_or(0);
-                leaf.metadata.iter().fold(
-                    postings.saturating_add(leaf.metadata.capacity().saturating_mul(size_of::<Entry>()))
-                        .saturating_add(leaf.first.owned_backing_bytes())
-                        .saturating_add(leaf.last.owned_backing_bytes()),
-                    |bytes, entry| bytes.saturating_add(entry.key.owned_backing_bytes()),
-                )
+                postings.saturating_add(leaf.metadata_bytes())
             }
             Self::Branch(children) => children.capacity().saturating_mul(size_of::<Link>()),
         };
@@ -540,7 +609,7 @@ struct Leaf {
 }
 
 impl Leaf {
-    fn from_entries(entries: Vec<EntryView<'_>>) -> Result<Self> {
+    fn from_entries(entries: &[EntryView<'_>]) -> Result<Self> {
         let count = entries.partition_point(|entry| matches!(entry.key, KeyRef::Posting(..)));
         let (keys, metadata) = entries.split_at(count);
         let postings = if keys.is_empty() {
@@ -632,12 +701,22 @@ impl Leaf {
         if row < self.posting_count() {
             EntryView {
                 key: self.key(row),
+                owned_key: None,
                 item: &POSTING_ITEM,
                 posting: self.postings.as_ref().map(|postings| (postings, row)),
             }
         } else {
             self.metadata[row - self.posting_count()].view()
         }
+    }
+
+    fn metadata_bytes(&self) -> usize {
+        let slots = self.metadata.capacity().saturating_mul(size_of::<Entry>());
+        self.metadata.iter().fold(
+            slots.saturating_add(self.first.owned_backing_bytes())
+                .saturating_add(self.last.owned_backing_bytes()),
+            |bytes, entry| bytes.saturating_add(entry.key.owned_backing_bytes()),
+        )
     }
 
     fn bytes(&self) -> usize {
@@ -669,27 +748,29 @@ impl Leaf {
 
 const ARROW_LEAF_HEADER: [u8; 16] = {
     let mut header = [0; 16];
-    header[0] = super::PAGE_LAYOUT_VERSION;
+    header[0] = super::LEAF_LAYOUT_VERSION;
     header
 };
 
-pub(super) fn encode_leaf(postings: Option<&Postings>, metadata: &[Entry]) -> Result<Vec<u8>> {
+pub(super) fn encode_leaf(
+    postings: Option<&Postings>, metadata: &[Entry], grant: &Arc<MemoryReservation>,
+) -> Result<Vec<u8>> {
     let correction = correction::CorrectionPage::prepare(metadata)?;
     let correction_batch = correction
         .as_ref()
-        .map(correction::CorrectionPage::stage)
+        .map(|page| page.stage(grant))
         .transpose()?;
     let correction_len = correction_batch.as_ref().map_or(0, |batch| batch.encoded_len());
     let posting_batch = postings
-        .map(|postings| postings.stage(&ARROW_LEAF_HEADER, correction_len))
+        .map(|postings| postings.stage(&ARROW_LEAF_HEADER, correction_len, grant))
         .transpose()?;
     let len = posting_batch.as_ref().map_or(correction_len, |batch| batch.encoded_len());
     let mut bytes = Vec::with_capacity(len);
     if let Some(batch) = posting_batch {
-        batch.append_batch(&mut bytes);
+        batch.append_batch(&mut bytes)?;
     }
     if let Some((page, batch)) = correction.as_ref().zip(correction_batch) {
-        batch.append_batch(&mut bytes);
+        batch.append_batch(&mut bytes)?;
         page.append_groups(&mut bytes);
     }
     Ok(bytes)
@@ -809,26 +890,43 @@ impl Tree {
     }
 
     fn leaf_link(&self, entries: Vec<EntryView<'_>>) -> Result<Link> {
-        let bytes = entries.iter().map(|entry| entry.bytes()).sum::<usize>();
+        let bytes = entries.iter().map(|entry| match entry.key {
+            KeyRef::Posting(..) => entry.bytes(),
+            KeyRef::Row(address) => size_of::<Entry>().saturating_add(address.key.len()),
+            KeyRef::Revision(_) => size_of::<Entry>(),
+        }).fold(0, usize::saturating_add);
         let width = match entries.first().map(|entry| entry.key) {
             Some(KeyRef::Posting(_, tuple, _)) => tuple.len(),
             _ => 0,
         };
-        let _scratch = self.memory.reserve(
+        let mut scratch = self.memory.reserve(
             bytes
                 .saturating_mul(4)
-                .saturating_add(width.saturating_mul(1024))
+                .saturating_add(width.saturating_mul(8192))
                 .saturating_add(4096),
         )?;
-        self.link(Page::Leaf(Leaf::from_entries(entries)?))
+        let mut leaf = Leaf::from_entries(&entries)?;
+        let mut retained = leaf.metadata_bytes().saturating_add(size_of::<Node>() + ARC_HEADER_BYTES);
+        let grant = Arc::get_mut(&mut scratch).expect("the leaf builder owns its workspace");
+        if let Some(postings) = &mut leaf.postings {
+            retained = retained.saturating_add(postings.fund_new(
+                grant, entries.iter().filter_map(|entry| entry.posting.map(|(postings, _)| postings)),
+            )?);
+        }
+        Self::link(Page::Leaf(leaf), grant.split_off(retained)?)
     }
 
-    fn link(&self, page: Page) -> Result<Link> {
+    fn branch_link(&self, children: Vec<Link>) -> Result<Link> {
+        let memory = self.memory.reserve(
+            children.capacity().saturating_mul(size_of::<Link>())
+                .saturating_add(size_of::<Node>() + ARC_HEADER_BYTES),
+        )?;
+        Self::link(Page::Branch(children), memory)
+    }
+
+    fn link(page: Page, memory: Arc<MemoryReservation>) -> Result<Link> {
         let entries = page.entry_count()?;
         let measure = page.measure()?;
-        let memory = self
-            .memory
-            .reserve(page.bytes().saturating_mul(2).saturating_add(256))?;
         Ok(Link::New(Arc::new(Node {
             page,
             entries,
@@ -986,7 +1084,7 @@ impl Tree {
         }
     }
 
-    pub async fn spans(&self, root: &Root, address: &Address) -> Result<Arc<[Span]>> {
+    pub async fn spans(&self, root: &Root, address: &Address) -> Result<Spans> {
         let key = Key::Row(address.clone());
         let mut link = root.clone();
         while let Some(page) = link.take() {
@@ -1000,7 +1098,7 @@ impl Tree {
                         let Item::Row(spans) = &leaf.metadata[slot].item else {
                             return Err(format_error("Ordered index row has another item type"));
                         };
-                        return Ok(Arc::clone(spans));
+                        return Ok(spans.clone());
                     }
                     break;
                 }
@@ -1010,7 +1108,7 @@ impl Tree {
                 }
             }
         }
-        Ok(Arc::from([]))
+        Ok(Spans::default())
     }
 
     pub async fn edit(&self, root: Root, edits: Vec<(Key, Option<Item>)>) -> Result<Root> {
@@ -1019,22 +1117,24 @@ impl Tree {
         }
         let mut pages = match root {
             Some(root) => self.edit_page(root, &edits).await?,
-            None => self.pack(
-                edits
+            None => {
+                let _views = self.memory.reserve(edits.len().saturating_mul(size_of::<EntryView<'_>>()))?;
+                let views = edits
                     .iter()
                     .filter_map(|(key, item)| {
                         item.as_ref().map(|item| EntryView {
                             key: key.view(),
+                            owned_key: Some(key),
                             item,
                             posting: None,
                         })
                     })
-                    .collect(),
-                |entries| self.leaf_link(entries),
-            )?,
+                    .collect();
+                self.pack(views, |entries| self.leaf_link(entries))?
+            }
         };
         while pages.len() > 1 {
-            pages = self.pack(pages, |children| self.link(Page::Branch(children)))?;
+            pages = self.pack(pages, |children| self.branch_link(children))?;
         }
         let Some(mut root) = pages.pop() else {
             return Ok(None);
@@ -1065,7 +1165,7 @@ impl Tree {
                 Page::Leaf(leaf) => {
                     let _scratch = self
                         .memory
-                        .reserve(leaf.bytes().saturating_mul(2).saturating_add(4096))?;
+                        .reserve((leaf.len() + edits.len()).saturating_mul(size_of::<EntryView<'_>>()))?;
                     let mut changed = Vec::with_capacity(leaf.len() + edits.len());
                     let mut row = 0;
                     for (key, item) in edits {
@@ -1082,6 +1182,7 @@ impl Tree {
                         if let Some(item) = item {
                             changed.push(EntryView {
                                 key: key.view(),
+                                owned_key: Some(key),
                                 item,
                                 posting: None,
                             });
@@ -1108,7 +1209,7 @@ impl Tree {
                         }
                     }
                     self.pack(self.merge_sparse(changed).await?, |children| {
-                        self.link(Page::Branch(children))
+                        self.branch_link(children)
                     })
                 }
             }
@@ -1125,10 +1226,7 @@ impl Tree {
                 let page = match (&left.page, &right.page) {
                     (Page::Leaf(left), Page::Leaf(right)) if left.len() + right.len() <= FANOUT => {
                         let _scratch = self.memory.reserve(
-                            left.bytes()
-                                .saturating_add(right.bytes())
-                                .saturating_mul(2)
-                                .saturating_add(4096),
+                            (left.len() + right.len()).saturating_mul(size_of::<EntryView<'_>>()),
                         )?;
                         Some(
                             self.leaf_link(
@@ -1142,7 +1240,7 @@ impl Tree {
                     (Page::Branch(left), Page::Branch(right))
                         if left.len() + right.len() <= FANOUT =>
                     {
-                        Some(self.link(Page::Branch(left.iter().chain(right).cloned().collect()))?)
+                        Some(self.branch_link(left.iter().chain(right).cloned().collect())?)
                     }
                     _ => None,
                 };
@@ -1219,7 +1317,7 @@ impl Tree {
                     let encoded = if leaf.postings.is_some()
                         || matches!(leaf.metadata[0].key, Key::Row(_))
                     {
-                        encode_leaf(leaf.postings.as_ref(), &leaf.metadata)?
+                        encode_leaf(leaf.postings.as_ref(), &leaf.metadata, &encoding)?
                     } else {
                         let revisions = leaf
                             .metadata
@@ -1272,8 +1370,8 @@ impl Tree {
             let last = link.last();
             let memory = self.memory.reserve(
                 (size_of::<Pointer>() + ARC_HEADER_BYTES + 64)
-                    .saturating_add(first.owned_backing_bytes())
-                    .saturating_add(last.owned_backing_bytes()),
+                    .saturating_add(first.pointer_backing_bytes())
+                    .saturating_add(last.pointer_backing_bytes()),
             )?;
             let digest = format!("{:x}", Sha256::digest(&encoded));
             let size = encoded.len();
@@ -1392,7 +1490,7 @@ fn decode_arrow(backing: &Buffer, generation: i64, opening: &mut MemoryReservati
     } else if backing.starts_with(&correction::HEADER) {
         (None, correction::decode(backing.clone(), FANOUT, opening)?)
     } else {
-        let batch = ipc::decode_buffer(backing.clone(), FANOUT * 2)?;
+        let batch = ipc::decode_buffer(backing.clone(), FANOUT)?;
         let parents = references::decode_page(batch, FANOUT, backing, opening)?;
         if parents.first().is_some_and(|(time, _)| time.is_some()) {
             (
@@ -1489,6 +1587,7 @@ fn sparse(link: &Link) -> bool {
 /// A directed tree walk starting at the first leaf whose fence can meet the seek.
 pub(super) struct Cursor {
     pages: Vec<(Arc<Node>, usize)>,
+    frames: Option<Arc<MemoryReservation>>,
     root: Root,
     reverse: bool,
 }
@@ -1544,9 +1643,28 @@ impl Cursor {
     pub fn new(root: Root, reverse: bool) -> Self {
         Self {
             pages: Vec::new(),
+            frames: None,
             root,
             reverse,
         }
+    }
+
+    fn push(&mut self, tree: &Tree, node: Arc<Node>, offset: usize) -> Result<()> {
+        let capacity = self.pages.capacity();
+        if self.pages.len() == capacity {
+            let next = capacity.saturating_mul(2).max(1);
+            let frame = size_of::<(Arc<Node>, usize)>();
+            if self.frames.is_none() {
+                self.frames = Some(tree.memory.reserve(0)?);
+            }
+            let granted = self.frames.as_mut().expect("the cursor has a frame reservation");
+            let granted = Arc::get_mut(granted).expect("the cursor owns its frames");
+            granted.grow_to(capacity.saturating_add(next).saturating_mul(frame))?;
+            self.pages.try_reserve_exact(next - capacity).map_err(format_error)?;
+            granted.shrink_to(self.pages.capacity().saturating_mul(frame))?;
+        }
+        self.pages.push((node, offset));
+        Ok(())
     }
 
     pub async fn next(
@@ -1647,7 +1765,7 @@ impl Cursor {
                     } else {
                         seek::partition(leaf.len(), |i| position(leaf.key(i)) == before)
                     };
-                    self.pages.push((node, offset));
+                    self.push(tree, node, offset)?;
                     return Ok(Some(()));
                 }
                 Page::Branch(children) => {
@@ -1666,7 +1784,7 @@ impl Cursor {
                             format_error("Ordered index seek contradicts its page fences")
                         })?;
                     link = children[slot].clone();
-                    self.pages.push((node, skipped + 1));
+                    self.push(tree, node, skipped + 1)?;
                 }
             }
         }

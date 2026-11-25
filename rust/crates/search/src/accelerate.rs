@@ -11,7 +11,7 @@ use arrow_array::{Float64Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
-use rtdb_columnar::{EntityIdRef, OwnedBatch};
+use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{data::PutText, keys::ArtefactOwner};
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Catalog, Expr};
@@ -19,6 +19,7 @@ use rtdb_query::{IidScope, MatchAnswers, PreparedSearchQuery, QueryContext, Scan
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TableRef, TemporalBounds, Timestamp};
+use tokio_util::sync::CancellationToken;
 
 use crate::{KIND, SearchDefinition, SearchFile, rank_cutoff::RankKey, runtime::{Suspect, TrieFile}};
 
@@ -148,9 +149,13 @@ impl ScanAccelerator for SearchAccelerator {
         for trie in &files {
             let set = match sets.entry(trie.identity.as_str()) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                    self.runtime.match_set_for_scan(request.database, trie, column, query, request.iid_scope())?,
-                ),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    match self.runtime.match_set_for_scan(request.database, trie, column, query, request.iid_scope(), request.memory) {
+                        Ok(set) => entry.insert(set),
+                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
             };
             answers.insert(&trie.data, Arc::new(set.member(trie.member)?));
         }
@@ -280,11 +285,19 @@ enum Judged { Hidden, Visible { exact: bool } }
 
 /// Cuts a file's documents by the events of the same entity in the partition's other tries and its live segments (fts.allium: CutByLaterEvents).
 /// A trie left unopened may still hold an event that cuts, a delete say, so a document whose entity it covers is no longer exact.
-struct Cutter<'a> { files: &'a [TrieFile], skipped: &'a [rtdb_format::keys::TrieKey], segments: Vec<&'a Arc<rtdb_index::LiveTable>>, bounds: TemporalBounds }
+struct Cutter<'a> {
+    files: &'a [TrieFile],
+    skipped: &'a [rtdb_format::keys::TrieKey],
+    segments: Vec<&'a Arc<rtdb_index::LiveTable>>,
+    bounds: TemporalBounds,
+    memory: &'a Arc<MemoryBudget>,
+    cancellation: &'a CancellationToken,
+}
 
 impl<'a> Cutter<'a> {
     fn new(files: &'a [TrieFile], skipped: &'a [rtdb_format::keys::TrieKey], request: &'a ScanRequest<'_>) -> Self {
-        Self { files, skipped, segments: request.snapshot.iter_segments(&request.scan.table.name.table).collect(), bounds: request.bounds }
+        Self { files, skipped, segments: request.snapshot.iter_segments(&request.scan.table.name.table).collect(),
+            bounds: request.bounds, memory: request.memory, cancellation: request.cancellation }
     }
 
     fn judge(&self, own: usize, doc: crate::DocMatch) -> Result<Judged> {
@@ -294,21 +307,21 @@ impl<'a> Cutter<'a> {
     fn judge_key(&self, own: usize, doc: crate::DocMatch, key: Option<&[u8]>) -> Result<Judged> {
         if key.is_some() && !self.segments.is_empty() { return Err(uncovered_owned_search()); }
         let own = &self.files[own];
-        let mut rectangles: Vec<[i64; 4]> = own.file.rectangles(doc.doc).collect();
+        let mut rectangles = RectangleScratch::new(self.memory, own.file.rectangles(doc.doc))?;
         let mut tied = false;
         for other in self.files {
             if other.identity == own.identity || !covers(other.trie.part(), &doc.iid) { continue; }
-            let events = if let Some(key) = key {
-                other.file.rows_for_key(&doc.iid, key).map(|row| row.map(|(_, event)| event)).collect::<Result<_>>()?
+            if let Some(key) = key {
+                tied |= rectangles.cut(other.file.rows_for_key(&doc.iid, key).map(|row| row.map(|(_, event)| event)), self.cancellation)?;
             } else {
-                other.file.events(&doc.iid)?
-            };
-            tied |= cut(&mut rectangles, events);
+                tied |= rectangles.cut(other.file.event_rows(&doc.iid), self.cancellation)?;
+            }
         }
         for segment in &self.segments {
-            tied |= cut(&mut rectangles, segment.iid_headers(Iid(doc.iid))?.map(crate::file::KeyedEvent::from));
+            let events = segment.iid_headers(Iid(doc.iid))?.map(|event| Ok(crate::file::KeyedEvent::from(event)));
+            tied |= rectangles.cut(events, self.cancellation)?;
         }
-        if !rectangles.iter().any(|rectangle| crate::file::meets(*rectangle, self.bounds)) { return Ok(Judged::Hidden); }
+        if !rectangles.current.iter().any(|rectangle| crate::file::meets(*rectangle, self.bounds)) { return Ok(Judged::Hidden); }
         Ok(Judged::Visible { exact: !tied && !self.skipped.iter().any(|trie| covers(trie.part(), &doc.iid)) })
     }
 }
@@ -318,23 +331,52 @@ fn covers(part: &[u8], iid: &[u8; 16]) -> bool {
     part.iter().enumerate().all(|(depth, digit)| (iid[depth / 4] >> (6 - 2 * (depth % 4))) & 3 == *digit)
 }
 
-/// Removes from rectangles what another source's events of the entity take from them, and returns whether any event shared a rectangle's system-from.
-/// A later put or delete over a valid interval takes that interval from its system time on; a later erase takes everything; an earlier event takes nothing.
-/// An event at the same instant takes nothing either: the scan orders such events itself, so the document is left, and marked inexact.
-fn cut(rectangles: &mut Vec<[i64; 4]>, events: impl IntoIterator<Item = crate::file::KeyedEvent>) -> bool {
-    let mut tied = false;
-    for event in events {
-        let mut kept = Vec::with_capacity(rectangles.len());
-        for rectangle in rectangles.drain(..) {
-            tied |= event.system_from == rectangle[2];
-            kept.extend(crate::rectangle::cut_rectangle(
-                rectangle, event.valid_from, event.valid_to, event.system_from,
-                event.op == rtdb_types::EventOp::Erase,
-            ).into_iter().flatten());
+struct RectangleScratch {
+    current: Vec<[i64; 4]>,
+    kept: Vec<[i64; 4]>,
+    charge: Arc<MemoryReservation>,
+}
+
+impl RectangleScratch {
+    fn new(memory: &Arc<MemoryBudget>, rectangles: impl Iterator<Item = [i64; 4]>) -> Result<Self> {
+        let mut scratch = Self { current: Vec::new(), kept: Vec::new(), charge: memory.reserve(0)? };
+        for rectangle in rectangles {
+            push_accounted(&mut scratch.current, rectangle, 0, &mut scratch.charge)?;
         }
-        *rectangles = kept;
+        Ok(scratch)
     }
-    tied
+
+    fn cut(&mut self, events: impl IntoIterator<Item = Result<crate::file::KeyedEvent>>, cancellation: &CancellationToken) -> Result<bool> {
+        let mut tied = false;
+        for event in events {
+            if cancellation.is_cancelled() { return Err(search_cancelled()); }
+            let event = event?;
+            let current_bytes = self.current.capacity() * size_of::<[i64; 4]>();
+            for &rectangle in &self.current {
+                tied |= event.system_from == rectangle[2];
+                for kept in crate::rectangle::cut_rectangle(rectangle, event.valid_from, event.valid_to,
+                    event.system_from, event.op == EventOp::Erase).into_iter().flatten() {
+                    push_accounted(&mut self.kept, kept, current_bytes, &mut self.charge)?;
+                }
+            }
+            self.current.clear();
+            std::mem::swap(&mut self.current, &mut self.kept);
+        }
+        Ok(tied)
+    }
+}
+
+fn push_accounted<T>(values: &mut Vec<T>, value: T, other_bytes: usize, charge: &mut Arc<MemoryReservation>) -> Result<()> {
+    if values.len() == values.capacity() {
+        let next = values.capacity().saturating_mul(2).max(8);
+        let bytes = other_bytes.saturating_add(next.saturating_add(values.capacity()).saturating_mul(size_of::<T>()));
+        let charge = Arc::get_mut(charge).expect("exclusive work reservation");
+        charge.grow_to(bytes.max(charge.bytes()))?;
+        values.try_reserve_exact(next - values.len()).map_err(|error| Anomaly::fault("rtdb.search/workspace", error.to_string()))?;
+        charge.shrink_to(other_bytes.saturating_add(values.capacity().saturating_mul(size_of::<T>())))?;
+    }
+    values.push(value);
+    Ok(())
 }
 
 impl SearchAccelerator {
@@ -564,8 +606,14 @@ struct CoveredCorpus {
     documents: u64,
     tokens: u64,
     frequencies: UInt64Array,
-    visible_runs: Vec<(Arc<SearchFile>, UInt32Array)>,
+    visible_runs: Vec<VisibleRuns>,
     _scratch: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+struct VisibleRuns {
+    file: Arc<SearchFile>,
+    documents: UInt32Array,
+    _charge: Arc<MemoryReservation>,
 }
 
 async fn covered_owned_corpus(
@@ -625,20 +673,24 @@ async fn covered_owned_corpus(
         files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_owned(), file, member: recorded.member });
     }
 
-    let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), bounds };
+    let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), bounds,
+        memory: &context.memory, cancellation: &context.cancellation };
     let mut documents = 0;
     let mut tokens = 0;
+    let retained_files = if retain_runs { files.len() } else { 0 };
+    let scratch = context.memory.reserve(4096usize.saturating_add(query.terms().len().saturating_mul(8))
+        .saturating_add(retained_files.saturating_mul(size_of::<VisibleRuns>())))?;
     let mut frequencies = vec![0; query.terms().len()];
-    let mut scratch = context.memory.reserve(4096)?;
+    let mut identities = context.memory.reserve(0)?;
     let mut seen = BTreeSet::new();
-    let mut visible_runs = Vec::new();
+    let mut visible_runs = Vec::with_capacity(retained_files);
     for selected in by_file(&files) {
-        let mut visible = BTreeSet::new();
+        let mut visible = Vec::new();
+        let mut selection = context.memory.reserve(128)?;
         for (&member, &own) in &selected.members {
             for doc in selected.file.single_column_member_runs(member)? {
                 if doc.doc % 128 == 0 { context.check_cancelled()?; }
                 if !selected.file.visible(doc.doc, bounds) { continue; }
-                Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(256)))?;
                 let key = selected.file.run_identity_bytes(doc)?;
                 let id = selected.file.run_identity_key(doc)?;
                 match cutter.judge_key(own, doc, Some(key))? {
@@ -646,8 +698,12 @@ async fn covered_owned_corpus(
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
                         if is_shadowed(id) { continue; }
-                        if !seen.insert(key) { return Err(uncovered_owned_search()); }
-                        visible.insert(doc.doc);
+                        Arc::get_mut(&mut identities).expect("corpus owns its identity reservation")
+                            .grow_to(seen.len().saturating_add(1).saturating_mul(256))?;
+                        if !seen.insert(key) || visible.last().is_some_and(|&last| last >= doc.doc) {
+                            return Err(uncovered_owned_search());
+                        }
+                        push_accounted(&mut visible, doc.doc, 128, &mut selection)?;
                         documents += 1;
                         tokens += u64::from(selected.file.token_length(doc.doc)?);
                     }
@@ -656,10 +712,10 @@ async fn covered_owned_corpus(
         }
         for (term, frequency) in query.terms().iter().zip(&mut frequencies) {
             let Some(postings) = selected.file.postings(column, term).map_err(|_| uncovered_owned_search())? else { continue; };
-            *frequency += postings.documents().iter().filter(|doc| visible.contains(doc)).count() as u64;
+            *frequency += postings.documents().iter().filter(|doc| visible.binary_search(doc).is_ok()).count() as u64;
         }
         if retain_runs && !visible.is_empty() {
-            visible_runs.push((Arc::clone(selected.file), UInt32Array::from_iter_values(visible)));
+            visible_runs.push(VisibleRuns { file: Arc::clone(selected.file), documents: UInt32Array::from(visible), _charge: selection });
         }
     }
     context.check_cancelled()?;
@@ -822,7 +878,7 @@ async fn rank_owned_artefacts<'a>(
     let query = scorer.query();
     let mut rank = OwnedRankWindow::new(&context.memory, offset, limit)?;
     for (partition, (relation, covered)) in corpus.partitions.iter().enumerate() {
-        for (file, visible) in &covered.visible_runs {
+        for VisibleRuns { file, documents: visible, .. } in &covered.visible_runs {
             context.check_cancelled()?;
             let mut matches = file.matched_scores(&covered.column, scorer, covered.bounds, Some(visible.values()))
                 .map_err(|_| uncovered_owned_search())?;
@@ -906,7 +962,7 @@ async fn rank_owned_artefacts<'a>(
                 for candidate in pending {
                     let score = candidate.verified.ok_or_else(uncovered_owned_search)?;
                     if let Some(at) = rank.position(partition, candidate.id, score) {
-                        rank.insert_at(at, partition, RankedIdentity::Covered(candidate.id), score)?;
+                        rank.insert_at(at, partition, RankedIdentity::Covered(candidate.id), score);
                     }
                 }
             }
@@ -927,21 +983,14 @@ const OWNED_RANK_CANDIDATES: usize = 100_000;
 
 pub(crate) enum RankedIdentity<'a> {
     Covered(EntityIdRef<'a>),
-    Held(EntityId),
+    Held(EntityId, Arc<MemoryReservation>),
 }
 
 impl RankedIdentity<'_> {
     fn key(&self) -> EntityIdRef<'_> {
         match self {
             Self::Covered(id) => *id,
-            Self::Held(id) => EntityIdRef::from(id),
-        }
-    }
-
-    fn retained_bytes(&self) -> usize {
-        match self {
-            Self::Covered(_) => 128,
-            Self::Held(id) => owned_id_bytes(EntityIdRef::from(id)).saturating_add(128),
+            Self::Held(id, _charge) => EntityIdRef::from(id),
         }
     }
 }
@@ -958,14 +1007,13 @@ pub(crate) struct OwnedRankWindow<'a> {
     offset: usize,
     window: usize,
     total: usize,
-    bytes: usize,
 }
 
 impl<'a> OwnedRankWindow<'a> {
     pub(crate) fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, offset: usize, limit: usize) -> Result<Self> {
         let window = offset + limit;
-        let memory = memory.reserve(4096 + (window + 1) * size_of::<RankedHit<'_>>())?;
-        Ok(Self { hits: Vec::with_capacity(window + 1), memory, offset, window, total: 0, bytes: 4096 })
+        let memory = memory.reserve(4096 + window * size_of::<RankedHit<'_>>())?;
+        Ok(Self { hits: Vec::with_capacity(window), memory, offset, window, total: 0 })
     }
 
     pub(crate) fn admit_candidate(&mut self) -> Result<()> {
@@ -983,16 +1031,11 @@ impl<'a> OwnedRankWindow<'a> {
         (at < self.window).then_some(at)
     }
 
-    pub(crate) fn insert_at(&mut self, at: usize, partition: usize, id: RankedIdentity<'a>, score: f64) -> Result<()> {
-        let added = id.retained_bytes();
+    pub(crate) fn insert_at(&mut self, at: usize, partition: usize, id: RankedIdentity<'a>, score: f64) {
         if self.hits.len() == self.window {
-            let evicted = self.hits.pop().expect("A full rank window has a last hit");
-            self.bytes -= evicted.id.retained_bytes();
+            self.hits.pop().expect("A full rank window has a last hit");
         }
         self.hits.insert(at, RankedHit { partition, id, score });
-        self.bytes = self.bytes.saturating_add(added);
-        let reservation = Arc::get_mut(&mut self.memory).expect("ranking owns its reservation");
-        reservation.grow_to(self.bytes.max(reservation.bytes()))
     }
 
     pub(crate) fn finish_batch(self) -> Result<OwnedSearchBatch> {
@@ -1346,7 +1389,10 @@ mod tests {
         let bounds = at(0, 0);
         let query = Query::parse("overdue");
         let files = [trie(1)];
-        let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), bounds };
+        let memory = MemoryBudget::new(1 << 20);
+        let cancellation = CancellationToken::new();
+        let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), bounds,
+            memory: &memory, cancellation: &cancellation };
         let iids = file_candidates(&cutter, "body", &query, 1, &mut 0).unwrap().unwrap();
         assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
         assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
@@ -1389,7 +1435,7 @@ mod tests {
         let mut rank = OwnedRankWindow::new(&memory, 0, 1).unwrap();
         rank.admit_candidate().unwrap();
         let key = file.run_identity_key(run).unwrap();
-        rank.insert_at(0, 0, RankedIdentity::Covered(key), 1.0).unwrap();
+        rank.insert_at(0, 0, RankedIdentity::Covered(key), 1.0);
         let EntityIdRef::String(held) = rank.hits[0].id.key() else { panic!("expected string identity") };
         assert_eq!(held.as_ptr(), file.run_identity_bytes(run).unwrap()[1..].as_ptr());
         assert_eq!(rank.bytes, 4096 + 128);
@@ -1436,10 +1482,12 @@ mod tests {
             trie("l01-rc-b00", &[row(20, i64::MAX, "pear")]),
         ];
         let query = Query::parse("apple");
+        let memory = MemoryBudget::new(1 << 20);
+        let cancellation = CancellationToken::new();
         for (system, expected) in [(15, true), (25, false), (35, true)] {
             let cutter = Cutter {
                 files: &files, skipped: &[], segments: Vec::new(),
-                bounds: at(5, system),
+                bounds: at(5, system), memory: &memory, cancellation: &cancellation,
             };
             let candidates = file_candidates(&cutter, "body", &query, 1, &mut 0).unwrap().unwrap();
             assert_eq!(candidates.contains(&Iid(iid)), expected, "at system time {system}");
@@ -1450,6 +1498,14 @@ mod tests {
     fn a_later_event_takes_its_valid_interval_from_its_system_time_on_and_an_erase_takes_everything() {
         use rtdb_types::EventOp::{Delete, Erase, Put};
         let whole = [0, 100, 10, i64::MAX];
+        let memory = MemoryBudget::new(1 << 20);
+        let cancellation = CancellationToken::new();
+        let cut = |rectangles: &mut Vec<_>, events: Vec<_>| {
+            let mut scratch = RectangleScratch::new(&memory, rectangles.drain(..)).unwrap();
+            let tied = scratch.cut(events.into_iter().map(Ok), &cancellation).unwrap();
+            *rectangles = scratch.current;
+            tied
+        };
         let mut rectangles = vec![whole];
         assert!(!cut(&mut rectangles, vec![event(20, 30, 60, Put)]));
         rectangles.sort_unstable();

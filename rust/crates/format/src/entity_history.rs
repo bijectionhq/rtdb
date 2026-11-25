@@ -1,8 +1,8 @@
-use std::{collections::BTreeSet, io::Write, ops::Range, sync::{Arc, LazyLock}};
+use std::{collections::BTreeSet, io::{self, Write}, ops::Range, sync::{Arc, LazyLock}};
 
 use arrow_array::{Array, FixedSizeBinaryArray, Int64Array, RecordBatch, UInt8Array, UInt32Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}, cast::AsArray, types::{Int64Type, UInt8Type, UInt32Type}};
-use arrow_buffer::{Buffer, bit_chunk_iterator::UnalignedBitChunk};
+use arrow_buffer::{Buffer, NullBufferBuilder, bit_chunk_iterator::UnalignedBitChunk};
 use arrow_ipc::reader::{FileDecoder, read_footer_length};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -371,14 +371,39 @@ pub struct HistoryWriter<W> {
     offset: u64,
     directory: Vec<u8>,
     charge: Arc<MemoryReservation>,
+    failed_range: bool,
+}
+
+struct RangeSink<'a, W> {
+    sink: &'a mut W,
+    length: usize,
+    digest: Sha256,
+    exceeded: bool,
+}
+
+impl<W: Write> Write for RangeSink<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_RANGE_BYTES - self.length {
+            self.exceeded = true;
+            return Err(io::Error::other("History exceeds its page or directory allowance"));
+        }
+        let written = self.sink.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        self.length += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> { self.sink.flush() }
 }
 
 impl<W: Write> HistoryWriter<W> {
     pub fn new(sink: W, owner: [u8; 32], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let charge = memory.reserve(4096)?;
-        let mut directory = [ROOT_MAGIC.as_slice(), &owner].concat();
+        let mut directory = Vec::with_capacity(charge.bytes());
+        directory.extend(ROOT_MAGIC);
+        directory.extend(owner);
         directory.extend([0; 4]);
-        Ok(Self { sink, offset: 0, directory, charge })
+        Ok(Self { sink, offset: 0, directory, charge, failed_range: false })
     }
 
     pub fn append(&mut self, page: u32, events: &EventBatch) -> Result<()> {
@@ -431,10 +456,20 @@ impl<W: Write> HistoryWriter<W> {
         let schema = forward_schema(columns);
         for first in (0..events.len()).step_by(ROWS_PER_RANGE) {
             let end = (first + ROWS_PER_RANGE).min(events.len());
+            let len = end - first;
+            let plain_iids = match events.iids()? {
+                rtdb_columnar::IidView::Plain(values) => Some(values),
+                _ => None,
+            };
+            let origins = events.origins()?.filter(|origins| (first..end).all(|row| {
+                origins.is_valid(row) || origins.value(row).iter().all(|&byte| byte == 0)
+            }));
+            let controls = usize::from(plain_iids.is_none()) * 16
+                + if origins.is_none() { EventOrigin::WIDTH as usize } else { 0 };
             let _scratch = self.charge.budget().reserve(16_384usize.saturating_add(
-                (end - first).saturating_mul(320usize.saturating_add(columns.saturating_mul(128)))))?;
-            let mut iids = FixedSizeBinaryBuilder::with_capacity(end - first, 16);
-            let mut origin = FixedSizeBinaryBuilder::with_capacity(end - first, EventOrigin::WIDTH);
+                len.saturating_mul(224usize.saturating_add(controls).saturating_add(columns.saturating_mul(128)))))?;
+            let mut iids = plain_iids.is_none().then(|| FixedSizeBinaryBuilder::with_capacity(len, 16));
+            let mut origin = origins.is_none().then(|| FixedSizeBinaryBuilder::with_capacity(len, EventOrigin::WIDTH));
             let mut revisions: Vec<_> = (0..columns).map(|_| FixedSizeBinaryBuilder::with_capacity(end - first, 32)).collect();
             let mut low = None;
             let mut high = None;
@@ -444,15 +479,33 @@ impl<W: Write> HistoryWriter<W> {
                 if high.is_some_and(|previous| previous > iid) { return Err(invalid("Primary page must be sorted by IID")); }
                 low.get_or_insert(iid);
                 high = Some(iid);
-                iids.append_value(iid.0).map_err(invalid)?;
-                if let Some(value) = events.origin(row)? { origin.append_value(value.0).map_err(invalid)?; } else { origin.append_null(); }
+                if let Some(iids) = &mut iids { iids.append_value(iid.0).map_err(invalid)?; }
+                if let Some(origin) = &mut origin {
+                    if let Some(value) = event.origin() { origin.append_value(value.0).map_err(invalid)?; }
+                    else { origin.append_null(); }
+                }
                 for (column, values) in revisions.iter_mut().enumerate() {
                     if let Some(value) = revision(row, &event, column)? {
                         values.append_value(value).map_err(invalid)?;
                     } else { values.append_null(); }
                 }
             }
-            let arrays = [Arc::new(iids.finish()) as arrow_array::ArrayRef, Arc::new(origin.finish())]
+            let iids = match iids {
+                Some(mut iids) => iids.finish(),
+                None => plain_iids.expect("plain IIDs are available").slice(first, len),
+            };
+            let origins = match origin {
+                Some(mut origin) => origin.finish(),
+                None => {
+                    let slice = origins.expect("source origins are available").slice(first, len);
+                    if slice.null_count() == 0 { slice } else {
+                        let mut valid = NullBufferBuilder::new(len);
+                        for row in 0..len { valid.append(slice.is_valid(row)); }
+                        FixedSizeBinaryArray::try_new(EventOrigin::WIDTH, slice.values().clone(), valid.finish()).map_err(invalid)?
+                    }
+                }
+            };
+            let arrays = [Arc::new(iids) as arrow_array::ArrayRef, Arc::new(origins)]
                 .into_iter().chain(revisions.iter_mut().map(|values| Arc::new(values.finish()) as arrow_array::ArrayRef)).collect();
             let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(invalid)?;
             self.write_range(page, first, low.expect("nonempty range"), high.expect("nonempty range"), &batch)?;
@@ -461,31 +514,46 @@ impl<W: Write> HistoryWriter<W> {
     }
 
     fn write_range(&mut self, page: u32, first: usize, low: Iid, high: Iid, batch: &RecordBatch) -> Result<()> {
-        let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(invalid)?;
-        writer.write(batch).map_err(invalid)?;
-        let bytes = writer.into_inner().map_err(invalid)?;
-        if bytes.len() > MAX_RANGE_BYTES || self.directory.len() + ENTRY_BYTES > MAX_ROOT_BYTES {
+        if self.failed_range { return Err(invalid("History contains an incomplete range")); }
+        self.failed_range = true;
+        let directory_end = self.directory.len() + ENTRY_BYTES;
+        if directory_end > MAX_ROOT_BYTES {
             return Err(invalid("History exceeds its page or directory allowance"));
         }
+        let first = u32::try_from(first).map_err(invalid)?;
+        self.offset.checked_add(MAX_RANGE_BYTES as u64).ok_or_else(|| invalid("History range offset overflow"))?;
         let lease = Arc::get_mut(&mut self.charge).expect("unpublished history writer owns its directory");
-        if self.directory.len() + ENTRY_BYTES > lease.bytes() {
+        if directory_end > lease.bytes() {
             lease.grow_to((lease.bytes() * 2).min(MAX_ROOT_BYTES))?;
         }
-        let length = bytes.len() as u32;
+        if directory_end > self.directory.capacity() {
+            self.directory.try_reserve_exact(lease.bytes() - self.directory.len()).map_err(invalid)?;
+        }
+        let mut sink = RangeSink { sink: &mut self.sink, length: 0, digest: Sha256::new(), exceeded: false };
+        let written = (|| {
+            let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut sink, batch.schema_ref())?;
+            writer.write(batch)?;
+            writer.finish()
+        })();
+        if sink.exceeded { return Err(invalid("History exceeds its page or directory allowance")); }
+        written.map_err(invalid)?;
+        let length = sink.length as u32;
+        let digest = sink.digest.finalize();
         self.directory.extend(low.0);
         self.directory.extend(high.0);
         self.directory.extend(page.to_le_bytes());
-        self.directory.extend(u32::try_from(first).map_err(invalid)?.to_le_bytes());
+        self.directory.extend(first.to_le_bytes());
         self.directory.extend((batch.num_rows() as u32).to_le_bytes());
         self.directory.extend(self.offset.to_le_bytes());
         self.directory.extend(length.to_le_bytes());
-        self.directory.extend(Sha256::digest(&bytes));
-        self.sink.write_all(&bytes).map_err(invalid)?;
+        self.directory.extend(digest);
         self.offset += u64::from(length);
+        self.failed_range = false;
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<(W, HistoryRoot)> {
+        if self.failed_range { return Err(invalid("History contains an incomplete range")); }
         let count = ((self.directory.len() - 44) / ENTRY_BYTES) as u32;
         self.directory[40..44].copy_from_slice(&count.to_le_bytes());
         let root = HistoryRoot { offset: self.offset, length: self.directory.len() as u32, digest: Sha256::digest(&self.directory).into() };
@@ -534,4 +602,45 @@ fn history_range_reuses_authenticated_arrow_buffers() {
     let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), decoded.0.schema_ref()).unwrap();
     writer.write(&decoded.0).unwrap();
     assert_eq!(writer.into_inner().unwrap(), reference_bytes);
+}
+
+
+#[test]
+fn forward_ranges_preserve_bytes_for_plain_and_run_end_iids() {
+    let iid = Iid([3; 16]);
+    let mut events = vec![crate::data::StoredEvent {
+        position: None, origin: Some(EventOrigin([7; EventOrigin::WIDTH as usize])),
+        commit_position: 0, entity_key: None, recency: None, iid, system_from: Timestamp(4),
+        valid_time: Interval::ALL, operation: crate::data::StoredOperation::Delete,
+    }; 2];
+    events[1].origin = None;
+    let memory = MemoryBudget::new(1 << 20);
+    let encode = |encoding| {
+        let events = EventBatch::new(crate::data::build_event_batch(&events, None, encoding).unwrap()).unwrap();
+        let mut writer = HistoryWriter::new(Vec::new(), [42; 32], &memory).unwrap();
+        writer.append_forward_revisions(0, &events, 1, |row, _, _| Ok((row == 0).then_some([5; 32]))).unwrap();
+        writer.finish().unwrap().0
+    };
+    assert_eq!(encode(None), encode(Some(rtdb_types::RunEndWidth::I16)));
+}
+
+#[test]
+fn a_partially_written_history_range_cannot_be_finalized() {
+    struct BrokenSink(usize);
+    impl Write for BrokenSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.0 == 0 { return Err(io::Error::other("sink failed")); }
+            let written = bytes.len().min(self.0);
+            self.0 -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    let batch = RecordBatch::new_empty(Arc::clone(schema()));
+    let mut writer = HistoryWriter::new(BrokenSink(12), [42; 32], &MemoryBudget::new(1 << 20)).unwrap();
+    let iid = Iid([3; 16]);
+    assert!(writer.write_range(0, 0, iid, iid, &batch).is_err());
+    assert!(writer.finish().is_err());
 }

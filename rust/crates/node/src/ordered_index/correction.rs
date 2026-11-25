@@ -2,19 +2,20 @@ use std::sync::Arc;
 
 use arrow_array::Int64Array;
 use arrow_buffer::Buffer;
+use bytes::Bytes;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Interval, Result, Timestamp};
 
 use super::{
-    PAGE_LAYOUT_VERSION, format_error,
+    LEAF_LAYOUT_VERSION, format_error,
     key::arrow,
     postings::{BatchKind, KeyBatch, KeyBatchEncoding, ProjectedKeys},
-    tree::{AddressRef, Entry, Item, Key, Span},
+    tree::{Address, Entry, Item, Key, Span, Spans},
 };
 
 pub(super) const HEADER: [u8; 16] = {
     let mut header = [0; 16];
-    header[0] = PAGE_LAYOUT_VERSION;
+    header[0] = LEAF_LAYOUT_VERSION;
     header[1] = 1;
     header
 };
@@ -71,8 +72,8 @@ impl<'a> CorrectionPage<'a> {
         }))
     }
 
-    pub fn stage(&self) -> Result<KeyBatchEncoding<'_>> {
-        self.batch.stage(&HEADER, self.groups_len)
+    pub fn stage(&self, grant: &Arc<MemoryReservation>) -> Result<KeyBatchEncoding<'_>> {
+        self.batch.stage(&HEADER, self.groups_len, grant)
     }
 
     pub fn append_groups(&self, bytes: &mut Vec<u8>) {
@@ -105,10 +106,10 @@ pub(super) fn decode(
     }
     let rows = batch.batch().num_rows();
     let keys_bytes = batch.bytes_excluding(&bytes)?
-        .saturating_add(ProjectedKeys::allocation_bytes())
-        .saturating_add(rows.saturating_mul(size_of::<Span>()));
+        .saturating_add(ProjectedKeys::allocation_bytes());
     if keys_bytes
-        .saturating_add(max_entries.saturating_mul(size_of::<Entry>()))
+        .saturating_add(max_entries.saturating_mul(size_of::<Entry>() + Spans::allocation_bytes(0)))
+        .saturating_add(rows.saturating_mul(size_of::<Span>()))
         > opening.bytes()
     {
         return Err(invalid());
@@ -117,6 +118,7 @@ pub(super) fn decode(
     let to = arrow::<Int64Array>(batch.batch().column(1).as_ref())?.clone();
     let mut entries = Vec::new();
     let mut offset = 0usize;
+    let mut retained_addresses = None;
     while !groups.is_empty() {
         if entries.len() == max_entries || groups.len() < GROUP_HEADER_BYTES { return Err(invalid()); }
         let group = &groups[..GROUP_HEADER_BYTES];
@@ -125,7 +127,15 @@ pub(super) fn decode(
         let key_len = u32::from_le_bytes(group[20..24].try_into().map_err(format_error)?) as usize;
         groups.advance(GROUP_HEADER_BYTES);
         let key = groups.get(..key_len).ok_or_else(invalid)?;
-        if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(key).map_err(format_error)?; }
+        let key = if key.is_empty() {
+            Bytes::new()
+        } else {
+            rtdb_columnar::EntityIdRef::from_handle_bytes(key).map_err(format_error)?;
+            if retained_addresses.is_none() {
+                retained_addresses = Some(Address::retain_bytes(bytes.clone(), opening.split_off(128)?));
+            }
+            retained_addresses.as_ref().expect("group backing is retained").slice_ref(key)
+        };
         let end = offset
             .checked_add(length)
             .filter(|&end| end <= rows)
@@ -133,16 +143,16 @@ pub(super) fn decode(
         if length == 0 {
             return Err(invalid());
         }
-        entries.push((AddressRef { iid, key }.owned(), offset..end));
+        entries.push((Address::from_retained(iid, key), offset..end));
         groups.advance(key_len);
         offset = end;
     }
     if offset != rows {
         return Err(invalid());
     }
-    let bytes = keys_bytes.saturating_add(entries.len().saturating_mul(2 * size_of::<usize>()));
-    let keys = ProjectedKeys::new(batch, opening.split_off(bytes)?);
+    let keys = ProjectedKeys::new(batch, opening.split_off(keys_bytes)?);
     entries.into_iter().map(|(address, range)| {
+        let memory = opening.split_off(Spans::allocation_bytes(range.len()))?;
         let mut spans = Vec::with_capacity(range.len());
         let mut prior_end = Timestamp::MIN;
         for row in range {
@@ -153,7 +163,7 @@ pub(super) fn decode(
             prior_end = valid.upper();
             spans.push(Span { valid, tuple: keys.row(row) });
         }
-        Ok(Entry { key: Key::Row(address), item: Item::Row(spans.into()) })
+        Ok(Entry { key: Key::Row(address), item: Item::Row(Spans::new(spans, memory)) })
     }).collect()
 }
 
@@ -169,7 +179,7 @@ mod tests {
     use crate::ordered_index::{
         key::{Atom, Bucket},
         postings::{Postings, Tuple},
-        tree::encode_leaf,
+        tree::{AddressRef, encode_leaf},
     };
 
     #[test]
@@ -193,9 +203,10 @@ mod tests {
         }.owned();
         let entries = [Entry {
             key: Key::Row(address.clone()),
-            item: Item::Row(Arc::from([span.clone()])),
+            item: Item::Row(Spans::new(vec![span.clone()], budget.reserve(Spans::allocation_bytes(1)).unwrap())),
         }];
-        let bytes = encode_leaf(None, &entries).unwrap();
+        let encoding = budget.reserve(32 << 10).unwrap();
+        let bytes = encode_leaf(None, &entries, &encoding).unwrap();
         assert!(
             !bytes
                 .windows(b"omitted-key".len())
@@ -215,16 +226,19 @@ mod tests {
             cells[0],
             address.view(),
         )]).unwrap();
-        let leaf = encode_leaf(Some(&postings), &entries).unwrap();
+        let leaf = encode_leaf(Some(&postings), &entries, &encoding).unwrap();
         let (_, suffix) = Postings::decode(Buffer::from_vec(leaf).slice(16), 64).unwrap();
         assert_eq!(suffix.as_ref(), bytes.as_slice());
 
         let mut opening = budget.reserve(16 << 10).unwrap();
         let opening = Arc::get_mut(&mut opening).unwrap();
         let buffer = Buffer::from_vec(bytes);
+        let source = buffer[group_start + GROUP_HEADER_BYTES..].as_ptr();
         let backing = rtdb_columnar::retain_buffer(&buffer, &opening.split_off(buffer.capacity()).unwrap());
         let entries = decode(backing, 64, opening).unwrap();
         assert_eq!(entries[0].key, Key::Row(address));
+        let Key::Row(address) = &entries[0].key else { unreachable!() };
+        assert_eq!(address.view().key.as_ptr(), source);
         let Item::Row(decoded) = &entries[0].item else {
             panic!("Expected correction spans");
         };

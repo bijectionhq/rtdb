@@ -1,12 +1,12 @@
 use std::{cell::OnceCell, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray, StructArray,
     UInt8Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
 };
 use arrow_buffer::Buffer;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Result, Timestamp};
@@ -31,23 +31,30 @@ impl AsRef<[u8]> for FenceAddressBuffer {
     }
 }
 
-fn fields() -> Vec<Field> {
+fn fields(first: DataType, last: DataType) -> Vec<Field> {
     vec![
         Field::new("revision", DataType::Int64, true),
+        Field::new("revision_transaction", DataType::Int64, true),
         Field::new("digest", DataType::Utf8, true),
         Field::new("generation", DataType::Int64, true),
         Field::new("size", DataType::UInt64, true),
         Field::new("entries", DataType::UInt64, true),
+        Field::new("measure_count", DataType::UInt64, true),
+        Field::new("measure_domain", DataType::FixedSizeBinary(3), true),
+        Field::new("measure_sum", DataType::FixedSizeBinary(32), true),
+        Field::new("first", first, false),
+        Field::new("last", last, false),
+    ]
+}
+
+fn fence_fields() -> Vec<Field> {
+    vec![
         Field::new("key_kind", DataType::UInt8, false),
         Field::new("bucket_level", DataType::UInt8, true),
         Field::new("bucket_start", DataType::UInt64, true),
         Field::new("iid", DataType::FixedSizeBinary(16), true),
         Field::new("entity_key", DataType::Binary, true),
         Field::new("system_time", DataType::Int64, true),
-        Field::new("measure_count", DataType::UInt64, true),
-        Field::new("measure_domain", DataType::FixedSizeBinary(3), true),
-        Field::new("measure_sum", DataType::FixedSizeBinary(32), true),
-        Field::new("revision_transaction", DataType::Int64, true),
         Field::new("fence_transaction", DataType::Int64, true),
     ]
 }
@@ -63,92 +70,97 @@ pub(super) fn encode(references: &[(Option<IndexRevision>, Option<&Pointer>)]) -
         })
         .max()
         .unwrap_or(0);
-    let rows = references.len().saturating_mul(2);
+    let rows = references.len();
     let mut revisions = Vec::with_capacity(rows);
     let mut revision_transactions = Vec::with_capacity(rows);
-    let mut fence_transactions = Vec::with_capacity(rows);
     let mut digests = StringBuilder::with_capacity(rows, 64 * rows);
     let mut generations = Vec::with_capacity(rows);
     let mut sizes = Vec::with_capacity(rows);
     let mut counts = Vec::with_capacity(rows);
+    let mut measure_counts = Vec::with_capacity(rows);
+    let mut measure_domains = FixedSizeBinaryBuilder::with_capacity(rows, 3);
+    let mut measure_sums = FixedSizeBinaryBuilder::with_capacity(rows, 32);
+    for &(revision, pointer) in references {
+        revisions.push(revision.map(|revision| revision.time.0));
+        revision_transactions.push(revision.map(|revision| revision.transaction));
+        digests.append_option(pointer.map(|pointer| pointer.digest.as_str()));
+        generations.push(pointer.map(|pointer| pointer.generation));
+        sizes.push(pointer.map(|pointer| pointer.size as u64));
+        counts.push(pointer.map(|pointer| pointer.entries));
+        measure_counts.push(pointer.map(|pointer| pointer.measure.count));
+        if let Some(pointer) = pointer {
+            measure_domains.append_value(measure_domain_bytes(pointer.measure.domain)).map_err(format_error)?;
+            measure_sums.append_value(pointer.measure.sum).map_err(format_error)?;
+        } else {
+            measure_domains.append_null();
+            measure_sums.append_null();
+        }
+    }
+    let first = encode_fences(width, references.iter().map(|(_, pointer)| pointer.map(|p| p.first.view())))?;
+    let last = encode_fences(width, references.iter().map(|(_, pointer)| pointer.map(|p| p.last.view())))?;
+    let schema = Arc::new(Schema::new(fields(first.data_type().clone(), last.data_type().clone())));
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(revisions)),
+        Arc::new(Int64Array::from(revision_transactions)),
+        Arc::new(digests.finish()),
+        Arc::new(Int64Array::from(generations)),
+        Arc::new(UInt64Array::from(sizes)),
+        Arc::new(UInt64Array::from(counts)),
+        Arc::new(UInt64Array::from(measure_counts)),
+        Arc::new(measure_domains.finish()),
+        Arc::new(measure_sums.finish()),
+        Arc::new(first),
+        Arc::new(last),
+    ];
+    RecordBatch::try_new(schema, arrays).map_err(format_error)
+}
+
+fn encode_fences<'a>(
+    width: usize, fences: impl ExactSizeIterator<Item = Option<KeyRef<'a>>>,
+) -> Result<StructArray> {
+    let rows = fences.len();
     let mut kinds = Vec::with_capacity(rows);
     let mut levels = Vec::with_capacity(rows);
     let mut starts = Vec::with_capacity(rows);
     let mut iids = FixedSizeBinaryBuilder::with_capacity(rows, 16);
     let mut addresses = BinaryBuilder::new();
     let mut times = Vec::with_capacity(rows);
-    let mut measure_counts = Vec::with_capacity(rows);
-    let mut measure_domains = FixedSizeBinaryBuilder::with_capacity(rows, 3);
-    let mut measure_sums = FixedSizeBinaryBuilder::with_capacity(rows, 32);
+    let mut transactions = Vec::with_capacity(rows);
     let mut keys = Vec::with_capacity(rows);
-    for &(revision, pointer) in references {
-        let fences = pointer.map(|pointer| [&pointer.first, &pointer.last]);
-        for side in 0..2 {
-            let (kind, level, start, address, time, tuple) =
-                match fences.map(|fences| fences[side].view()) {
-                    Some(KeyRef::Posting(bucket, tuple, iid)) => (
-                        0,
-                        Some(u8::try_from(bucket.level).map_err(format_error)?),
-                        Some(bucket.start),
-                        Some(iid),
-                        None,
-                        tuple,
-                    ),
-                    Some(KeyRef::Row(iid)) => (1, None, None, Some(iid), None, Tuple::Nulls(width)),
-                    Some(KeyRef::Revision(time)) => {
-                        (2, None, None, None, Some(time), Tuple::Nulls(width))
-                    }
-                    None => (3, None, None, None, None, Tuple::Nulls(width)),
-                };
-            revisions.push(revision.map(|revision| revision.time.0));
-            revision_transactions.push(revision.map(|revision| revision.transaction));
-            digests.append_option(pointer.map(|pointer| pointer.digest.as_str()));
-            generations.push(pointer.map(|pointer| pointer.generation));
-            sizes.push(pointer.map(|pointer| pointer.size as u64));
-            counts.push(pointer.map(|pointer| pointer.entries));
-            kinds.push(kind);
-            levels.push(level);
-            starts.push(start);
-            if let Some(address) = address {
-                iids.append_value(address.iid.as_bytes())
-                    .map_err(format_error)?;
-            } else {
-                iids.append_null();
-            }
-            addresses.append_option(address.map(|address| address.key));
-            times.push(time.map(|revision| revision.time.0));
-            fence_transactions.push(time.map(|revision| revision.transaction));
-            measure_counts.push(pointer.map(|pointer| pointer.measure.count));
-            if let Some(pointer) = pointer {
-                measure_domains.append_value(measure_domain_bytes(pointer.measure.domain)).map_err(format_error)?;
-                measure_sums.append_value(pointer.measure.sum).map_err(format_error)?;
-            } else {
-                measure_domains.append_null();
-                measure_sums.append_null();
-            }
-            keys.push(tuple);
+    for fence in fences {
+        let (kind, level, start, address, time, tuple) = match fence {
+            Some(KeyRef::Posting(bucket, tuple, iid)) => (
+                0, Some(u8::try_from(bucket.level).map_err(format_error)?), Some(bucket.start),
+                Some(iid), None, tuple,
+            ),
+            Some(KeyRef::Row(iid)) => (1, None, None, Some(iid), None, Tuple::Nulls(width)),
+            Some(KeyRef::Revision(time)) => (2, None, None, None, Some(time), Tuple::Nulls(width)),
+            None => (3, None, None, None, None, Tuple::Nulls(width)),
+        };
+        kinds.push(kind);
+        levels.push(level);
+        starts.push(start);
+        if let Some(address) = address {
+            iids.append_value(address.iid.as_bytes()).map_err(format_error)?;
+        } else {
+            iids.append_null();
         }
+        addresses.append_option(address.map(|address| address.key));
+        times.push(time.map(|revision| revision.time.0));
+        transactions.push(time.map(|revision| revision.transaction));
+        keys.push(tuple);
     }
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(revisions)),
-        Arc::new(digests.finish()),
-        Arc::new(Int64Array::from(generations)),
-        Arc::new(UInt64Array::from(sizes)),
-        Arc::new(UInt64Array::from(counts)),
         Arc::new(UInt8Array::from(kinds)),
         Arc::new(UInt8Array::from(levels)),
         Arc::new(UInt64Array::from(starts)),
         Arc::new(iids.finish()),
         Arc::new(addresses.finish()),
         Arc::new(Int64Array::from(times)),
-        Arc::new(UInt64Array::from(measure_counts)),
-        Arc::new(measure_domains.finish()),
-        Arc::new(measure_sums.finish()),
-        Arc::new(Int64Array::from(revision_transactions)),
-        Arc::new(Int64Array::from(fence_transactions)),
+        Arc::new(Int64Array::from(transactions)),
     ];
-    let keys = KeyBatch::build_with_prefix(&keys, fields(), arrays)?;
-    Ok(keys.batch().clone())
+    let keys = KeyBatch::build_with_prefix(&keys, fence_fields(), arrays)?;
+    Ok(StructArray::from(keys.batch().clone()))
 }
 
 #[cfg(test)]
@@ -191,46 +203,45 @@ pub(super) fn decode_page(
     Ok(references)
 }
 
+fn revision_key(time: &Int64Array, transaction: &Int64Array, row: usize) -> Result<Option<IndexRevision>> {
+    match (time.is_null(row), transaction.is_null(row)) {
+        (true, true) => Ok(None),
+        (false, false) => Ok(Some(IndexRevision {
+            time: Timestamp(time.value(row)),
+            transaction: transaction.value(row),
+        })),
+        _ => Err(invalid()),
+    }
+}
+
 fn decode_with_memory(
     batch: RecordBatch,
     max: usize,
-    reserve: impl FnOnce(&KeyBatch, bool) -> Result<Arc<MemoryReservation>>,
+    mut reserve: impl FnMut(&KeyBatch, bool) -> Result<Arc<MemoryReservation>>,
 ) -> Result<Vec<Reference>> {
-    let rows = batch.num_rows();
-    if rows % 2 != 0 || rows / 2 > max {
+    let columns = batch.columns();
+    if batch.num_rows() == 0 || batch.num_rows() > max || columns.len() != 11 {
         return Err(invalid());
     }
-    let keys = KeyBatch::from_batch(batch, &fields())?;
-    let columns = keys.batch().columns().to_vec();
-    let kinds = arrow::<UInt8Array>(columns[5].as_ref())?;
-    let memory = reserve(&keys, kinds.values().contains(&0))?;
-    let keys = ProjectedKeys::new(keys, memory.clone());
+    let first = arrow::<StructArray>(columns[9].as_ref())?;
+    let last = arrow::<StructArray>(columns[10].as_ref())?;
+    let expected = fields(first.data_type().clone(), last.data_type().clone());
+    if first.null_count() != 0 || last.null_count() != 0 || first.fields().len() != last.fields().len()
+        || batch.schema_ref().fields().iter().zip(expected).any(|(actual, expected)| actual.as_ref() != &expected)
+    {
+        return Err(invalid());
+    }
+    let first = decode_fences(first, &mut reserve)?;
+    let last = decode_fences(last, &mut reserve)?;
     let revisions = arrow::<Int64Array>(columns[0].as_ref())?;
-    let digests = arrow::<StringArray>(columns[1].as_ref())?;
-    let generations = arrow::<Int64Array>(columns[2].as_ref())?;
-    let sizes = arrow::<UInt64Array>(columns[3].as_ref())?;
-    let counts = arrow::<UInt64Array>(columns[4].as_ref())?;
-    let levels = arrow::<UInt8Array>(columns[6].as_ref())?;
-    let starts = arrow::<UInt64Array>(columns[7].as_ref())?;
-    let iids = arrow::<FixedSizeBinaryArray>(columns[8].as_ref())?;
-    let addresses = arrow::<BinaryArray>(columns[9].as_ref())?;
-    let retained_addresses = OnceCell::new();
-    let times = arrow::<Int64Array>(columns[10].as_ref())?;
-    let measure_counts = arrow::<UInt64Array>(columns[11].as_ref())?;
-    let measure_domains = arrow::<FixedSizeBinaryArray>(columns[12].as_ref())?;
-    let measure_sums = arrow::<FixedSizeBinaryArray>(columns[13].as_ref())?;
-    let revision_transactions = arrow::<Int64Array>(columns[14].as_ref())?;
-    let fence_transactions = arrow::<Int64Array>(columns[15].as_ref())?;
-    let revision_key = |time: &Int64Array, transaction: &Int64Array, row| -> Result<_> {
-        match (time.is_null(row), transaction.is_null(row)) {
-            (true, true) => Ok(None),
-            (false, false) => Ok(Some(IndexRevision {
-                time: Timestamp(time.value(row)),
-                transaction: transaction.value(row),
-            })),
-            _ => Err(invalid()),
-        }
-    };
+    let revision_transactions = arrow::<Int64Array>(columns[1].as_ref())?;
+    let digests = arrow::<StringArray>(columns[2].as_ref())?;
+    let generations = arrow::<Int64Array>(columns[3].as_ref())?;
+    let sizes = arrow::<UInt64Array>(columns[4].as_ref())?;
+    let counts = arrow::<UInt64Array>(columns[5].as_ref())?;
+    let measure_counts = arrow::<UInt64Array>(columns[6].as_ref())?;
+    let measure_domains = arrow::<FixedSizeBinaryArray>(columns[7].as_ref())?;
+    let measure_sums = arrow::<FixedSizeBinaryArray>(columns[8].as_ref())?;
     let measure = |row| -> Result<_> {
         match (measure_counts.is_null(row), measure_domains.is_null(row), measure_sums.is_null(row)) {
             (true, true, true) => Ok(None),
@@ -258,7 +269,62 @@ fn decode_with_memory(
             measure(row)?,
         ))
     };
-    let key = |row| -> Result<_> {
+    first.into_iter().zip(last).enumerate().map(|(row, (first, last))| {
+            let time = revision(row)?;
+            let address = identity(row)?;
+            match (address, first, last) {
+                (
+                    (Some(digest), Some(generation), Some(size), Some(entries), Some(measure)),
+                    Some(first),
+                    Some(last),
+                ) if generation >= 0
+                    && size > 0
+                    && entries > 0
+                    && measure.count <= entries
+                    && first <= last
+                    && digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+                {
+                    Ok((
+                        time,
+                        Some(Arc::new(Pointer {
+                            digest: digest.to_owned(),
+                            generation,
+                            size: usize::try_from(size).map_err(format_error)?,
+                            entries,
+                            measure,
+                            first,
+                            last,
+                            _memory: None,
+                        })),
+                    ))
+                }
+                ((None, None, None, None, None), None, None) => Ok((time, None)),
+                _ => Err(invalid()),
+            }
+        })
+        .collect()
+}
+
+fn decode_fences(
+    rows: &StructArray,
+    reserve: &mut impl FnMut(&KeyBatch, bool) -> Result<Arc<MemoryReservation>>,
+) -> Result<Vec<Option<Key>>> {
+    let keys = KeyBatch::from_batch(RecordBatch::from(rows.clone()), &fence_fields())?;
+    let columns = keys.batch().columns().to_vec();
+    let kinds = arrow::<UInt8Array>(columns[0].as_ref())?;
+    let memory = reserve(&keys, kinds.values().contains(&0))?;
+    let keys = ProjectedKeys::new(keys, memory.clone());
+    let levels = arrow::<UInt8Array>(columns[1].as_ref())?;
+    let starts = arrow::<UInt64Array>(columns[2].as_ref())?;
+    let iids = arrow::<FixedSizeBinaryArray>(columns[3].as_ref())?;
+    let addresses = arrow::<BinaryArray>(columns[4].as_ref())?;
+    let times = arrow::<Int64Array>(columns[5].as_ref())?;
+    let fence_transactions = arrow::<Int64Array>(columns[6].as_ref())?;
+    let retained_addresses = OnceCell::new();
+    (0..rows.len()).map(|row| -> Result<_> {
         let tuple = keys.row(row);
         let bucket = match (levels.is_null(row), starts.is_null(row)) {
             (true, true) => None,
@@ -311,49 +377,7 @@ fn decode_with_memory(
             (3, None, None, None) if empty() => Ok(None),
             _ => Err(invalid()),
         }
-    };
-    (0..rows)
-        .step_by(2)
-        .map(|row| {
-            let time = revision(row)?;
-            let address = identity(row)?;
-            if time != revision(row + 1)? || address != identity(row + 1)? {
-                return Err(invalid());
-            }
-            match (address, key(row)?, key(row + 1)?) {
-                (
-                    (Some(digest), Some(generation), Some(size), Some(entries), Some(measure)),
-                    Some(first),
-                    Some(last),
-                ) if generation >= 0
-                    && size > 0
-                    && entries > 0
-                    && measure.count <= entries
-                    && first <= last
-                    && digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
-                {
-                    Ok((
-                        time,
-                        Some(Arc::new(Pointer {
-                            digest: digest.to_owned(),
-                            generation,
-                            size: usize::try_from(size).map_err(format_error)?,
-                            entries,
-                            measure,
-                            first,
-                            last,
-                            _memory: None,
-                        })),
-                    ))
-                }
-                ((None, None, None, None, None), None, None) => Ok((time, None)),
-                _ => Err(invalid()),
-            }
-        })
-        .collect()
+    }).collect()
 }
 
 pub(super) fn measure_domain_bytes(domain: MeasureDomain) -> [u8; 3] {
@@ -424,8 +448,11 @@ mod tests {
             ipc::encode(&encode(&[(None, Some(posting)), (None, Some(rows))]).unwrap()).unwrap()
         };
         let encoded = Bytes::from(encode_both(&pointer, &rows));
-        let batch = ipc::decode(encoded.clone(), 4).unwrap();
-        let addresses = arrow::<BinaryArray>(batch.column(9).as_ref()).unwrap().clone();
+        let batch = ipc::decode(encoded.clone(), 2).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let first = arrow::<StructArray>(batch.column(9).as_ref()).unwrap();
+        let last = arrow::<StructArray>(batch.column(10).as_ref()).unwrap();
+        let addresses = [first, last].map(|fence| arrow::<BinaryArray>(fence.column(4).as_ref()).unwrap().clone());
         let budget = MemoryBudget::new(1 << 20);
         let reservation = budget.reserve(64 << 10).unwrap();
         let mut decoded = decode(batch, 2, &reservation).unwrap();
@@ -438,12 +465,12 @@ mod tests {
                 panic!("Expected a posting fence");
             };
             assert_eq!(address.iid, iid);
-            assert_eq!(address.key.as_ptr(), addresses.value(offset).as_ptr());
+            assert_eq!(address.key.as_ptr(), addresses[offset].value(0).as_ptr());
         }
         let KeyRef::Row(address) = row.first.view() else {
             panic!("Expected a row fence");
         };
-        assert_ne!(address.key.as_ptr(), addresses.value(2).as_ptr());
+        assert_ne!(address.key.as_ptr(), addresses[0].value(1).as_ptr());
         assert_eq!(encode_both(posting, row).as_slice(), encoded.as_ref());
         let legacy = serde_json::to_vec(&pointer).unwrap();
         assert_eq!(serde_json::to_vec(posting).unwrap(), legacy);
@@ -454,5 +481,15 @@ mod tests {
         assert_eq!(budget.used_bytes(), 64 << 10);
         drop(decoded.remove(0));
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn an_absent_root_keeps_its_revision_in_one_reference_row() {
+        let revision = IndexRevision { time: Timestamp(42), transaction: 104 };
+        let encoded = encode(&[(Some(revision), None)]).unwrap();
+        assert_eq!(encoded.num_rows(), 1);
+        let budget = MemoryBudget::new(1 << 20);
+        let grant = budget.reserve(16 << 10).unwrap();
+        assert_eq!(decode(encoded, 1, &grant).unwrap(), [(Some(revision), None)]);
     }
 }

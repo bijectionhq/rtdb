@@ -131,7 +131,10 @@ impl TermEdits {
         if term.is_empty() || term.contains('\0') { return Err(invalid("Invalid analyzed term")); }
         self.retained = self.retained.saturating_add(176 + term.len());
         grow(&mut self.charge, self.retained)?;
-        let mut key = term_prefix(field, term);
+        let mut key = Vec::with_capacity(5 + term.len() + run.len());
+        key.extend(field.to_be_bytes());
+        key.extend(term.as_bytes());
+        key.push(0);
         key.extend(run);
         let value = stats.map(TermStats::encode);
         if let Some(value) = &value { TermStats::decode(value)?; }
@@ -139,15 +142,23 @@ impl TermEdits {
         Ok(())
     }
 
-    pub async fn apply(self, store: &dyn PageStore, base: Option<&RootRef>, memory: &Arc<MemoryBudget>)
-        -> Result<Option<RootRef>> {
-        let Self { edits, charge: _charge, .. } = self;
-        let edits = edits.into_iter().map(|(key, value)| match value {
-            Some(value) => Edit::Put(Row { key, value }),
-            None => Edit::Delete(key),
-        }).collect();
+    pub async fn apply(self, store: &dyn PageStore, base: Option<&RootRef>) -> Result<Option<RootRef>> {
+        let Self { edits, mut charge, .. } = self;
+        let lease = Arc::get_mut(&mut charge).expect("unpublished term edits own their reservation");
+        let vector = edits.len().saturating_mul(size_of::<Edit>());
+        lease.grow_to(lease.bytes().saturating_add(vector))?;
+        let mut sorted = Vec::with_capacity(edits.len());
+        let mut retained = vector;
+        for (key, value) in edits {
+            retained = retained.saturating_add(key.capacity()).saturating_add(value.as_ref().map_or(0, Vec::capacity));
+            sorted.push(match value {
+                Some(value) => Edit::Put(Row { key, value }),
+                None => Edit::Delete(key),
+            });
+        }
+        lease.shrink_to(retained)?;
         let generation = PageGeneration::Attempt(uuid::Uuid::new_v4());
-        let (root, _) = cow_tree::apply_with_generation(store, base, edits, &MaxUnitBound, memory, Some(generation)).await?;
+        let (root, _) = cow_tree::apply_admitted_with_generation(store, base, sorted, charge, &MaxUnitBound, generation).await?;
         Ok(root)
     }
 }
@@ -285,7 +296,7 @@ mod tests {
         ] {
             edits.record(field, term, run, Some(summary)).unwrap();
         }
-        let root = edits.apply(&pages, None, &memory).await.unwrap().unwrap();
+        let root = edits.apply(&pages, None).await.unwrap().unwrap();
         assert_eq!(root.summary, unit_term_score(2).to_be_bytes());
         let matching = Query::parse("\"audit report\"");
         let scoring = Query::parse("memo report audit");
@@ -315,11 +326,11 @@ mod tests {
         let mut edits = TermEdits::new(&memory).unwrap();
         edits.record(0, "report", old, Some(stats(1, 1, 1))).unwrap();
         edits.record(0, "memo", kept, Some(stats(1, 1, 1))).unwrap();
-        let before = edits.apply(&pages, None, &memory).await.unwrap().unwrap();
+        let before = edits.apply(&pages, None).await.unwrap().unwrap();
         let mut edits = TermEdits::new(&memory).unwrap();
         edits.record(0, "report", old, None).unwrap();
         edits.record(0, "report", replacement, Some(stats(1, 2, 2))).unwrap();
-        let after = edits.apply(&pages, Some(&before), &memory).await.unwrap().unwrap();
+        let after = edits.apply(&pages, Some(&before)).await.unwrap().unwrap();
         assert_eq!(read_term(&pages, &before, 0, "report", &BTreeMap::from([(old, 0), (kept, 1)]), &memory)
             .await.unwrap().stats.keys().copied().collect::<Vec<_>>(), [0]);
         let active = BTreeMap::from([(replacement, 2), (kept, 1)]);
@@ -338,7 +349,7 @@ mod tests {
         let rebuild = || {
             let mut edits = TermEdits::new(&memory).unwrap();
             edits.record(0, "report", run, Some(stats(1, 1, 1))).unwrap();
-            edits.apply(&pages, None, &memory)
+            edits.apply(&pages, None)
         };
 
         let abandoned = rebuild().await.unwrap().unwrap();

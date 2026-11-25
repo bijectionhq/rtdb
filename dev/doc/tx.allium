@@ -26,6 +26,7 @@
 -- Other parameter layouts and plans that decline direct binding use the scalar binding path.
 -- Embedded Clojure SQL plans bind compatible positional arguments as one C Data row with their native widths and nulls.
 -- Flight SQL uploads retain the message body as backing storage for compatible record and dictionary buffers.
+-- Flight SQL admits command decoding from the descriptor and releases its grant as the decoded fields are consumed.
 -- Scalar evaluation reads a bound parameter from its Arrow column when the expression reaches it.
 -- A prepared Flight SQL query binds the first row of a multi-row parameter batch for the streaming cursor.
 -- It compacts that row when the selection fits the memory budget.
@@ -68,6 +69,7 @@
 -- The decoder borrows tokens while visiting nested input.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
+-- The ticket keeps the parameter types admitted for its result description across later bindings of the prepared statement.
 -- The authenticated session and original attachment authorize redemption of its ticket.
 -- A prepared statement reuses its cached plan when its parameter types, planning options, and observed catalog lookups agree.
 -- Rebinding charges execution to the query budget while the statement retains its plan charge.
@@ -88,7 +90,9 @@
 -- A materialized relation evaluates on its first reached reference and preserves the order of its pages.
 -- Native execution holds its pages within the materialization row and memory bounds.
 -- When either bound is crossed it replays all pages through one query-scoped spill file, using the column spill format.
--- Every reference has its own replay position and every outstanding page retains its own memory.
+-- Every reference has its own replay position.
+-- References to an in-memory page share the query budget charge for its Arrow backing and pay for their copied values and metadata.
+-- Every outstanding page keeps the memory it uses charged until it is released.
 -- Measured operators reserve against sibling scopes of the same query budget.
 -- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
 -- EXPLAIN renders packed floating-point literals from their Arrow children at the original float width.

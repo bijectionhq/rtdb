@@ -19,7 +19,7 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, OffsetBuffer
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use rtdb_columnar::{
-    BatchBuilder, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
+    BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
 };
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, UnaryOp};
 use rtdb_query::{ConstantEvaluator, OrderedBatches, OrderedCandidates, OrderedIidBuffer, OrderedScan, ScanAccelerator, ScanRequest, ScanSelection};
@@ -182,15 +182,33 @@ impl Constants<'_> {
     }
 }
 
-#[derive(Debug, Default)]
-struct Range {
-    prefix: Vec<Atom>,
-    lower: Option<(Atom, bool)>,
-    upper: Option<(Atom, bool)>,
-    cursors: Vec<CursorBound>,
+trait BoundAtom {
+    fn view(&self) -> AtomRef<'_>;
 }
 
-impl Range {
+impl BoundAtom for Atom {
+    fn view(&self) -> AtomRef<'_> { self.borrowed() }
+}
+
+impl BoundAtom for AtomRef<'_> {
+    fn view(&self) -> AtomRef<'_> { *self }
+}
+
+#[derive(Debug)]
+struct Range<T = Atom> {
+    prefix: Vec<T>,
+    lower: Option<(T, bool)>,
+    upper: Option<(T, bool)>,
+    cursors: Vec<CursorBound<T>>,
+}
+
+impl<T> Default for Range<T> {
+    fn default() -> Self {
+        Self { prefix: Vec::new(), lower: None, upper: None, cursors: Vec::new() }
+    }
+}
+
+impl Range<Atom> {
     fn is_open(&self) -> bool {
         self.prefix.is_empty()
             && self.lower.is_none()
@@ -263,12 +281,14 @@ impl Range {
         }
         Ok(range)
     }
+}
 
+impl<T: BoundAtom> Range<T> {
     fn position(&self, key: Tuple<'_>) -> Ordering {
         let prefix = key
             .iter()
             .zip(&self.prefix)
-            .map(|(value, bound)| value.cmp(&bound.borrowed()))
+            .map(|(value, bound)| value.cmp(&bound.view()))
             .find(|order| *order != Ordering::Equal)
             .unwrap_or(Ordering::Equal);
         if prefix != Ordering::Equal {
@@ -278,7 +298,7 @@ impl Range {
             return Ordering::Equal;
         };
         if self.lower.as_ref().is_some_and(|(lower, strict)| {
-            next < lower.borrowed() || (*strict && next == lower.borrowed())
+            next < lower.view() || (*strict && next == lower.view())
         }) || self
             .cursors
             .iter()
@@ -287,7 +307,7 @@ impl Range {
             return Ordering::Less;
         }
         if self.upper.as_ref().is_some_and(|(upper, strict)| {
-            next > upper.borrowed() || (*strict && next == upper.borrowed())
+            next > upper.view() || (*strict && next == upper.view())
         }) || self
             .cursors
             .iter()
@@ -300,13 +320,14 @@ impl Range {
 }
 
 #[derive(Debug)]
-struct CursorBound {
-    key: Vec<Atom>,
+struct CursorBound<T> {
+    key: Vec<T>,
     lower: bool,
     strict: bool,
+    _allocation: Option<Arc<MemoryReservation>>,
 }
 
-impl CursorBound {
+impl CursorBound<Atom> {
     async fn bind(
         constants: &Constants<'_>,
         predicate: &Expr,
@@ -333,15 +354,18 @@ impl CursorBound {
             key,
             lower: matches!(operator, BinaryOp::Gt | BinaryOp::GtEq),
             strict: matches!(operator, BinaryOp::Gt | BinaryOp::Lt),
+            _allocation: None,
         }))
     }
+}
 
+impl<T: BoundAtom> CursorBound<T> {
     fn position(&self, tuple: Tuple<'_>, offset: usize) -> Ordering {
         let order = tuple
             .iter()
             .skip(offset)
             .zip(&self.key)
-            .map(|(value, bound)| value.cmp(&bound.borrowed()))
+            .map(|(value, bound)| value.cmp(&bound.view()))
             .find(|order| *order != Ordering::Equal)
             .unwrap_or(Ordering::Equal);
         match (order, self.lower, self.strict) {
@@ -691,32 +715,10 @@ async fn use_index(
         return Ok(None);
     };
     let reverse = top.is_some_and(|top| top.reverse);
-    let buckets: Vec<_> = Bucket::at(request.bounds.valid_time.lower()).collect();
-    let cursors = buckets
-        .iter()
-        .map(|_| Cursor::new(root.clone(), reverse))
-        .collect();
-    let scratch = request.memory.reserve(
-        MAX_CANDIDATES
-            .min(top.map_or(MAX_CANDIDATES, |top| top.limit))
-            .saturating_mul(64)
-            .saturating_add(16_384),
-    )?;
-    let mut scan = PostingScan {
-        heap: BinaryHeap::new(),
-        cursors,
-        buckets,
-        advanced: None,
-        range,
-        reverse,
-        width: definition.columns.len(),
-        cancellation: request.cancellation.clone(),
-        _scratch: scratch,
-        tree,
-    };
-    for slot in 0..scan.cursors.len() {
-        scan.advance(slot).await?;
-    }
+    let scan = PostingScan::open(
+        tree, root, request.bounds.valid_time.lower(), range, reverse, definition.columns.len(),
+        request.cancellation,
+    ).await?;
 
     let postings = MatchingPostings {
         scan,
@@ -791,7 +793,7 @@ pub(super) async fn owned_page(
     let positions: Vec<_> = (0..fields.len()).collect();
     let covered =
         Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
-    let (range, reverse, limit) = bounds.bind(&fields)?;
+    let (range, reverse, limit) = bounds.bind(&fields, &context.memory)?;
     if !(1..=BATCH_ROWS).contains(&limit) {
         return Err(rtdb_types::Anomaly::incorrect(
             "rtdb.owned/range-limit",
@@ -806,29 +808,9 @@ pub(super) async fn owned_page(
         return Ok(super::OwnedRangePage { schema: covered.schema, batch: None });
     }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
-    let buckets: Vec<_> = Bucket::at(valid_at).collect();
-    let scratch = context
-        .memory
-        .reserve(limit.saturating_mul(64).saturating_add(16_384))?;
-    let cursors = buckets
-        .iter()
-        .map(|_| Cursor::new(root.clone(), reverse))
-        .collect();
-    let mut scan = PostingScan {
-        heap: BinaryHeap::new(),
-        cursors,
-        buckets,
-        advanced: None,
-        range,
-        reverse,
-        width: definition.columns.len(),
-        cancellation: context.cancellation.clone(),
-        _scratch: scratch,
-        tree,
-    };
-    for slot in 0..scan.cursors.len() {
-        scan.advance(slot).await?;
-    }
+    let scan = PostingScan::open(
+        tree, root, valid_at, range, reverse, definition.columns.len(), &context.cancellation,
+    ).await?;
     let schema = Arc::clone(&covered.schema);
     let mut seek = CoveredSeek {
         state: Some(CoveredState {
@@ -879,8 +861,8 @@ pub(super) async fn owned_count(
         .filter(|position| decimal.is_none() || Some(*position) != measure_position).collect();
     Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
     let mut range = Range::default();
-    compound_bound(&mut range, &fields, request.lower, true, false)?;
-    compound_bound(&mut range, &fields, request.upper, false, true)?;
+    compound_bound(&mut range, &fields, request.lower, true, false, &context.memory)?;
+    compound_bound(&mut range, &fields, request.upper, false, true, &context.memory)?;
     request.valid_at.next()?;
     let present = context.current_time.as_micros()?;
     if lifetime.is_some() && request.valid_at != present {
@@ -935,7 +917,7 @@ pub(super) async fn owned_count(
 }
 
 async fn rank_owned_range(
-    tree: &Tree, root: &Root, range: &Range, valid_at: Timestamp,
+    tree: &Tree, root: &Root, range: &Range<AtomRef<'_>>, valid_at: Timestamp,
     cancellation: &CancellationToken, measured: bool,
 ) -> Result<(u64, Measure)> {
     let mut count = 0u64;
@@ -990,14 +972,14 @@ pub(super) fn invalid_bound() -> rtdb_types::Anomaly {
     )
 }
 
-fn bound_atom(field: &Field, value: &rtdb_types::Value) -> Result<Atom> {
-    admit_bound_atom(field, Atom::of(value).ok_or_else(invalid_bound)?)
+fn bound_atom<'a>(field: &Field, value: &'a rtdb_types::Value) -> Result<AtomRef<'a>> {
+    admit_bound_atom(field, AtomRef::of(value).ok_or_else(invalid_bound)?)
 }
 
-fn admit_bound_atom(field: &Field, atom: Atom) -> Result<Atom> {
+fn admit_bound_atom<'a>(field: &Field, atom: AtomRef<'a>) -> Result<AtomRef<'a>> {
     let expected = owned_family(&field.data_type).ok_or_else(invalid_bound)?;
     if atom.family() == Some(expected)
-        || (matches!(atom, Atom::Null) && field.name != "_id" && field.data_type.nullable())
+        || (matches!(atom, AtomRef::Null) && field.name != "_id" && field.data_type.nullable())
     {
         Ok(atom)
     } else {
@@ -1005,12 +987,13 @@ fn admit_bound_atom(field: &Field, atom: Atom) -> Result<Atom> {
     }
 }
 
-fn compound_bound(
-    range: &mut Range,
+fn compound_bound<'a>(
+    range: &mut Range<AtomRef<'a>>,
     fields: &[Field],
-    key: Option<super::OwnedKeyBound<'_>>,
+    key: Option<super::OwnedKeyBound<'a>>,
     lower: bool,
     strict: bool,
+    memory: &Arc<MemoryBudget>,
 ) -> Result<()> {
     let Some(key) = key else {
         return Ok(());
@@ -1023,24 +1006,30 @@ fn compound_bound(
     if width != fields.len() {
         return Err(invalid_bound());
     }
-    let key = fields
-        .iter()
-        .map(|field| match key {
-            OwnedKeyBound::Values(key) => {
-                let value = key.get(&field.name).ok_or_else(invalid_bound)?;
-                if !field.data_type.legs().contains(&value.logical_type()) { return Err(invalid_bound()); }
-                bound_atom(field, value)
-            }
-            OwnedKeyBound::Arrow { .. } => {
-                let cell = key.arrow_field(&field.name).ok_or_else(invalid_bound)?;
-                if !field.data_type.legs().contains(&cell.logical_type()?) { return Err(invalid_bound()); }
-                let atom = AtomRef::from_arrow(cell.field, cell.array, cell.row).map_err(|_| invalid_bound())?;
-                if !atom.is_bound() { return Err(invalid_bound()); }
-                admit_bound_atom(field, atom.owned())
-            }
-        })
-        .collect::<Result<_>>()?;
-    range.cursors.push(CursorBound { key, lower, strict });
+    let cell = |field: &Field| match key {
+        OwnedKeyBound::Values(key) => {
+            let value = key.get(&field.name).ok_or_else(invalid_bound)?;
+            if !field.data_type.legs().contains(&value.logical_type()) { return Err(invalid_bound()); }
+            bound_atom(field, value)
+        }
+        OwnedKeyBound::Arrow { .. } => {
+            let cell = key.arrow_field(&field.name).ok_or_else(invalid_bound)?;
+            if !field.data_type.legs().contains(&cell.logical_type()?) { return Err(invalid_bound()); }
+            let atom = AtomRef::from_arrow(cell.field, cell.array, cell.row).map_err(|_| invalid_bound())?;
+            if !atom.is_bound() { return Err(invalid_bound()); }
+            admit_bound_atom(field, atom)
+        }
+    };
+    fields.iter().try_for_each(|field| cell(field).map(drop))?;
+    let allocation = memory.reserve(
+        width.saturating_mul(size_of::<AtomRef<'_>>())
+            .saturating_add(4 * size_of::<CursorBound<AtomRef<'_>>>()),
+    )?;
+    let mut key = Vec::with_capacity(width);
+    for field in fields {
+        key.push(cell(field)?);
+    }
+    range.cursors.push(CursorBound { key, lower, strict, _allocation: Some(allocation) });
     Ok(())
 }
 
@@ -1052,7 +1041,7 @@ impl<'a> RowBounds<'a> {
         }
     }
 
-    fn bind(self, fields: &[Field]) -> Result<(Range, bool, usize)> {
+    fn bind(self, fields: &[Field], memory: &Arc<MemoryBudget>) -> Result<(Range<AtomRef<'a>>, bool, usize)> {
         let mut range = Range::default();
         match self {
             Self::Leading {
@@ -1077,7 +1066,7 @@ impl<'a> RowBounds<'a> {
                     (request.upper, false, true),
                     (request.after, !request.descending, true),
                 ] {
-                    compound_bound(&mut range, fields, key, lower, strict)?;
+                    compound_bound(&mut range, fields, key, lower, strict, memory)?;
                 }
                 Ok((range, request.descending, request.limit))
             }
@@ -1085,18 +1074,18 @@ impl<'a> RowBounds<'a> {
     }
 }
 
-struct MatchingPostings {
-    scan: PostingScan,
+struct MatchingPostings<T = Atom> {
+    scan: PostingScan<T>,
     predicates: Vec<Predicate>,
     distinct: Option<DistinctPrefix>,
     last: Option<Head>,
     identity_slot: Option<usize>,
 }
 
-impl MatchingPostings {
+impl<T: BoundAtom + Send + Sync> MatchingPostings<T> {
     async fn next(&mut self) -> Result<Option<Head>> {
         while let Some(head) = self.scan.next().await? {
-            if let Some(slot) = self.identity_slot { head.require_identity(slot, &self.scan.tree.memory)?; }
+            if let Some(slot) = self.identity_slot { head.require_identity(slot)?; }
             if !self
                 .predicates
                 .iter()
@@ -1143,12 +1132,12 @@ impl OrderedCandidates for PostingCandidates {
     }
 }
 
-struct PostingScan {
+struct PostingScan<T> {
     heap: BinaryHeap<Head>,
     cursors: Vec<Cursor>,
     buckets: Vec<Bucket>,
     advanced: Option<usize>,
-    range: Range,
+    range: Range<T>,
     reverse: bool,
     width: usize,
     cancellation: CancellationToken,
@@ -1156,7 +1145,39 @@ struct PostingScan {
     tree: Tree,
 }
 
-impl PostingScan {
+impl<T: BoundAtom + Send + Sync> PostingScan<T> {
+    async fn open(
+        tree: Tree,
+        root: Root,
+        valid_at: Timestamp,
+        range: Range<T>,
+        reverse: bool,
+        width: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        let buckets = Bucket::at(valid_at);
+        let capacity = buckets.len();
+        let scratch = tree.memory.reserve(
+            capacity * (size_of::<Bucket>() + size_of::<Cursor>() + size_of::<Head>()),
+        )?;
+        let mut scan = Self {
+            heap: BinaryHeap::with_capacity(capacity),
+            cursors: (0..capacity).map(|_| Cursor::new(root.clone(), reverse)).collect(),
+            buckets: buckets.collect(),
+            advanced: None,
+            range,
+            reverse,
+            width,
+            cancellation: cancellation.clone(),
+            _scratch: scratch,
+            tree,
+        };
+        for slot in 0..capacity {
+            scan.advance(slot).await?;
+        }
+        Ok(scan)
+    }
+
     async fn advance(&mut self, slot: usize) -> Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(cancelled());
@@ -1193,15 +1214,15 @@ impl PostingScan {
     }
 }
 
-struct CoveredState {
+struct CoveredState<T> {
     projection: Covered,
-    postings: MatchingPostings,
+    postings: MatchingPostings<T>,
     skip: usize,
     remaining: usize,
 }
 
-struct CoveredSeek {
-    state: Option<CoveredState>,
+struct CoveredSeek<T = Atom> {
+    state: Option<CoveredState<T>>,
     sliced_rows: u64,
     gathered_rows: u64,
 }
@@ -1217,12 +1238,13 @@ impl CoveredSeek {
 }
 
 #[async_trait]
-impl OrderedBatches for CoveredSeek {
+impl<T: BoundAtom + Send + Sync> OrderedBatches for CoveredSeek<T> {
     async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(state) = &mut self.state else {
             return Ok(None);
         };
         let capacity = BATCH_ROWS.min(state.remaining);
+        let _staging = state.postings.scan.tree.memory.reserve(capacity * size_of::<Head>())?;
         let mut rows = Vec::with_capacity(capacity);
         while rows.len() < capacity {
             let Some(head) = state.postings.next().await? else {
@@ -1269,7 +1291,7 @@ impl OrderedBatches for CoveredSeek {
 async fn next(
     cursor: &mut Cursor,
     tree: &Tree,
-    range: &Range,
+    range: &Range<impl BoundAtom>,
     bucket: Bucket,
     slot: usize,
     reverse: bool,
@@ -1780,10 +1802,9 @@ impl Head {
         address
     }
 
-    fn require_identity(&self, slot: usize, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+    fn require_identity(&self, slot: usize) -> Result<()> {
         use rtdb_columnar::EntityIdRef;
         let key = self.address().key;
-        let _decode = memory.reserve(key.len().saturating_add(256))?;
         let matches = match (EntityIdRef::from_handle_bytes(key)?, self.tuple().cell(slot)) {
             (EntityIdRef::String(id), AtomRef::Text(value)) => id == value,
             (EntityIdRef::Binary(id), AtomRef::Binary(value)) => id == value,
@@ -1907,18 +1928,21 @@ mod tests {
             lower: Some(bound.borrowed()), upper: None, after: Some(bound.borrowed()),
             descending: true, limit: 13,
         };
-        let (range, reverse, limit) = RowBounds::Compound(request).bind(&fields).unwrap();
+        let (range, reverse, limit) = RowBounds::Compound(request).bind(&fields, &MemoryBudget::new(4096)).unwrap();
         assert!(reverse);
         assert_eq!(limit, 13);
         assert_eq!(range.cursors.len(), 2);
         assert!(range.cursors[0].lower && !range.cursors[0].strict);
         assert!(!range.cursors[1].lower && range.cursors[1].strict);
+        let identity = bound.borrowed().arrow_field("_id").unwrap().utf8().unwrap();
         for bound in range.cursors {
-            assert_eq!(bound.key, [Atom::Day(-1), Atom::Text("target".into())]);
+            assert_eq!(bound.key, [AtomRef::Day(-1), AtomRef::Text("target")]);
+            let AtomRef::Text(text) = bound.key[1] else { unreachable!() };
+            assert_eq!(text.as_ptr(), identity.as_ptr());
         }
         let mismatched = [path_field("day", LogicalType::Scalar(ScalarType::DateDay)), fields[1].clone()];
         let mut range = Range::default();
-        let failure = compound_bound(&mut range, &mismatched, Some(bound.borrowed()), true, false).unwrap_err();
+        let failure = compound_bound(&mut range, &mismatched, Some(bound.borrowed()), true, false, &MemoryBudget::new(4096)).unwrap_err();
         assert_eq!(failure.code, "rtdb.owned/range-bound");
     }
 
@@ -1932,7 +1956,7 @@ mod tests {
         for row in 0..4 {
             let selector = crate::OwnedKeyBound::Arrow { field: &field, array: &array, row };
             let mut range = Range::default();
-            let result = compound_bound(&mut range, &fields, Some(selector), true, false);
+            let result = compound_bound(&mut range, &fields, Some(selector), true, false, &MemoryBudget::new(4096));
             assert_eq!(result.is_ok(), row == 3);
         }
     }
