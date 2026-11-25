@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Anomaly, ListKind, LogicalType, Result, ScalarType, StructFields, TimeUnit, Value};
 
+/// UTC years 0001 through 9999 for native hosted assertion and value slots.
+pub const HOSTED_INSTANT_MICROS: std::ops::Range<i64> = -62_135_596_800_000_000..253_402_300_800_000_000;
+
 /// Durable expiry frontier for one immutable creation-lifetime relation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedLifetimeFloor {

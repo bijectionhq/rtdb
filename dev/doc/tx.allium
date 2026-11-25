@@ -365,6 +365,7 @@
 -- A hosted clear Root field adoption checks the installed writer, Root and relation declaration stamps, and the two held partition heads and data frontiers against the durable predecessor.
 -- The receiver derives the source data and journal populations from that predecessor and matches each positioned put and delete to its ordered journal touch.
 -- A native Decimal inside an adopted compound cell uses its signed Decimal128 coefficient and canonical Int8 scale under the exact declared struct.
+-- Adopted compound records keep canonical field order including the empty first field, and native Date and Instant cells must remain inside hosted years 0001 through 9999.
 -- The virgin successor receives the original coordinates, assertion ordinals, origin, valid intervals and SQL history times with its changed field carrier and intrinsic order roles.
 -- The Root declaration switch, successor partition head, attempt marker and source retirement publish with the copied history in one resolved transaction.
 -- A direct historical read of the successor must select a cut at or after the adoption, and an earlier held Root catalog continues to select the predecessor.

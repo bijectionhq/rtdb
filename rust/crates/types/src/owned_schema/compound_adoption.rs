@@ -1,4 +1,4 @@
-use super::{Kind, invalid};
+use super::{HOSTED_INSTANT_MICROS, Kind, invalid};
 use crate::{DecimalValue, Result, StructFields, TimeUnit, Value};
 
 const DECIMAL_DIGITS: u8 = 38;
@@ -151,10 +151,16 @@ fn cell(kind: &Kind, bytes: &mut &[u8]) -> Option<Value> {
             if value.is_nan() && bits != 0x7ff8_0000_0000_0000 { return None; }
             Value::F64(value)
         }
-        Kind::DateDay {} => Value::DateDay((u32::from_be_bytes(word(bytes)?) ^ (1 << 31)) as i32),
-        Kind::Instant {} => Value::Timestamp {
-            value: signed(word(bytes)?), unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
-        },
+        Kind::DateDay {} => {
+            let days = (u32::from_be_bytes(word(bytes)?) ^ (1 << 31)) as i32;
+            if !(-719_162..=2_932_896).contains(&days) { return None; }
+            Value::DateDay(days)
+        }
+        Kind::Instant {} => {
+            let value = signed(word(bytes)?);
+            if !HOSTED_INSTANT_MICROS.contains(&value) { return None; }
+            Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }
+        }
         Kind::Utf8 {} => Value::Utf8(String::from_utf8(payload(bytes)?).ok()?),
         Kind::Binary {} => Value::Binary(payload(bytes)?),
         Kind::Struct { .. } if head == DECIMAL_TAG => {
@@ -173,10 +179,14 @@ fn cell(kind: &Kind, bytes: &mut &[u8]) -> Option<Value> {
         }
         Kind::Struct { fields } => {
             let mut values = StructFields::new();
-            let mut previous = String::new();
+            let mut previous: Option<String> = None;
             while !close(bytes) {
                 let name = String::from_utf8(payload(bytes)?).ok()?;
-                if name <= previous { return None; }
+                if name.starts_with('$') || !name.bytes().all(|byte| (32..127).contains(&byte))
+                    || previous.as_ref().is_some_and(|previous| &name <= previous)
+                {
+                    return None;
+                }
                 let physical = format!("value_{name}");
                 let field = fields.iter().find(|field| field.name == physical)?;
                 let value = if field.nullable && bytes.first() == Some(&2) {
@@ -186,7 +196,7 @@ fn cell(kind: &Kind, bytes: &mut &[u8]) -> Option<Value> {
                     cell(&field.kind, bytes)?
                 };
                 values.insert(physical, value);
-                previous = name;
+                previous = Some(name);
             }
             for field in fields {
                 let Some(name) = field.name.strip_prefix("is_present_") else {
@@ -318,6 +328,71 @@ mod tests {
             let wrong = successor(json!({"kind":"list","element":kind}))?;
             assert!(original.clear_compound_successor(&wrong, &[]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_compound_dates_and_instants_keep_the_hosted_bounds() -> crate::Result<()> {
+        let original = declaration(json!({"kind":"canonical_binary"}))?;
+        let dates = successor(json!({"kind":"list","element":{"kind":"date_day"}}))?;
+        let (_, date) = original.clear_compound_successor(&dates, &[])?;
+        for (days, admitted) in [(-719_163i32, false), (-719_162, true), (2_932_896, true), (2_932_897, false)] {
+            let mut image = vec![12, 7];
+            image.extend_from_slice(&((days as u32) ^ (1 << 31)).to_be_bytes());
+            image.extend_from_slice(&[0, 0]);
+            let converted = date.convert(&image);
+            if admitted {
+                assert_eq!(converted?, Value::Struct(StructFields::from([
+                    ("v2_value".into(), Value::list(vec![Value::DateDay(days)])),
+                ])));
+            } else {
+                assert!(converted.is_err());
+            }
+        }
+        let instants = successor(json!({"kind":"list","element":{"kind":"instant"}}))?;
+        let (_, instant) = original.clear_compound_successor(&instants, &[])?;
+        for (micros, admitted) in [
+            (-62_135_596_800_000_001i64, false),
+            (-62_135_596_800_000_000, true),
+            (253_402_300_799_999_999, true),
+            (253_402_300_800_000_000, false),
+        ] {
+            let mut image = vec![12, 8];
+            image.extend_from_slice(&((micros as u64) ^ (1 << 63)).to_be_bytes());
+            image.extend_from_slice(&[0, 0]);
+            let converted = instant.convert(&image);
+            if admitted {
+                let value = Value::Timestamp {
+                    value: micros, unit: crate::TimeUnit::Microsecond, timezone: Some("UTC".into()),
+                };
+                assert_eq!(converted?, Value::Struct(StructFields::from([
+                    ("v2_value".into(), Value::list(vec![value])),
+                ])));
+            } else {
+                assert!(converted.is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_compound_admits_the_empty_first_field_and_refuses_a_duplicate() -> crate::Result<()> {
+        let original = declaration(json!({"kind":"canonical_binary"}))?;
+        let next = successor(json!({"kind":"struct","fields":[
+            {"name":"value_","type":{"kind":"bool"},"optional":false,"nullable":false},
+        ]}))?;
+        let (_, codec) = original.clear_compound_successor(&next, &[])?;
+        let field = [0, 1, 3, 1];
+        let mut image = vec![13];
+        image.extend_from_slice(&field);
+        let mut duplicate = image.clone();
+        image.extend_from_slice(&[0, 0]);
+        duplicate.extend_from_slice(&field);
+        duplicate.extend_from_slice(&[0, 0]);
+        assert_eq!(codec.convert(&image)?, Value::Struct(StructFields::from([
+            ("v2_value".into(), Value::Struct(StructFields::from([("value_".into(), Value::Bool(true))]))),
+        ])));
+        assert!(codec.convert(&duplicate).is_err());
         Ok(())
     }
 
