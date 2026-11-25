@@ -1609,7 +1609,8 @@ impl Guard {
                 })
             }
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),
-            Self::Unwritten { range, since } => Ok(view(MAIN_BRANCH)?.store_written_since(range, *since)?.is_none()),
+            Self::Unwritten { range, since } => Ok(index.view(MAIN_BRANCH, At::Latest, Layer::Merged, time)?
+                .store_written_since(range, *since)?.is_none()),
         }
     }
 }
