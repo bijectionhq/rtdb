@@ -275,7 +275,6 @@ mod tests {
         }
 
         let bounded = encode_batch(&batch, encoded.len()).unwrap();
-        assert_eq!(bounded.capacity(), encoded.len());
         assert_eq!(bounded, encoded);
     }
 

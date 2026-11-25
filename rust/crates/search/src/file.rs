@@ -267,10 +267,6 @@ impl<'a> CatalogStatsReader<'a> {
     }
 }
 
-pub(crate) fn decode_tree_locator(bytes: &[u8]) -> Option<TreeLocator> {
-    CatalogStatsReader::open(bytes)?.tree_locator()
-}
-
 pub(crate) fn decode_footer_locator(bytes: &[u8]) -> Option<FooterLocator> {
     let reader = StreamReader::try_new(Cursor::new(bytes), None).ok()?;
     FooterLocator::decode(reader.schema().metadata().get(FOOTER_LOCATOR)?)
