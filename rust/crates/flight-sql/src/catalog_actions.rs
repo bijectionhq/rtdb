@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Schema};
 use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, to_field};
-use rtdb_format::ipc::OwnedStream;
+use rtdb_format::ipc::{OwnedStream, RecordSpans};
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{LogicalType, ScalarType, TableRef};
 use tonic::{Response, Status};
@@ -51,6 +51,12 @@ impl CatalogIpcEncoder {
     }
 
     fn page(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<ActionResult>, Status> {
+        if self.dictionaries.dict_id().is_empty()
+            && let Some(frame) = catalog_ipc_span_frame(batch, &charge)?
+        {
+            return Ok(vec![frame]);
+        }
+
         let (dictionaries, record) = IpcDataGenerator::default()
             .encode(batch, &mut self.dictionaries, &self.options, &mut self.compression)
             .map_err(arrow)?;
@@ -58,6 +64,35 @@ impl CatalogIpcEncoder {
             catalog_ipc_frame(message, &self.options, Arc::clone(&charge))
         }).collect()
     }
+}
+
+fn catalog_ipc_span_frame(
+    batch: &RecordBatch,
+    charge: &Arc<MemoryReservation>,
+) -> Result<Option<ActionResult>, Status> {
+    // The page reservation funds the span plan and final frame together.
+    let scratch = MemoryBudget::new(charge.bytes());
+    let framed = RecordSpans::exact(batch, IPC_ALIGNMENT, &scratch).and_then(|spans| {
+        let Some(spans) = spans else { return Ok(None) };
+        let (metadata, body_len) = spans.framed_metadata()?;
+        Ok(Some((spans, metadata, body_len)))
+    });
+    let (spans, metadata, body_len) = match framed {
+        Ok(Some(framed)) => framed,
+        Ok(None) => return Ok(None),
+        Err(error) => match error.code.as_str() {
+            "rtdb/memory-budget-exceeded" | "rtdb.format/invalid-arrow" => return Ok(None),
+            _ => return Err(status(error)),
+        },
+    };
+    let len = wire::add(metadata.len(), body_len)?;
+    let Ok(_frame_charge) = scratch.reserve(wire::add(len, 256)?) else {
+        return Ok(None);
+    };
+    let mut frame = Vec::with_capacity(len);
+    frame.extend_from_slice(&metadata);
+    spans.write_body(&mut frame).map_err(arrow)?;
+    Ok(Some(ActionResult { body: wire::retain(frame, Arc::clone(charge)) }))
 }
 
 fn catalog_ipc_frame(
@@ -567,6 +602,36 @@ mod tests {
     use arrow_schema::Field;
     use rtdb_tx::prepare_submission;
     use rtdb_types::Value;
+
+    #[test]
+    fn catalog_ipc_spanned_page_matches_stream_writer_bytes_with_only_the_page_reservation() {
+        let keys = Int64Array::from_iter_values(0..4097);
+        let batch = RecordBatch::try_from_iter([("key", Arc::new(keys) as ArrayRef)]).unwrap();
+        let schema = batch.schema_ref();
+        let schema_bound = wire::schema_bound(schema).unwrap();
+        let page_bound = batch.get_array_memory_size() * 6 + schema_bound;
+        let memory = MemoryBudget::new(schema_bound + page_bound);
+        let schema_charge = memory.reserve(schema_bound).unwrap();
+        let (mut encoder, initial) = CatalogIpcEncoder::new(schema, schema_charge).unwrap();
+        let charge = memory.reserve(page_bound).unwrap();
+        assert_eq!(memory.available_bytes(), 0);
+        assert!(catalog_ipc_span_frame(&batch, &charge).unwrap().is_some());
+
+        let mut reference = StreamWriter::try_new(Vec::new(), schema).unwrap();
+        assert_eq!(initial.body.as_ref(), std::mem::take(reference.get_mut()).as_slice());
+        reference.write(&batch).unwrap();
+        let page = encoder.page(&batch, charge).unwrap();
+        let [frame] = page.as_slice() else {
+            panic!("Expected one record frame");
+        };
+        assert_eq!(frame.body.as_ref(), reference.get_ref().as_slice());
+        let body = frame.body.clone();
+        drop(initial);
+        drop(page);
+        assert_eq!(memory.used_bytes(), page_bound);
+        drop(body);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn catalog_ipc_frames_match_stream_writer_with_dictionary_replacements() {
