@@ -861,6 +861,13 @@ pub fn normalize_java_stream_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     decoded_schema::normalize_stream_validity(batch)
 }
 
+/// Rebase sliced runs and their enclosing arrays for a native V5 stream layout.
+/// The input batch already owns its value buffers, and the schema charge covers the new descriptors.
+pub fn normalize_native_stream_batch(batch: &OwnedBatch, schema: Arc<MemoryReservation>) -> Result<OwnedBatch> {
+    let normalized = decoded_schema::normalize_native_stream(batch.batch(), schema.budget())?;
+    Ok(OwnedBatch::with_funded_columns(normalized, Arc::clone(&schema)).with_schema_reservation(schema))
+}
+
 /// Owns a complete IPC stream's decoded schema and independently funded pages.
 pub struct OwnedStream {
     schema: SchemaRef,
@@ -2191,6 +2198,49 @@ fn jvm_end_marker(bytes: &mut Vec<u8>, end: usize) -> Result<()> {
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-arrow", error.to_string())
+}
+
+#[test]
+fn native_stream_normalization_rebases_sliced_list_runs_without_copying_values() {
+    use arrow_array::{Array, Int16Array, Int64Array, ListArray, RunArray, TimestampMicrosecondArray, cast::AsArray, types::Int16Type};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::Field;
+
+    let details = arrow_array::StructArray::new(
+        vec![Field::new("code", DataType::Int64, false)].into(),
+        vec![Arc::new(Int64Array::from(vec![Some(10), Some(20), None, Some(40)]))],
+        Some(NullBuffer::from(vec![true, true, false, true])),
+    );
+    let runs = RunArray::<Int16Type>::try_new(&Int16Array::from(vec![2, 4, 6, 8]), &details).unwrap();
+    let lists = ListArray::new(
+        Arc::new(Field::new("item", runs.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0, 3, 5, 7, 8].into()),
+        Arc::new(runs),
+        None,
+    ).slice(1, 2);
+    let times = TimestampMicrosecondArray::from(vec![83, 85]).with_timezone("");
+    let batch = RecordBatch::try_from_iter([
+        ("run_lists", Arc::new(lists) as ArrayRef),
+        ("observed", Arc::new(times) as ArrayRef),
+    ]).unwrap();
+    let memory = MemoryBudget::new(16 << 20);
+    let input = OwnedBatch::new(batch, &memory).unwrap();
+    let batch = input.batch();
+    let reference = write_stream(batch.schema_ref(), std::slice::from_ref(batch)).unwrap();
+    let reference = OwnedStream::read(&reference, &memory).unwrap();
+    let charge = memory.reserve(schema_translation_bound(batch.schema_ref()).unwrap()).unwrap();
+    let normalized = normalize_native_stream_batch(&input, charge).unwrap();
+    let normalized = normalized.batch();
+    assert_eq!(normalized, reference.pages()[0].batch());
+    let lists = normalized.column(0).as_list::<i32>();
+    assert_eq!(lists.value_offsets(), &[0, 2, 4]);
+    let runs = lists.values().as_any().downcast_ref::<RunArray<Int16Type>>().unwrap();
+    assert_eq!(runs.run_ends().values(), &[1, 3, 4]);
+    let before = batch.column(0).as_list::<i32>().values().as_any().downcast_ref::<RunArray<Int16Type>>().unwrap();
+    let before = before.values().as_struct().column(0).as_primitive::<arrow_array::types::Int64Type>().values();
+    let after = runs.values().as_struct().column(0).as_primitive::<arrow_array::types::Int64Type>().values();
+    assert_eq!(after.as_ptr(), before[1..].as_ptr());
+    assert!(runs.values().as_struct().is_null(1));
 }
 
 

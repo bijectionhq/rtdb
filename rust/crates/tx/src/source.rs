@@ -390,61 +390,47 @@ impl SourceTransaction {
         for (field, column) in schema.fields().iter().zip(batch.batch().columns()) {
             layout.inspect(field, column.as_ref())?;
         }
-        if !layout.run_end_encoded {
-            let _schema = self.memory.reserve(schema_bytes)?;
-            let normalized = if layout.masked || layout.empty_timezone {
-                // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Apply Java stream validity and decoded field types in memory.
-                Some(rtdb_format::ipc::normalize_java_stream_batch(batch.batch())?)
-            } else {
-                // arrow-flow: rtdb.proposal.landing/compatible operation-batch operations materialize java-v5 required adapt_stream_batch | Read operations from a compatible in-memory layout.
-                rtdb_format::ipc::adapt_stream_batch(batch.batch())?
-            };
-            let batch = match normalized {
-                Some(normalized) => OwnedBatch::with_reservation(normalized, Arc::clone(batch.reservation()))?,
-                None => batch,
-            };
+        let schema_charge = self.memory.reserve(schema_bytes)?;
+        if layout.run_end_encoded {
+            // arrow-flow: rtdb.proposal.landing/run-ends operation-batch operations materialize native-v5 required normalize_native_stream_batch | Rebase sliced runs in memory and retain native batch validity.
+            let normalized = rtdb_format::ipc::normalize_native_stream_batch(&batch, schema_charge)?;
             if let Some(flow) = flow {
-                let measures = Measures {
-                    rows: Some(batch.batch().num_rows()),
-                    reservation_bytes: Some(batch.reservation().bytes()),
+                flow.record("rtdb.proposal.landing/run-ends", Measures {
+                    layout: Some("run-end-encoded"),
+                    rows: Some(normalized.batch().num_rows()),
+                    reservation_bytes: Some(normalized.reservation().bytes()),
                     ..Measures::default()
-                };
-                if layout.masked {
-                    flow.record("rtdb.proposal.landing/masked", Measures { layout: Some("masked-children"), ..measures });
-                } else if layout.empty_timezone {
-                    // arrow-flow: rtdb.proposal.landing/empty-timezone operation-batch operations materialize java-v5 required - | The shared in-memory normalizer omits empty timestamp timezones.
-                    flow.record("rtdb.proposal.landing/empty-timezone", Measures { layout: Some("empty-timezone"), ..measures });
-                } else {
-                    flow.record("rtdb.proposal.landing/compatible", Measures { layout: Some("compatible"), ..measures });
-                }
+                });
             }
-            return decode(std::slice::from_ref(&batch));
+            return decode(std::slice::from_ref(&normalized));
         }
-
-        // arrow-flow: rtdb.proposal.landing/fallback-encode operation-batch temporary-ipc encode java-v5 candidate ipc::encode | A run-end field makes Java layout pass the entire Arrow batch body through. Arrow IPC rebases sliced runs and retains native validity.
-        let footprint = crate::ipc::encode(schema, [batch.batch()], &self.memory)?;
+        let normalized = if layout.masked || layout.empty_timezone {
+            // arrow-flow: rtdb.proposal.landing/masked operation-batch operations materialize java-v5 required normalize_java_stream_batch | Apply Java stream validity and decoded field types in memory.
+            Some(rtdb_format::ipc::normalize_java_stream_batch(batch.batch())?)
+        } else {
+            // arrow-flow: rtdb.proposal.landing/compatible operation-batch operations materialize java-v5 required adapt_stream_batch | Read operations from a compatible in-memory layout.
+            rtdb_format::ipc::adapt_stream_batch(batch.batch())?
+        };
+        let batch = match normalized {
+            Some(normalized) => OwnedBatch::with_reservation(normalized, Arc::clone(batch.reservation()))?,
+            None => batch,
+        };
         if let Some(flow) = flow {
-            flow.record("rtdb.proposal.landing/fallback-encode", Measures {
-                layout: Some("run-end-encoded"),
+            let measures = Measures {
                 rows: Some(batch.batch().num_rows()),
-                encoded_bytes: Some(footprint.as_slice().len()),
-                reservation_bytes: Some(footprint.reservation_bytes()),
-                output_buffer: Some(1),
+                reservation_bytes: Some(batch.reservation().bytes()),
                 ..Measures::default()
-            });
+            };
+            if layout.masked {
+                flow.record("rtdb.proposal.landing/masked", Measures { layout: Some("masked-children"), ..measures });
+            } else if layout.empty_timezone {
+                // arrow-flow: rtdb.proposal.landing/empty-timezone operation-batch operations materialize java-v5 required - | The shared in-memory normalizer omits empty timestamp timezones.
+                flow.record("rtdb.proposal.landing/empty-timezone", Measures { layout: Some("empty-timezone"), ..measures });
+            } else {
+                flow.record("rtdb.proposal.landing/compatible", Measures { layout: Some("compatible"), ..measures });
+            }
         }
-        drop(batch);
-        // arrow-flow: rtdb.proposal.landing/fallback-decode temporary-ipc operations decode java-v5 candidate ipc::decode | Read the rebased run-end layout and its batch validity before lowering operations.
-        let pages = crate::ipc::decode(&footprint.into_bytes(), &self.memory)?;
-        if let Some(flow) = flow {
-            flow.record("rtdb.proposal.landing/fallback-decode", Measures {
-                layout: Some("run-end-encoded"),
-                rows: Some(pages.iter().map(|page| page.batch().num_rows()).sum()),
-                input_buffer: Some(1),
-                ..Measures::default()
-            });
-        }
-        decode(&pages)
+        decode(std::slice::from_ref(&batch))
     }
     // arrow-flow-end
 
