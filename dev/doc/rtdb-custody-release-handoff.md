@@ -62,24 +62,51 @@ Renew with the same issuer subject, grant ID and scope to keep the same receipt 
 
 Require `row-custody.managed-original-family-placement` in the bearer session.
 Call `scope` on `rtdb.v1.OriginalFamilyLanding` to obtain the stage scope, receipt namespace and effective credential expiry.
-Use the existing authoring and landing staging operations for the granted family and an exact tracked merged Query with fields 7 and 13 for its reviewed point.
+Use the existing authoring and landing staging operations for the granted family and an unpaged tracked `Exactly` merged Query with fields 7 and 13 for its reviewed row on the granted named branch.
+The SQL must track only the selected row's identity, for example with `_id = $1`.
 This Query exposes the selected row identity, its written coordinate and the reviewed trailer.
-Use the same session's proof and claim in the reviewed reserve, and put the exact signed writer's `Version::Written` first in every placement transaction's `requires`.
+Use the opaque claim and proof from that Query on the same bearer in the signed single-operation reviewed reserve.
+The claim binds the Query request, session, grant namespace, current writer and immutable branch creation Basis.
+Put the exact signed writer's `Version::Written` first in every placement transaction's `requires`.
 
 Use `submit_placement` with `family`, `transaction_b64` (the exact v1 `TransactRequest` bytes) and a lowercase hexadecimal `signature`.
 The independent placement signer authorizes those exact bytes for that family after validating the application effects.
 The Ed25519 message is the ASCII domain `rtdb/v1/original-family-placement` followed by a NUL, the raw 32-byte receipt namespace and SHA-256 of the raw transaction bytes.
 The first authoring placement and rewrite write may carry signed clear effects on the named branch.
 Each reserve is a single operation.
-The accepting transaction may carry signed clear effects on main, including the two distinct body witnesses at their literal valid instants, and ends with the exact family landing.
+The accepting transaction may carry signed clear effects on main, including the two distinct body witnesses at their literal valid instants, and ends with the exact `LandCustodyBranch` for the granted line.
+It names the retained `Then` reserve key and Basis in the same managed receipt namespace.
 Supply a fresh exclusive window that fits the reviewed proof and ordered branch lifetime.
 
 `submit_placement` returns `receipt_b64`, the v1 `Receipt` protobuf.
 Use `placement_receipt` with `family` and the exact key to recover a positive result from its independently confirmed placement position and credential namespace.
 Recover activation with `activate` on the same current epoch after branch drop or a lost reply.
 The managed credential is scoped to one family and one already created named line.
-Use the independently provisioned Fork and co-ordered registry row for line creation, and the existing independently authorized readback routes for wider application and catalog reads.
+For an imported attachment, the line creation follows the current ordered ClaimWriter and family receipts must follow the import fence.
 Original response release, disposal and family plaintext opening retain their existing authorization boundaries.
+
+#### Provisioning the named line
+
+Commission a separate version 2 credential from the managed assignment issuer with `authority.role` set to `provision-branch`.
+The authority contains the exact `fence` and applied `writer`, a `line` with `branch`, `generation`, `registry` and `owner`, and the `request_digest` for the complete `ManagedWorkloadRequest` body.
+Use the configured line registry for `registry` and the exact application owner/admission row's table, string row ID and valid instant for `owner`.
+Table references are objects with `schema` and `table` strings.
+The `owner` has `table`, `id` encoded as `{"String":"owner-row-id"}`, and integer `valid_at` in microseconds.
+The `request_digest` is SHA-256 of the ASCII domain `rtdb.v1/managed-workload-attempt`, a NUL, and the unchanged action body.
+Order `ManagedWorkloadRequest.provision_branch` at tag 11 using its `WorkloadWrite` envelope and the independently commissioned bearer on the current Original.
+The outer key, inner key and registry `creation_key` are the same 16–64 raw bytes.
+
+Use the current writer's `Version::Written` first, main application Versions or assignment-bound main Claims for additional checks, and an exclusive request cutoff at or before the child expiry.
+The accepting arm has one writable Fork from a retained clear main cut, the owner/admission Put, and one absent-only main registry Put.
+The registry Put selects at valid time zero and contains the exact binary `line_generation` and `creation_key`, `created_basis` as `TxBasis`, the matching `proposal_owner`, `writable: true`, and the same microsecond `expires` as the Fork.
+Commission the application relations and validate other clear main effects before authorizing the exact request bytes.
+The order may declare the configured registry schema when it is absent.
+The provisioner returns its namespaced receipt and the independent `receipt-recovery` grant reads the retained key using family `provision-branch` (wire value 7).
+On the imported route, both receipts must follow the import fence.
+Verify the exact `Then`, branch lineage, and co-written registry and owner at the creation Basis before issuing the version 4 family grant.
+Supply the existing independent exact readback separately for merged branch and main queries, catalogue evidence and keyed status.
+
+#### Family action encoding
 
 The action takes JSON and returns one JSON object.
 Unless a field ends in `_b64`, byte fields use lowercase hex.

@@ -6,7 +6,7 @@ use ring::{hkdf, rand::{SecureRandom, SystemRandom}};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
     rtdb_v1::{
-        Basis, Claim, ClaimEvidence, ClaimScope, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH,
+        Basis, Claim, ClaimEvidence, ClaimRegion, ClaimScope, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH,
         MAX_CLAIM_PAYLOAD_BYTES, valid_branch_name,
     },
 };
@@ -156,6 +156,30 @@ const EXPORT_BYTES: usize = Basis::WIDTH + 16 + 32;
 const OBSERVATION_BYTES: usize = Basis::WIDTH + 16 + 64;
 const ERASURE_EVIDENCE_BYTES: usize = Basis::WIDTH + 16 + 32 + 24;
 const SCOPED_CLAIM_DOMAIN: &[u8; 8] = b"scoped\0\x01";
+const ORIGINAL_FAMILY_CLAIM_HEADER: usize = 32 + Basis::WIDTH + 32;
+
+pub struct OriginalFamilyClaimScope<'a> {
+    pub binding: [u8; 32],
+    pub branch: &'a str,
+    pub created: Basis,
+}
+
+impl OriginalFamilyClaimScope<'_> {
+    fn matches(&self, evidence: &ClaimEvidence, incarnation: [u8; 16]) -> bool {
+        self.binding != [0; 32]
+            && self.branch != MAIN_BRANCH
+            && valid_branch_name(self.branch)
+            && self.created.incarnation() == incarnation
+            && self.created.position() > 0
+            && evidence.scope.basis.incarnation() == incarnation
+            && evidence.scope.basis >= self.created
+            && evidence.scope.branch == self.branch
+            && evidence.scope.layer == Layer::Merged
+            && evidence.footprint.regions().is_some_and(|regions| {
+                regions.len() == 1 && matches!(regions.first(), Some(ClaimRegion::Row { .. }))
+            })
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Purpose {
@@ -168,12 +192,13 @@ enum Purpose {
     PeerRequest = 7,
     PeerReply = 8,
     WorkloadClaim = 9,
+    OriginalFamilyClaim = 10,
 }
 
 impl Purpose {
     fn invalid(self) -> Anomaly {
         match self {
-            Self::Claim | Self::WorkloadClaim => Anomaly::incorrect("rtdb/invalid-claim", "Invalid query claim"),
+            Self::Claim | Self::WorkloadClaim | Self::OriginalFamilyClaim => Anomaly::incorrect("rtdb/invalid-claim", "Invalid query claim"),
             Self::Page => Anomaly::new(
                 AnomalyCategory::NotFound,
                 "rtdb/cursor-expired",
@@ -195,6 +220,7 @@ impl Purpose {
         match self {
             Self::Claim => MAX_CLAIM_PAYLOAD_BYTES,
             Self::WorkloadClaim => 32 + MAX_CLAIM_PAYLOAD_BYTES,
+            Self::OriginalFamilyClaim => ORIGINAL_FAMILY_CLAIM_HEADER + MAX_CLAIM_PAYLOAD_BYTES,
             Self::Page => PAGE_BYTES,
             Self::Export => EXPORT_BYTES,
             Self::ReceiverClock => OBSERVATION_BYTES,
@@ -301,6 +327,37 @@ impl TokenAuthority {
         if *claimed != binding || evidence.scope.basis.incarnation() != *self.incarnation.as_bytes()
             || evidence.scope.branch != MAIN_BRANCH || evidence.scope.layer != Layer::Merged
         {
+            return Err(purpose.invalid());
+        }
+        Ok(evidence)
+    }
+
+    pub async fn verify_original_family_claims<'a>(
+        &self, claims: impl IntoIterator<Item = &'a Claim>, scope: &OriginalFamilyClaimScope<'_>,
+    ) -> VerifiedClaims {
+        let mut verified = Vec::new();
+        for claim in claims {
+            if !verified.iter().any(|(known, _)| known == claim) {
+                let result = self.open_original_family_claim(claim, scope).await;
+                verified.push((claim.clone(), result));
+            }
+        }
+        VerifiedClaims(verified)
+    }
+
+    async fn open_original_family_claim(
+        &self, claim: &Claim, scope: &OriginalFamilyClaimScope<'_>,
+    ) -> Result<ClaimEvidence> {
+        let purpose = Purpose::OriginalFamilyClaim;
+        let (payload, _) = self.open(purpose, claim.as_bytes()).await?;
+        let (binding, rest) = payload.split_first_chunk::<32>().ok_or_else(|| purpose.invalid())?;
+        let (created, rest) = rest.split_first_chunk::<{ Basis::WIDTH }>().ok_or_else(|| purpose.invalid())?;
+        let (_, bytes) = rest.split_first_chunk::<32>().ok_or_else(|| purpose.invalid())?;
+        if *binding != scope.binding || *created != scope.created.to_bytes() {
+            return Err(purpose.invalid());
+        }
+        let evidence = serde_json::from_slice(bytes).map_err(|_| purpose.invalid())?;
+        if !scope.matches(&evidence, *self.incarnation.as_bytes()) {
             return Err(purpose.invalid());
         }
         Ok(evidence)
@@ -629,6 +686,20 @@ impl TokenIssuer {
         Ok(Claim::from_bytes(self.authority.seal(&self.key, purpose, &bytes).await?))
     }
 
+    pub async fn seal_original_family_claim(
+        &self, evidence: &ClaimEvidence, scope: &OriginalFamilyClaimScope<'_>, request: [u8; 32],
+    ) -> Result<Claim> {
+        let purpose = Purpose::OriginalFamilyClaim;
+        if !scope.matches(evidence, *self.authority.incarnation.as_bytes()) {
+            return Err(purpose.invalid());
+        }
+        let mut bytes = Zeroizing::new(scope.binding.to_vec());
+        bytes.extend_from_slice(&scope.created.to_bytes());
+        bytes.extend_from_slice(&request);
+        serde_json::to_writer(&mut *bytes, evidence).map_err(|_| purpose.invalid())?;
+        Ok(Claim::from_bytes(self.authority.seal(&self.key, purpose, &bytes).await?))
+    }
+
     pub async fn seal_scoped_claim(&self, basis: Basis, scope: &LabelScope) -> Result<Claim> {
         let incarnation = *self.authority.incarnation.as_bytes();
         if basis.incarnation() != incarnation { return Err(Purpose::Claim.invalid()); }
@@ -768,6 +839,56 @@ mod tests {
         assert_eq!(authority.verify_workload_claims([&claim], [1; 32]).await.verify(&claim).unwrap(), evidence);
         assert!(authority.verify_workload_claims([&claim], [2; 32]).await.verify(&claim).is_err());
         assert!(authority.open_claim(&claim).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn original_family_claims_require_the_exact_named_creation_and_query_binding() {
+        let database = Uuid::from_u128(42);
+        let kms: Arc<dyn Kms> = Arc::new(crate::LocalKms::new(|| 0));
+        let metadata = TokenKey::create(kms.as_ref(), Generation { database, number: 0 })
+            .await.unwrap().encode();
+        let authority = TokenAuthority::new(database, kms, Arc::new(Keys(vec![metadata])));
+        let issuer = authority.issuer().await.unwrap();
+        let basis = |position| Basis::new(*database.as_bytes(), position);
+        let scope = OriginalFamilyClaimScope { binding: [1; 32], branch: "authored", created: basis(5) };
+        let evidence = ClaimEvidence {
+            scope: ClaimScope { basis: basis(9), branch: scope.branch.into(), layer: Layer::Merged },
+            footprint: ClaimFootprint::from_regions([ClaimRegion::Row {
+                table: TableRef::new("public", "placements"), iid: EntityId::String("selected".into()).iid(),
+            }]),
+        };
+        let claim = issuer.seal_original_family_claim(&evidence, &scope, [2; 32]).await.unwrap();
+        assert_eq!(authority.open_original_family_claim(&claim, &scope).await.unwrap(), evidence);
+        assert_ne!(issuer.seal_original_family_claim(&evidence, &scope, [3; 32]).await.unwrap(), claim);
+        assert!(issuer.seal_workload_claim(&evidence, scope.binding).await.is_err());
+        assert!(authority.open_workload_claim(&claim, scope.binding).await.is_err());
+        assert!(authority.open_claim(&claim).await.is_err());
+        let unbound = issuer.seal_claim(&evidence).await.unwrap();
+        assert!(authority.open_original_family_claim(&unbound, &scope).await.is_err());
+
+        for foreign in [
+            OriginalFamilyClaimScope { binding: [0; 32], ..scope },
+            OriginalFamilyClaimScope { binding: [4; 32], ..scope },
+            OriginalFamilyClaimScope { branch: MAIN_BRANCH, ..scope },
+            OriginalFamilyClaimScope { branch: "other", ..scope },
+            OriginalFamilyClaimScope { created: basis(6), ..scope },
+        ] {
+            assert!(authority.open_original_family_claim(&claim, &foreign).await.is_err());
+        }
+
+        let mut evidence = evidence;
+        evidence.scope.layer = Layer::Local;
+        assert!(issuer.seal_original_family_claim(&evidence, &scope, [2; 32]).await.is_err());
+        evidence.scope.layer = Layer::Merged;
+        evidence.scope.basis = basis(4);
+        assert!(issuer.seal_original_family_claim(&evidence, &scope, [2; 32]).await.is_err());
+        evidence.scope.basis = basis(9);
+        evidence.scope.branch = MAIN_BRANCH.into();
+        let ordinary = issuer.seal_workload_claim(&evidence, scope.binding).await.unwrap();
+        assert!(authority.open_original_family_claim(&ordinary, &scope).await.is_err());
+        evidence.scope.branch = scope.branch.into();
+        evidence.footprint = ClaimFootprint::default();
+        assert!(issuer.seal_original_family_claim(&evidence, &scope, [2; 32]).await.is_err());
     }
 
     #[tokio::test]

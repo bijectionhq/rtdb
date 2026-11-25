@@ -761,6 +761,10 @@ impl TransactState {
             WorkloadFamily::CustodyWrite | WorkloadFamily::ClaimWriter))
     }
 
+    pub fn original_line_creation_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        self.exact_original_receipt(key, basis, |family| family == WorkloadFamily::ProvisionBranch)
+    }
+
     fn exact_original_receipt(
         &self, key: &[u8], basis: Basis, allows_family: impl Fn(WorkloadFamily) -> bool,
     ) -> Result<Receipt> {

@@ -303,6 +303,7 @@ enum WorkloadFamily {
   WORKLOAD_FAMILY_CLOSE_WRITER = 4;
   WORKLOAD_FAMILY_CLOSE_EMPTY_ASSIGNMENT = 5;
   WORKLOAD_FAMILY_CUSTODY_WRITE = 6;
+  WORKLOAD_FAMILY_PROVISION_BRANCH = 7;
 }
 message WorkloadSettleAttempt {
   bytes original_namespace = 1;
@@ -321,6 +322,7 @@ message ManagedWorkloadRequest {
     WorkloadSettleAttempt settle_attempt = 8;
     WorkloadCloseEmptyAssignment close_empty_assignment = 9;
     WorkloadWrite custody_write = 10;
+    WorkloadWrite provision_branch = 11;
   }
 }
 message WorkloadEvidence {

@@ -246,6 +246,10 @@ pub trait ServingDriver: Send + Sync {
         self.original_custody_receipt(key, basis, cancellation).await
     }
 
+    async fn original_line_creation_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        self.original_custody_receipt(key, basis, cancellation).await
+    }
+
     async fn submit_custody_release(&self, _command: TrustedCustodyCommand, _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no trusted release submission"))
     }

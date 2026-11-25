@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_auth::{OriginalFamilyGrant, VerifiedWorkloadGrant};
+use rtdb_crypt::tokens::TokenIssuer;
 use rtdb_node::{
     Clock, Database,
     serving::{
@@ -12,10 +13,13 @@ use rtdb_tx::transact::{
     Cell, CustodyPlacement, Op, Row, Transact,
     workload::{self, Authority, Family as ReceiptFamily, Operation, Point, Reply},
 };
-use rtdb_types::{Timestamp, Value as CellValue, rtdb_v1::At};
+use rtdb_types::{
+    Timestamp, Value as CellValue,
+    rtdb_v1::{At, Claim, ClaimEvidence, ClaimRegion},
+};
 
 use super::*;
-use crate::v1::custody::CustodyProviderRoute;
+use crate::v1::custody::{CustodyProviderRoute, session_binding};
 
 pub(in crate::v1) const MANAGED_FEATURE: &str = "row-custody.managed-original-family-placement";
 
@@ -31,20 +35,22 @@ pub(in crate::v1) struct ManagedFamily<'a> {
 }
 
 impl ManagedFamily<'_> {
-    pub fn claim_binding(&self) -> Result<[u8; 32], Status> {
-        self.write_authority([0; 32])?
-            .assignment_binding()
-            .map_err(error::anomaly)?
-            .ok_or_else(denied)
+    pub async fn seal_review_claim(
+        &self, call: &Call, issuer: &TokenIssuer, evidence: &ClaimEvidence, request: [u8; 32],
+    ) -> Result<Claim, Status> {
+        let authority = self.write_authority(call, [0; 32])?;
+        let scope = authority.original_family_claim_scope(self.namespace).map_err(error::anomaly)?;
+        issuer.seal_original_family_claim(evidence, &scope, request).await.map_err(error::anomaly)
     }
 
-    fn write_authority(&self, request_digest: [u8; 32]) -> Result<Authority, Status> {
+    fn write_authority(&self, call: &Call, request_digest: [u8; 32]) -> Result<Authority, Status> {
         Ok(Authority::OriginalFamilyWrite {
             fence: self.scope.fence.clone(),
             writer: self.scope.writer.clone(),
             branch: self.scope.branch.clone(),
             created: self.created()?,
             group: self.scope.group,
+            session: session_binding(call),
             request_digest,
         })
     }
@@ -86,7 +92,7 @@ impl Service {
         managed: &ManagedFamily<'_>,
         source: QuerySource,
         selection: &proto::CustodyReviewSelection,
-    ) -> Result<QueryView, Status> {
+    ) -> Result<(QueryView, ClaimRegion), Status> {
         let At::Exactly(basis) = source.at else {
             return Err(denied());
         };
@@ -110,17 +116,16 @@ impl Service {
             .map_err(error::anomaly)?;
         let family = lock.family().map_err(error::anomaly)?;
         family.live().map_err(error::anomaly)?;
-        if family.group != managed.scope.group
-            || !family.authors.iter().any(|author| {
-                author
-                    .confirmed
-                    .as_ref()
-                    .is_some_and(|authored| authored.occurrence == selected)
-            })
-        {
+        if family.group != managed.scope.group {
             return Err(denied());
         }
-        managed
+        let author = family.authors.iter().find(|author| {
+            matches_author(managed.scope, author)
+                && author.confirmed.as_ref().is_some_and(|authored| authored.occurrence == selected)
+        }).ok_or_else(denied)?;
+        let target = &author.order.target;
+        let region = ClaimRegion::Row { table: target.table.clone(), iid: target.id.iid() };
+        let view = managed
             .database
             .serving_driver()
             .ok_or_else(denied)?
@@ -136,7 +141,8 @@ impl Service {
                 &call.cancellation,
             )
             .await
-            .map_err(error::anomaly)
+            .map_err(error::anomaly)?;
+        Ok((view, region))
     }
 
     pub(in crate::v1) async fn managed_family<'a>(
@@ -357,7 +363,7 @@ impl Service {
                         call,
                         Operation::Submit {
                             key: transaction.key.clone(),
-                            authority: managed.write_authority(digest)?,
+                            authority: managed.write_authority(call, digest)?,
                             transaction: Some(transaction),
                             digest,
                         },

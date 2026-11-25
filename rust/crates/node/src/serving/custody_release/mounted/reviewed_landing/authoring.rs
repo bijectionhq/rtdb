@@ -54,7 +54,7 @@ impl MountedResponseRelease<'_> {
             }
             if let Some(line) = &authoring.line {
                 require_line_registration(&index, authoring, line, index.exact(authoring.branch_created)?.system_time)?;
-                let receipt = release.driver.original_custody_receipt(
+                let receipt = release.driver.original_line_creation_receipt(
                     &line.creation_key, authoring.branch_created, self.cancellation,
                 ).await?;
                 if receipt.outcome != Outcome::Then

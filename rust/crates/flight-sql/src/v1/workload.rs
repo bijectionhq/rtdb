@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use prost::Message;
 use rtdb_auth::VerifiedWorkloadGrant;
-use rtdb_node::Database;
+use rtdb_node::{Database, SystemClock};
 use rtdb_tx::transact::workload::{
     self, Applied, Authority, Evidence, Family, Fence, Holder, Operation, Placement, Predecessor,
     Previous,
@@ -96,18 +96,27 @@ impl Service {
         let request: proto::ManagedWorkloadRequest = decode(body)?;
         let (operation, namespace) =
             request_operation(call, request, authority, grant.receipt_namespace(), digest)?;
-        let reply = driver
-            .managed_workload(
-                workload::Request {
-                    point: point.clone(),
-                    namespace,
-                    expires_at,
-                    operation,
-                },
-                &call.cancellation,
-            )
-            .await
-            .map_err(error::anomaly)?;
+        let request = workload::Request { point: point.clone(), namespace, expires_at, operation };
+        let reply = if let Authority::ProvisionBranch { line, writer, .. } = authority {
+            let route = self.0.config.custody_providers.get(&call.database).ok_or_else(denied)?;
+            if call.minted || !super::original_family_landing::installed_native_authority(&database)
+                || route.family_line_registry.as_ref() != Some(&line.registry)
+                || !driver.features().contains(&"branches")
+            {
+                return Err(denied());
+            }
+            let owner = route.acquire(self, call, &database).await?;
+            let mounted = owner.response_release(&SystemClock, &call.cancellation).map_err(error::anomaly)?;
+            let observed = mounted.original_writer_fence().await.map_err(error::anomaly)?;
+            if observed.table != point.table || observed.id != point.id || observed.valid_at != point.valid_at
+                || observed.written.to_bytes() != writer.basis
+            {
+                return Err(denied());
+            }
+            driver.managed_original_family(request, &call.cancellation).await
+        } else {
+            driver.managed_workload(request, &call.cancellation).await
+        }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         grant
             .assignment(&call.database, driver.incarnation(), self.0.node.now())
@@ -237,6 +246,18 @@ fn request_operation(
             },
             Some(required(value.transaction)?),
         ),
+        Wire::ProvisionBranch(value) => {
+            let Authority::ProvisionBranch { line, .. } = granted else { return Err(denied()); };
+            (
+                Authority::ProvisionBranch {
+                    fence: fence(required(value.fence)?)?,
+                    writer: applied(required(value.writer)?)?,
+                    line: line.clone(),
+                    request_digest: digest,
+                },
+                Some(required(value.transaction)?),
+            )
+        }
         Wire::CloseWriter(value) => {
             let fence = fence(required(value.fence)?)?;
             let writer = applied(required(value.writer)?)?;
@@ -399,6 +420,7 @@ fn family(value: i32) -> Result<Family, Status> {
         Ok(proto::WorkloadFamily::CloseWriter) => Ok(Family::CloseWriter),
         Ok(proto::WorkloadFamily::CustodyWrite) => Ok(Family::CustodyWrite),
         Ok(proto::WorkloadFamily::CloseEmptyAssignment) => Ok(Family::CloseEmptyAssignment),
+        Ok(proto::WorkloadFamily::ProvisionBranch) => Ok(Family::ProvisionBranch),
         _ => Err(error::incorrect(
             "Invalid managed workload operation family",
         )),

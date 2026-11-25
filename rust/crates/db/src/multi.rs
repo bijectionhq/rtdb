@@ -386,6 +386,12 @@ impl MultiDatabase {
         self.durable_transactions().original_writer_receipt(key, basis)
     }
 
+    pub async fn original_line_creation_receipt(&mut self, key: &[u8], basis: Basis) -> Result<Receipt> {
+        self.refresh().await?;
+        self.require_active()?;
+        self.durable_transactions().original_line_creation_receipt(key, basis)
+    }
+
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
         self.tx_status_in(key, None).await
     }

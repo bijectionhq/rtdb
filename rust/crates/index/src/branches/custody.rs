@@ -113,6 +113,10 @@ impl CustodyGroup {
 impl BranchIndex {
     pub fn has_custody_groups(&self) -> bool { !self.custody.is_empty() }
 
+    pub fn has_custody_groups_at(&self, at: Basis) -> bool {
+        self.custody.values().any(|group| group.created.is_none_or(|created| created <= at))
+    }
+
     pub fn require_classic_write(&self, table: &TableRef) -> Result<()> {
         if self.definition(table, self.head().basis).is_some_and(|definition| definition.visibility.is_some())
             || self.has_custody_relation(table)

@@ -230,6 +230,97 @@ fn write(marker: u8, table: TableRef, id: EntityId) -> Transact {
 }
 
 #[test]
+fn commissioned_fork_co_orders_the_registry_and_owner_under_the_current_writer() {
+    let mut journal = Writer::new();
+    let (fence, writer) = begin(&mut journal);
+    let writer_basis = Basis::from_bytes(&writer.basis).unwrap();
+    let line = LineProvision {
+        branch: "authored".into(),
+        registry: TableRef::new("public", "line_registry"),
+        generation: [13; 16],
+        owner: Point::new("public.admissions", "owner".into(), Timestamp(0)).unwrap(),
+    };
+    let key = vec![12; 16];
+    let expires = Timestamp(300);
+    let authority = Authority::ProvisionBranch {
+        fence: fence.clone(), writer: writer.clone(), line: line.clone(), request_digest: [12; 32],
+    };
+    let mut request = write(12, line.owner.table.clone(), line.owner.id.clone());
+    let Op::Put { rows, .. } = &mut request.ops[0] else { panic!("expected owner put") };
+    rows[0].valid = Some(Interval::ALL.into());
+    request.window.before = Some(Timestamp(200));
+    request.requires.push(Guard::Version {
+        branch: MAIN_BRANCH.into(), table: journal.point.table.clone(), id: journal.point.id.clone(),
+        valid_at: Some(journal.point.valid_at), expect: Version::Written(writer_basis),
+    });
+    request.ops.push(Op::Fork {
+        child: line.branch.clone(), from: (MAIN_BRANCH.into(), writer_basis),
+        writable: true, expires_at: Some(expires),
+    });
+    let row = Row {
+        id: EntityId::String(line.branch.clone()), valid: Some(Interval::ALL.into()),
+        cells: StructFields::from_iter([
+            ("created_basis".into(), Cell::TxBasis),
+            ("creation_key".into(), Cell::Value(Value::Binary(key.clone()))),
+            ("line_generation".into(), binary_cell(line.generation)),
+            ("proposal_owner".into(), text_cell("owner".into())),
+            ("expires".into(), Cell::Value(Value::I64(expires.0))),
+            ("writable".into(), Cell::Value(Value::Bool(true))),
+        ]),
+        custody_group: None, protected_columns: Vec::new(), custody_payload: None,
+    };
+    request.ops.push(Op::Put {
+        branch: MAIN_BRANCH.into(), table: line.registry.clone(), rows: vec![row], if_absent: true,
+    });
+
+    let ordinary = Authority::Write { fence: fence.clone(), writer: writer.clone() };
+    assert!(journal.turn(WRITE, submit(ordinary, 12, Some(request.clone()))).is_err());
+    let mut mismatched = request.clone();
+    let Op::Put { rows, .. } = &mut mismatched.ops[2] else { panic!("expected registry put") };
+    rows[0].cells.insert("creation_key".into(), binary_cell([9; 16]));
+    assert!(journal.turn(WRITE, submit(authority.clone(), 12, Some(mismatched))).is_err());
+    let mut no_owner = request.clone();
+    no_owner.ops.remove(0);
+    assert!(journal.turn(WRITE, submit(authority.clone(), 12, Some(no_owner))).is_err());
+
+    let receipt = applied(journal.turn(WRITE, submit(authority, 12, Some(request))).unwrap(), WRITE);
+    let created = Basis::from_bytes(&receipt.basis).unwrap();
+    let state = journal.pipeline.durable();
+    assert!(fence.covers_imported_family_line(&fence, &writer, created));
+    assert!(!fence.covers_imported_family_line(&fence, &writer, writer_basis));
+    assert_eq!(state.original_line_creation_receipt(&key, created).unwrap().basis, created);
+    assert!(state.original_custody_receipt(&key, created).is_err());
+    assert!(state.index().lineage(created).iter().any(|branch| branch.branch == line.branch && branch.created == created));
+    let view = state.index().view(MAIN_BRANCH, At::Exactly(created), Layer::Local, Timestamp(receipt.system_time_micros)).unwrap();
+    let registry = view.row(&line.registry, &EntityId::String(line.branch), Timestamp(0)).unwrap();
+    assert_eq!(registry.written_basis(), Some(created));
+    assert_eq!(registry.image_at(Timestamp(0)).unwrap().cells.get("created_basis"), Some(&Value::Binary(receipt.basis.to_vec())));
+    assert_eq!(view.row(&line.owner.table, &line.owner.id, line.owner.valid_at).unwrap().written_basis(), Some(created));
+}
+
+#[test]
+fn original_family_claim_scope_commits_to_the_session_grant_and_writer() {
+    let mut journal = Writer::new();
+    let (fence, writer) = begin(&mut journal);
+    let mut authority = Authority::OriginalFamilyWrite {
+        fence, writer, branch: "authored".into(), created: Basis::new(INCARNATION, 9),
+        group: [4; 16], session: [5; 32], request_digest: [6; 32],
+    };
+    let namespace = [7; 32];
+    let binding = authority.original_family_claim_scope(namespace).unwrap().binding;
+    assert!(authority.assignment_binding().unwrap().is_none());
+    assert!(authority.original_family_claim_scope([0; 32]).is_err());
+    assert_ne!(authority.original_family_claim_scope([8; 32]).unwrap().binding, binding);
+    let Authority::OriginalFamilyWrite { session, .. } = &mut authority else { unreachable!() };
+    *session = [9; 32];
+    assert_ne!(authority.original_family_claim_scope(namespace).unwrap().binding, binding);
+    let changed_session = authority.original_family_claim_scope(namespace).unwrap().binding;
+    let Authority::OriginalFamilyWrite { writer, .. } = &mut authority else { unreachable!() };
+    writer.key = vec![10; 16];
+    assert_ne!(authority.original_family_claim_scope(namespace).unwrap().binding, changed_session);
+}
+
+#[test]
 fn exact_close_and_successor_fence_outlive_checkpoint_and_reject_the_former_writer() {
     let mut journal = Writer::new();
     let (fence, writer) = begin(&mut journal);

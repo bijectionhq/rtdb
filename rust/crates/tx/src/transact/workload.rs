@@ -1,5 +1,8 @@
 use super::*;
 
+mod provision;
+pub use provision::LineProvision;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
     pub table: TableRef,
@@ -86,6 +89,15 @@ impl Fence {
             && self.placement.epoch > imported.placement.epoch
             && self.applied.system_time_micros > imported.applied.system_time_micros
     }
+
+    pub fn covers_imported_family_line(&self, imported: &Self, writer: &Applied, created: Basis) -> bool {
+        let (Ok(placement), Ok(written)) = (Basis::from_bytes(&self.applied.basis), Basis::from_bytes(&writer.basis)) else {
+            return false;
+        };
+        self.at_or_after_import(imported)
+            && written.incarnation() == placement.incarnation() && written > placement
+            && created.incarnation() == placement.incarnation() && created > written
+    }
 }
 
 pub struct ImportedPlacement {
@@ -122,6 +134,7 @@ pub enum Family {
     CloseEmptyAssignment,
     CustodyWrite,
     OriginalFamilyWrite,
+    ProvisionBranch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,12 +166,19 @@ pub enum Authority {
         writer: Applied,
         request_digest: [u8; 32],
     },
+    ProvisionBranch {
+        fence: Fence,
+        writer: Applied,
+        line: LineProvision,
+        request_digest: [u8; 32],
+    },
     OriginalFamilyWrite {
         fence: Fence,
         writer: Applied,
         branch: String,
         created: Basis,
         group: CustodyGroupId,
+        session: [u8; 32],
         request_digest: [u8; 32],
     },
     CloseWriter {
@@ -200,7 +220,7 @@ impl Authority {
         let fence = match self {
             Self::ClaimWriter { fence } | Self::ReadRoot { fence, .. }
             | Self::ReadCustody { fence, .. } | Self::Write { fence, .. }
-            | Self::CustodyWrite { fence, .. } | Self::CloseWriter { fence, .. }
+            | Self::CustodyWrite { fence, .. } | Self::ProvisionBranch { fence, .. } | Self::CloseWriter { fence, .. }
             | Self::CloseWriterGuarded { fence, .. } | Self::CloseEmptyAssignment { fence, .. }
             | Self::ObservePlacement { fence }
             | Self::AdvancePlacement { previous: Previous::Vacant { fence }, .. } => fence,
@@ -261,11 +281,13 @@ impl Authority {
                 writer,
                 request_digest,
             } => held(fence) && applied(writer) && *request_digest != [0; 32],
-            Self::OriginalFamilyWrite { fence, writer, branch, created, group, request_digest } =>
+            Self::ProvisionBranch { fence, writer, line, request_digest } =>
+                held(fence) && applied(writer) && line.valid() && *request_digest != [0; 32],
+            Self::OriginalFamilyWrite { fence, writer, branch, created, group, session, request_digest } =>
                 held(fence) && applied(writer) && branch != MAIN_BRANCH
                     && rtdb_types::rtdb_v1::valid_branch_name(branch)
                     && created.incarnation() == incarnation && created.position() > 0
-                    && *group != [0; 16] && *request_digest != [0; 32],
+                    && *group != [0; 16] && *session != [0; 32] && *request_digest != [0; 32],
             Self::CloseWriter {
                 fence,
                 writer,
@@ -300,18 +322,30 @@ impl Authority {
         }
     }
 
-    pub fn assignment_binding(&self) -> Result<Option<[u8; 32]>> {
-        if let Self::OriginalFamilyWrite { fence, writer, branch, created, group, .. } = self {
-            let mut hash = Sha256::new();
-            hash.update(b"rtdb.v1/original-family-claim\0");
-            hash.update(serde_json::to_vec(&(fence, writer, branch, created, group)).map_err(|_| denied())?);
-            return Ok(Some(hash.finalize().into()));
+    pub fn original_family_claim_scope(
+        &self, namespace: [u8; 32],
+    ) -> Result<rtdb_crypt::tokens::OriginalFamilyClaimScope<'_>> {
+        let Self::OriginalFamilyWrite { fence, writer, branch, created, group, session, .. } = self else {
+            return Err(denied());
+        };
+        if namespace == [0; 32] || *session == [0; 32] {
+            return Err(denied());
         }
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb.v1/original-family-claim\0");
+        hash.update(namespace);
+        hash.update(session);
+        hash.update(serde_json::to_vec(&(fence, writer, branch, created, group)).map_err(|_| denied())?);
+        Ok(rtdb_crypt::tokens::OriginalFamilyClaimScope { binding: hash.finalize().into(), branch, created: *created })
+    }
+
+    pub fn assignment_binding(&self) -> Result<Option<[u8; 32]>> {
         let (fence, writer) = match self {
             Self::ReadRoot { fence, writer }
             | Self::ReadCustody { fence, writer, .. }
             | Self::Write { fence, writer }
             | Self::CustodyWrite { fence, writer, .. }
+            | Self::ProvisionBranch { fence, writer, .. }
             | Self::CloseWriterGuarded { fence, writer, .. } => (fence, writer),
             _ => return Ok(None),
         };
@@ -329,6 +363,7 @@ impl Authority {
             Self::Write { .. } => Family::Write,
             Self::CustodyWrite { .. } => Family::CustodyWrite,
             Self::OriginalFamilyWrite { .. } => Family::OriginalFamilyWrite,
+            Self::ProvisionBranch { .. } => Family::ProvisionBranch,
             Self::CloseWriter { .. } | Self::CloseWriterGuarded { .. } => Family::CloseWriter,
             Self::CloseEmptyAssignment { .. } => Family::CloseEmptyAssignment,
             _ => return None,
@@ -623,6 +658,7 @@ impl Request {
                 }
                 if matches!(authority, Authority::CustodyWrite { request_digest, .. }
                     | Authority::OriginalFamilyWrite { request_digest, .. }
+                    | Authority::ProvisionBranch { request_digest, .. }
                     | Authority::CloseWriterGuarded { request_digest, .. } if request_digest != digest)
                 {
                     return Err(denied());
@@ -838,9 +874,20 @@ impl Point {
                 )?;
                 return Ok(transaction.clone());
             }
+            Authority::ProvisionBranch { line, writer, .. } => {
+                let transaction = transaction.filter(|tx| tx.key == key).ok_or_else(denied)?;
+                line.check(self, writer, state.index(), transaction, now)?;
+                return Ok(transaction.clone());
+            }
             Authority::OriginalFamilyWrite { branch, created, group, .. } => {
                 let transaction = transaction.filter(|tx| tx.key == key).ok_or_else(denied)?;
                 require_family_branch(state.index(), branch, *created, now)?;
+                let reviewed_reserve = transaction.ops.iter().any(|op| matches!(op, Op::ReserveReviewedCustodyPlacement { .. }));
+                if transaction.claims().count() != usize::from(reviewed_reserve)
+                    || reviewed_reserve && !transaction.requires.iter().any(|guard| matches!(guard, Guard::Unchanged(_)))
+                {
+                    return Err(denied());
+                }
                 let data_branch = if transaction.uses_reviewed_custody() { MAIN_BRANCH } else { branch };
                 if !transaction.uses_custody() || !transaction.otherwise.is_empty()
                     || transaction.custody_request_digest.is_some() || state.index.has_visibility_history()
@@ -1070,6 +1117,7 @@ impl Point {
             | Authority::ReadCustody { fence, writer, .. }
             | Authority::Write { fence, writer }
             | Authority::CustodyWrite { fence, writer, .. }
+            | Authority::ProvisionBranch { fence, writer, .. }
             | Authority::OriginalFamilyWrite { fence, writer, .. }
             | Authority::CloseWriter { fence, writer, .. }
             | Authority::CloseWriterGuarded { fence, writer, .. } => {

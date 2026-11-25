@@ -123,7 +123,7 @@ impl CustodyProviderRoute {
         self
     }
 
-    pub(super) fn authority(&self) -> CustodyCarrierAuthority {
+    pub(crate) fn authority(&self) -> CustodyCarrierAuthority {
         self.installation.authority
     }
 
@@ -327,7 +327,7 @@ fn terminal(phase: CustodyReleasePhase) -> Result<Reply, Status> {
 fn unavailable() -> Status {
     error::unavailable("The original custody provider is unavailable")
 }
-fn session_binding(call: &Call) -> [u8; 32] {
+pub(super) fn session_binding(call: &Call) -> [u8; 32] {
     Sha256::digest(call.session.id.as_bytes()).into()
 }
 

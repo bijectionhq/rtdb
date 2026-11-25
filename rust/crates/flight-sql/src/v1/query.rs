@@ -443,16 +443,13 @@ impl Service {
                 uuid::Uuid::from_bytes(scope.labels.main_read_incarnation(*raw_scope.as_bytes()))
             })
         };
-        let workload_binding = match &family {
-            Some(family) => Some(family.claim_binding()?),
-            None => workload.map(|grant| {
-                let driver = driver.ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
-                let (authority, _, _) = grant.assignment(&call.database, driver.incarnation(), self.0.node.now())
-                    .map_err(error::anomaly)?;
-                authority.assignment_binding().map_err(error::anomaly)?
-                    .ok_or_else(|| error::unsupported("managed-workload.read-root"))
-            }).transpose()?,
-        };
+        let workload_binding = workload.filter(|_| !managed_family).map(|grant| {
+            let driver = driver.ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
+            let (authority, _, _) = grant.assignment(&call.database, driver.incarnation(), self.0.node.now())
+                .map_err(error::anomaly)?;
+            authority.assignment_binding().map_err(error::anomaly)?
+                .ok_or_else(|| error::unsupported("managed-workload.read-root"))
+        }).transpose()?;
         let request_hash = {
             let _encoding = request.ranked_ivf.as_ref().map(|ranked| call.reserve(ranked.encoded_len())).transpose()?;
             let request_hash = fingerprint(&request);
@@ -491,13 +488,16 @@ impl Service {
             None => (None, None),
         };
         let mut ranked_catalog = None;
+        let mut family_region = None;
         let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, scoped_source_basis, follower_evidence) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
             let (view, follower_evidence) = if let Some(family) = &family {
                 let selection = request.custody_review.as_ref().ok_or_else(|| error::unsupported(MANAGED_FEATURE))?;
-                (self.managed_family_review(call, family, query_source, selection).await?, None)
+                let (view, region) = self.managed_family_review(call, family, query_source, selection).await?;
+                family_region = Some(region);
+                (view, None)
             } else if let Some(ranked) = &ranked_ivf {
                 let (view, catalog, progress) = self.ranked_view(call, driver, query_source, &ranked.target, now, request.observe_applied_position).await?;
                 ranked_catalog = Some(catalog);
@@ -611,11 +611,17 @@ impl Service {
                 scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: claim_layer },
                 footprint,
             };
-            let claim = if let Some(binding) = workload_binding {
-                issuer.seal_workload_claim(&evidence, binding).await
+            let claim = if let Some(family) = &family {
+                let region = family_region.as_ref().ok_or_else(|| error::unsupported(MANAGED_FEATURE))?;
+                if !evidence.footprint.regions().is_some_and(|regions| regions.len() == 1 && regions.contains(region)) {
+                    return Err(error::unsupported(MANAGED_FEATURE));
+                }
+                family.seal_review_claim(call, issuer, &evidence, request_hash).await?
+            } else if let Some(binding) = workload_binding {
+                issuer.seal_workload_claim(&evidence, binding).await.map_err(error::anomaly)?
             } else {
-                issuer.seal_claim(&evidence).await
-            }.map_err(error::anomaly)?;
+                issuer.seal_claim(&evidence).await.map_err(error::anomaly)?
+            };
             let value = claim.into_bytes();
             Some(proto::Claim { value })
         } else { None };

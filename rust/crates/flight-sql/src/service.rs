@@ -130,6 +130,13 @@ impl Call {
                     && matches!(authority, rtdb_tx::transact::workload::Authority::ReceiptRecovery { .. })
                 || matches!(self.kind, CallKind::Handshake | CallKind::ManagedWorkload)
                     && matches!(authority, rtdb_tx::transact::workload::Authority::AttemptSettlement { .. }));
+        let allowed = allowed || (caller.verified_credential && self.kind.allows_original_family()
+            && self.service.0.config.custody_providers.get(&self.database).is_some_and(|route| {
+                caller.principal.workload_grant()
+                    .and_then(|grant| grant.original_family(&self.database, route.authority(), self.service.0.node.now()).ok())
+                    .is_some_and(|(scope, _, _)| rtdb_types::rtdb_v1::Basis::from_bytes(&scope.created)
+                        .is_ok_and(|created| scope.fence.covers_imported_family_line(fence, &scope.writer, created)))
+            }));
         if allowed { Ok(()) } else { Err(Status::permission_denied("This deployment requires its exact imported workload assignment")) }
     }
 

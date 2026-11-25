@@ -375,12 +375,20 @@ surface StatelessDatabase {
         -- The active local writer verifies the mounted Original's signed writer observation against the exact ordered assignment and writer receipts.
         -- The family credential serves capabilities, the private family action and an exact tracked merged Query selecting a confirmed occurrence.
         -- The Query exposes the selected point identity and binds its claim, reviewed evidence and delivery to that session, mount and credential lifetime.
+        -- The claim authenticates the exact unpaged tracked reviewed row Query, its receipt namespace and session, the current writer and the immutable creation Basis of the granted branch.
         -- The family action enrolls and seals stages before it accepts a signed exact placement request for those stages.
         -- A reviewed reservation consumes the claim and proof from the same Query.
         -- The accepting arm settles the retained namespaced reservation, protected placement, paired application witnesses and source drop together under the current assignment and deadline.
         -- Family receipt recovery derives the position from the enrolled placement and reads the credential's retained namespace at that position.
+        -- A family on an imported attachment starts after its current ClaimWriter and retains only receipts strictly after the import fence.
         -- Branch creation is confirmed at the registered creation Basis and authoring is confirmed at the physical occurrence's Written Basis.
         -- The active epoch can recover its exact landing after the source branch drops.
+
+    @guarantee ManagedOriginalBranchProvisioning
+        -- An independent provision grant commits the exact request, current Original writer, configured registry, named line generation and application owner point.
+        -- One accepting arm forks the retained clear main Basis and co-writes the owner point and one main registry row at the branch creation Basis.
+        -- At valid time zero the registry row identifies the child by name, generation, creation Basis, raw creation key and owner.
+        -- Receipt readback uses the provision namespace and operation family at a Basis strictly after the import fence when present.
 
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.

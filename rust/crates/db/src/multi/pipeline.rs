@@ -796,6 +796,10 @@ impl MultiDatabase {
         self.require_active()?;
         let lease = self.authority()?;
         let claims = match &request.operation {
+            workload::Operation::Submit { authority: authority @ workload::Authority::OriginalFamilyWrite { .. }, transaction: Some(transaction), .. } => {
+                let scope = authority.original_family_claim_scope(request.namespace)?;
+                self.tokens.verify_original_family_claims(transaction.claims(), &scope).await
+            }
             workload::Operation::Submit { authority, transaction: Some(transaction), .. } => {
                 let binding = authority.assignment_binding()?.ok_or_else(workload::denied)?;
                 self.tokens.verify_workload_claims(transaction.claims(), binding).await

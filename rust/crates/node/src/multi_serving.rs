@@ -357,7 +357,7 @@ impl MultiServing {
     /// Accepts only the narrow ordered response-release command from an admitted peer.
     pub async fn managed_workload_local(&self, mut request: workload::Request) -> Result<workload::Reply> {
         if matches!(&request.operation, workload::Operation::Submit {
-            authority: workload::Authority::OriginalFamilyWrite { .. }, ..
+            authority: workload::Authority::OriginalFamilyWrite { .. } | workload::Authority::ProvisionBranch { .. }, ..
         } | workload::Operation::Status { family: workload::Family::OriginalFamilyWrite, .. }
             | workload::Operation::ImportedStatus { family: workload::Family::OriginalFamilyWrite, .. }
             | workload::Operation::Settle { family: workload::Family::OriginalFamilyWrite, .. }
@@ -518,22 +518,40 @@ impl ServingDriver for MultiServing {
         }).await.ok_or_else(interrupted)?
     }
 
-    async fn managed_original_family(&self, request: workload::Request,
+    async fn managed_original_family(&self, mut request: workload::Request,
                                      cancellation: &CancellationToken) -> Result<workload::Reply> {
-        if self.classic_workload_fence.is_some()
-            || !matches!(&request.operation, workload::Operation::ReadRoot { .. }
-                | workload::Operation::Status { family: workload::Family::OriginalFamilyWrite, .. }
-                | workload::Operation::Submit { authority: workload::Authority::OriginalFamilyWrite { .. }, .. })
+        let imported = self.classic_workload_fence.as_ref();
+        let after = imported.map(|fence| Basis::from_bytes(&fence.applied.basis)).transpose()?;
+        match &request.operation {
+            workload::Operation::ReadRoot { fence, .. }
+                if imported.is_none_or(|origin| fence.at_or_after_import(origin)) => {}
+            workload::Operation::Submit { authority: workload::Authority::OriginalFamilyWrite { fence, writer, created, .. }, .. }
+                if imported.is_none_or(|origin| fence.covers_imported_family_line(origin, writer, *created)) => {}
+            workload::Operation::Submit { authority: workload::Authority::ProvisionBranch { fence, .. }, .. }
+                if imported.is_none_or(|origin| fence.at_or_after_import(origin)) => {}
+            workload::Operation::Status { key, family: family @ workload::Family::OriginalFamilyWrite } => {
+                if let Some(after) = after {
+                    request.operation = workload::Operation::ImportedStatus { key: key.clone(), family: *family, after };
+                }
+            }
+            _ => return Err(workload::denied()),
+        }
+        let reply = cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)??;
+        if let (Some(after), workload::Reply::Receipt(receipt)) = (after, &reply)
+            && (receipt.basis.incarnation() != after.incarnation() || receipt.basis <= after)
         {
             return Err(workload::denied());
         }
-        cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)?
+        Ok(reply)
     }
 
     async fn query_original_family_review(&self, source: QuerySource, review: FamilyReviewSelection,
         now: Timestamp, cancellation: &CancellationToken) -> Result<QueryView> {
         let At::Exactly(basis) = source.at else { return Err(workload::denied()); };
-        if self.classic_workload_fence.is_some() || source.layer != Layer::Merged || basis < review.created {
+        let imported = self.classic_workload_fence.as_ref().map(|fence| Basis::from_bytes(&fence.applied.basis)).transpose()?;
+        if source.layer != Layer::Merged || basis < review.created
+            || imported.is_some_and(|after| review.created.incarnation() != after.incarnation() || review.created <= after)
+        {
             return Err(workload::denied());
         }
         cancellation.run_until_cancelled(async {
@@ -819,6 +837,16 @@ impl ServingDriver for MultiServing {
     async fn original_writer_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
         cancellation.run_until_cancelled(async {
             self.database.lock().await.original_writer_receipt(key, basis).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn original_line_creation_receipt(&self, key: &[u8], basis: Basis, cancellation: &CancellationToken) -> Result<Receipt> {
+        if let Some(imported) = &self.classic_workload_fence {
+            let after = Basis::from_bytes(&imported.applied.basis)?;
+            if basis.incarnation() != after.incarnation() || basis <= after { return Err(workload::denied()); }
+        }
+        cancellation.run_until_cancelled(async {
+            self.database.lock().await.original_line_creation_receipt(key, basis).await
         }).await.ok_or_else(interrupted)?
     }
 

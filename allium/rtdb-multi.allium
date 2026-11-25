@@ -651,6 +651,8 @@ contract LogService {
         -- The active writer verifies a later workload fence on the same native stream from its exact ordered receipt and current authority row.
         -- Later placement advances require an ordered closed writer or vacant predecessor at or beyond the imported fence.
         -- Exact attempt settlement on the imported stream exposes only terminals ordered after that fence.
+        -- Commissioned Original branch provisioning and family placement require the current ordered writer at or beyond the imported fence.
+        -- The commissioned named family starts at a creation Basis after that writer's ClaimWriter, and its retained receipts remain strictly after the imported fence.
         -- Historical readback returns the exact ordered opening or exclusion independently of current authority.
 
     @invariant InstalledJournalErasureCommit
