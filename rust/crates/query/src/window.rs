@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 use async_trait::async_trait;
 use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType};
@@ -108,6 +108,19 @@ impl BatchWindow {
                     })?,
                     WindowFunction::Lead { column, offset } | WindowFunction::Lag { column, offset } => {
                         let position = self.schema.position(column).ok_or_else(|| invalid("window-column", "Window value column is absent"))?;
+                        if let Some(span) = shifted_span(expression.function, start, batch.len, offset, group) {
+                            let source = offsets.partition_point(|&start| start <= span.start) - 1;
+                            let base = offsets[source];
+                            if span.end - base <= batches[source].len {
+                                for row in 0..batch.len {
+                                    context.check_cancelled_at(row)?;
+                                }
+                                if let Some(suffix) = batches[source].lend_window_span(position, span.start - base..span.end - base, memory)? {
+                                    suffixes.push(suffix);
+                                    continue;
+                                }
+                            }
+                        }
                         let _picks = memory.reserve(batch.len.checked_mul(size_of::<Option<(usize, usize)>>()).ok_or_else(window_size)?)?;
                         let mut cells = Vec::with_capacity(batch.len);
                         for row in 0..batch.len {
@@ -181,6 +194,19 @@ impl BatchCursor for WindowInput {
 }
 
 fn window_size() -> rtdb_types::Anomaly { invalid("window-size", "Window batch inventory exceeds addressable memory") }
+
+fn shifted_span(function: WindowFunction, start: usize, len: usize, offset: u64,
+    group: impl Fn(usize) -> (usize, usize),
+) -> Option<Range<usize>> {
+    if offset == 0 { return Some(start..start + len); }
+    let last = start + len - 1;
+    let (lower, upper) = group(start);
+    if last >= upper { return None; }
+    // The row-wise path reports offset overflow in cancellation order.
+    let first_target = usize::try_from(shifted_index(function, start as u64, offset).ok().flatten()?).ok()?;
+    let last_target = usize::try_from(shifted_index(function, last as u64, offset).ok().flatten()?).ok()?;
+    (lower <= first_target && last_target < upper).then(|| first_target..last_target + 1)
+}
 
 fn shifted_index(function: WindowFunction, index: u64, offset: u64) -> Result<Option<u64>> {
     if matches!(function, WindowFunction::Lead { .. }) {

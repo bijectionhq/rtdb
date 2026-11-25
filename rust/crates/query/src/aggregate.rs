@@ -1,9 +1,9 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::{HashMap, HashSet}, mem::size_of, sync::Arc};
 
 use arrow_array::{Array, cast::AsArray, types::*};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{CellReadCheck, MemoryReservation};
 use rtdb_expr::{cast, compare_in_timezone, is_true, number, sql_eq_in_timezone};
 use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
@@ -12,7 +12,7 @@ use crate::context::Execution;
 use crate::columnar::{BatchCursor, Column, ColumnBatch};
 use crate::cursor::OwnedRow;
 use crate::runtime_schema::{EmissionMode, EmittedRelation};
-use crate::set_keys::BatchKeyIndex;
+use crate::set_keys::{BatchKeyIndex, KeyColumns};
 use crate::invalid;
 
 #[derive(Clone, Copy)]
@@ -31,13 +31,62 @@ impl AsRef<Value> for AggregateCell<'_> {
 
 impl<'a> Rows<'a> {
     fn columns(batch: &'a ColumnBatch, positions: &[usize], projected: bool, context: &'a crate::QueryContext) -> Result<Self> {
-        for &position in positions {
-            for row in 0..batch.len {
-                context.check_cancelled_at(row)?;
-                batch.columns[position].validate_readable_cell(row, &context.memory)?;
+        if batch.len != 0 {
+            for &position in positions {
+                Self::validate_column(&batch.columns[position], batch.len, context)?;
             }
         }
         Ok(Self { batch, projected, memory: &context.memory })
+    }
+
+    fn validate_column(column: &Column, len: usize, context: &crate::QueryContext) -> Result<()> {
+        type Layout = (*const arrow_schema::Field, Option<*const LogicalType>);
+        let mut first: Option<(Layout, CellReadCheck<'_>)> = None;
+        let mut reservation: Option<Arc<MemoryReservation>> = None;
+        let mut additional: HashMap<Layout, CellReadCheck<'_>> = HashMap::new();
+        for row in 0..len {
+            context.check_cancelled_at(row)?;
+            let Some(Some((array, field, logical, offset))) = column.arrow_cell(row) else { continue; };
+            let layout = (std::ptr::from_ref(field), logical.map(std::ptr::from_ref));
+            if let Some((known, check)) = &first && *known == layout {
+                check.validate(array, offset)?;
+                continue;
+            }
+            if let Some(check) = additional.get(&layout) {
+                check.validate(array, offset)?;
+                continue;
+            }
+            let check = {
+                let derived;
+                let _schema;
+                let logical = match logical {
+                    Some(logical) => logical,
+                    None => {
+                        _schema = context.memory.reserve(field.size().checked_mul(8)
+                            .ok_or_else(|| invalid("column-size", "Column page exceeds addressable memory"))?)?;
+                        derived = rtdb_columnar::from_field(field)?;
+                        &derived
+                    }
+                };
+                if logical == &LogicalType::Nothing {
+                    return Err(rtdb_types::Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read"));
+                }
+                CellReadCheck::admit(field, array, logical, offset, &context.memory)?
+            };
+            if first.is_none() {
+                first = Some((layout, check));
+            } else {
+                let bytes = additional.len().checked_add(1)
+                    .and_then(|len| len.checked_mul(4 * (size_of::<(Layout, CellReadCheck<'_>)>() + 1)))
+                    .ok_or_else(|| invalid("aggregate-size", "Read check inventory exceeds addressable memory"))?;
+                match &mut reservation {
+                    Some(reservation) => Arc::get_mut(reservation).expect("Read checks own their reservation").grow_to(bytes)?,
+                    None => reservation = Some(context.memory.reserve(bytes)?),
+                }
+                additional.insert(layout, check);
+            }
+        }
+        Ok(())
     }
 
     fn len(&self) -> usize { self.batch.len }
@@ -167,13 +216,19 @@ impl AggregateCursor {
             let rtdb_plan::Expr::Column { id, .. } = &group.expr else { return None };
             positions.push(schema.position(*id)?);
         }
+        let mut arguments = HashSet::new();
+        let mut add_argument = |argument: &rtdb_plan::Expr| {
+            let position = argument_position(argument, schema).ok()?;
+            if arguments.insert(position) { positions.push(position); }
+            Some(())
+        };
         for aggregate in aggregates {
             if aggregate.function.canonical() == AggregateFunction::ArrayAgg {
                 for order in &aggregate.order_by {
-                    positions.push(argument_position(&order.expr, schema).ok()?);
+                    add_argument(&order.expr)?;
                 }
             }
-            if let Some(argument) = &aggregate.argument { positions.push(argument_position(argument, schema).ok()?); }
+            if let Some(argument) = &aggregate.argument { add_argument(argument)?; }
         }
         Some(positions)
     }
@@ -227,21 +282,15 @@ impl AggregateCursor {
             if batch.len == 0 { continue; }
             let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>())
                 .ok_or_else(|| invalid("aggregate-size", "Group mapping exceeds addressable memory"))?)?;
-            let keys = {
-                let _rows = memory.reserve(batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
-                    .ok_or_else(|| invalid("aggregate-size", "Group key positions exceed addressable memory"))?)?;
-                let rows = (0..batch.len).map(|row| (0, row)).collect::<Vec<_>>();
-                ColumnBatch::take_rows_with_custody(&[&batch], &rows, group_positions, true, memory)?
-            };
+            let keys = KeyColumns::projection(&batch, group_positions);
             let mut mapping = Vec::with_capacity(batch.len);
-            index.identify(&keys, projected, context, &key_schema, |_, ordinal, _| {
+            index.identify(keys, projected, context, &key_schema, |_, ordinal, _| {
                 if ordinal >= i32::MAX as usize {
                     return Err(invalid("group-count", "Aggregate group count exceeds the reference vector limit"));
                 }
                 mapping.push(ordinal);
                 Ok(())
             })?;
-            drop(keys);
             if self.accepts_typed_aggregates(&batch)? {
                 self.reduce_typed(&batch, &mapping, index.len(), &mut columns)?;
                 continue;

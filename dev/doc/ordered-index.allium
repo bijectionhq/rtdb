@@ -21,6 +21,9 @@ entity Checkpoint {
 -- Repeating a declaration with IF NOT EXISTS preserves the definition and its generation.
 -- A checkpoint covers the table catalog's durable event count at its frontier.
 -- The checkpoint becomes usable after every referenced page is durable.
+-- A manifest read admits the selected extent before fetching its body and matches the physical version when the storage owner exposes one.
+-- Immutable publication evidence confirms a checkpoint's exact bytes before reclamation begins.
+-- A checkpoint root owns its retained pointer backing after manifest decode workspace is released.
 -- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
@@ -38,6 +41,7 @@ entity Checkpoint {
 -- A snapshot may reuse decoded index definitions for the same catalog read time.
 -- A snapshot may reuse projected tail changes from the same definition and captured source block.
 -- A read or maintenance cycle owns index page buffers for its own lifetime.
+-- A reachability walk releases each opened page after visiting its references unless the page already belongs to the cycle's seek cache.
 -- A point read merges bucket prefixes in key order.
 -- Readers of the shared layout open JSON and Arrow IPC branch pages, revision directories, and checkpoint manifests.
 -- Shared-layout Arrow reference publication starts after each reader in the installation can open both formats.

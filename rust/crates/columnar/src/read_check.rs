@@ -203,28 +203,65 @@ fn present(field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
 /// Checks value-dependent reads from a column whose Arrow layout has already been validated.
 pub fn validate_readable_column(field: &Field, array: &dyn Array, logical: &LogicalType, memory: &Arc<MemoryBudget>) -> Result<()> {
     if array.is_empty() { return Ok(()); }
-    if ambiguous_union(field, logical)? {
-        let _scratch = reserve_plan(field, memory)?;
-        let plan = ReadPlan::new(field, logical);
-        for row in 0..array.len() { plan.check(field, array, row, Some(memory))?; }
-        return Ok(());
-    }
-    if needs_check(field, false) {
-        for row in 0..array.len() { check_cell(field, array, row, false)?; }
+    let check = CellReadCheck::for_layout(field, logical, memory)?;
+    if !matches!(check.mode, CellReadMode::Plain) {
+        for row in 0..array.len() { check.check(array, row)?; }
     }
     Ok(())
 }
 
 /// Checks the selected cell without reading payloads whose physical layouts already establish validity.
 pub fn validate_readable_cell(field: &Field, array: &dyn Array, logical: &LogicalType, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
-    if row >= array.len() || array.data_type() != field.data_type() { return Err(layout()); }
-    if ambiguous_union(field, logical)? {
-        let _scratch = reserve_plan(field, memory)?;
-        ReadPlan::new(field, logical).check(field, array, row, Some(memory))?;
-    } else if needs_check(field, false) {
-        check_cell(field, array, row, false)?;
+    CellReadCheck::admit(field, array, logical, row, memory).map(drop)
+}
+
+pub struct CellReadCheck<'a> {
+    field: &'a Field,
+    mode: CellReadMode,
+}
+
+enum CellReadMode {
+    Plain,
+    Physical,
+    Logical { plan: ReadPlan, reservation: Arc<crate::MemoryReservation> },
+}
+
+impl<'a> CellReadCheck<'a> {
+    /// Admits the first selected cell and prepares a check for later cells of the same layout.
+    pub fn admit(field: &'a Field, array: &dyn Array, logical: &LogicalType, row: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if row >= array.len() || array.data_type() != field.data_type() { return Err(layout()); }
+        let check = Self::for_layout(field, logical, memory)?;
+        check.check(array, row)?;
+        Ok(check)
     }
-    Ok(())
+
+    pub fn validate(&self, array: &dyn Array, row: usize) -> Result<()> {
+        if row >= array.len() || array.data_type() != self.field.data_type() { return Err(layout()); }
+        self.check(array, row)
+    }
+
+    fn for_layout(field: &'a Field, logical: &LogicalType, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mode = if ambiguous_union(field, logical)? {
+            let reservation = reserve_plan(field, memory)?;
+            CellReadMode::Logical { plan: ReadPlan::new(field, logical), reservation }
+        } else if needs_check(field, false) {
+            CellReadMode::Physical
+        } else {
+            CellReadMode::Plain
+        };
+        Ok(Self { field, mode })
+    }
+
+    fn check(&self, array: &dyn Array, row: usize) -> Result<()> {
+        match &self.mode {
+            CellReadMode::Plain => {},
+            CellReadMode::Physical => { check_cell(self.field, array, row, false)?; }
+            CellReadMode::Logical { plan, reservation } => {
+                plan.check(self.field, array, row, Some(reservation.budget()))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 
