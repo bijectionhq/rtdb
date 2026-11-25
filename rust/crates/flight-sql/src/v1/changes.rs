@@ -727,11 +727,6 @@ impl<'a> ImageProjection<'a> {
     }
 }
 
-enum ChangeRow {
-    Reserved(ReservedRow),
-    Encoded(Vec<FlightData>),
-}
-
 #[derive(Clone, Copy)]
 enum Boundary {
     Opened,
@@ -940,12 +935,13 @@ async fn change_page(
     pack_limit: usize,
 ) -> Result<Page, Status> {
     let schema = Arc::new(schema());
-    let mut encoder = (!request.progress_only)
+    let encoder = (!request.progress_only)
         .then(|| wire::Encoder::new(&schema, memory))
         .transpose()
         .map_err(error::map_status)?;
     let mut groups = BTreeMap::<Timestamp, Vec<_>>::new();
     let mut readers = Vec::new();
+    let mut has_more = false;
     let direction = if request.descending { "DESC" } else { "ASC" };
     for table in &request.tables {
         let table_name: Arc<str> = format!("{}.{}", table.schema, table.table).into();
@@ -1043,12 +1039,20 @@ async fn change_page(
                                 reader_groups += 1;
                                 last_time = Some(time);
                             }
-                            let rows = groups.entry(time).or_default();
+                            groups.entry(time).or_default();
+                            if groups.len() > request.limit {
+                                has_more = true;
+                                if request.descending {
+                                    groups.pop_first();
+                                } else {
+                                    groups.pop_last();
+                                }
+                            }
                             if reader_groups > request.limit {
                                 more = true;
                                 break;
                             }
-                            let (Some(encoder), Some(row_base)) = (encoder.as_mut(), row_base) else {
+                            let Some(row_base) = row_base else {
                                 continue;
                             };
                             let (key, _key_scratch) = key_writer
@@ -1082,7 +1086,7 @@ async fn change_page(
                             };
                             // The singleton charge covers the retained images and one image's
                             // encoding scratch. Image encoding finishes before outer encoding.
-                            if !(MIN_DEFERRED_IMAGE_ROW_BOUND..=pack_limit).contains(&bound)
+                            if bound < MIN_DEFERRED_IMAGE_ROW_BOUND
                                 || row
                                     .images
                                     .iter()
@@ -1091,12 +1095,9 @@ async fn change_page(
                             {
                                 row.finish_images()?;
                             }
-                            let row = if bound <= pack_limit {
-                                ChangeRow::Reserved(row)
-                            } else {
-                                ChangeRow::Encoded(row.encode(&schema, encoder)?)
-                            };
-                            rows.push((reader_index, row));
+                            if let Some(rows) = groups.get_mut(&time) {
+                                rows.push((reader_index, row));
+                            }
                         }
                         Ok(())
                     })
@@ -1108,14 +1109,6 @@ async fn change_page(
         }
     }
     let has_changes = !groups.is_empty();
-    let has_more = groups.len() > request.limit;
-    while groups.len() > request.limit {
-        if request.descending {
-            groups.pop_first();
-        } else {
-            groups.pop_last();
-        }
-    }
     let through = if request.descending {
         if has_more {
             Timestamp(
@@ -1205,7 +1198,7 @@ fn outer_row(
 }
 
 fn encode_page(
-    mut groups: BTreeMap<Timestamp, Vec<(usize, ChangeRow)>>,
+    mut groups: BTreeMap<Timestamp, Vec<(usize, ReservedRow)>>,
     descending: bool,
     shared_images: bool,
     schema: &SchemaRef,
@@ -1214,9 +1207,7 @@ fn encode_page(
     pack_limit: usize,
 ) -> Result<Vec<(usize, Vec<FlightData>)>, Status> {
     for (_, row) in groups.values_mut().flatten() {
-        if let ChangeRow::Reserved(row) = row {
-            row.finish_images()?;
-        }
+        row.finish_images()?;
     }
     let mut groups = groups.into_values();
     let mut rows = std::iter::from_fn(|| {
@@ -1229,21 +1220,16 @@ fn encode_page(
     .flatten()
     .peekable();
     let mut frames = Vec::new();
-    while let Some((reader, row)) = rows.next() {
-        let first = match row {
-            ChangeRow::Encoded(data) => {
-                frames.push((reader, data));
-                continue;
-            }
-            ChangeRow::Reserved(row) => row,
-        };
+    while let Some((reader, first)) = rows.next() {
         let mut bound = first.charge.bytes();
+        if bound > pack_limit {
+            frames.push((reader, first.encode(schema, &mut encoder)?));
+            continue;
+        }
         let mut run = vec![first];
-        while let Some((_, ChangeRow::Reserved(row))) = rows.next_if(|(next_reader, next)| {
-            *next_reader == reader
-                && matches!(next, ChangeRow::Reserved(row)
-                    if row.charge.bytes() <= pack_limit - bound
-                        && (!shared_images || run[0].shares_streams_with(row)))
+        while let Some((_, row)) = rows.next_if(|(next_reader, row)| {
+            *next_reader == reader && row.charge.bytes() <= pack_limit - bound
+                && (!shared_images || run[0].shares_streams_with(row))
         }) {
             bound += row.charge.bytes();
             run.push(row);
@@ -2019,7 +2005,7 @@ mod tests {
                     images: [None, None, None],
                     charge,
                 };
-                (0, ChangeRow::Reserved(row))
+                (0, row)
             })
             .collect();
         let filler = memory.reserve(memory.available_bytes()).unwrap();
@@ -2041,6 +2027,30 @@ mod tests {
         );
         drop((frames, filler));
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn selected_rows_above_the_packing_limit_keep_singleton_frames() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Arc::new(schema());
+        let table: Arc<str> = Arc::from("public.rows");
+        let time = Timestamp(1);
+        let charge = singleton_bound(singleton_base(&schema, &table).unwrap(), [None; 3]).unwrap();
+        let make_row = || ReservedRow {
+            table: Arc::clone(&table),
+            time,
+            opened: true,
+            images: [None, None, None],
+            charge: memory.reserve(charge).unwrap(),
+        };
+        let mut encoder = wire::Encoder::new(&schema, &memory).unwrap();
+        let expected = make_row().encode(&schema, &mut encoder).unwrap();
+        let encoder = wire::Encoder::new(&schema, &memory).unwrap();
+        let frames = encode_page(
+            BTreeMap::from([(time, vec![(2, make_row()), (2, make_row())])]),
+            false, false, &schema, encoder, &memory, charge - 1,
+        ).unwrap();
+        assert_eq!(frames, vec![(2, expected.clone()), (2, expected)]);
     }
 
     #[test]
