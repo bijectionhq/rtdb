@@ -314,7 +314,7 @@ pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdent
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
 pub(crate) const HELD_PROTECTED_COVERAGE_V2: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v2";
-pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
+pub(crate) const HELD_ROW_CARRIER_EXISTS_V2: &str = "rtdb.owned.ReadHeldRowCarrierExists.v2";
 pub(crate) const HELD_PROTECTED_CARRIERS_V2: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v2";
 pub(crate) const HELD_SEALED_SEARCH_UNIT_ROWS_V1: &str = "rtdb.owned.ReadHeldSealedSearchUnitRows.v1";
 pub(crate) const HELD_WORLD_SHARED_COLUMN_CENSUS_V2: &str = "rtdb.owned.ReadHeldWorldSharedColumnCensus.v2";
@@ -2867,7 +2867,18 @@ impl Service {
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Protected row existence needs its held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, _, _identity) = point_request(call, body, request, PointTime::Default)?;
+        let (relation, arrow) = split_relation(request)?;
+        let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
+        let batch = batch.batch();
+        let fields = batch.schema_ref().fields();
+        if batch.num_rows() != 1 || fields.len() != 2
+            || fields[0].as_ref() != &Field::new("_id", DataType::Binary, false)
+            || fields[1].as_ref() != &Field::new("valid_micros", DataType::Int64, true)
+            || batch.column(1).is_valid(0)
+        {
+            return Err(invalid("Protected row existence needs one Binary identity and a null valid_micros"));
+        }
+        let (id, _identity) = point_identity(call, batch)?;
         let present = held.snapshot.protected_row_carrier_exists(&relation, &id, scope).await.map_err(status)?;
         Ok(ActionResult { body: wire::retain(vec![u8::from(present)], call.reserve(64)?) })
     }
@@ -4882,11 +4893,11 @@ impl Service {
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
         let frozen = held.snapshot.ancestor().is_some_and(|(_, inherited)|
             !held.snapshot.clock_mode().is_writable() || system <= inherited);
-        let original_scope = if (parent || frozen) && relation.name() == "fact_unit_column_payloads" {
+        let original_scope = if (parent || frozen) && matches!(relation.name(), "fact_unit_column_payloads" | rtdb_types::ROOT_ROW_CARRIERS) {
             if !self.supports_hosted_upload(call) { return Err(unsupported()); }
             Some(self.hosted_control_scope(call).await?)
         } else if !parent && frozen && self.supports_hosted_upload(call)
-            && matches!(&id, EntityId::String(key) if key.starts_with("row-position/row/"))
+            && matches!(&id, EntityId::Binary(key) if rtdb_types::RootRowCarrier::is_assertion_key(key))
         {
             Some(self.hosted_control_scope(call).await?)
         } else {
@@ -4912,7 +4923,7 @@ impl Service {
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
         let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, compact)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
-        let original_scope = if relation.name() == SHARED_COLUMN_CARRIERS {
+        let original_scope = if matches!(relation.name(), SHARED_COLUMN_CARRIERS | rtdb_types::ROOT_ROW_CARRIERS) {
             if !matches!(*mode, 2 | 3) || !self.supports_hosted_upload(call) { return Err(unsupported()); }
             Some(self.hosted_control_scope(call).await?)
         } else {
