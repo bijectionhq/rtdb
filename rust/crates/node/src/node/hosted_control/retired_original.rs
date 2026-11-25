@@ -91,7 +91,7 @@ fn row(point: &HostedControlPoint) -> Result<(&rtdb_columnar::OwnedBatch, Timest
 }
 
 impl CurrentAssertionFamilyRead {
-    async fn require_retired(&self, source: &RetiredOriginalFamilySource) -> Result<()> {
+    async fn require_retired(&self, source: &RetiredOriginalFamilySource) -> Result<Uuid> {
         let unavailable = hosted_source_unavailable;
         let marker = self.carrier_point(RESTORE, ARCHIVE_FENCE).await?;
         let (fence, revision) = row(&marker)?;
@@ -127,7 +127,8 @@ impl CurrentAssertionFamilyRead {
         if ArrowCell::named(owner.batch(), "audience_tablet", 0).and_then(ArrowCell::binary) != Some(source.audience_tablet.as_slice()) {
             return Err(unavailable());
         }
-        self.context.check_cancelled()
+        self.context.check_cancelled()?;
+        Ok(handoff.capture)
     }
 }
 
@@ -136,11 +137,16 @@ pub struct RetiredOriginalFamilyRead {
     deployment: Uuid,
     installation: Uuid,
     fence: TransactionKey,
+    capture: Uuid,
 }
 
 impl RetiredOriginalFamilyRead {
     pub fn current(&self) -> &CurrentAssertionFamilyRead {
         &self.current
+    }
+
+    pub fn handoff_capture(&self) -> Uuid {
+        self.capture
     }
 
     /// Authenticate every selected publication against the same retired
@@ -277,9 +283,9 @@ impl OriginalAssertionFamilyReader {
     ) -> Result<RetiredOriginalFamilyRead> {
         let floor = source.floor(self.history_fingerprint())?;
         let current = self.current_covering(&floor, cancellation).await?;
-        current.require_retired(source).await?;
+        let capture = current.require_retired(source).await?;
         Ok(RetiredOriginalFamilyRead {
-            current, deployment: source.deployment, installation: source.installation, fence: source.fence,
+            current, deployment: source.deployment, installation: source.installation, fence: source.fence, capture,
         })
     }
 }

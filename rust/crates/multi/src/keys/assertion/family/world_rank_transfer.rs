@@ -11,12 +11,15 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::keys::KeyService;
+use crate::{family_custody::framed_digest, keys::KeyService};
+
+mod wire;
+pub(crate) use wire::Frame as WorldRankFrame;
 
 use super::{
     ATTEMPTS, AssertionAuthoring, AssertionEnvelope, AssertionFamilies, AssertionKeyService, AssertionStage,
     AssertionVaultRecord, DerivedRow, Family, FamilyOccurrence, MAX_RECORD_BYTES, WorldRowSlot,
-    contention, family_vault_address, malformed, position, too_large, world_row_scope,
+    contention, family_vault_address, malformed, too_large, world_row_scope,
     world_row_slot_commitment,
 };
 
@@ -26,16 +29,14 @@ const WORLD_CODEC: u32 = u32::from_be_bytes(*b"BJWR");
 const WORLD_PAYLOAD: &str = "fact_unit_column_payloads";
 const MAX_CARRIER_BYTES: usize = 1 << 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldRankTransferSource {
     pub original: RetiredOriginalFamilySource,
     pub custody_incarnation: NonZeroU64,
     pub archive: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldRankTransferDestination {
     pub deployment: Uuid,
     pub installation: Uuid,
@@ -44,13 +45,11 @@ pub struct WorldRankTransferDestination {
     pub preparation: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorldRankTransferContributor {
     pub family: Uuid,
     pub occurrence: FamilyOccurrence,
     pub transaction: TransactionKey,
-    #[serde(with = "position")]
     pub rank_position: Position,
     pub rank: DerivedRow,
     pub disclosure: [u8; 32],
@@ -61,8 +60,7 @@ pub struct WorldRankTransferContributor {
     pub frozen_effects_sha256: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorldRankTransfer {
     pub source: WorldRankTransferSource,
     pub destination: WorldRankTransferDestination,
@@ -76,16 +74,14 @@ pub struct WorldRankTransferBinding {
     pub agreement: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcceptedWorldRankReplay {
     pub transaction: TransactionKey,
     pub receipt: [u8; 32],
     pub backing: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorldRankTransferState {
     Prepared,
     Installed { replay: AcceptedWorldRankReplay, copy_drain: [u8; 32] },
@@ -112,6 +108,7 @@ pub struct WorldRankSourceDrain {
     pub source: WorldRankTransferSource,
     pub binding: WorldRankTransferBinding,
     pub destination: WorldRankTransferState,
+    pub generation: [u8; 32],
     pub copy_drain: [u8; 32],
 }
 
@@ -139,38 +136,53 @@ pub struct WorldRankTransferRead<'a> {
     pub generation: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Preparing,
     Bound,
-    Drained { destination: WorldRankTransferState, source_drain: [u8; 32] },
+    Drained { destination: WorldRankTransferState, source_drain: [u8; 32], generation: [u8; 32] },
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TransferRecord {
     agreement: WorldRankTransfer,
     phase: Phase,
+    delivery_revoked: bool,
+}
+
+impl TransferRecord {
+    fn live_delivery(&self, expected: AcceptedWorldRankReplay, generation: [u8; 32]) -> Result<WorldRankTransferState> {
+        let Phase::Drained { destination: terminal @ WorldRankTransferState::Installed { replay, .. },
+            generation: accepted, .. } = self.phase else { return Err(unavailable()); };
+        if self.delivery_revoked || generation == [0; 32] || accepted != generation || replay != expected {
+            return Err(unavailable());
+        }
+        Ok(terminal)
+    }
+}
+
+impl WorldRankTransferBinding {
+    pub(crate) fn archive_address(history: [u8; 32], archive: [u8; 32]) -> [u8; 32] {
+        let mut address = Context::new(&SHA256);
+        address.update(b"rtdb.multi/world-rank-transfer-archive/v1\0");
+        address.update(&history);
+        address.update(&archive);
+        finish(address)
+    }
 }
 
 impl WorldRankTransfer {
     pub fn binding(&self) -> Result<WorldRankTransferBinding> {
-        self.validate()?;
-        let source = self.source.original;
-        let mut address = Context::new(&SHA256);
-        address.update(b"rtdb.multi/world-rank-transfer-archive/v1\0");
-        address.update(&source.history);
-        address.update(&self.source.archive);
         Ok(WorldRankTransferBinding {
-            address: finish(address),
-            agreement: commitment(b"rtdb.multi/world-rank-transfer-agreement/v1\0", self)?,
+            address: WorldRankTransferBinding::archive_address(self.source.original.history, self.source.archive),
+            agreement: framed_digest(b"rtdb.multi/world-rank-transfer-agreement/v1\0", &[&self.to_bytes()?]),
         })
     }
 
     pub fn inventory(&self) -> Result<[u8; 32]> {
         self.validate()?;
-        commitment(b"rtdb.multi/world-rank-transfer-inventory/v1\0", &self.contributors)
+        let mut inventory = Vec::new();
+        self.put_inventory(&mut inventory)?;
+        Ok(framed_digest(b"rtdb.multi/world-rank-transfer-inventory/v1\0", &[&inventory]))
     }
 
     fn validate(&self) -> Result<()> {
@@ -237,12 +249,13 @@ impl WorldRankTransferContributor {
         let stage = self.occurrence.capability;
         let envelope = carrier_body(self, founder, b"BJWC1", stage, self.founder_carrier_sha256)?;
         verify_envelope(self, stage, slot, envelope, keys, region).await?;
-        verify_projection(self, rank, keys, region).await
+        verify_projection(self, rank, keys, region).await?;
+        Ok(())
     }
 }
 
 impl WorldRankTransferState {
-    fn terminal(self) -> bool {
+    pub(crate) fn terminal(self) -> bool {
         match self {
             Self::Prepared => false,
             Self::Installed { replay, copy_drain } => valid_key(replay.transaction)
@@ -263,9 +276,13 @@ impl AssertionFamilies<'_> {
         let original = self.retired_transfer_source(agreement.source).await?;
         if let Some((prior, _)) = self.read_rank_transfer(binding.address).await? {
             require_agreement(&prior, agreement)?;
+            if prior.delivery_revoked { return Err(unavailable()); }
             match prior.phase {
-                Phase::Bound | Phase::Drained { destination: WorldRankTransferState::Installed { .. }, .. } =>
-                    return Ok(binding),
+                Phase::Bound => {
+                    self.verify_rank_members(agreement, &original, Some(binding)).await?;
+                    confirm_prepared(agreement, binding, authority, cancellation).await?;
+                    return Ok(binding);
+                }
                 Phase::Preparing => (),
                 Phase::Drained { .. } => return Err(conflict()),
             }
@@ -276,12 +293,20 @@ impl AssertionFamilies<'_> {
         publications.dedup();
         original.require_pre_fence_publications(&publications).await?;
         self.verify_rank_members(agreement, &original, None).await?;
-        let record = TransferRecord { agreement: agreement.clone(), phase: Phase::Preparing };
+        let record = TransferRecord {
+            agreement: agreement.clone(), phase: Phase::Preparing, delivery_revoked: false,
+        };
         self.write_rank_transfer(binding, None, &record).await?;
         for _ in 0..ATTEMPTS {
             let (mut record, etag) = self.exact_rank_transfer(binding, agreement).await?;
+            if record.delivery_revoked { return Err(unavailable()); }
             match record.phase {
-                Phase::Bound => return Ok(binding),
+                Phase::Bound => {
+                    let original = self.retired_transfer_source(agreement.source).await?;
+                    self.verify_rank_members(agreement, &original, Some(binding)).await?;
+                    confirm_prepared(agreement, binding, authority, cancellation).await?;
+                    return Ok(binding);
+                }
                 Phase::Preparing => (),
                 Phase::Drained { .. } => return Err(conflict()),
             }
@@ -320,23 +345,28 @@ impl AssertionFamilies<'_> {
         self.retired_transfer_source(agreement.source).await?;
         for _ in 0..ATTEMPTS {
             let (mut record, etag) = self.exact_rank_transfer(binding, agreement).await?;
-            if matches!(record.phase, Phase::Drained { .. }) {
-                return Ok(());
-            }
-            let destination = observe_destination(agreement.destination, binding, authority, cancellation).await?.state;
-            if !destination.terminal()
-                || (matches!(destination, WorldRankTransferState::Installed { .. }) && record.phase != Phase::Bound)
+            let observed = observe_destination(agreement.destination, binding, authority, cancellation).await?;
+            let destination = observed.state;
+            if observed.generation == [0; 32] || !destination.terminal()
+                || (matches!(destination, WorldRankTransferState::Installed { .. }) && record.phase == Phase::Preparing)
             {
                 return Err(conflict());
             }
             let drain = cancellation.run_until_cancelled(authority.source_copy_drain(agreement.source, cancellation))
                 .await.ok_or_else(unavailable)??;
             if drain.source != agreement.source || drain.binding != binding
-                || drain.destination != destination || drain.copy_drain == [0; 32]
+                || drain.destination != destination || drain.generation != observed.generation
+                || drain.copy_drain == [0; 32]
             {
                 return Err(conflict());
             }
-            record.phase = Phase::Drained { destination, source_drain: drain.copy_drain };
+            let terminal = Phase::Drained {
+                destination, source_drain: drain.copy_drain, generation: observed.generation,
+            };
+            if matches!(record.phase, Phase::Drained { .. }) {
+                return if record.phase == terminal { Ok(()) } else { Err(conflict()) };
+            }
+            record.phase = terminal;
             if self.write_rank_transfer(binding, Some(&etag), &record).await? {
                 return Ok(());
             }
@@ -346,20 +376,20 @@ impl AssertionFamilies<'_> {
 
     /// Register the accepted destination generation and every contributing
     /// Original fence in the existing release scope before opening a rank.
-    pub async fn require_world_rank_transfer_read(
-        &self, agreement: Arc<WorldRankTransfer>, read: WorldRankTransferRead<'_>,
+    async fn require_world_rank_transfer_read<'a>(
+        &self, agreement: Arc<WorldRankTransfer>, read: WorldRankTransferRead<'a>,
         keys: Arc<dyn KeyService>, authority: Arc<dyn WorldRankTransferAuthority>,
-    ) -> Result<()> {
+    ) -> Result<&'a [u8]> {
         if !PlaintextView::has_delivery_scope() || read.generation == [0; 32] {
             return Err(unavailable());
         }
         let binding = agreement.binding()?;
         let cancellation = self.transfer_cancellation(agreement.source)?;
         let (record, _) = self.exact_rank_transfer(binding, &agreement).await?;
-        let Phase::Drained { destination: terminal @ WorldRankTransferState::Installed { replay, .. }, .. } = record.phase
-        else { return Err(unavailable()); };
+        let replay = read.replay;
+        let terminal = record.live_delivery(replay, read.generation)?;
         let rank = &read.contributor.rank;
-        if replay != read.replay || !agreement.contributors.contains(read.contributor)
+        if !agreement.contributors.contains(read.contributor)
             || rank.world != Some(read.slot.world) || rank.relation != read.slot.relation
             || rank.key.as_slice() != read.slot.key
         {
@@ -368,7 +398,7 @@ impl AssertionFamilies<'_> {
         let original = self.retired_transfer_source(agreement.source).await?;
         self.verify_rank_members(&agreement, &original, Some(binding)).await?;
         let assertion_keys = keys.assertion_keys().ok_or_else(unavailable)?;
-        verify_projection(read.contributor, read.carrier, assertion_keys, &self.region).await?;
+        let envelope = verify_projection(read.contributor, read.carrier, assertion_keys, &self.region).await?;
 
         let owner = self.original.as_ref().ok_or_else(unavailable)?;
         let check = Arc::new(TransferredRankDelivery {
@@ -376,8 +406,59 @@ impl AssertionFamilies<'_> {
             keys, region: Arc::clone(&self.region), agreement, binding, terminal, generation: read.generation,
         });
         check.require_current().await?;
-        let key = commitment(b"rtdb.multi/world-rank-transfer-delivery/v1\0", &(binding, replay, read.generation))?;
-        PlaintextView::track_release_check(key, check)
+        let key = framed_digest(b"rtdb.multi/world-rank-transfer-delivery/v1\0", &[
+            &binding.address, &binding.agreement, &replay.receipt, &replay.backing, &read.generation,
+        ]);
+        PlaintextView::track_release_check(key, check)?;
+        Ok(envelope)
+    }
+
+    pub(crate) async fn world_rank_transfer_agreement(
+        &self, binding: WorldRankTransferBinding,
+    ) -> Result<WorldRankTransfer> {
+        let (record, _) = self.read_rank_transfer(binding.address).await?.ok_or_else(unavailable)?;
+        if record.agreement.binding()? != binding {
+            return Err(conflict());
+        }
+        Ok(record.agreement)
+    }
+
+    /// A successor owner closes delivery before retiring its accepted backing.
+    /// A stale state proof cannot re-enable delivery after this vault CAS.
+    pub(crate) async fn revoke_world_rank_transfer_delivery(&self, agreement: &WorldRankTransfer) -> Result<()> {
+        let binding = agreement.binding()?;
+        self.retired_transfer_source(agreement.source).await?;
+        for _ in 0..ATTEMPTS {
+            let (mut record, etag) = self.exact_rank_transfer(binding, agreement).await?;
+            if record.delivery_revoked {
+                return Ok(());
+            }
+            record.delivery_revoked = true;
+            if self.write_rank_transfer(binding, Some(&etag), &record).await? {
+                return Ok(());
+            }
+        }
+        Err(contention())
+    }
+
+    pub(crate) async fn open_transferred_world_rank(
+        &self, agreement: Arc<WorldRankTransfer>, read: WorldRankTransferRead<'_>, carrier: Bytes,
+        keys: Arc<dyn KeyService>, authority: Arc<dyn WorldRankTransferAuthority>,
+    ) -> Result<Bytes> {
+        if read.carrier != carrier.as_ref() {
+            return Err(conflict());
+        }
+        let member = read.contributor;
+        let slot = read.slot;
+        let envelope = self.require_world_rank_transfer_read(agreement, read, Arc::clone(&keys), authority).await?;
+        let keys = keys.assertion_keys().ok_or_else(unavailable)?;
+        let stage = member.rank.capability.ok_or_else(conflict)?;
+        let envelope_offset = carrier.len() - envelope.len();
+        keys.open_assertion_for_resolution(stage, AssertionAuthoring {
+            assertion_id: member.occurrence.assertion,
+            scope_commitment: world_row_scope(slot, &member.disclosure),
+            codec: WORLD_CODEC,
+        }, &self.region, AssertionEnvelope::try_from(carrier.slice(envelope_offset..))?).await
     }
 
     pub(super) async fn world_rank_transfers_drained(&self, family: &Family) -> Result<bool> {
@@ -436,10 +517,10 @@ impl AssertionFamilies<'_> {
             AssertionVaultRecord::WorldRankTransfer(address), &self.region,
         ).await? else { return Ok(None); };
         if bytes.len() > MAX_RECORD_BYTES { return Err(too_large()); }
-        let record: TransferRecord = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
+        let record = TransferRecord::from_bytes(&bytes)?;
         if record.agreement.binding()?.address != address
-            || matches!(record.phase, Phase::Drained { destination, source_drain }
-                if !destination.terminal() || source_drain == [0; 32])
+            || matches!(record.phase, Phase::Drained { destination, source_drain, generation }
+                if !destination.terminal() || source_drain == [0; 32] || generation == [0; 32])
         {
             return Err(malformed());
         }
@@ -450,7 +531,7 @@ impl AssertionFamilies<'_> {
         &self, binding: WorldRankTransferBinding, previous: Option<&str>, record: &TransferRecord,
     ) -> Result<bool> {
         self.journal.write_record(
-            AssertionVaultRecord::WorldRankTransfer(binding.address), &self.region, previous, encode(record)?.into(),
+            AssertionVaultRecord::WorldRankTransfer(binding.address), &self.region, previous, record.to_bytes()?.into(),
         ).await
     }
 }
@@ -476,7 +557,8 @@ impl PlaintextReleaseCheck for TransferredRankDelivery {
         let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(unavailable)?
             .with_original_reader(&self.original, agreement.source.original.deployment, &self.cancellation);
         let (record, _) = families.exact_rank_transfer(self.binding, agreement).await?;
-        if !matches!(record.phase, Phase::Drained { destination, .. } if destination == self.terminal) {
+        let WorldRankTransferState::Installed { replay, .. } = self.terminal else { return Err(unavailable()); };
+        if record.live_delivery(replay, self.generation)? != self.terminal {
             return Err(unavailable());
         }
         let original = families.retired_transfer_source(agreement.source).await?;
@@ -543,10 +625,10 @@ fn check_member(family: &Family, member: &WorldRankTransferContributor) -> Resul
     Ok(())
 }
 
-async fn verify_projection(
-    member: &WorldRankTransferContributor, carrier: &[u8], keys: &dyn AssertionKeyService,
+async fn verify_projection<'a>(
+    member: &WorldRankTransferContributor, carrier: &'a [u8], keys: &dyn AssertionKeyService,
     region: &Arc<IoRegion>,
-) -> Result<()> {
+) -> Result<&'a [u8]> {
     let stage = member.rank.capability.ok_or_else(conflict)?;
     let body = carrier_body(member, carrier, b"BJWP1", stage, member.rank_carrier_sha256)?;
     let (disclosure, envelope) = body.split_first_chunk::<32>().ok_or_else(conflict)?;
@@ -554,7 +636,8 @@ async fn verify_projection(
     let slot = WorldRowSlot {
         world: member.rank.world.ok_or_else(conflict)?, relation: &member.rank.relation, key: &member.rank.key,
     };
-    verify_envelope(member, stage, slot, envelope, keys, region).await
+    verify_envelope(member, stage, slot, envelope, keys, region).await?;
+    Ok(envelope)
 }
 
 fn carrier_body<'a>(
@@ -605,19 +688,6 @@ fn valid_key(key: TransactionKey) -> bool { key.tx_id.0 >= 0 && key.system_time.
 fn require_agreement(record: &TransferRecord, agreement: &WorldRankTransfer) -> Result<()> {
     if record.agreement != *agreement { return Err(conflict()); }
     Ok(())
-}
-
-fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
-    if bytes.len() > MAX_RECORD_BYTES { return Err(too_large()); }
-    Ok(bytes)
-}
-
-fn commitment(domain: &[u8], value: &impl Serialize) -> Result<[u8; 32]> {
-    let mut hash = Context::new(&SHA256);
-    hash.update(domain);
-    hash.update(&encode(value)?);
-    Ok(finish(hash))
 }
 
 fn finish(hash: Context) -> [u8; 32] {
@@ -768,6 +838,24 @@ mod tests {
     }
 
     #[test]
+    fn raw_agreement_keeps_complete_binary_keys_and_rejects_trailing_bytes() -> Result<()> {
+        let agreement = agreement()?;
+        let bytes = agreement.to_bytes()?;
+        assert_eq!(&bytes[..4], b"WRT1");
+        let binary = agreement.contributors[0].rank.key.as_slice();
+        assert!(bytes.windows(binary.len()).any(|value| value == binary));
+        let round_trip = WorldRankTransfer::from_bytes(&bytes)?;
+        assert_eq!(round_trip, agreement);
+        assert_eq!(round_trip.binding()?, agreement.binding()?);
+        assert_eq!(round_trip.inventory()?, agreement.inventory()?);
+        assert!(WorldRankTransfer::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut extra = bytes;
+        extra.push(0);
+        assert!(WorldRankTransfer::from_bytes(&extra).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn delivery_requires_the_accepted_receipt_and_current_generation() -> Result<()> {
         let agreement = agreement()?;
         let state = installation();
@@ -784,6 +872,29 @@ mod tests {
         assert!(require_current_destination(
             WorldRankDestinationCustody { state: WorldRankTransferState::Prepared, ..observed }, state, [26; 32],
         ).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_positive_drain_binds_one_delivery_generation_until_irreversible_revoke() -> Result<()> {
+        let accepted = installation();
+        let WorldRankTransferState::Installed { replay, .. } = accepted else { unreachable!(); };
+        let mut record = TransferRecord {
+            agreement: agreement()?,
+            phase: Phase::Bound,
+            delivery_revoked: false,
+        };
+        let generation = [11; 32];
+        assert!(record.live_delivery(replay, generation).is_err());
+        record.phase = Phase::Drained { destination: accepted, source_drain: [12; 32], generation };
+        assert_eq!(record.live_delivery(replay, generation)?, accepted);
+        assert!(record.live_delivery(replay, [13; 32]).is_err());
+        assert!(record.live_delivery(AcceptedWorldRankReplay { backing: [14; 32], ..replay }, generation).is_err());
+        record.delivery_revoked = true;
+
+        let durable = TransferRecord::from_bytes(&record.to_bytes()?)?;
+        assert!(durable.live_delivery(replay, generation).is_err());
+        assert!(matches!(durable.phase, Phase::Drained { .. }));
         Ok(())
     }
 
@@ -833,7 +944,9 @@ mod tests {
         let (accepted, _) = families.read(id).await?.unwrap();
         check_member(&accepted, member)?;
         let binding = agreement.binding()?;
-        let preparing = TransferRecord { agreement: agreement.clone(), phase: Phase::Preparing };
+        let preparing = TransferRecord {
+            agreement: agreement.clone(), phase: Phase::Preparing, delivery_revoked: false,
+        };
         assert!(families.write_rank_transfer(binding, None, &preparing).await?);
         families.update(id, |family| Ok(((), family.rank_transfers.insert(binding)))).await?;
         let order = Uuid::new_v4();
@@ -846,7 +959,11 @@ mod tests {
         let (_, etag) = families.exact_rank_transfer(binding, &agreement).await?;
         let discarded = TransferRecord {
             agreement: agreement.clone(),
-            phase: Phase::Drained { destination: WorldRankTransferState::Discarded { copy_drain: [29; 32] }, source_drain: [30; 32] },
+            phase: Phase::Drained {
+                destination: WorldRankTransferState::Discarded { copy_drain: [29; 32] },
+                source_drain: [30; 32], generation: [31; 32],
+            },
+            delivery_revoked: true,
         };
         assert!(families.write_rank_transfer(binding, Some(&etag), &discarded).await?);
         assert!(families.world_rank_transfers_drained(&fenced).await?);
