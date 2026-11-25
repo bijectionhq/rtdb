@@ -30,33 +30,45 @@ An assigned follower and a restored attachment dependent on another custody auth
 ### Native reviewed placement backed by an Original assertion family
 
 The reviewed producer and the Original-vault bridge have independent admission.
-The planned steady-state Flight action is `rtdb.v1.OriginalFamilyLanding` and advertises `row-custody.original-family-landing` on the authenticated Original attachment after the native family authority is installed.
-The reviewed producer can continue to advertise `transact.custody-reviewed-placement` independently.
-The planned action and capability are currently gated.
+The steady-state action is `rtdb.v1.OriginalFamilyLanding`.
+Its `row-custody.original-family-landing` capability requires an authenticated current Original writer mount with native row custody and a configured family vault.
+Generic reviewed placement can be available independently.
 
-`NativeFamilyLanding::from_placed_original` is the compatibility mount for an existing placed Original.
-It binds the authenticated placed session, its exact directory writer, the existing assertion vault and a live native `MountedResponseRelease` on the same deployment.
-The existing scoped successor grant and distinct reader and controller credentials continue to govern that compatibility route.
-The native Original mount takes its authority from the installed v1 attachment, the current writer receipt and a positively bound family vault identity.
-It has no directory dependency.
+`NativeFamilyLanding::from_placed_original` remains the compatibility mount for an existing placed Original.
+The native Original route uses the existing v1 Original writer, receipt and occurrence checks and its own durable family vault.
 
-#### Native Original mount inputs
+#### Native Original installation
 
-- Provide a stable family vault namespace, stage ownership and assertion line identity bound to the exact native database incarnation and mounted Original writer.
-  Install the family provider under the existing authenticated custody owner and preserve that binding through restart and handoff.
-- Enroll the family member and capability durably, then confirm the exact original native occurrence against its keyed writing receipt.
-  Supply authenticated authorship and slot evidence for the original and winning rewrite, including the physical authoring branch when it differs from the review branch.
-- Reuse `MountedResponseRelease` for the current writer, exact reviewed source and acceptance evidence, live group and native response and checkpoint-copy drain.
-  The independent family reservation pins both stage identities before either can be sealed.
-  Acceptance recovery by key confirms the exact applied placement, branch drop and paired application witnesses before activating the family binding.
-- Supply a keyed, ordered Original family close with the exact elected writer, family, native group and family inventory.
-  Include enrolled and pending stages in the close inventory.
-  The family vault serializes closure with reservation, activation and admission.
-  The native group revocation provides the separate outer occurrence fence.
-- Install Original family release registration, promotion, cutoff and positive disposition under the generic custody surface.
-  Opening requires the exact active family binding, a live mounted occurrence and the promoted Original family hold.
-  Sending requires the existing fresh v1 native response admission for the exact part.
-  Settlement requires the Original family release and checkpoint-copy terminals and the native group release and checkpoint-copy drain for their exact fences.
+Set `originalFamilyVault` on the matching `flightSql.custodyProviders` entry.
+The path is an existing private, durable directory shared by all processes that can own the exact Original installation.
+The vault uses durable file locking, atomic record replacement and a separate family stage key namespace.
+Reopen the same directory through restart and retain the installed Original custody authority.
+Authoritative writer identity changes require a custody handoff before the replacement can reopen these records.
+
+The action takes JSON and returns one JSON object.
+Unless a field ends in `_b64`, byte fields use lowercase hex.
+Fields ending in `_b64` use unpadded base64url.
+Every operation except `scope` names the family UUID.
+`scope` returns the 24-byte `stage_scope`, which prefixes the 16-byte stage UUID in a stage handle.
+
+#### Authoring the first member and a rewrite
+
+1. Call `enroll_authoring` with `family`, `assertion`, `stage`, `group`, `native_target_b64`, `branch_created_basis`, `write_key` and `disclosure_sha256`.
+   The target is a v1 `CustodyPlacementTarget` protobuf and the branch Basis identifies the physical branch creation.
+   The vault retains the exact writer and enrolls the stage before it can be sealed.
+2. Call `seal_authoring` with `family`, `assertion`, `write_key` and the unit-sealed `carrier_b64`.
+   Persist the returned opaque `carrier_b64` and `carrier_sha256`, which the same request recovers after reply loss.
+   For a new group, order `CreateCustodyGroup` and `PlaceCustodyRow` in the pinned accepting arm with the payload stage UUID as placement ID.
+3. Call `confirm_authoring` with `family`, `assertion` and `write_key`.
+   The verifier confirms the keyed `Then` receipt and the exact physical branch, slot, validity and carrier occurrence at the write Basis.
+   It returns the 104-byte `member` and `occurrence_b64` containing the v1 `CustodyReadContributor` protobuf.
+   A rewrite returns its own authored position and occurrence.
+   Keep the first occurrence's returned member as the Original family member.
+4. For an existing family rewrite, include `rewrite` in enrollment with `source_occurrence_sha256`, `link_stage`, `reserve_key` and `review_sha256`.
+   Its source needs a confirmed occurrence in the same live family.
+   Sealing also returns `link_b64` and `link_sha256`.
+   Order the exact native `ReserveCustodyPlacement` under the reserve key before `PlaceCustodyRow` under the write key.
+   Confirm checks both receipts and the retained source, original, destination and link binding.
 
 #### Reservation and acceptance
 
@@ -72,12 +84,21 @@ It has no directory dependency.
    Call `activate` with the original acceptance key, including after a lost reply or branch drop.
    The bridge confirms both keyed `Then` receipts, both cells written at the accepting Basis, the exact Root placement and source drop.
    It recovers the opaque carrier and link from that exact occurrence, authenticates the frames and retains the same Root binding in the Original vault.
-4. Pending stages grant no plaintext.
-   Reuse the existing Original family registration and release manager with the same native mount on an activated binding.
-   Original release admission and the final live hold check require both authorities.
-5. After both fences, record the exact native group drain, which requires positive response and checkpoint-copy closure.
-   The Original stage settlement still requires positive Original release and checkpoint-copy closure.
-   Existing Original fence inventory includes the capabilities of a reservation whose activation never completes.
+4. The native payload sealed by `seal_payload` is the opaque carrier placed verbatim in the native row.
+   Keep the separately sealed link in its native protected column.
+   The compatibility mount retains its original carrier formats.
+5. Pending stages grant no plaintext.
+   Use `open` with the exact active binding or `open_authoring` with the confirmed authored assertion.
+   Both use the existing v1 `CustodyReleaseRegistration` JSON object at `registration`, bound to the exact promoted native occurrence and response part.
+   Original opening durably enrolls an independent family hold before returning the unit-sealed carrier.
+   Sending requires a fresh v1 response admission for that exact output part.
+   Use `dispose` with the same registration after the transport positively disposes of that part.
+6. Get `family_inventory_sha256` from `plan_close`.
+   Use the ordered native group revocation's `revoke_key`, `revoked_at` and `inventory_sha256` with that family inventory in `close`.
+   The family close records the exact applied revoke receipt and includes pending stages.
+   `record_drain` takes the same `revoked_at` and `inventory_sha256`.
+   It requires positive native release and checkpoint-copy drain and positive disposal of all family holds before destroying the family stage keys.
+   The native family vault keeps its stage keys on the Original mount, including when managed checkpoints copy the opaque native carrier.
 
 Protected exports remain subject to the managed checkpoint custody agreement.
 The existing hosted assertion-family route continues to own its current consumers.

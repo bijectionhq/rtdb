@@ -13,7 +13,7 @@ mod original;
 pub(crate) use mounted::CustodyProviderSlot;
 pub use mounted::{
     CapturedCustodyRank, CustodyContributors, CustodyProviderInstallation, CustodyProviderMount,
-    CustodyResponseOwner, MountedResponseRelease, NativeLandingOrder, NativeLandingReview, NativeLandingWitness,
+    CustodyResponseOwner, MountedResponseRelease, NativeAuthoring, NativeAuthoringRewrite, NativeLandingOrder, NativeLandingReview, NativeLandingWitness,
     RegisteredCustodyResponse, VerifiedNativeLanding,
     custody_frame_commitment,
 };

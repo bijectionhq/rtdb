@@ -386,6 +386,16 @@ impl BranchIndex {
         Ok((original.commitment(group), occurrence))
     }
 
+    pub fn custody_reservation_at(
+        &self, group: CustodyGroupId, placement: CustodyPlacementId, at: Basis,
+    ) -> Result<(&CustodyReservation, Basis)> {
+        self.exact(at)?;
+        let reservation = self.live_custody(group)?.reservations.get(&placement)
+            .filter(|entry| entry.at <= at)
+            .ok_or_else(placement_conflict)?;
+        Ok((&reservation.reservation, reservation.at))
+    }
+
     pub fn custody_occurrence_payload(
         &self, selected: Basis, group: CustodyGroupId, commitment: [u8; 32],
     ) -> Result<&super::CustodyPayload> {

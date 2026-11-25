@@ -20,6 +20,7 @@ const MAX_RESPONSE: usize = 512 * 1024;
 pub struct Settings {
     pub database: String,
     pub(crate) owner: Option<String>,
+    pub(crate) original_family_vault: Option<std::path::PathBuf>,
     endpoint: Url,
     ca_certificate: Option<String>,
     bearer: Secret,
@@ -77,6 +78,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
     };
     let public_key = fixed_hex(&fields.required_string("providerPublicKey")?)?;
     let ca_certificate = fields.nullable_string("caCertificate")?;
+    let original_family_vault = fields.string("originalFamilyVault")?.map(std::path::PathBuf::from);
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -90,6 +92,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
     Ok(Settings {
         database,
         owner,
+        original_family_vault,
         endpoint,
         ca_certificate,
         bearer: Secret::new(bearer),

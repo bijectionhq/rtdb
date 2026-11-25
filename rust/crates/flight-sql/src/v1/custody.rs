@@ -87,6 +87,7 @@ pub struct CustodyProviderRoute {
     installation: CustodyProviderInstallation,
     owner: Option<String>,
     mount: Mutex<Option<CustodyProviderMount>>,
+    pub(super) family_vault: Option<super::original_family_landing::NativeFamilyVault>,
 }
 impl fmt::Debug for CustodyProviderRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,6 +101,7 @@ impl CustodyProviderRoute {
             installation,
             owner: None,
             mount: Mutex::new(None),
+            family_vault: None,
         }
     }
 
@@ -112,7 +114,12 @@ impl CustodyProviderRoute {
         self.owner.as_deref().filter(|owner| !owner.is_empty())
     }
 
-    async fn acquire(
+    pub fn with_original_family_vault(mut self, path: &std::path::Path) -> rtdb_types::Result<Self> {
+        self.family_vault = Some(super::original_family_landing::NativeFamilyVault::open(path, self.installation.authority)?);
+        Ok(self)
+    }
+
+    pub(super) async fn acquire(
         &self,
         service: &Service,
         call: &Call,

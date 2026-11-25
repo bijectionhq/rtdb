@@ -229,20 +229,26 @@ fn decode_custody_reservation(
     reserve: proto::ReserveCustodyPlacement, memory: &Arc<MemoryBudget>,
 ) -> Result<(tx::CustodyGroupId, CustodyReservation), Status> {
     let target = reserve.target.ok_or_else(|| error::incorrect("Missing custody placement target"))?;
-    let valid = target.valid.ok_or_else(|| error::incorrect("Missing custody placement interval"))?;
     Ok((custody_identity(&reserve.group)?, CustodyReservation {
         original: commitment(&reserve.original_occurrence_sha256)?,
         source: commitment(&reserve.source_occurrence_sha256)?,
         destination: custody_identity(&reserve.destination)?,
         link: custody_identity(&reserve.link)?,
-        target: CustodyTarget {
-            branch: branch(target.branch)?, table: table(&target.table)?,
-            id: entity(target.id, memory)?, valid: interval(valid)?,
-        },
+        target: custody_target(target, memory)?,
         review_sha256: commitment(&reserve.review_sha256)?,
         carrier_sha256: commitment(&reserve.carrier_sha256)?,
         link_sha256: commitment(&reserve.link_sha256)?,
     }))
+}
+
+pub(super) fn custody_target(
+    target: proto::CustodyPlacementTarget, memory: &Arc<MemoryBudget>,
+) -> Result<CustodyTarget<ValidTime>, Status> {
+    let valid = target.valid.ok_or_else(|| error::incorrect("Missing custody placement interval"))?;
+    Ok(CustodyTarget {
+        branch: branch(target.branch)?, table: table(&target.table)?,
+        id: entity(target.id, memory)?, valid: interval(valid)?,
+    })
 }
 
 fn decode_custody_placement(

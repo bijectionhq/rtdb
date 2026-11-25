@@ -17,6 +17,7 @@ use crate::{
 
 mod changes;
 pub(crate) mod custody;
+mod original_family_landing;
 pub(crate) mod error;
 mod query;
 mod scoped_hold;
@@ -68,7 +69,7 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
 }
 
 pub(crate) fn is_action(name: &str) -> bool {
-    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name.starts_with("rtdb.admin.v1.")
+    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name.starts_with("rtdb.admin.v1.")
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -177,6 +178,11 @@ impl Service {
                                     features.retain(|feature| feature != ROW_CUSTODY);
                                 } else if self.reviewed_custody_writer(&call, &database).await.is_ok() {
                                     features.push(REVIEWED_CUSTODY_PLACEMENT.into());
+                                    if original_family_landing::installed_native_authority(&database)
+                                        && self.custody_route(&call).is_ok_and(|route| route.family_vault.is_some())
+                                    {
+                                        features.push(original_family_landing::FEATURE.into());
+                                    }
                                 }
                             }
                         } else if database.wire_linearizable_reads() {
@@ -253,6 +259,7 @@ impl Service {
             }.await,
             scoped_hold::ACTION => self.scoped_hold_action(&call, &action.body).await,
             custody::RELEASE => self.custody_release_action(&call, &action.body).await,
+            original_family_landing::ACTION => self.original_family_landing(&call, &action.body).await,
             OFFER_DECISION_CLOCK => match decode(action.body) {
                 Ok(request) => self.v1_offer_decision_clock(&call, request).await,
                 Err(status) => Err(status),

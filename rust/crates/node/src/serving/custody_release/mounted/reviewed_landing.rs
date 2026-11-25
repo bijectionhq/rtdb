@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+mod authoring;
+pub use authoring::{NativeAuthoring, NativeAuthoringRewrite};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeLandingReview {
     pub group: CustodyGroupId,

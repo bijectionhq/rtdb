@@ -39,6 +39,7 @@ sha2.workspace = true
 subtle.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-rustls = "=0.26.6"
@@ -55,7 +56,6 @@ protoc-bin-vendored.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tempfile.workspace = true
 rtdb-maintenance.workspace = true
 rtdb-metrics.workspace = true
 rtdb-replication.workspace = true

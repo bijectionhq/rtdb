@@ -323,6 +323,10 @@ impl ServerDriver {
                     Some(owner) => route.with_owner(owner.clone()),
                     None => route,
                 };
+                let route = match &provider.original_family_vault {
+                    Some(path) => route.with_original_family_vault(path)?,
+                    None => route,
+                };
                 if custody_providers.insert(provider.database.clone(), Arc::new(route)).is_some() {
                     return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "A database accepts one configured original custody provider"));
                 }
