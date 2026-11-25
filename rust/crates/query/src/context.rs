@@ -193,20 +193,34 @@ impl CatalogSnapshot {
     /// Funds the logical field tree and join scratch for just this table.
     pub fn table_binding_reserved(&self, name: &QualifiedTable, memory: &Arc<MemoryBudget>) -> Result<Option<(TableBinding, Arc<MemoryReservation>)>> {
         if !self.permits_table(name) { return Ok(None); }
-        let snapshot = self.database(&name.database)?;
+        self.binding_reserved(&name.database, &name.table, memory)
+    }
+
+    pub(crate) fn binding_reserved(&self, database: &str, table: &TableRef, memory: &Arc<MemoryBudget>) -> Result<Option<(TableBinding, Arc<MemoryReservation>)>> {
+        let snapshot = self.database(database)?;
         let overflow = || invalid("catalog-size", "Table metadata allocation exceeds addressable memory");
-        let base = [name.database.len(), name.table.schema.len(), name.table.table.len()]
+        let base = [database.len(), table.schema.len(), table.table.len()]
             .into_iter().try_fold(4096usize, |bytes, len| bytes.checked_add(len).ok_or_else(overflow))?;
-        let bytes = if let Some(definition) = crate::system_schema::definition(&name.table) {
-            base.checked_add(definition.allocation_bound(&name.database)?).ok_or_else(overflow)?
+        let bytes = if let Some(definition) = crate::system_schema::definition(table) {
+            base.checked_add(definition.allocation_bound(database)?).ok_or_else(overflow)?
         } else {
-            snapshot.partitions.iter().filter(|part| part.contains_table(&name.table))
+            snapshot.partitions.iter().filter(|part| part.contains_table(table))
                 .try_fold(base, |bytes, part| {
-                    bytes.checked_add(part.table_schema_allocation_bound(&name.database, &name.table)?).ok_or_else(overflow)
+                    bytes.checked_add(part.table_schema_allocation_bound(database, table)?).ok_or_else(overflow)
                 })?
         };
         let reservation = memory.reserve(bytes)?;
-        Ok(self.table(name)?.map(|binding| (binding, reservation)))
+        Ok(self.binding(database, table)?.map(|binding| (binding, reservation)))
+    }
+
+    pub(crate) fn catalog_table_oid(&self, database: &str, table: &TableRef) -> Result<Option<i32>> {
+        let mut oid = None;
+        if crate::system_schema::definition(table).is_none() {
+            for snapshot in &self.database(database)?.partitions {
+                if snapshot.contains_table(table) { include_table_oid(&mut oid, snapshot, table)?; }
+            }
+        }
+        Ok(oid)
     }
 
     /// Reserves schema enumeration and joins before creating the returned table bindings.
