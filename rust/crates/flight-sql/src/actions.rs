@@ -84,6 +84,31 @@ fn fresh_replica_action(action: &str) -> bool {
         | CLOSE_OWNED_READ_V1)
 }
 
+pub(crate) fn classic_retained_action(action: &str) -> bool {
+    use crate::owned_actions::*;
+    matches!(action, OPEN_FRESH_OWNED_READ_V2 | CLOSE_OWNED_READ_V1
+        | OPEN_OWNED_SCOPED_READ_V2 | OPEN_OWNED_READ_AS_OF_V2 | OPEN_OWNED_READ_AT_PUBLICATION_V1
+        | READ_HELD_ROOT_CATALOG_V1 | READ_HELD_HOSTED_CONTROL_V3 | READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1
+        | owned_batch::READ_POINTS | owned_batch::READ_SELECTION
+        | HELD_OWNED_POINT_V1 | HELD_OWNED_POINT_V2 | HELD_OWNED_FIXED_POINT_V1
+        | HELD_OWNED_POSITION_POINT_V1 | HELD_OWNED_HISTORICAL_POINT_V1 | HELD_ROOT_CUT_POINT_V1
+        | HELD_OWNED_RANGE_V1 | HELD_OWNED_RANGE_V2 | HELD_OWNED_RANGE_V3 | HELD_OWNED_RANGE_V4
+        | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | HELD_LOOKUP_PUBLICATION_V1)
+}
+
+#[cfg(test)]
+#[test]
+fn classic_retained_grants_admit_only_the_selected_owned_read_surface() {
+    use crate::owned_actions::*;
+    assert!(classic_retained_action(OPEN_FRESH_OWNED_READ_V2));
+    assert!(classic_retained_action(READ_HELD_ROOT_CATALOG_V1));
+    assert!(classic_retained_action(CLOSE_OWNED_READ_V1));
+    assert!(!classic_retained_action(COMMIT_OWNED_V4));
+    assert!(!classic_retained_action(VALIDATE_FRESH_HOSTED_V1));
+    assert!(!classic_retained_action(CLOSE_SESSION));
+    assert!(!classic_retained_action("rtdb.v1.Query"));
+}
+
 impl Service {
     async fn confirm_audience_observation(&self, call: &Call) -> Result<(), Status> {
         let source = call.session.audience_source().ok_or_else(unsupported)?;

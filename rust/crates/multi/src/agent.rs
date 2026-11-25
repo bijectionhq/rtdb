@@ -1433,6 +1433,10 @@ impl NodeAgent {
         let _turn = turn.lock().await;
         let record = self.record(name).await?;
         if record.lifecycle != Lifecycle::Live { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/not-live", format!("{name} is not live"))); }
+        if usage == SubscriptionUse::FreshQuery && rtdb_directory::classic_flight::excludes_unclassified(&record) {
+            return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/classic-flight-order",
+                "The Classic Original excludes unclassified FreshFlight subscriptions"));
+        }
         if usage == SubscriptionUse::FreshQuery && !record.linearizable_reads {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/read-policy-changed", format!("The read policy of {name} changed")));
         }

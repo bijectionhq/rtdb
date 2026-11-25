@@ -18,6 +18,8 @@ pub struct Commission {
     pub coverage_sha256: [u8; 32],
     pub begin_sha256: [u8; 32],
     pub original_catalog_sha256: [u8; 32],
+    pub retained_path_sha256: [u8; 32],
+    pub prior_generations: Vec<Generation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +27,13 @@ pub struct Commission {
 pub enum Role {
     Gateway,
     Receiver,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Generation {
+    pub generation: Uuid,
+    pub role: Role,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +79,14 @@ pub struct Terminal<'a> {
 
 pub fn commission(record: &DeploymentRecord) -> Option<&Commission> {
     record.classic_flight.as_ref().map(|admission| &admission.commission)
+}
+
+pub fn excludes_unclassified(record: &DeploymentRecord) -> bool {
+    record.classic_flight.is_some()
+        || record.checkpoint_transfer_fence.as_ref().is_some_and(|fence| {
+            fence.destination.intent.source.to_string() == record.id
+                && fence.destination.intent.classic_migration.is_some()
+        })
 }
 
 fn selects_live(record: &DeploymentRecord, commission: &Commission) -> bool {
@@ -158,6 +175,7 @@ fn transition(record: &DeploymentRecord, change: Change<'_>) -> Result<Admission
         if !selects_live(record, selected)
             || selected.coverage_sha256 == [0; 32] || selected.begin_sha256 == [0; 32]
             || selected.original_catalog_sha256 == [0; 32]
+            || selected.retained_path_sha256 == [0; 32]
             || !record.checkpoint_captures.get(&selected.intent.capture).is_some_and(|capture| {
                 capture.incarnation == record.incarnation && capture.log_epoch == record.log_epoch
                     && capture.media_bound && capture.remote_disposal.is_none()
@@ -167,7 +185,16 @@ fn transition(record: &DeploymentRecord, change: Change<'_>) -> Result<Admission
         {
             return Err(conflict());
         }
-        return Ok(Admission { commission: selected.clone(), owners: BTreeMap::new(), frozen: None });
+        if selected.prior_generations.len() > MAX_GENERATIONS { return Err(conflict()); }
+        let mut owners = BTreeMap::new();
+        for prior in &selected.prior_generations {
+            if prior.generation.is_nil() || owners.insert(prior.generation, Owner {
+                role: prior.role, admitted_at: at, joined: None,
+            }).is_some() {
+                return Err(conflict());
+            }
+        }
+        return Ok(Admission { commission: selected.clone(), owners, frozen: None });
     }
     let mut admission = record.classic_flight.as_deref().ok_or_else(conflict)?.clone();
     match change {
@@ -264,6 +291,8 @@ pub(super) fn check_transfer_order(
     let commission = Commission {
         intent: selection.stage.intent.clone(),
         coverage_sha256: [1; 32], begin_sha256: [2; 32], original_catalog_sha256: [3; 32],
+        retained_path_sha256: [7; 32],
+        prior_generations: Vec::new(),
     };
     let apply = |record: &DeploymentRecord, change| {
         let mut next = record.clone();

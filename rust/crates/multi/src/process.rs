@@ -49,6 +49,7 @@ pub struct NodeSettings {
     pub local_compaction: bool,
     /// The cell's secret, so the node accepts the capabilities its gateways mint in place of a password.
     pub capabilities: Option<Arc<crate::capability::CellSecret>>,
+    pub classic_retained_flight_key: Option<PathBuf>,
 }
 
 /// A running node. Dropping it does not stop it; call `shutdown` or `kill`.
@@ -194,6 +195,9 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
+        classic_flight_exclusion: Some(Arc::new(crate::classic_flight::ReceiverExclusion::new(
+            Arc::clone(&directory), settings.classic_retained_flight_key.as_deref(),
+        )?)),
         flight_owned_worlds,
         world_constraints: Some(Arc::new(owned_archive)),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),

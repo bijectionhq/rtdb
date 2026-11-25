@@ -509,6 +509,7 @@ async fn serve_reader(
         claim_wait: Duration::from_secs(1),
         capabilities: None,
         flight_peer: None,
+        classic_flight_exclusion: None,
         flight_owned_worlds: None,
     };
     let auth = match &transport {

@@ -9,6 +9,7 @@ pub mod archive;
 pub mod capability;
 mod family_custody;
 mod catalog_readers;
+mod classic_flight;
 mod cell_attempt;
 pub mod cells;
 mod checkpoint_copy_budget;

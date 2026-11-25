@@ -239,6 +239,7 @@ pub async fn serve_standalone(
                 cache_dir: settings.root.join(CACHE),
                 local_compaction: true,
                 capabilities: Some(Arc::clone(&capabilities)),
+                classic_retained_flight_key: None,
             },
         )
         .await?;

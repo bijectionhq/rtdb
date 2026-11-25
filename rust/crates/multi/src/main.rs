@@ -54,7 +54,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--rebalance-write-bytes-per-second BYTES] [--rebalance-tail-bytes BYTES] [--rebalance-cache-bytes BYTES] [--rebalance-query-cpu-ms-per-second MS] [--read-sessions-per-node N --max-read-width N] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE [--recovery-native-destination FILE] [--recovery-classic-application-layout FILE]]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE [--recovery-native-destination FILE] [--recovery-classic-application-layout FILE] [--recovery-classic-flight-authority FILE]]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -619,6 +619,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
+                classic_retained_flight_key: arguments.optional("classic-retained-flight-key").map(PathBuf::from),
                 keys: key_service(&keys).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
@@ -841,6 +842,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 };
                 let service = if arguments.present("recovery-classic-application-layout") {
                     service.with_classic_application_layout(std::path::Path::new(arguments.required("recovery-classic-application-layout")?))?
+                } else {
+                    service
+                };
+                let service = if arguments.present("recovery-classic-flight-authority") {
+                    service.with_classic_flight_authority(std::path::Path::new(arguments.required("recovery-classic-flight-authority")?))?
                 } else {
                     service
                 };

@@ -7,6 +7,7 @@ use rtdb_auth::Authenticator;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Clock, DatabaseAccess, Node, SessionIdentity};
 use rtdb_storage::cache::CacheBudget;
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
@@ -20,6 +21,8 @@ use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, Sea
 mod audience_owner;
 
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
+const CLASSIC_RETAINED_PROOF: &str = "x-rtdb-classic-retained-proof";
+const MAX_CLASSIC_RETAINED_PROOF: usize = 4608;
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
@@ -59,7 +62,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -97,6 +100,10 @@ impl CallKind {
     fn action(audience: bool, name: &str) -> Self {
         if audience && matches!(name, CLOSE_SESSION | crate::owned_actions::CLOSE_OWNED_READ_V1) {
             Self::AudienceCleanup
+        } else if name == crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 {
+            Self::OpenFresh
+        } else if name.starts_with("rtdb.owned.") {
+            Self::OwnedAction
         } else {
             Self::Action
         }
@@ -115,6 +122,8 @@ pub(crate) struct Call {
     _reservation: Arc<MemoryReservation>,
     egress: Option<Arc<crate::server::FlightEgress>>,
     routed_delivery: bool,
+    pub(crate) classic_flight_excluded: bool,
+    pub(crate) classic_retained: Option<crate::ClassicRetainedAdmission>,
 }
 struct Admission { service: Service, permit: Option<OwnedSemaphorePermit> }
 impl Admission {
@@ -165,6 +174,7 @@ impl Call {
     }
 
     pub(crate) fn handoff(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
+        let relay = self.classic_deadline(relay);
         if let Some(egress) = &self.egress { return egress.admit(grant, relay).map_err(status); }
         grant.check().map_err(status)?;
         if grant.is_bounded() || relay.is_some() { return Err(Status::unavailable("Flight answer transport has no delivery fence")); }
@@ -186,13 +196,20 @@ impl Call {
     ) -> Result<(tonic::metadata::MetadataMap, Option<DeliveryDeadline>), Status> {
         let mut headers = self.response(())?.metadata().clone();
         let cutoff = if self.routed_delivery {
-            grant.transport_deadline().or_else(|| streaming.then(DeliveryDeadline::answer_window))
+            self.classic_deadline(grant.transport_deadline().or_else(|| streaming.then(DeliveryDeadline::answer_window)))
         } else { None };
         if let Some(cutoff) = cutoff {
             let wire = cutoff.wire_nanos().ok_or_else(|| Status::unavailable("Flight answer deadline cannot be routed"))?;
             headers.insert(crate::GATEWAY_ANSWER_DEADLINE_HEADER, wire.to_string().parse().map_err(arrow)?);
         }
         Ok((headers, cutoff))
+    }
+
+    fn classic_deadline(&self, cutoff: Option<DeliveryDeadline>) -> Option<DeliveryDeadline> {
+        match self.classic_retained {
+            Some(retained) => Some(cutoff.map_or(retained.deadline, |cutoff| cutoff.earlier(retained.deadline))),
+            None => cutoff,
+        }
     }
 
     pub fn response<T>(&self, value: T) -> Result<Response<T>, Status> {
@@ -305,8 +322,18 @@ impl Service {
     pub async fn call<T>(&self, request: &Request<T>, body_bytes: usize) -> Result<Call, Status> {
         self.call_with_kind(request, body_bytes, CallKind::Ordinary).await
     }
+    async fn classic_flight_excluded(&self, attachment: Option<&rtdb_node::Database>) -> Result<bool, Status> {
+        match self.0.config.classic_flight_exclusion.as_ref().zip(attachment) {
+            Some((policy, attachment)) => policy.excludes_unclassified(attachment).await.map_err(status),
+            None => Ok(false),
+        }
+    }
     async fn call_with_kind<T>(&self, request: &Request<T>, body_bytes: usize, kind: CallKind) -> Result<Call, Status> {
         if self.0.cancellation.is_cancelled() { return Err(cancelled()); }
+        let retained_proof = request.metadata().contains_key(CLASSIC_RETAINED_PROOF);
+        if retained_proof && !matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) {
+            return Err(classic_retained_refusal());
+        }
         if self.follower_only() && (!kind.serves_assigned_follower()
             || request.metadata().contains_key(FORWARDED_PEER_HEADER)
             || request.metadata().contains_key(crate::GATEWAY_ANSWER_DEADLINE_HEADER))
@@ -327,6 +354,7 @@ impl Service {
             return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
         }
         let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
+        if retained_proof && audience.is_some() { return Err(classic_retained_refusal()); }
         let seat_headers = request.metadata().get_all(AUDIENCE_SEAT_HEADER);
         let mut seats = seat_headers.iter();
         let (first, second) = (seats.next(), seats.next());
@@ -395,8 +423,9 @@ impl Service {
         };
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
+        if retained_proof && bearer.or(cookie).is_none() { return Err(classic_retained_refusal()); }
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
-        let (session, minted, lease) = if let Some(id) = bearer.or(cookie) {
+        let (session, minted, lease, mint_exclusion) = if let Some(id) = bearer.or(cookie) {
             if forwarded_peer.is_some() {
                 return Err(auth::unauthenticated("Forwarded peer proof is for a new session"));
             }
@@ -410,11 +439,11 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
+            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus | CallKind::AudienceCleanup)
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus | CallKind::AudienceCleanup)
             {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
@@ -427,7 +456,7 @@ impl Service {
                 return Err(auth::auth_error(error));
             }
             admit_workload(&session.caller.principal, session.fresh_replica)?;
-            (session, false, lease)
+            (session, false, lease, None)
         } else {
             if audience_source.is_some() && (!matches!(kind, CallKind::Handshake) || forwarded_peer.is_none()) {
                 return Err(Status::permission_denied("An audience session requires an authenticated placed handshake"));
@@ -475,6 +504,12 @@ impl Service {
                 }
                 match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
+            let excluded = if audience.is_none() && (fresh_replica || matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh)) {
+                self.classic_flight_excluded(placement.as_deref()).await?
+            } else { false };
+            if excluded && (fresh_replica || matches!(kind, CallKind::OpenFresh)) {
+                return Err(classic_flight_refusal());
+            }
             if audience_source.is_some() && (placement.is_none() || caller.mac.is_none() || self.0.config.hosted_controls.as_ref()
                 .is_none_or(|controls| caller.principal.user_id() != Some(controls.owner.as_str())))
             {
@@ -569,7 +604,7 @@ impl Service {
                 mint(None)?
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            (session, true, lease)
+            (session, true, lease, Some(excluded))
         };
         if session.caller.principal.label_scope().is_some() && !kind.allows_label_scope() {
             return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
@@ -596,11 +631,20 @@ impl Service {
         if let Some(scope) = session.caller.principal.label_scope() {
             scope.admit_database_name(&database).map_err(status)?;
         }
-        let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
+        let classic_flight_excluded = match mint_exclusion {
+            Some(excluded) => excluded,
+            None if !retained_proof && audience.is_none() && matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) =>
+                self.classic_flight_excluded(attachment.as_deref()).await?,
+            None => false,
+        };
+        if classic_flight_excluded && matches!(kind, CallKind::OpenFresh) && !retained_proof { return Err(classic_flight_refusal()); }
+        let active_call = attachment.as_deref().filter(|_| !retained_proof)
+            .and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
         let call = Call { service: self.clone(), kind, session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
             egress: transport.map(|transport| transport.egress.clone()),
-            routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward") };
+            routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward"),
+            classic_flight_excluded, classic_retained: None };
         if self.0.node.catalog().is_managed()
             && let Ok(attached) = self.0.node.catalog().database(&call.database)
         {
@@ -833,11 +877,40 @@ impl FlightService for Service {
             return self.v1_action(call, request.into_inner()).await;
         }
         let kind = CallKind::action(self.0.audience.is_some(), name);
-        let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
+        let mut call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
+        let proof_headers = request.metadata().get_all(CLASSIC_RETAINED_PROOF);
+        let mut proofs = proof_headers.iter();
+        if let Some(proof) = proofs.next() {
+            let proof = proof.to_str().ok().filter(|proof| proof.len() <= MAX_CLASSIC_RETAINED_PROOF)
+                .ok_or_else(classic_retained_refusal)?;
+            if proofs.next().is_some() || call.session.fresh_replica
+                || !call.session.caller.verified_credential || call.egress.is_none()
+                || !crate::actions::classic_retained_action(name)
+            {
+                return Err(classic_retained_refusal());
+            }
+            let principal = call.session.caller.principal.user_id().ok_or_else(classic_retained_refusal)?;
+            let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+            let attachment = attachment.ok_or_else(classic_retained_refusal)?;
+            let authority = self.0.config.classic_flight_exclusion.as_ref().ok_or_else(classic_retained_refusal)?;
+            let admission = authority.verify_retained(&attachment, crate::ClassicRetainedRead {
+                principal, action: name, body_sha256: Sha256::digest(&request.get_ref().body).into(), proof,
+            }).await.map_err(status)?;
+            call.classic_retained = Some(admission);
+            call._active_call = self.0.node.hold_active_call(&attachment).map(Arc::from);
+        }
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)
             .is_some_and(|encoding| encoding == "stream-v1");
         self.action(call, request.into_inner(), ipc_stream).await
     }
+}
+
+pub(crate) fn classic_flight_refusal() -> Status {
+    Status::failed_precondition("The Classic Original excludes unclassified FreshFlight")
+}
+
+fn classic_retained_refusal() -> Status {
+    Status::permission_denied("The request lacks its exact Classic retained read authority")
 }
 
 fn follower_refusal() -> Status {

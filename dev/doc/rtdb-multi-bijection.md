@@ -575,6 +575,52 @@ The last join records the terminal revision, or the fence revision supplies it i
 The ordinary selector requires a joined gateway generation and a joined receiver generation even for an unused ingress.
 An old installation or one without commissioned coverage can fence and seal the source while ordinary status stays deferred.
 
+The installed gateway and subscriber refuse a Classic fresh route for the commissioned Original before opening a subscriber or forwarding a fresh handshake.
+The receiver checks the directory for the exact placed attachment at the fresh handshake and the Owned fresh open, including direct and ordinary holder sessions.
+Owned actions on existing ordinary fresh handles and their derived handles repeat that exclusion check.
+The admission order does not settle work or delivery already in flight.
+Flight action streams retain their call until the stream drops, and Hyper, Tonic and the socket can retain output past that point.
+
+Mount `--recovery-classic-flight-authority FILE` on the private Original recovery endpoint to enable commissioning and positive owner joins.
+The file contains distinct Ed25519 public keys `coverage_key` and `disposal_key`, represented as 32-byte JSON arrays.
+The coverage authority must establish the full ingress topology, take every bypass and pre-feature listener out of admission, and establish independent retained-only access for the exact held Begin.
+Its evidence includes the gateway, direct receiver, subscriber and holder fallback deployments and each generation that could still own a handle, in-flight call or delivery.
+An upgraded or stopped task can still leave forwarded work or output with another owner.
+
+`commission_classic_migration_ordinary_flight` uses the authenticated Original recovery envelope, the observer's exact `selection`, a `coverage` object and a base64url unpadded Ed25519 `signature`.
+The 16 KiB request includes `coverage_sha256`, `begin_sha256`, `original_catalog_sha256`, `retained_path_sha256` and `prior_generations` in `coverage`.
+The last field is a list of `{generation, role}` objects sorted by UUID, with roles `gateway` and `receiver` and at most 128 total generations.
+The authority signs compact JSON `["rtdb.multi/classic-ordinary-flight-commission/v1", original_name, commission]`.
+The typed `commission` object begins with the exact `CheckpointStageIntent` in `intent`, followed by the five coverage fields in the order just given.
+The affirmative outcome `classic_migration_ordinary_flight_commissioned` carries `coverage_sha256`.
+
+`join_classic_migration_ordinary_flight_owner` uses the same recovery envelope after observing its exact paired fence.
+Its `disposition` object has `fence_sha256`, `generation`, `role` and `disposal_sha256` in order, and the request carries a base64url unpadded `signature`.
+The transport disposition authority signs compact JSON `["rtdb.multi/classic-ordinary-flight-generation-join/v1", original_name, commission, disposition]`.
+The affirmative outcome `classic_migration_ordinary_flight_owner_joined` carries `generation` and `fence_sha256`.
+The disposition digest must name retained positive evidence of that generation's actual call, snapshot, spill, storage work and delivery closure as applicable to its role.
+Delivery evidence includes downstream HTTP/2 and pending socket output, including output handed off before the fence or before the receiver stopped.
+For a lost generation the transport owner must prove that the exact stopped generation can no longer deliver that output.
+Neither the recovery endpoint nor the directory can derive this evidence from a process lease, a stop request, absent counters, an expired handle, or a catalog drain.
+
+For live retained-only Flight, mount `--classic-retained-flight-key FILE` on the Original's placed holder.
+The file is a JSON array containing the 32-byte Ed25519 verification key of the independent Original read authority.
+The consumer uses an ordinary holder-directed placed handshake with verified credentials and omits the ordinary fresh-routing header.
+Each retained DoAction presents `x-rtdb-classic-retained-proof` as unpadded base64url of the compact grant JSON, a dot, and unpadded base64url of the 64-byte signature.
+The authority signs compact JSON `["rtdb.multi/classic-retained-flight-read/v1", grant]`.
+The grant has fields `scope`, `principal`, `action`, `body_sha256` and `expires_at_ms` in order.
+The digest covers the exact Flight action body and the signed expiry is at most 30 seconds in the future.
+The scope has fields `name`, `authority`, `capture`, `source_manifest_sha256`, `holder`, `source`, `snapshot`, `begin_sha256`, `original_catalog_sha256`, `custody_sha256`, `application_selection_sha256` and `retained_path_sha256` in order.
+The typed `source` is the observer's `{incarnation,log_epoch,writer_epoch}`.
+The issuer owns current held Begin and positive application selection and custody checks before approving specific reads.
+The receiver verifies the signature, login principal, current Original holder and capture, directory coordinates and commissioned Begin, catalog and retained path when present.
+The supported actions cover fresh open and close, held catalog and control, scoped and publication-derived handles, and held point and range reads.
+Fresh open retains a handle only if the snapshot's transaction key equals the signed `snapshot`.
+Each handle and its descendants can be used only under the same exact retained scope, with an independently authorized body on each call.
+The delivery cutoff is forwarded through the gateway and applied to the socket by the existing Flight egress guard.
+The live holder route ends at the exact directory transfer fence.
+Post-fence retained continuation requires the corresponding independent certified replay read or other retained owner.
+
 The positive owner contract requires all of the following.
 
 1. Bind the population and purpose before any ordinary request can acquire a resource or dispatch to a receiver.

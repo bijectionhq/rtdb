@@ -74,7 +74,7 @@ pub(super) fn ordinary_flight_fence_reply(
     })
 }
 
-fn flight_fence_digest(fence: &CheckpointTransferFence) -> Result<[u8; 32]> {
+pub(super) fn flight_fence_digest(fence: &CheckpointTransferFence) -> Result<[u8; 32]> {
     Ok(archive::sha256(&archive::encode(&("rtdb.multi/classic-ordinary-flight-fence/v1", fence))?))
 }
 

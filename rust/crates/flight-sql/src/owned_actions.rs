@@ -427,12 +427,20 @@ pub(crate) struct OwnedReadResource {
     owner: ResourceOwner,
     pub(crate) session: String,
     database: String,
+    purpose: ReadPurpose,
     audience_work: Option<rtdb_storage::audience_work::TurnAllowance>,
     audience_projection_work: Option<rtdb_storage::audience_work::TurnAllowance>,
     witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
     spatial_filters: Mutex<BTreeMap<Uuid, Arc<RetainedSpatialFilter>>>,
     _permit: Option<OwnedSemaphorePermit>,
     _reservation: Arc<MemoryReservation>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadPurpose {
+    OrdinaryFresh,
+    ClassicRetained([u8; 32]),
+    Other,
 }
 
 struct RetainedSpatialFilter {
@@ -2333,6 +2341,12 @@ impl Service {
 
     pub(crate) async fn open_fresh_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let purpose = match call.classic_retained {
+            Some(retained) if retained.deadline.is_live() => ReadPurpose::ClassicRetained(retained.scope_sha256),
+            Some(_) => return Err(Status::permission_denied("The Classic retained read grant expired")),
+            None if call.classic_flight_excluded => return Err(crate::service::classic_flight_refusal()),
+            None => ReadPurpose::OrdinaryFresh,
+        };
         if call.session.placed_database() != Some(call.database.as_str()) || call.session.audience_source().is_some() {
             return Err(Status::permission_denied("A fresh owned read requires its ordinary placed session"));
         }
@@ -2354,7 +2368,10 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_fresh_owned_read(deployment, required.as_ref()).await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, Some(permit), 0)
+        if call.classic_retained.is_some_and(|retained| !retained.deadline.is_live() || retained.snapshot != snapshot.present()) {
+            return Err(Status::failed_precondition("The retained read did not capture the authorized Classic snapshot"));
+        }
+        self.retain_owned_read(call, snapshot, Some(permit), 0, purpose)
     }
 
     pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2393,7 +2410,7 @@ impl Service {
             Some(minimum) => native.open_applied_owned_read(minimum).await,
             None => native.open_owned_read().await,
         }.map_err(status)?;
-        self.retain_owned_read(call, snapshot, permit, generation)
+        self.retain_owned_read(call, snapshot, permit, generation, ReadPurpose::Other)
     }
 
     pub(crate) async fn open_owned_scoped_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2417,7 +2434,7 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let snapshot = original.snapshot.scope_root_read(relations).await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, Some(permit), 0)
+        self.retain_owned_read(call, snapshot, Some(permit), 0, original.purpose)
     }
 
     pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8], positioned: bool) -> Result<ActionResult, Status> {
@@ -2457,12 +2474,14 @@ impl Service {
         }.map_err(status)?;
         held.snapshot.check_relation(&publication).map_err(status)?;
         match snapshot {
-            Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), 0),
+            Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), 0, held.purpose),
             None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
         }
     }
 
-    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: Option<OwnedSemaphorePermit>, generation: u64) -> Result<ActionResult, Status> {
+    fn retain_owned_read(
+        &self, call: &Call, snapshot: OwnedReadSession, permit: Option<OwnedSemaphorePermit>, generation: u64, purpose: ReadPurpose,
+    ) -> Result<ActionResult, Status> {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
         let handle = Uuid::new_v4();
@@ -2473,7 +2492,7 @@ impl Service {
         reply.extend_from_slice(&position.0.to_be_bytes());
         reply.extend_from_slice(&snapshot.query_time().map_err(status)?.0.to_be_bytes());
         let held = Arc::new(OwnedReadResource {
-            snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
+            snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(), purpose,
             audience_work: rtdb_storage::audience_work::current_turn(),
             audience_projection_work: (generation > 1 && call.session.audience_source().is_some()).then(|| {
                 rtdb_storage::audience_work::TurnAllowance::new(
@@ -2508,6 +2527,17 @@ impl Service {
         };
         if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
             return Err(Status::not_found("unknown owned read"));
+        }
+        match (entry.purpose, call.classic_retained) {
+            (ReadPurpose::OrdinaryFresh, None) if call.classic_flight_excluded => {
+                self.0.owned_reads.take(handle);
+                entry.close();
+                return Err(crate::service::classic_flight_refusal());
+            }
+            (ReadPurpose::ClassicRetained(expected), Some(admission))
+                if admission.scope_sha256 == expected && admission.deadline.is_live() => {}
+            (ReadPurpose::ClassicRetained(_), _) | (_, Some(_)) => return Err(Status::not_found("unknown owned read")),
+            _ => {}
         }
         Ok(entry)
     }

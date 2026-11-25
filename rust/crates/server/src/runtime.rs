@@ -45,6 +45,7 @@ pub struct PlacedOptions {
     /// Accepts capabilities minted by the cell's gateways in place of a password.
     pub capabilities: Option<Arc<dyn rtdb_pgwire::CapabilityVerifier>>,
     pub flight_peer: Option<Arc<dyn rtdb_flight_sql::FlightPeerVerifier>>,
+    pub classic_flight_exclusion: Option<Arc<dyn rtdb_flight_sql::ClassicFlightExclusion>>,
     pub flight_owned_worlds: Option<Arc<dyn rtdb_flight_sql::OwnedWorldHost>>,
     pub world_constraints: Option<Arc<dyn rtdb_node::WorldConstraintArchive>>,
 }
@@ -286,6 +287,7 @@ impl ServerDriver {
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
         let flight_peer = placed.as_ref().and_then(|placed| placed.flight_peer.clone());
+        let classic_flight_exclusion = placed.as_ref().and_then(|placed| placed.classic_flight_exclusion.clone());
         let flight_owned_worlds = placed.as_ref().and_then(|placed| placed.flight_owned_worlds.clone());
         let world_constraints = placed.as_ref().and_then(|placed| placed.world_constraints.clone());
         let gateway_session_state = placed.is_some();
@@ -365,7 +367,7 @@ impl ServerDriver {
             let ordinary = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                 transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
                 session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
-                forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
+                forwarded_peer: flight_peer, classic_flight_exclusion, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions,
                 hosted_controls: settings.hosted_controls.clone(), custody_providers,
                 #[cfg(feature = "multi")]
                 deployment_admin: config.deployment_admin.clone(),
@@ -376,6 +378,7 @@ impl ServerDriver {
             if let Some((address, audience)) = settings.audience {
                 let reserved = rtdb_flight_sql::FlightConfig {
                     address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None, custody_providers: Default::default(),
+                    classic_flight_exclusion: None,
                     #[cfg(feature = "multi")]
                     deployment_admin: None,
                     #[cfg(feature = "multi")]

@@ -31,6 +31,7 @@ use crate::{
 };
 
 mod classic_destination;
+mod classic_flight;
 pub(crate) mod classic_provider;
 
 const FRAME_BYTES: usize = 2048;
@@ -190,6 +191,15 @@ enum Action {
     },
     ObserveClassicMigrationOrdinaryFlightFence {
         selection: classic_provider::FlightFenceSelection,
+    },
+    CommissionClassicMigrationOrdinaryFlight {
+        selection: classic_provider::FlightFenceSelection,
+        coverage: classic_flight::Coverage,
+        signature: String,
+    },
+    JoinClassicMigrationOrdinaryFlightOwner {
+        disposition: classic_flight::Disposition,
+        signature: String,
     },
     ReadClassicMigrationPointHistories {
         selection: classic_destination::Selection,
@@ -381,6 +391,8 @@ enum Reply {
         fenced_writer_epoch: u64,
         fence_sha256: [u8; 32],
     },
+    ClassicMigrationOrdinaryFlightCommissioned { coverage_sha256: [u8; 32] },
+    ClassicMigrationOrdinaryFlightOwnerJoined { generation: Uuid, fence_sha256: [u8; 32] },
     ClassicMigrationPointHistories {
         selection: classic_destination::Selection,
         candidate_binding: CandidateBinding,
@@ -422,6 +434,7 @@ pub struct RecoveryService {
     memory: Arc<MemoryBudget>,
     classic_destination: Option<classic_destination::Relay>,
     classic_application_layout: Option<Arc<archive::ApplicationLayout>>,
+    classic_flight_authority: Option<classic_flight::Authority>,
 }
 
 impl RecoveryService {
@@ -447,6 +460,7 @@ impl RecoveryService {
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
             classic_destination: None,
             classic_application_layout: None,
+            classic_flight_authority: None,
         })
     }
 
@@ -457,6 +471,11 @@ impl RecoveryService {
 
     pub fn with_classic_application_layout(mut self, configuration: &Path) -> Result<Self> {
         self.classic_application_layout = Some(archive::ApplicationLayout::installed(configuration)?);
+        Ok(self)
+    }
+
+    pub fn with_classic_flight_authority(mut self, configuration: &Path) -> Result<Self> {
+        self.classic_flight_authority = Some(classic_flight::Authority::from_file(configuration)?);
         Ok(self)
     }
 
@@ -1011,6 +1030,24 @@ impl RecoveryService {
                 };
                 classic_provider::ordinary_flight_fence_reply(&scratch, fence)
             }
+            Action::CommissionClassicMigrationOrdinaryFlight { selection, coverage, signature } => {
+                let Some(owner) = &self.classic_flight_authority else { return Ok(Reply::Refused); };
+                let intent = selection.intent(request.authority, request.capture, &self.org)?;
+                classic_provider::observe_ordinary_flight_fence(&installation, &intent)?;
+                archive::require_capture_open(&installation, request.capture)?;
+                let current_capture = archive::capture_receipt(
+                    &installation, &self.archive, request.authority, request.capture,
+                )?.is_some_and(|(point, manifest)| {
+                    point.incarnation == installation.incarnation && point.log_epoch == installation.log_epoch
+                        && installation.checkpoint == Some(point.checkpoint) && manifest == intent.source_manifest_sha256
+                });
+                if !current_capture { return Ok(Reply::Refused); }
+                owner.commission(directory.as_ref(), &installation, intent, coverage, &signature).await
+            }
+            Action::JoinClassicMigrationOrdinaryFlightOwner { disposition, signature } => {
+                let Some(owner) = &self.classic_flight_authority else { return Ok(Reply::Refused); };
+                owner.join(directory.as_ref(), &installation, request.capture, disposition, &signature).await
+            }
             Action::ReadClassicMigrationPointHistories { selection, candidate_binding, classic_cut, valid_at, points } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
                 classic_destination::Operation::Application {
@@ -1402,6 +1439,7 @@ fn admits_frame_size(action: &Action, bytes: usize) -> bool {
         | Action::ClassicMigrationDestinationReadyStatus { .. }
         | Action::ReadClassicMigrationApplicationClosure { .. }
         | Action::ClassicMigrationProviderDrainStatus { .. }
+        | Action::CommissionClassicMigrationOrdinaryFlight { .. }
         | Action::ReadClassicMigrationPointHistories { .. } => CANDIDATE_FRAME_BYTES,
         Action::ReadClassicMigrationOriginalReceipt { .. } => ORIGINAL_RECEIPT_FRAME_BYTES,
         _ => FRAME_BYTES,

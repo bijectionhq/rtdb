@@ -103,6 +103,28 @@ pub trait FlightPeerVerifier: std::fmt::Debug + Send + Sync {
     fn verify(&self, proof: &str, attachment: &Database) -> Result<(IpAddr, bool)>;
 }
 
+#[async_trait::async_trait]
+pub trait ClassicFlightExclusion: std::fmt::Debug + Send + Sync {
+    async fn excludes_unclassified(&self, attachment: &Database) -> Result<bool>;
+    async fn verify_retained(
+        &self, attachment: &Database, request: ClassicRetainedRead<'_>,
+    ) -> Result<ClassicRetainedAdmission>;
+}
+
+pub struct ClassicRetainedRead<'a> {
+    pub principal: &'a str,
+    pub action: &'a str,
+    pub body_sha256: [u8; 32],
+    pub proof: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub struct ClassicRetainedAdmission {
+    pub scope_sha256: [u8; 32],
+    pub snapshot: rtdb_types::TransactionKey,
+    pub deadline: rtdb_storage::sealing::DeliveryDeadline,
+}
+
 /// The installed hosted principal and its finite ordinary control table allowlist.
 #[derive(Clone, Debug)]
 pub struct HostedControlConfig {
@@ -129,6 +151,7 @@ pub struct FlightConfig {
     pub maximum_concurrent_calls: usize,
     pub playground: bool,
     pub forwarded_peer: Option<Arc<dyn FlightPeerVerifier>>,
+    pub classic_flight_exclusion: Option<Arc<dyn ClassicFlightExclusion>>,
     pub owned_world_host: Option<Arc<dyn crate::OwnedWorldHost>>,
     /// Installed by the trusted deployment host for checkpoint administration.
     #[cfg(feature = "multi")]
@@ -139,7 +162,7 @@ pub struct FlightConfig {
 }
 impl Default for FlightConfig {
     fn default() -> Self {
-        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, custody_providers: Default::default(), audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None,
+        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, custody_providers: Default::default(), audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, classic_flight_exclusion: None, owned_world_host: None,
             #[cfg(feature = "multi")]
             deployment_admin: None,
             #[cfg(feature = "multi")]

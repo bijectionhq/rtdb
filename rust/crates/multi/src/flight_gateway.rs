@@ -322,6 +322,7 @@ impl Router {
         let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
             .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id))
             .ok_or_else(|| Status::not_found("No matching local Flight SQL deployment"))?;
+        if rtdb_directory::classic_flight::excludes_unclassified(&record) { return Err(classic_flight_refusal()); }
         if !record.linearizable_reads || record.lifecycle != Lifecycle::Live || record.move_from.is_some() {
             return Err(moved());
         }
@@ -417,6 +418,7 @@ impl Router {
         if self.options.installed_cell.is_some() { return Err(moved()); }
         if let Some(replica) = &target.replica {
             let Some(record) = self.directory.deployment(&target.deployment).await.map_err(directory_error)? else { return Err(moved()); };
+            if rtdb_directory::classic_flight::excludes_unclassified(&record) { return Err(classic_flight_refusal()); }
             if record.name != target.name || record.epoch != target.epoch || record.log_epoch != replica.log_epoch
                 || record.stream("replica") != replica.stream || record.storage_prefix() != replica.storage_prefix
                 || !record.linearizable_reads || record.lifecycle != Lifecycle::Live || record.move_from.is_some()
@@ -430,6 +432,9 @@ impl Router {
         }
         if target.enrollment.is_some() || target.ordered_reader.is_some() { return Err(moved()); }
         let (record, member) = tokio::try_join!(self.directory.deployment(&target.deployment), self.directory.member(&target.holder)).map_err(directory_error)?;
+        if target.fresh && record.as_ref().is_some_and(rtdb_directory::classic_flight::excludes_unclassified) {
+            return Err(classic_flight_refusal());
+        }
         let current = record.zip(member).is_some_and(|(record, member)| {
             record.name == target.name && record.epoch == target.epoch && holder_is_current(&record, &member)
         });
@@ -625,5 +630,6 @@ fn header_value(value: &str) -> std::result::Result<HeaderValue, Status> {
 }
 
 fn moved() -> Status { Status::unavailable("The Flight SQL placement changed. Establish a new session.") }
+fn classic_flight_refusal() -> Status { Status::failed_precondition("The Classic Original excludes unclassified FreshFlight") }
 fn directory_error(_: Anomaly) -> Status { Status::unavailable("The Flight SQL directory is unavailable") }
 fn network(error: std::io::Error) -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/flight-gateway", error.to_string()) }
