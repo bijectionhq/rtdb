@@ -272,6 +272,35 @@ impl ArrowFile {
         Ok(batch)
     }
 
+    /// Funds newly read wire bytes and the selected decode independently.
+    /// Existing retained ranges must carry their reader's allocation charge.
+    pub fn read_event_page_reserved(
+        &mut self, page: usize, put_columns: &[String], memory: &Arc<MemoryBudget>,
+    ) -> Result<(RecordBatch, Arc<MemoryReservation>)> {
+        let range = self.pages.page_range(page)?;
+        let start = usize::try_from(range.start).map_err(invalid)?;
+        let end = usize::try_from(range.end).map_err(invalid)?;
+        let wire = match self.reader.block_slice(start..end, true) {
+            Some(buffer) => buffer,
+            None => {
+                let charge = memory.reserve(end - start)?;
+                let buffer = read_block_copy(self.reader.as_mut(), range)?;
+                rtdb_columnar::retain_buffer_with_owner(&buffer, charge)
+            }
+        };
+        let (batch, charge) = match self.pages.decode_projected_buffer_reserved(
+            page, &wire, PageProjection::PutColumns(put_columns), |bytes| memory.reserve(bytes),
+        )? {
+            Some(decoded) => decoded,
+            None => {
+                let charge = memory.reserve(self.pages.full_page_decode_bound(page, &wire)?)?;
+                (self.pages.decode_page(page, wire)?, charge)
+            }
+        };
+        self.next_page = page + 1;
+        Ok((batch, charge))
+    }
+
 }
 
 pub struct PageDecoder {
@@ -418,20 +447,26 @@ impl PageDecoder {
     /// `None` leaves full-page admission to the caller.
     pub fn decode_projected_page_reserved<G>(
         &self, page: usize, wire: impl AsRef<[u8]> + Send + 'static, selection: PageProjection<'_>,
+        reserve: impl FnMut(usize) -> Result<G>,
+    ) -> Result<Option<(RecordBatch, G)>> {
+        self.decode_projected_buffer_reserved(page, &Buffer::from(Bytes::from_owner(wire)), selection, reserve)
+    }
+
+    fn decode_projected_buffer_reserved<G>(
+        &self, page: usize, bytes: &Buffer, selection: PageProjection<'_>,
         mut reserve: impl FnMut(usize) -> Result<G>,
     ) -> Result<Option<(RecordBatch, G)>> {
         if matches!(selection, PageProjection::Iid) {
             self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
         }
-        let bytes = wire.as_ref();
         let (batch, version, body) = self.projected_block(page, bytes)?;
         let Some((bound, workspace)) = projection::allocation_bound(&bytes[body..], batch, &self.decoded_schema, version, selection)? else {
             return Ok(None);
         };
         let charge = reserve(bound)?;
         let _workspace = (workspace != 0).then(|| reserve(workspace)).transpose()?;
-        let bytes = Buffer::from(Bytes::from_owner(wire));
-        Ok(self.decode_projected_page(page, &bytes, selection).ok().map(|batch| (batch, charge)))
+        Ok(projection::decode(&bytes.slice(body), batch, &self.decoded_schema, version, selection)
+            .ok().map(|batch| (batch, charge)))
     }
 
     fn decode_projected_page(&self, page: usize, bytes: &Buffer, selection: PageProjection<'_>) -> Result<RecordBatch> {
@@ -479,6 +514,10 @@ fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block, record:
     let start = usize::try_from(range.start).map_err(invalid)?;
     let end = usize::try_from(range.end).map_err(invalid)?;
     if let Some(buffer) = reader.block_slice(start..end, record) { return Ok(buffer); }
+    read_block_copy(reader, range)
+}
+
+fn read_block_copy(reader: &mut dyn RetainedReader, range: Range<u64>) -> Result<Buffer> {
     reader.seek(SeekFrom::Start(range.start)).map_err(invalid)?;
     let mut bytes = vec![0; usize::try_from(range.end - range.start).map_err(invalid)?];
     reader.read_exact(&mut bytes).map_err(invalid)?;
@@ -1712,6 +1751,39 @@ fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {
     assert!(rtdb_columnar::shared_allocation_size(&decoded).unwrap() < bytes.len());
     drop((reader, bytes));
     assert_eq!(decoded, batch);
+}
+
+#[test]
+fn seekable_event_projection_funds_only_selected_decode_and_wire() {
+    use crate::data::{EventBatch, StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_types::{Iid, Interval, StructFields, Timestamp, Value};
+
+    let event = StoredEvent {
+        position: None, origin: None, entity_key: None, iid: Iid([4; 16]),
+        system_from: Timestamp(7), commit_position: 0, valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([
+            ("_id".into(), Value::I64(1)),
+            ("selected".into(), Value::I64(42)),
+            ("ignored".into(), Value::Utf8("x".repeat(256 << 10))),
+        ])),
+    };
+    let batch = build_event_batch(std::slice::from_ref(&event), None, None).unwrap();
+    let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = writer.into_inner().unwrap();
+    let mut reader = ArrowFile::from_reader(Cursor::new(bytes), None).unwrap();
+    let memory = MemoryBudget::new(512 << 10);
+    assert!(reader.page_allocation_bound(0).unwrap() > memory.limit_bytes());
+    let (page, charge) = reader.read_event_page_reserved(0, &["selected".into()], &memory).unwrap();
+    assert!(memory.used_bytes() >= reader.encoded_page_size(0).unwrap() + charge.bytes());
+    let page = EventBatch::new(page).unwrap();
+    let actual = page.read_event(0).unwrap();
+    assert_eq!(actual.header(), event.header());
+    let StoredOperation::Put(fields) = actual.operation else { panic!("Expected the put leg") };
+    assert_eq!(fields.get("selected"), Some(&Value::I64(42)));
+    assert!(!fields.contains_key("ignored"));
+    drop((page, charge));
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]
