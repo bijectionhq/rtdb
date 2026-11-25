@@ -111,6 +111,7 @@
 -- Flight SQL connections default to XTDB Flight SQL and embedded connections default to XTDB.
 -- The application name survives DISCARD ALL.
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
+-- Mixed column spill can replay complete fragments in their original order while the page keeps their Arrow backing charged.
 -- Computed VALUES and replayed literal pages admit their results column by column.
 -- Compatible XTQL literal pages build their Arrow columns during binding and retain the order and size of every page.
 -- System catalog scans build the requested columns in Arrow and apply filters to their batches.

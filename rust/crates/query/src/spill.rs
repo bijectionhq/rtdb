@@ -326,18 +326,8 @@ impl SpillReader {
                     .ok_or_else(|| invalid("invalid-spill", "Spilled Arrow fragments are absent"))?;
                 let bytes = rtdb_columnar::retain_buffer(&Buffer::from_vec(bytes), &charge);
                 drop(charge);
-                let mut batches = decode_batches(bytes, &self.memory)?;
-                if batches.len() == 1 { return Ok(batches.pop()); }
-                if batches.is_empty() { return Err(invalid("invalid-spill", "Spilled page has no Arrow fragments")); }
-                let rows = batches.iter().try_fold(0usize, |count, batch| {
-                    count.checked_add(batch.len).ok_or_else(|| invalid("invalid-spill", "Spilled page row count overflow"))
-                })?;
-                let bound = rows.checked_mul(std::mem::size_of::<(usize, usize)>())
-                    .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("invalid-spill", "Spilled page selection overflow"))?;
-                let _picks = self.memory.reserve(bound)?;
-                let picks = batches.iter().enumerate().flat_map(|(index, batch)| (0..batch.len).map(move |row| (index, row))).collect::<Vec<_>>();
-                let columns = (0..width).collect::<Vec<_>>();
-                ColumnBatch::take_rows(&batches, &picks, &columns, &self.memory).map(Some)
+                let batches = decode_batches(bytes, &self.memory)?;
+                ColumnBatch::from_spill_fragments(batches, width, &self.memory).map(Some)
             }
             _ => Err(invalid("invalid-spill", "Invalid spill page header")),
         }
@@ -589,6 +579,9 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
 
     let replay_memory = MemoryBudget::new(1 << 23);
     let mut reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    let mut wide_reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    assert_eq!(wide_reader.read_columns(2).err().unwrap().code, "rtdb.query/column-gather");
+    drop(wide_reader);
     drop(file);
     let replayed = reader.read_columns(1).unwrap().unwrap();
     let Column::Selected(selected) = &replayed.columns[0] else { panic!("Expected mixed Arrow fields") };
@@ -606,4 +599,60 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     assert!(replay_memory.used_bytes() > 0);
     drop(retained);
     assert_eq!(replay_memory.used_bytes(), 0);
+}
+
+#[test]
+fn mixed_spill_assembly_keeps_whole_fragments_and_distinguishes_missing_cells() {
+    use arrow_array::{ArrayRef, Int64Array, NullArray, StructArray};
+    use arrow_schema::{Field, Schema};
+    use rtdb_types::{StructFields, Value};
+
+    let backing = MemoryBudget::new(1 << 20);
+    let memory = MemoryBudget::new(4096);
+    let short = ColumnBatch::empty_with_width(0, &backing).unwrap();
+    let error = ColumnBatch::from_spill_fragments(vec![short], 1, &memory).err().unwrap();
+    assert_eq!(error.code, "rtdb.query/column-gather");
+    let page = |array: ArrayRef| {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", array.data_type().clone(), true)]));
+        let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+        ColumnBatch::from_owned(OwnedBatch::new(record, &backing).unwrap()).unwrap()
+    };
+    let rows = 4096;
+    let input = vec![7i64; rows];
+    let nested = StructArray::from(vec![(
+        Arc::new(Field::new("a", DataType::Int64, false)), Arc::new(Int64Array::from(input)) as ArrayRef,
+    )]);
+    let fragments = vec![
+        page(Arc::new(nested)),
+        ColumnBatch::empty_with_width(1, &backing).unwrap(),
+        page(Arc::new(Int64Array::from(vec![None, Some(42)]))),
+        page(Arc::new(NullArray::new(1))),
+    ];
+    let replay = ColumnBatch::from_spill_fragments(fragments, 1, &memory).unwrap();
+    assert_eq!(replay.len, rows + 3);
+    assert_eq!(replay.columns.len(), 1);
+    let column = &replay.columns[0];
+    let nested = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
+    assert_eq!(column.value(0).unwrap(), nested);
+    assert_eq!(column.value(rows - 1).unwrap(), nested);
+    assert!(matches!(column.arrow_cell(rows), Some(Some((array, _, _, row))) if array.is_null(row)));
+    assert_eq!(column.value(rows + 1).unwrap(), Value::I64(42));
+    assert!(matches!(column.arrow_cell(rows + 2), Some(None)));
+    assert!(backing.used_bytes() > 0);
+    drop(replay);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(backing.used_bytes(), 0);
+}
+
+#[test]
+fn malformed_spill_fragments_keep_the_decoder_error() {
+    let memory = MemoryBudget::new(1 << 20);
+    let spill = Arc::new(SpillRegion::new(64).unwrap());
+    let mut writer = spill.create().unwrap();
+    writer.write_frame(&[2]).unwrap();
+    writer.write_frame(&[0; 7]).unwrap();
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let error = reader.read_columns(1).err().unwrap();
+    assert_eq!(error.code, "rtdb.query/fragment-decode");
+    assert!(error.message.as_deref().unwrap().contains("fragment frame is truncated"));
 }
