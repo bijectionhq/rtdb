@@ -25,7 +25,7 @@ pub use managed_workload_oidc::{ManagedWorkloadOidcConfig, ScopedAudienceIssuerC
 pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
 pub use visibility_scope::VerifiedLabelScope;
-pub use workload_grant::{VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
+pub use workload_grant::{OriginalCustodyOperation, VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
 
 #[derive(Clone)]
 pub struct Secret(Zeroizing<String>);

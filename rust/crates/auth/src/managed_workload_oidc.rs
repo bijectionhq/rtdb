@@ -219,7 +219,7 @@ impl ManagedWorkloadOidc {
                 .filter(|provider| provider.accepts_scoped_audience(id)),
         ) {
             (Some(_), None, None) => (&self.create, VerifiedWorkloadGrant::is_create),
-            (None, Some(_), None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment),
+            (None, Some(_), None) => (&self.assignment, VerifiedWorkloadGrant::is_assignment_issued),
             (None, None, Some(provider)) => return provider.client_credentials(id, secret).await,
             _ => return Err(workload_grant::invalid_grant()),
         };
@@ -518,6 +518,44 @@ mod tests {
                 principal.workload_grant().unwrap().receipt_namespace(),
                 grant.receipt_namespace()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_original_control_requires_its_exact_issuer_authority_and_operation() {
+        use rtdb_node::{DatabaseAccess, serving::custody_release::CustodyCarrierAuthority};
+        use crate::OriginalCustodyOperation;
+
+        let memory = MemoryBudget::new(8 << 20);
+        let authority = CustodyCarrierAuthority {
+            incarnation: [7; 16], source_history: [2; 32], installation: [3; 16],
+            registry: [4; 32], original_writer: [5; 32],
+        };
+        let grant_id = [9_u8; 16];
+        for (name, operation, other) in [
+            ("release", OriginalCustodyOperation::Release, OriginalCustodyOperation::Dispose),
+            ("dispose", OriginalCustodyOperation::Dispose, OriginalCustodyOperation::Release),
+        ] {
+            let claim = json!({
+                "version": 3, "audience": "cell", "database": "db", "incarnation": authority.incarnation,
+                "grant_id": grant_id, "expires_at_micros": 800_000,
+                "original_custody": { "operation": name, "authority": authority },
+            });
+            let create = Arc::new(Issuer::new(CREATE, "create-", claim.clone(), &memory));
+            let assignment = Arc::new(Issuer::new(ASSIGNMENT, "assignment-", claim, &memory));
+            let auth = authenticate_with(create, assignment).await;
+            assert!(auth.verify_client_credentials("create-client", "fixture").await.is_err());
+            let principal = auth.verify_client_credentials("assignment-client", "fixture").await.unwrap();
+            assert!(principal.authorize_database("db", DatabaseAccess::Write).is_err());
+            let grant = principal.workload_grant().unwrap();
+            assert!(grant.is_original_custody_control());
+            assert!(!grant.is_assignment());
+            assert!(grant.assignment("db", authority.incarnation, Timestamp(0)).is_err());
+            assert_eq!(grant.admit_original_custody("db", authority, operation, Timestamp(0)).unwrap(), Timestamp(800_000));
+            assert!(grant.admit_original_custody("db", authority, other, Timestamp(0)).is_err());
+            assert!(grant.admit_original_custody("db", authority, operation, Timestamp(800_000)).is_err());
+            assert!(grant.admit_original_custody("other", authority, operation, Timestamp(0)).is_err());
+            assert!(grant.admit_original_custody("db", CustodyCarrierAuthority { original_writer: [6; 32], ..authority }, operation, Timestamp(0)).is_err());
         }
     }
 

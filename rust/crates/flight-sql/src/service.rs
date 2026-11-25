@@ -59,7 +59,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, V1CustodyRelease, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -72,6 +72,10 @@ impl CallKind {
 
     fn allows_workload_root_read(self) -> bool {
         matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities)
+    }
+
+    fn allows_original_custody_control(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1CustodyRelease)
     }
 
     fn allows_workload_grant(self) -> bool {
@@ -313,7 +317,9 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                let allowed = if grant.is_custody_reader() {
+                let allowed = if grant.is_original_custody_control() {
+                    kind.allows_original_custody_control()
+                } else if grant.is_custody_reader() {
                     matches!(kind, CallKind::Handshake | CallKind::V1Query | CallKind::V1Capabilities)
                 } else if grant.is_root_reader() {
                     kind.allows_workload_root_read()
@@ -749,6 +755,7 @@ impl FlightService for Service {
                 crate::v1::MANAGED_CREATE => CallKind::ManagedCreate,
                 crate::v1::MANAGED_WORKLOAD => CallKind::ManagedWorkload,
                 crate::v1::TX_STATUS => CallKind::TxStatus,
+                crate::v1::custody::RELEASE => CallKind::V1CustodyRelease,
                 _ => CallKind::V1Action,
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
@@ -817,6 +824,23 @@ mod tests {
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
             assert!(!kind.allows_workload_grant());
         }
+    }
+
+    #[test]
+    fn original_control_is_separate_from_workload_and_audience_routes() {
+        for kind in [CallKind::Handshake, CallKind::V1CustodyRelease] {
+            assert!(kind.allows_original_custody_control());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query,
+            CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action, CallKind::ManagedCreate,
+            CallKind::ManagedWorkload, CallKind::TxStatus] {
+            assert!(!kind.allows_original_custody_control());
+        }
+        let release = CallKind::V1CustodyRelease;
+        assert!(!release.allows_label_scope());
+        assert!(!release.allows_workload_grant());
+        assert!(!release.allows_workload_root_read());
+        assert!(!release.serves_assigned_follower());
     }
 
     #[test]

@@ -392,3 +392,28 @@ Database and scope protection can close the lease early when the retained visibl
 Before enabling a Bijection consumer, qualify the paired wire and Original provider in both serving modes.
 Existing checkpoints that already erased labelled history without projection metadata cannot reconstruct that history from the clean fold.
 Application funded-offer admission, cross-incarnation projected continuation, and hosted consumers with a separate Original provider attachment need their own evidence and qualification.
+
+
+### Managed Multi Original control
+
+The assignment issuer can issue a dedicated client credential with an `rtdb_workload_grant` of version 3.
+Keep the usual `audience`, `database`, `incarnation`, `grant_id` and `expires_at_micros` envelope.
+Set `original_custody` to an object containing `operation` and `authority`.
+The authority is the configured Original tuple with `incarnation`, `source_history`, `installation`, `registry` and `original_writer` as unsigned byte arrays.
+The verified subject must equal the explicit `owner` on that database's custody provider entry.
+Use independent client credentials and grant IDs for `release` and `dispose`.
+
+A release credential authorizes `resolve_scoped`, `resolve_scoped_occurrences`, `check_scoped` and `admit_scoped` on the same serving attachment that produced the opaque handles.
+A disposal credential authorizes `dispose` and `drained` for the exact configured Original.
+This authentication class is confined to the Release action after Flight handshake.
+RTDB still checks the current Original writer, proof mount and generation, carrier receipts, complete response manifest and positive disposition.
+
+With a managed release credential, register the exact frame and all carrier receipts at the independent Original registry first.
+The response cutoff must fit within the credential and every read proof.
+`check_scoped` verifies the planned registrations without ordering holds.
+`admit_scoped` derives those same registrations from the verified records, stages and promotes them under the writer fence, then orders the full response.
+Keep the exact registrations and transport reservation for disposal if a reply is lost or the order stops partway through.
+The existing recorded and clear response rules apply.
+
+Issue and exercise the dedicated credentials in the paired Bijection integration before enabling managed delivery.
+Keep scoped Query and Changes on the separately authenticated private audience attachment.

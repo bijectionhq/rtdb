@@ -373,20 +373,68 @@ impl MountedResponseRelease<'_> {
         &self, part: CustodyResponsePart, frame_sha256: [u8; 32],
         read_proofs_sha256: [u8; 32], proof_expires_at: Timestamp,
     ) -> Result<()> {
+        self.registered_scoped_cutoff(part, frame_sha256, read_proofs_sha256, &CustodyContributors::new(), proof_expires_at)
+            .await.map(drop)
+    }
+
+    pub async fn registered_scoped_cutoff(
+        &self, part: CustodyResponsePart, frame_sha256: [u8; 32], read_proofs_sha256: [u8; 32],
+        contributors: &CustodyContributors, latest_cutoff: Timestamp,
+    ) -> Result<Timestamp> {
         let installation = &self.owner.provider.installation;
         let authority = installation.authority;
-        self.while_mounted(async {
+        let cutoff = self.while_mounted(async {
             self.require_original_writer().await?;
             let frame = installation.observations.registered_response(authority, part, self.cancellation).await?;
             if frame.authority != authority || frame.part != part || frame.frame_sha256 != frame_sha256
-                || frame.read_proofs_sha256 != Some(read_proofs_sha256) || !frame.contributors.is_empty()
-                || frame.expires_at > proof_expires_at || frame.expires_at <= self.clock.now()
+                || frame.read_proofs_sha256 != Some(read_proofs_sha256) || frame.contributors != *contributors
+                || frame.expires_at > latest_cutoff
             {
                 return Err(release_unavailable());
             }
-            Ok(())
+            self.require_original_writer().await?;
+            if frame.expires_at <= self.clock.now() { return Err(release_unavailable()); }
+            Ok(frame.expires_at)
         }).await?;
-        self.owner.with_live_mount(|| self.release().require_authority(authority))
+        self.owner.with_live_mount(|| self.release().require_authority(authority))?;
+        Ok(cutoff)
+    }
+
+    pub async fn prepare_scoped_registrations(
+        &self, admission: &CustodyResponseAdmission, promote: bool,
+    ) -> Result<()> {
+        let first = admission.registrations.first().copied().ok_or_else(release_unavailable)?;
+        let deadline = self.response_deadline(first)?;
+        let release = self.release();
+        tokio::time::timeout_at(deadline.instant().into(), self.while_mounted(async {
+            let (index, writer) = release.current_with_writer(first.authority).await?;
+            let mut groups = BTreeSet::new();
+            let mut pending = Vec::new();
+            for &registration in &admission.registrations {
+                if registration.authority != first.authority || registration.part != first.part
+                    || registration.expires_at != first.expires_at
+                {
+                    return Err(release_unavailable());
+                }
+                release.require_live_registration(registration).await?;
+                require_live_group(&index, registration)?;
+                match index.custody_release_phase(registration)? {
+                    None | Some(CustodyReleasePhase::Private) => pending.push(registration),
+                    Some(CustodyReleasePhase::Promoted) => (),
+                    _ => return Err(release_unavailable()),
+                }
+                groups.insert(registration.group);
+            }
+            release.driver.check_custody_release_delivery(&groups, &writer, Some(admission.key_generation), self.cancellation).await?;
+            if promote {
+                for registration in pending {
+                    release.stage(registration).await?;
+                    release.promote(registration).await?;
+                }
+            }
+            Ok(())
+        })).await.map_err(|_| release_unavailable())??;
+        self.finish_response(first, deadline)
     }
 
     pub async fn check_registered_response(

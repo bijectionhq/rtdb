@@ -1,3 +1,4 @@
+use rtdb_node::serving::custody_release::CustodyCarrierAuthority;
 use rtdb_types::{Anomaly, Result, Timestamp};
 use rtdb_tx::transact::workload::{Authority, Point};
 use serde::Deserialize;
@@ -66,6 +67,20 @@ pub enum WorkloadOperation {
     CreateDeployment,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OriginalCustodyOperation {
+    Release,
+    Dispose,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalCustodyControl {
+    operation: OriginalCustodyOperation,
+    authority: CustodyCarrierAuthority,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Claim<'a> {
@@ -77,6 +92,7 @@ struct Claim<'a> {
     expires_at_micros: i64,
     operations: Option<[WorkloadOperation; 1]>,
     authority: Option<Authority>,
+    original_custody: Option<OriginalCustodyControl>,
 }
 
 pub struct VerifiedWorkloadGrant {
@@ -90,6 +106,7 @@ pub struct VerifiedWorkloadGrant {
 enum Permission {
     Create(WorkloadOperation),
     Assignment { authority: Box<Authority>, point: Point },
+    OriginalCustody(OriginalCustodyControl),
 }
 
 impl VerifiedWorkloadGrant {
@@ -115,12 +132,17 @@ impl VerifiedWorkloadGrant {
         {
             return Err(invalid_grant());
         }
-        let permission = match (claim.version, claim.operations, claim.authority, config.assignment()) {
-            (1, Some([operation]), None, _) if claim_field_absent(raw, "authority") =>
-                Permission::Create(operation),
-            (2, None, Some(authority), Some(point)) if claim_field_absent(raw, "operations")
-                && authority.valid(claim.incarnation) =>
+        let permission = match (claim.version, claim.operations, claim.authority, claim.original_custody, config.assignment()) {
+            (1, Some([operation]), None, None, _) if claim_field_absent(raw, "authority")
+                && claim_field_absent(raw, "original_custody") => Permission::Create(operation),
+            (2, None, Some(authority), None, Some(point)) if claim_field_absent(raw, "operations")
+                && claim_field_absent(raw, "original_custody") && authority.valid(claim.incarnation) =>
                 Permission::Assignment { authority: Box::new(authority), point: point.clone() },
+            (3, None, None, Some(control), Some(_)) if claim_field_absent(raw, "operations")
+                && claim_field_absent(raw, "authority") && control.authority.incarnation == claim.incarnation
+                && control.authority.installation != [0; 16] && control.authority.source_history != [0; 32]
+                && control.authority.registry != [0; 32] && control.authority.original_writer != [0; 32] =>
+                Permission::OriginalCustody(control),
             _ => return Err(invalid_grant()),
         };
         let mut hash = Sha256::new();
@@ -145,6 +167,28 @@ impl VerifiedWorkloadGrant {
     }
 
     pub fn is_assignment(&self) -> bool { matches!(self.permission, Permission::Assignment { .. }) }
+
+    pub(super) fn is_assignment_issued(&self) -> bool {
+        self.is_assignment() || self.is_original_custody_control()
+    }
+
+    pub fn is_original_custody_control(&self) -> bool {
+        matches!(self.permission, Permission::OriginalCustody(_))
+    }
+
+    pub fn admit_original_custody(
+        &self, database: &str, authority: CustodyCarrierAuthority, operation: OriginalCustodyOperation,
+        now: Timestamp,
+    ) -> Result<Timestamp> {
+        if self.database != database || self.incarnation != authority.incarnation
+            || !matches!(&self.permission, Permission::OriginalCustody(control)
+                if control.operation == operation && control.authority == authority)
+        {
+            return Err(invalid_grant());
+        }
+        self.revalidate(now)?;
+        Ok(self.expires_at)
+    }
 
     pub(super) fn is_create(&self) -> bool {
         matches!(self.permission, Permission::Create(WorkloadOperation::CreateDeployment))
@@ -189,7 +233,7 @@ impl VerifiedWorkloadGrant {
         self.revalidate(now)?;
         match &self.permission {
             Permission::Assignment { authority, point } => Ok((authority, point, self.expires_at)),
-            Permission::Create(_) => Err(invalid_grant()),
+            Permission::Create(_) | Permission::OriginalCustody(_) => Err(invalid_grant()),
         }
     }
 
@@ -202,7 +246,7 @@ impl VerifiedWorkloadGrant {
 
     pub(super) fn memory_bytes(&self) -> usize {
         self.database.capacity() + match &self.permission {
-            Permission::Create(_) => 0,
+            Permission::Create(_) | Permission::OriginalCustody(_) => 0,
             Permission::Assignment { .. } => 8192,
         }
     }

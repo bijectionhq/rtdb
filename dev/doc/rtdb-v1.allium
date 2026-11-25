@@ -336,6 +336,14 @@ surface StatelessDatabase {
         -- A successful scoped admission response returns only the application response state.
         -- Positive Original disposal settles promoted registrations independently of the read-proof lifetime.
 
+    @guarantee ManagedOriginalCustodyControl
+        -- An assignment issuer can authenticate a release or disposal credential scoped to the exact installed database, configured Original owner and provider authority.
+        -- Release resolves scoped proof handles and checks or admits the exact registered response part.
+        -- The registered frame fixes the complete native contributor inventory and cutoff before the writer prepares its ordered holds.
+        -- The cutoff fits within the lease of the release credential and each selected proof.
+        -- A separate disposal credential confirms positive transport disposition and the exact revoked group drain.
+        -- Original writer identity and delivery fences remain current when the writer admits the response.
+
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.
         -- A route advertising changes.images.stream-v1 accepts an explicit request for shared image streams and acknowledges the selected representation in the response.

@@ -1,7 +1,8 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use prost::Message as _;
+use rtdb_auth::{OriginalCustodyOperation, VerifiedWorkloadGrant};
 use rtdb_crypt::tokens::CustodyReadProof;
 use rtdb_node::{
     Database, DatabaseAccess, SystemClock,
@@ -9,7 +10,7 @@ use rtdb_node::{
     serving::custody_release::{
         CustodyCarrierAuthority, CustodyContributors, CustodyProviderInstallation,
         CustodyProviderMount, CustodyReleasePhase, CustodyReleaseRegistration,
-        CustodyResponseAdmission, CustodyResponseOwner, CustodyResponsePart,
+        CustodyResponseAdmission, CustodyResponseOwner, CustodyResponsePart, OriginalReceipt,
     },
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyOccurrence, Op, Outcome, Transact};
@@ -196,6 +197,17 @@ enum Request {
     },
 }
 
+impl Request {
+    fn control_operation(&self) -> Option<OriginalCustodyOperation> {
+        match self {
+            Self::ResolveScoped { .. } | Self::ResolveScopedOccurrences { .. }
+            | Self::CheckScoped(_) | Self::AdmitScoped(_) => Some(OriginalCustodyOperation::Release),
+            Self::Dispose { .. } | Self::Drained { .. } => Some(OriginalCustodyOperation::Dispose),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponseRequest {
@@ -220,6 +232,22 @@ struct OriginalContributor {
     receipt_key: Vec<u8>,
     written_basis: Vec<u8>,
     system_time_micros: i64,
+}
+
+impl OriginalContributor {
+    fn registration(
+        self, authority: CustodyCarrierAuthority, part: CustodyResponsePart, expires_at: Timestamp,
+    ) -> Result<CustodyReleaseRegistration, Status> {
+        let receipt = OriginalReceipt {
+            key: self.receipt_key,
+            basis: Basis::from_bytes(&self.written_basis).map_err(error::anomaly)?,
+            system_time: Timestamp(self.system_time_micros),
+        };
+        Ok(CustodyReleaseRegistration {
+            authority, part, expires_at, group: self.group, original: self.original,
+            occurrence: self.occurrence, carrier_receipt_sha256: receipt.commitment(),
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -419,7 +447,7 @@ impl Service {
             }
             let groups = proof.contributors.iter().map(|(group, _)| *group).collect();
             let generation = proof.key_generation.ok_or_else(unavailable)?;
-            driver.check_custody_release_delivery(&groups, &writer, generation, &call.cancellation).await.map_err(error::anomaly)?;
+            driver.check_custody_release_delivery(&groups, &writer, Some(generation), &call.cancellation).await.map_err(error::anomaly)?;
         }
         self.check_attachment(call, database)
     }
@@ -512,12 +540,35 @@ impl Service {
         Ok(inventory)
     }
 
+    fn managed_custody_control(
+        &self, call: &Call, request: &Request, grant: &VerifiedWorkloadGrant,
+    ) -> Result<(&CustodyProviderRoute, Arc<Database>, Timestamp), Status> {
+        let denied = || Status::permission_denied("The action requires its exact Original custody control credential");
+        let operation = request.control_operation().ok_or_else(denied)?;
+        let route = self.0.config.custody_providers.get(&call.database).map(Arc::as_ref).ok_or_else(denied)?;
+        let caller = &call.session.caller;
+        if !caller.verified_credential || route.owner().is_none() || caller.principal.user_id() != route.owner()
+            || !self.0.node.catalog().is_managed() || self.follower_only()
+            || call.session.audience_source().is_some() || call.session.fresh_replica
+        {
+            return Err(denied());
+        }
+        let authority = route.installation.authority;
+        let cutoff = grant.admit_original_custody(&call.database, authority, operation, self.0.node.now())
+            .map_err(error::anomaly)?;
+        let database = self.0.node.catalog().database(&call.database).map_err(error::anomaly)?;
+        if database.read_only() || database.serving_driver().is_none_or(|driver| driver.incarnation() != authority.incarnation) {
+            return Err(unavailable());
+        }
+        self.check_attachment(call, &database)?;
+        Ok((route, database, cutoff))
+    }
+
     pub(super) async fn custody_release_action(
         &self,
         call: &Call,
         body: &[u8],
     ) -> Result<Vec<u8>, Status> {
-        let route = self.custody_route(call)?;
         if body.len() > MAX_RELEASE_BYTES {
             return Err(Status::resource_exhausted(
                 "Custody release request exceeds its bound",
@@ -526,17 +577,43 @@ impl Service {
         let _charge = call.reserve(body.len() * 3 + 4096)?;
         let request = serde_json::from_slice(body)
             .map_err(|_| error::incorrect("Invalid custody release request"))?;
-        let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
-        let owner = route.acquire(self, call, &database).await?;
+        let _occurrence_charge = match &request {
+            Request::ResolveScopedOccurrences { .. } => Some(call.reserve(MAX_SCOPED_OCCURRENCE_INVENTORY_BYTES * 4)?),
+            _ => None,
+        };
+        let (route, database, control_cutoff) = if let Some(grant) = call.session.caller.principal.workload_grant() {
+            let (route, database, cutoff) = self.managed_custody_control(call, &request, grant)?;
+            (route, database, Some(cutoff))
+        } else {
+            (self.custody_route(call)?, self.wire_attachment(call, DatabaseAccess::Write).await?, None)
+        };
+        let dispatch = self.dispatch_custody_release(call, &database, route, request, control_cutoff);
+        let reply = if let Some(cutoff) = control_cutoff {
+            let denied = || Status::permission_denied("The Original custody control credential expired");
+            let remaining = cutoff.0.saturating_sub(self.0.node.now().0);
+            if remaining <= 0 { return Err(denied()); }
+            let reply = tokio::time::timeout(Duration::from_micros(remaining as u64), dispatch)
+                .await.map_err(|_| denied())??;
+            if cutoff <= self.0.node.now() { return Err(denied()); }
+            reply
+        } else {
+            dispatch.await?
+        };
+        self.check_attachment(call, &database)?;
+        serde_json::to_vec(&reply)
+            .map_err(|_| Status::internal("Cannot encode the custody release response"))
+    }
+
+    async fn dispatch_custody_release(
+        &self, call: &Call, database: &Arc<Database>, route: &CustodyProviderRoute,
+        request: Request, control_cutoff: Option<Timestamp>,
+    ) -> Result<Reply, Status> {
+        let owner = route.acquire(self, call, database).await?;
         let mounted = owner
             .response_release(&SystemClock, &call.cancellation)
             .map_err(error::anomaly)?;
         let release = mounted.release();
         let admit = matches!(&request, Request::Admit(_) | Request::AdmitScoped(_));
-        let _occurrence_charge = match &request {
-            Request::ResolveScopedOccurrences { .. } => Some(call.reserve(MAX_SCOPED_OCCURRENCE_INVENTORY_BYTES * 4)?),
-            _ => None,
-        };
         let reply = match request {
             Request::Prepare { registration } => Reply::Prepared {
                 registration: release
@@ -575,7 +652,7 @@ impl Service {
                 let (contributors, selected_basis, key_generation) = self
                     .verify_custody_reads(
                         call,
-                        &database,
+                        database,
                         route.proof_owner(&owner),
                         &read_proofs,
                         first.expires_at,
@@ -612,12 +689,15 @@ impl Service {
             Request::ResolveScoped { read_proofs } => {
                 mounted.require_original_writer().await.map_err(error::anomaly)?;
                 let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
-                Reply::ResolvedScoped { contributors: self.resolve_scoped_contributors(call, &database, &read).await? }
+                let contributors = self.resolve_scoped_contributors(call, database, &read).await?;
+                mounted.require_original_writer().await.map_err(error::anomaly)?;
+                if read.expires_at <= self.0.node.now() { return Err(unavailable()); }
+                Reply::ResolvedScoped { contributors }
             }
             Request::ResolveScopedOccurrences { read_proofs } => {
                 mounted.require_original_writer().await.map_err(error::anomaly)?;
                 let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
-                let inventory = self.resolve_scoped_occurrences(call, &database, &read).await?;
+                let inventory = self.resolve_scoped_occurrences(call, database, &read).await?;
                 mounted.require_original_writer().await.map_err(error::anomaly)?;
                 if read.expires_at <= self.0.node.now() {
                     return Err(unavailable());
@@ -633,28 +713,42 @@ impl Service {
                 if frame_sha256 == [0; 32] { return Err(unavailable()); }
                 let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
                 let proof_commitment = read_proofs_commitment(&read_proofs);
+                let latest_cutoff = control_cutoff.map_or(read.expires_at, |cutoff| cutoff.min(read.expires_at));
                 if read.contributors.is_empty() {
-                    mounted.check_clear_response(part, frame_sha256, proof_commitment, read.expires_at)
+                    mounted.check_clear_response(part, frame_sha256, proof_commitment, latest_cutoff)
                         .await.map_err(error::anomaly)?;
                     Reply::ScopedAdmission { state: "clear" }
                 } else {
-                    let index = release.driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
-                    let registrations = index.promoted_custody_registrations(route.installation.authority, part, &read.contributors)
-                        .map_err(error::anomaly)?;
-                    if registrations.iter().any(|registration| registration.expires_at > read.expires_at) {
+                    let authority = route.installation.authority;
+                    let key_generation = read.generation.ok_or_else(unavailable)?;
+                    let registrations = if control_cutoff.is_some() {
+                        let cutoff = mounted.registered_scoped_cutoff(part, frame_sha256, proof_commitment, &read.contributors, latest_cutoff)
+                            .await.map_err(error::anomaly)?;
+                        self.resolve_scoped_contributors(call, database, &read).await?.into_iter()
+                            .map(|contributor| contributor.registration(authority, part, cutoff))
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        let index = release.driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+                        index.promoted_custody_registrations(authority, part, &read.contributors).map_err(error::anomaly)?
+                    };
+                    if registrations.iter().any(|registration| registration.expires_at > latest_cutoff) {
                         return Err(unavailable());
                     }
                     let admission = CustodyResponseAdmission {
-                        registrations, frame_sha256, selected_basis: read.source,
-                        key_generation: read.generation.ok_or_else(unavailable)?,
+                        registrations, frame_sha256, selected_basis: read.source, key_generation,
                         read_proofs_sha256: Some(proof_commitment),
                     };
+                    if control_cutoff.is_some() {
+                        mounted.prepare_scoped_registrations(&admission, admit).await.map_err(error::anomaly)?;
+                    }
                     if admit {
                         let receipt = mounted.admit_registered_response(&read.contributors, admission)
                             .await.map_err(error::anomaly)?;
                         Reply::ScopedAdmission { state: if receipt.replayed { "recorded" } else { "admitted" } }
                     } else {
-                        mounted.check_registered_response(&read.contributors, &admission).await.map_err(error::anomaly)?;
+                        if control_cutoff.is_none() {
+                            mounted.check_registered_response(&read.contributors, &admission).await.map_err(error::anomaly)?;
+                        }
                         Reply::Ack { ok: true }
                     }
                 }
@@ -685,9 +779,7 @@ impl Service {
                     .map_err(error::anomaly)?,
             },
         };
-        self.check_attachment(call, &database)?;
-        serde_json::to_vec(&reply)
-            .map_err(|_| Status::internal("Cannot encode the custody release response"))
+        Ok(reply)
     }
 
     async fn verify_custody_reads(
@@ -773,6 +865,49 @@ mod tests {
         assert!(reads.resolve(Timestamp(49), [8; 32], std::slice::from_ref(&first)).await.is_err());
         assert!(reads.resolve(Timestamp(50), [1; 32], std::slice::from_ref(&first)).await.is_err());
         assert!(reads.resolve(Timestamp(49), [1; 32], &[first, other_scope]).await.is_err());
+    }
+
+    #[test]
+    fn managed_original_control_classifies_only_scoped_release_and_exact_disposition() {
+        let authority = CustodyCarrierAuthority {
+            incarnation: [1; 16], source_history: [2; 32], installation: [3; 16],
+            registry: [4; 32], original_writer: [5; 32],
+        };
+        let part = CustodyResponsePart {
+            transport_history: [6; 16], producer: [7; 16], consumer: [8; 16], response: [9; 16],
+            ordinal: std::num::NonZeroU64::MIN,
+        };
+        let group = [10; 16];
+        let inventory_sha256 = [11; 32];
+        let registration = CustodyReleaseRegistration {
+            authority, part, group, original: [12; 32], occurrence: [13; 32],
+            carrier_receipt_sha256: [14; 32], expires_at: Timestamp(30),
+        };
+        let frame_sha256 = [15; 32];
+        for operation in ["resolve_scoped", "resolve_scoped_occurrences", "check_scoped", "admit_scoped",
+            "prepare", "stage", "promote", "cancel", "check", "admit", "dispose", "drained"]
+        {
+            let (body, expected) = match operation {
+                "resolve_scoped" | "resolve_scoped_occurrences" => (
+                    serde_json::json!({ "operation": operation, "read_proofs": [] }), Some(OriginalCustodyOperation::Release),
+                ),
+                "check_scoped" | "admit_scoped" => (
+                    serde_json::json!({ "operation": operation, "part": part, "frame_sha256": frame_sha256, "read_proofs": [] }),
+                    Some(OriginalCustodyOperation::Release),
+                ),
+                "drained" => (
+                    serde_json::json!({ "operation": operation, "authority": authority, "group": group,
+                        "revoked_at": Basis::new(authority.incarnation, 1).to_bytes(), "inventory_sha256": inventory_sha256 }),
+                    Some(OriginalCustodyOperation::Dispose),
+                ),
+                "dispose" => (serde_json::json!({ "operation": operation, "registration": registration }), Some(OriginalCustodyOperation::Dispose)),
+                "check" | "admit" => (
+                    serde_json::json!({ "operation": operation, "registrations": [], "frame_sha256": frame_sha256, "read_proofs": [] }), None,
+                ),
+                _ => (serde_json::json!({ "operation": operation, "registration": registration }), None),
+            };
+            assert_eq!(serde_json::from_value::<Request>(body).unwrap().control_operation(), expected);
+        }
     }
 
     #[test]
