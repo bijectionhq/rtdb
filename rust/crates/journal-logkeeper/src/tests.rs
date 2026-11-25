@@ -174,3 +174,39 @@ async fn stream_journal_recovers_a_batch_after_lost_publication_replies() {
         expected
     );
 }
+
+const CONSENSUS_PRINCIPALS: [&str; 3] = [
+    "urn:logkeeper:client:1",
+    "urn:logkeeper:client:2",
+    "urn:logkeeper:client:3",
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_journal_conforms_through_the_rtdb_adapter() {
+    use stream_logkeeper::stream::consensus::testing::LocalCluster;
+
+    let mut cluster = LocalCluster::start(&CONSENSUS_PRINCIPALS).await.unwrap();
+    let config = cluster.journal_config(conformance::LIMITS.stream_quota_bytes, conformance::LIMITS.max_record_bytes);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+        "keepers": config.keepers,
+        "catalog": config.catalog,
+        "voters": config.voters,
+        "quota_bytes": config.quota_bytes,
+        "max_record_bytes": config.max_record_bytes,
+    })).unwrap()).unwrap();
+    let url = format!("{CONSENSUS_SCHEME}{}", path.display());
+    let journals = CONSENSUS_PRINCIPALS.map(|principal| {
+        connect_consensus(&url, &cluster.credentials(principal).unwrap()).unwrap().unwrap()
+    });
+    assert!(connect_consensus("logkeeper-consensus://relative.json", &cluster.credentials(CONSENSUS_PRINCIPALS[0]).unwrap())
+        .unwrap()
+        .is_err());
+    conformance::run(|identity: Identity| {
+        let index = CONSENSUS_PRINCIPALS.iter().position(|principal| identity.as_str() == *principal).unwrap();
+        Arc::new(journals[index].clone()) as Arc<dyn Journal>
+    })
+    .await;
+    cluster.shutdown().await.unwrap();
+}

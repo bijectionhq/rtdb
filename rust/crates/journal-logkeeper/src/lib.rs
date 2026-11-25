@@ -4,7 +4,28 @@ use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
 use stream_logkeeper::stream::{transport::TcpTransport, writer::Writer};
 
+pub use stream_logkeeper::stream::consensus::{ConsensusJournal, JournalConfig};
 pub use stream_logkeeper::stream::transport::Credentials;
+
+/// The URL scheme that selects keeper-hosted consensus streams. The rest of
+/// the URL is the absolute path of a `JournalConfig` JSON file.
+pub const CONSENSUS_SCHEME: &str = "logkeeper-consensus://";
+
+/// Opens the consensus journal named by a `logkeeper-consensus://` URL.
+/// Returns `None` for any other URL.
+pub fn connect_consensus(url: &str, credentials: &Credentials) -> Option<io::Result<ConsensusJournal>> {
+    let path = url.strip_prefix(CONSENSUS_SCHEME)?;
+    Some((|| {
+        let path = std::path::Path::new(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a consensus journal URL names an absolute configuration path",
+            ));
+        }
+        ConsensusJournal::new(credentials, &JournalConfig::read(path)?)
+    })())
+}
 pub use stream_logkeeper::stream::{
     timed::{TimedOriginal, TimedOriginalProof, TimedOriginalVerifier},
     wire::KeeperId,

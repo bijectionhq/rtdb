@@ -13,6 +13,8 @@ stream-logkeeper.workspace = true
 
 [dev-dependencies]
 journal-contract = { workspace = true, features = ["conformance"] }
+stream-logkeeper = { workspace = true, features = ["consensus-testing"] }
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
