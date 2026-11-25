@@ -46,6 +46,8 @@
 -- Native SQL, XTQL, and logical relation execution opens Arrow batches for the root operator.
 -- Semantic pages remain Arrow batches through downstream operators and transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Native cursor pages with a fixed result layout share one admitted Arrow schema.
+-- Result buffers that share operator backing carry its admission for as long as their Arrow views retain it.
 -- Arrow result layout adaptation reserves its scratch space against the client operation's budget.
 -- A Flight SQL world point reply retains a compatible selected Arrow value and publishes its concrete cell type.
 -- An Arrow client result union of one data leg and nullable null legs conforms to that leg's declared plain field by Arrow position.

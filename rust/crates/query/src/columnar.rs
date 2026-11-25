@@ -778,7 +778,7 @@ impl ColumnBatch {
         Ok(())
     }
 
-    fn column_reservation(&self, position: usize) -> &Arc<MemoryReservation> {
+    pub(crate) fn column_reservation(&self, position: usize) -> &Arc<MemoryReservation> {
         let offset = self.columns.len() - self.appended.len();
         position.checked_sub(offset).map_or(&self.reservation, |position| &self.appended[position])
     }

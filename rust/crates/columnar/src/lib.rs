@@ -27,7 +27,7 @@ pub use iid::{IidView, build_iids};
 pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells, interleave};
 pub use hash::{decimal_cell_as_f64, hash_cell, hash_float_components, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
 pub use memory::{BatchBuilder, BufferIdentity, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn,
-    RetainedArray, Selection, retain_array, retain_buffer, retain_buffer_with_owner, shared_allocation_size,
+    ResultArrayFunding, RetainedArray, Selection, retain_array, retain_buffer, retain_buffer_with_owner, retain_result_array, shared_allocation_size,
     shared_allocation_size_excluding, shared_batches_allocation_size, visible_buffer_bytes};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
 pub use text::{TextCell, binary_cell, owned_text_cell, selected_cell, text_cell, utf8_list};

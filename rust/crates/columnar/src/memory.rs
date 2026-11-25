@@ -95,8 +95,21 @@ impl OwnedBatch {
         Self { batch, reservation: Arc::clone(&self.reservation), schema_reservation: self.schema_reservation.clone() }
     }
 
+    /// The reservation covers the batch's descriptors, including arrays without backing buffers.
+    /// Each column with backing buffers already carries its allocation owners.
+    pub fn with_funded_columns(batch: RecordBatch, reservation: Arc<MemoryReservation>) -> Self {
+        Self { batch, reservation, schema_reservation: None }
+    }
+
+    /// The reservation covers the allocation of this batch's immutable schema.
+    pub fn with_schema_reservation(mut self, reservation: Arc<MemoryReservation>) -> Self {
+        self.schema_reservation = Some(reservation);
+        self
+    }
+
     /// Cloned Arrow arrays retain the reservation through their allocation owners.
     pub fn batch(&self) -> &RecordBatch { &self.batch }
+    /// The batch's own charge. Shared buffers and the schema can carry separate charges.
     pub fn reservation(&self) -> &Arc<MemoryReservation> { &self.reservation }
     pub fn owns_schema(&self) -> bool { self.schema_reservation.is_some() }
 
@@ -435,6 +448,75 @@ fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<
 /// Keeps a copy's allocation charge with its Arrow buffers through moves and slices.
 pub fn retain_array(array: ArrayRef, reservation: &Arc<MemoryReservation>) -> Result<ArrayRef> {
     attach_data(array.to_data(), reservation).map(make_array)
+}
+
+#[derive(Clone, Copy)]
+pub enum ResultArrayFunding<'a> {
+    Copy,
+    Shared(&'a Arc<MemoryReservation>),
+    Relayout(&'a ArrayRef, &'a Arc<MemoryReservation>),
+}
+
+/// Settles an exclusive construction grant, excluding backing covered by the source owner.
+/// Arrow buffer clones carry their custody, while bufferless descriptors are charged to the page.
+pub fn retain_result_array(
+    array: ArrayRef, mut grant: Arc<MemoryReservation>, funding: ResultArrayFunding<'_>,
+    page: &mut MemoryReservation, schema: &Arc<MemoryReservation>,
+) -> Result<ArrayRef> {
+    let mut source_buffers = BTreeSet::new();
+    let source_charge = match funding {
+        ResultArrayFunding::Copy => None,
+        ResultArrayFunding::Shared(charge) => Some(charge),
+        ResultArrayFunding::Relayout(source, charge) => {
+            visit_buffers(&source.to_data(), &mut |buffer| {
+                source_buffers.insert(BufferIdentity::of(buffer));
+                Ok(())
+            })?;
+            Some(charge)
+        }
+    };
+    let is_shared = |buffer| match funding {
+        ResultArrayFunding::Shared(_) => true,
+        ResultArrayFunding::Relayout(..) => source_buffers.contains(&buffer),
+        ResultArrayFunding::Copy => false,
+    };
+    let data = array.to_data();
+    let mut bytes = sum(256, array_descriptors(&array)?)?;
+    let mut has_buffers = false;
+    let mut new_buffers = BTreeMap::new();
+    visit_buffers(&data, &mut |buffer| {
+        has_buffers = true;
+        if is_shared(BufferIdentity::of(buffer)) {
+            bytes = sum(bytes, 128)?;
+            Ok(())
+        } else {
+            count_new_buffer(&mut new_buffers, buffer, &|_| false)
+        }
+    })?;
+    let bytes = new_buffers.into_values().try_fold(bytes, sum)?;
+    let lease = Arc::get_mut(&mut grant).ok_or_else(|| {
+        Anomaly::fault("rtdb/shared-allocation-reservation", "Result column construction grant escaped")
+    })?;
+    if bytes > lease.bytes() { lease.grow_to(bytes)?; }
+    else { lease.shrink_to(bytes)?; }
+    if !has_buffers {
+        page.absorb(lease)?;
+        return Ok(array);
+    }
+    drop(array);
+    let output_owner: Arc<dyn Send + Sync> = Arc::new((grant, Arc::clone(schema)));
+    let shared_owner: Option<Arc<dyn Send + Sync>> = source_charge.map(|charge| {
+        Arc::new((Arc::clone(charge), Arc::clone(&output_owner))) as Arc<dyn Send + Sync>
+    });
+    let data = attach_buffers(data, &|buffer| {
+        let owner = if is_shared(BufferIdentity::of(buffer)) {
+            shared_owner.as_ref().expect("Shared result buffers have a source charge")
+        } else {
+            &output_owner
+        };
+        retain_buffer_with_owner(buffer, Arc::clone(owner))
+    })?;
+    Ok(make_array(data))
 }
 
 /// Identifies backing storage while its Arrow buffers remain live.

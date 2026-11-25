@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, RecordBatchOptions};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array_refs, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, ResultArrayFunding, copy_array_refs, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, retain_result_array, to_field};
 use rtdb_plan::{BinaryOp, Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
@@ -269,7 +269,7 @@ impl PreparedQuery {
         let context = Arc::clone(&context).with_tracer(context.tracer.clone(), parent);
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
-        Ok(Some(QueryCursor { schema, runtime_schema, input: Some(QueryInput::Projection { batch: Some(projected), trace: operator_trace }), context,
+        Ok(Some(QueryCursor { schema, runtime_schema, result_arrow: None, input: Some(QueryInput::Projection { batch: Some(projected), trace: operator_trace }), context,
             sample, trace, query_span, plan_reservation: self._plan_reservation.clone() }))
     }
 
@@ -419,7 +419,7 @@ impl PreparedQuery {
             return Ok(cursor);
         }
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
-        Ok(QueryCursor { schema, runtime_schema: runtime_schema.output(), input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
+        Ok(QueryCursor { schema, runtime_schema: runtime_schema.output(), result_arrow: None, input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
     }
 }
 
@@ -656,15 +656,19 @@ struct ColumnOutput {
     pending: Option<(OwnedBatch, usize)>,
 }
 
-type EmitColumns<'a> = dyn FnMut(&Schema, &Arc<MemoryBudget>, crate::columnar::ColumnBatch) -> Result<OwnedBatch> + Send + 'a;
+type EmitColumns<'a> = dyn FnMut(&Schema, &ResultArrowSchema, &Arc<MemoryBudget>, crate::columnar::ColumnBatch) -> Result<OwnedBatch> + Send + 'a;
 
 impl ColumnOutput {
-    async fn next(&mut self, schema: &Schema, memory: &Arc<MemoryBudget>, emit: &mut EmitColumns<'_>) -> Result<Option<OwnedBatch>> {
+    async fn next(&mut self, schema: &Schema, result_arrow: &mut Option<ResultArrowSchema>, memory: &Arc<MemoryBudget>, emit: &mut EmitColumns<'_>) -> Result<Option<OwnedBatch>> {
         let (batch, offset) = match self.pending.take() {
             Some(pending) => pending,
             None => loop {
                 let Some(batch) = self.input.next_batch().await? else { return Ok(None); };
-                if batch.len != 0 { break (emit(schema, memory, batch)?, 0); }
+                if batch.len != 0 {
+                    check_output_width(schema, &batch)?;
+                    let arrow = ResultArrowSchema::cached(result_arrow, schema, memory)?;
+                    break (emit(schema, arrow, memory, batch)?, 0);
+                }
             },
         };
         let count = (batch.batch().num_rows() - offset).min(self.limit);
@@ -687,7 +691,7 @@ pub fn encoding_ordered_batch() -> bool { ENCODING_ORDERED_BATCH.try_with(|_| ()
 #[derive(Clone, Copy)]
 enum Batching { Rows, Pages, Columns, ColumnRows }
 
-pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<QueryInput>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
+pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, result_arrow: Option<ResultArrowSchema>, input: Option<QueryInput>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
 impl QueryCursor {
     /// The caller reserves before allocating rows; the reservation must cover their complete retained capacities.
     /// The returned cursor owns the rows and a child cancellation scope; its parent context stays usable after cancellation.
@@ -705,7 +709,7 @@ impl QueryCursor {
     fn from_report_rows(schema: &Schema, input: ReportRows, context: Arc<QueryContext>, sample: Option<ExecutionSample>) -> Result<Self> {
         let runtime_schema = RuntimeSchema::fixed(schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows { input, offset: 0 }), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, result_arrow: None, input: Some(QueryInput::Rows { input, offset: 0 }), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
     pub fn context(&self) -> &Arc<QueryContext> { &self.context }
@@ -735,7 +739,7 @@ impl QueryCursor {
     }
 
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
-        self.next_batch_with(&mut column_batch).await
+        self.next_batch_with(&mut cached_column_batch).await
     }
 
     #[doc(hidden)]
@@ -748,15 +752,13 @@ impl QueryCursor {
         }
         let runtime = Arc::clone(&self.runtime_schema);
         let mut fallback = None;
-        let batch = self.next_batch_with(&mut |schema, memory, input| {
-            let indices = 0..schema.len();
+        let batch = self.next_batch_with(&mut |schema, arrow, memory, input| {
             let bytes = schema.len().checked_mul(std::mem::size_of::<(usize, P)>()).and_then(|bytes| bytes.checked_add(512));
             let Some(charge) = bytes.and_then(|bytes| memory.reserve(bytes).ok()) else {
-                return column_batch(schema, memory, input);
+                return cached_column_batch(schema, arrow, memory, input);
             };
-            let fields = output_fields(schema, &input, indices.clone())?;
             let mut replacements = Vec::with_capacity(schema.len());
-            for (index, field) in fields.iter().enumerate() {
+            for (index, field) in arrow.schema.fields().iter().enumerate() {
                 let cells = SpatialProbeCells { column: &input.columns[index], logical: &schema.fields()[index].data_type };
                 if let Some(plan) = plan(field, cells, memory) {
                     replacements.push((index, plan));
@@ -764,14 +766,17 @@ impl QueryCursor {
             }
             if replacements.is_empty() {
                 drop(charge);
-                return emit_columns(schema, memory, &input, indices.map(|index| (index, index)), fields, |_| false, false);
+                return cached_column_batch(schema, arrow, memory, input);
             }
             let skip = |index| replacements.binary_search_by_key(&index, |(index, _)| *index).is_ok();
-            let output = match emit_columns(schema, memory, &input, indices.map(|index| (index, index)), fields, skip, false) {
+            let output = match (|| {
+                let deferred = ResultArrowSchema::new(schema, 0..schema.len(), &skip, memory)?;
+                emit_columns(schema, &deferred, memory, &input, (0..schema.len()).map(|index| (index, index)), &skip, false)
+            })() {
                 Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
                     drop(replacements);
                     drop(charge);
-                    return column_batch(schema, memory, input);
+                    return cached_column_batch(schema, arrow, memory, input);
                 }
                 result => result?,
             };
@@ -784,7 +789,7 @@ impl QueryCursor {
     }
 
     async fn next_batch_with(&mut self, emit: &mut EmitColumns<'_>) -> Result<Option<OwnedBatch>> {
-        if let Err(error) = self.context.check_cancelled() { self.input = None; self.record_error(); return Err(error); }
+        if let Err(error) = self.context.check_cancelled() { self.release_input(); self.record_error(); return Err(error); }
         let token = self.context.cancellation.clone();
         let owner = self.context.owner_cancellation.clone();
         if let Some(trace) = &mut self.trace { trace.start(); }
@@ -812,16 +817,20 @@ impl QueryCursor {
             Ok(batch)
         });
         match result {
-            Ok(batch) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
-            Err(error) => { self.input = None; self.record_error(); Err(error) }
+            Ok(batch) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.release_input(); } Ok(batch) }
+            Err(error) => { self.release_input(); self.record_error(); Err(error) }
         }
     }
     fn record_error(&self) { if let Some(observer) = &self.context.execution_observer { observer.record_error(ExecutionError::Query); } }
     /// Records an error while consuming a returned batch, such as row encoding or transport writing.
     /// Do not call this for `next_batch` failures, which the cursor already records.
     pub fn record_consumer_error(&self) { self.record_error(); }
-    fn finish_trace(&mut self) {
+    fn release_input(&mut self) {
         self.input = None;
+        self.result_arrow = None;
+    }
+    fn finish_trace(&mut self) {
+        self.release_input();
         self.trace = None;
         self.query_span = None;
     }
@@ -838,12 +847,22 @@ impl QueryCursor {
             QueryInput::ColumnPages(input) => {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 batch.validate_readable(&self.context)?;
-                return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some);
+                let schema = self.runtime_schema.schema();
+                check_output_width(schema, &batch)?;
+                let arrow = ResultArrowSchema::cached(&mut self.result_arrow, schema, &self.context.memory)?;
+                return cached_column_batch(schema, arrow, &self.context.memory, batch).map(Some);
             }
-            QueryInput::Columns(output) => return output.next(self.runtime_schema.schema(), &self.context.memory, emit).await,
+            QueryInput::Columns(output) => {
+                return output.next(self.runtime_schema.schema(), &mut self.result_arrow, &self.context.memory, emit).await;
+            }
             QueryInput::Ordered(input) => loop {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
-                if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }
+                if batch.len != 0 {
+                    let schema = self.runtime_schema.schema();
+                    check_output_width(schema, &batch)?;
+                    let arrow = ResultArrowSchema::cached(&mut self.result_arrow, schema, &self.context.memory)?;
+                    return cached_column_batch(schema, arrow, &self.context.memory, batch).map(Some);
+                }
             },
             QueryInput::Rows { input, offset } => {
                 let limit = self.context.options.batch_rows;
@@ -866,7 +885,7 @@ impl QueryCursor {
             bound = bound.checked_add(estimate_builder_bytes_refs(&field.data_type, rows.iter().map(|row| &row[column]))?).ok_or_else(|| invalid("batch-size", "Output batch allocation bound overflow"))?;
         }
         let reservation = self.context.memory.reserve(bound)?;
-        let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
+        let arrow = ResultArrowSchema::cached(&mut self.result_arrow, schema, &self.context.memory)?;
         let arrays: Vec<ArrayRef> = schema.fields().iter().enumerate().map(|(column, field)| {
             copy_array_refs(&field.data_type, &rows.iter().map(|row| &row[column]).collect::<Vec<_>>())
         }).collect::<Result<_>>()?;
@@ -875,73 +894,124 @@ impl QueryCursor {
             rows.by_ref().take(count).for_each(drop);
         }
         let options = RecordBatchOptions::new().with_row_count(Some(count));
-        let batch = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
-        OwnedBatch::with_reservation(batch, reservation).map(Some)
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&arrow.schema), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
+        Ok(Some(OwnedBatch::with_reservation(batch, reservation)?.with_schema_reservation(Arc::clone(&arrow.reservation))))
     }
 }
 
-/// Aligns a column page with the result schema, retaining matching Arrow arrays.
-pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
-    let indices = 0..schema.len();
-    let fields = output_fields(schema, &batch, indices.clone())?;
-    emit_columns(schema, memory, &batch, indices.map(|index| (index, index)), fields, |_| false, false)
+struct ResultArrowSchema {
+    schema: SchemaRef,
+    reservation: Arc<MemoryReservation>,
 }
 
-fn output_fields(schema: &Schema, batch: &crate::columnar::ColumnBatch, indices: impl Iterator<Item = usize>) -> Result<Vec<ArrowField>> {
+impl ResultArrowSchema {
+    fn new(
+        logical: &Schema, indices: impl Iterator<Item = usize> + Clone, defer: &impl Fn(usize) -> bool,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let overflow = || invalid("batch-size", "Output schema allocation bound overflow");
+        let bound = indices.clone().try_fold(256usize, |bytes, index| {
+            let field = &logical.fields()[index];
+            let ty = if defer(index) { 0 } else { field.data_type.retained_bytes()? };
+            ty.checked_add(field.name.len()).and_then(|size| size.checked_mul(8))
+                .and_then(|size| size.checked_add(1024))
+                .and_then(|size| size.checked_add(bytes)).ok_or_else(overflow)
+        })?;
+        let mut reservation = memory.reserve(bound)?;
+        let fields = indices.map(|index| {
+            let field = &logical.fields()[index];
+            if defer(index) { Ok(ArrowField::new(&field.name, DataType::Null, true)) }
+            else { to_field(&field.name, &field.data_type) }
+        }).collect::<Result<Vec<_>>>()?;
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let bytes = schema.fields().iter().try_fold(256usize, |bytes, field| {
+            field.size().checked_add(32).and_then(|size| size.checked_add(bytes)).ok_or_else(overflow)
+        })?;
+        Arc::get_mut(&mut reservation).expect("Result schema construction owns its reservation").shrink_to(bytes)?;
+        Ok(Self { schema, reservation })
+    }
+
+    fn cached<'a>(
+        cache: &'a mut Option<Self>, logical: &Schema, memory: &Arc<MemoryBudget>,
+    ) -> Result<&'a Self> {
+        if cache.is_none() {
+            *cache = Some(Self::new(logical, 0..logical.len(), &|_| false, memory)?);
+        }
+        Ok(cache.as_ref().expect("Result schema is initialized"))
+    }
+}
+
+fn check_output_width(schema: &Schema, batch: &crate::columnar::ColumnBatch) -> Result<()> {
     if batch.columns.len() != schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
-    indices.map(|index| {
-        let field = &schema.fields()[index];
-        to_field(&field.name, &field.data_type)
-    }).collect()
+    Ok(())
+}
+
+pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
+    check_output_width(schema, &batch)?;
+    let arrow = ResultArrowSchema::new(schema, 0..schema.len(), &|_| false, memory)?;
+    cached_column_batch(schema, &arrow, memory, batch)
+}
+
+fn cached_column_batch(
+    schema: &Schema, arrow: &ResultArrowSchema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch,
+) -> Result<OwnedBatch> {
+    emit_columns(schema, arrow, memory, &batch, (0..schema.len()).map(|index| (index, index)), &|_| false, false)
 }
 
 fn emit_columns(
-    schema: &Schema, memory: &Arc<MemoryBudget>, batch: &crate::columnar::ColumnBatch,
-    indices: impl Iterator<Item = (usize, usize)> + Clone, mut fields: Vec<ArrowField>,
-    defer: impl Fn(usize) -> bool, selected_probe: bool,
+    schema: &Schema, arrow: &ResultArrowSchema, memory: &Arc<MemoryBudget>, batch: &crate::columnar::ColumnBatch,
+    indices: impl Iterator<Item = (usize, usize)>, defer: &impl Fn(usize) -> bool, selected_probe: bool,
 ) -> Result<OwnedBatch> {
+    use crate::columnar::Column;
+
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
-    let kept: Vec<Option<ArrayRef>> = indices.clone().zip(&mut fields).map(|((index, source), arrow)| {
-        if defer(index) {
-            *arrow = ArrowField::new(arrow.name(), DataType::Null, true);
-            Some(Arc::new(NullArray::new(batch.len)) as ArrayRef)
-        } else {
-            crate::columnar::conform(&batch.columns[source], &schema.fields()[index].data_type, arrow)
-        }
-    }).collect();
-    let kept_bytes = kept.iter().flatten().try_fold(4096usize, |bytes, array| bytes.checked_add(array.get_array_memory_size()).ok_or_else(overflow))?;
-    let mut reservation = memory.reserve(kept_bytes)?;
-    let mut arrays = Vec::with_capacity(kept.len());
-    for ((kept, (index, source)), arrow) in kept.into_iter().zip(indices).zip(&fields) {
-        if let Some(array) = kept { arrays.push(array); continue; }
+    let fields = arrow.schema.fields();
+    let bytes = fields.len().checked_mul(std::mem::size_of::<ArrayRef>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<OwnedBatch>() + 256)).ok_or_else(overflow)?;
+    let mut reservation = memory.reserve(bytes)?;
+    let page = Arc::get_mut(&mut reservation).expect("Output batch construction owns its reservation");
+    let mut arrays = Vec::with_capacity(fields.len());
+    for ((index, source), field) in indices.zip(fields) {
         let column = &batch.columns[source];
-        let field = &schema.fields()[index];
-        let relayout = if selected_probe {
-            crate::columnar::relayout_spatial_probe_output(column, &field.data_type, arrow, memory)
+        let logical = &schema.fields()[index].data_type;
+        let layout = field.as_ref();
+        let (array, scratch, funding) = if defer(index) {
+            let scratch = memory.reserve(256)?;
+            (Arc::new(NullArray::new(batch.len)) as ArrayRef, scratch, ResultArrayFunding::Copy)
         } else {
-            crate::columnar::relayout_output(column, &field.data_type, arrow, memory)
+            if let Column::Arrow { logical: Some(_), .. } = column {
+                let bound = layout.size().checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
+                let scratch = memory.reserve(bound)?;
+                if let Some(array) = crate::columnar::conform(column, logical, layout) {
+                    let funding = ResultArrayFunding::Shared(batch.column_reservation(source));
+                    arrays.push(retain_result_array(array, scratch, funding, page, &arrow.reservation)?);
+                    continue;
+                }
+            }
+            let relayout = if selected_probe {
+                crate::columnar::relayout_spatial_probe_output(column, logical, layout, memory)
+            } else {
+                crate::columnar::relayout_output(column, logical, layout, memory)
+            };
+            if let Some((array, scratch)) = relayout? {
+                let funding = match column {
+                    Column::Arrow { array, .. } => ResultArrayFunding::Relayout(array, batch.column_reservation(source)),
+                    _ => ResultArrayFunding::Copy,
+                };
+                (array, scratch, funding)
+            } else if let Some((array, scratch)) = crate::columnar::float_vector::relayout(column, batch.len, layout, memory)? {
+                (array, scratch, ResultArrayFunding::Copy)
+            } else {
+                let (array, scratch) = rtdb_columnar::copy_evaluated_cells(logical, batch.len, memory,
+                    |row| column.bound(row), |row| column.value(row))?;
+                (array, scratch, ResultArrayFunding::Copy)
+            }
         };
-        if let Some((array, _scratch)) = relayout? {
-            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("batch-size", "An output batch's charge is shared"))?;
-            lease.grow_to(lease.bytes().checked_add(array.get_array_memory_size()).ok_or_else(overflow)?)?;
-            arrays.push(array);
-            continue;
-        }
-        if let Some((array, mut charge)) = crate::columnar::float_vector::relayout(column, batch.len, arrow, memory)? {
-            let lease = Arc::get_mut(&mut reservation).expect("An output batch owns its reservation");
-            lease.absorb(Arc::get_mut(&mut charge).expect("A gathered vector owns its reservation"))?;
-            arrays.push(array);
-            continue;
-        }
-        let (array, _scratch) = rtdb_columnar::copy_evaluated_cells(&field.data_type, batch.len, memory,
-            |row| column.bound(row), |row| column.value(row))?;
-        let lease = Arc::get_mut(&mut reservation).expect("An output batch owns its reservation");
-        lease.grow_to(lease.bytes().checked_add(array.get_array_memory_size()).ok_or_else(overflow)?)?;
-        arrays.push(array);
+        arrays.push(retain_result_array(array, scratch, funding, page, &arrow.reservation)?);
     }
     let options = RecordBatchOptions::new().with_row_count(Some(batch.len));
-    let output = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
-    OwnedBatch::with_reservation(output, reservation)
+    let output = RecordBatch::try_new_with_options(Arc::clone(&arrow.schema), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
+    Ok(OwnedBatch::with_funded_columns(output, reservation).with_schema_reservation(Arc::clone(&arrow.reservation)))
 }
 
 #[doc(hidden)]
@@ -1009,12 +1079,13 @@ impl<P> SpatialProbeFallback<P> {
     /// The row positions address the returned page directly when the second value is true.
     pub fn project_rows(&self, indices: &[usize], rows: &[usize], memory: &Arc<MemoryBudget>) -> Result<(OwnedBatch, bool)> {
         let schema = self.runtime.schema();
-        let fields = output_fields(schema, &self.input, indices.iter().copied())?;
+        check_output_width(schema, &self.input)?;
+        let arrow = ResultArrowSchema::new(schema, indices.iter().copied(), &|_| false, memory)?;
         let original = indices.iter().copied().map(|index| (index, index));
         if rows.iter().copied().eq(0..self.input.len) {
-            return emit_columns(schema, memory, &self.input, original, fields, |_| false, false).map(|page| (page, true));
+            return emit_columns(schema, &arrow, memory, &self.input, original, &|_| false, false).map(|page| (page, true));
         }
-        let can_select = indices.iter().zip(&fields).all(|(&index, field)| {
+        let can_select = indices.iter().zip(arrow.schema.fields()).all(|(&index, field)| {
             if self.plan(index).is_some() {
                 return true;
             }
@@ -1024,13 +1095,13 @@ impl<P> SpatialProbeFallback<P> {
                     .layouts().is_some()
         });
         if !can_select {
-            return emit_columns(schema, memory, &self.input, original, fields, |_| false, false).map(|page| (page, false));
+            return emit_columns(schema, &arrow, memory, &self.input, original, &|_| false, false).map(|page| (page, false));
         }
         let _positions = memory.reserve(size_of_val(rows) * 2)?;
         let picks = rows.iter().map(|&row| (0, row)).collect::<Vec<_>>();
         let selected = crate::columnar::ColumnBatch::take_rows_with_custody(&[&self.input], &picks, indices, true, memory)?;
         let selected_indices = indices.iter().copied().zip(0..indices.len());
-        emit_columns(schema, memory, &selected, selected_indices, fields, |_| false, true).map(|page| (page, true))
+        emit_columns(schema, &arrow, memory, &selected, selected_indices, &|_| false, true).map(|page| (page, true))
     }
 }
 enum ReportRows {
@@ -1043,6 +1114,105 @@ impl Drop for QueryCursor { fn drop(&mut self) { self.context.cancellation.cance
 mod tests {
     use super::*;
     use rtdb_columnar::copy_array;
+
+    #[test]
+    fn result_arrays_keep_their_projected_source_grants() -> Result<()> {
+        use arrow_array::{Int64Array, ListArray};
+        use arrow_buffer::OffsetBuffer;
+        use crate::columnar::{Column, ColumnBatch};
+
+        let memory = MemoryBudget::new(220 * 1024);
+        let rows = 8192;
+        let integer = LogicalType::Scalar(ScalarType::I64);
+        let list = LogicalType::list(integer.clone());
+        let scalar_field = Arc::new(to_field("scalar", &integer)?);
+        let list_field = Arc::new(to_field("list", &list)?);
+        let DataType::List(item) = list_field.data_type() else { unreachable!(); };
+        let scalar = Int64Array::from(vec![11; rows]);
+        let child = Int64Array::from(vec![23; rows]);
+        let scalar_address = scalar.values().as_ptr();
+        let child_address = child.values().as_ptr();
+        let nested = ListArray::try_new(Arc::clone(item), OffsetBuffer::from_lengths(std::iter::repeat_n(1, rows)),
+            Arc::new(child), None).unwrap();
+        let scalar = Column::Arrow { array: Arc::new(scalar), field: scalar_field, logical: Some(integer.clone()) };
+        let mut input = ColumnBatch::settled(vec![scalar], rows, memory.reserve(80 * 1024)?)?;
+        let nested = Column::Arrow { array: Arc::new(nested), field: list_field, logical: Some(list.clone()) };
+        input.append_column(nested, memory.reserve(112 * 1024)?, &memory)?;
+        let scalar_charge = Arc::downgrade(input.column_reservation(0));
+        let list_charge = Arc::downgrade(input.column_reservation(1));
+        let projected = input.duplicate_for_replay(&memory)?;
+        drop(input);
+
+        let schema = Schema::new([("scalar", integer), ("list", list)].into_iter().enumerate().map(|(index, (name, data_type))| {
+            rtdb_plan::Field { id: rtdb_plan::ColumnId(index as u32), name: name.into(), qualifier: None,
+                qualified_only: false, unnamed: false, data_type }
+        }).collect())?;
+        let output = column_batch(&schema, &memory, projected)?;
+        let scalar = Arc::clone(output.batch().column(0));
+        let list = output.batch().column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        let child = Arc::clone(list.values());
+        drop(output);
+        assert!(scalar_charge.upgrade().is_some());
+        assert!(list_charge.upgrade().is_some());
+        let values = |array: &ArrayRef| array.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
+        assert_eq!(values(&scalar), scalar_address);
+        assert_eq!(values(&child), child_address);
+        drop(scalar);
+        assert!(scalar_charge.upgrade().is_none());
+        assert!(list_charge.upgrade().is_some());
+        drop(child);
+        assert!(list_charge.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn columns_and_ordered_pages_share_a_funded_zero_field_schema() -> Result<()> {
+        use crate::columnar::{BatchCursor, ColumnBatch};
+        use std::collections::BTreeMap;
+        use rtdb_types::Timestamp;
+
+        struct Pages(std::vec::IntoIter<ColumnBatch>);
+        #[async_trait]
+        impl BatchCursor for Pages {
+            async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.next()) }
+        }
+
+        let memory = MemoryBudget::new(1 << 20);
+        let database = crate::DatabaseSnapshot {
+            partitions: Vec::new(),
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false)?;
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(10), "UTC", crate::QueryOptions::default(),
+            &tokio_util::sync::CancellationToken::new())?;
+        for ordered in [false, true] {
+            let runtime = RuntimeSchema::fixed(&Schema::new(vec![])?, &memory)?;
+            let pages = [2, 3].into_iter().map(|rows| ColumnBatch::settled(vec![], rows, memory.reserve(256)?))
+                .collect::<Result<Vec<_>>>()?;
+            let pages = Box::new(Pages(pages.into_iter()));
+            let input = if ordered { QueryInput::Ordered(pages) }
+                else { QueryInput::Columns(ColumnOutput { input: pages, limit: usize::MAX, pending: None }) };
+            let mut cursor = QueryCursor {
+                schema: Arc::clone(&runtime), runtime_schema: runtime, result_arrow: None, input: Some(input),
+                context: context.execution_child(), sample: None, trace: None, query_span: None, plan_reservation: None,
+            };
+            let first = cursor.next_batch().await?.unwrap();
+            let second = cursor.next_batch().await?.unwrap();
+            assert_eq!(first.batch().num_rows(), 2);
+            assert_eq!(second.batch().num_rows(), 3);
+            assert_eq!(first.batch().num_columns(), 0);
+            assert!(Arc::ptr_eq(first.batch().schema_ref(), second.batch().schema_ref()));
+            let charge = Arc::downgrade(&cursor.result_arrow.as_ref().unwrap().reservation);
+            let sliced = second.slice(1, 1)?;
+            drop((cursor, first, second));
+            assert!(charge.upgrade().is_some());
+            assert!(sliced.owns_schema());
+            drop(sliced);
+            assert!(charge.upgrade().is_none());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn spatial_probe_defers_covered_columns_and_keeps_uncovered_read_errors() -> Result<()> {
@@ -1075,7 +1245,7 @@ mod tests {
             let batch = crate::columnar::ColumnBatch::from_owned(OwnedBatch::new(batch, &memory)?)?;
             let input = crate::columnar::single_batch(Some(batch), Arc::clone(&context));
             Ok(QueryCursor {
-                schema: Arc::clone(&runtime), runtime_schema: Arc::clone(&runtime),
+                schema: Arc::clone(&runtime), runtime_schema: Arc::clone(&runtime), result_arrow: None,
                 input: Some(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None })),
                 context: context.execution_child(), sample: None, trace: None, query_span: None, plan_reservation: None,
             })
@@ -1123,9 +1293,11 @@ mod tests {
         let column = rtdb_columnar::copy_array(&source, &values).unwrap();
         let array = column.as_any().downcast_ref::<StructArray>().unwrap();
         let original = array.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
-        let input = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![to_field("v", &source).unwrap()])), vec![column]).unwrap();
-        let input = OwnedBatch::new(input, &memory).unwrap();
-        let input = crate::columnar::ColumnBatch::from_owned(input).unwrap();
+        let field = Arc::new(to_field("v", &source).unwrap());
+        let input = crate::columnar::ColumnBatch::settled(vec![crate::columnar::Column::Arrow {
+            array: column, field, logical: Some(source),
+        }], 1, memory.reserve(4096).unwrap()).unwrap();
+        let source_charge = Arc::downgrade(input.column_reservation(0));
         let schema = Schema::new(vec![rtdb_plan::Field {
             id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
             qualified_only: false, unnamed: false, data_type: target,
@@ -1133,13 +1305,23 @@ mod tests {
 
         let output = column_batch(&schema, &memory, input).unwrap();
 
-        let array = output.batch().column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+        let retained = Arc::clone(output.batch().column(0));
+        drop(output);
+        let array = retained.as_any().downcast_ref::<UnionArray>().unwrap();
         let DataType::Union(fields, _) = array.data_type() else { panic!("Expected the declared union"); };
         let (id, _) = fields.iter().find(|(_, field)| field.name() == "struct").unwrap();
         assert_eq!(array.type_id(0), id);
         let child = array.child(id).as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(child.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr(), original);
         assert!(child.column(1).is_null(0));
+        assert!(source_charge.upgrade().is_some());
+        let nulls = Arc::clone(child.column(1));
+        drop(retained);
+        assert!(source_charge.upgrade().is_none());
+        assert!(memory.used_bytes() > 0);
+        assert!(nulls.is_null(0));
+        drop(nulls);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
