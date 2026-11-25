@@ -1233,7 +1233,7 @@ mod custody_tests {
             id: journal_id.clone(), role: MemberRole::Logkeeper, address, control_address: None,
             availability_zone: "test".into(), engine_version: "test".into(), lease_expires_at_ms: now_ms() + 60_000,
             state: MemberState::Eligible, drain_target_engine: None, pool: Default::default(),
-            storage_namespaces: source.storage_namespaces, version: 0,
+            storage_namespaces: source.storage_namespaces, decommission: None, version: 0,
         }).await?;
         source.ensemble = vec![journal_id];
         let cancellation = CancellationToken::new();

@@ -1569,7 +1569,7 @@ mod tests {
         directory.register_member(MemberRecord {
             id: holder.clone(), role: MemberRole::Node, address: "node".into(), control_address: None,
             availability_zone: "zone".into(), engine_version: "engine".into(), lease_expires_at_ms: now_ms() + 60_000,
-            state: MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 0,
+            state: MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, version: 0,
         }).await?;
         let mut source = DeploymentRecord::new("tenant", "cell", vec![], now_ms());
         let authority: Uuid = source.id.parse().unwrap();

@@ -3907,7 +3907,7 @@ mod tests {
         let register = |id: &str, pool| rtdb_directory::MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
             availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: now_ms() + 60_000,
-            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, version: 0,
+            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, decommission: None, version: 0,
         };
         let mut holder = directory.register_member(register("holder", MemberPool::General)).await.unwrap();
         let worker = directory.register_member(register("compactor", MemberPool::Compaction)).await.unwrap();

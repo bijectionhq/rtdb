@@ -2605,7 +2605,7 @@ async fn controller_probes_can_progress_before_another_member_replies() {
         directory.register_member(MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Node, address: pgwire_address.clone(), control_address: Some(address.clone()),
             availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
         }).await.unwrap();
     }
     let answer = async {
@@ -2668,7 +2668,7 @@ async fn a_missed_serving_probe_counts_only_without_inspection_overflow() {
         id: MemberId("writer".into()), role: MemberRole::Node, address: address.to_string(),
         control_address: Some(control_address.to_string()), availability_zone: "local".into(),
         engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
     }).await.unwrap();
     let options = admin::ControllerOptions { control: common::control(), ..Default::default() };
     let mut failures = BTreeMap::new();
@@ -2700,7 +2700,7 @@ async fn the_controller_cannot_confirm_an_endpoint_changed_while_its_probe_is_pe
         id: MemberId("node".into()), role: MemberRole::Node, address: unreachable,
         control_address: Some(control.local_addr().unwrap().to_string()), availability_zone: "local".into(),
         engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
     }).await.unwrap();
     let id = member.id.clone();
     let replace_during_probe = async {
@@ -2733,7 +2733,7 @@ async fn the_controller_counts_failures_at_each_endpoint_independently() {
     let mut member = directory.register_member(MemberRecord {
         id: MemberId("node".into()), role: MemberRole::Node, address: address.clone(), control_address: Some(address),
         availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
     }).await.unwrap();
     let options = admin::ControllerOptions { suspicion_probes: 2, probe_timeout: Duration::from_millis(20), ..Default::default() };
     let mut failures = std::collections::BTreeMap::new();
@@ -3181,6 +3181,38 @@ async fn a_draining_logkeeper_keeps_its_lease_and_its_deployments_leave_it_at_th
     assert!(placement.reached_by(&moved.ensemble));
     assert_eq!(moved.journal_placement, None);
     drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_evacuated_logkeeper_is_decommissioned_only_once_no_deployment_retains_its_journal() {
+    let mut cell = Cell::start_durable(1).await;
+    cell.add_logkeeper().await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let leaving = cell.directory.deployment(&deployment.id).await.unwrap().unwrap().ensemble[0].clone();
+    admin::drain(cell.directory.as_ref(), &leaving).await.unwrap();
+    assert_eq!(admin::certify_logkeeper_decommissions(cell.directory.as_ref()).await.unwrap(), 0);
+    let refused = admin::decommission_logkeeper(cell.directory.as_ref(), &leaving).await.unwrap_err();
+    assert_eq!(refused.code, "rtdb.multi/decommission-uncertified");
+
+    assert_eq!(admin::balance_journals(cell.directory.as_ref(), 8).await.unwrap(), 1);
+    cell.node(0).agent.park("shop").await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    drop(client);
+    let moved = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(!moved.ensemble.contains(&leaving));
+    assert!(moved.replica_journals.iter().any(|journal| journal.journal() == Some(leaving.as_str())), "the evacuated journal keeps its copy custody");
+    assert_eq!(admin::certify_logkeeper_decommissions(cell.directory.as_ref()).await.unwrap(), 0);
+
+    admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    assert_eq!(admin::certify_logkeeper_decommissions(cell.directory.as_ref()).await.unwrap(), 1);
+    let retired = admin::decommission_logkeeper(cell.directory.as_ref(), &leaving).await.unwrap();
+    assert_eq!(retired.state, rtdb_directory::MemberState::Retired);
+    assert!(!retired.is_live(rtdb_directory::now_ms()));
     cell.stop().await;
 }
 

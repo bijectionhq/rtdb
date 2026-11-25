@@ -1119,6 +1119,8 @@ entity MemberRecord {
     lease_expires_at: Timestamp
     storage_namespaces: StorageNamespaces?
     state: MemberState
+    -- Logkeepers only: present once a draining journal is certified free of custody, and kept once it is decommissioned.
+    decommission: LogkeeperDecommission?
 
     transitions state {
         joining -> eligible      -- prewarmed and admitted by the controller
@@ -1131,6 +1133,7 @@ entity MemberRecord {
         -- A locked logkeeper journal may reacquire its member record and become eligible again.
         -- A draining logkeeper keeps serving its journal, renews over the drain, and reacquires its record as draining.
         -- The reaper leaves a draining logkeeper's record in place.
+        -- A decommissioned logkeeper is retired, and its journal identity never reacquires a lease.
     }
 
     -- Derived: what it may hold or serve.
@@ -1148,6 +1151,21 @@ value JournalPlacement {
     -- A durability-placement decision: the journals the deployment's next holder moves its log onto.
     operation: String
     destination: List<MemberId>
+}
+
+value DecommissionCertificate {
+    -- No deployment record retained custody of this journal when the directory was read.
+    journal: MemberId
+    address: String
+    -- A digest of every checked deployment's ID and version, with their count.
+    deployments_checked: String
+    certified_at: Timestamp
+}
+
+value LogkeeperDecommission {
+    certificate: DecommissionCertificate
+    -- Absent while only certified; set when the decommission retires the member.
+    decommissioned_at: Timestamp?
 }
 
 value StorageNamespaces {
@@ -2629,6 +2647,41 @@ rule BalanceJournals {
     ensures:
         for record in DeploymentsToRebalanceJournals(cell) limit config.journal_moves_per_pass:
             JournalPlacementRequested(record, BalancedDestination(record))
+}
+
+rule CertifyLogkeeperDecommission {
+    -- Each controller pass reads the deployment records once while any logkeeper is draining.
+    -- A record retains custody of a journal while any of its fields names the journal's identity or address, until its disposal receipt is recorded.
+    -- That covers its ensemble, a pending journal placement, copy custody, replica journals and staged transfer sources.
+    -- The certificate is written conditionally on the member record, and kept across lease renewals while the journal stays draining at the same address.
+    -- A later pass that finds a reference withdraws the certificate.
+    when: ControllerPass(cell)
+
+    ensures:
+        for member in cell.members where member.role = log_server and member.state = draining:
+            if not exists record in cell.deployments: RetainsCustody(record, member):
+                member.decommission = LogkeeperDecommission(certificate: DecommissionCertificate(journal: member.id), decommissioned_at: null)
+            else:
+                member.decommission = null
+}
+
+rule LogkeeperDecommissionRequiresNoCustody {
+    -- `rtdb-multi decommission-logkeeper` retires a logkeeper only under a certificate for its own identity and address, issued while it was draining.
+    -- It reads the deployment records again and refuses while any retains custody of the journal, so every journal a record references, including one a journal placement moved it off, stays a member until the record finishes disposal.
+    -- The retirement is conditional on the member still draining under the same certificate.
+    -- The process serving the journal loses its lease, after which the journal's storage may be destroyed.
+    -- No placement, ensemble repair or claim chooses a logkeeper that is not eligible.
+    when: LogkeeperDecommissionRequested(member)
+
+    requires: member.role = log_server
+    requires: member.state = draining
+    requires: member.decommission != null and member.decommission.decommissioned_at = null
+    requires: member.decommission.certificate.journal = member.id and member.decommission.certificate.address = member.address
+    requires: not exists record in Directory.deployments: RetainsCustody(record, member)
+
+    ensures:
+        member.state = retired
+        member.decommission.decommissioned_at = now
 }
 
 rule DrainMember {

@@ -375,7 +375,7 @@ mod tests {
         let member = |id: &str, expires, pool| MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
             availability_zone: "test".into(), engine_version: "test".into(), lease_expires_at_ms: expires,
-            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, version: 1,
+            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, decommission: None, version: 1,
         };
         let members: BTreeMap<_, _> = [
             member("node", 20, MemberPool::General),
@@ -422,7 +422,7 @@ mod tests {
         let member = |id: &str, address: &str, zone: &str| MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
             availability_zone: zone.into(), engine_version: "test".into(), lease_expires_at_ms: 100,
-            state: rtdb_directory::MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 1,
+            state: rtdb_directory::MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, version: 1,
         };
         let (a, alternative, b, c, reused) = (member("a", "a", "one"), member("a2", "a2", "one"),
             member("b", "b", "two"), member("c", "c", "three"), member("reused", "a", "one"));

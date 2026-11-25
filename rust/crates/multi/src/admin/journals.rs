@@ -183,7 +183,7 @@ mod tests {
         MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
             availability_zone: zone.into(), engine_version: "test".into(), lease_expires_at_ms: i64::MAX, state: MemberState::Eligible,
-            drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 0,
+            drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, version: 0,
         }
     }
 

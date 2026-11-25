@@ -59,6 +59,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
+       rtdb-multi decommission-logkeeper --directory DIR --member ID\n\
        rtdb-multi place-journals --directory DIR --name NAME --journals ID,ID,ID [--cell-secret FILE]\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
@@ -1238,6 +1239,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "drain" => {
             let directory = directory(arguments.required("directory")?).await?;
             admin::drain(directory.as_ref(), &rtdb_directory::MemberId(arguments.required("member")?.into())).await?;
+            Ok(())
+        }
+        "decommission-logkeeper" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let member = admin::decommission_logkeeper(directory.as_ref(), &rtdb_directory::MemberId(arguments.required("member")?.into())).await?;
+            println!("{}", serde_json::to_string_pretty(&member).expect("a member record serializes"));
             Ok(())
         }
         "list" => {

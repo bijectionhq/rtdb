@@ -178,7 +178,7 @@ impl World {
             self.slots[slot].generation += 1;
             let member = MemberId(format!("m{slot}.{generation}"));
             let record = MemberRecord { id: member.clone(), role: MemberRole::Node, address: String::new(), control_address: None, availability_zone: format!("az{slot}"),
-                engine_version: "0".into(), lease_expires_at_ms: self.now + LEASE, state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0 };
+                engine_version: "0".into(), lease_expires_at_ms: self.now + LEASE, state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0 };
             block_on(self.directory.register_member(record)).map_err(|error| error.to_string())?;
             let skew = self.rng.range(-CLOCK_SKEW, CLOCK_SKEW);
             self.slots[slot].process = Some(Process { id: self.next_process, member: member.clone(), writer: None, last_time: i64::MIN, skew });

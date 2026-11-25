@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Directory, MemberId, MemberRecord, MemberRole, MemberState, now_ms};
+use rtdb_directory::{Cas, Directory, LogkeeperDecommission, MemberId, MemberRecord, MemberRole, MemberState, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
@@ -39,7 +39,7 @@ impl Registration {
         MemberRecord {
             id, role: self.role, address: self.address, control_address: self.control_address,
             availability_zone: self.availability_zone, engine_version: self.engine_version,
-            lease_expires_at_ms: 0, state: MemberState::Eligible, drain_target_engine: None, pool: self.pool, storage_namespaces: self.storage_namespaces, version: 0,
+            lease_expires_at_ms: 0, state: MemberState::Eligible, drain_target_engine: None, pool: self.pool, storage_namespaces: self.storage_namespaces, decommission: None, version: 0,
         }
     }
 }
@@ -80,6 +80,10 @@ impl MemberLease {
                 let Some(previous) = previous else { return directory.register_member(candidate.clone()).await; };
                 if previous.role != MemberRole::Logkeeper || (stable_address && previous.address != candidate.address) {
                     return Err(conflict());
+                }
+                if matches!(previous.decommission, Some(LogkeeperDecommission::Decommissioned { .. })) {
+                    return Err(Anomaly::incorrect("rtdb.multi/logkeeper-decommissioned",
+                        format!("Logkeeper {} was decommissioned and cannot rejoin the cell", previous.id)));
                 }
                 if !previous.is_live(now) {
                     draining = previous.state == MemberState::Draining;

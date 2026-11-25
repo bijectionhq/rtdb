@@ -24,6 +24,8 @@ mod holder;
 pub use holder::{HolderObservation, observe_holder};
 pub(crate) use holder::observe_holder_record;
 mod holder_handoff;
+mod decommission;
+pub use decommission::{certify_logkeeper_decommissions, decommission_logkeeper};
 mod journals;
 pub use journals::{balance_journals, place_journals};
 
@@ -2629,6 +2631,7 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
                 if options.journal_moves > 0 {
                     let _ = balance_journals(directory.as_ref(), options.journal_moves).await;
                 }
+                let _ = certify_logkeeper_decommissions(directory.as_ref()).await;
             }
         }
     }
@@ -2784,7 +2787,7 @@ mod tests {
             id: MemberId::fresh(), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
             availability_zone: "local".into(), engine_version: String::new(), lease_expires_at_ms: i64::MAX,
             state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::default(),
-            storage_namespaces: None, version: 1,
+            storage_namespaces: None, decommission: None, version: 1,
         };
         let members = BTreeMap::from([(replacement.id.clone(), replacement)]);
         let directory = MemoryDirectory::new();

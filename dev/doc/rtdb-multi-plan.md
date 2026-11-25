@@ -26,7 +26,7 @@ Paths are relative to `rust/crates/` unless they start with another top-level di
 What runs on the `rtdb-multi` branch, stage by stage, and where it still departs from the spec.
 Update this section as work lands.
 
-`rtdb-multi` runs every cell process: `directory`, `cell-map`, `logkeeper`, `node`, `gateway`, `controller`, `reaper`, plus the administrative commands `create`, `list`, `status`, `drain`, `pin-engine`, `roll-engine`, `move`, `move-cell`, `read-width`, `unquarantine`, `fork`, `delete`, `deletion-key`, `verify-deletion`, `audit` and `audit-log`.
+`rtdb-multi` runs every cell process: `directory`, `cell-map`, `logkeeper`, `node`, `gateway`, `controller`, `reaper`, plus the administrative commands `create`, `list`, `status`, `drain`, `pin-engine`, `roll-engine`, `move`, `move-cell`, `read-width`, `unquarantine`, `decommission-logkeeper`, `fork`, `delete`, `deletion-key`, `verify-deletion`, `audit` and `audit-log`.
 `crates/multi/tests/cell.rs` drives an in-process cell (or two) through tokio-postgres; `tests/chaos.rs` runs a writer against a seeded sequence of faults and audits the history afterwards; `tests/footprint.rs` measures an idle deployment.
 
 | Stage | Built | Departures and gaps |
@@ -584,7 +584,11 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    `rtdb-multi controller --journal-balance MOVES` records up to that many placements per pass: off logkeepers drained with `rtdb-multi drain`, then from the busiest eligible logkeeper to one carrying at least two fewer deployments.
    The balancer never parks a holder, so a placement applies at the deployment's next park, move or failover.
    A drained logkeeper keeps its lease and its draining state across restarts.
-   It reads every deployment record on each pass; an indexed or paged scan remains open, as does the certified closure that would let an evacuated journal be decommissioned.
+   It reads every deployment record on each pass; an indexed or paged scan remains open.
+   Each controller pass certifies a draining logkeeper once no deployment record names its journal identity or address, until the record's disposal receipt is recorded, and withdraws the certificate if a later pass finds a reference.
+   `rtdb-multi decommission-logkeeper` checks the records again and retires a certified logkeeper for good: its process loses its lease, its journal identity can never register again, and its storage may then be destroyed.
+   A logkeeper still referenced, or never certified, is refused.
+   A journal placement leaves the evacuated journal in the deployment's copy custody, so the journal becomes eligible only once each deployment it ever served has finished disposal; releasing a live deployment's retained copy remains open.
 
    An installed ordered journal route supplies the node's exact worker enrollment and the gateway's read-only journal identity.
    On that route the journal owns nominations, the writer fence, append reconciliation, fresh read markers and checkpoint publication.
@@ -1288,6 +1292,10 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    Save the `replica_anchor` object on its own as the offline command’s `--prefix-report`, and use the extended digest as `--expect`.
    Install the new directory, logkeeper and node versions together before relying on continuous anchors.
 4. A staging cell holds ten million deployments (300 bytes each when parked) under Zipf activity.
+5. A keyed watch relay fans directory watches out by deployment, so that followers and gateways do not each watch the directory.
+   Build it when directory watch QPS or DynamoDB read cost crosses a threshold; tracked in #286, with `serve_relay` of eb32786b01 as a reference.
+6. A due-time maintenance index lets maintenance workers query the deployments whose `next_maintenance_at` is due, by shard, instead of scanning every record, and claim them through keyed claims (fa688ceaab).
+   Build it when the reaper's full scan becomes a measured cost; tracked in #287, with 9b8e90d5f8 and 31e5dbaf2e as references.
 
 **Local parked-density measurement**
 

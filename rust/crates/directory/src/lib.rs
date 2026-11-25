@@ -93,7 +93,35 @@ pub struct MemberRecord {
     pub pool: MemberPool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_namespaces: Option<StorageNamespaces>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decommission: Option<LogkeeperDecommission>,
     pub version: Version,
+}
+
+/// A draining logkeeper's way out of the cell, which only a certificate of no remaining custody opens.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum LogkeeperDecommission {
+    Certified(DecommissionCertificate),
+    /// Terminal: the journal identity never regains a lease.
+    Decommissioned { certificate: DecommissionCertificate, decommissioned_at_ms: i64 },
+}
+
+impl LogkeeperDecommission {
+    pub fn certificate(&self) -> &DecommissionCertificate {
+        match self { Self::Certified(certificate) | Self::Decommissioned { certificate, .. } => certificate }
+    }
+}
+
+/// Evidence that no deployment record retained custody of one logkeeper journal when it was checked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecommissionCertificate {
+    pub journal: MemberId,
+    pub address: String,
+    /// SHA-256 over every checked deployment's ID and version, in ID order.
+    pub deployments_sha256: [u8; 32],
+    pub deployments_checked: u64,
+    pub certified_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
