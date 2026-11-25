@@ -1132,6 +1132,47 @@ impl ColumnBatch {
         self.project_keys(positions, false, memory)
     }
 
+    pub(crate) fn membership_build_key(
+        &self, position: usize, memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let owner = self.column_reservation(position);
+        let (array, field, logical, owner, rows) = match &self.columns[position] {
+            Column::Arrow { array, field, logical } => (array, field, logical, owner, 0..self.len),
+            Column::Selected(selection) => {
+                let Some(((array, field, logical, custody), rows)) =
+                    selection.contiguous_source(0..self.len)
+                else {
+                    return self.project_keys(&[position], true, memory);
+                };
+                (array, field, logical, custody.as_ref().unwrap_or(owner), rows)
+            }
+            Column::Values(values) => {
+                let (column, reservation) = pack_evaluated_column(values, memory)?;
+                return Self::settled(vec![column], self.len, reservation);
+            }
+        };
+        let logical_bytes = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?;
+        let metadata = field.size().checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(logical_bytes))
+            .and_then(|bytes| bytes.checked_add(512))
+            .ok_or_else(size_error)?;
+        let reservation = memory.reserve(metadata)?;
+        let view = if rows == (0..array.len()) {
+            Arc::clone(array)
+        } else {
+            array.slice(rows.start, rows.len())
+        };
+        let visible = rtdb_columnar::visible_buffer_bytes(std::slice::from_ref(&view)).unwrap_or(0);
+        let backing = owner.bytes().max(array.get_buffer_memory_size());
+        let (array, custody) = if backing <= visible.saturating_mul(2).saturating_add(4096) {
+            (view, Arc::clone(owner))
+        } else {
+            compact_arrow_rows(array.as_ref(), field, rows, memory)?
+        };
+        let column = Column::Arrow { array, field: Arc::clone(field), logical: logical.clone() };
+        Ok(Self { columns: vec![column], len: self.len, reservation, appended: vec![custody] })
+    }
+
     pub(crate) fn compact_ranked_projection(&self, row: usize, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         const MAX_ROW_BYTES: usize = 64 * 1024;
         let base = positions.len().saturating_mul(std::mem::size_of::<Column>()).saturating_add(256);
@@ -1466,6 +1507,61 @@ fn dense_partition_keys_release_an_attached_page_reservation() {
     drop(input);
     assert!(memory.used_bytes() < 64 * 1024);
     assert_eq!(keys.columns[0].value(0).unwrap(), Value::I64(20));
+}
+
+#[test]
+fn membership_build_key_reuses_an_independently_funded_column() {
+    let memory = MemoryBudget::new(1 << 20);
+    let mut source = ColumnBatch::settled(vec![Column::Values(vec![Value::I64(42); 2])], 2, memory.reserve(0).unwrap()).unwrap();
+    let array: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(10), None]));
+    let field = Arc::new(ArrowField::new("key", DataType::Int64, true));
+    let logical = LogicalType::Scalar(ScalarType::I64).maybe();
+    source.append_column(Column::Arrow { array: Arc::clone(&array), field, logical: Some(logical) },
+        memory.reserve(1024).unwrap(), &memory).unwrap();
+    let owner = Arc::downgrade(source.column_reservation(1));
+    let key = source.membership_build_key(1, &memory).unwrap();
+    drop(source);
+    let [Column::Arrow { array: retained, .. }] = key.columns.as_slice() else {
+        panic!("Expected one direct Arrow key");
+    };
+    assert!(Arc::ptr_eq(retained, &array));
+    assert!(owner.upgrade().is_some());
+    drop((key, array));
+    assert!(owner.upgrade().is_none());
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn membership_build_key_detaches_wide_backing_and_keeps_nullable_date64() {
+    use arrow_array::{Date64Array, RecordBatch, StringArray};
+    use arrow_schema::Schema;
+
+    let memory = MemoryBudget::new(3 << 20);
+    let date = LogicalType::Scalar(ScalarType::DateMilli).maybe();
+    let schema = Arc::new(Schema::new(vec![
+        ArrowField::new("payload", DataType::Utf8, false),
+        rtdb_columnar::to_field("key", &date).unwrap(),
+    ]));
+    let record = RecordBatch::try_new(schema, vec![
+        Arc::new(StringArray::from(vec!["x".repeat(1 << 20), String::new()])),
+        Arc::new(Date64Array::from(vec![Some(86_400_000), None])),
+    ]).unwrap();
+    let source = rtdb_columnar::OwnedBatch::new(record, &memory).unwrap();
+    let owner = Arc::downgrade(source.reservation());
+    let batch = ColumnBatch::from_owned(source).unwrap();
+    let key = batch.membership_build_key(1, &memory).unwrap();
+    drop(batch);
+    assert!(owner.upgrade().is_none());
+    let [Column::Arrow { array, logical, .. }] = key.columns.as_slice() else {
+        panic!("Expected one direct Arrow key");
+    };
+    assert_eq!(array.data_type(), &DataType::Date64);
+    assert_eq!(logical.as_ref(), Some(&date));
+    assert_eq!(key.columns[0].value(0).unwrap(), Value::DateMilli(86_400_000));
+    assert_eq!(key.columns[0].value(1).unwrap(), Value::Null);
+    assert!(memory.used_bytes() < 64 * 1024);
+    drop(key);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]

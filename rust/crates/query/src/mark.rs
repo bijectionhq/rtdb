@@ -103,13 +103,8 @@ impl BatchMembership {
                 context.check_cancelled_at(row)?;
                 self.facts.null |= Self::is_null(&batch.columns[build_key], row, context)?;
             }
-            let key = {
-                let bytes = batch.len.checked_mul(std::mem::size_of::<(usize, usize)>()).ok_or_else(mark_size)?;
-                let _rows = memory.reserve(bytes)?;
-                let rows = (0..batch.len).map(|row| (0, row)).collect::<Vec<_>>();
-                let key = ColumnBatch::take_rows_with_custody(&[&batch], &rows, &[build_key], true, memory)?;
-                key.compact_group_keys(&rows, memory)?
-            };
+            let key = batch.membership_build_key(build_key, memory)?;
+            drop(batch);
             if !self.spill {
                 index.build(key, projected, context)?;
                 continue;
@@ -152,14 +147,14 @@ impl BatchMembership {
     fn mark_batch(&self, mut batch: ColumnBatch, index: &mut BatchKeyIndex, projected: bool) -> Result<ColumnBatch> {
         let context = &self.execution.context;
         let memory = &context.memory;
-        let key = batch.key_projection(&[self.keys.0], memory)?;
+        let probe_key = self.keys.0;
         let bytes = batch.len.checked_add(256).ok_or_else(mark_size)?;
         let reservation = memory.reserve(bytes)?;
         let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let null = Self::is_null(&key.columns[0], row, context)?;
-            if !null && index.matches(&key, row, projected, false, context)? {
+            let null = Self::is_null(&batch.columns[probe_key], row, context)?;
+            if !null && index.matches_column(&batch, probe_key, row, projected, context)? {
                 marks.append_value(true);
             } else if !self.facts.empty && (self.facts.null || null) {
                 marks.append_null();
@@ -167,7 +162,6 @@ impl BatchMembership {
                 marks.append_value(false);
             }
         }
-        drop(key);
         let logical = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
         let field = Arc::new(rtdb_columnar::to_field("mark", &logical)?);
         batch.append_column(Column::Arrow { array: Arc::new(marks.finish()), field, logical: Some(logical) }, reservation, memory)?;

@@ -468,6 +468,21 @@ impl BatchKeyIndex {
             .map(|found| found.is_some())
     }
 
+    pub(crate) fn matches_column(
+        &mut self,
+        batch: &ColumnBatch,
+        position: usize,
+        row: usize,
+        projected: bool,
+        context: &QueryContext,
+    ) -> Result<bool> {
+        let positions = [position];
+        let columns = KeyColumns::projection(batch, &positions);
+        let (hash, key) = Key::bind(columns, row, projected, context, self.hashing)?;
+        self.find(hash, &key, false, context)
+            .map(|found| found.is_some())
+    }
+
     fn find(
         &mut self,
         hash: u32,
