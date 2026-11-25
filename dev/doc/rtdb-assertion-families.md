@@ -338,8 +338,9 @@ Custody and erasure use the full physical selector.
 The installed writer uses the registered selector for both first publication and later backfill, and ordinary writes cannot replace an active landed carrier.
 This publication contract requires a fresh installation and supported retained cuts with no previous raw family derivative slots.
 A raw projection expresses ordinary protected custody and uses the existing corpus bounds.
-Before admitting an unshadowed decorated Root projection, the ranker requires absence of the raw projection and reads the payload carrier at `row/<AddressRef>` and the protected journal at `row-position/row/<AddressRef>` at the same held valid and system cut.
+Before admitting an unshadowed decorated Root projection, the ranker requires absence of the raw projection and reads the Binary address in `fact_protected_row_carriers` and the protected journal at `[1] || address` at the same held valid and system cut.
 The journal belongs to the installed base relation underlying the search relation.
+The journal uses `[0] || address` for removals. The `row/<address hex>` name identifies the durable erasure fence and the assertion-family World ciphertext slot. `ReadHeldRowCarrierExists.v2` checks the entire valid extent of the Binary carrier under the installed Original scope.
 The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
 The Root contributor uses the journal assertion ordinal.
 A decorated selector with a different carrier or with a visible raw alias refuses.

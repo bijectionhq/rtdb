@@ -4,17 +4,16 @@ use std::sync::Arc;
 
 use rtdb_columnar::{EntityIdRef, read_owned_entity_id};
 use rtdb_query::QueryContext;
-use rtdb_types::{EntityId, Interval, OwnedRelation, Result, SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp, Value};
+use rtdb_types::{EntityId, Interval, OwnedRelation, Result, ROOT_ROW_CARRIERS, RootRowCarrier, SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp, Value};
 
 use super::{occupancy_value_at, overflow, uncovered};
 
 pub(super) const PROTECTED_MEMBERSHIP: &str = "protected_membership";
 const FENCES: &str = "fact_unit_fences";
-const ROW_CARRIERS: &str = "fact_unit_column_payloads";
 const UNTIL: &str = "membership_until";
 
 pub(super) enum ProtectedProjection<'a> {
-    Rows(&'a str),
+    Rows(&'a [u8; 16]),
     SharedUnit { carriers: SharedColumnCarrierPrefix<'a>, fence: &'a str },
 }
 
@@ -26,11 +25,7 @@ impl<'a> ProtectedProjection<'a> {
     pub(super) fn decode(encoded: &'a [u8]) -> Result<Self> {
         let (&kind, encoded) = encoded.split_first().ok_or_else(uncovered)?;
         match kind {
-            0 => {
-                let image = std::str::from_utf8(encoded).map_err(|_| uncovered())?;
-                if image.len() != 32 || !lowercase_hex(image) { return Err(uncovered()); }
-                Ok(Self::Rows(image))
-            }
+            3 => Ok(Self::Rows(encoded.try_into().map_err(|_| uncovered())?)),
             2 => {
                 let (carriers, fence) = encoded.split_at_checked(SharedColumnCarrierPrefix::WIDTH).ok_or_else(uncovered)?;
                 let carriers = SharedColumnCarrierPrefix::parse(carriers).ok_or_else(uncovered)?;
@@ -46,21 +41,24 @@ impl<'a> ProtectedProjection<'a> {
         let fences = OwnedRelation::new(FENCES)?;
         match self {
             Self::Rows(table) => {
-                let carriers = OwnedRelation::new(ROW_CARRIERS)?;
-                let id_prefix = format!("row/0b{table}");
+                let carriers = OwnedRelation::new(ROOT_ROW_CARRIERS)?;
+                let id_prefix = RootRowCarrier::table_prefix(table);
                 let mut count = 0i64;
                 if let Some(mut cursor) = rtdb_query::open_owned_root_prefix_projection(
-                    Arc::clone(&context), owner, &carriers, ordered, &["_id"], EntityIdRef::String(&id_prefix),
+                    Arc::clone(&context), owner, &carriers, ordered, &["_id"], EntityIdRef::Binary(&id_prefix),
                 ).await? {
                     while let Some(batch) = cursor.next_batch().await? {
                         let rows = batch.batch();
+                        let (column, field) = rows.schema_ref().column_with_name("_id").ok_or_else(uncovered)?;
                         for row in 0..rows.num_rows() {
                             context.check_cancelled_at(row)?;
-                            let EntityId::String(id) = occupancy_value_at(&context.memory, rows, row, "_id", uncovered)?
-                                .entity_id()? else { return Err(uncovered()); };
-                            let position = row_membership_id(&id_prefix, &id)?;
-                            if !point_exists(&context, owner, &fences, &EntityId::String(id), ordered).await?
-                                && position_survives(&context, owner, journal, &EntityId::String(position), ordered).await?
+                            let EntityIdRef::Binary(id) = read_owned_entity_id(field, rows.column(column).as_ref(), row)
+                                .map_err(|_| uncovered())? else { return Err(uncovered()); };
+                            let carrier = RootRowCarrier::parse(id).filter(|_| id.starts_with(&id_prefix))
+                                .ok_or_else(uncovered)?;
+                            let _keys = context.memory.reserve(3 * id.len() + 256)?;
+                            if !point_exists(&context, owner, &fences, &EntityId::String(carrier.fence_name()), ordered).await?
+                                && position_survives(&context, owner, journal, &EntityId::Binary(carrier.assertion_key()), ordered).await?
                             {
                                 count = count.checked_add(1).ok_or_else(overflow)?;
                             }
@@ -92,13 +90,6 @@ impl<'a> ProtectedProjection<'a> {
             }
         }
     }
-}
-
-fn row_membership_id(table_prefix: &str, carrier: &str) -> Result<String> {
-    if !carrier.starts_with(table_prefix) {
-        return Err(uncovered());
-    }
-    Ok(format!("row-position/{carrier}"))
 }
 
 async fn point_exists(
@@ -196,7 +187,7 @@ mod tests {
         let options = SubmitOptions { user: Some(owner.into()), ..Default::default() };
         let state = PartitionState::empty(Default::default())?;
         let root = OwnedRelation::new(SHARED_COLUMN_CARRIERS)?;
-        let overlay = OwnedRelation::new(ROW_CARRIERS)?;
+        let overlay = OwnedRelation::new("fact_unit_column_payloads")?;
         let fence = "ab".repeat(32);
         let journal = OwnedRelation::new("fact_fixture")?;
         let key = |id, time| TransactionKey { tx_id: TxId(id), system_time: Timestamp(time) };
@@ -253,11 +244,13 @@ mod tests {
     }
 
     #[test]
-    fn sealed_membership_names_the_same_incarnation_as_the_carrier() -> Result<()> {
-        let prefix = "row/0b11111111111111111111111111111111";
-        let carrier = format!("{prefix}cafe");
-        assert_eq!(row_membership_id(prefix, &carrier)?, format!("row-position/{carrier}"));
-        assert!(row_membership_id("row/0b22222222222222222222222222222222", &carrier).is_err());
-        Ok(())
+    fn protected_row_membership_admits_only_the_raw_table_operand() {
+        let table = [17; 16];
+        let raw = [&[3][..], table.as_slice()].concat();
+        assert!(matches!(ProtectedProjection::decode(&raw), Ok(ProtectedProjection::Rows(id)) if id == &table));
+        assert!(ProtectedProjection::decode(&raw[..16]).is_err());
+        assert!(ProtectedProjection::decode(&[raw.as_slice(), &[0]].concat()).is_err());
+        let hex = "11".repeat(16);
+        assert!(ProtectedProjection::decode(&[&[0], hex.as_bytes()].concat()).is_err());
     }
 }

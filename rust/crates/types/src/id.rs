@@ -232,6 +232,84 @@ impl<'a> OwnedIdentityScan<'a> {
 }
 
 pub const SHARED_COLUMN_CARRIERS: &str = "fact_unit_shared_column_carriers";
+pub const ROOT_ROW_CARRIERS: &str = "fact_protected_row_carriers";
+
+/// The opaque ordered address used by the hosted protected Root row carrier.
+#[derive(Clone, Copy)]
+pub struct RootRowCarrier<'a>(&'a [u8]);
+
+impl<'a> RootRowCarrier<'a> {
+    const REFERENCE: u8 = 11;
+    const MARKER: [u8; 2] = [0, 255];
+    const END: [u8; 2] = [0, 1];
+    const MAX_IMAGE: usize = 17 + 2 * (3 + 4096 + 32 + 4096) + 2;
+
+    pub fn parse(image: &'a [u8]) -> Option<Self> {
+        let mut payload = image.get(17..)?.strip_suffix(&Self::END)?.strip_prefix(&Self::MARKER)?;
+        if image.len() > Self::MAX_IMAGE || image[0] != Self::REFERENCE { return None; }
+        let mut at = 1;
+        let mut partition = 0;
+        let mut incarnation = false;
+        while let Some((&byte, rest)) = payload.split_first() {
+            payload = if byte == 0 { rest.strip_prefix(&[255])? } else { rest };
+            if at <= 2 { partition = partition * 256 + usize::from(byte); }
+            else if (3 + partition..3 + partition + 32).contains(&at) { incarnation |= byte != 0; }
+            at += 1;
+        }
+        let width = at.checked_sub(3 + partition + 32)?;
+        (partition <= 4096 && incarnation && matches!(width, 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096))
+            .then_some(Self(image))
+    }
+
+    pub fn table_prefix(table: &[u8; 16]) -> [u8; 19] {
+        let mut prefix = [0; 19];
+        prefix[0] = Self::REFERENCE;
+        prefix[1..17].copy_from_slice(table);
+        prefix[17..].copy_from_slice(&Self::MARKER);
+        prefix
+    }
+
+    pub fn assertion_key(self) -> Vec<u8> { self.journal_key(1) }
+    pub fn retirement_key(self) -> Vec<u8> { self.journal_key(0) }
+
+    pub fn is_assertion_key(id: &'a [u8]) -> bool {
+        id.strip_prefix(&[1]).and_then(Self::parse).is_some()
+    }
+
+    fn journal_key(self, tag: u8) -> Vec<u8> {
+        let mut id = Vec::with_capacity(1 + self.0.len());
+        id.push(tag);
+        id.extend_from_slice(self.0);
+        id
+    }
+
+    /// The existing textual name of the durable custody control for this row.
+    pub fn fence_name(self) -> String {
+        use fmt::Write;
+        let mut id = String::with_capacity(4 + 2 * self.0.len());
+        id.push_str("row/");
+        for byte in self.0 { write!(&mut id, "{byte:02x}").expect("writing to a string"); }
+        id
+    }
+
+    /// Recover the ordered address bound by a named custody record.
+    pub fn decode_named_address(text: &str) -> Option<Vec<u8>> {
+        fn nibble(digit: u8) -> Option<u8> {
+            match digit {
+                b'0'..=b'9' => Some(digit - b'0'),
+                b'a'..=b'f' => Some(digit - b'a' + 10),
+                _ => None,
+            }
+        }
+        if text.len() > 2 * Self::MAX_IMAGE || text.len() % 2 != 0 { return None; }
+        let address: Vec<_> = text.as_bytes().chunks_exact(2)
+            .map(|digits| Some(16 * nibble(digits[0])? + nibble(digits[1])?))
+            .collect::<Option<_>>()?;
+        RootRowCarrier::parse(&address)?;
+        Some(address)
+    }
+}
+
 const SHARED_COLUMN_CARRIER_PREFIX_WIDTH: usize = 5 + 16 + 32 + 16 + 1 + 16 + 16 + 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -352,6 +430,7 @@ impl OwnedRelation {
     pub fn admits_world_ciphertext_points(&self, schema: &crate::OwnedSchema) -> bool {
         match self.name() {
             "fact_unit_column_payloads" => schema.has_only_opaque_column("sealed_payload"),
+            ROOT_ROW_CARRIERS => schema.is_opaque_root_carrier(),
             relation if relation.ends_with("_search") => schema.has_only_opaque_column("sealed_world_projection"),
             _ => false,
         }

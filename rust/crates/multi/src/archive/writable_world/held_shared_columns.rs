@@ -21,7 +21,7 @@ fn world_component(component: &str) -> bool {
 impl HeldCheckpointWorld {
     pub(super) fn shared_root_schema(&self, relation: &OwnedRelation) -> Result<&OwnedSchema> {
         self.open.record.schemas.relation(relation)
-            .filter(|schema| relation.name() == SHARED_COLUMN_CARRIERS && schema.is_shared_column_carrier())
+            .filter(|schema| relation.name() == SHARED_COLUMN_CARRIERS && schema.is_opaque_root_carrier())
             .ok_or_else(OwnedWorld::unavailable)
     }
 

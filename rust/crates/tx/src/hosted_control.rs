@@ -7,7 +7,7 @@ pub(crate) use retired_family::RetiredFamilyFence;
 
 use rtdb_types::{
     Anomaly, EntityId, Interval, OwnedPointVersion, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope,
-    Result, RootFamilyDerivativeId, StructFields, TableRef, TimeUnit, Timestamp, Value,
+    Result, ROOT_ROW_CARRIERS, RootFamilyDerivativeId, RootRowCarrier, StructFields, TableRef, TimeUnit, Timestamp, Value,
 };
 
 mod replay_worlds;
@@ -1546,7 +1546,8 @@ mod retained_release_tests {
         let pin = Iid([2; 16]);
         let admission = OwnedRelation::new("bj_fact_root_admission")?;
         let fences = OwnedRelation::new(rtdb_types::ASSERTION_FAMILY_FENCES)?;
-        let carrier = OwnedRelation::new("fact_unit_column_payloads")?;
+        let carrier = OwnedRelation::new(ROOT_ROW_CARRIERS)?;
+        let world_carrier = OwnedRelation::new(WORLD_ROW_CARRIER)?;
         let journal = OwnedRelation::new("fact_row")?;
         let search = OwnedRelation::new("fact_row_search")?;
         let local_search = search.in_world(world)?;
@@ -1562,35 +1563,44 @@ mod retained_release_tests {
             control(&format!("root_proposal_private_landing:{}", "b".repeat(64)), None)?,
             control(&format!("root_proposal_private_landing_proof:{}", "c".repeat(64)), None)?,
         ];
-        let mut root = row("row/0102");
+        let mut address = RootRowCarrier::table_prefix(&[17; 16]).to_vec();
+        address.extend_from_slice(&[0, 255, 0, 255]);
+        address.extend_from_slice(&[1; 64]);
+        address.extend_from_slice(&[0, 1]);
+        let key = RootRowCarrier::parse(&address).unwrap();
+        let fence = key.fence_name();
+        let address_name = fence.strip_prefix("row/").unwrap();
+        let assertion = key.assertion_key();
+        let mut root = StructFields::from([("_id".into(), Value::Binary(address.clone()))]);
         let mut body = b"BJRL1".to_vec();
         body.extend([1; 16]);
         body.extend([2; 40]);
         body.extend([3; 32]);
         root.insert("sealed_payload".into(), Value::Binary(body));
-        let selector = format!("bjrl1/{}/{}/0102", "01".repeat(16), "03".repeat(32));
+        let selector = format!("bjrl1/{}/{}/{address_name}", "01".repeat(16), "03".repeat(32));
         let source = rtdb_types::OwnedPointVersion {
             history: Timestamp(3),
             position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(2), ordinal: 1 },
         };
-        for (relation, source_id, target_id, document) in [
-            (&carrier, "row/0102", "row/0102", root),
-            (&journal, "row-position/row/0102", "row-position/row/0102", row("row-position/row/0102")),
-            (&search, "0102", selector.as_str(), row(&selector)),
+        for (relation, source_relation, source_id, target_id, document) in [
+            (&carrier, &world_carrier, EntityId::String(fence.clone()), EntityId::Binary(address), root),
+            (&journal, &journal, EntityId::Binary(assertion.clone()), EntityId::Binary(assertion.clone()),
+                StructFields::from([("_id".into(), Value::Binary(assertion))])),
+            (&search, &search, EntityId::String(address_name.into()), EntityId::String(selector.clone()), row(&selector)),
         ] {
-            let local = relation.in_world(world)?;
+            let local = source_relation.in_world(world)?;
             ops.extend([
-                TxOp::OwnedCheck { relation: relation.clone(), id: EntityId::String(target_id.into()),
+                TxOp::OwnedCheck { relation: relation.clone(), id: target_id,
                     valid_at: Timestamp(4), expected: None },
                 TxOp::OwnedInsertDocs { relation: relation.clone(), documents: crate::Documents::new(vec![document], &memory)?,
                     valid_from: None, valid_to: None },
                 TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-                TxOp::OwnedCheck { relation: local, id: EntityId::String(source_id.into()),
+                TxOp::OwnedCheck { relation: local, id: source_id,
                     valid_at: Timestamp(3), expected: Some(source) },
             ]);
         }
         ops.extend([
-            TxOp::OwnedCheck { relation: search, id: EntityId::String("0102".into()),
+            TxOp::OwnedCheck { relation: search, id: EntityId::String(address_name.into()),
                 valid_at: Timestamp(4), expected: None },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
@@ -1994,6 +2004,16 @@ impl<'a> OwnedDocumentRow<'a> {
         }
     }
 
+    pub(crate) fn binary_id(&self) -> Option<&'a [u8]> {
+        match *self {
+            Self::Values(row) => match row.get("_id") { Some(Value::Binary(id)) => Some(id), _ => None },
+            Self::Arrow(page, row) => match page.owned_id_ref(row).ok()? {
+                rtdb_columnar::EntityIdRef::Binary(id) => Some(id),
+                _ => None,
+            },
+        }
+    }
+
     fn only_id(&self) -> bool {
         match self {
             Self::Values(row) => row.len() == 1,
@@ -2371,7 +2391,7 @@ struct ProposalLandingKey<'a> {
     create_only: bool,
 }
 
-const ROOT_ROW_CARRIER: &str = "fact_unit_column_payloads";
+const WORLD_ROW_CARRIER: &str = "fact_unit_column_payloads";
 const ROOT_SEARCH_UNITS: &str = "fact_sealed_search_units";
 
 fn unique_landing_point<T>(mut points: impl Iterator<Item = T>) -> Option<T> {
@@ -2547,10 +2567,11 @@ pub(crate) fn hosted_proposal_land(
     let mut destinations = std::collections::BTreeSet::new();
     for op in operations {
         let Some(write) = owned_document_write(op) else { continue; };
-        if write.relation.is_root_data() && write.relation.name() == ROOT_ROW_CARRIER {
+        if write.relation.is_root_data() && write.relation.name() == ROOT_ROW_CARRIERS {
             if !protected { return None; }
             for row in write.documents.rows() {
-                let carrier_id = row.string_id()?;
+                let carrier_id = row.binary_id()?;
+                RootRowCarrier::parse(carrier_id)?;
                 let carrier = row.binary("sealed_payload", || Anomaly::incorrect(
                     "rtdb.owned/proposal-landing", "Invalid protected landing carrier",
                 )).ok()??;
@@ -2602,7 +2623,8 @@ pub(crate) fn hosted_proposal_land(
             }
         }
     }
-    let carrier_relation = OwnedRelation::new(ROOT_ROW_CARRIER).ok()?;
+    let carrier_relation = OwnedRelation::new(ROOT_ROW_CARRIERS).ok()?;
+    let world_carrier = OwnedRelation::new(WORLD_ROW_CARRIER).ok()?;
     for ProposalLandingKey { relation, id, extents, create_only } in writes.values() {
         let create_only = *create_only;
         let root_checked = extents.iter().all(|extent| operations.iter().any(|op| matches!(op,
@@ -2634,13 +2656,15 @@ pub(crate) fn hosted_proposal_land(
             {
                 return None;
             }
-            let carrier = format!("row/{}", selector.address);
-            if root_members.get(carrier.as_str()).copied() != Some((selector.family, selector.member.to_bytes())) {
+            let address = RootRowCarrier::decode_named_address(selector.address)?;
+            if root_members.get(address.as_slice()).copied() != Some((selector.family, selector.member.to_bytes())) {
                 return None;
             }
+            let row = RootRowCarrier::parse(&address)?;
             let raw = EntityId::String(selector.address.to_owned());
-            let position = EntityId::String(format!("row-position/{carrier}"));
-            let carrier = EntityId::String(carrier);
+            let position = EntityId::Binary(row.assertion_key());
+            let local_carrier = EntityId::String(row.fence_name());
+            let carrier = EntityId::Binary(address);
             let journal = OwnedRelation::new(relation.name().strip_suffix("_search")?).ok()?;
             for (reln, key) in [(&carrier_relation, &carrier), (&journal, &position)] {
                 let matching = writes.get(&(reln.name(), key.handle_bytes()))?;
@@ -2654,7 +2678,7 @@ pub(crate) fn hosted_proposal_land(
                 return None;
             }
             let (valid, source) = landing_local_point(operations, world, pin, relation, &raw)?;
-            for (reln, key) in [(&carrier_relation, &carrier), (&journal, &position)] {
+            for (reln, key) in [(&world_carrier, &local_carrier), (&journal, &position)] {
                 let (at, witness) = landing_local_point(operations, world, pin, reln, key)?;
                 if at != valid || witness.history != source.history
                     || witness.position.transaction != source.position.transaction
@@ -2665,11 +2689,18 @@ pub(crate) fn hosted_proposal_land(
             derived_relations.insert(relation.name());
             continue;
         }
-        let local = relation.in_world(world).ok()?;
+        let (local_relation, local_carrier) = if relation.name() == ROOT_ROW_CARRIERS {
+            let EntityId::Binary(address) = id else { return None; };
+            (&world_carrier, Some(EntityId::String(RootRowCarrier::parse(address)?.fence_name())))
+        } else {
+            (*relation, None)
+        };
+        let local = local_relation.in_world(world).ok()?;
+        let local_id = local_carrier.as_ref().unwrap_or(id);
         let local_checked = extents.iter().all(|extent| operations.windows(2).any(|pair| matches!(pair, [
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision) })
-        ] if guarded == &local && checked == &local && observed == id && *original == pin
+        ] if guarded == &local && checked == &local && observed == local_id && *original == pin
             && extent.is_none_or(|extent| {
                 extent.lower() == *valid_at && expected_clock.is_some_and(|tip| revision.history <= tip)
             }))));

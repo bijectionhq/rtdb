@@ -3,7 +3,7 @@ use std::{num::NonZeroU64, sync::Arc};
 use rtdb_columnar::{ArrowCell, EntityIdRef, OwnedBatch};
 use rtdb_query::{QueryContext, owned_row_revision, owned_row_revision_for, read_owned_point_revision};
 use rtdb_storage::sealing::{PlaintextView, RootRankSelection};
-use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, EntityId, Interval, OwnedRelation, Result, RootFamilyDerivativeId, RootLandingTarget, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, EntityId, Interval, OwnedRelation, Result, ROOT_ROW_CARRIERS, RootFamilyDerivativeId, RootLandingTarget, RootRowCarrier, Timestamp};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -56,8 +56,11 @@ impl<'a> RootProjectionId<'a> {
             return Err(unavailable());
         }
 
-        let carrier_relation = OwnedRelation::new("fact_unit_column_payloads")?;
-        let carrier = EntityId::String(format!("row/{}", landing.address));
+        let _keys = context.memory.reserve(landing.address.len() + 256)?;
+        let address = RootRowCarrier::decode_named_address(landing.address).ok_or_else(unavailable)?;
+        let journal_id = EntityId::Binary(RootRowCarrier::parse(&address).ok_or_else(unavailable)?.assertion_key());
+        let carrier_relation = OwnedRelation::new(ROOT_ROW_CARRIERS)?;
+        let carrier = EntityId::Binary(address);
         let page = point(context, owner, &carrier_relation, &carrier, valid).await?;
         let body = ArrowCell::named(page.batch(), "sealed_payload", 0)
             .and_then(ArrowCell::binary).ok_or_else(unavailable)?;
@@ -74,7 +77,6 @@ impl<'a> RootProjectionId<'a> {
         }
 
         let journal = OwnedRelation::new(relation.name().strip_suffix("_search").ok_or_else(unavailable)?)?;
-        let journal_id = EntityId::String(format!("row-position/row/{}", landing.address));
         let position = point(context, owner, &journal, &journal_id, valid).await?;
         ArrowCell::named(position.batch(), "membership_until", 0).and_then(ArrowCell::binary)
             .filter(|bytes| bytes.len() == size_of::<i64>()).ok_or_else(unavailable)?;

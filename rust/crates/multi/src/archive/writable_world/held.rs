@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use rtdb_flight_sql::FrozenWorldWinner;
-use rtdb_types::{OwnedIdentityScan, SharedColumnCarrierPrefix};
+use rtdb_types::{OwnedIdentityScan, ROOT_ROW_CARRIERS, RootRowCarrier, SharedColumnCarrierPrefix};
 use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedPathColumns, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
 use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
@@ -708,7 +708,7 @@ impl HeldCheckpointWorld {
             if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         }
         if let Some(ancestor) = self.open.record.ancestor()
-            && relations.iter().any(|relation| relation.name() == "fact_unit_column_payloads")
+            && relations.iter().any(|relation| matches!(relation.name(), "fact_unit_column_payloads" | ROOT_ROW_CARRIERS))
         {
             self.archived_accepted_clock(relations, ClockCut::Publication(ancestor.publication)).await?;
         }
@@ -731,7 +731,10 @@ impl HeldCheckpointWorld {
         if system > self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
-        let schema = if relation.name() == "fact_unit_column_payloads" {
+        let schema = if matches!(relation.name(), "fact_unit_column_payloads" | ROOT_ROW_CARRIERS) {
+            if relation.name() == ROOT_ROW_CARRIERS
+                && !matches!(id, EntityId::Binary(key) if RootRowCarrier::parse(key).is_some())
+            { return Err(OwnedWorld::unavailable()); }
             self.require_original_carrier_scope(&witness, original_scope).await?;
             if let Some(ancestor) = self.open.record.ancestor() {
                 self.archived_accepted_clock(std::slice::from_ref(relation), ClockCut::Publication(ancestor.publication)).await?;
@@ -874,12 +877,13 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
         system: Timestamp, original_scope: Option<PlacedAttemptScope>,
     ) -> Result<(Option<WorldFact>, bool, Option<FrozenWorldWinner>)> {
+        if relation.name() == ROOT_ROW_CARRIERS { return Err(OwnedWorld::unavailable()); }
         if self.uses_frozen_overlay(Some(system)) {
             let protected = relation.name() == "fact_unit_column_payloads";
             let schema = self.world_point_schema(relation)?;
             if protected && !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
             let prove_winner = protected || (original_scope.is_some() && schema.has_world_assertion_journal()
-                && matches!(id, EntityId::String(key) if key.starts_with("row-position/row/")));
+                && matches!(id, EntityId::Binary(key) if RootRowCarrier::is_assertion_key(key)));
             if prove_winner {
                 let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
                 self.require_original_carrier_scope(&witness, original_scope).await?;
@@ -1004,6 +1008,19 @@ impl HeldCheckpointWorld {
             let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
             self.require_original_carrier_scope(&witness, original_scope).await?;
             let schema = self.shared_root_schema(relation)?;
+            let fact = self.archive_point_checked(relation, id, valid_at, None, Some(schema)).await?;
+            self.check_parent_point(relation, None)?;
+            return Ok(WorldPoint { present: self.present(), fact, until: None, shadowed: false,
+                witness: observed.then_some(witness) });
+        }
+        if relation.name() == ROOT_ROW_CARRIERS {
+            let unavailable = OwnedWorld::unavailable;
+            if !matches!(id, EntityId::Binary(key) if RootRowCarrier::parse(key).is_some()) {
+                return Err(unavailable());
+            }
+            let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+            self.require_original_carrier_scope(&witness, original_scope).await?;
+            let schema = self.world_point_schema(relation)?;
             let fact = self.archive_point_checked(relation, id, valid_at, None, Some(schema)).await?;
             self.check_parent_point(relation, None)?;
             return Ok(WorldPoint { present: self.present(), fact, until: None, shadowed: false,
