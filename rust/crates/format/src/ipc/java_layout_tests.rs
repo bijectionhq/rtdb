@@ -1,6 +1,17 @@
-use std::io::{Read, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 
 use super::JavaLayout;
+
+#[derive(Default)]
+struct ShortWrites(Vec<u8>);
+
+impl Write for ShortWrites {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(&bytes[..bytes.len().min(13)])
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
 
 /// The reference's source-log tx-ops stream for `indexer-test`'s first transaction, as its Java writer produced it.
 const REFERENCE_TX_OPS: &[u8] = include_bytes!("java_layout_tx.ipc");
@@ -8,10 +19,12 @@ const REFERENCE_TX_OPS: &[u8] = include_bytes!("java_layout_tx.ipc");
 #[test]
 fn rewriting_the_reference_tx_ops_stream_reproduces_its_bytes() {
     for chunk in [1, 7, REFERENCE_TX_OPS.len()] {
-        let mut writer = JavaLayout::new(Vec::new());
+        let mut writer = JavaLayout::new_stream(ShortWrites::default());
         for piece in REFERENCE_TX_OPS.chunks(chunk) { writer.write_all(piece).unwrap(); }
-        assert_eq!(writer.inner.len(), REFERENCE_TX_OPS.len(), "chunk {chunk}");
-        assert!(writer.inner == REFERENCE_TX_OPS, "chunk {chunk}: first difference at {:?}", writer.inner.iter().zip(REFERENCE_TX_OPS).position(|(a, b)| a != b));
+        assert!(writer.footer.is_none());
+        let written = writer.inner.0;
+        assert_eq!(written.len(), REFERENCE_TX_OPS.len(), "chunk {chunk}");
+        assert!(written == REFERENCE_TX_OPS, "chunk {chunk}: first difference at {:?}", written.iter().zip(REFERENCE_TX_OPS).position(|(a, b)| a != b));
     }
 }
 
@@ -53,5 +66,10 @@ fn rewriting_reference_files_reproduces_their_bytes() {
         output.rewind().unwrap();
         output.read_to_end(&mut copied).unwrap();
         assert!(copied == bytes, "{name}: the incremental writer's file differs");
+
+        let mut sink = crate::ipc::JavaFile::new(ShortWrites::default(), file.schema().as_ref()).unwrap();
+        for page in &pages { sink.write(page).unwrap(); }
+        let written = sink.finish().unwrap().0;
+        assert!(written == bytes, "{name}: the short-writing sink's file differs");
     }
 }
