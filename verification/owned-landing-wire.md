@@ -103,3 +103,56 @@ The value mapping can be supplied by the shared native_columnar owner once its c
 RTDB can execute that same mapping over its checked inventory and build the ordered baseline.
 If the caller supplies promoted Arrow instead, RTDB still needs a receiver-executed equivalence check for every positioned cell against its original canonical bytes before staging the candidate.
 The current local subset and its source cases provide no correspondence evidence for the refused shapes.
+
+## Protected populated field successor
+
+Source review at RTDB `c79675ec6d` and Bijection `86601a3448b` found a missing custody and representation boundary for populated protected fields.
+The placed `adopt-relation` group names the predecessor, staged successor and retention.
+The resolver reads two exact population frontiers at one held cut and admits one virgin data and change-journal pair.
+For compacted history it authenticates the current data object versions and exact row counts and requires the same census as for L0, including the revision-zero journal floor.
+The replica checks the paired baseline, original position bounds and co-published Root controls, attempt marker and retirement.
+Its adoption marker carries the predecessor and activation transaction.
+[Flight control](../rust/crates/flight-sql/src/owned_actions.rs#L2056) · [Resolver census](../rust/crates/tx/src/resolver/relation_adoption.rs#L100) · [Replica publication](../rust/crates/tx/src/replica.rs#L273) · [Baseline bounds](../rust/crates/index/src/live.rs#L875)
+
+In Bijection, `world/fact_opening/schema_revision.rs` admits only clear Root layouts to the existing field successor.
+`CompiledLayout::stage` in `world/fact_opening.rs` supplies zero ordinary field columns when the table owns a protected row or shared-unit field.
+For a protected row, `fact_points/row_addresses/payloads.rs` packs the whole canonical row under row custody and writes it to `fact_protected_row_carriers` under its complete Binary address.
+The label partition instead receives a Binary assertion marker and membership cutoff, with a separate Binary retirement key.
+The live owner checks the current fence, pairs the exact carrier and assertion winners and opens the payload through the original unit reader.
+The shared-unit route binds a separate carrier to the exact member, ciphertext, unit, label and field generation, as implemented by `fact_points/membership/replay.rs` and `fact_store/src/facts/sealed.rs` in Bijection.
+RTDB requires the fixed carrier relations to use the opaque payload declaration and their respective complete Binary address formats.
+A complete census of the layout partition and its change journal can account for every assertion marker while supplying zero field values and zero custody authorizations.
+[Root carrier schema](../rust/crates/types/src/owned_schema.rs#L514) · [Root carrier admission](../rust/crates/tx/src/resolver.rs#L4147)
+
+Bijection's `recovery/owned_archive/catalog.rs` authenticates a protected carrier through the frozen Original transaction, event, layout and custody, and checks the original Binary assertion markers separately.
+RTDB's held Original replay accounts for the original assertion ordinals while its direct writes take the destination transaction and SQL history time.
+The ordinary protected rank replay additionally verifies the typed rank effects and exact indexed erase inventory.
+Landed and World rank transfers have a separate current Original custody gate for exact enrolled contributors.
+The rank digest and transfer authorization are scoped to those effects.
+Held replay refuses `OwnedAdoptRelation` at direct Original effect admission.
+The live clear successor mirrors erasure into the predecessor, and the existing Original replay refuses an adopted relation erase.
+[Archive replica checks](../rust/crates/tx/src/replica.rs#L327) · [Ordered position assignment](../rust/crates/index/src/live.rs#L1415) · [Rank erasures](../rust/crates/tx/src/resolver/replay_rank.rs#L29) · [Retired rank owner](../rust/crates/multi/src/process/owned_worlds/assertion_families/retired_world_rank.rs) · [Replay admission](../rust/crates/tx/src/resolver/hosted_control.rs#L662) · [Adopted erasure](../rust/crates/tx/src/resolver.rs#L2872)
+
+Start with one ordinary, directly unit-owned Root row partition in the same installation and one bounded field shape.
+Require uninterrupted original coverage, a live unit, stable label and address rules, and the absence of expiry, withdrawal, shared-unit routes, family stages, dependent Worlds, derivative paths and constraints at adoption.
+The Bijection layout and payload owners in `world/fact_opening/schema_revision.rs` and `fact_points/row_addresses/payloads.rs` would select a virgin carrier generation by the successor certificate.
+The existing reader at a predecessor cut would select the predecessor generation.
+The Bijection custody owner would open each admitted Original, compute the exact field conversion with missing and explicit null kept distinct, then seal a typed Arrow payload for the successor with the same unit and label obligations.
+The conversion preserves every other field and uses the same admitted canonical value contract as the clear compound codec.
+The outer Arrow carrier remains opaque Binary and the plaintext Arrow schema is confined to the custody boundary, including value-derived metadata.
+The prepared bytes and their custody evidence must remain bound to the original deployment attempt through an ambiguous reply.
+
+Carry a bounded custody endorsement in the existing placed Root decision, authenticated under the installed custody authority and bound to the attempt, endpoint declarations, Original hold and file identities, current fence stamps and the complete source and successor effect digests.
+The resolver in `relation_adoption.rs` would join the authenticated ciphertext, assertion and change journal by their full keys and exact Original occurrence, preserving each event position, assertion ordinal, valid interval, SQL time and origin.
+The receiver must establish that the custody owner's endorsement covers the exact typed conversion for every opened Original and covers every candidate effect once.
+Only after that check and a current fence comparison can `replica.rs` and `index/src/live.rs` install the complete baseline with the catalog switch, receipt and predecessor retirement in one ordered publication.
+The replica boundary needs a checked binding to the full staged effects and their protected roles.
+`resolver.rs`, the held readers and the Original archive owners must carry the generation lineage through live and archived erasure, recovery and held-reader drain.
+An unavailable Original, a changed fence, an unmatched occurrence or a pruned history without exact evidence refuses activation.
+
+The source fixtures in `relation_adoption.rs` compare clear admission with protected declaration refusal and a complete Binary assertion census with pruned, substituted and re-positioned inputs.
+Their census case exercises the existing journal check independently of custody.
+The proposed profile needs differential cases for an altered ciphertext under the same key, a swapped custody endorsement, tied SQL times, a fence ordered after preparation, retry after a lost reply, a retained predecessor read and archive replay of successor erasure.
+Affected formal areas for implementation include installed authority, placed decision, landing wire, ordered read-back, change groups, archive file identity and direct archive positions.
+[Installed authority](verus/installed_authority_wire/area.json) · [Placed decision](verus/owned_flight_decision/area.json) · [Landing wire](verus/owned_landing_wire/area.json) · [Ordered read-back](verus/readback_identity/area.json) · [Change groups](verus/owned_change_group/area.json) · [Archive file identity](verus/owned_archive_files/area.json) · [Direct archive positions](verus/direct_archive_plan/area.json)
+The existing laws leave a composition obligation across typed conversion, custody, exact historical coverage, replica application and erasure.

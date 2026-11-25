@@ -428,24 +428,140 @@ pub(super) fn uncovered(reason: impl Into<String>) -> Anomaly {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{num::NonZeroU32, sync::Arc};
 
     use rtdb_columnar::MemoryBudget;
-    use rtdb_format::{data::StoredOperation, envelope::ReplicaBody};
+    use rtdb_format::{data::{StoredEvent, StoredOperation}, envelope::ReplicaBody};
     use rtdb_index::PartitionState;
     use rtdb_query::QueryOptions;
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::{
-        DecimalValue, EntityId, Interval, OwnedChangeKind, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
+        DecimalValue, EntityId, EventPosition, Interval, OwnedChange, OwnedChangeKind, OwnedRelation,
+        OwnedSchema, PlacedAttemptScope, ROOT_ROW_CARRIERS, Result, RootRowCarrier, SHARED_COLUMN_CARRIERS,
         SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value,
     };
     use tokio_util::sync::CancellationToken;
 
     use crate::{Documents, HostedAuthority, HostedControlWrite, SourceTransaction, SubmitOptions, TxOp, bind_installed_authority};
-    use super::intrinsic_orders;
+    use super::{intrinsic_orders, verify_journal};
     use super::super::{OpenTransaction, OwnedPathKind, ResolveContext, TransactionAuthorization, TxResolver, attempt_marker_document};
 
     const PAYLOAD: &str = "c_0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn clear_compound_successor_refuses_protected_declaration_roles() -> Result<()> {
+        use serde_json::json;
+
+        let schema = |orders: [&str; 2], payload: serde_json::Value, protection: Option<(&str, &str)>| -> Result<OwnedSchema> {
+            let mut fields = orders.map(|name|
+                json!({"name": name, "type": {"kind": "binary"}, "optional": false, "nullable": false})
+            ).to_vec();
+            fields.push(json!({"name": PAYLOAD, "type": payload, "optional": true, "nullable": false}));
+            if let Some((name, kind)) = protection {
+                fields.push(json!({"name": name, "type": {"kind": kind}, "optional": true, "nullable": false}));
+            }
+            OwnedSchema::from_json(json!({
+                "version": 2, "validity": "acceptance", "fields": fields,
+            }).to_string().as_bytes())
+        };
+        let previous = ["population_before", "creation_before"];
+        let successor = ["population_after", "creation_after"];
+        let orders = [(previous[0], successor[0]), (previous[1], successor[1])];
+        let binary = json!({"kind": "binary"});
+        let typed = json!({"kind": "union", "legs": [
+            {"kind": "binary"}, {"kind": "struct", "fields": [{
+                "name": "v2_value", "type": {"kind": "list", "element": {"kind": "i64"}},
+                "optional": false, "nullable": true,
+            }]},
+        ]});
+        let before = schema(previous, binary.clone(), None)?;
+        let after = schema(successor, typed.clone(), None)?;
+        assert_eq!(before.clear_compound_successor(&after, &orders)?.0, PAYLOAD);
+        assert!(schema(previous, json!({"kind": "sealed"}), None)?
+            .clear_compound_successor(&after, &orders).is_err());
+        for control in [
+            ("sealed_payload", "opaque_binary"),
+            ("membership_until", "binary"),
+            ("label", "label"),
+        ] {
+            let before = schema(previous, binary.clone(), Some(control))?;
+            let after = schema(successor, typed.clone(), Some(control))?;
+            assert!(before.clear_compound_successor(&after, &orders).is_err(), "{control:?}");
+        }
+        for relation in [ROOT_ROW_CARRIERS, SHARED_COLUMN_CARRIERS] {
+            assert!(intrinsic_orders(&OwnedRelation::new(relation)?).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positioned_binary_assertion_census_refuses_pruning_and_substitutions() -> Result<()> {
+        let schema = OwnedSchema::from_json(br#"{
+            "version": 2, "validity": "acceptance", "fields": [
+                {"name": "membership_until", "type": {"kind": "binary"}, "optional": true, "nullable": false}
+            ]
+        }"#)?;
+        assert!(schema.has_world_assertion_journal());
+        let mut address = RootRowCarrier::table_prefix(&[8; 16]).to_vec();
+        address.extend_from_slice(&[0, 255, 0, 255]);
+        address.extend_from_slice(&[9; 32]);
+        address.extend_from_slice(&[10; 32]);
+        address.extend_from_slice(&[0, 1]);
+        let carrier = RootRowCarrier::parse(&address).expect("complete protected Root address");
+        let assertion = EntityId::Binary(carrier.assertion_key());
+        let retirement = EntityId::Binary(carrier.retirement_key());
+        let position = |tx, ordinal| EventPosition { transaction: TxId(tx), ordinal };
+        let put = |id: &EntityId, position, valid_time, commit_position, mut fields: StructFields<Value>| {
+            fields.insert("_id".into(), id.as_value());
+            StoredEvent {
+                position: Some(position), origin: None, entity_key: None, iid: id.iid(),
+                system_from: Timestamp(200), valid_time, commit_position,
+                operation: StoredOperation::Put(fields), recency: None,
+            }
+        };
+        let valid = Interval::new(Timestamp(180), Timestamp::MAX)?;
+        let mut data = [
+            put(&assertion, position(10, 2), valid, 7, StructFields::from([
+                ("membership_until".into(), Value::Binary(i64::MAX.to_be_bytes().to_vec())),
+            ])),
+            put(&retirement, position(11, 2), valid, 8, StructFields::new()),
+        ];
+        for (event, id) in data.iter_mut().zip([&assertion, &retirement]) {
+            event.entity_key = Some(id.handle_bytes().into());
+        }
+        let entry = |revision, position, through, value| {
+            put(&EntityId::Integer(revision), position, Interval::ALL, 0, StructFields::from([
+                ("entry".into(), value), ("through_events".into(), Value::I64(through)),
+            ]))
+        };
+        let touch = |id: &EntityId, ordinal| Value::list(vec![OwnedChange {
+            id: id.clone(), kind: OwnedChangeKind::Put, valid, assertion_ordinal: NonZeroU32::new(ordinal),
+        }.to_value()]);
+        let journal = [
+            entry(0, position(10, 3), 0, Value::Null),
+            entry(1, position(10, 4), 1, touch(&assertion, 7)),
+            entry(2, position(11, 3), 2, touch(&retirement, 8)),
+        ];
+        verify_journal(&data, &journal, &schema)?;
+        assert!(verify_journal(&data, &journal[1..], &schema).is_err());
+        assert!(verify_journal(&data, &journal[..2], &schema).is_err());
+        assert!(verify_journal(&data[1..], &journal, &schema).is_err());
+
+        for wrong in [touch(&assertion, 8), touch(&retirement, 7)] {
+            let mut substituted = journal.clone();
+            substituted[2] = entry(2, position(11, 3), 2, wrong);
+            assert!(verify_journal(&data, &substituted, &schema).is_err());
+        }
+        let mut substituted = data.clone();
+        substituted[1].entity_key = Some(assertion.handle_bytes().into());
+        assert!(verify_journal(&substituted, &journal, &schema).is_err());
+        data[1].valid_time = Interval::new(Timestamp(190), Timestamp::MAX)?;
+        assert!(verify_journal(&data, &journal, &schema).is_err());
+        data[1].valid_time = valid;
+        data[1].position = Some(position(10, 5));
+        assert!(verify_journal(&data, &journal, &schema).is_err());
+        Ok(())
+    }
 
     struct InstalledWriter;
     impl TransactionAuthorization for InstalledWriter {
