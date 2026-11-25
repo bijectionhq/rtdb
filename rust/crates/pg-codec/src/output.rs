@@ -139,7 +139,7 @@ fn write_range(lower: i64, upper: i64, output: &mut impl Write) -> Result<()> {
     write!(output, "[{lower},{upper})").map_err(write_error)
 }
 
-fn write_bytes(output: &mut impl Write, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_bytes(output: &mut impl Write, bytes: &[u8]) -> Result<()> {
     output.write_all(bytes).map_err(write_error)
 }
 

@@ -1,5 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
+use arrow_schema::SchemaRef;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, ReplaySubmissionPermit, TransactionStatus, control_schema};
 use rtdb_pg_codec::{ArrowWrite, Format, SessionEnvironment};
@@ -7,7 +8,7 @@ use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::{BoundParameters, QueryCursor};
 use rtdb_tx::SqlArguments;
 use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
-use rtdb_types::{Anomaly, PgType, Result, Value};
+use rtdb_types::{Anomaly, LogicalType, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
@@ -58,7 +59,76 @@ impl Prepared {
     }
 }
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
-struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, types: Vec<rtdb_types::LogicalType>, row: usize, sent: u64 }
+struct QueryPortal {
+    cursor: QueryCursor,
+    batch: Option<OwnedBatch>,
+    layout: Option<ResultLayout>,
+    row: usize,
+    sent: u64,
+}
+
+impl QueryPortal {
+    async fn advance(&mut self, memory: &Arc<MemoryBudget>) -> Result<()> {
+        loop {
+            self.batch = self.cursor.next_batch().await?;
+            self.row = 0;
+            if self.batch.as_ref().is_none_or(|batch| batch.batch().num_rows() != 0) {
+                break;
+            }
+        }
+        if let Some(batch) = self.batch.take() {
+            ResultLayout::refresh(&mut self.layout, batch.batch().schema_ref(), memory)?;
+            self.batch = Some(batch);
+        } else {
+            self.layout = None;
+        }
+        Ok(())
+    }
+}
+
+struct ResultLayout {
+    schema: SchemaRef,
+    types: Vec<LogicalType>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl ResultLayout {
+    fn refresh(cache: &mut Option<Self>, schema: &SchemaRef, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if cache.as_ref().is_some_and(|layout| {
+            Arc::ptr_eq(&layout.schema, schema) || layout.schema.as_ref() == schema.as_ref()
+        }) {
+            return Ok(());
+        }
+        *cache = None;
+        *cache = Some(Self::new(schema, memory)?);
+        Ok(())
+    }
+
+    fn new(schema: &SchemaRef, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let overflow = || protocol("Query result layout is too large");
+        let metadata = schema.metadata();
+        let base = metadata.capacity().checked_mul(64).and_then(|slots| slots.checked_add(256)).ok_or_else(overflow)?;
+        let schema_bytes = metadata.iter().try_fold(base, |bytes, (key, value)| {
+            bytes.checked_add(key.capacity()).and_then(|bytes| bytes.checked_add(value.capacity())).ok_or_else(overflow)
+        })?;
+        let schema_bytes = schema.fields().iter().try_fold(schema_bytes, |bytes, field| {
+            bytes.checked_add(field.size()).and_then(|bytes| bytes.checked_add(64)).ok_or_else(overflow)
+        })?;
+        let mut reservation = memory.reserve(schema_bytes.checked_mul(16).ok_or_else(overflow)?)?;
+        let mut types = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            types.push(rtdb_columnar::from_field(field)?);
+        }
+        let base = (types.capacity() - types.len()).checked_mul(std::mem::size_of::<LogicalType>())
+            .and_then(|slots| schema_bytes.checked_add(slots)).ok_or_else(overflow)?;
+        let retained = types.iter().try_fold(base, |bytes, ty| {
+            bytes.checked_add(ty.retained_bytes()?).ok_or_else(overflow)
+        })?;
+        Arc::get_mut(&mut reservation).expect("Result layout owns its reservation").shrink_to(retained)?;
+        Ok(Self { schema: Arc::clone(schema), types, _reservation: reservation })
+    }
+}
+
 enum PortalState { Query(QueryPortal), Ready }
 struct Portal {
     prepared: Arc<Prepared>,
@@ -542,7 +612,7 @@ impl ProtocolSession {
                 let actual = cursor.runtime_schema();
                 if columns.len() != actual.len() || columns.iter().zip(actual.fields()).any(|(column, field)| !column.ty.accepts_result(&field.data_type).unwrap_or(false)) { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "xtdb/prepared-query-out-of-date", "cached plan must not change result type")); }
             }
-            portal.state = PortalState::Query(QueryPortal { cursor, batch: None, types: Vec::new(), row: 0, sent: 0 });
+            portal.state = PortalState::Query(QueryPortal { cursor, batch: None, layout: None, row: 0, sent: 0 });
         }
         Ok(portal)
     }
@@ -657,11 +727,11 @@ impl ProtocolSession {
         let memory = self.node.query_memory();
         while limit == 0 || emitted < limit {
             if query.batch.as_ref().is_none_or(|batch| query.row == batch.batch().num_rows()) {
-                loop { query.batch = query.cursor.next_batch().await?; query.row = 0; if query.batch.as_ref().is_none_or(|batch| batch.batch().num_rows() != 0) { break; } }
-                query.types = query.batch.as_ref().map(|batch| batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field)).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
+                query.advance(self.node.memory()).await?;
             }
             let Some(batch) = &query.batch else { break; };
-            let schema = batch.batch().schema();
+            let layout = query.layout.as_ref().expect("A result batch has an admitted layout");
+            let schema = batch.batch().schema_ref();
             let row = query.row;
             let delivery = query.cursor.delivery_grant();
             let consumption: Result<()> = async {
@@ -674,7 +744,7 @@ impl ProtocolSession {
                     let array = batch.batch().column(index).as_ref();
                     let cell = rtdb_columnar::ArrowCell { field: schema.field(index), array, row };
                     if direct_cell(column.ty, column.format, cell, &environment, &memory, &mut body)? { continue; }
-                    match rtdb_pg_codec::encode_arrow(column.ty, column.format, &query.types[index], cell, &environment, &memory)? {
+                    match rtdb_pg_codec::encode_arrow(column.ty, column.format, &layout.types[index], cell, &environment, &memory)? {
                         None => body.null_cell()?,
                         Some(encoded) => body.cell(encoded.as_slice())?,
                     }
@@ -1022,7 +1092,7 @@ fn direct_cell(
     memory: &Arc<MemoryBudget>,
     out: &mut DataRow,
 ) -> Result<bool> {
-    let mut payload = DataRowPayload::new(out);
+    let mut payload = DataRowPayload::new(out, ty != PgType::Numeric);
     match rtdb_pg_codec::write_arrow_cell(ty, format, cell, environment, memory, &mut payload)? {
         ArrowWrite::Written => { payload.finish()?; Ok(true) }
         ArrowWrite::Null => { payload.row.null_cell()?; Ok(true) }
@@ -1173,13 +1243,14 @@ impl DataRow {
 struct DataRowPayload<'a> {
     row: &'a mut DataRow,
     start: usize,
+    defer_errors: bool,
     error: Option<Anomaly>,
 }
 
 impl<'a> DataRowPayload<'a> {
-    fn new(row: &'a mut DataRow) -> Self {
+    fn new(row: &'a mut DataRow, defer_errors: bool) -> Self {
         let start = row.bytes.len();
-        Self { row, start, error: None }
+        Self { row, start, defer_errors, error: None }
     }
 
     fn finish(self) -> Result<()> {
@@ -1205,7 +1276,12 @@ impl std::io::Write for DataRowPayload<'_> {
             } else {
                 self.row.reserve(bytes.len()).map(|()| self.row.bytes.extend_from_slice(bytes))
             };
-            self.error = result.err();
+            if let Err(error) = result {
+                if !self.defer_errors {
+                    return Err(std::io::Error::other(error));
+                }
+                self.error = Some(error);
+            }
         }
         Ok(bytes.len())
     }
@@ -1218,6 +1294,68 @@ mod tests {
     use rtdb_columnar::ArrowCell;
     use rtdb_sql::BatchStatement;
     use super::*;
+
+    #[test]
+    fn result_layout_reuses_equal_schemas_under_a_full_budget() {
+        use arrow_schema::{DataType, Field, Schema};
+        use rtdb_types::ScalarType;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let equal = Arc::new(schema.as_ref().clone());
+        let memory = MemoryBudget::new(1 << 20);
+        let mut cache = None;
+        ResultLayout::refresh(&mut cache, &schema, &memory).unwrap();
+        let charged = memory.used_bytes();
+        assert!(charged > 0);
+        let rest = memory.reserve(memory.available_bytes()).unwrap();
+
+        ResultLayout::refresh(&mut cache, &equal, &memory).unwrap();
+        let layout = cache.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&layout.schema, &schema));
+        assert_eq!(layout.types.as_slice(), &[
+            LogicalType::Scalar(ScalarType::I64),
+            LogicalType::Scalar(ScalarType::Utf8).maybe(),
+        ]);
+        drop(rest);
+        assert_eq!(memory.used_bytes(), charged);
+        drop(cache);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn result_layout_replaces_changed_metadata_and_validates_new_fields() {
+        use arrow_schema::Schema;
+        use rtdb_types::ScalarType;
+
+        let decimal = |scale| LogicalType::Scalar(ScalarType::Decimal { precision: 12, scale, bit_width: 128 });
+        let field = |scale| rtdb_columnar::to_field("n", &decimal(scale)).unwrap();
+        let first = Arc::new(Schema::new(vec![field(129)]));
+        let second = Arc::new(Schema::new(vec![field(-130)]));
+        assert_eq!(first.field(0).data_type(), second.field(0).data_type());
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut cache = None;
+        ResultLayout::refresh(&mut cache, &first, &memory).unwrap();
+        ResultLayout::refresh(&mut cache, &second, &memory).unwrap();
+        assert_eq!(cache.as_ref().unwrap().types, [decimal(-130)]);
+
+        let marked = Arc::new(Schema::new_with_metadata(second.fields().clone(), [("revision".into(), "2".into())].into()));
+        ResultLayout::refresh(&mut cache, &marked, &memory).unwrap();
+        let layout = cache.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&layout.schema, &marked));
+        assert_eq!(memory.used_bytes(), layout._reservation.bytes());
+
+        let invalid = Arc::new(Schema::new(vec![field(-130).with_metadata([
+            (rtdb_columnar::EXTENSION_NAME_KEY.into(), "unknown-layout".into()),
+        ].into())]));
+        let error = ResultLayout::refresh(&mut cache, &invalid, &memory).unwrap_err();
+        assert_eq!(error.code, "rtdb/unknown-arrow-extension");
+        assert!(cache.is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn postgres_arrow_cells_match_the_value_codec_in_both_formats() {
@@ -1283,6 +1421,79 @@ mod tests {
             assert!(direct_cell(PgType::Int8, Format::Text, ArrowCell { field: &field, array: array.as_ref(), row }, &environment, &memory, &mut output).unwrap());
         }
         assert_eq!(&output.bytes, b"\0\0\0\x017\0\0\0\x02-5");
+    }
+
+    #[test]
+    fn postgres_numeric_arrow_cells_write_length_prefixed_wire_bytes() {
+        let cases: [(u16, i128, i32, &str, &[i16], usize); 7] = [
+            (32, 0, 0, "0", &[0, -1, 0x4000, 0], 0),
+            (64, -12345, 2, "-123.45", &[2, 0, 0x4000, 2, 123, 4500], 0),
+            (64, 0, -5, "0E+5", &[0, -1, 0x4000, 0], 0),
+            (128, 12345, 4, "1.2345", &[2, 0, 0, 4, 1, 2345], 0),
+            (128, 0, 3, "0.000", &[1, -1, 0x4000, 3, 0], 0),
+            (256, 3, -4101, "3E+4101", &[1026, 1025, 0, 0, 30], 1025),
+            (256, -123, i32::MAX, "-1.23E-2147483645", &[1, -1, 0x4000, -1, 1230], 0),
+        ];
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(1 << 20);
+        for (width, coefficient, scale, text, header_and_digits, zero_groups) in cases {
+            let bytes = coefficient.to_be_bytes();
+            let unscaled = if width == 256 {
+                let mut wide = vec![if coefficient < 0 { 0xff } else { 0 }; 32];
+                wide[16..].copy_from_slice(&bytes);
+                wide
+            } else {
+                bytes[bytes.len() - usize::from(width / 8)..].to_vec()
+            };
+            let value = Value::Decimal(rtdb_types::DecimalValue::new(unscaled, 8, scale, width).unwrap());
+            let logical = value.logical_type().maybe();
+            let field = rtdb_columnar::to_field("numeric", &logical).unwrap();
+            let array = rtdb_columnar::copy_array(&logical, &[value.clone(), Value::Null]).unwrap();
+            let mut binary = header_and_digits.iter().flat_map(|word| word.to_be_bytes()).collect::<Vec<_>>();
+            binary.resize(binary.len() + zero_groups * 2, 0);
+            for (format, payload) in [(Format::Binary, binary.as_slice()), (Format::Text, text.as_bytes())] {
+                let mut output = DataRow::new(&memory).unwrap();
+                output.cell(b"previous").unwrap();
+                let start = output.bytes.len();
+                for row in 0..2 {
+                    let cell = ArrowCell { field: &field, array: array.as_ref(), row };
+                    assert!(direct_cell(PgType::Numeric, format, cell, &environment, &memory, &mut output).unwrap());
+                }
+                let end = start + 4 + payload.len();
+                assert_eq!(&output.bytes[start..start + 4], &(payload.len() as i32).to_be_bytes());
+                assert_eq!(&output.bytes[start + 4..end], payload);
+                assert_eq!(&output.bytes[end..], &(-1i32).to_be_bytes());
+                let owned = rtdb_pg_codec::encode_value(PgType::Numeric, format, &value, &environment).unwrap();
+                assert_eq!(owned.as_slice(), payload);
+                assert_eq!(memory.used_bytes(), output.bytes.capacity() + 256);
+            }
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn postgres_numeric_arrow_cells_preserve_scale_and_admission_errors() {
+        let environment = SessionEnvironment::default();
+        for (scale, limit, code) in [
+            (i32::MIN, 256, "xtdb.pgwire/invalid-arg-representation"),
+            (-4101, 256, "rtdb/memory-budget-exceeded"),
+            (-4101, 8192 + 256, "rtdb/memory-budget-exceeded"),
+        ] {
+            let value = Value::Decimal(rtdb_types::DecimalValue::new(3i128.to_be_bytes().to_vec(), 8, scale, 128).unwrap());
+            let logical = value.logical_type();
+            let field = rtdb_columnar::to_field("numeric", &logical).unwrap();
+            let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+            let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+            let memory = MemoryBudget::new(limit);
+            let mut output = DataRow::new(&memory).unwrap();
+            let error = direct_cell(PgType::Numeric, Format::Binary, cell, &environment, &memory, &mut output).unwrap_err();
+            assert_eq!(error.code, code);
+            if scale == i32::MIN {
+                assert_eq!(error, rtdb_pg_codec::encode_value(PgType::Numeric, Format::Binary, &value, &environment).unwrap_err());
+            }
+            assert!(output.bytes.is_empty());
+            assert_eq!(memory.used_bytes(), 256);
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub fn write_arrow_cell(
         PgType::Int4s | PgType::Int8s | PgType::Texts | PgType::Float4s | PgType::Float8s => {
             return write_arrow_array(ty, format, cell, memory, output);
         }
+        PgType::Numeric => return write_arrow_numeric(format, cell, memory, output),
         _ => {}
     }
     if !matches!(
@@ -84,6 +85,37 @@ pub fn write_arrow_cell(
         json_cell(cell, ty == PgType::JsonLd, output, Some(memory), 0)?;
     } else if !write_scalar(ty, format, cell.physical()?, environment, output)? {
         return Ok(ArrowWrite::Unsupported);
+    }
+    Ok(ArrowWrite::Written)
+}
+
+fn write_arrow_numeric(
+    format: Format,
+    cell: ArrowCell<'_>,
+    memory: &Arc<MemoryBudget>,
+    output: &mut impl Write,
+) -> Result<ArrowWrite> {
+    if cell.is_null()? {
+        return Ok(ArrowWrite::Null);
+    }
+    let Some((parameters, mut buffer)) = cell.decimal_coefficient()? else {
+        return Ok(ArrowWrite::Unsupported);
+    };
+    let start = buffer.len() - usize::from(parameters.bit_width / 8);
+    match format {
+        Format::Binary => {
+            let coefficient = &buffer[start..];
+            crate::binary::numeric_allocation_bound(coefficient, parameters.scale)?;
+            let _scratch = memory.reserve(8192)?;
+            crate::binary::write_numeric(coefficient, parameters.scale, output)?;
+        }
+        Format::Text => {
+            let _scratch = memory.reserve(8192)?;
+            let sign = if buffer[start] & 0x80 != 0 { 0xff } else { 0 };
+            buffer[..start].fill(sign);
+            let decimal = rtdb_types::jvm_number::decimal_coefficient_display(buffer, parameters.scale);
+            write!(output, "{decimal}").map_err(write_error)?;
+        }
     }
     Ok(ArrowWrite::Written)
 }

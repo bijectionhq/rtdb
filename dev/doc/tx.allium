@@ -54,10 +54,14 @@
 -- A fixed-size vector result column already in its declared layout keeps its component buffer.
 -- Query output aligns selected floating-point components and compatible scalar aliases with the declared Arrow field.
 -- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
+-- A pgwire query portal validates each new result schema before writing its rows.
+-- Equal result schemas within a pgwire query portal reuse its last admitted logical layout, including across Execute suspension.
 -- A pgwire portal writes supported primitive, temporal, interval, duration, range, and PostgreSQL reference cells from their Arrow positions into DataRow.
 -- The portal selects active dense union legs before writing their payloads.
 -- A pgwire portal writes JSON and JSON-LD structures and their scalar leaves into the reserved DataRow buffer.
--- A pgwire portal can encode numeric coefficients and Transit results from their Arrow cells.
+-- A pgwire portal writes Numeric payloads from Arrow coefficients into the reserved DataRow buffer.
+-- Binary Numeric writes negative-scale padding in bounded chunks.
+-- A pgwire portal can encode Transit results from their Arrow cells.
 -- Pgwire accepts one-dimensional real and double precision arrays with nullable elements in text and binary format.
 -- Pgwire emits floating-point list results from Arrow components with PostgreSQL array framing.
 -- Transit JSON and MessagePack readers collect floating-point components in typed buffers and resolve tags and cache references in wire order.
