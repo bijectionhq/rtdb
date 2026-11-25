@@ -493,19 +493,18 @@ impl LiveTable {
     }
     pub fn block_pages(&self, memory: &Arc<MemoryBudget>) -> Result<BlockPages<'_>> {
         let _reservation = memory.reserve(self.chunks.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Invalid block page inventory size"))?)?;
-        let empty = IndexBatch::copy_events_with_put_schema(&[], &self.column_types, memory)?;
         let include_origins = self.chunks.iter().any(|(_, batch)| batch.view().has_origin_column());
         let keyed = self.table.is_owned_event_data();
         let recency = !self.chunks.is_empty() && self.chunks.iter().all(|(_, batch)| batch.arrow().column_by_name("_recency").is_some());
-        let mut schema = empty.arrow().schema();
+        let (schema, schema_reservation) = rtdb_format::data::owned_live_event_schema(&self.column_types, recency, memory)?;
+        // Run ends inside a PUT still go through the live index's plain union admission.
+        if let Ok(op) = schema.field_with_name("op") && has_run_end(op.data_type()) {
+            from_field(op)?;
+        }
         let include_positions = self.chunks.iter().any(|(_, batch)| batch.view().has_position_column());
         let topology = self.table.is_owned_world_topology();
-        if include_origins || include_positions || topology || keyed || recency {
+        let schema = if include_origins || include_positions || topology || keyed {
             let mut fields = schema.fields().to_vec();
-            if recency {
-                let system_time = schema.field_with_name("_system_from").map_err(|error| invalid(error.to_string()))?;
-                fields.push(Arc::new(Field::new("_recency", system_time.data_type().clone(), false)));
-            }
             if keyed {
                 fields.push(Arc::new(rtdb_format::data::entity_key_field()));
             }
@@ -514,16 +513,13 @@ impl LiveTable {
                 fields.push(Arc::new(rtdb_format::data::event_origin_field()));
             }
             if include_positions { fields.push(Arc::new(rtdb_format::data::event_position_field())); }
-            schema = Arc::new(arrow_schema::Schema::new(fields));
-        }
-        let sources: Option<Vec<_>> = (!keyed && !recency && self.chunks.iter().all(|(_, batch)| batch.arrow().schema() == schema))
+            arrow_schema::Schema::new(fields)
+        } else { schema };
+        let sources: Option<Vec<_>> = (!keyed && !recency && self.chunks.iter().all(|(_, batch)| batch.arrow().schema_ref().as_ref() == &schema))
             .then(|| self.chunks.iter().map(|(_, batch)| &batch.owned).collect());
-        let _schema_reservation = match sources.as_ref().and_then(|batches| batches.first()) {
-            Some(batch) => {
-                schema = batch.batch().schema();
-                None
-            }
-            None => Some(Arc::clone(empty.arrow_reservation())),
+        let (schema, _schema_reservation) = match sources.as_ref().and_then(|batches| batches.first()) {
+            Some(batch) => (batch.batch().schema(), None),
+            None => (Arc::new(schema), Some(schema_reservation)),
         };
         Ok(BlockPages { table: self, sources, schema, include_origins, memory: Arc::clone(memory), _reservation, _schema_reservation })
     }
@@ -1526,7 +1522,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
             let id = EntityId::Integer(id);
             StoredEvent {
                 position: None,
-                origin: None,
+                origin: Some(rtdb_types::EventOrigin([time as u8; 32])),
                 commit_position: if keyed { time as u32 } else { 0 },
                 entity_key: keyed.then(|| id.handle_bytes().into()),
                 iid: id.iid(),
@@ -1539,6 +1535,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
                 recency: recency.then_some(Timestamp(time * 100)),
             }
         }).enumerate().map(|(offset, mut event)| {
+            event.position = Some(EventPosition { transaction: rtdb_types::TxId(time), ordinal: offset as u64 });
             if keyed { event.commit_position += offset as u32; }
             event
         }).collect::<Vec<_>>();
@@ -1554,6 +1551,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
             let actual = pages.copy(&[3, 0, 2]).unwrap();
             let selected = vec![second[1].clone(), first[0].clone(), second[0].clone()];
             let expected = IndexBatch::copy_events_with_put_schema(&selected, live.column_types(), &memory).unwrap();
+            assert_eq!(&pages.schema, expected.arrow().schema_ref());
             assert_eq!(actual.batch(), expected.arrow());
             if layout_changes || keyed {
                 assert!(pages.copy_relayout(&[3, 0, 2]).unwrap().is_some());
@@ -1562,6 +1560,24 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
             assert_eq!(bytes(actual.batch()), bytes(expected.arrow()));
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_topology_block_declares_commit_positions_under_its_schema_reservation() {
+    let memory = MemoryBudget::new(16 << 10);
+    let table = rtdb_types::OwnedRelation::world_clock_table("owner");
+    let live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+    let pages = live.block_pages(&memory).unwrap();
+    let names = pages.schema.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>();
+    assert_eq!(names, ["_iid", "_system_from", "_valid_from", "_valid_to", "op", "_commit_position"]);
+    let DataType::Union(legs, UnionMode::Dense) = pages.schema.field(4).data_type() else { panic!("Expected a dense operation union"); };
+    assert_eq!(legs.iter().map(|(id, field)| (id, field.name().as_str())).collect::<Vec<_>>(),
+        [(0, "delete"), (1, "erase")]);
+    assert_eq!(pages.schema.field(5), &rtdb_format::data::commit_position_field());
+    assert!(pages._schema_reservation.is_some());
+    drop(pages);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[cfg(test)]

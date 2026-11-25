@@ -245,6 +245,7 @@ contract OutputSegmentLayout {
         -- A job below the cutover uses the legacy policy and can share existing output names with legacy workers.
 
     @invariant OutputPagesShareTheMergedSchema
+        -- Native compaction declares the merged event fields before writing the first page.
         -- Every page in an output data file uses the merged schema, including its field types and nullability.
         -- Normalization retains the complete entity-key column in governed event data.
         -- Temporal resolution tracks each complete governed key independently when several keys share an IID.

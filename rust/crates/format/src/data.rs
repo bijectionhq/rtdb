@@ -7,8 +7,8 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, NullArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt32Array, UnionArray,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}};
 use arrow_buffer::ScalarBuffer;
-use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, retain_array, retain_buffer, struct_field_cell, to_field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
+use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, MemoryReservation, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, iid_data_type, retain_array, retain_buffer, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, Timestamp, Value};
 
 #[cfg(test)]
@@ -816,15 +816,28 @@ pub fn owned_event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<Struc
 }
 
 fn event_builder(rows: usize, put_fields: Option<&StructFields<LogicalType>>, memory: &Arc<MemoryBudget>) -> Result<(BatchBuilder, usize)> {
-    let metadata = put_fields.map_or(Ok(4096), |fields| {
+    let metadata = event_schema_bytes(put_fields)?;
+    let headers = rows.checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
+    let builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
+    Ok((builder, metadata))
+}
+
+fn event_schema_bytes(put_fields: Option<&StructFields<LogicalType>>) -> Result<usize> {
+    put_fields.map_or(Ok(4096), |fields| {
         fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
             ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
                 .and_then(|bytes| bytes.checked_mul(8)).and_then(|size| bytes.checked_add(size)).ok_or_else(event_size)
         })
-    })?;
-    let headers = rows.checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
-    let builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
-    Ok((builder, metadata))
+    })
+}
+
+pub fn owned_live_event_schema(
+    put_fields: &StructFields<LogicalType>, recency: bool, memory: &Arc<MemoryBudget>,
+) -> Result<(Schema, Arc<MemoryReservation>)> {
+    let put_fields = Some(put_fields);
+    let reservation = memory.reserve(event_schema_bytes(put_fields)?)?;
+    let schema = event_schema(put_fields, None, recency, PutLeg::Last, false)?;
+    Ok((schema, reservation))
 }
 
 /// `source_bytes` is the shared source allocation held by the document buffers.
@@ -892,11 +905,7 @@ fn put_batch(
         if bound > lease.bytes() { lease.grow_to(bound)?; } else { lease.shrink_to(bound)?; }
         reservation
     } else { memory.reserve(bound)? };
-    let fields = UnionFields::new(0..3, [
-        Field::new("delete", DataType::Null, true),
-        Field::new("erase", DataType::Null, true),
-        Field::new("put", documents.data_type().clone(), false),
-    ]);
+    let fields = operation_fields(Some(documents.data_type().clone()), PutLeg::Last, false);
     let offsets = (0..headers.len()).map(|offset| i32::try_from(offset).map_err(invalid)).collect::<Result<Vec<_>>>()?;
     let operations = UnionArray::try_new(fields, ScalarBuffer::from(vec![2; headers.len()]), Some(ScalarBuffer::from(offsets)),
         vec![Arc::new(NullArray::new(0)), Arc::new(NullArray::new(0)), documents]).map_err(invalid)?;
@@ -964,19 +973,21 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(invalid)?);
     }
-    let mut op_fields = vec![Arc::new(Field::new("delete", DataType::Null, true)), Arc::new(Field::new("erase", DataType::Null, true))];
     let mut children: Vec<ArrayRef> = vec![Arc::new(NullArray::new(deletes)), Arc::new(NullArray::new(erases))];
-    if let Some(fields) = put_fields {
+    let put_type = if let Some(fields) = put_fields {
         let documents = put_columns(&puts, fields, copy, builder.as_deref_mut())?;
+        let data_type = documents.data_type().clone();
         let index = usize::try_from(put_id).map_err(invalid)?;
-        op_fields.insert(index, Arc::new(Field::new("put", documents.data_type().clone(), false)));
         children.insert(index, documents);
-    }
-    if redacted > 0 || redacted_leg {
-        op_fields.push(Arc::new(Field::new("redacted", DataType::Null, true)));
+        Some(data_type)
+    } else {
+        None
+    };
+    let include_redacted = redacted > 0 || redacted_leg;
+    if include_redacted {
         children.push(Arc::new(NullArray::new(redacted)));
     }
-    let op_fields = UnionFields::new(0..op_fields.len() as i8, op_fields);
+    let op_fields = operation_fields(put_type, put_leg, include_redacted);
     let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields, ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
     let recencies = events.iter().any(|event| event.recency().is_some()).then(|| {
         events.iter().map(|event| event.recency().map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()
@@ -1123,22 +1134,59 @@ pub fn commit_position_field() -> Field {
     Field::new(COMMIT_POSITION_FIELD, DataType::UInt32, false)
 }
 
+fn operation_fields(put: Option<DataType>, put_leg: PutLeg, redacted: bool) -> UnionFields {
+    let mut fields = vec![Field::new("delete", DataType::Null, true), Field::new("erase", DataType::Null, true)];
+    if let Some(put) = put {
+        let index = match put_leg { PutLeg::First => 0, PutLeg::Last => 2 };
+        fields.insert(index, Field::new("put", put, false));
+    }
+    if redacted { fields.push(Field::new("redacted", DataType::Null, true)); }
+    UnionFields::new(0..fields.len() as i8, fields)
+}
+
+fn event_time_type() -> DataType {
+    DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()))
+}
+
+fn recency_field() -> Field { Field::new("_recency", event_time_type(), false) }
+
+fn event_fields(iid: DataType, op: DataType, recency: bool) -> Vec<Field> {
+    let time_type = event_time_type();
+    let mut fields = vec![
+        Field::new("_iid", iid, false),
+        Field::new("_system_from", time_type.clone(), false),
+        Field::new("_valid_from", time_type.clone(), false),
+        Field::new("_valid_to", time_type, false),
+        Field::new("op", op, false),
+    ];
+    if recency { fields.push(recency_field()); }
+    fields
+}
+
+fn put_column_field(name: &str, ty: &LogicalType) -> Result<Arc<Field>> {
+    to_field(name, ty).map(Arc::new)
+}
+
+fn event_schema(
+    put_fields: Option<&StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool,
+    put_leg: PutLeg, redacted: bool,
+) -> Result<Schema> {
+    let put = put_fields.filter(|fields| !fields.is_empty()).map(|fields| {
+        fields.iter().map(|(name, ty)| put_column_field(name, ty)).collect::<Result<Vec<_>>>()
+            .map(|fields| DataType::Struct(fields.into()))
+    }).transpose()?;
+    let op = DataType::Union(operation_fields(put, put_leg, redacted), UnionMode::Dense);
+    Ok(Schema::new(event_fields(iid_data_type(iid_encoding)?, op, recency)))
+}
+
 fn event_columns(headers: &[EventHeader], op: ArrayRef, iid_encoding: Option<RunEndWidth>, recencies: Option<Vec<i64>>) -> Result<RecordBatch> {
     let iids: Vec<_> = headers.iter().map(|header| header.iid).collect();
     let iids = build_iids(&iids, iid_encoding)?;
-    let time_type = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
-    let mut fields = vec![
-        Field::new("_iid", iids.data_type().clone(), false),
-        Field::new("_system_from", time_type.clone(), false),
-        Field::new("_valid_from", time_type.clone(), false),
-        Field::new("_valid_to", time_type.clone(), false),
-        Field::new("op", op.data_type().clone(), false),
-    ];
+    let fields = event_fields(iids.data_type().clone(), op.data_type().clone(), recencies.is_some());
     let times = |values: Vec<i64>| Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
     let mut columns = vec![iids, times(headers.iter().map(|header| header.system_from.0).collect()),
         times(headers.iter().map(|header| header.valid_time.lower().0).collect()), times(headers.iter().map(|header| header.valid_time.upper().0).collect()), op];
     if let Some(recencies) = recencies {
-        fields.push(Field::new("_recency", time_type, false));
         columns.push(times(recencies));
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)
@@ -1156,9 +1204,9 @@ fn put_columns<E: EncodedEvent>(
     let mut schema = Vec::with_capacity(fields.len());
     let mut columns = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
-        let field = to_field(&name, &ty)?;
+        let field = put_column_field(&name, &ty)?;
         if copy && let Some(column) = columns::gather_column(documents, &field, &ty, builder.as_deref_mut())? {
-            schema.push(Arc::new(field));
+            schema.push(field);
             columns.push(column);
             continue;
         }
@@ -1177,7 +1225,7 @@ fn put_columns<E: EncodedEvent>(
             read_bytes = Some(read_size()?);
             Ok(())
         })? {
-            schema.push(Arc::new(field));
+            schema.push(field);
             columns.push(column);
             continue;
         }
@@ -1194,7 +1242,7 @@ fn put_columns<E: EncodedEvent>(
             Some(builder) => builder.column(estimate_builder_bytes_refs(&ty, cells.iter().map(|cell| cell.as_ref()))?, build)?,
             None => build()?,
         };
-        schema.push(Arc::new(field));
+        schema.push(field);
         columns.push(column);
     }
     build_struct_array(schema.into(), &columns, documents.len(), None)
@@ -1218,8 +1266,8 @@ pub fn copy_encoded_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields
 /// Describes a compaction output's operation and recency layout before its first page.
 pub fn compacted_event_schema(
     put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, redacted_leg: bool,
-) -> Result<arrow_schema::SchemaRef> {
-    Ok(event_batch_with_recency::<StoredEvent>(&[], put_fields, iid_encoding, recency, false, None, redacted_leg)?.schema())
+) -> Result<SchemaRef> {
+    event_schema(put_fields.as_ref(), iid_encoding, recency, PutLeg::First, redacted_leg).map(Arc::new)
 }
 
 /// Copies a compaction page under the declared operation layout and memory budget.
@@ -1285,7 +1333,7 @@ fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<St
     let batch = event_batch(events, put_fields, iid_encoding, copy, builder, PutLeg::First, redacted_leg)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
-        fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));
+        fields.push(Arc::new(recency_field()));
         let mut columns = batch.columns().to_vec();
         columns.push(Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone("UTC")));
         return RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid);
@@ -1303,6 +1351,39 @@ fn event_size() -> Anomaly { invalid("Event batch allocation exceeds addressable
 mod tests {
     use super::*;
     use rtdb_types::{EntityId, ScalarType};
+
+    #[test]
+    fn compacted_declaration_matches_the_empty_event_writer() {
+        let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 280, scale: -200, bit_width: 128 });
+        let variants = LogicalType::from_legs([LogicalType::Scalar(ScalarType::Utf8), LogicalType::Null, decimal.clone()]);
+        let document = StructFields::from([
+            ("z".into(), LogicalType::Struct(StructFields::from([
+                ("nullable_decimal".into(), decimal.maybe()),
+                ("variants".into(), variants),
+            ])).maybe()),
+            ("a".into(), LogicalType::Nothing),
+        ]);
+        for put in [None, Some(StructFields::new()), Some(document)] {
+            for iid in [None, Some(RunEndWidth::I16), Some(RunEndWidth::I32), Some(RunEndWidth::I64)] {
+                for (recency, redaction) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let expected = event_batch_with_recency::<StoredEvent>(&[], put.clone(), iid, recency, false, None, redaction).unwrap();
+                    let declared = compacted_event_schema(put.clone(), iid, recency, redaction).unwrap();
+                    assert_eq!(&declared, expected.schema_ref());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compacted_declaration_and_writer_reject_invalid_put_types() {
+        let fields = Some(StructFields::from([
+            ("invalid".into(), LogicalType::Scalar(ScalarType::FixedSizeBinary(-1))),
+        ]));
+        let expected = event_batch_with_recency::<StoredEvent>(&[], fields.clone(), None, false, false, None, false).unwrap_err();
+        let actual = compacted_event_schema(fields, None, false, false).unwrap_err();
+        assert_eq!(actual.code, expected.code);
+        assert_eq!(actual.message, expected.message);
+    }
 
     #[test]
     fn a_staged_put_charges_only_the_selected_part_of_its_large_source_buffer() {

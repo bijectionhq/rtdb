@@ -908,6 +908,7 @@ config {
 --      Each L0 page retains Arrow statistics for the metadata file and releases temporary allocations for scanning that page.
 --      The metadata writer aligns those arrays to the joined schema and writes the existing node tags and page order.
 --      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
+--      The native live trie writer declares its event fields under a schema reservation before gathering any leaf.
 --      The live trie writer aligns compatible Arrow chunk layouts to the captured schema before gathering the leaf's selected positions.
 --      An encoded document column gathers physical run positions and coalesces consecutive values with identical stored representations.
 --      A selected named union leg can use its logical field over compatible stored Arrow buffers.
