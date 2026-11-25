@@ -80,15 +80,34 @@ impl Cache {
 
     pub fn get(&mut self, location: Location) -> Option<Bytes> { self.touch(location) }
 
-    /// Keeps a copy, so a payload sliced from a larger buffer does not pin the rest of it.
+    /// Keeps a copy after admission so a request slice cannot pin its full frame.
     pub fn insert(&mut self, location: Location, payload: &[u8]) {
-        let payload = Bytes::copy_from_slice(payload);
-        let cost = Self::cost(&payload);
-        if cost > self.budget || self.touch(location).is_some() { return; }
-        while self.bytes + cost > self.budget {
-            let Some((_, oldest)) = self.by_use.pop_first() else { break };
-            if let Some((evicted, _)) = self.entries.remove(&oldest) { self.bytes -= Self::cost(&evicted); }
+        if let Some(cost) = self.admit(location, payload.len()) {
+            self.store(location, Bytes::copy_from_slice(payload), cost);
         }
+    }
+
+    /// Disk reads and the cache can share the admitted compact allocation.
+    pub fn insert_read(&mut self, location: Location, payload: Bytes) -> Bytes {
+        let Some(cost) = self.admit(location, payload.len()) else { return payload };
+        let compact = Bytes::copy_from_slice(&payload);
+        self.store(location, compact.clone(), cost);
+        compact
+    }
+
+    fn admit(&mut self, location: Location, len: usize) -> Option<usize> {
+        let cost = len.checked_add(ENTRY_OVERHEAD)?;
+        if cost > self.budget || self.touch(location).is_some() { return None; }
+        while self.bytes > self.budget - cost {
+            let Some((_, oldest)) = self.by_use.pop_first() else { break };
+            if let Some((evicted, _)) = self.entries.remove(&oldest) {
+                self.bytes -= Self::cost(&evicted);
+            }
+        }
+        Some(cost)
+    }
+
+    fn store(&mut self, location: Location, payload: Bytes, cost: usize) {
         self.tick += 1;
         self.entries.insert(location, (payload, self.tick));
         self.by_use.insert(self.tick, location);

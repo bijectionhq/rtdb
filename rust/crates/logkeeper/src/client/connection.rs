@@ -2,7 +2,7 @@
 //! Sending never waits: a request joins the session's outbox in call order, and its reply is handed to a callback or a future.
 //! A failed session fails every outstanding request, and the next request opens a new one.
 
-use crate::protocol::{Identify, Request, RequestBody, Response, ResponseBody, encode_frame, read_frame};
+use crate::protocol::{FrameParts, WIRE_BATCH_FRAMES, Identify, Request, RequestBody, Response, ResponseBody, encode_frame, read_frame};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
@@ -193,20 +193,22 @@ async fn run_session(
         _ => return waiters.fail("the server did not advertise a journal identity".to_owned()),
     };
     let writing = async {
-        let mut buffer = BytesMut::new();
-        let encode = |queued: QueuedRequest, buffer: &mut BytesMut| {
+        let mut buffer = FrameParts::default();
+        let encode = |queued: QueuedRequest, buffer: &mut FrameParts| {
             if queued.binding.admits(&identity) {
-                encode_frame(&Request { id: queued.id, body: Some(queued.body), target_journal: identity.to_string() }, buffer);
+                buffer.push_wire(&Request { id: queued.id, body: Some(queued.body), target_journal: identity.to_string() });
             } else if let Some(callback) = waiters.take(queued.id) {
                 callback(Err(remote(&address, format!("journal {identity} does not own this ensemble slot"))));
             }
         };
         while let Some(queued) = requests.recv().await {
             encode(queued, &mut buffer);
-            while let Ok(queued) = requests.try_recv() { encode(queued, &mut buffer); }
-            if buffer.is_empty() { continue; }
-            writer.write_all(&buffer).await.map_err(|error| error.to_string())?;
-            buffer.clear();
+            for _ in 1..WIRE_BATCH_FRAMES {
+                if buffer.wire_batch_full() { break; }
+                let Ok(queued) = requests.try_recv() else { break };
+                encode(queued, &mut buffer);
+            }
+            buffer.send_wire(&mut writer).await.map_err(|error| error.to_string())?;
         }
         Ok::<_, String>(())
     };
