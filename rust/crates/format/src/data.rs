@@ -1162,7 +1162,7 @@ fn put_columns<E: EncodedEvent>(
             columns.push(column);
             continue;
         }
-        let read_bytes = builder.as_deref().map(|_| {
+        let read_size = || {
             documents.iter().try_fold(0usize, |bytes, doc| {
                 let cell = match doc.put_column(&name) {
                     Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::estimate_read_cell_bytes(field, array, row)?,
@@ -1171,13 +1171,20 @@ fn put_columns<E: EncodedEvent>(
                 };
                 bytes.checked_add(cell).ok_or_else(event_size)
             })
-        }).transpose()?;
-        if copy && let Some(column) = selected::column(documents, &field, &ty, builder.as_deref_mut())? {
+        };
+        let mut read_bytes = None;
+        if copy && let Some(column) = selected::column(documents, &field, &ty, builder.as_deref_mut(), || {
+            read_bytes = Some(read_size()?);
+            Ok(())
+        })? {
             schema.push(Arc::new(field));
             columns.push(column);
             continue;
         }
-        let _scratch = builder.as_deref().zip(read_bytes).map(|(builder, bytes)| builder.reserve_scratch(bytes)).transpose()?;
+        let _scratch = builder.as_deref().map(|builder| {
+            let bytes = read_bytes.map_or_else(read_size, Ok)?;
+            builder.reserve_scratch(bytes)
+        }).transpose()?;
         let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
             let values = cells.iter().map(|cell| cell.as_ref()).collect::<Vec<_>>();
