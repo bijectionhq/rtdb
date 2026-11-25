@@ -3968,7 +3968,7 @@ mod kernel {
         use arrow_array::ArrayRef;
         use rtdb_plan::{ColumnId, Field};
         use rtdb_types::LogicalType;
-        use super::super::{ArrowField, MemoryBudget};
+        use crate::columnar::{ArrowField, MemoryBudget};
 
         let memory = MemoryBudget::new(1 << 20);
         let parameters = rtdb_expr::Parameters::Values(&[]);

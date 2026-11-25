@@ -159,9 +159,12 @@ impl Shortlist {
                 let width = read_width(cut, read, clusters);
                 let clusters = &clusters[..width];
                 let dimensions = self.probe.values().len();
-                let blocks = futures::stream::iter(clusters.iter().enumerate().map(|(index, cluster)| {
+                // Collected first so the stream holds plain futures rather than a lifetime-generic closure,
+                // which the `Send` check of the async-trait accelerator cannot prove general enough.
+                let reads = clusters.iter().enumerate().map(|(index, cluster)| {
                     async move { (index, read_block(cut, read, cluster, dimensions).await) }
-                })).buffer_unordered(width);
+                }).collect::<Vec<_>>();
+                let blocks = futures::stream::iter(reads).buffer_unordered(width);
                 futures::pin_mut!(blocks);
                 let mut retry = [false; MAX_CLUSTER_READS];
                 while let Some((index, block)) = blocks.next().await {
