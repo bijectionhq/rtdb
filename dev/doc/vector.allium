@@ -49,8 +49,10 @@ entity ProbePlan {
 -- Each cluster starts at a 64-byte boundary and holds one Arrow IPC stream with 64-byte message and buffer alignment relative to that start.
 -- The directory names every cluster's partition, centroid, byte range, row count and SHA-256 digest covering the stream through its end marker.
 -- Generation staging admits row descriptors and normalized components before growing their buffers.
--- Each cluster streams its selected components in row order from the staged arena into one logical IPC buffer.
--- Training and output scratch have a separate reservation.
+-- Each cluster streams its side columns and selected components in row order from the staged rows and arena.
+-- A single-cluster partition writes its ordered member range directly.
+-- Training and IPC scratch are scoped to the partition and stream that use them.
+-- The directory admits retained rows and centroids as they accumulate.
 -- The artefact record carries the directory's location and digest, and a reader checks every directory and cluster byte it uses against them.
 -- The artefact lane builds generations for the tries `wants` admits and publishes them with ArtefactsAdded.
 -- Compaction output gets its own generation; an erased version is absent from compacted tries and so from their generations.
@@ -66,7 +68,9 @@ entity ProbePlan {
 -- An equality filter that fixes every partition column selects the clusters of that partition before any ranking.
 -- An IID scope from another accelerator small enough to rank exactly leaves the scan exact.
 -- Each generation probes its eligible clusters nearest centroid first; the recall target sets the starting probe fraction and shortlist.
--- The directory is validated in place. The read reserves ranking scratch before retaining the eligible cluster descriptions.
+-- The directory is validated in place, including ascending partition order.
+-- A partition filter seeks its contiguous directory row range.
+-- The read reserves ranking scratch before retaining the eligible cluster descriptions.
 -- The shortlist keeps the nearest distinct IIDs by unit-vector distance across generations and the frontier.
 -- One funded score per distinct IID stays available for subsequent rounds, including IIDs omitted from a narrower round.
 -- The scan uses exact ranking if another distinct IID would exceed the funded score bound.

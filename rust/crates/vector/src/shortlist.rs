@@ -53,14 +53,14 @@ struct Opened {
 
 impl Opened {
     fn rank(key: &ObjectKey, directory: &Directory, probe: &[f32], partition: Option<Partition>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        let eligible = || (0..directory.len()).filter(|&row| partition.is_none_or(|partition| directory.partition(row) == partition));
-        let count = eligible().count();
+        let eligible = directory.partition_rows(partition);
+        let count = eligible.len();
         if count == 0 { return Ok(None); }
         let held = (2 * size_of::<Self>()).saturating_add(key.as_str().len()).saturating_add(count.saturating_mul(size_of::<Cluster>()));
         let bytes = held.saturating_add(count.saturating_mul(size_of::<(f64, usize)>()));
         let mut allocation = memory.reserve(bytes)?;
         let mut order = Vec::with_capacity(count);
-        order.extend(eligible().map(|row| (rows::unit_distance(probe, directory.centroid(row)), row)));
+        order.extend(eligible.map(|row| (rows::unit_distance(probe, directory.centroid(row)), row)));
         order.sort_unstable_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
         let mut clusters = Vec::with_capacity(count);
         clusters.extend(order.iter().map(|&(_, row)| directory.cluster(row)));
@@ -356,13 +356,13 @@ mod tests {
             rows.push_unit(header, partition, &[1.0, 0.0]);
         }
         let mut bytes = Vec::new();
-        let locator = write_generation(rows, &mut bytes, &CancellationToken::new()).unwrap().locator;
-        let range = locator.directory_range();
         let decode_memory = MemoryBudget::new(1 << 20);
+        let locator = write_generation(rows, decode_memory.reserve(0).unwrap(), &mut bytes, &decode_memory,
+            &CancellationToken::new()).unwrap().locator;
+        let range = locator.directory_range();
         let directory_bytes = Bytes::from(bytes).slice(range.start as usize..range.end as usize);
         let directory = Directory::read(directory_bytes, &locator, &decode_memory).unwrap();
-        let expected: Vec<_> = (0..directory.len()).filter(|&row| directory.partition(row) == selected)
-            .map(|row| directory.cluster(row).range).collect();
+        let expected = vec![directory.cluster(0).range];
         assert!(!expected.is_empty() && expected.len() < directory.len());
         let first = ObjectKey::new("ivf/generation-1").unwrap();
         let second = ObjectKey::new("ivf/generation-2").unwrap();

@@ -63,15 +63,12 @@ impl ArtefactBuilder for Builder {
             let mut rows = IndexedRows::new(definition.dimensions);
             read_indexed_rows(source, &definition, &memory, &cancel, &mut rows,
                 Arc::get_mut(&mut staging).expect("generation owns its staging reservation"))?;
-            let training_bytes_per_component = size_of::<f32>() + size_of::<f64>();
-            // The directory's centroid vector grows geometrically as partitions are written.
-            let directory_bytes_per_component = 2 * size_of::<f32>();
-            let work_per_row = definition.dimensions
-                .saturating_mul(training_bytes_per_component + directory_bytes_per_component)
-                .saturating_add(384);
-            let _work = memory.reserve(16_384usize.saturating_add(rows.rows().len().saturating_mul(work_per_row)))?;
-            let mut writer = std::io::BufWriter::new(std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?);
-            let written = file::write_generation(rows, &mut writer, &cancel)?;
+            const WRITE_BUFFER_BYTES: usize = 8192;
+            let _write_buffer = memory.reserve(WRITE_BUFFER_BYTES)?;
+            let mut writer = std::io::BufWriter::with_capacity(
+                WRITE_BUFFER_BYTES, std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?,
+            );
+            let written = file::write_generation(rows, staging, &mut writer, &memory, &cancel)?;
             std::io::Write::flush(&mut writer).map_err(fault)?;
             Ok::<_, Anomaly>(written)
         }).await.map_err(fault)??;

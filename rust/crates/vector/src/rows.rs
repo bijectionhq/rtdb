@@ -110,6 +110,28 @@ pub(crate) struct IndexedRow {
     unit_offset: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ClusterRows<'a> {
+    Ordered(&'a [IndexedRow]),
+    Selected(&'a [IndexedRow], &'a [usize]),
+}
+
+impl<'a> ClusterRows<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Ordered(rows) => rows.len(),
+            Self::Selected(_, order) => order.len(),
+        }
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = &'a IndexedRow> {
+        (0..self.len()).map(move |index| match self {
+            Self::Ordered(rows) => &rows[index],
+            Self::Selected(rows, order) => &rows[order[index]],
+        })
+    }
+}
+
 pub(crate) struct IndexedRows {
     dimensions: usize,
     rows: Vec<IndexedRow>,
@@ -123,17 +145,16 @@ impl IndexedRows {
     pub(crate) fn rows(&self) -> &[IndexedRow] { &self.rows }
     pub(crate) fn unit(&self, row: &IndexedRow) -> &[f32] { &self.units[row.unit_offset..row.unit_offset + self.dimensions] }
 
-    pub(crate) fn unit_spans<'a>(&'a self, mut selected: &'a [&'a IndexedRow]) -> impl Iterator<Item = &'a [f32]> + 'a {
+    pub(crate) fn unit_spans<'a>(&'a self, selected: impl Iterator<Item = &'a IndexedRow> + 'a)
+        -> impl Iterator<Item = &'a [f32]> + 'a
+    {
+        let mut selected = selected.peekable();
         std::iter::from_fn(move || {
-            let start = selected.first()?.unit_offset;
+            let start = selected.next()?.unit_offset;
             let mut end = start + self.dimensions;
-            let mut count = 1;
-            for row in &selected[1..] {
-                if row.unit_offset != end { break; }
+            while selected.next_if(|row| row.unit_offset == end).is_some() {
                 end += self.dimensions;
-                count += 1;
             }
-            selected = &selected[count..];
             Some(&self.units[start..end])
         })
     }

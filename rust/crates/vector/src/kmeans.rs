@@ -14,6 +14,22 @@ pub(crate) fn cluster_count(rows: usize) -> usize {
     ((rows as f64).sqrt().round() as usize).clamp(1, MAX_CLUSTERS)
 }
 
+fn sample_size(rows: usize, clusters: usize) -> usize {
+    clusters.saturating_mul(TRAINING_ROWS_PER_CLUSTER).min(MAX_TRAINING_ROWS).min(rows)
+}
+
+pub(crate) fn scratch_bytes(rows: usize, dimensions: usize) -> usize {
+    let clusters = cluster_count(rows);
+    let components = clusters.saturating_mul(dimensions);
+    let training = components.saturating_mul(size_of::<f64>()).saturating_add(
+        sample_size(rows, clusters).saturating_mul(size_of::<&[f32]>() + size_of::<u32>()),
+    );
+    let grouping = rows.saturating_mul(size_of::<u32>() + size_of::<usize>()).saturating_add(
+        (clusters + 1) * size_of::<usize>(),
+    );
+    components.saturating_mul(size_of::<f32>()).saturating_add(training.max(grouping))
+}
+
 /// Spherical k-means over unit vectors, with every choice a function of the input order.
 /// Seeds are evenly spaced rows, training runs on an evenly spaced sample, ties go to the lower cluster,
 /// and every sum accumulates in f64 in row order, so the same rows in the same order give the same bytes.
@@ -25,7 +41,7 @@ pub(crate) fn train<'a>(rows: usize, dimensions: usize, unit: impl Fn(usize) -> 
     let mut centroids = Vec::with_capacity(clusters * dimensions);
     for cluster in 0..clusters { centroids.extend_from_slice(unit(cluster * rows / clusters)); }
     if clusters > 1 {
-        let sample_size = clusters.saturating_mul(TRAINING_ROWS_PER_CLUSTER).min(MAX_TRAINING_ROWS).min(rows);
+        let sample_size = sample_size(rows, clusters);
         let sample: Vec<&[f32]> = (0..sample_size).map(|index| unit(index * rows / sample_size)).collect();
         let mut assignment = vec![u32::MAX; sample.len()];
         for _ in 0..ITERATIONS {

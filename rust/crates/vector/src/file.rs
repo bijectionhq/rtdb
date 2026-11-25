@@ -22,7 +22,7 @@ use rtdb_types::{Anomaly, Iid, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{definition::FILE_VERSION, kmeans, rows::{IndexedRow, IndexedRows, Partition}};
+use crate::{definition::FILE_VERSION, kmeans, rows::{ClusterRows, IndexedRow, IndexedRows, Partition}};
 
 const MAGIC: &[u8; 8] = b"RTDBVEC1";
 const FOOTER_BYTES: usize = 32;
@@ -97,91 +97,156 @@ pub(crate) struct Written { pub(crate) size: u64, pub(crate) locator: Locator }
 
 /// Writes the generation of `rows`, which this sorts so that the bytes depend only on the set of rows.
 /// Each partition trains its own clusters; a row belongs to exactly one cluster of its partition.
-pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, cancellation: &CancellationToken) -> Result<Written> {
+pub(crate) fn write_generation(
+    rows: IndexedRows, staging: Arc<MemoryReservation>, output: &mut impl Write,
+    memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<Written> {
+    let (_staging, mut rows) = (staging, rows);
     let dimensions = rows.dimensions();
     let dimensions_u32 = u32::try_from(dimensions).map_err(|_| corrupt("Vector dimensions exceed the file format"))?;
-    rows.sort();
+    {
+        let _sort = memory.reserve(rows.rows().len().saturating_mul(size_of::<IndexedRow>()))?;
+        rows.sort();
+    }
     let ordered_rows = rows.rows();
+    let _schema = memory.reserve(1024)?;
     let block = block_schema(dimensions)?;
     let mut written = 0u64;
-    let mut partitions = Vec::new();
-    let mut centroids = Vec::new();
-    let mut offsets = Vec::new();
-    let mut lengths = Vec::new();
-    let mut counts = Vec::new();
-    let mut digests = Vec::new();
+    let mut directory_memory = memory.reserve(0)?;
+    let mut entries = Vec::<DirectoryEntry>::new();
+    let mut centroids = Vec::<f32>::new();
+    let directory_memory = Arc::get_mut(&mut directory_memory).expect("generation owns its directory reservation");
+
     let mut start = 0;
     while start < ordered_rows.len() {
         let partition = ordered_rows[start].partition;
         let end = start + ordered_rows[start..].iter().take_while(|row| row.partition == partition).count();
         let members = &ordered_rows[start..end];
-        let (trained, assignment) = kmeans::train(members.len(), dimensions, |index| rows.unit(&members[index]), cancellation)?;
-        let centroids_by_cluster = trained.chunks_exact(dimensions);
-        let mut selections = vec![Vec::new(); centroids_by_cluster.len()];
-        for (row, cluster) in members.iter().zip(assignment) { selections[cluster as usize].push(row); }
-        for (centroid, selected) in centroids_by_cluster.zip(selections) {
-            if selected.is_empty() { continue; }
+        let mut emit = |centroid: &[f32], selected: ClusterRows<'_>| -> Result<()> {
+            if selected.len() == 0 { return Ok(()); }
             if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
             let count = u32::try_from(selected.len()).map_err(|_| corrupt("A cluster exceeds the row count the format records"))?;
             let padding = ((ALIGNMENT - written % ALIGNMENT) % ALIGNMENT) as usize;
             output.write_all(&[0u8; ALIGNMENT as usize][..padding]).map_err(io)?;
-            written += padding as u64;
-            let (length, digest) = write_block(output, &block, &rows, &selected)?;
-            partitions.extend_from_slice(&partition.0);
+            written = generation_end(written, padding as u64)?;
+            let (length, digest) = {
+                let _ipc = memory.reserve(ENCODE_SCRATCH_BYTES)?;
+                write_block(output, &block, &rows, selected)?
+            };
+            let next = generation_end(written, length)?;
+            admit_directory_growth(&mut entries, 1, directory_memory)?;
+            admit_directory_growth(&mut centroids, dimensions, directory_memory)?;
+            entries.push(DirectoryEntry { partition, offset: written, length, count, digest });
             centroids.extend_from_slice(centroid);
-            offsets.push(written);
-            lengths.push(length);
-            counts.push(count);
-            digests.extend_from_slice(&digest);
-            written += length;
+            written = next;
+            Ok(())
+        };
+
+        if members.len() <= kmeans::FLAT_ROWS {
+            emit(rows.unit(&members[0]), ClusterRows::Ordered(members))?;
+        } else {
+            let mut training = memory.reserve(kmeans::scratch_bytes(members.len(), dimensions))?;
+            let (trained, assignment) = kmeans::train(members.len(), dimensions, |index| rows.unit(&members[index]), cancellation)?;
+            let clusters = trained.len() / dimensions;
+            let mut ends = vec![0usize; clusters + 1];
+            for &cluster in &assignment { ends[cluster as usize + 1] += 1; }
+            for cluster in 0..clusters { ends[cluster + 1] += ends[cluster]; }
+            let mut selected = vec![0usize; members.len()];
+            // Filling backwards leaves the original row order within each cluster.
+            for (row, cluster) in assignment.into_iter().enumerate().rev() {
+                let end = &mut ends[cluster as usize + 1];
+                *end -= 1;
+                selected[*end] = row;
+            }
+            ends.remove(0);
+            ends.push(selected.len());
+            Arc::get_mut(&mut training).expect("partition owns its training reservation").shrink_to(
+                trained.capacity() * size_of::<f32>() + ends.capacity() * size_of::<usize>()
+                    + selected.capacity() * size_of::<usize>(),
+            )?;
+            for (centroid, range) in trained.chunks_exact(dimensions).zip(ends.windows(2)) {
+                emit(centroid, ClusterRows::Selected(members, &selected[range[0]..range[1]]))?;
+            }
         }
         start = end;
     }
+    drop(rows);
+    drop(_staging);
+    drop(block);
+    drop(_schema);
+
+    let _ipc = memory.reserve(ENCODE_SCRATCH_BYTES)?;
     let directory = directory_schema(dimensions)?;
-    let count = counts.len();
-    let buffers: [&[u8]; 13] = [
-        &[], &partitions,
-        &[], &[], centroids.to_byte_slice(),
-        &[], offsets.to_byte_slice(),
-        &[], lengths.to_byte_slice(),
-        &[], counts.to_byte_slice(),
-        &[], &digests,
+    let count = entries.len();
+    let mut partitions = entries.iter().map(|entry| entry.partition.0.as_slice());
+    let mut offsets = entries.iter().map(|entry| std::slice::from_ref(&entry.offset).to_byte_slice());
+    let mut lengths = entries.iter().map(|entry| std::slice::from_ref(&entry.length).to_byte_slice());
+    let mut counts = entries.iter().map(|entry| std::slice::from_ref(&entry.count).to_byte_slice());
+    let mut digests = entries.iter().map(|entry| entry.digest.as_slice());
+    use UncompressedBuffer::{Slice, Spans};
+    let mut buffers = [
+        Slice(&[]), Spans { length: count * 32, spans: &mut partitions },
+        Slice(&[]), Slice(&[]), Slice(centroids.to_byte_slice()),
+        Slice(&[]), Spans { length: count * 8, spans: &mut offsets },
+        Slice(&[]), Spans { length: count * 8, spans: &mut lengths },
+        Slice(&[]), Spans { length: count * 4, spans: &mut counts },
+        Slice(&[]), Spans { length: count * 32, spans: &mut digests },
     ];
     let directory_offset = written;
     let (directory_len, digest) = write_counted_stream(
-        output, &directory, count, &[count, count, centroids.len(), count, count, count, count],
-        &mut buffers.map(UncompressedBuffer::Slice),
+        output, &directory, count, &[count, count, centroids.len(), count, count, count, count], &mut buffers,
     )?;
-    written += directory_len;
+    written = generation_end(written, directory_len)?;
     let locator = Locator { directory: (directory_offset, directory_len), dimensions: dimensions_u32, digest };
     output.write_all(&footer(directory_offset, directory_len, dimensions_u32)).map_err(io)?;
-    written += FOOTER_BYTES as u64;
+    written = generation_end(written, FOOTER_BYTES as u64)?;
     Ok(Written { size: written, locator })
 }
 
+const ENCODE_SCRATCH_BYTES: usize = 8192;
+
+struct DirectoryEntry {
+    partition: Partition,
+    offset: u64,
+    length: u64,
+    count: u32,
+    digest: [u8; 32],
+}
+
+fn admit_directory_growth<T>(values: &mut Vec<T>, additional: usize, memory: &mut MemoryReservation) -> Result<()> {
+    let needed = values.len().saturating_add(additional);
+    let current = values.capacity();
+    if needed <= current { return Ok(()); }
+    let capacity = needed.max(current.saturating_mul(2));
+    let held = memory.bytes();
+    memory.grow_to(held.saturating_add(capacity.saturating_mul(size_of::<T>())))?;
+    values.try_reserve_exact(capacity - values.len()).map_err(|error| {
+        Anomaly::fault("rtdb.vector/staging", error.to_string())
+    })?;
+    memory.shrink_to(held.saturating_add((values.capacity() - current).saturating_mul(size_of::<T>())))
+}
+
+fn generation_end(offset: u64, length: u64) -> Result<u64> {
+    offset.checked_add(length).ok_or_else(|| corrupt("Generation size exceeds the file format"))
+}
+
 fn write_block(
-    output: &mut impl Write, schema: &Schema, rows: &IndexedRows, selected: &[&IndexedRow],
+    output: &mut impl Write, schema: &Schema, rows: &IndexedRows, selected: ClusterRows<'_>,
 ) -> Result<(u64, [u8; 32])> {
     use UncompressedBuffer::{Slice, Spans};
 
     let count = selected.len();
-    let mut iids = Vec::with_capacity(count * 16);
-    let mut valid_from = Vec::with_capacity(count);
-    let mut valid_to = Vec::with_capacity(count);
-    let mut system_from = Vec::with_capacity(count);
-    for row in selected {
-        iids.extend_from_slice(&row.iid.0);
-        valid_from.push(row.valid_from);
-        valid_to.push(row.valid_to);
-        system_from.push(row.system_from);
-    }
+    let mut iids = selected.iter().map(|row| row.iid.0.as_slice());
+    let mut valid_from = selected.iter().map(|row| std::slice::from_ref(&row.valid_from).to_byte_slice());
+    let mut valid_to = selected.iter().map(|row| std::slice::from_ref(&row.valid_to).to_byte_slice());
+    let mut system_from = selected.iter().map(|row| std::slice::from_ref(&row.system_from).to_byte_slice());
     let unit_count = count * rows.dimensions();
-    let mut unit_spans = rows.unit_spans(selected).map(|span| span.to_byte_slice());
+    let mut unit_spans = rows.unit_spans(selected.iter()).map(|span| span.to_byte_slice());
     let mut buffers = [
-        Slice(&[]), Slice(&iids),
-        Slice(&[]), Slice(valid_from.to_byte_slice()),
-        Slice(&[]), Slice(valid_to.to_byte_slice()),
-        Slice(&[]), Slice(system_from.to_byte_slice()),
+        Slice(&[]), Spans { length: count * 16, spans: &mut iids },
+        Slice(&[]), Spans { length: count * 8, spans: &mut valid_from },
+        Slice(&[]), Spans { length: count * 8, spans: &mut valid_to },
+        Slice(&[]), Spans { length: count * 8, spans: &mut system_from },
         Slice(&[]), Slice(&[]), Spans { length: unit_count * size_of::<f32>(), spans: &mut unit_spans },
     ];
     write_counted_stream(output, schema, count, &[count, count, count, count, count, unit_count], &mut buffers)
@@ -376,6 +441,9 @@ impl Directory {
                 .filter(|end| offset.is_multiple_of(ALIGNMENT) && offset < *end && *end <= locator.directory.0)
                 .ok_or_else(|| corrupt("A cluster has an invalid range"))?;
         }
+        if (1..partitions.len()).any(|row| partitions.value(row - 1) > partitions.value(row)) {
+            return Err(corrupt("Cluster partitions are out of order"));
+        }
         Ok(Self {
             dimensions, partitions: partitions.clone(), centroids: values,
             offsets: offsets.clone(), lengths: lengths.clone(), counts: counts.clone(),
@@ -385,8 +453,25 @@ impl Directory {
 
     pub(crate) fn len(&self) -> usize { self.offsets.len() }
 
-    pub(crate) fn partition(&self, row: usize) -> Partition {
-        Partition(self.partitions.value(row).try_into().expect("validated partition width"))
+    pub(crate) fn partition_rows(&self, partition: Option<Partition>) -> Range<usize> {
+        let Some(partition) = partition else { return 0..self.len(); };
+        let start = self.partition_bound(|value| value < partition.0.as_slice());
+        let end = self.partition_bound(|value| value <= partition.0.as_slice());
+        start..end
+    }
+
+    fn partition_bound(&self, before: impl Fn(&[u8]) -> bool) -> usize {
+        let mut left = 0;
+        let mut right = self.len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if before(self.partitions.value(middle)) {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        left
     }
 
     pub(crate) fn centroid(&self, row: usize) -> &[f32] {
@@ -481,12 +566,17 @@ mod tests {
         rows
     }
 
+    fn write_fixture(rows: IndexedRows, output: &mut impl Write, cancellation: &CancellationToken) -> Result<Written> {
+        let memory = MemoryBudget::new(1 << 20);
+        write_generation(rows, memory.reserve(0)?, output, &memory, cancellation)
+    }
+
     #[test]
     fn a_generation_is_a_function_of_its_rows() {
         let token = CancellationToken::new();
         let (mut first, mut second) = (Vec::new(), Vec::new());
-        let written = write_generation(rows(0..1_000), &mut first, &token).unwrap();
-        write_generation(rows((0..1_000).rev()), &mut second, &token).unwrap();
+        let written = write_fixture(rows(0..1_000), &mut first, &token).unwrap();
+        write_fixture(rows((0..1_000).rev()), &mut second, &token).unwrap();
         assert_eq!(first, second);
         assert_eq!(written.size, first.len() as u64);
         let locator = Locator::decode(&written.locator.encode()).unwrap();
@@ -499,6 +589,12 @@ mod tests {
         let directory = Directory::read(StoredBytes(directory_bytes), &locator, &memory).unwrap();
         let total: u32 = (0..directory.len()).map(|row| directory.cluster(row).rows).sum();
         assert_eq!(total, 1_000);
+        for value in [0, 1, 2] {
+            let partition = Partition::of([Some(std::borrow::Cow::Owned(rtdb_types::Value::I64(value)))]).unwrap();
+            let matching = directory.partition_rows(Some(partition));
+            let count: u32 = matching.map(|row| directory.cluster(row).rows).sum();
+            assert_eq!(count, if value == 2 { 0 } else { 500 });
+        }
         let schema = block_schema(2).unwrap();
         let mut previous_end = 0u64;
         for cluster in (0..directory.len()).map(|row| directory.cluster(row)) {
@@ -525,31 +621,31 @@ mod tests {
     fn cluster_stream_uses_the_selected_unit_order() {
         let rows = rows([0, 2, 4, 6]);
         let source = rows.rows();
-        let contiguous = [&source[1], &source[2], &source[3]];
-        let reordered = [&source[3], &source[1], &source[2]];
-        let gapped = [&source[0], &source[2], &source[3]];
+        let contiguous = ClusterRows::Ordered(&source[1..]);
+        let reordered = ClusterRows::Selected(source, &[3, 1, 2]);
+        let gapped = ClusterRows::Selected(source, &[0, 2, 3]);
 
         let schema = block_schema(2).unwrap();
         let memory = MemoryBudget::new(1 << 20);
         for (selected, run_lengths) in [(contiguous, &[3][..]), (reordered, &[1, 2][..]), (gapped, &[1, 2][..])] {
-            let mut spans = rows.unit_spans(&selected);
+            let mut spans = rows.unit_spans(selected.iter());
             let mut start = 0;
             for &run_length in run_lengths {
                 let span = spans.next().unwrap();
-                assert_eq!(span.as_ptr(), rows.unit(selected[start]).as_ptr());
+                assert_eq!(span.as_ptr(), rows.unit(selected.iter().nth(start).unwrap()).as_ptr());
                 assert_eq!(span.len(), run_length * rows.dimensions());
                 start += run_length;
             }
             assert!(spans.next().is_none());
 
             let mut bytes = Vec::new();
-            let (length, digest) = write_block(&mut bytes, &schema, &rows, &selected).unwrap();
+            let (length, digest) = write_block(&mut bytes, &schema, &rows, selected).unwrap();
             let cluster = Cluster { range: 0..length, rows: selected.len() as u32, digest };
             let buffer = Buffer::from_vec(bytes);
             let batch = decode(StoredBytes(buffer.clone()), || Ok(Arc::clone(&schema)), Some(selected.len()), &memory).unwrap();
             assert_eq!(buffer.as_slice(), encode(&schema, batch.batch).unwrap().as_slice());
             let block = Block::read(StoredBytes(buffer), &cluster, 2, &memory).unwrap();
-            for (index, row) in selected.into_iter().enumerate() {
+            for (index, row) in selected.iter().enumerate() {
                 assert_eq!(block.iid(index).unwrap(), row.iid);
                 assert_eq!(block.extent(index), (row.valid_from, row.valid_to, row.system_from));
                 assert_eq!(block.unit(index), rows.unit(row));
@@ -572,16 +668,16 @@ mod tests {
 
         let token = CancellationToken::new();
         let mut expected = Vec::new();
-        let written = write_generation(rows(0..4), &mut expected, &token).unwrap();
+        let written = write_fixture(rows(0..4), &mut expected, &token).unwrap();
         let mut output = ShortOutput { bytes: Vec::new(), limit: expected.len() };
-        let actual = write_generation(rows(0..4), &mut output, &token).unwrap();
+        let actual = write_fixture(rows(0..4), &mut output, &token).unwrap();
         assert_eq!(actual.locator, written.locator);
         assert_eq!(actual.size, written.size);
         assert_eq!(output.bytes, expected);
 
         let limit = written.locator.directory.0 as usize - END.len() - 1;
         let mut output = ShortOutput { bytes: Vec::new(), limit };
-        let error = write_generation(rows(0..4), &mut output, &token).err().unwrap();
+        let error = write_fixture(rows(0..4), &mut output, &token).err().unwrap();
         assert_eq!(error.code, "rtdb.vector/io");
         assert_eq!(output.bytes.as_slice(), &expected[..limit]);
     }
@@ -589,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn directory_and_cluster_columns_keep_their_range_and_decode_charges() {
         let mut bytes = Vec::new();
-        let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
+        let locator = write_fixture(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
         let key = ObjectKey::new("vector").unwrap();
         let range_owner = size_of::<CacheLease>() + 2 * BUFFER_OWNER_BYTES;
         let directory_len = locator.directory.1 as usize;
@@ -661,7 +757,7 @@ mod tests {
     #[test]
     fn misaligned_cluster_values_still_decode_and_bad_records_decline() {
         let mut bytes = Vec::new();
-        let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
+        let locator = write_fixture(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
         let aligned = Buffer::from_slice_ref(&bytes);
         let memory = MemoryBudget::new(1 << 20);
         let directory_bytes = aligned.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize);
