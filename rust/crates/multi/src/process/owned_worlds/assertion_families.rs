@@ -149,8 +149,7 @@ impl Scope {
 
     fn derived(&self, family: Uuid, row: FamilyDerivedRow) -> Result<DerivedRow> {
         if row.world.is_none() {
-            let selector = std::str::from_utf8(&row.key).ok()
-                .and_then(|key| rtdb_types::RootFamilyDerivativeId::parse(key).ok().flatten())
+            let selector = rtdb_types::RootFamilyDerivativeId::parse(&row.key).ok().flatten()
                 .ok_or_else(|| scope_mismatch("Root derivatives require a reserved landing selector"))?;
             if selector.family != *family.as_bytes() || selector.member != row.member {
                 return Err(scope_mismatch("Root derivative selector differs from its family member"));
@@ -385,7 +384,7 @@ impl rtdb_storage::sealing::RootRankAuthority for RootRankCustody {
         };
         let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(OwnedWorld::unavailable)?
             .with_original_reader(&self.original, self.deployment, &self.cancellation);
-        families.require_root_rank_landing(scope.family(selected.family), stage, binding, selected.relation, selected.selector.as_bytes())
+        families.require_root_rank_landing(scope.family(selected.family), stage, binding, selected.relation, selected.selector)
             .await?;
         let current = self.original.current(self.deployment, &self.cancellation).await?;
         if current.assertion_family_fence(selected.family).await?.is_some() {

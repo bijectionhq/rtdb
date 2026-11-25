@@ -589,8 +589,7 @@ impl<'a> AssertionFamilies<'a> {
                     return Err(conflict());
                 }
                 if row.world.is_none() {
-                    let selector = std::str::from_utf8(&row.key).ok()
-                        .and_then(|key| rtdb_types::RootFamilyDerivativeId::parse(key).ok().flatten())
+                    let selector = rtdb_types::RootFamilyDerivativeId::parse(&row.key).ok().flatten()
                         .ok_or_else(conflict)?;
                     if selector.member != row.member
                         || !record.landings.iter().any(|landing| landing.reservation.destination == row.member)
@@ -709,13 +708,14 @@ impl<'a> AssertionFamilies<'a> {
                 return Err(conflict());
             }
             let fence = record.fence_inventory(marker.order);
-            let roots = fence.derived.iter().filter(|row| row.world.is_none());
-            if marker.inventory != fence.vault_inventory() || roots.clone().count() != root_erases.len() {
+            if marker.inventory != fence.vault_inventory()
+                || fence.derived.iter().filter(|row| row.world.is_none()).count() != root_erases.len()
+            {
                 return Err(conflict());
             }
-            for row in roots {
-                let relation = OwnedRelation::new(row.relation.as_str())?;
-                let id = EntityId::String(std::str::from_utf8(&row.key).map_err(|_| conflict())?.to_owned());
+            for row in fence.derived.into_iter().filter(|row| row.world.is_none()) {
+                let relation = OwnedRelation::new(row.relation)?;
+                let id = EntityId::Binary(row.key);
                 if !root_erases.contains(&(&relation, &id)) {
                     return Err(conflict());
                 }
@@ -1159,9 +1159,13 @@ mod tests {
             capability: stage(realm), link_capability: stage(realm), review_commitment: [7; 32],
         };
         families.reserve_landing(family, reservation).await?;
+        let mut address = rtdb_types::RootRowCarrier::table_prefix(&[1; 16]).to_vec();
+        address.extend_from_slice(&[0, 255, 0, 255]);
+        address.extend_from_slice(&[2; 64]);
+        address.extend_from_slice(&[0, 1]);
         let root = DerivedRow {
             member: reservation.destination,
-            key: format!("bjrl1/{}/{}/01", "01".repeat(16), "03".repeat(32)).into_bytes(),
+            key: [rtdb_types::RootFamilyDerivativeId::PREFIX, &[1; 16], &[3; 32], &address].concat(),
             ..raw_root
         };
         assert!(families.require_reserved_root_derivative(family, root.member, &root.relation, &root.key).await.is_err());

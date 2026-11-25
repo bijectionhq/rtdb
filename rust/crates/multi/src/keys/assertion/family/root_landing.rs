@@ -276,9 +276,15 @@ mod tests {
         };
         let release = |binding| FamilyReleaseInput::RootLanding { member, binding };
         let open = |binding| families.open_root_landing_payload(family, reservation.capability, binding, payload.clone(), &vault);
+        let mut address = rtdb_types::RootRowCarrier::table_prefix(&[1; 16]).to_vec();
+        address.extend_from_slice(&[0, 255, 0, 255]);
+        address.extend_from_slice(&[2; 64]);
+        address.extend_from_slice(&[0, 1]);
+        let selector = [rtdb_types::RootFamilyDerivativeId::PREFIX, family.as_bytes(),
+            &reservation.destination.to_bytes(), &address].concat();
         let derivative = DerivedRow {
             member: reservation.destination, world: None, capability: None,
-            relation: "fact_label_search".into(), key: b"bjrl1/exact".to_vec(),
+            relation: "fact_label_search".into(), key: selector,
         };
         families.register_derived(family, std::slice::from_ref(&derivative)).await?;
         let rank = |binding, key| families.require_root_rank_landing(
@@ -306,7 +312,10 @@ mod tests {
         assert!(open(RootLandingBinding { position: position(4), ..binding }).await.is_err());
         assert_eq!(open(binding).await?, carrier);
         rank(binding, &derivative.key).await?;
-        assert!(rank(binding, b"bjrl1/other").await.is_err());
+        let mut foreign = derivative.key.clone();
+        let offset = foreign.len() - 3;
+        foreign[offset] = 3;
+        assert!(rank(binding, &foreign).await.is_err());
         assert!(rank(RootLandingBinding { position: position(4), ..binding }, &derivative.key).await.is_err());
         let fence = families.fence(family, binding.position, Uuid::new_v4()).await?;
         assert_eq!(fence.positions, BTreeSet::from([original.position, binding.position]));

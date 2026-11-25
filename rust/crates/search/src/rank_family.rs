@@ -23,23 +23,23 @@ pub(crate) async fn needs_rank_family(
 }
 
 pub(crate) struct RootProjectionId<'a> {
-    physical: &'a str,
+    physical: &'a [u8],
     landing: Option<RootFamilyDerivativeId<'a>>,
 }
 
 impl<'a> RootProjectionId<'a> {
     pub(crate) fn parse(id: EntityIdRef<'a>) -> Result<Self> {
-        let EntityIdRef::String(physical) = id else { return Err(unavailable()); };
-        if physical.is_empty() { return Err(unavailable()); }
+        let EntityIdRef::Binary(physical) = id else { return Err(unavailable()); };
         let landing = RootFamilyDerivativeId::parse(physical).map_err(|_| unavailable())?;
+        if landing.is_none() && !rtdb_types::is_rank_row_address(physical) { return Err(unavailable()); }
         Ok(Self { physical, landing })
     }
 
     pub(crate) fn canonical(&self) -> EntityIdRef<'a> {
-        EntityIdRef::String(self.address())
+        EntityIdRef::Binary(self.address())
     }
 
-    fn address(&self) -> &'a str {
+    fn address(&self) -> &'a [u8] {
         self.landing.map_or(self.physical, |landing| landing.address)
     }
 
@@ -49,6 +49,7 @@ impl<'a> RootProjectionId<'a> {
     ) -> Result<()> {
         let Some(landing) = self.landing else { return Ok(()); };
         PlaintextView::charge_rank_carrier()?;
+        let _keys = context.memory.reserve(3 * landing.address.len() + 256)?;
         let alias = self.canonical().into_owned();
         if read_owned_point_revision(Arc::clone(context), owner, relation, &alias, Interval::at(valid)?)
             .await?.is_some()
@@ -56,11 +57,10 @@ impl<'a> RootProjectionId<'a> {
             return Err(unavailable());
         }
 
-        let _keys = context.memory.reserve(landing.address.len() + 256)?;
-        let address = RootRowCarrier::decode_named_address(landing.address).ok_or_else(unavailable)?;
-        let journal_id = EntityId::Binary(RootRowCarrier::parse(&address).ok_or_else(unavailable)?.assertion_key());
+        let address = landing.address;
+        let journal_id = EntityId::Binary(RootRowCarrier::parse(address).ok_or_else(unavailable)?.assertion_key());
         let carrier_relation = OwnedRelation::new(ROOT_ROW_CARRIERS)?;
-        let carrier = EntityId::Binary(address);
+        let carrier = EntityId::Binary(address.to_vec());
         let page = point(context, owner, &carrier_relation, &carrier, valid).await?;
         let body = ArrowCell::named(page.batch(), "sealed_payload", 0)
             .and_then(ArrowCell::binary).ok_or_else(unavailable)?;
@@ -82,7 +82,7 @@ impl<'a> RootProjectionId<'a> {
             .filter(|bytes| bytes.len() == size_of::<i64>()).ok_or_else(unavailable)?;
         let publication = owned_row_revision(position.batch(), 0, &journal_id, &context.memory)?;
         let carrier_revision = owned_row_revision(page.batch(), 0, &carrier, &context.memory)?;
-        let derivative_revision = owned_row_revision_for(projection, row, EntityIdRef::String(self.physical), &context.memory)?;
+        let derivative_revision = owned_row_revision_for(projection, row, EntityIdRef::Binary(self.physical), &context.memory)?;
         if publication != carrier_revision || derivative_revision < publication || publication.0 <= 0 {
             return Err(unavailable());
         }
@@ -102,7 +102,7 @@ impl<'a> RootProjectionId<'a> {
         entry.extend_from_slice(stage);
         entry.extend_from_slice(&publication.to_be_bytes());
         entry.extend_from_slice(&ordinal.get().to_be_bytes());
-        for field in [relation.name().as_bytes(), self.physical.as_bytes()] {
+        for field in [relation.name().as_bytes(), self.physical] {
             entry.extend_from_slice(&(field.len() as u16).to_be_bytes());
             entry.extend_from_slice(field);
         }
