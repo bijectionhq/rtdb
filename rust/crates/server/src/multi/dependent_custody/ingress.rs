@@ -25,7 +25,7 @@ use super::{
     },
     *,
 };
-use crate::multi::{DatabaseOpen, open_database, retryable};
+use crate::multi::{DatabaseOpen, catalog::Status, open_database, retryable};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -292,7 +292,7 @@ impl Ingress {
         }
         let path = parts.uri.path();
         let role = match path {
-            METADATA => self
+            METADATA | METADATA_POINT => self
                 .metadata
                 .iter()
                 .any(|reader| reader.client_certificate_sha256 == certificate),
@@ -322,6 +322,13 @@ impl Ingress {
                 return empty(StatusCode::BAD_REQUEST);
             };
             self.metadata(runtime, certificate, request)
+                .await
+                .and_then(|result| reply(&body, result))
+        } else if path == METADATA_POINT {
+            let Ok(request) = serde_json::from_slice::<MetadataPointRequest>(&body) else {
+                return empty(StatusCode::BAD_REQUEST);
+            };
+            self.metadata_point(runtime, node, certificate, request)
                 .await
                 .and_then(|result| reply(&body, result))
         } else if matches!(path, SETTLE | STATUS) {
@@ -425,21 +432,7 @@ impl Ingress {
         request: MetadataRequest,
     ) -> Result<MetadataResult> {
         let scope = request.scope;
-        if request.version != VERSION {
-            return Err(refused());
-        }
-        let profile = self
-            .metadata
-            .iter()
-            .find(|profile| {
-                profile.client_certificate_sha256 == certificate
-                    && matches_scope(
-                        profile.source_incarnation,
-                        profile.destination_incarnation,
-                        scope,
-                    )
-            })
-            .ok_or_else(refused)?;
+        let profile = self.metadata_profile(certificate, request.version, scope)?;
         let selected = runtime
             .managed_entry(&profile.destination, profile.destination_incarnation)
             .await?;
@@ -491,6 +484,110 @@ impl Ingress {
             return Err(refused());
         }
         Ok(MetadataResult::Ready { metadata })
+    }
+
+    fn metadata_profile(
+        &self,
+        certificate: [u8; 32],
+        version: u32,
+        scope: NativeDependentCustodyScope,
+    ) -> Result<&MetadataProfile> {
+        if version != VERSION {
+            return Err(refused());
+        }
+        self.metadata
+            .iter()
+            .find(|profile| {
+                profile.client_certificate_sha256 == certificate
+                    && matches_scope(
+                        profile.source_incarnation,
+                        profile.destination_incarnation,
+                        scope,
+                    )
+            })
+            .ok_or_else(refused)
+    }
+
+    async fn metadata_point(
+        &self,
+        runtime: &MultiRuntime,
+        node: &Node,
+        certificate: [u8; 32],
+        request: MetadataPointRequest,
+    ) -> Result<MetadataPointResult> {
+        let scope = request.point.scope;
+        let profile = self.metadata_profile(certificate, request.version, scope)?;
+        let selected = runtime
+            .catalog
+            .read_deployment(&profile.destination, profile.destination_incarnation)
+            .await?;
+        if selected.managed_transfer()?.reservation != scope.reservation {
+            return Err(refused());
+        }
+        let ready_at = selected.written;
+        let Status::ManagedTransferReady { transfer, basis } = selected.status else {
+            return Ok(MetadataPointResult::Pending);
+        };
+        if basis != scope.destination
+            || runtime
+                .native_checkpoint_provider(&profile.destination, &transfer)
+                .is_none()
+        {
+            return Err(refused());
+        }
+        let mut database = match open_database(
+            &runtime.backends,
+            &runtime.kms,
+            profile.destination_incarnation,
+            DatabaseOpen::Prepared,
+        )
+        .await
+        {
+            Ok(database) => database,
+            Err(error) if retryable(&error) => return Ok(MetadataPointResult::Pending),
+            Err(error) => return Err(error),
+        };
+        let (restored, view, generation) = database
+            .require_managed_checkpoint_restore(scope.reservation)
+            .await?;
+        if restored != basis {
+            return Err(refused());
+        }
+        let point = view.native_dependent_point_selector(&request.point, node.now())?;
+
+        let (restored, view, current_generation) = database
+            .require_managed_checkpoint_restore(scope.reservation)
+            .await?;
+        if restored != basis
+            || view.native_dependent_point_selector(&request.point, node.now())? != point
+        {
+            return Err(refused());
+        }
+        if current_generation != generation {
+            return Ok(MetadataPointResult::Pending);
+        }
+        let selected = runtime
+            .catalog
+            .read_deployment(&profile.destination, profile.destination_incarnation)
+            .await?;
+        if selected.written != ready_at
+            || !matches!(selected.status,
+            Status::ManagedTransferReady { transfer: current, basis: current_basis }
+                if current == transfer && current_basis == basis)
+        {
+            return Err(refused());
+        }
+        let (branch_created, valid, member) = point;
+        Ok(MetadataPointResult::Ready {
+            point: NativeDependentPointSelector {
+                scope,
+                destination_generation: generation,
+                branch_created,
+                valid_at: request.point.valid_at,
+                valid,
+                member,
+            },
+        })
     }
 
     async fn settlement(

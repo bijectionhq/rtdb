@@ -202,6 +202,18 @@ impl Catalog {
         read(&mut *self.database.lock().await).await
     }
 
+    pub(super) async fn read_deployment(&self, name: &str, database: Uuid) -> Result<Deployment> {
+        let mut control = self.database.lock().await;
+        let (index, generation) = control.fresh_view().await?;
+        let at = index.head().system_time;
+        let view = index.view(MAIN_BRANCH, At::Latest, Layer::Local, at)?;
+        let row = view.row(&table(), &EntityId::String(name.to_owned()), at).ok_or_else(conflict)?;
+        let image = row.image_at(at).ok_or_else(invalid_catalog)?;
+        let deployment = decode_deployment(name, row.cut.basis, &image.cells)?;
+        control.check_generation(generation).await?;
+        check_identity(deployment, database)
+    }
+
     /// Selects a stable incarnation before any provisioner opens its data stream.
     pub(super) async fn reserve(&self, name: &str, database: Uuid) -> Result<Deployment> {
         self.reserve_status(name, database, Status::Reserved).await
@@ -633,48 +645,43 @@ async fn read(control: &mut MultiDatabase) -> Result<BTreeMap<String, Deployment
         };
         let row = view.row(&table, id, at).ok_or_else(invalid_catalog)?;
         let image = row.image_at(at).ok_or_else(invalid_catalog)?;
-        let (Some(Value::Uuid(database)), Some(Value::Bool(ready))) =
-            (image.cells.get("database"), image.cells.get("ready"))
-        else {
-            return Err(invalid_catalog());
-        };
-        let status = decode_status(*ready, *database, &image.cells)?;
-        if let Status::ClassicCandidate { held: Some(held), .. } = &status
-            && (!held.valid_for(Uuid::from_bytes(row.cut.basis.incarnation()), Uuid::from_bytes(*database))
-                || held.reserved_at >= row.cut.basis)
-        {
-            return Err(invalid_catalog());
-        }
-        if let Status::ClassicCandidate { request, held, opening: Some(opening), .. } = &status {
-            let catalog = Uuid::from_bytes(row.cut.basis.incarnation());
-            let witness = &opening.witness;
-            if !witness.valid(catalog) || witness.name() != name || *witness.database().as_bytes() != *database
-                || witness.held_ready.binding_sha256 != *request
-                || held.as_deref() != Some(&witness.held_ready.ready)
-                || witness.held_ready.recorded_at >= row.cut.basis
-                || matches!(&opening.phase, OpeningPhase::Opening { profile } | OpeningPhase::Opened { profile, .. } if *profile == [0; 32])
-                || matches!(&opening.phase, OpeningPhase::Opened { workload_fence, .. } if !witness.valid_fence(workload_fence))
-            {
-                return Err(invalid_catalog());
-            }
-        }
-        if let Status::ManagedTransferReady { transfer, .. } = &status {
-            let reserved_at = transfer.reservation.reserved_at;
-            if reserved_at.incarnation() != row.cut.basis.incarnation() || reserved_at >= row.cut.basis {
-                return Err(invalid_catalog());
-            }
-        }
-        entries.insert(
-            name.clone(),
-            Deployment {
-                database: Uuid::from_bytes(*database),
-                status,
-                written: row.cut.basis,
-            },
-        );
+        entries.insert(name.clone(), decode_deployment(name, row.cut.basis, &image.cells)?);
     }
     control.check_generation(generation).await?;
     Ok(entries)
+}
+
+fn decode_deployment(name: &str, written: Basis, cells: &StructFields<Value>) -> Result<Deployment> {
+    let (Some(Value::Uuid(database)), Some(Value::Bool(ready))) = (cells.get("database"), cells.get("ready")) else {
+        return Err(invalid_catalog());
+    };
+    let status = decode_status(*ready, *database, cells)?;
+    let database = Uuid::from_bytes(*database);
+    let catalog = Uuid::from_bytes(written.incarnation());
+    if let Status::ClassicCandidate { held: Some(held), .. } = &status
+        && (!held.valid_for(catalog, database) || held.reserved_at >= written)
+    {
+        return Err(invalid_catalog());
+    }
+    if let Status::ClassicCandidate { request, held, opening: Some(opening), .. } = &status {
+        let witness = &opening.witness;
+        if !witness.valid(catalog) || witness.name() != name || witness.database() != database
+            || witness.held_ready.binding_sha256 != *request
+            || held.as_deref() != Some(&witness.held_ready.ready)
+            || witness.held_ready.recorded_at >= written
+            || matches!(&opening.phase, OpeningPhase::Opening { profile } | OpeningPhase::Opened { profile, .. } if *profile == [0; 32])
+            || matches!(&opening.phase, OpeningPhase::Opened { workload_fence, .. } if !witness.valid_fence(workload_fence))
+        {
+            return Err(invalid_catalog());
+        }
+    }
+    if let Status::ManagedTransferReady { transfer, .. } = &status {
+        let reserved_at = transfer.reservation.reserved_at;
+        if reserved_at.incarnation() != written.incarnation() || reserved_at >= written {
+            return Err(invalid_catalog());
+        }
+    }
+    Ok(Deployment { database, status, written })
 }
 
 async fn find(control: &mut MultiDatabase, name: &str) -> Result<Deployment> {

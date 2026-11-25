@@ -616,6 +616,18 @@ The reader rejects missing, erased, tombstoned, protected, expired, or out-of-bo
 The response includes the configured metadata JSON and reverse commitments.
 It excludes protected carrier bytes and provides no ordinary Query or new route readiness.
 
+Use the same destination metadata mTLS leaf for `POST /rtdb/native-dependent-custody/v1/metadata/point`.
+The body is `{"version":1,"point":{"scope":SCOPE,"branch":BRANCH,"table":{"schema":NAME,"table":NAME},"id":TYPED_ID,"valid_at":MICROS,"placement":[...]}}`.
+Select one exact enrolled native placement on its physical branch and supply the authorized valid instant in microseconds.
+The mounted destination uses the exact ready catalog entry and checked native restore to find the physical winner at both the restore and current cuts.
+It observes the generation and the same winner again before returning the evidence.
+The request-bound reply has `kind: "ready"` and `point` containing `scope`, `destination_generation`, `branch_created`, `valid_at`, `valid` and `member`.
+`branch_created` is the creation Basis in destination coordinates and `valid` contains the winning interval's `lower` and exclusive `upper` in microseconds.
+The `member` has the same fields as one reverse census member, with its actual native occurrence, typed target and Original `source_basis` and `enrolled` coordinates.
+An exact reservation still awaiting readiness or a generation change during observation returns `kind: "pending"`.
+Match the returned member against the independent destination enrollment before constructing `/inherited/read` with the retained application key.
+The selector returns coordinates and commitments, and the existing Original read and carrier actions authorize subsequent release.
+
 Use `rtdb native-dependent-custody settle|status --connection-file PATH --request-file PATH` on the separately commissioned source operator ingress.
 The connection file uses the same TLS profile and points at the selected source writer.
 The request file contains `{"version":1,"settlement":{"destination":"...","scope":{...},"fence":{...}}}`.
@@ -707,6 +719,10 @@ The source orders under the current writer fence and returns `kind: "disposed"` 
 Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
 Qualify `managed_catalog_waits_for_confirmation_and_drains_and_recovers_a_lost_unpin_reply` for the private catalog and mounted destination attachment gates.
 Qualify `native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain` for the native forward enrollment, reciprocal restore, unpin and original revocation fence.
+Use the copied child branch from the same fixture to match its destination creation Basis and half-open valid interval with its Original enrolled member.
+Exercise the private selector with a substitute placement, a different typed entity with the same text, a valid instant at exclusive expiry, and a point shadowed after restore.
+Rotate the destination generation between selector observations and again before `/inherited/read` to check retry and refusal at the correct boundary.
+Exercise the separate metadata, settlement and inherited reader leaves and confirm that the selector carries neither the application key nor any carrier bytes.
 At the installed boundary, lose replies after the source pin, destination append, reverse-vault terminal and source unpin, and recover the same terminal from trimmed history.
 Exercise multiple original families and ranked derivatives, an unknown group or missing source carrier, a substituted row slot, wrong source and destination incarnations, a changed reservation Basis, and a concurrent fence of each contributing family.
 Rotate the destination generation between protected opening and delivery, and verify that late replies cannot admit a send, that settled send evidence survives restart, and that ordinary export and unpin cannot bypass the managed fence.

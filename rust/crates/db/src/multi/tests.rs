@@ -391,11 +391,13 @@ async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
 
 #[tokio::test]
 async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain() {
+    use rtdb_index::branches::{BranchCut, BranchEvent, WrittenVersion};
     use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, CustodyWriterFence, DerivedCustodyReservation};
+    use rtdb_types::Interval;
     use rtdb_types::rtdb_v1::{
         DependentApplicationKey, DependentCustodyReceipt, DependentKeyCustody, DependentKeyDisposition,
         DependentKeyTerminal, NativeCustodyFence, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
-        NativeDependentCustodyMember, NativeDependentCustodyOrder, NativeDependentCustodyScope, NativeDependentRead,
+        NativeDependentCustodyMember, NativeDependentCustodyOrder, NativeDependentCustodyScope, NativeDependentPoint, NativeDependentRead,
     };
     use sha2::{Digest, Sha256};
 
@@ -404,6 +406,13 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     source.create().await.unwrap();
     source.tick(&live(1)).await.unwrap();
+    let fork_at = source.fresh_index().await.unwrap().head().basis;
+    let fork = request(50, Op::Fork {
+        child: "copied-point".into(), from: (MAIN_BRANCH.into(), fork_at), writable: true, expires_at: None,
+    });
+    let forked = append_custody_fixture(&mut source, &fork).await;
+    assert_eq!(forked.outcome, Outcome::Then);
+    let linked_valid = Interval::from_micros(0, 10_000).unwrap();
     let registry = TableRef::new("public", "custody_registry");
     let mut placements = Vec::new();
     for n in [1, 2] {
@@ -439,9 +448,9 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
             let binding = [3; 32];
             let payload = vault.seal(group, binding, &clear).await.unwrap();
             write.ops.push(Op::PlaceCustodyRow {
-                branch: MAIN_BRANCH.into(), table: table(),
+                branch: "copied-point".into(), table: table(),
                 row: Row {
-                    id: EntityId::Integer(3), valid: None, cells: StructFields::new(),
+                    id: EntityId::Integer(3), valid: Some(linked_valid.into()), cells: StructFields::new(),
                     custody_group: Some(group), protected_columns: vec!["carrier".into(), "link".into()],
                     custody_payload: Some(CustodyPayload { binding, envelope: payload }),
                 },
@@ -544,9 +553,32 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     assert_eq!(copy, &claim);
     let derived = NativeDependentRead {
         placement: [3; 16], occurrence: metadata.members[1].native.occurrence.unwrap(),
+        branch: "copied-point".into(), branch_created: Basis::new(installed.incarnation(), forked.basis.position()),
         id: EntityId::Integer(3), ..read.clone()
     };
     let (_, derived_binding) = view.native_dependent_destination(&derived, original.system_time).unwrap();
+    let point = NativeDependentPoint {
+        scope, branch: derived.branch.clone(), table: derived.table.clone(), id: derived.id.clone(),
+        valid_at: derived.valid_at, placement: derived.placement,
+    };
+    let (created, valid, member) = view.native_dependent_point_selector(&point, original.system_time).unwrap();
+    assert_eq!((created, valid), (derived.branch_created, linked_valid));
+    assert_eq!(member, metadata.members[1]);
+    let outside = NativeDependentPoint { valid_at: linked_valid.upper(), ..point.clone() };
+    assert!(view.native_dependent_point_selector(&outside, original.system_time).is_err());
+    let other_id = NativeDependentPoint { id: EntityId::String("3".into()), ..point.clone() };
+    assert!(view.native_dependent_point_selector(&other_id, original.system_time).is_err());
+    let other_placement = NativeDependentPoint { placement: *group, ..point.clone() };
+    assert!(view.native_dependent_point_selector(&other_placement, original.system_time).is_err());
+    let mut shadowed = view.clone();
+    let head = shadowed.head();
+    let cut = BranchCut { basis: Basis::new(head.basis.incarnation(), head.basis.position() + 1), system_time: head.system_time.next().unwrap() };
+    shadowed.advance(cut).unwrap();
+    shadowed.apply(BranchEffect::Write {
+        branch: point.branch.clone(), table: point.table.clone(),
+        event: BranchEvent { id: point.id.clone(), valid: linked_valid, cut, image: None, written: WrittenVersion::Branch },
+    }).unwrap();
+    assert!(shadowed.native_dependent_point_selector(&point, cut.system_time).is_err());
     let mut substituted = read.clone();
     substituted.placement = *other_group;
     assert!(view.check_native_dependent_destination(&substituted, original.system_time).is_err());

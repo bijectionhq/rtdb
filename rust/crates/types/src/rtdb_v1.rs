@@ -175,6 +175,17 @@ pub struct NativeDependentRead {
     pub application_key: [u8; 32],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentPoint {
+    pub scope: NativeDependentCustodyScope,
+    pub branch: Branch,
+    pub table: TableRef,
+    pub id: EntityId,
+    pub valid_at: Timestamp,
+    pub placement: [u8; 16],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeDependentSourceGeneration {
@@ -201,6 +212,17 @@ pub struct NativeDependentCheckpointMember {
     pub branch: String,
     pub table: String,
     pub target: EntityId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentPointSelector {
+    pub scope: NativeDependentCustodyScope,
+    pub destination_generation: u64,
+    pub branch_created: Basis,
+    pub valid_at: Timestamp,
+    pub valid: Interval,
+    pub member: NativeDependentCheckpointMember,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

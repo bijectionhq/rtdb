@@ -621,6 +621,8 @@ contract LogService {
         -- The source group's release drain requires its own releases and every dependent disposition.
         -- The installed source writer checks the commissioned destination owner and exact observation request before ordering a positive receipt.
         -- The destination metadata reader authenticates the applied private restore and returns its reverse census and commissioned group metadata.
+        -- The private destination selector uses the ready native restore to observe one enrolled physical placement at the caller's valid instant.
+        -- The selector returns the destination generation, branch creation, and the winning occurrence's validity and native enrollment coordinates from the checked restore.
         -- The source operator recovers a disposition only by its exact retained order and receipt.
         -- The native inherited attachment withholds plaintext until it has an exact destination response-release authority.
 
@@ -4043,6 +4045,7 @@ surface ScopedRowVisibility {
 
     @guarantee NativeDependentReadEvidence
         -- A commissioned destination owner selects one physical branch creation, valid point and enrolled placement at an exact native restore and current destination generation.
+        -- The destination owner matches the selected native member to its independently retained enrollment before supplying the application key to the Original read.
         -- The current Original writer confirms the same occurrence at the pinned source cut and current point, the applied carrier receipt and each copied group's live fence.
         -- The independently commissioned destination registry recovers the exact retained enrollment, registered frame, selected application key and exclusive cutoff for the response part.
         -- The release proof rechecks the Original writer, journal epoch and key generation and the destination generation after observing the registered part.

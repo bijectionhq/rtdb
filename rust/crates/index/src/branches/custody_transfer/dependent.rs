@@ -2,7 +2,8 @@ use rtdb_types::rtdb_v1::{
     DependentCustodyReceipt, DependentKeyCustody, DependentKeyTerminal, NativeCheckpointMember,
     NativeCustodyFence, NativeDependentCheckpointMember, NativeDependentCheckpointMetadata,
     NativeDependentCheckpointRow, NativeDependentCustodyDisposition,
-    NativeDependentCustodyEnrollment, NativeDependentCustodyScope, NativeDependentRead,
+    NativeDependentCustodyEnrollment, NativeDependentCustodyScope, NativeDependentPoint,
+    NativeDependentRead,
 };
 
 use super::*;
@@ -15,6 +16,14 @@ pub(super) struct Dependent {
     pub(super) disposition: Option<NativeDependentCustodyDisposition>,
 }
 
+struct PointSlot<'a> {
+    branch: &'a str,
+    table: &'a TableRef,
+    id: &'a EntityId,
+    valid_at: Timestamp,
+    placement: CustodyPlacementId,
+}
+
 impl BranchIndex {
     pub fn check_native_dependent_destination(&self, read: &NativeDependentRead, now: Timestamp) -> Result<&NativeCheckpointCustody> {
         self.native_dependent_destination(read, now).map(|(custody, _)| custody)
@@ -23,7 +32,54 @@ impl BranchIndex {
     pub fn native_dependent_destination(
         &self, read: &NativeDependentRead, now: Timestamp,
     ) -> Result<(&NativeCheckpointCustody, [u8; 32])> {
-        let scope = read.scope;
+        let custody = self.native_destination_scope(read.scope)?;
+        let (_, payload) = self.native_dependent_point(read, read.scope.destination, now)?;
+        Ok((custody, payload.binding))
+    }
+
+    pub fn native_dependent_point_selector(
+        &self, point: &NativeDependentPoint, now: Timestamp,
+    ) -> Result<(Basis, Interval, NativeDependentCheckpointMember)> {
+        let scope = point.scope;
+        self.native_destination_scope(scope)?;
+        let slot = PointSlot {
+            branch: &point.branch,
+            table: &point.table,
+            id: &point.id,
+            valid_at: point.valid_at,
+            placement: point.placement,
+        };
+        let (created, occurrence, _) =
+            self.native_dependent_winner(scope.group, slot, scope.destination, now)?;
+        let enrolled = if let Some(reservation) = occurrence.reservation {
+            let entry = self.live_custody(scope.group)?.reservations
+                .get(&point.placement).ok_or_else(dependent_conflict)?;
+            if entry.at > occurrence.written
+                || entry.commitment(scope.reservation.source.basis.incarnation(), scope.group) != reservation
+            {
+                return Err(dependent_conflict());
+            }
+            entry.at
+        } else {
+            occurrence.written
+        };
+        Ok((created, occurrence.target.valid, NativeDependentCheckpointMember {
+            native: NativeCheckpointMember {
+                placement: occurrence.placement_id,
+                reservation: occurrence.reservation,
+                occurrence: Some(occurrence.commitment(scope.group)),
+                carrier_sha256: occurrence.carrier_sha256,
+                link_sha256: occurrence.link_sha256,
+            },
+            source_basis: occurrence.written,
+            enrolled,
+            branch: occurrence.target.branch.clone(),
+            table: occurrence.target.table.to_string(),
+            target: occurrence.target.id.clone(),
+        }))
+    }
+
+    fn native_destination_scope(&self, scope: NativeDependentCustodyScope) -> Result<&NativeCheckpointCustody> {
         let custody = self.inherited_custody().ok_or_else(dependent_conflict)?;
         if custody.reservation != scope.reservation
             || custody.enrolled_at != scope.source_enrolled_at
@@ -33,8 +89,7 @@ impl BranchIndex {
         {
             return Err(dependent_conflict());
         }
-        let (_, payload) = self.native_dependent_point(read, scope.destination, now)?;
-        Ok((custody, payload.binding))
+        Ok(custody)
     }
 
     pub fn native_dependent_original(
@@ -117,36 +172,50 @@ impl BranchIndex {
         }
     }
 
-    fn native_dependent_point(
-        &self, read: &NativeDependentRead, pinned: Basis, now: Timestamp,
-    ) -> Result<(&CustodyOccurrence, &CustodyPayload)> {
-        if read.branch_created.incarnation() != read.scope.destination.incarnation() {
-            return Err(dependent_conflict());
-        }
-        let created = Basis::new(pinned.incarnation(), read.branch_created.position());
-        if self.lineage_at(&read.branch, pinned).is_none_or(|line| line.created != created)
-            || self.lineage_at(&read.branch, self.head.basis).is_none_or(|line| line.created != created)
-        {
-            return Err(dependent_conflict());
-        }
-        let historical = self.view(&read.branch, At::Exactly(pinned), Layer::Local, now)?;
-        let current = self.view(&read.branch, At::Latest, Layer::Local, now)?;
-        let selected = historical.row(&read.table, &read.id, read.valid_at).ok_or_else(dependent_conflict)?;
-        if current.row(&read.table, &read.id, read.valid_at).is_none_or(|row| !std::ptr::eq(row, selected)) {
-            return Err(dependent_conflict());
-        }
-        let envelope = selected.image_at(now.max(self.head.system_time))
-            .filter(|image| image.custody_group == Some(read.scope.group))
-            .and_then(|image| image.custody_payload.as_ref())
-            .ok_or_else(dependent_conflict)?;
-        let occurrence = self.checkpoint_occurrence(read.scope.group, &read.branch, &read.table, selected, &envelope.envelope)?;
-        if occurrence.placement_id != read.placement
+    fn native_dependent_point<'a>(
+        &'a self, read: &'a NativeDependentRead, pinned: Basis, now: Timestamp,
+    ) -> Result<(&'a CustodyOccurrence, &'a CustodyPayload)> {
+        let slot = PointSlot {
+            branch: &read.branch,
+            table: &read.table,
+            id: &read.id,
+            valid_at: read.valid_at,
+            placement: read.placement,
+        };
+        let (created, occurrence, envelope) = self.native_dependent_winner(read.scope.group, slot, pinned, now)?;
+        if read.branch_created != Basis::new(read.scope.destination.incarnation(), created.position())
             || occurrence.commitment(read.scope.group) != read.occurrence
-            || matches!(selected.written, WrittenVersion::Custody(Some(ordinal)) if ordinal != occurrence.ordinal)
         {
             return Err(dependent_conflict());
         }
         Ok((occurrence, envelope))
+    }
+
+    fn native_dependent_winner<'a>(
+        &'a self, group: CustodyGroupId, slot: PointSlot<'a>, pinned: Basis, now: Timestamp,
+    ) -> Result<(Basis, &'a CustodyOccurrence, &'a CustodyPayload)> {
+        let historical = self.view(slot.branch, At::Exactly(pinned), Layer::Local, now)?;
+        let current = self.view(slot.branch, At::Latest, Layer::Local, now)?;
+        let created = historical.data.created;
+        let selected = historical.row(slot.table, slot.id, slot.valid_at).ok_or_else(dependent_conflict)?;
+        if current.data.created != created
+            || current.row(slot.table, slot.id, slot.valid_at).is_none_or(|row| !std::ptr::eq(row, selected))
+        {
+            return Err(dependent_conflict());
+        }
+        let envelope = selected.image_at(now.max(self.head.system_time))
+            .filter(|image| image.custody_group == Some(group))
+            .and_then(|image| image.custody_payload.as_ref())
+            .ok_or_else(dependent_conflict)?;
+        let occurrence = self.checkpoint_occurrence(
+            group, slot.branch, slot.table, selected, &envelope.envelope, Some(slot.placement),
+        )?;
+        if occurrence.placement_id != slot.placement
+            || matches!(selected.written, WrittenVersion::Custody(Some(ordinal)) if ordinal != occurrence.ordinal)
+        {
+            return Err(dependent_conflict());
+        }
+        Ok((created, occurrence, envelope))
     }
 
     pub fn native_dependent_custody_roster(

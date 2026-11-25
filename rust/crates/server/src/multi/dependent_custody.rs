@@ -4,6 +4,7 @@ use rtdb_types::{
     Anomaly, AnomalyCategory, Result,
     rtdb_v1::{
         Basis, NativeCustodyFence, NativeDependentCheckpointMetadata, NativeDependentCustodyScope,
+        NativeDependentPoint, NativeDependentPointSelector,
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -25,6 +26,7 @@ const MAX_CONFIG_BYTES: usize = 64 << 10;
 const DEADLINE: Duration = Duration::from_secs(15);
 const OBSERVE: &str = "/rtdb/native-dependent-custody/v1/observe";
 const METADATA: &str = "/rtdb/native-dependent-custody/v1/metadata";
+const METADATA_POINT: &str = "/rtdb/native-dependent-custody/v1/metadata/point";
 const ENROLLMENT_SOURCE: &str = "/rtdb/native-dependent-custody/v1/enrollment/source";
 const INHERITED_READ: &str = "/rtdb/native-dependent-custody/v1/inherited/read";
 const INHERITED_RELEASE: &str = "/rtdb/native-dependent-custody/v1/inherited/release";
@@ -91,6 +93,20 @@ enum MetadataResult {
     Ready {
         metadata: NativeDependentCheckpointMetadata,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataPointRequest {
+    version: u32,
+    point: NativeDependentPoint,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MetadataPointResult {
+    Pending,
+    Ready { point: NativeDependentPointSelector },
 }
 
 #[derive(Deserialize, Serialize)]

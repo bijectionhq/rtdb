@@ -62,6 +62,7 @@ impl BranchIndex {
                         table,
                         event,
                         &payload.envelope,
+                        None,
                     )?;
                     if !retained.insert((*group, occurrence.commitment(*group))) {
                         return Err(inventory_unavailable());
@@ -293,7 +294,7 @@ impl BranchIndex {
                 .custody_group
                 .filter(|&group| contains(custody, group))
                 .ok_or_else(transfer_conflict)?;
-            let occurrence = self.checkpoint_occurrence(group, branch, table, event, envelope)?;
+            let occurrence = self.checkpoint_occurrence(group, branch, table, event, envelope, None)?;
             if found
                 .replace((group, occurrence.commitment(group)))
                 .is_some()
@@ -311,6 +312,7 @@ impl BranchIndex {
         table: &TableRef,
         event: &BranchEvent,
         envelope: &[u8],
+        placement: Option<CustodyPlacementId>,
     ) -> Result<&CustodyOccurrence> {
         let source = self
             .inherited_custody
@@ -321,7 +323,7 @@ impl BranchIndex {
         let written = Basis::new(source, event.cut.basis.position());
         let digest: [u8; 32] = Sha256::digest(envelope).into();
         let record = self.live_custody(group)?;
-        let mut matches = record.occurrences().filter(|occurrence| {
+        let matches_event = |occurrence: &&CustodyOccurrence| {
             occurrence.written == written
                 && occurrence.target.branch == branch
                 && occurrence.target.table == *table
@@ -329,14 +331,26 @@ impl BranchIndex {
                 && occurrence.target.valid == event.valid
                 && occurrence.envelope_sha256 == digest
                 && !occurrence.receipt_key.is_empty()
-        });
-        let occurrence = matches.next().ok_or_else(inventory_unavailable)?;
+        };
+        let occurrence = if let Some(placement) = placement {
+            record.original.as_ref()
+                .filter(|occurrence| occurrence.placement_id == placement)
+                .or_else(|| record.reservations.get(&placement)?.occurrence.as_ref())
+                .filter(matches_event)
+                .ok_or_else(inventory_unavailable)?
+        } else {
+            let mut matches = record.occurrences().filter(matches_event);
+            let occurrence = matches.next().ok_or_else(inventory_unavailable)?;
+            if matches.next().is_some() {
+                return Err(inventory_unavailable());
+            }
+            occurrence
+        };
         let ordinal = occurrence
             .ordinal
             .checked_sub(1)
             .ok_or_else(inventory_unavailable)?;
-        if matches.next().is_some()
-            || !record.members.contains(&custody::CustodyMember {
+        if !record.members.contains(&custody::CustodyMember {
                 branch: branch.to_owned(),
                 table: table.clone(),
                 id: event.id.clone(),
