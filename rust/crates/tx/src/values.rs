@@ -351,6 +351,17 @@ impl ArrowDocuments {
         }
     }
 
+    pub(crate) fn from_scalar_mutation_page(content: &StructArray, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let batch = RecordBatch::from(content.clone());
+        let columns = batch.columns().iter().enumerate().map(|(index, column)| {
+            if canonical_mutation_scalar(column.as_ref()) { return Ok(Arc::clone(column)); }
+            copy_argument_column(&[&batch], index, memory)
+        }).collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
+        Self::from_record_batch(&batch, memory)
+    }
+
     fn prepare_columns(batch: &RecordBatch, schema: &Schema, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<Self>> {
         let mut fields = Vec::with_capacity(schema.fields().len());
         let mut columns = Vec::with_capacity(schema.fields().len());
@@ -871,6 +882,47 @@ fn canonical_nullable_uuid(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Resu
     drop(cells);
     Arc::get_mut(&mut reservation).expect("UUID selection owns its reservation").shrink_to(column.get_array_memory_size())?;
     rtdb_columnar::retain_array(column, &reservation)
+}
+
+fn canonical_mutation_scalar(array: &dyn Array) -> bool {
+    if array.data_type() == &DataType::Null { return true; }
+    let nulls = array.nulls();
+    if nulls.is_some_and(|nulls| nulls.null_count() == 0 || !canonical_bitmap(nulls.inner())) {
+        return false;
+    }
+    let null_rows = || nulls.into_iter().flat_map(|nulls| nulls.iter().enumerate())
+        .filter_map(|(row, valid)| (!valid).then_some(row));
+    let data = array.to_data();
+    if data.offset() != 0 { return false; }
+    let len = array.len();
+    match (array.data_type(), data.buffers()) {
+        (DataType::Boolean, [_]) => {
+            let values = array.as_boolean().values();
+            canonical_bitmap(values) && null_rows().all(|row| !values.value(row))
+        }
+        (DataType::Utf8 | DataType::Binary, [offsets, values]) => {
+            let offsets = offsets.typed_data::<i32>();
+            offsets.len().checked_sub(1) == Some(len) && offsets.first() == Some(&0)
+                && offsets.last().and_then(|&end| usize::try_from(end).ok()) == Some(values.len())
+                && null_rows().all(|row| offsets[row] == offsets[row + 1])
+        }
+        (ty, [values]) => {
+            let width = match ty {
+                DataType::FixedSizeBinary(width) => usize::try_from(*width).ok(),
+                ty => ty.primitive_width(),
+            };
+            width.is_some_and(|width| len.checked_mul(width) == Some(values.len())
+                && null_rows().all(|row| values[row * width..(row + 1) * width].iter().all(|&byte| byte == 0)))
+        }
+        _ => false,
+    }
+}
+
+fn canonical_bitmap(bitmap: &arrow_buffer::BooleanBuffer) -> bool {
+    let values = bitmap.inner();
+    let bits = bitmap.len() % 8;
+    bitmap.offset() == 0 && values.len() == bitmap.len().div_ceil(8)
+        && (bits == 0 || values.last().is_some_and(|byte| *byte >> bits == 0))
 }
 
 pub(crate) fn canonical_argument_column(pages: &[&RecordBatch], index: usize, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {

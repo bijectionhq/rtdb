@@ -8,7 +8,7 @@ use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, NullArray,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, struct_field_cell, to_field};
+use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, retain_array, retain_buffer, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, Timestamp, Value};
 
 #[cfg(test)]
@@ -829,16 +829,25 @@ fn event_builder(rows: usize, put_fields: Option<&StructFields<LogicalType>>, me
 
 /// `source_bytes` is the shared source allocation held by the document buffers.
 pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
-    put_batch(documents, headers, None, source_bytes, memory)
+    put_batch(documents, headers, None, source_bytes, false, memory)
+}
+
+/// Stages puts whose document buffers already carry their allocation grants.
+/// A compacted document and the event columns receive their own grants.
+pub fn funded_put_batch(documents: ArrayRef, headers: &[EventHeader], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    put_batch(documents, headers, None, None, true, memory)
 }
 
 /// Stages governed puts with their complete entity keys alongside the Arrow documents.
 pub fn keyed_put_batch(documents: ArrayRef, headers: &[EventHeader], keys: BinaryArray, source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     if keys.len() != headers.len() || keys.null_count() != 0 { return Err(invalid("Governed puts require one complete key per header")); }
-    put_batch(documents, headers, Some(keys), source_bytes, memory)
+    put_batch(documents, headers, Some(keys), source_bytes, false, memory)
 }
 
-fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryArray>, source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+fn put_batch(
+    documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryArray>, source_bytes: Option<usize>,
+    funded: bool, memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
     if documents.len() != headers.len() || documents.null_count() != 0
         || !matches!(documents.data_type(), DataType::Struct(_))
         || headers.iter().any(|header| header.op != EventOp::Put || (keys.is_none() && header.commit_position != 0)) {
@@ -846,6 +855,7 @@ fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryAr
     }
     let retained = documents.get_array_memory_size().max(source_bytes.unwrap_or_default());
     let field = Field::new("put", documents.data_type().clone(), false);
+    let document_layout_bytes = if funded { field.size() } else { 0 };
     let mut selected = documents.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
     if selected < retained {
         for row in 0..documents.len() {
@@ -869,8 +879,13 @@ fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryAr
     } else {
         (documents, None)
     };
-    let bound = headers.len().checked_mul(128).and_then(|bytes| bytes.checked_add(documents.get_array_memory_size()))
+    let shared = funded && copy.is_none();
+    let shared_bytes = if shared { documents.get_buffer_memory_size() } else { 0 };
+    let layout_bytes = if shared { document_layout_bytes } else { 0 };
+    let document_bytes = documents.get_array_memory_size().checked_sub(shared_bytes).ok_or_else(event_size)?;
+    let bound = headers.len().checked_mul(128).and_then(|bytes| bytes.checked_add(document_bytes))
         .and_then(|bytes| bytes.checked_add(keys.as_ref().map_or(0, Array::get_array_memory_size)))
+        .and_then(|bytes| bytes.checked_add(layout_bytes))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
     let mut reservation = if let Some(mut reservation) = copy {
         let lease = Arc::get_mut(&mut reservation).expect("put copy owns its reservation");
@@ -896,8 +911,21 @@ fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryAr
         batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)?;
     }
     let batch = with_event_positions(batch, headers.iter().map(|header| header.position))?;
-    Arc::get_mut(&mut reservation).expect("put construction owns its reservation").shrink_to(batch.get_array_memory_size())?;
-    OwnedBatch::with_reservation(batch, reservation)
+    let retained = batch.get_array_memory_size().checked_sub(shared_bytes)
+        .and_then(|bytes| bytes.checked_add(layout_bytes)).ok_or_else(event_size)?;
+    Arc::get_mut(&mut reservation).expect("put construction owns its reservation").shrink_to(retained)?;
+    if !shared { return OwnedBatch::with_reservation(batch, reservation); }
+
+    let op_index = batch.schema_ref().index_of("op").map_err(invalid)?;
+    let columns = batch.columns().iter().enumerate().map(|(index, column)| {
+        if index != op_index { return retain_array(Arc::clone(column), &reservation); }
+        let (fields, types, offsets, children) = column.as_union().clone().into_parts();
+        let types = ScalarBuffer::from(retain_buffer(types.inner(), &reservation));
+        let offsets = offsets.map(|values| ScalarBuffer::from(retain_buffer(values.inner(), &reservation)));
+        Ok(Arc::new(UnionArray::try_new(fields, types, offsets, children).map_err(invalid)?) as ArrayRef)
+    }).collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(batch.schema(), columns).map_err(invalid)?;
+    Ok(OwnedBatch::with_funded_columns(batch, reservation))
 }
 
 /// A batch has a `put` leg when it holds a put or declares document columns, as the reference's relation gains one.
