@@ -78,5 +78,8 @@ futures.workspace = true
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }
 fs2.workspace = true
 
+[dev-dependencies]
+stream-logkeeper = { workspace = true, features = ["consensus-testing"] }
+
 [lints]
 workspace = true

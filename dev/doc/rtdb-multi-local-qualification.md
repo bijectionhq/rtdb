@@ -367,6 +367,17 @@ python3 rust/bench/v1_transact_commits.py "$output" --clients 32 \
 Record the selected keeper limits and storage layout with the comparison.
 The three local processes have separate durable journals and share the test host.
 
+## One Multi writer on consensus keepers
+
+`rust/bench/v1_consensus_keepers.py` runs the consensus variant end to end.
+It provisions three voter keepers in distinct domains and a catalog keeper as separate processes, writes a `JournalConfig` and starts `rtdb dev --multi --multi-journal-url logkeeper-consensus://CONFIG`.
+It then drives rtdb.v1 commits through a voter loss and restart, an RTDB kill and reopen, and a full keeper restart, and rechecks every acknowledged key with TxStatus.
+See [rtdb-multi-consensus-keeper.md](rtdb-multi-consensus-keeper.md) for the configuration.
+
+```bash
+python3 rust/bench/v1_consensus_keepers.py --rtdb "$RTDB" --logkeeper "$LOGKEEPER" "$output"
+```
+
 ## Certified timed original StreamJournal
 
 The native Multi journal connection can load an independent keeper verifier with
