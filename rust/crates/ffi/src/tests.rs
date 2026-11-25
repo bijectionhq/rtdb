@@ -366,6 +366,75 @@ fn retained_c_data_binding_owns_the_original_child_until_the_last_batch_clone_dr
 }
 
 #[test]
+fn c_data_bind_preserves_empty_shapes_and_schema_metadata() {
+    use arrow_array::RecordBatchOptions;
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let empty_rows = RecordBatch::new_empty(Arc::new(Schema::new_with_metadata(vec![
+        Field::new("second", DataType::Int64, false),
+        Field::new("first", DataType::Utf8, true).with_metadata([("units".into(), "text".into())].into()),
+    ], [("source".into(), "empty rows".into())].into())));
+    let empty_columns = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty().with_metadata([("source".into(), "empty columns".into())].into())),
+        vec![], &RecordBatchOptions::new().with_row_count(Some(3)),
+    ).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8).maybe()];
+
+    for bind in [arrow::import_arguments, arrow::import_retained_arguments] {
+        for (batch, names, types) in [(&empty_rows, &["second", "first"][..], types.as_slice()), (&empty_columns, &[][..], &[][..])] {
+            let mut schema = FFI_ArrowSchema::try_from(batch.schema_ref().as_ref()).unwrap();
+            let mut array = FFI_ArrowArray::new(&StructArray::from(batch.clone()).into_data());
+            let bound = unsafe { bind(&mut array, &mut schema, &memory) }.unwrap();
+            assert!(array.release.is_none() && schema.release.is_none());
+            assert_eq!(bound.names, names);
+            assert_eq!(bound.arguments.types(), types);
+            assert_eq!(bound.arguments.row_count(), batch.num_rows());
+            assert_eq!(bound.arguments.single_arrow_page().unwrap().batch().schema_ref(), batch.schema_ref());
+            drop(bound);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn c_data_bind_releases_both_inputs_when_a_nested_cell_is_unreadable() {
+    use arrow_array::{ArrayRef, StringArray};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let uri = Arc::new(rtdb_columnar::to_field("uri", &LogicalType::Scalar(ScalarType::Uri)).unwrap());
+    let column: ArrayRef = Arc::new(StringArray::from(vec!["bad uri"]));
+    let nested = StructArray::new(vec![Arc::clone(&uri)].into(), vec![Arc::clone(&column)], None);
+    let batch = RecordBatch::try_from_iter([("nested", Arc::new(nested) as ArrayRef)]).unwrap();
+    let expected = rtdb_columnar::read_value(&uri, column.as_ref(), 0).unwrap_err().code;
+
+    for bind in [arrow::import_arguments, arrow::import_retained_arguments] {
+        let mut schema = FFI_ArrowSchema::try_from(batch.schema_ref().as_ref()).unwrap();
+        let mut array = FFI_ArrowArray::new(&StructArray::from(batch.clone()).into_data());
+        assert_eq!(unsafe { bind(&mut array, &mut schema, &memory) }.err().unwrap().code, expected);
+        assert!(array.release.is_none() && schema.release.is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn admitted_argument_types_cannot_be_attached_to_different_decimal_metadata() {
+    use rtdb_tx::{ArrowArgumentTypes, SqlArguments};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let field = Field::new("value", DataType::Decimal128(3, 1), false);
+    let extended = rtdb_columnar::with_decimal_scale(field.clone(), -129).unwrap();
+    let original = RecordBatch::new_empty(Arc::new(Schema::new(vec![field])));
+    let other = RecordBatch::new_empty(Arc::new(Schema::new(vec![extended])));
+    let admitted = ArrowArgumentTypes::for_readable_columns(original.schema(), original.columns(), &memory).unwrap();
+    let other = OwnedBatch::new(other, &memory).unwrap();
+    let error = SqlArguments::from_admitted_arrow_with_canonical_source(other, admitted).unwrap_err();
+    assert_eq!(error.code, "rtdb.tx/argument-schema");
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn adbc_unsigned_parameter_buffers_execute_as_signed_and_preserve_typed_nulls() {
     let mut native = Native::open();
     let operation = native.operation();

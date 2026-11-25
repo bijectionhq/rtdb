@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
-use arrow_schema::{DataType, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{ArrowCell, ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
@@ -1380,6 +1380,42 @@ impl Deref for ArgumentRow<'_> {
     fn deref(&self) -> &[Value] { &self.values }
 }
 
+/// Funded logical types in the field order of one immutable Arrow argument schema.
+pub struct ArrowArgumentTypes {
+    schema: SchemaRef,
+    types: Vec<LogicalType>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl ArrowArgumentTypes {
+    /// Validates readable values in structurally admitted columns before the caller copies or retains them.
+    pub fn for_readable_columns(
+        schema: SchemaRef, columns: &[ArrayRef], memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let invalid_layout = || Anomaly::incorrect("rtdb.tx/argument-schema", "Arrow argument columns must match their schema");
+        if schema.fields().len() != columns.len() { return Err(invalid_layout()); }
+        Self::translate(schema, memory, |index, field, logical| {
+            let column = columns[index].as_ref();
+            if field.data_type() != column.data_type() { return Err(invalid_layout()); }
+            rtdb_columnar::validate_readable_column(field, column, logical, memory)
+        })
+    }
+
+    fn translate(
+        schema: SchemaRef, memory: &Arc<MemoryBudget>,
+        mut validate: impl FnMut(usize, &Field, &LogicalType) -> Result<()>,
+    ) -> Result<Self> {
+        let reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let mut types = Vec::with_capacity(schema.fields().len());
+        for (index, field) in schema.fields().iter().enumerate() {
+            let logical = from_field(field)?;
+            validate(index, field, &logical)?;
+            types.push(logical);
+        }
+        Ok(Self { schema, types, reservation })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SqlArguments {
     types: Arc<Vec<LogicalType>>,
@@ -1411,6 +1447,12 @@ impl SqlArguments {
     pub fn from_arrow_with_canonical_source(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
         Self::arrow(batch, SourceArgumentLayout::Canonical, memory)
     }
+
+    /// Reuses the admitted types when the resulting batch keeps the very same schema.
+    pub fn from_admitted_arrow_with_canonical_source(batch: OwnedBatch, admitted: ArrowArgumentTypes) -> Result<Self> {
+        Self::arrow_with_types(batch, SourceArgumentLayout::Canonical, admitted)
+    }
+
     /// Retains a single argument row built with the source row writer's canonical fields and buffers.
     pub fn from_canonical_arrow_row(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if batch.batch().num_rows() != 1 {
@@ -1425,12 +1467,20 @@ impl SqlArguments {
     }
 
     fn arrow(batch: OwnedBatch, source_layout: SourceArgumentLayout, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let schema = batch.batch().schema();
-        let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
-        let types = Arc::new(schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?);
+        let admitted = ArrowArgumentTypes::translate(batch.batch().schema(), memory, |_, _, _| Ok(()))?;
+        Self::arrow_with_types(batch, source_layout, admitted)
+    }
+
+    fn arrow_with_types(batch: OwnedBatch, source_layout: SourceArgumentLayout, admitted: ArrowArgumentTypes) -> Result<Self> {
+        if !Arc::ptr_eq(batch.batch().schema_ref(), &admitted.schema) {
+            return Err(Anomaly::incorrect("rtdb.tx/argument-schema", "Arrow argument batch does not use the admitted schema"));
+        }
+        let ArrowArgumentTypes { types, reservation: schema_reservation, .. } = admitted;
+        let memory = Arc::clone(schema_reservation.budget());
+        let types = Arc::new(types);
         let row_count = batch.batch().num_rows();
         let chunk = Arc::new(ArgumentChunk::Arrow { batch, types: Arc::clone(&types), source_layout, _reservation: Arc::clone(&schema_reservation) });
-        Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
+        Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory, schema_reservation, row_count })
     }
     pub fn from_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = rows.first().map_or(0, Vec::len);

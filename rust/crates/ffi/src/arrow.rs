@@ -1,4 +1,4 @@
-use std::{ffi::{CStr, CString, c_char, c_void}, mem::size_of, sync::Arc};
+use std::{borrow::Cow, ffi::{CStr, CString, c_char, c_void}, mem::size_of, sync::Arc};
 use arrow_array::{
     Array, RecordBatch, RecordBatchOptions, StructArray, cast::AsArray,
     ffi::{FFI_ArrowArray, from_ffi_and_data_type}, make_array,
@@ -6,9 +6,9 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
-use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, DeclaredBatch, MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
-use rtdb_tx::SqlArguments;
+use arrow_schema::{DataType, FieldRef, Fields, Schema, UnionFields, ffi::FFI_ArrowSchema};
+use rtdb_columnar::{DecimalParameters, DeclaredBatch, MemoryBudget, MemoryReservation, OwnedBatch, to_field};
+use rtdb_tx::{ArrowArgumentTypes, SqlArguments};
 use rtdb_types::{Anomaly, LogicalType, Result};
 
 pub(crate) fn logical_schema(schema: &rtdb_plan::Schema) -> Result<Schema> {
@@ -62,15 +62,97 @@ pub(crate) fn export_schema(schema: &Schema, memory: &Arc<MemoryBudget>) -> Resu
     let reservation = memory.reserve(schema_bound(schema)?)?;
     if schema.metadata().keys().any(|key| reserved_decimal_key(key)) { return Err(super::invalid("Decimal annotation cannot appear on a schema")); }
     let mut decimals = Vec::new();
-    let clean = rtdb_columnar::map_schema_fields(schema, |mut field| {
-        if let Some(parameters) = rtdb_columnar::decimal_field_parameters(&field)? { decimals.push(parameters); }
-        let mut metadata = field.metadata().clone(); metadata.retain(|key, _| !reserved_decimal_key(key)); field.set_metadata(metadata); Ok(field)
-    })?;
-    let mut exported = FFI_ArrowSchema::try_from(&clean).map_err(arrow_error)?;
+    let clean = schema_without_decimal_annotations(schema, &mut decimals)?;
+    let mut exported = FFI_ArrowSchema::try_from(clean.as_ref()).map_err(arrow_error)?;
     let mut decimals = decimals.into_iter();
     retain_schema(&mut exported, reservation, &mut decimals)?;
     if decimals.next().is_some() { return Err(super::invalid("Unused decimal C export parameters")); }
     Ok(exported)
+}
+
+fn schema_without_decimal_annotations<'a>(
+    schema: &'a Schema, decimals: &mut Vec<DecimalParameters>,
+) -> Result<Cow<'a, Schema>> {
+    fn fields(original: &Fields, decimals: &mut Vec<DecimalParameters>) -> Result<Option<Fields>> {
+        let mut updated = None;
+        for (index, child) in original.iter().enumerate() {
+            if let Some(child) = field(child, decimals)? {
+                updated.get_or_insert_with(|| original.to_vec())[index] = child;
+            }
+        }
+        Ok(updated.map(Fields::from))
+    }
+
+    fn field(original: &FieldRef, decimals: &mut Vec<DecimalParameters>) -> Result<Option<FieldRef>> {
+        let updated_type = data_type(original.data_type(), decimals)?;
+        let strip = if let Some(parameters) = rtdb_columnar::decimal_field_parameters(original)? {
+            decimals.push(parameters);
+            decimal_needs_extended_format(parameters)
+        } else { false };
+        if updated_type.is_none() && !strip { return Ok(None); }
+        let mut updated = original.as_ref().clone();
+        if let Some(data_type) = updated_type { updated.set_data_type(data_type); }
+        if strip {
+            updated.metadata_mut().remove(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY);
+            updated.metadata_mut().remove(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY);
+        }
+        Ok(Some(Arc::new(updated)))
+    }
+
+    fn data_type(original: &DataType, decimals: &mut Vec<DecimalParameters>) -> Result<Option<DataType>> {
+        use DataType::*;
+        Ok(match original {
+            Struct(children) => fields(children, decimals)?.map(Struct),
+            Union(children, mode) => {
+                let mut updated = None;
+                let mut seen = 0u128;
+                let mut invalid_ids = false;
+                for (index, (id, child)) in children.iter().enumerate() {
+                    if let Some(child) = field(child, decimals)? {
+                        updated.get_or_insert_with(|| children.iter().map(|(_, child)| Arc::clone(child))
+                            .collect::<Vec<_>>())[index] = child;
+                    }
+                    let bit = 1u128.checked_shl(id as u32).unwrap_or(0);
+                    invalid_ids |= bit == 0 || seen & bit != 0;
+                    seen |= bit;
+                }
+                if invalid_ids || updated.is_some() {
+                    let updated = updated.unwrap_or_else(|| children.iter().map(|(_, child)| Arc::clone(child)).collect());
+                    let ids = children.iter().map(|(id, _)| id);
+                    Some(Union(UnionFields::try_new(ids, updated).map_err(rtdb_columnar::arrow_error)?, *mode))
+                } else { None }
+            }
+            List(child) => field(child, decimals)?.map(List),
+            LargeList(child) => field(child, decimals)?.map(LargeList),
+            ListView(child) => field(child, decimals)?.map(ListView),
+            LargeListView(child) => field(child, decimals)?.map(LargeListView),
+            FixedSizeList(child, size) => field(child, decimals)?.map(|child| FixedSizeList(child, *size)),
+            Map(child, sorted) => field(child, decimals)?.map(|child| Map(child, *sorted)),
+            RunEndEncoded(ends, values) => {
+                let next_ends = field(ends, decimals)?;
+                let next_values = field(values, decimals)?;
+                if next_ends.is_none() && next_values.is_none() { None } else {
+                    Some(RunEndEncoded(next_ends.unwrap_or_else(|| Arc::clone(ends)), next_values.unwrap_or_else(|| Arc::clone(values))))
+                }
+            }
+            Dictionary(key, value) => {
+                let next_key = data_type(key, decimals)?;
+                let next_value = data_type(value, decimals)?;
+                if next_key.is_none() && next_value.is_none() { None } else {
+                    Some(Dictionary(
+                        Box::new(next_key.unwrap_or_else(|| key.as_ref().clone())),
+                        Box::new(next_value.unwrap_or_else(|| value.as_ref().clone())),
+                    ))
+                }
+            }
+            _ => None,
+        })
+    }
+
+    Ok(match fields(schema.fields(), decimals)? {
+        Some(fields) => Cow::Owned(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        None => Cow::Borrowed(schema),
+    })
 }
 
 #[cfg(test)]
@@ -180,8 +262,9 @@ fn retain_schema(schema: &mut FFI_ArrowSchema, reservation: Arc<MemoryReservatio
     if !schema.dictionary.is_null() { unsafe { retain_schema(&mut *schema.dictionary, Arc::clone(&reservation), decimals)?; } }
     let format = schema.format;
     let full_format = if decimal_format(schema.format())?.is_some() {
-        let DecimalParameters { precision, scale, bit_width } = decimals.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?;
-        if i8::try_from(scale).is_err() || u8::try_from(precision).is_err() {
+        let parameters = decimals.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?;
+        if decimal_needs_extended_format(parameters) {
+            let DecimalParameters { precision, scale, bit_width } = parameters;
             let text = if bit_width == 128 { format!("d:{precision},{scale}") } else { format!("d:{precision},{scale},{bit_width}") };
             Some(CString::new(text).map_err(|_| super::invalid("Invalid decimal C format"))?)
         } else { None }
@@ -304,36 +387,32 @@ unsafe fn import_arguments_with_lifetime(
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
     let schema = std::mem::replace(schema, FFI_ArrowSchema::empty());
-    let fields = if unsafe { foreign_schema_needs_carrier(&schema) }? {
+    let native_schema = Arc::new(if unsafe { foreign_schema_needs_carrier(&schema) }? {
         import_decimal_schema(&schema)?
     } else {
         Schema::try_from(&schema).map_err(arrow_error)?
-    };
-    let imported = unsafe { from_ffi_and_data_type(array, DataType::Struct(fields.fields().clone())) }.map_err(arrow_error)?;
+    });
+    let imported = unsafe { from_ffi_and_data_type(array, DataType::Struct(native_schema.fields().clone())) }.map_err(arrow_error)?;
     imported.validate_full().map_err(arrow_error)?;
     let array = StructArray::from(imported);
     if array.null_count() > 0 { return Err(super::invalid("The bound record batch may not contain null rows")); }
-    for (field, column) in fields.fields().iter().zip(array.columns()) {
-        let logical = from_field(field)?;
-        rtdb_columnar::validate_readable_column(field, column.as_ref(), &logical, memory)?;
-    }
-    let names = fields.fields().iter().map(|field| field.name().clone()).collect();
+    let types = ArrowArgumentTypes::for_readable_columns(Arc::clone(&native_schema), array.columns(), memory)?;
+    let names = native_schema.fields().iter().map(|field| field.name().clone()).collect();
     let options = RecordBatchOptions::new().with_row_count(Some(array.len()));
-    let fields = Arc::new(fields);
     let batch = if retain {
-        let batch = RecordBatch::try_new_with_options(fields, array.columns().to_vec(), &options).map_err(arrow_error)?;
+        let batch = RecordBatch::try_new_with_options(native_schema, array.columns().to_vec(), &options).map_err(arrow_error)?;
         OwnedBatch::new(batch, memory)?
     } else {
         let bound = super::add(4096, super::mul(array.get_array_memory_size(), 4)?)?;
         let mut reservation = memory.reserve(bound)?;
         let columns = array.columns().iter().map(|column| copy_foreign_data(column.to_data()).map(make_array))
             .collect::<Result<Vec<_>>>()?;
-        let batch = RecordBatch::try_new_with_options(fields, columns, &options).map_err(arrow_error)?;
+        let batch = RecordBatch::try_new_with_options(native_schema, columns, &options).map_err(arrow_error)?;
         Arc::get_mut(&mut reservation).expect("Arrow import owns its reservation").shrink_to(batch.get_array_memory_size())?;
         OwnedBatch::with_reservation(batch, reservation)?
     };
     drop(array);
-    let arguments = SqlArguments::from_arrow_with_canonical_source(batch, memory)?;
+    let arguments = SqlArguments::from_admitted_arrow_with_canonical_source(batch, types)?;
     Ok(BoundArguments { arguments, names, _reservation: schema_charge })
 }
 
@@ -355,6 +434,10 @@ fn decimal_format(format: &str) -> Result<Option<DecimalParameters>> {
     let width = parts.next().map(|part| part.parse::<u16>().map_err(|_| super::invalid("Invalid decimal C width"))).transpose()?.unwrap_or(128);
     if parts.next().is_some() || !matches!(width, 32 | 64 | 128 | 256) { return Err(super::invalid("Invalid decimal C format")); }
     Ok(Some(DecimalParameters { precision, scale, bit_width: width }))
+}
+
+fn decimal_needs_extended_format(parameters: DecimalParameters) -> bool {
+    u8::try_from(parameters.precision).is_err() || i8::try_from(parameters.scale).is_err()
 }
 
 fn import_decimal_schema(schema: &FFI_ArrowSchema) -> Result<Schema> {
@@ -392,3 +475,60 @@ fn foreign_carrier(schema: &FFI_ArrowSchema, decimals: &mut Vec<DecimalParameter
 }
 fn reserved_decimal_key(key: &str) -> bool { matches!(key, rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY | rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY) }
 pub(crate) fn arrow_error(error: arrow_schema::ArrowError) -> Anomaly { Anomaly::incorrect("rtdb.ffi/arrow", error.to_string()) }
+
+#[cfg(test)]
+#[test]
+fn c_schema_projection_borrows_ordinary_schemas_and_shares_unedited_fields() {
+    use arrow_schema::Field;
+
+    let standard = Arc::new(Field::new("standard", DataType::Decimal64(5, -2), false)
+        .with_metadata([("units".into(), "USD".into())].into()));
+    let ordinary = Schema::new(vec![Arc::clone(&standard)]);
+    let mut decimals = Vec::new();
+    let projected = schema_without_decimal_annotations(&ordinary, &mut decimals).unwrap();
+    assert!(matches!(projected, Cow::Borrowed(schema) if std::ptr::eq(schema, &ordinary)));
+
+    let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Decimal256(1, 1)));
+    let dictionary = rtdb_columnar::with_decimal_parameters(
+        Field::new("dictionary", dict_type, true).with_dict_is_ordered(true)
+            .with_metadata([("units".into(), "EUR".into())].into()),
+        DecimalParameters { precision: 256, scale: -129, bit_width: 256 },
+    ).unwrap();
+    let nested = Field::new_struct("nested", vec![Arc::clone(&standard), Arc::new(dictionary)], false);
+    let schema = Schema::new_with_metadata(vec![nested], [("source".into(), "test".into())].into());
+    decimals.clear();
+    let projected = schema_without_decimal_annotations(&schema, &mut decimals).unwrap();
+    let DataType::Struct(children) = projected.field(0).data_type() else { panic!("Expected a struct"); };
+    assert!(Arc::ptr_eq(&children[0], &standard));
+
+    let memory = MemoryBudget::new(1 << 20);
+    let exported = export_schema(&schema, &memory).unwrap();
+    assert_eq!(exported.metadata().unwrap(), *schema.metadata());
+    let nested = exported.child(0);
+    assert_eq!(nested.child(0).format(), "d:5,-2,64");
+    assert_eq!(nested.child(0).metadata().unwrap(), *standard.metadata());
+    let dictionary = nested.child(1);
+    assert_eq!(dictionary.name(), Some("dictionary"));
+    assert!(dictionary.dictionary_ordered() && dictionary.nullable());
+    assert_eq!(dictionary.metadata().unwrap(), std::collections::HashMap::from([("units".to_owned(), "EUR".to_owned())]));
+    let values = unsafe { FFI_ArrowSchema::from_raw(dictionary.dictionary) };
+    drop(exported);
+    assert!(memory.used_bytes() > 0);
+    assert_eq!(values.format(), "d:256,-129,256");
+    drop(values);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn c_schema_export_rejects_reserved_decimal_annotations_on_non_decimal_fields() {
+    use arrow_schema::Field;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let child = Field::new("item", DataType::Int64, false).with_metadata([
+        (rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY.to_owned(), "-129".to_owned()),
+    ].into());
+    let schema = Schema::new(vec![Field::new_list("values", child, false)]);
+    assert_eq!(export_schema(&schema, &memory).unwrap_err().code, "rtdb/decimal-metadata");
+    assert_eq!(memory.used_bytes(), 0);
+}
