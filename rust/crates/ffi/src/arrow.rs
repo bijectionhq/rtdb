@@ -1,9 +1,13 @@
-use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
-use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray, ffi::{FFI_ArrowArray, from_ffi}, make_array};
+use std::{ffi::{CStr, CString, c_char, c_void}, mem::size_of, sync::Arc};
+use arrow_array::{
+    Array, RecordBatch, RecordBatchOptions, StructArray, cast::AsArray,
+    ffi::{FFI_ArrowArray, from_ffi_and_data_type}, make_array,
+    types::{BinaryViewType, Int16Type, Int32Type, Int64Type, StringViewType},
+};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
+use rtdb_columnar::{DecimalParameters, DeclaredBatch, MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, LogicalType, Result};
 
@@ -71,39 +75,104 @@ pub(crate) fn export_schema(schema: &Schema, memory: &Arc<MemoryBudget>) -> Resu
 
 #[cfg(test)]
 pub(crate) fn export_batch(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
-    let reservation = memory.reserve(super::add(schema_bound(batch.batch().schema().as_ref())?, batch.batch().get_array_memory_size())?)?;
-    let schema = export_schema(batch.batch().schema().as_ref(), memory)?;
-    let array = StructArray::from(batch.batch().clone());
-    let mut exported = FFI_ArrowArray::new(&array.to_data());
-    retain_array(&mut exported, reservation);
-    Ok((exported, schema))
+    let schema = batch.batch().schema();
+    export_declared_batch(rtdb_columnar::conform_batch(batch, &schema, memory)?, memory)
 }
 
-pub(crate) fn export_declared_batch(batch: rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
-    let reservation = memory.reserve(super::add(schema_bound(batch.declared_schema())?, batch.batch().get_array_memory_size())?)?;
+pub(crate) fn export_declared_batch(batch: DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
     let schema = export_schema(batch.declared_schema(), memory)?;
-    Ok((export_array(batch, reservation), schema))
+    Ok((export_declared_array(batch, memory)?, schema))
 }
 
-pub(crate) fn export_declared_array(batch: rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<FFI_ArrowArray> {
-    let reservation = memory.reserve(super::add(schema_bound(batch.declared_schema())?, batch.batch().get_array_memory_size())?)?;
-    Ok(export_array(batch, reservation))
+pub(crate) fn export_declared_array(batch: DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<FFI_ArrowArray> {
+    let scratch = batch.batch().columns().iter().try_fold(512, |bytes, column| {
+        super::add(bytes, array_data_scratch_bound(column.as_ref())?)
+    })?;
+    let _scratch = memory.reserve(scratch)?;
+    let data = StructArray::from(batch.batch().clone()).into_data();
+    let reservation = memory.reserve(super::add(size_of::<ArrayExport>() + 64, c_array_bound(&data)?)?)?;
+    let mut exported = FFI_ArrowArray::new(&data);
+    retain_array(&mut exported, Arc::new(ArrayExport { _batch: batch, _reservation: reservation }));
+    Ok(exported)
 }
 
-fn export_array(batch: rtdb_columnar::DeclaredBatch, reservation: Arc<MemoryReservation>) -> FFI_ArrowArray {
-    let array = StructArray::from(batch.batch().clone());
-    let mut exported = FFI_ArrowArray::new(&array.to_data());
-    retain_array(&mut exported, reservation);
-    exported
+fn array_data_scratch_bound(array: &dyn Array) -> Result<usize> {
+    fn columns_bound(columns: &[arrow_array::ArrayRef]) -> Result<usize> {
+        columns.iter().try_fold(0, |bytes, column| super::add(bytes, array_data_scratch_bound(column.as_ref())?))
+    }
+
+    // Arrow's built-in arrays reuse backing on to_data(). A byte view clones a
+    // variable number of Buffer handles, and a dictionary clones boxed types.
+    let nested = match array.data_type() {
+        DataType::Struct(_) => columns_bound(array.as_struct().columns())?,
+        DataType::Union(fields, _) => fields.iter().try_fold(0, |bytes, (id, _)| {
+            super::add(bytes, array_data_scratch_bound(array.as_union().child(id).as_ref())?)
+        })?,
+        DataType::List(_) => array_data_scratch_bound(array.as_list::<i32>().values().as_ref())?,
+        DataType::LargeList(_) => array_data_scratch_bound(array.as_list::<i64>().values().as_ref())?,
+        DataType::ListView(_) => array_data_scratch_bound(array.as_list_view::<i32>().values().as_ref())?,
+        DataType::LargeListView(_) => array_data_scratch_bound(array.as_list_view::<i64>().values().as_ref())?,
+        DataType::FixedSizeList(_, _) => array_data_scratch_bound(array.as_fixed_size_list().values().as_ref())?,
+        DataType::Map(_, _) => array_data_scratch_bound(array.as_map().entries())?,
+        DataType::RunEndEncoded(ends, _) => {
+            let values = match ends.data_type() {
+                DataType::Int16 => array.as_run::<Int16Type>().values(),
+                DataType::Int32 => array.as_run::<Int32Type>().values(),
+                DataType::Int64 => array.as_run::<Int64Type>().values(),
+                _ => return Err(super::invalid("Arrow run-end type is invalid")),
+            };
+            super::add(512, array_data_scratch_bound(values.as_ref())?)?
+        }
+        DataType::Dictionary(_, _) => {
+            let mut bytes = array_data_scratch_bound(array.as_any_dictionary().values().as_ref())?;
+            let mut data_type = array.data_type();
+            while let DataType::Dictionary(_, values) = data_type {
+                bytes = super::add(bytes, 2 * size_of::<DataType>())?;
+                data_type = values;
+            }
+            bytes
+        }
+        DataType::Utf8View => super::mul(array.as_byte_view::<StringViewType>().data_buffers().len(), 2 * size_of::<Buffer>())?,
+        DataType::BinaryView => super::mul(array.as_byte_view::<BinaryViewType>().data_buffers().len(), 2 * size_of::<Buffer>())?,
+        _ => 0,
+    };
+    super::add(512, nested)
 }
 
-struct ArrayLease { private: *mut c_void, release: Option<unsafe extern "C" fn(*mut FFI_ArrowArray)>, _reservation: Arc<MemoryReservation> }
+fn c_array_bound(data: &ArrayData) -> Result<usize> {
+    // FFI_ArrowArray::new allocates per-node private data, buffer slots and child
+    // pointers. Its only new payloads are validity alignment and view lengths.
+    let mut bytes = 256 + size_of::<FFI_ArrowArray>() + size_of::<ArrayLease>();
+    let slots = super::add(data.buffers().len(), 2)?;
+    bytes = super::add(bytes, super::mul(slots, 2 * (size_of::<Option<Buffer>>() + size_of::<*const c_void>()))?)?;
+    bytes = super::add(bytes, super::mul(data.child_data().len(), size_of::<*mut FFI_ArrowArray>())?)?;
+    if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+        let entries = data.buffers().len().saturating_sub(1);
+        bytes = super::add(bytes, super::mul(entries, 2 * size_of::<i64>())?.max(4 * size_of::<i64>()))?;
+    }
+    if let Some(nulls) = data.nulls() {
+        let bitmap = if data.offset() == nulls.offset() {
+            0
+        } else if data.offset() != 0 {
+            super::add(data.offset(), nulls.len())?.div_ceil(8)
+        } else if nulls.offset() % 8 != 0 {
+            super::mul(nulls.len().div_ceil(64).max(4), size_of::<u64>())?
+        } else {
+            0
+        };
+        bytes = super::add(bytes, bitmap)?;
+    }
+    data.child_data().iter().try_fold(bytes, |bytes, child| super::add(bytes, c_array_bound(child)?))
+}
+
+struct ArrayExport { _batch: DeclaredBatch, _reservation: Arc<MemoryReservation> }
+struct ArrayLease { private: *mut c_void, release: Option<unsafe extern "C" fn(*mut FFI_ArrowArray)>, _owner: Arc<ArrayExport> }
 struct SchemaLease { private: *mut c_void, release: Option<unsafe extern "C" fn(*mut FFI_ArrowSchema)>, format: *const c_char, _full_format: Option<CString>, _reservation: Arc<MemoryReservation> }
 
-fn retain_array(array: &mut FFI_ArrowArray, reservation: Arc<MemoryReservation>) {
-    for index in 0..array.n_children as usize { unsafe { retain_array(&mut **array.children.add(index), Arc::clone(&reservation)); } }
-    if !array.dictionary.is_null() { unsafe { retain_array(&mut *array.dictionary, Arc::clone(&reservation)); } }
-    let lease = Box::new(ArrayLease { private: array.private_data, release: array.release, _reservation: reservation });
+fn retain_array(array: &mut FFI_ArrowArray, owner: Arc<ArrayExport>) {
+    for index in 0..array.n_children as usize { unsafe { retain_array(&mut **array.children.add(index), Arc::clone(&owner)); } }
+    if !array.dictionary.is_null() { unsafe { retain_array(&mut *array.dictionary, Arc::clone(&owner)); } }
+    let lease = Box::new(ArrayLease { private: array.private_data, release: array.release, _owner: owner });
     array.private_data = Box::into_raw(lease).cast(); array.release = Some(release_array);
 }
 fn retain_schema(schema: &mut FFI_ArrowSchema, reservation: Arc<MemoryReservation>, decimals: &mut impl Iterator<Item = DecimalParameters>) -> Result<()> {
@@ -144,27 +213,18 @@ unsafe extern "C" fn release_schema(pointer: *mut FFI_ArrowSchema) {
     }));
 }
 
-/// Borrows a valid Arrow C Data schema tree, including its terminated strings and metadata buffers.
-/// All pointers must remain readable throughout this call; the Arrow producer owns their validity.
-pub(crate) unsafe fn foreign_schema_bound(schema: &FFI_ArrowSchema, depth: usize) -> Result<usize> {
+// The producer must keep the C strings, metadata and child pointers readable.
+unsafe fn foreign_schema_bound(schema: &FFI_ArrowSchema, depth: usize) -> Result<usize> {
     if depth > 64 || schema.n_children < 0 { return Err(super::invalid("Arrow schema nesting or child count is invalid")); }
     let mut bytes = 4096;
     for pointer in [schema.format, schema.name] {
         if !pointer.is_null() { bytes = super::add(bytes, super::mul(unsafe { CStr::from_ptr(pointer) }.to_bytes().len(), 8)?)?; }
     }
-    if !schema.metadata.is_null() {
-        let mut pointer = schema.metadata.cast::<u8>();
-        let count = unsafe { pointer.cast::<i32>().read_unaligned() };
-        if count < 0 { return Err(super::invalid("Arrow metadata has a negative entry count")); }
-        pointer = unsafe { pointer.add(4) };
-        for _ in 0..count {
-            for _ in 0..2 {
-                let length = unsafe { pointer.cast::<i32>().read_unaligned() };
-                if length < 0 { return Err(super::invalid("Arrow metadata has a negative string length")); }
-                bytes = super::add(bytes, super::add(super::mul(length as usize, 8)?, 256)?)?;
-                pointer = unsafe { pointer.add(super::add(length as usize, 4)?) };
-            }
-        }
+    unsafe {
+        visit_foreign_metadata(schema, |text, _| {
+            bytes = super::add(bytes, super::add(super::mul(text.len(), 8)?, 256)?)?;
+            Ok(())
+        })?;
     }
     if schema.n_children > 0 && schema.children.is_null() { return Err(super::invalid("Arrow schema children pointer is null")); }
     for index in 0..schema.n_children as usize {
@@ -174,6 +234,50 @@ pub(crate) unsafe fn foreign_schema_bound(schema: &FFI_ArrowSchema, depth: usize
     }
     if !schema.dictionary.is_null() { bytes = super::add(bytes, unsafe { foreign_schema_bound(&*schema.dictionary, depth + 1) }?)?; }
     Ok(bytes)
+}
+
+unsafe fn visit_foreign_metadata(schema: &FFI_ArrowSchema, mut visit: impl FnMut(&[u8], bool) -> Result<()>) -> Result<()> {
+    if schema.metadata.is_null() { return Ok(()); }
+    let mut pointer = schema.metadata.cast::<u8>();
+    let count = unsafe { pointer.cast::<i32>().read_unaligned() };
+    if count < 0 { return Err(super::invalid("Arrow metadata has a negative entry count")); }
+    pointer = unsafe { pointer.add(4) };
+    for _ in 0..count {
+        for is_key in [true, false] {
+            let length = unsafe { pointer.cast::<i32>().read_unaligned() };
+            if length < 0 { return Err(super::invalid("Arrow metadata has a negative string length")); }
+            let length = length as usize;
+            let next = super::add(length, 4)?;
+            let text = unsafe { std::slice::from_raw_parts(pointer.add(4), length) };
+            visit(text, is_key)?;
+            pointer = unsafe { pointer.add(next) };
+        }
+    }
+    Ok(())
+}
+
+// Arrow's schema parser can skip metadata on dictionary value nodes.
+unsafe fn foreign_schema_needs_carrier(schema: &FFI_ArrowSchema) -> Result<bool> {
+    unsafe {
+        visit_foreign_metadata(schema, |text, is_key| {
+            let text = std::str::from_utf8(text).map_err(|error| arrow_error(error.into()))?;
+            if is_key && reserved_decimal_key(text) {
+                return Err(super::invalid("External Arrow metadata uses a reserved decimal key"));
+            }
+            Ok(())
+        })?;
+    }
+    let _ = schema.name();
+    let format = schema.format();
+    let mut needs_carrier = decimal_format(format)?.is_some_and(|decimal| {
+        u8::try_from(decimal.precision).is_err()
+            || i8::try_from(decimal.scale).is_err()
+            || format.split(',').nth(2).is_some_and(|width| !matches!(width, "32" | "64" | "128" | "256"))
+    });
+    for child in schema.children().chain(schema.dictionary()) {
+        needs_carrier |= unsafe { foreign_schema_needs_carrier(child) }?;
+    }
+    Ok(needs_carrier)
 }
 
 pub(crate) struct BoundArguments {
@@ -200,20 +304,13 @@ unsafe fn import_arguments_with_lifetime(
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
     let schema = std::mem::replace(schema, FFI_ArrowSchema::empty());
-    let mut decimals = Vec::new();
-    let carrier = foreign_carrier(&schema, &mut decimals)?;
-    let fields = Schema::try_from(&carrier).map_err(arrow_error)?;
-    let mut decimals = decimals.into_iter();
-    let fields = rtdb_columnar::map_schema_fields(&fields, |field| {
-        if rtdb_columnar::decimal_parameters(field.data_type()).is_some() {
-            rtdb_columnar::with_decimal_parameters(field, decimals.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?)
-        } else { Ok(field) }
-    })?;
-    if decimals.next().is_some() { return Err(super::invalid("Unused decimal C schema parameters")); }
-    let native_schema = FFI_ArrowSchema::try_from(&fields).map_err(arrow_error)?;
-    let imported = unsafe { from_ffi(array, &native_schema) }.map_err(arrow_error)?;
+    let fields = if unsafe { foreign_schema_needs_carrier(&schema) }? {
+        import_decimal_schema(&schema)?
+    } else {
+        Schema::try_from(&schema).map_err(arrow_error)?
+    };
+    let imported = unsafe { from_ffi_and_data_type(array, DataType::Struct(fields.fields().clone())) }.map_err(arrow_error)?;
     imported.validate_full().map_err(arrow_error)?;
-    if !matches!(imported.data_type(), DataType::Struct(_)) { return Err(super::invalid("Arrow bind requires a record-batch struct")); }
     let array = StructArray::from(imported);
     if array.null_count() > 0 { return Err(super::invalid("The bound record batch may not contain null rows")); }
     for (field, column) in fields.fields().iter().zip(array.columns()) {
@@ -260,9 +357,22 @@ fn decimal_format(format: &str) -> Result<Option<DecimalParameters>> {
     Ok(Some(DecimalParameters { precision, scale, bit_width: width }))
 }
 
+fn import_decimal_schema(schema: &FFI_ArrowSchema) -> Result<Schema> {
+    let mut decimals = Vec::new();
+    let carrier = foreign_carrier(schema, &mut decimals)?;
+    let fields = Schema::try_from(&carrier).map_err(arrow_error)?;
+    let mut decimals = decimals.into_iter();
+    let fields = rtdb_columnar::map_schema_fields(&fields, |field| {
+        if rtdb_columnar::decimal_parameters(field.data_type()).is_some() {
+            rtdb_columnar::with_decimal_parameters(field, decimals.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?)
+        } else { Ok(field) }
+    })?;
+    if decimals.next().is_some() { return Err(super::invalid("Unused decimal C schema parameters")); }
+    Ok(fields)
+}
+
 fn foreign_carrier(schema: &FFI_ArrowSchema, decimals: &mut Vec<DecimalParameters>) -> Result<FFI_ArrowSchema> {
     let metadata = schema.metadata().map_err(arrow_error)?;
-    if metadata.keys().any(|key| reserved_decimal_key(key)) { return Err(super::invalid("External Arrow metadata uses a reserved decimal key")); }
     let children = schema.children().map(|child| foreign_carrier(child, decimals)).collect::<Result<Vec<_>>>()?;
     let dictionary = schema.dictionary().map(|dictionary| foreign_carrier(dictionary, decimals)).transpose()?;
     let format = match decimal_format(schema.format())? {

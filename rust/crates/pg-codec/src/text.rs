@@ -5,6 +5,8 @@ use crate::interval::parse as interval;
 
 mod column;
 pub use column::{read_source_text_column, read_text_column, read_vector_column};
+mod wal_array;
+pub use wal_array::{WalArrayRow, WalListColumn, WalListRow, read_wal_array};
 mod transit_input;
 pub use transit_input::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction, visit_transit_sequence};
 mod json_input;

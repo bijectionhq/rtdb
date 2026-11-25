@@ -1,11 +1,11 @@
 use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
-use arrow_array::{Array, RecordBatch, RecordBatchOptions};
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
 use crate::{Lsn, read_text, vector_types::{VectorType, VectorTypes}, wire::{Column, Input, protocol}};
-use rtdb_pg_codec::{Format, read_source_binary, read_source_binary_column, read_source_text_column};
+use rtdb_pg_codec::{Format, WalArrayRow, read_source_binary, read_source_binary_column, read_source_text_column, read_wal_array};
 
 mod pending;
 use pending::{DecodedCell, PendingTransaction, Run};
@@ -193,14 +193,25 @@ impl Decoder {
                 for (index, Column { name, oid, typmod, .. }) in columns.iter().enumerate() {
                     let vector = self.vector_types.as_ref().filter(|_| self.wal_vectors.contains(oid)).and_then(|types| types.get(*oid, None));
                     let oid = match vector { Some(VectorType::FloatArray(base)) => base, _ => *oid };
-                    let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
                     let text = recover(values[index], old.as_deref(), index, name, &relation.table)?;
-                    let bound = text.map(|text| text_bound(bound_oid, text)).transpose()?.unwrap_or_default();
+                    let dimension = match vector {
+                        Some(VectorType::Pgvector(domain_typmod)) => Some(domain_typmod.unwrap_or(*typmod)),
+                        _ => None,
+                    };
+                    if let Some((field, row)) = read_wal_array(name, oid, dimension, text, &self.memory)? {
+                        let cell = match row {
+                            WalArrayRow::List(row) => DecodedCell::List(row),
+                            WalArrayRow::Text(text) => DecodedCell::ArrayText(text),
+                        };
+                        let charge = Arc::get_mut(&mut row_charge).expect("decoded row owns its reservation");
+                        charge.grow_to(charge.bytes().checked_add(cell.retained()?).ok_or_else(overflow)?)?;
+                        cells.push((field, cell));
+                        continue;
+                    }
+                    let bound = text.map(|text| text_bound(oid, text)).transpose()?.unwrap_or_default();
                     let mut charge = self.memory.reserve(bound.checked_add(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
                     let mut column = BatchBuilder::new(0, &self.memory)?;
-                    let typed = if let Some(VectorType::Pgvector(domain_typmod)) = vector {
-                        Some(rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), 1, |_| Ok(text), &mut column)?)
-                    } else if matches!(oid, 1007 | 1009 | 1016 | 1021 | 1022 | 3910 | 16384) {
+                    let typed = if matches!(oid, 3910 | 16384) {
                         read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
                     } else { None };
                     let (field, cell) = match typed {
@@ -265,12 +276,19 @@ fn decode_columns<'a>(
     let mut output = BatchBuilder::new(metadata(columns.iter().map(|column| column.name.as_str()))?, memory)?;
     let mut arrays = Vec::with_capacity(columns.len());
     let mut fields = Vec::with_capacity(columns.len());
-    let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
     for (index, Column { name, oid, typmod, format }) in columns.iter().enumerate() {
         let vector = vector(*oid);
         let oid = match vector { Some(VectorType::FloatArray(base)) => base, _ => *oid };
+        if vector.is_none() && *format == Format::Binary
+            && let Some((field, array)) = read_source_binary_column(name, oid, count, |row| cell(row, index), &mut output)?
+        {
+            arrays.push(array);
+            fields.push(field);
+            continue;
+        }
         let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
         let text = |row| cell(row, index)?.map(|bytes| std::str::from_utf8(bytes).map_err(protocol)).transpose();
+        let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
         let temporary = (0..count).try_fold(base, |bytes, row| {
             let size = match format {
                 Format::Text => text(row)?.map(|text| text_bound(bound_oid, text)).transpose()?,
@@ -285,19 +303,9 @@ fn decode_columns<'a>(
             fields.push(field);
             continue;
         }
-        let typed = match format {
-            Format::Text => read_source_text_column(name, oid, count, text, &mut output)?,
-            Format::Binary => {
-                match read_source_binary_column(name, oid, count, |row| cell(row, index))? {
-                    Some((field, array)) => {
-                        let bound = array.get_array_memory_size().checked_add(512).ok_or_else(overflow)?;
-                        Some((field, output.column(bound, || Ok(array))?))
-                    }
-                    None => None,
-                }
-            }
-        };
-        if let Some((field, array)) = typed {
+        if *format == Format::Text
+            && let Some((field, array)) = read_source_text_column(name, oid, count, text, &mut output)?
+        {
             arrays.push(array);
             fields.push(field);
             continue;
@@ -433,6 +441,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn wal_list_groups_preserve_null_empty_and_text_shapes_in_event_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(&memory));
+        let description = [("_id", 23), ("floats", 1021), ("ints", 1007), ("strings", 1009)];
+        let columns = description.map(|(name, oid)| column(name, oid));
+        decoder.receive_decoded(&relation(1, "docs", &description)).unwrap();
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+
+        let typed = [Some("1"), Some("{-0,NULL}"), Some("{NULL,2}"), Some(r#"{"NULL",NULL}"#)];
+        let bounded = [Some("2"), Some("[0:1]={1,2}"), None, None];
+        let nested = [Some("3"), Some("{{1,2},{3,4}}"), None, None];
+        let empty = [Some("4"), Some("{}"), Some("{}"), Some("{}")];
+        let all_null = [Some("5"), None, Some("{NULL,NULL}"), Some("{NULL}")];
+        let changes = [
+            (b'I', typed), (b'I', bounded), (b'D', typed), (b'I', empty),
+            (b'I', all_null), (b'I', typed), (b'I', nested), (b'I', all_null), (b'I', typed),
+        ];
+        for (tag, values) in changes {
+            decoder.receive_decoded(&row(tag, 1, &values)).unwrap();
+        }
+        let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        assert_eq!(transaction.batches.iter().map(|batch| batch.rows.batch().num_rows()).collect::<Vec<_>>(), [3, 2, 1, 1, 2]);
+        let ordered = transaction.ordered_runs().flat_map(|(changes, rows)| rows.map(move |row| (changes, row))).collect::<Vec<_>>();
+        assert_eq!(ordered.len(), changes.len());
+        for ((actual, position), (tag, values)) in ordered.into_iter().zip(changes) {
+            assert_eq!(actual.kind, if tag == b'D' { RowKind::Delete } else { RowKind::Put });
+            let expected = decode_columns(&columns, 1, &memory, |_| None, |_, col| Ok(values[col].map(str::as_bytes))).unwrap();
+            let actual = actual.rows.batch().slice(position, 1);
+            assert_eq!(actual.schema_ref(), expected.batch().schema_ref());
+            for (actual, expected) in actual.columns().iter().zip(expected.batch().columns()) {
+                assert_eq!(actual.to_data(), expected.to_data());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_wal_array_releases_row_scratch_without_changing_pending_lists() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(&memory));
+        decoder.receive_decoded(&relation(1, "docs", &[("_id", 23), ("ints", 1016), ("floats", 1022)])).unwrap();
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+        let before = row(b'I', 1, &[Some("1"), Some("{4,NULL,5}"), Some("{1.5,2.5}")]);
+        decoder.receive_decoded(&before).unwrap();
+        let held = memory.used_bytes();
+
+        let bad = row(b'I', 1, &[Some("2"), Some("{3,4}"), Some("{1.0,bad}")]);
+        let error = decoder.receive_decoded(&bad).unwrap_err();
+        let mut output = BatchBuilder::new(8192, &memory).unwrap();
+        let expected = read_source_text_column("floats", 1022, 1, |_| Ok(Some("{1.0,bad}")), &mut output).unwrap_err();
+        assert_eq!(error, expected);
+        drop(output);
+        assert_eq!(memory.used_bytes(), held);
+
+        let old = row(b'U', 1, &[Some("1"), Some("{9,NULL}"), Some("{3.5,4.5}")]);
+        let mut new = row(b'U', 1, &[Some("1"), None, Some("{5.5,6.5}")]);
+        let second_cell = row(b'U', 1, &[Some("1")]).len();
+        new[second_cell] = b'u';
+        let mut update = old;
+        update[5] = b'O';
+        update.extend_from_slice(&new[5..]);
+        decoder.receive_decoded(&update).unwrap();
+
+        let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        assert_eq!(transaction.batches.len(), 1);
+        assert_eq!(transaction.row_count(), 2);
+        let rows = transaction.to_rows(&memory).unwrap();
+        assert_eq!(rows.operations[1].row["ints"], Value::list(vec![Value::I64(9), Value::Null]));
+        drop((decoder, transaction, rows));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn wal_array_relation_changes_keep_equal_arrow_layouts_in_the_same_group() {
+        use arrow_array::{Float64Array, ListArray};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut decoder = Decoder::new(BTreeSet::new(), memory);
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+        for (oid, text) in [(114, "[1.5,2.5]"), (1022, "{3.5,4.5}"), (114, "[5.5,6.5]")] {
+            decoder.receive_decoded(&relation(1, "docs", &[("prices", oid)])).unwrap();
+            decoder.receive_decoded(&row(b'I', 1, &[Some(text)])).unwrap();
+        }
+        let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        assert_eq!(transaction.batches.len(), 1);
+        let batch = transaction.batches[0].rows.batch();
+        let list = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let child = list.values().as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 4, 6]);
+        assert_eq!(child.values().as_ref(), &[1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+    }
+
+    #[test]
     fn pg_source_arrow_snapshot_binary_and_text_layouts_are_identical() {
         let memory = MemoryBudget::new(1 << 22);
         let text = [Column { name: "_id".into(), oid: 20, typmod: -1, format: Format::Text },
@@ -455,6 +555,53 @@ pub(crate) mod tests {
         let ipc = |batch: &OwnedBatch| rtdb_format::ipc::write_stream(batch.batch().schema_ref(), std::slice::from_ref(batch.batch())).unwrap();
         assert_eq!(actual.batch().schema(), expected.batch().schema());
         assert!(ipc(&actual) == ipc(&expected));
+    }
+
+    #[test]
+    fn snapshot_binary_text_fits_the_arrow_budget_and_keeps_the_batch_charge() {
+        use arrow_array::{Array, StringArray};
+
+        let memory = MemoryBudget::new(48 << 10);
+        let columns = [Column { format: Format::Binary, ..column("name", 1043) }];
+        let text = b"0123456789abcdef0123456789abcdef";
+        let batch = decode_columns(&columns, 1000, &memory, |_| None, |row, _| {
+            Ok((row != 499).then_some(text.as_slice()))
+        }).unwrap();
+        let values = Arc::clone(batch.batch().column(0));
+        drop(batch);
+        let strings = values.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.value(0).as_bytes(), text);
+        assert!(strings.is_null(499));
+        assert_eq!(strings.value(999).as_bytes(), text);
+        assert!(memory.used_bytes() > text.len() * 999);
+        drop(values);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn direct_binary_snapshot_columns_preserve_null_layouts_and_payload_errors() {
+        let memory = MemoryBudget::new(1 << 20);
+        for (oid, payload) in [
+            (16, b"\x02".as_slice()),
+            (21, b"\x00"),
+            (23, b"\x00\x00\x00\x00\x00"),
+            (20, b"\x00"),
+            (25, b"\xff"),
+            (2950, b"\x00"),
+        ] {
+            let columns = [Column { format: Format::Binary, ..column("value", oid) }];
+            let expected = read_source_binary(oid, payload).unwrap_err();
+            let actual = decode_columns(&columns, 1, &memory, |_| None, |_, _| Ok(Some(payload))).unwrap_err();
+            assert_eq!(actual, expected, "OID {oid}");
+            for count in [0, 2] {
+                let batch = decode_columns(&columns, count, &memory, |_| None, |_, _| Ok(None)).unwrap();
+                let field = batch.batch().schema_ref().field(0);
+                assert_eq!(field.data_type(), &arrow_schema::DataType::Null);
+                assert_eq!(field.is_nullable(), count != 0);
+                assert_eq!(batch.batch().num_rows(), count);
+            }
+        }
+        assert_eq!(memory.used_bytes(), 0);
     }
 }
 
@@ -582,9 +729,16 @@ fn wal_uses_base_layouts_and_declared_dimensions_for_vector_types_and_domains() 
         row.extend_from_slice(&(text.len() as i32).to_be_bytes());
         row.extend_from_slice(text);
     }
-    decoder.receive_arrow(&row).unwrap();
+    decoder.receive_decoded(&row).unwrap();
+    let mut null_row = vec![b'I', 0, 0, 0, 1, b'N', 0, 5];
+    null_row.extend([b'n'; 5]);
+    decoder.receive_decoded(&null_row).unwrap();
+    decoder.receive_decoded(&row).unwrap();
+    decoder.receive_decoded(&null_row).unwrap();
     let mut commit = vec![b'C']; commit.extend([0; 25]);
-    let transaction = decoder.receive_arrow(&commit).unwrap().unwrap();
+    let transaction = decoder.receive_decoded(&commit).unwrap().unwrap();
+    assert_eq!(transaction.batches.len(), 2);
+    assert_eq!(transaction.ordered_runs().count(), 4);
     let batch = transaction.batches[0].rows.batch();
     let fixed = batch.column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
     assert_eq!(fixed.value_length(), 2);
@@ -592,6 +746,7 @@ fn wal_uses_base_layouts_and_declared_dimensions_for_vector_types_and_domains() 
     assert_eq!(child.value(0).to_bits(), (-0.0_f32).to_bits());
     let variable = batch.column(1).as_any().downcast_ref::<ListArray>().unwrap();
     assert_eq!(variable.value_length(0), 3);
+    assert_eq!(variable.value_length(1), 3);
     assert!(variable.values().as_any().is::<Float32Array>());
     assert_eq!(batch.column(2).as_any().downcast_ref::<StringArray>().unwrap().value(0), "[4,5]");
     assert!(!fixed.is_null(0));
@@ -600,6 +755,13 @@ fn wal_uses_base_layouts_and_declared_dimensions_for_vector_types_and_domains() 
     let child = array_domain.values().as_any().downcast_ref::<Float32Array>().unwrap();
     assert_eq!(child.value(0).to_bits(), (-0.0_f32).to_bits());
     assert!(child.is_null(1));
+    let null_batch = transaction.batches[1].rows.batch();
+    let fixed_nulls = null_batch.column(3).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    assert_eq!(fixed_nulls.null_count(), 2);
+    assert_eq!(fixed_nulls.values().null_count(), 4);
+    let variable_nulls = null_batch.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(variable_nulls.null_count(), 2);
+    assert!(variable_nulls.values().is_empty());
 }
 
 #[test]

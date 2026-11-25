@@ -50,10 +50,6 @@ pub fn read_text_column<'a>(oid: u32, count: usize, mut cell: impl FnMut(usize) 
 fn float_array<'a, T: ArrowPrimitiveType>(
     count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>, parse: impl Fn(&str) -> Result<T::Native>,
 ) -> Result<ArrayRef> {
-    let text_layout = |text: &str| {
-        let text = text.trim_start();
-        text.starts_with('[') || text.strip_prefix('{').is_some_and(|inner| inner.trim_start().starts_with('{'))
-    };
     let build = |count, cell: &mut dyn FnMut(usize) -> Result<Option<&'a str>>| {
         list(count, cell, true, PrimitiveBuilder::<T>::with_capacity(0), |builder, text| {
             visit_array(text, |item| {
@@ -64,7 +60,7 @@ fn float_array<'a, T: ArrowPrimitiveType>(
     };
     let mut has_text = false;
     for row in 0..count {
-        if cell(row)?.is_some_and(text_layout) { has_text = true; break; }
+        if cell(row)?.is_some_and(float_array_text_layout) { has_text = true; break; }
     }
     if !has_text { return build(count, &mut cell); }
 
@@ -76,7 +72,7 @@ fn float_array<'a, T: ArrowPrimitiveType>(
     let mut offsets = Vec::with_capacity(count);
     for row in 0..count {
         let (name, offset) = match cell(row)? {
-            Some(text) if text_layout(text) => {
+            Some(text) if float_array_text_layout(text) => {
                 let offset = strings.len();
                 strings.append_value(text);
                 ("utf8", offset)
@@ -114,6 +110,11 @@ fn float_array<'a, T: ArrowPrimitiveType>(
     Ok(Arc::new(UnionArray::try_new(fields, ids.into(), Some(offsets.into()), children).map_err(invalid)?))
 }
 
+pub(super) fn float_array_text_layout(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with('[') || text.strip_prefix('{').is_some_and(|inner| inner.trim_start().starts_with('{'))
+}
+
 fn primitive<'a, T: ArrowPrimitiveType>(
     count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>, mut parse: impl FnMut(&str) -> Result<T::Native>,
 ) -> Result<ArrayRef> {
@@ -141,15 +142,21 @@ where
         }
         Ok(())
     })?;
+    fill_integer_nulls(builder, start, first.filter(|_| has_null));
+    Ok(())
+}
+
+pub(super) fn fill_integer_nulls<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>, start: usize, first: Option<T::Native>,
+) {
     // Packed lists gather null slots from offset zero in each row's compact value buffer.
-    if let Some(first) = first.filter(|_| has_null) {
+    if let Some(first) = first {
         for index in start..builder.len() {
             if builder.validity_slice().is_some_and(|bits| !arrow_buffer::bit_util::get_bit(bits, index)) {
                 builder.values_slice_mut()[index] = first;
             }
         }
     }
-    Ok(())
 }
 
 fn list<'a, B: ArrayBuilder>(
@@ -270,14 +277,13 @@ pub fn read_vector_column<'a>(
 ) -> Result<(Field, ArrayRef)> {
     if typmod == -1 {
         let array = list(count, cell, true, PrimitiveBuilder::<Float32Type>::with_capacity(0), |builder, text| {
-            for component in vector_items(text)? { builder.append_value(vector_component(component)?); }
+            for component in vector_components(text, None)? { builder.append_value(component?); }
             Ok(())
         })?;
         return account_column(name, array, output);
     }
 
-    let width = usize::try_from(typmod).ok().filter(|width| *width > 0)
-        .ok_or_else(|| invalid("Invalid pgvector dimension"))?;
+    let width = vector_width(typmod)?;
     let total = count.checked_mul(width).ok_or_else(|| invalid("pgvector column length overflow"))?;
     let scratch = total.checked_mul(8).and_then(|size| size.checked_add(4096))
         .ok_or_else(|| invalid("pgvector column allocation overflow"))?;
@@ -288,9 +294,7 @@ pub fn read_vector_column<'a>(
             let text = cell(row)?;
             present.push(text.is_some());
             if let Some(text) = text {
-                let components = vector_items(text)?;
-                if components.clone().count() != width { return Err(invalid("pgvector value does not match its declared dimension")); }
-                for component in components { builder.append_value(vector_component(component)?); }
+                for component in vector_components(text, Some(width))? { builder.append_value(component?); }
             } else {
                 builder.append_nulls(width);
             }
@@ -303,10 +307,19 @@ pub fn read_vector_column<'a>(
     Ok((field, array))
 }
 
-fn vector_items(text: &str) -> Result<std::str::Split<'_, char>> {
+pub(super) fn vector_width(typmod: i32) -> Result<usize> {
+    usize::try_from(typmod).ok().filter(|width| *width > 0)
+        .ok_or_else(|| invalid("Invalid pgvector dimension"))
+}
+
+pub(super) fn vector_components(text: &str, width: Option<usize>) -> Result<impl Iterator<Item = Result<f32>> + '_> {
     let elements = text.strip_prefix('[').and_then(|text| text.strip_suffix(']'))
         .filter(|text| !text.is_empty()).ok_or_else(|| invalid("Invalid pgvector text value"))?;
-    Ok(elements.split(','))
+    let components = elements.split(',');
+    if width.is_some_and(|width| components.clone().count() != width) {
+        return Err(invalid("pgvector value does not match its declared dimension"));
+    }
+    Ok(components.map(vector_component))
 }
 
 fn vector_component(text: &str) -> Result<f32> {

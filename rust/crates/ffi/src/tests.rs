@@ -195,14 +195,14 @@ fn adbc_virtual_endpoints_keep_declared_schema_and_conformed_null_buffers() {
     let prepared = statement.schema(false, &token).unwrap();
     assert!(!prepared.schema.field(0).is_nullable());
     let cursor = statement.query(&token).unwrap();
-    assert_eq!(cursor.schema, prepared.schema);
+    assert_eq!(cursor.schema().as_ref(), &prepared.schema);
     let batch = cursor.next().unwrap().unwrap();
-    assert_eq!(batch.declared_schema().as_ref(), &cursor.schema);
+    assert!(Arc::ptr_eq(batch.declared_schema(), cursor.schema()));
     assert_eq!(batch.batch().column(0).null_count(), 1);
     assert!(batch.batch().schema().field(0).is_nullable());
     let (array, schema) = arrow::export_declared_batch(batch, session.region.memory()).unwrap();
     let exported = Schema::try_from(&schema).unwrap();
-    assert_eq!(exported, cursor.schema);
+    assert_eq!(&exported, cursor.schema().as_ref());
     assert_eq!(array.child(0).null_count(), 1);
     assert!(cursor.next().unwrap().is_none());
     drop(array); drop(schema);
@@ -294,22 +294,36 @@ fn released_ids_are_rejected_and_retained_ids_are_independent() {
 
 #[test]
 fn ffi_batch_survives_statement_cursor_and_database_close() {
-    let mut native = Native::open();
-    let statement = native.statement("SELECT 42 AS answer"); let operation = native.operation();
-    let cursor = native.query(statement, operation);
-    let memory = Arc::clone(handles::database(native.database).unwrap().0.memory());
-    let mut array = FFI_ArrowArray::empty(); let mut schema = FFI_ArrowSchema::empty(); let mut present = 0; let mut error = 0;
-    ok(unsafe { rtdb_v1_cursor_next(cursor, &mut array, &mut schema, &mut present, &mut error) }, error); assert_eq!(present, 1);
-    ok(unsafe { rtdb_v1_close(statement, &mut error) }, error);
-    ok(unsafe { rtdb_v1_close(cursor, &mut error) }, error);
-    ok(unsafe { rtdb_v1_close(native.database, &mut error) }, error);
-    drop(native);
-    let imported = unsafe { from_ffi(array, &schema) }.unwrap();
-    let rows = StructArray::from(imported);
-    let value = rtdb_columnar::read_value(&Field::try_from(schema.child(0)).unwrap(), rows.column(0).as_ref(), 0).unwrap();
-    assert!(matches!(value, rtdb_types::Value::I32(42) | rtdb_types::Value::I64(42)));
-    assert!(memory.used_bytes() > 0);
-    drop(rows); drop(schema); assert_eq!(memory.used_bytes(), 0);
+    for array_only in [false, true] {
+        let mut native = Native::open();
+        let statement = native.statement("SELECT 42 AS answer");
+        let operation = native.operation();
+        let cursor = native.query(statement, operation);
+        let memory = Arc::clone(handles::database(native.database).unwrap().0.memory());
+        let mut array = FFI_ArrowArray::empty();
+        let mut schema = FFI_ArrowSchema::empty();
+        let mut present = 0;
+        let mut error = 0;
+        if array_only {
+            ok(unsafe { rtdb_v1_cursor_schema(cursor, &mut schema, &mut error) }, error);
+            ok(unsafe { rtdb_v1_cursor_next_array(cursor, &mut array, &mut present, &mut error) }, error);
+        } else {
+            ok(unsafe { rtdb_v1_cursor_next(cursor, &mut array, &mut schema, &mut present, &mut error) }, error);
+        }
+        assert_eq!(present, 1);
+        ok(unsafe { rtdb_v1_close(statement, &mut error) }, error);
+        ok(unsafe { rtdb_v1_close(cursor, &mut error) }, error);
+        ok(unsafe { rtdb_v1_close(native.database, &mut error) }, error);
+        drop(native);
+        let imported = unsafe { from_ffi(array, &schema) }.unwrap();
+        let rows = StructArray::from(imported);
+        let value = rtdb_columnar::read_value(&Field::try_from(schema.child(0)).unwrap(), rows.column(0).as_ref(), 0).unwrap();
+        assert!(matches!(value, rtdb_types::Value::I32(42) | rtdb_types::Value::I64(42)));
+        assert!(memory.used_bytes() > 0);
+        drop(rows);
+        drop(schema);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }
 
 #[test]
@@ -367,7 +381,7 @@ fn adbc_unsigned_parameter_buffers_execute_as_signed_and_preserve_typed_nulls() 
         assert_eq!(imported.arguments.types(), &[rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64).maybe()]);
         statement.bind(imported).unwrap();
         let cursor = statement.query(&token).unwrap();
-        assert_eq!(cursor.schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(cursor.schema().field(0).data_type(), &DataType::Int64);
         let page = cursor.next().unwrap().unwrap();
         let expected = value.map(|_| rtdb_types::Value::I64(-1)).unwrap_or(rtdb_types::Value::Null);
         assert_eq!(rtdb_columnar::read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), expected);
@@ -455,9 +469,91 @@ fn arrow_release_is_idempotent_and_retains_charge_through_imported_children() {
 }
 
 #[test]
+fn exact_c_data_pages_reuse_the_funded_declaration_and_export_under_a_tight_budget() {
+    use rtdb_columnar::DeclaredSchema;
+
+    for (array_only, headroom) in [(true, 4096), (false, 16 * 1024)] {
+        let memory = MemoryBudget::new(4 << 20);
+        let array = Arc::new(Int64Array::from(vec![42; 1 << 18]));
+        let record = RecordBatch::try_from_iter([("v", array as arrow_array::ArrayRef)]).unwrap();
+        let batch = OwnedBatch::new(record, &memory).unwrap();
+        let original = batch.batch().column(0).to_data().buffers()[0].as_ptr();
+        let schema = batch.batch().schema_ref().as_ref();
+        let schema_bytes = arrow::schema_bound(schema).unwrap();
+        let declared = DeclaredSchema::with_reservation(schema.clone(), memory.reserve(schema_bytes).unwrap());
+        let hold = memory.reserve(memory.available_bytes() - headroom).unwrap();
+        let before = memory.used_bytes();
+
+        let page = declared.conform(batch, &memory).unwrap();
+        assert!(Arc::ptr_eq(page.declared_schema(), declared.schema()));
+        assert_eq!(memory.used_bytes(), before);
+        let (array, schema) = if array_only {
+            (arrow::export_declared_array(page, &memory).unwrap(), None)
+        } else {
+            let (array, schema) = arrow::export_declared_batch(page, &memory).unwrap();
+            (array, Some(schema))
+        };
+        assert_eq!(array.child(0).buffer(1), original);
+        drop(declared);
+        drop(schema);
+        assert!(memory.used_bytes() > before);
+        drop(array);
+        drop(hold);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn detached_c_data_dictionary_retains_view_lengths_and_rebased_validity() {
+    use arrow_array::{DictionaryArray, Int8Array, StringViewArray, types::Int8Type};
+    use rtdb_columnar::DeclaredSchema;
+
+    let memory = MemoryBudget::new(4 << 20);
+    let text = "a long dictionary value stored outside its view";
+    let len = 1 << 15;
+    let mut values = vec![Some("tail"); len + 1];
+    values[..3].copy_from_slice(&[Some("prefix"), Some(text), None]);
+    let values = StringViewArray::from(values).slice(1, len);
+    let dictionary = DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![0, 1, 2]), Arc::new(values)).unwrap();
+    let record = RecordBatch::try_from_iter([("v", Arc::new(dictionary) as arrow_array::ArrayRef)]).unwrap();
+    let batch = OwnedBatch::new(record, &memory).unwrap();
+    let dictionary_data = batch.batch().column(0).to_data();
+    let values_data = &dictionary_data.child_data()[0];
+    let nulls = values_data.nulls().unwrap();
+    assert_ne!(values_data.offset(), nulls.offset());
+    let original_validity = nulls.buffer().as_ptr();
+    let original_values = values_data.buffers()[1].as_ptr();
+    drop(dictionary_data);
+    let schema = batch.batch().schema_ref().as_ref();
+    let declared = DeclaredSchema::with_reservation(schema.clone(), memory.reserve(arrow::schema_bound(schema).unwrap()).unwrap());
+    let schema = Arc::downgrade(declared.schema());
+    let page = declared.conform(batch, &memory).unwrap();
+    let funded = memory.used_bytes();
+    let root = arrow::export_declared_array(page, &memory).unwrap();
+    assert!(memory.used_bytes() - funded >= len.div_ceil(8));
+    let child = unsafe { FFI_ArrowArray::from_raw(*root.children) };
+    let values = unsafe { FFI_ArrowArray::from_raw(child.dictionary) };
+    drop(root);
+    drop(child);
+    drop(declared);
+
+    assert!(schema.upgrade().is_some());
+    assert!(memory.used_bytes() > 0);
+    assert_ne!(values.buffer(0), original_validity);
+    assert_eq!(values.buffer(2), original_values);
+    let value_schema = FFI_ArrowSchema::try_from(&DataType::Utf8View).unwrap();
+    let imported = StringViewArray::from(unsafe { from_ffi(values, &value_schema) }.unwrap());
+    assert_eq!(imported.len(), len);
+    assert_eq!(imported.iter().take(3).collect::<Vec<_>>(), [Some(text), None, Some("tail")]);
+    drop(imported);
+    assert!(schema.upgrade().is_none());
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn decimal_c_data_uses_signed_parameters_and_retains_detached_schema_children() {
     for width in [32, 64, 128, 256] {
-        for (precision, scale) in [(3, i32::MIN), (3, -129), (3, 128), (3, i32::MAX), (i32::MIN, 0), (-1, i32::MIN), (0, i32::MAX), (256, 1), (i32::MAX, i32::MAX)] {
+        for (precision, scale) in [(3, 1), (3, i32::MIN), (3, -129), (3, 128), (3, i32::MAX), (i32::MIN, 0), (-1, i32::MIN), (0, i32::MAX), (256, 1), (i32::MAX, i32::MAX)] {
             let memory = MemoryBudget::new(16 * 1024 * 1024);
             let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision, scale, bit_width: width });
             let coefficient = arrow_buffer::i256::from_i128(-123).to_be_bytes();
@@ -478,6 +574,32 @@ fn decimal_c_data_uses_signed_parameters_and_retains_detached_schema_children() 
             let release = child.release.unwrap(); unsafe { release(&mut child); release(&mut child); }
             assert_eq!(memory.used_bytes(), 0);
         }
+    }
+}
+
+#[test]
+fn foreign_decimal_annotations_on_nested_dictionary_values_are_rejected_by_both_binds() {
+    let memory = MemoryBudget::new(1 << 20);
+    let dictionary = Field::new_dictionary("dict", DataType::Int8, DataType::Int64, true);
+    let nested = DataType::Struct(vec![dictionary].into());
+    let schema = Arc::new(Schema::new(vec![Field::new("nested", nested, true)]));
+    let record = RecordBatch::new_empty(Arc::clone(&schema));
+    for retain in [false, true] {
+        let mut foreign = FFI_ArrowSchema::try_from(schema.as_ref()).unwrap();
+        let mut array = FFI_ArrowArray::new(&StructArray::from(record.clone()).into_data());
+        let annotated = FFI_ArrowSchema::try_from(&DataType::Int64).unwrap().with_metadata([
+            (rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY.to_owned(), "256".to_owned())
+        ]).unwrap();
+        unsafe { *foreign.child(0).child(0).dictionary = annotated; }
+        let result = if retain {
+            unsafe { arrow::import_retained_arguments(&mut array, &mut foreign, &memory) }
+        } else {
+            unsafe { arrow::import_arguments(&mut array, &mut foreign, &memory) }
+        };
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("reserved decimal key"));
+        assert!(array.release.is_none() && foreign.release.is_none());
+        assert_eq!(memory.used_bytes(), 0);
     }
 }
 

@@ -457,7 +457,7 @@ pub unsafe extern "C" fn rtdb_v1_cursor_schema(handle: u64, out: *mut FFI_ArrowS
     unsafe { call(error, || {
         let out = output(out)?; if out.release.is_some() { return Err(invalid("Output Arrow schema is still owned")); }
         let cursor = handles::cursor(handle)?; let _admitted = cursor.region.enter()?;
-        *out = arrow::export_schema(&cursor.schema, cursor.region.memory())?; Ok(())
+        *out = arrow::export_schema(cursor.schema(), cursor.region.memory())?; Ok(())
     }) }
 }
 #[unsafe(no_mangle)]

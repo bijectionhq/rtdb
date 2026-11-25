@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
-use arrow_schema::Schema as ArrowSchema;
-use rtdb_columnar::{DeclaredBatch, MemoryReservation, OwnedBatch, conform_batch};
+use arrow_schema::SchemaRef;
+use rtdb_columnar::{DeclaredBatch, DeclaredSchema, MemoryReservation, OwnedBatch};
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
 use rtdb_query::{BoundParameters, QueryCursor};
@@ -273,9 +273,8 @@ fn not_prepared() -> Anomaly { Anomaly::incorrect("xtdb.adbc/not-prepared", "Cal
 pub(crate) struct CursorHandle {
     pub region: Arc<EmbeddedRegion>,
     pub token: CancellationToken,
-    pub schema: ArrowSchema,
+    schema: DeclaredSchema,
     state: Mutex<Option<CursorInput>>,
-    _reservation: Arc<MemoryReservation>,
 }
 enum CursorInput { Query(QueryCursor), Batch(OwnedBatch) }
 impl CursorHandle {
@@ -283,22 +282,24 @@ impl CursorHandle {
         let mut bound = 4096;
         for field in cursor.schema().fields() { bound = super::add(bound, super::add(super::mul(field.data_type.retained_bytes()?, 8)?, super::mul(field.name.len(), 4)?)?)?; }
         let reservation = region.memory().reserve(bound)?;
-        let schema = crate::arrow::logical_schema(cursor.schema())?;
-        Ok(Arc::new(Self { region, token, schema, state: Mutex::new(Some(CursorInput::Query(cursor))), _reservation: reservation }))
+        let schema = DeclaredSchema::with_reservation(crate::arrow::logical_schema(cursor.schema())?, reservation);
+        Ok(Arc::new(Self { region, token, schema, state: Mutex::new(Some(CursorInput::Query(cursor))) }))
     }
     pub fn from_batch(region: Arc<EmbeddedRegion>, batch: OwnedBatch, token: CancellationToken) -> Result<Arc<Self>> {
-        let reservation = region.memory().reserve(crate::arrow::schema_bound(batch.batch().schema().as_ref())?)?;
-        let schema = batch.batch().schema().as_ref().clone();
-        Ok(Arc::new(Self { region, token: token.child_token(), schema, state: Mutex::new(Some(CursorInput::Batch(batch))), _reservation: reservation }))
+        let schema = batch.batch().schema_ref().as_ref();
+        let reservation = region.memory().reserve(crate::arrow::schema_bound(schema)?)?;
+        let schema = DeclaredSchema::with_reservation(schema.clone(), reservation);
+        Ok(Arc::new(Self { region, token: token.child_token(), schema, state: Mutex::new(Some(CursorInput::Batch(batch))) }))
     }
+    pub fn schema(&self) -> &SchemaRef { self.schema.schema() }
     pub fn next(&self) -> Result<Option<DeclaredBatch>> {
         let mut state = self.state.lock();
         if self.token.is_cancelled() { state.take(); return Err(super::cancelled()); }
         if matches!(state.as_ref(), Some(CursorInput::Batch(_))) {
-            let Some(CursorInput::Batch(batch)) = state.take() else { unreachable!() }; return conform_batch(batch, &self.schema, self.region.memory()).map(Some);
+            let Some(CursorInput::Batch(batch)) = state.take() else { unreachable!() }; return self.schema.conform(batch, self.region.memory()).map(Some);
         }
         let Some(CursorInput::Query(cursor)) = state.as_mut() else { return Ok(None); };
-        let result = self.region.run(cursor.next_batch()).and_then(|batch| batch.map(|batch| conform_batch(batch, &self.schema, self.region.memory()).inspect_err(|_| cursor.record_consumer_error())).transpose());
+        let result = self.region.run(cursor.next_batch()).and_then(|batch| batch.map(|batch| self.schema.conform(batch, self.region.memory()).inspect_err(|_| cursor.record_consumer_error())).transpose());
         if !matches!(&result, Ok(Some(_))) { state.take(); }
         result
     }
