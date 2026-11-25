@@ -21,6 +21,7 @@ parking_lot.workspace = true
 serde.workspace = true
 sha2.workspace = true
 imbl.workspace = true
+store_filter = { package = "bijection-store-filter", path = "../../vendor/bijection-store-filter" }
 
 [lints]
 workspace = true

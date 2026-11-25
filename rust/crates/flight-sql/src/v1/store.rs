@@ -12,7 +12,7 @@ use arrow_ipc::writer::StreamWriter;
 
 use bytes::Bytes;
 use prost::Message;
-use rtdb_index::branches::store::{KeyRange, MAX_PAGE_ENTRIES, Projection, StoreEntry, StoreRead, VALUE_COLUMN, store_table};
+use rtdb_index::branches::store::{KeyRange, MAX_PAGE_ENTRIES, Projection, StoreEntry, StoreRead, VALUE_COLUMN, ValueFilter, store_table};
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Row, Transact, Window};
 use rtdb_types::{EntityId, StructFields, Value, rtdb_v1::{At, Basis, MAIN_BRANCH}};
@@ -106,11 +106,15 @@ impl Service {
             proto::Projection::Keys => Projection::Keys,
             proto::Projection::Slice => Projection::Slice { start: request.slice_start, len: request.slice_len },
         };
+        let filter = request.filter.as_deref()
+            .map(ValueFilter::decode)
+            .transpose()
+            .map_err(|refused| error::incorrect(&refused.to_string()))?;
         let mut pages = Vec::with_capacity(request.ranges.len());
         let mut read_at = None;
         for key_range in ranges(request.ranges)? {
             let after = request.after.clone().filter(|after| key_range.contains(after));
-            let read = StoreRead { range: key_range, after, limit, projection };
+            let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone() };
             let page = driver.read_store(read, at, self.0.node.now(), &call.cancellation).await.map_err(error::anomaly)?;
             // Every later range reads the cut the first one selected.
             at = At::Exactly(page.cut.basis);

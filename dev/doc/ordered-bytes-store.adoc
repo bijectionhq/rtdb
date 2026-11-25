@@ -14,6 +14,10 @@ All ranges of one request read the same version.
 A page stops at its limit and names the key to resume after.
 A projection selects what each entry returns of its value: the whole value, nothing, or one byte slice at a fixed offset.
 Every projection equals reading the whole value and projecting it afterwards.
+A read may carry a value filter, in the wire form of Bijection's `ValueFilter`, which RTDB vendors as `rust/vendor/bijection-store-filter`.
+The store runs the filter on each whole value before projecting it and returns only the entries that pass; the limit counts returned entries.
+A filtered read returns exactly what an unfiltered read of the same ranges and version returns after filtering, and it still covers every key of its ranges.
+Bijection defines what a filter means; RTDB only runs it next to the data.
 With `arrow`, each page is one Arrow IPC stream with columns `key`, `written` and `value`.
 
 `rtdb.store.v1.Append`:: Commits its writes at a new version, unless a write committed after `since` intersects one of its read ranges.

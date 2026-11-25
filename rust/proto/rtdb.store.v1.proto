@@ -49,6 +49,11 @@ message ReadRequest {
   uint32 slice_len = 8;
   // Return each page as one Arrow IPC stream instead of entries.
   bool arrow = 9;
+  // Return only entries whose whole value passes this filter, in the wire form
+  // of Bijection's ValueFilter (vendor/bijection-store-filter).
+  // Evaluated before the projection; limit counts returned entries.
+  // A filter never narrows what the read covers.
+  optional bytes filter = 10;
 }
 
 enum Projection {

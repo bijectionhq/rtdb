@@ -10,6 +10,8 @@ use rtdb_types::{Anomaly, EntityId, Result, TableRef, Value, rtdb_v1::Basis};
 
 use super::{BranchCut, BranchEvent, BranchView};
 
+pub use store_filter::ValueFilter;
+
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
 pub const VALUE_COLUMN: &str = "v";
@@ -57,6 +59,10 @@ pub struct StoreRead {
     pub after: Option<Vec<u8>>,
     pub limit: usize,
     pub projection: Projection,
+    /// Return only entries whose whole value passes this filter, evaluated
+    /// before the projection; `limit` counts returned entries.
+    /// Bijection defines the filter; this crate only runs it.
+    pub filter: Option<store_filter::ValueFilter>,
 }
 
 /// What a read returns of each value. Each equals projecting the whole value.
@@ -124,14 +130,23 @@ impl BranchView<'_> {
         for (id, _) in rows.events.range(read.range.ids(read.after.as_deref())) {
             let EntityId::Binary(key) = id else { return Err(invalid_store_value()); };
             let Some(event) = self.row(&table, id, at) else { continue; };
+            let whole = match (&read.filter, read.projection) {
+                (None, Projection::Keys) => None,
+                _ => Some(value_of(event)?),
+            };
+            if let (Some(filter), Some(whole)) = (&read.filter, &whole)
+                && !filter.matches(whole)
+            {
+                continue;
+            }
             if entries.len() == limit {
                 resume = entries.last().map(|entry: &StoreEntry| entry.key.clone());
                 break;
             }
             let written = event.written_basis().ok_or_else(invalid_store_value)?;
-            let value = match read.projection {
-                Projection::Keys => None,
-                projection => projection.apply(&value_of(event)?),
+            let value = match (read.projection, whole) {
+                (Projection::Keys, _) | (_, None) => None,
+                (projection, Some(whole)) => projection.apply(&whole),
             };
             entries.push(StoreEntry { key: key.clone(), value, written });
         }
@@ -198,7 +213,7 @@ mod tests {
         put(&mut index, cut(2), b"a2", b"z")?;
 
         let all = KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) };
-        let read = StoreRead { range: all.clone(), after: None, limit: 10, projection: Projection::Values };
+        let read = StoreRead { range: all.clone(), after: None, limit: 10, projection: Projection::Values, filter: None };
         let early = index.view(MAIN_BRANCH, At::Exactly(cut(1).basis), Layer::Merged, cut(2).system_time)?.store_page(&read)?;
         assert_eq!(early.entries.iter().map(|entry| entry.key.as_slice()).collect::<Vec<_>>(), [b"a1".as_slice()]);
         let late = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, cut(2).system_time)?;
@@ -206,9 +221,16 @@ mod tests {
         assert_eq!(page.entries[0].value.as_deref(), Some(b"x".as_slice()));
         assert_eq!(page.resume.as_deref(), Some(b"a1".as_slice()));
         let sliced = late.store_page(&StoreRead {
-            range: all.clone(), after: None, limit: 10, projection: Projection::Slice { start: 0, len: 0 },
+            range: all.clone(), after: None, limit: 10, projection: Projection::Slice { start: 0, len: 0 }, filter: None,
         })?;
         assert!(sliced.entries.iter().all(|entry| entry.value.as_deref() == Some(b"".as_slice())));
+        // A pushed-down filter returns what filtering the unfiltered page returns.
+        let only_z = ValueFilter::Prefix { field: store_filter::Field::Whole, prefix: b"z".to_vec() };
+        let filtered = late.store_page(&StoreRead {
+            range: all.clone(), after: None, limit: 10, projection: Projection::Keys, filter: Some(only_z),
+        })?;
+        assert_eq!(filtered.entries.iter().map(|entry| entry.key.as_slice()).collect::<Vec<_>>(), [b"a2".as_slice()]);
+        assert!(filtered.entries[0].value.is_none() && filtered.resume.is_none());
 
         assert_eq!(late.store_written_since(&all, cut(1).basis)?.as_deref(), Some(b"a2".as_slice()));
         assert_eq!(late.store_written_since(&all, cut(2).basis)?, None);
