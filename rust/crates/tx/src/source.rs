@@ -384,15 +384,23 @@ impl SourceTransaction {
             let operations = decode_operation_pages(pages, false, &self.memory, scratch)?;
             Self::from_operations(operations, self.options.clone(), &self.memory)
         };
+        let mut masked = false;
         if schema.fields().iter().zip(batch.batch().columns())
-            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref()))
+            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref(), &mut masked))
         {
             let _schema = self.memory.reserve(schema_bytes)?;
-            let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch())? {
-                Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation()))?,
-                None => batch,
-            };
-            return decode(std::slice::from_ref(&batch));
+            if masked {
+                if let Ok(normalized) = rtdb_format::ipc::normalize_java_stream_batch(batch.batch()) {
+                    let normalized = OwnedBatch::with_reservation(normalized, Arc::clone(batch.reservation()))?;
+                    return decode(std::slice::from_ref(&normalized));
+                }
+            } else {
+                let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch())? {
+                    Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation()))?,
+                    None => batch,
+                };
+                return decode(std::slice::from_ref(&batch));
+            }
         }
 
         let footprint = crate::ipc::encode(schema, [batch.batch()], &self.memory)?;
@@ -523,10 +531,11 @@ impl SourceTransaction {
         })?;
         let _scratch_reservation = self.memory.reserve(scratch)?;
         let mut entries = Vec::new();
+        let mut argument_values = None;
         for operation in operations() {
             check_writable_table(operation)?;
             if matches!(operation, Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) if ids.ids().is_empty()) { continue; }
-            entries.push(operation_value(operation, &self.memory, purpose)?);
+            entries.push(operation_value(operation, &self.memory, purpose, &mut argument_values)?);
         }
         // Operations on one table with the same columns share one document schema, so its fields are charged once.
         // Each operation still adds its cells to the type, offset and list buffers that hold the operations together.
@@ -541,27 +550,25 @@ impl SourceTransaction {
             })
         })?;
         let mut arrays = BatchBuilder::new(metadata_bound, &self.memory)?;
-        let union = named_union(entries, |leg| operation_leg(leg, &mut arrays, &self.memory))?;
+        let union = named_union(entries, |leg| operation_leg(leg, &mut arrays, &self.memory, &mut argument_values))?;
         let schema = Arc::new(Schema::new(vec![Field::new("tx-ops", union.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
         arrays.finish(batch)
     }
 }
 
-fn landing_field_matches_ipc(field: &Field, array: &dyn Array) -> bool {
-    // The Java stream layout drops validity buffers for non-nullable fields, including masked child nulls.
-    if (!field.is_nullable() && array.null_count() != 0) || rtdb_columnar::decimal_field_parameters(field).is_err() {
-        return false;
-    }
+fn landing_field_matches_ipc(field: &Field, array: &dyn Array, masked: &mut bool) -> bool {
+    if rtdb_columnar::decimal_field_parameters(field).is_err() { return false; }
+    *masked |= !field.is_nullable() && array.null_count() != 0;
     match field.data_type() {
         DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
-            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref())),
+            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref(), masked)),
         DataType::Union(fields, UnionMode::Dense) => fields.iter()
-            .all(|(id, field)| landing_field_matches_ipc(field, array.as_union().child(id).as_ref())),
-        DataType::List(item) => landing_field_matches_ipc(item, array.as_list::<i32>().values().as_ref()),
-        DataType::LargeList(item) => landing_field_matches_ipc(item, array.as_list::<i64>().values().as_ref()),
-        DataType::FixedSizeList(item, _) => landing_field_matches_ipc(item, array.as_fixed_size_list().values().as_ref()),
-        DataType::Map(entries, _) => landing_field_matches_ipc(entries, array.as_map().entries()),
+            .all(|(id, field)| landing_field_matches_ipc(field, array.as_union().child(id).as_ref(), masked)),
+        DataType::List(item) => landing_field_matches_ipc(item, array.as_list::<i32>().values().as_ref(), masked),
+        DataType::LargeList(item) => landing_field_matches_ipc(item, array.as_list::<i64>().values().as_ref(), masked),
+        DataType::FixedSizeList(item, _) => landing_field_matches_ipc(item, array.as_fixed_size_list().values().as_ref(), masked),
+        DataType::Map(entries, _) => landing_field_matches_ipc(entries, array.as_map().entries(), masked),
         // Arrow IPC omits an empty timezone string from the schema.
         DataType::Timestamp(_, zone) => zone.as_ref().is_none_or(|zone| !zone.is_empty()),
         DataType::Null | DataType::Boolean
@@ -610,27 +617,13 @@ struct SourceOperation<'a> {
 }
 
 enum SourceOperationBody<'a> {
-    Values { fields: StructFields<Value>, arguments: Option<SourceArgumentBytes<'a>> },
+    Values { fields: StructFields<Value>, arguments: Option<i32> },
     Path {
         relation: &'a str,
         name: &'a str,
         columns: Option<&'a [String]>,
         encoding: Option<rtdb_types::SpatialGeometryEncoding>,
     },
-}
-
-enum SourceArgumentBytes<'a> {
-    Direct { bytes: Vec<u8>, _reservation: Arc<MemoryReservation> },
-    Encoded(Cow<'a, RetainedBytes>),
-}
-
-impl SourceArgumentBytes<'_> {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Direct { bytes, .. } => bytes,
-            Self::Encoded(bytes) => bytes.as_slice(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -739,7 +732,9 @@ fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections
     Ok(Some(rows))
 }
 
-fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, purpose: SourcePurpose) -> Result<(String, SourceOperation<'a>)> {
+fn operation_value<'a>(
+    operation: &'a Operation, memory: &Arc<MemoryBudget>, purpose: SourcePurpose, argument_values: &mut Option<crate::ipc::Output>,
+) -> Result<(String, SourceOperation<'a>)> {
     let mut body = StructFields::new();
     let mut docs = None;
     let mut arguments = None;
@@ -748,19 +743,21 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         Operation::Public(TxOp::Sql { sql, args }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), Value::Null);
-            arguments = args.as_ref().map(|args| match purpose {
-                SourcePurpose::Log => {
-                    let (bytes, reservation) = argument_output(args, memory, purpose)?.into_parts();
-                    Ok(SourceArgumentBytes::Direct { bytes, _reservation: reservation })
-                }
-                SourcePurpose::Receipt => encode_arguments(args, memory).map(|bytes| SourceArgumentBytes::Encoded(Cow::Owned(bytes))),
-            }).transpose()?;
+            if let Some(args) = args {
+                let values = argument_output(argument_values, memory)?;
+                write_arguments(args, memory, purpose, values)?;
+                arguments = Some(i32::try_from(values.len()).map_err(|_| overflow())?);
+            }
             "sql"
         }
         Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), Value::Null);
-            arguments = (!arg_bytes.as_slice().is_empty()).then_some(SourceArgumentBytes::Encoded(Cow::Borrowed(arg_bytes)));
+            if !arg_bytes.as_slice().is_empty() {
+                let values = argument_output(argument_values, memory)?;
+                values.append_bytes(arg_bytes.as_slice())?;
+                arguments = Some(i32::try_from(values.len()).map_err(|_| overflow())?);
+            }
             "sql"
         }
         Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, at_most }) => {
@@ -1251,7 +1248,10 @@ fn named_union<T>(
     Ok(Arc::new(UnionArray::try_new(UnionFields::new((0..fields.len()).map(|id| id as i8), fields), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+fn operation_leg(
+    values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>,
+    argument_values: &mut Option<crate::ipc::Output>,
+) -> Result<ArrayRef> {
     if let Some(SourceOperation { body: SourceOperationBody::Path { columns, .. }, .. }) = values.first() {
         let with_columns = columns.is_some();
         return owned_path_leg(values, with_columns, arrays);
@@ -1292,7 +1292,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
         let column = if name == "iids" {
             iid_vector(&iids, &field, arrays)?
         } else if name == "args" {
-            argument_column(std::mem::take(&mut arguments), arrays)?
+            argument_column(&arguments, argument_values.take(), arrays)?
         } else {
             let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
             let bound = estimate_builder_bytes_refs(&ty, cells())?;
@@ -2996,43 +2996,49 @@ impl SourceOperationReader<'_> {
     }
 }
 
-fn argument_column(mut arguments: Vec<Option<SourceArgumentBytes<'_>>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
-    let bytes = arguments.iter().flatten().try_fold(0usize, |bytes, value| {
-        bytes.checked_add(value.as_slice().len()).ok_or_else(overflow)
-    })?;
-    let end = i32::try_from(bytes).map_err(|_| overflow())?;
-    let bound = arguments.len().checked_mul(16).and_then(|size| size.checked_add(bytes.checked_mul(2)?))
+fn argument_column(
+    arguments: &[Option<i32>], values: Option<crate::ipc::Output>, arrays: &mut BatchBuilder,
+) -> Result<ArrayRef> {
+    let bound = arguments.len().checked_mul(16)
+        .and_then(|size| size.checked_add(values.as_ref().map_or(0, crate::ipc::Output::len).checked_mul(2)?))
         .and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?;
-    let mut populated = arguments.iter().enumerate().filter_map(|(index, args)| args.as_ref().map(|args| (index, args)));
-    if let Some((index, SourceArgumentBytes::Direct { .. })) = populated.next()
-        && populated.next().is_none()
-    {
-        return arrays.column(bound, || {
-            let Some(SourceArgumentBytes::Direct { bytes, _reservation }) = arguments[index].take() else { unreachable!() };
-            let mut offsets = vec![0; arguments.len() + 1];
-            offsets[index + 1..].fill(end);
-            let mut nulls = NullBufferBuilder::new(arguments.len());
-            for row in 0..arguments.len() { nulls.append(row == index); }
-            // Release the writer's spare capacity before transferring the allocation to the batch's reservation.
-            let values = Buffer::from_vec(bytes.into_boxed_slice().into_vec());
-            let array = BinaryArray::try_new(OffsetBuffer::new(offsets.into()), values, nulls.finish())
-                .map_err(|error| invalid(error.to_string()))?;
-            Ok(Arc::new(array) as ArrayRef)
-        });
-    }
     arrays.column(bound, || {
-        let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(arguments.len(), bytes);
-        for args in &arguments { builder.append_option(args.as_ref().map(SourceArgumentBytes::as_slice)); }
-        Ok(Arc::new(builder.finish()) as ArrayRef)
+        let mut offsets = Vec::with_capacity(arguments.len() + 1);
+        let mut nulls = NullBufferBuilder::new(arguments.len());
+        offsets.push(0);
+        let mut end = 0;
+        for &argument in arguments {
+            if let Some(offset) = argument { end = offset; }
+            offsets.push(end);
+            nulls.append(argument.is_some());
+        }
+        let (bytes, _reservation) = values.map(crate::ipc::Output::into_parts).unzip();
+        let values = Buffer::from_vec(bytes.unwrap_or_default().into_boxed_slice().into_vec());
+        let array = BinaryArray::try_new(OffsetBuffer::new(offsets.into()), values, nulls.finish())
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(Arc::new(array) as ArrayRef)
     })
 }
 
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
-    let (bytes, reservation) = argument_output(arguments, memory, SourcePurpose::Receipt)?.into_parts();
+    let mut output = crate::ipc::Output::new(memory, 0)?;
+    write_arguments(arguments, memory, SourcePurpose::Receipt, &mut output)?;
+    let (bytes, reservation) = output.into_parts();
     RetainedBytes::with_reservation(bytes, reservation)
 }
 
-fn argument_output(arguments: &SqlArguments, memory: &Arc<MemoryBudget>, purpose: SourcePurpose) -> Result<crate::ipc::Output> {
+fn argument_output<'a>(
+    output: &'a mut Option<crate::ipc::Output>, memory: &Arc<MemoryBudget>,
+) -> Result<&'a mut crate::ipc::Output> {
+    Ok(match output {
+        Some(output) => output,
+        None => output.insert(crate::ipc::Output::new(memory, 0)?),
+    })
+}
+
+fn write_arguments(
+    arguments: &SqlArguments, memory: &Arc<MemoryBudget>, purpose: SourcePurpose, output: &mut crate::ipc::Output,
+) -> Result<()> {
     if arguments.retains_uploaded_source_layout() && let Some(pages) = arguments.uniform_arrow_pages() {
         let first = pages[0];
         let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
@@ -3062,14 +3068,10 @@ fn argument_output(arguments: &SqlArguments, memory: &Arc<MemoryBudget>, purpose
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.num_rows()));
         let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
             .map_err(|error| invalid(error.to_string()))?;
-        let mut output = crate::ipc::Output::new(memory, 0)?;
-        output.write_stream(&schema, [&page])?;
-        return Ok(output);
+        return output.write_stream(&schema, [&page]);
     }
     let batch = arguments.source_columnar_batch(memory)?;
-    let mut output = crate::ipc::Output::new(memory, 0)?;
-    output.write_stream(batch.batch().schema_ref(), [batch.batch()])?;
-    Ok(output)
+    output.write_stream(batch.batch().schema_ref(), [batch.batch()])
 }
 
 pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
@@ -3512,7 +3514,7 @@ mod tests {
                     body,
                     iids: Cow::Borrowed(&[]),
                     documents: None,
-                }], &mut arrays, &memory).unwrap()
+                }], &mut arrays, &memory, &mut None).unwrap()
             };
             let expected = operation_array(SourceOperationBody::Values { fields: legacy, arguments: None });
             let actual = operation_array(SourceOperationBody::Path { relation: "places", name: "by_location", columns, encoding: None });
@@ -3659,6 +3661,38 @@ mod tests {
         };
         assert_eq!(arguments.single_arrow_page().unwrap().batch().num_rows(), 2);
         assert_eq!(arguments.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn sql_source_packs_multiple_argument_streams_in_operation_order() {
+        let memory = budget();
+        let submitted = |value| SqlArguments::from_rows(vec![vec![Value::I64(value)]], &memory).unwrap();
+        let bytes = |value| encode_arguments(&submitted(value), &memory).unwrap();
+        let sql = "UPDATE docs SET v = ?";
+        let request = |first, last| SourceTransaction::new(vec![
+            first,
+            TxOp::Sql { sql: "ASSERT TRUE".into(), args: None },
+            TxOp::SqlBytes { sql: sql.into(), arg_bytes: bytes(2) },
+            last,
+        ], SubmitOptions::default(), &memory).unwrap();
+        let source = request(
+            TxOp::Sql { sql: sql.into(), args: Some(submitted(1)) },
+            TxOp::Sql { sql: sql.into(), args: Some(submitted(3)) },
+        );
+        let reference = request(
+            TxOp::SqlBytes { sql: sql.into(), arg_bytes: bytes(1) },
+            TxOp::SqlBytes { sql: sql.into(), arg_bytes: bytes(3) },
+        );
+        assert_eq!(source.encode().unwrap().as_slice(), reference.encode().unwrap().as_slice());
+        assert_eq!(source.body_digest().unwrap(), reference.body_digest().unwrap());
+        let replayed = roundtrip(&source);
+        let values: Vec<_> = replayed.operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::Sql { args: Some(arguments), .. }) => {
+                Some(arguments.rows().next().unwrap().unwrap()[0].clone())
+            }
+            _ => None,
+        }).collect();
+        assert_eq!(values, [Value::I64(1), Value::I64(2), Value::I64(3)]);
     }
 
     #[test]
@@ -5050,7 +5084,7 @@ mod tests {
             assert!(presence[2].contains("item"));
             assert!(documents.array().fields()[1].is_nullable());
             let retained_ids = documents.array().column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            assert_eq!(retained_ids.value(0).as_ptr() == ids.value(0).as_ptr(), !masked_child);
+            assert_eq!(retained_ids.value(0).as_ptr(), ids.value(0).as_ptr());
             let detail = documents.array().column(2).as_struct();
             assert!(detail.is_null(1));
             assert!(detail.column(0).is_valid(1));

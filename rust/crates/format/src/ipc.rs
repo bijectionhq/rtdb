@@ -740,6 +740,12 @@ pub fn restore_spill_page_schema(batch: &RecordBatch, schema: &SchemaRef) -> Res
 /// Returns a replacement only when the stream reader would change the schema.
 pub fn adapt_stream_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> { decoded_schema::adapt_batch(batch) }
 
+/// Removes validity that the Java stream layout discards, then adapts the decoded schema.
+/// The caller establishes that the Java stream writer models the layout and preserves its field types.
+pub fn normalize_java_stream_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    decoded_schema::normalize_stream_validity(batch)
+}
+
 /// Owns a complete IPC stream's schema and decoded Arrow buffers under one reservation.
 pub struct OwnedStream {
     schema: SchemaRef,
