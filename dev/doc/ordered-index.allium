@@ -58,6 +58,7 @@ entity Checkpoint {
 -- Maintenance builds the runtime-installed layout from captured sources when its checkpoint is absent.
 -- A reader validates immutable page size and digest before interpreting the page's format.
 -- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.
+-- One Arrow reference row binds the pointer identity once and carries its first and last typed fences separately.
 -- An Arrow posting fence can share its address bytes under the reservation already held by its key tuple.
 -- Every immutable page reference binds its exact subtree entry count and full fences.
 -- A covered held count subtracts the full-key boundary ranks in each bucket containing the requested valid instant.

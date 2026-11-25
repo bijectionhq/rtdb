@@ -7,7 +7,7 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Interval, Result, Timestamp};
 
 use super::{
-    PAGE_LAYOUT_VERSION, format_error,
+    LEAF_LAYOUT_VERSION, format_error,
     key::arrow,
     postings::{BatchKind, KeyBatch, KeyBatchEncoding, ProjectedKeys},
     tree::{Address, Entry, Item, Key, Span},
@@ -15,7 +15,7 @@ use super::{
 
 pub(super) const HEADER: [u8; 16] = {
     let mut header = [0; 16];
-    header[0] = PAGE_LAYOUT_VERSION;
+    header[0] = LEAF_LAYOUT_VERSION;
     header[1] = 1;
     header
 };

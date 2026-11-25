@@ -714,7 +714,7 @@ impl Leaf {
 
 const ARROW_LEAF_HEADER: [u8; 16] = {
     let mut header = [0; 16];
-    header[0] = super::PAGE_LAYOUT_VERSION;
+    header[0] = super::LEAF_LAYOUT_VERSION;
     header
 };
 
@@ -1456,7 +1456,7 @@ fn decode_arrow(backing: &Buffer, generation: i64, opening: &mut MemoryReservati
     } else if backing.starts_with(&correction::HEADER) {
         (None, correction::decode(backing.clone(), FANOUT, opening)?)
     } else {
-        let batch = ipc::decode_buffer(backing.clone(), FANOUT * 2)?;
+        let batch = ipc::decode_buffer(backing.clone(), FANOUT)?;
         let parents = references::decode_page(batch, FANOUT, backing, opening)?;
         if parents.first().is_some_and(|(time, _)| time.is_some()) {
             (
