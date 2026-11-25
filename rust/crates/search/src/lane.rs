@@ -304,7 +304,7 @@ impl ArtefactBuilder for SearchBuilder {
                     .filter(|record| ArtefactOwner::of(&trie.key, record).is_ok_and(|owner| owner == job.owner)))
                 .find_map(|record| record.stats.as_deref());
             if format >= crate::file::TREE_FORMAT_VERSION {
-                let locator = stats.and_then(crate::file::decode_tree_locator)
+                let locator = stats.and_then(|stats| crate::file::CatalogStatsReader::open(stats)?.tree_locator())
                     .ok_or_else(|| fault("Recorded search tree has no root locator"))?;
                 match self.runtime.tree_file(&self.storage, &key, &locator, &columns, &identity, definition.version, true).await {
                     Ok(file) if file.verify().await.is_ok() => {

@@ -673,7 +673,7 @@ mod tests {
             let fields = StructFields::from([("_id".into(), value.logical_type())]);
             let event = StoredEvent {
                 position: None, origin: None, commit_position: 1,
-                entity_key: Some(bytes::Bytes::copy_from_slice(encoded)),
+                entity_key: Some(std::sync::Arc::<[u8]>::from(encoded)),
                 iid, system_from: Timestamp(10), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), value)])),
                 recency: None,

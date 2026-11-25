@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_array::{BooleanArray, Int64Array};
 use rtdb_columnar::{MemoryBudget, TextCell, from_field, selected_cell, text_cell, utf8_list};
 use rtdb_index::Snapshot;
+use rtdb_plan::Catalog;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, Instant, LogicalType, Result, TableRef};

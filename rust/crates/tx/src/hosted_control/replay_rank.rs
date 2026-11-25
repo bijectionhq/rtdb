@@ -278,9 +278,9 @@ fn verify_purge_floors(
                 let mut digest = Sha256::new();
                 digest.update(b"b");
                 digest.update(address);
-                let mut expected: [u8; 16] = digest.finalize()[..16].try_into().map_err(|_| replay_invalid())?;
-                expected[0] |= 0x80;
-                if bucket != expected || *at <= 0 || *at > key.system_time.0 { return Err(replay_invalid()); }
+                let mut expected_bucket: [u8; 16] = digest.finalize()[..16].try_into().map_err(|_| replay_invalid())?;
+                expected_bucket[0] |= 0x80;
+                if bucket != expected_bucket || *at <= 0 || *at > key.system_time.0 { return Err(replay_invalid()); }
                 if Timestamp(*at) == key.system_time {
                     let handle = expected.get(handle.as_slice()).copied().ok_or_else(replay_invalid)?;
                     covered_floors.entry(relation).or_default().insert(handle);
