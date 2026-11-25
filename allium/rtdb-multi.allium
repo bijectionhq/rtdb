@@ -457,6 +457,8 @@ contract Directory {
 
     @invariant PlacementWorkScalesWithHoldings
         -- Rebalancing and compaction placement find candidates through live members' holding indexes.
+        -- A claim reads its claimant, recorded holder, move target, ensemble and placed journals by key.
+        -- Only a claim over a degraded ensemble reads the whole member set, to choose its repair journals.
         -- An indexed candidate's current record is checked before it affects placement.
         -- An index entry that has yet to appear is picked up on a later pass.
         -- A compaction worker checks the current record before treating an absent index entry as a revocation.

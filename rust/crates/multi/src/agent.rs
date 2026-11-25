@@ -356,6 +356,23 @@ impl NodeAgent {
         Ok(self.directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect())
     }
 
+    /// The members a claim of `record` reads by key: the claimant, the recorded holder, a move target, and the ensemble and placed journals.
+    /// Repairing a degraded ensemble chooses among every logkeeper, so a claim over one reads the whole member set.
+    async fn claim_members(&self, record: &DeploymentRecord, claimant: &MemberId) -> Result<BTreeMap<MemberId, MemberRecord>> {
+        let mut ids = BTreeSet::from([claimant.clone()]);
+        ids.extend(record.holder.iter().cloned());
+        ids.extend(record.active_move(now_ms()).map(|intent| intent.target.clone()));
+        ids.extend(record.ensemble.iter().cloned());
+        if let Some(placement) = &record.journal_placement { ids.extend(placement.destination.iter().cloned()); }
+        let fetched = futures::future::try_join_all(ids.iter().map(|id| self.directory.member(id))).await?;
+        let members: BTreeMap<_, _> = fetched.into_iter().flatten().map(|member| (member.id.clone(), member)).collect();
+        let now = now_ms();
+        if record.ensemble.iter().any(|id| !members.get(id).is_some_and(|member| member.is_live(now))) {
+            return self.members().await;
+        }
+        Ok(members)
+    }
+
     fn require_directory_route(&self, name: &str) -> Result<()> {
         if self.ordered.is_runtime() || !directory_route_allowed(self.ordered.by_name(name).is_some()) {
             return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An installed journal uses its own placement decisions"));
@@ -399,7 +416,7 @@ impl NodeAgent {
             {
                 return Ok(held);
             }
-            let members = self.members().await?;
+            let members = self.claim_members(&record, &me).await?;
             let now = now_ms();
             let holder = effective_holder(&record, &members, now);
             if holder == Some(&me) && let Some(held) = reuse_local() { return Ok(held); }
