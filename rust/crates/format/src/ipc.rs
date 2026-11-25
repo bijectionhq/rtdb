@@ -846,8 +846,8 @@ pub fn restore_spill_page_schema(batch: &RecordBatch, schema: &SchemaRef) -> Res
 /// Returns a replacement only when the stream reader would change the schema.
 pub fn adapt_stream_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> { decoded_schema::adapt_batch(batch) }
 
-/// Removes validity that the Java stream layout discards, then adapts the decoded schema.
-/// The caller establishes that the Java stream writer models the layout and preserves its field types.
+/// Applies Java stream validity and the decoded schema, including the omission of empty timestamp timezones.
+/// The caller establishes that the Java stream writer models the batch layout.
 pub fn normalize_java_stream_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     decoded_schema::normalize_stream_validity(batch)
 }
