@@ -21,37 +21,70 @@ struct FieldLayout { nulls: NullCount, buffers: usize, validity: bool, nullable:
 
 /// A `Write` adapter that rewrites each framed stream message as it passes.
 /// The end marker and any message it doesn't recognise pass through as written.
-/// It also records each record batch's file block, positioned from the first byte it writes plus `start`, and the Java-layout schema.
 pub(crate) struct JavaLayout<W> {
     pub(crate) inner: W, pending: Vec<u8>, state: State, layouts: Option<Vec<FieldLayout>>,
-    position: u64, pub(crate) blocks: Vec<arrow_ipc::Block>, pub(crate) schema: Option<Vec<u8>>,
+    footer: Option<FileFooter>,
 }
 
-/// Counts the bytes written through it into the adapter's output position.
-struct Counted<'a, W> { inner: &'a mut W, position: &'a mut u64 }
-impl<W: Write> Write for Counted<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { let count = self.inner.write(bytes)?; *self.position += count as u64; Ok(count) }
+struct FileFooter {
+    position: u64,
+    blocks: Vec<arrow_ipc::Block>,
+    schema: Option<Vec<u8>>,
+}
+
+struct Output<'a, W> { inner: &'a mut W, footer: Option<&'a mut FileFooter> }
+impl<W: Write> Write for Output<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.inner.write(bytes)?;
+        if let Some(footer) = self.footer.as_deref_mut() {
+            footer.position += count as u64;
+        }
+        Ok(count)
+    }
     fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
 }
 
 enum State { Prefix, Metadata { length: usize, continuation: bool }, Body { remaining: usize }, Planned(BodyPlan), Ended }
 
 /// Where each of a batch body's buffers comes from in the arrow-rs body and how it is written.
-struct BodyPlan { segments: Vec<Segment>, index: usize, position: usize, length: usize }
+struct BodyPlan {
+    segments: Vec<Segment>,
+    index: usize,
+    position: usize,
+    length: usize,
+    output_length: i64,
+}
 struct Segment { start: usize, length: usize, emit: Emit, padding: usize }
-enum Emit { Copy, Drop, Fill(Vec<u8>) }
+
+enum Emit {
+    Copy,
+    Drop,
+    AllValid { length: usize, last_byte: u8 },
+}
 
 impl<W> JavaLayout<W> {
-    pub(crate) fn new(inner: W) -> Self { Self::starting_at(inner, 0) }
-    /// As `new`, for output that begins `start` bytes into its file.
-    pub(crate) fn starting_at(inner: W, start: u64) -> Self { Self { inner, pending: Vec::new(), state: State::Prefix, layouts: None, position: start, blocks: Vec::new(), schema: None } }
+    fn new(inner: W, footer: Option<FileFooter>) -> Self {
+        Self { inner, pending: Vec::new(), state: State::Prefix, layouts: None, footer }
+    }
+
+    pub(super) fn new_stream(inner: W) -> Self { Self::new(inner, None) }
+
+    pub(super) fn new_file(inner: W, start: u64) -> Self {
+        Self::new(inner, Some(FileFooter { position: start, blocks: Vec::new(), schema: None }))
+    }
+
+    pub(super) fn file_footer(&self) -> Result<Vec<u8>, String> {
+        let file = self.footer.as_ref().ok_or("Arrow writer has no file footer state")?;
+        let schema = file.schema.as_deref().ok_or("Arrow file has no schema message")?;
+        footer(schema, &file.blocks)
+    }
 }
 
 impl<W: Write> Write for JavaLayout<W> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let written = bytes.len();
+        let mut out = Output { inner: &mut self.inner, footer: self.footer.as_mut() };
         while !bytes.is_empty() {
-            let mut out = Counted { inner: &mut self.inner, position: &mut self.position };
             match &mut self.state {
                 State::Ended => { out.write_all(bytes)?; break; }
                 State::Body { remaining } => {
@@ -88,14 +121,18 @@ impl<W: Write> Write for JavaLayout<W> {
                     let metadata = std::mem::take(&mut self.pending);
                     let rewritten = rewrite(&mut self.layouts, &metadata).map_err(io::Error::other)?;
                     let encoded = rewritten.metadata.unwrap_or(metadata);
-                    let offset = *out.position;
+                    let offset = out.footer.as_ref().map_or(0, |footer| footer.position);
                     frame(&mut out, &encoded, continuation)?;
-                    let framed = *out.position - offset;
-                    let body = rewritten.plan.as_ref().map_or(rewritten.body as i64, BodyPlan::output_length);
-                    match rewritten.header {
-                        MessageHeader::Schema => self.schema = Some(encoded),
-                        MessageHeader::RecordBatch => self.blocks.push(arrow_ipc::Block::new(offset as i64, framed as i32, body)),
-                        _ => {}
+                    if let Some(footer) = out.footer.as_deref_mut() {
+                        match rewritten.header {
+                            MessageHeader::Schema => footer.schema = Some(encoded),
+                            MessageHeader::RecordBatch => {
+                                let framed = footer.position - offset;
+                                let body = rewritten.plan.as_ref().map_or(rewritten.body as i64, |plan| plan.output_length);
+                                footer.blocks.push(arrow_ipc::Block::new(offset as i64, framed as i32, body));
+                            }
+                            _ => {}
+                        }
                     }
                     self.state = match rewritten.plan {
                         Some(mut plan) if plan.length == 0 => { plan.finish(&mut out)?; State::Prefix }
@@ -130,8 +167,7 @@ fn rewrite(layouts: &mut Option<Vec<FieldLayout>>, metadata: &[u8]) -> Result<Re
             let batch = message.header_as_record_batch().ok_or("Arrow batch message has no batch")?;
             match layouts.as_deref().and_then(|layouts| BodyPlan::new(&batch, layouts, body)) {
                 Some((plan, nodes, buffers)) => {
-                    let length = plan.output_length();
-                    (Some(record_batch_message(message.version().0, length, &batch, &nodes, &buffers)), Some(plan))
+                    (Some(record_batch_message(message.version().0, plan.output_length, &batch, &nodes, &buffers)), Some(plan))
                 }
                 None => (None, None),
             }
@@ -158,22 +194,30 @@ impl BodyPlan {
                 let (start, input_length) = (usize::try_from(buffer.offset()).ok()?, usize::try_from(buffer.length()).ok()?);
                 if start.checked_add(input_length)? > length { return None; }
                 let emit = if layout.validity && index == 0 {
-                    if !layout.nullable { Emit::Drop }
-                    else if input_length == 0 && node.length() > 0 { Emit::Fill(all_valid(usize::try_from(node.length()).ok()?)) }
-                    else { Emit::Copy }
+                    if !layout.nullable {
+                        Emit::Drop
+                    } else if input_length == 0 && node.length() > 0 {
+                        let rows = usize::try_from(node.length()).ok()?;
+                        let remainder = rows % 8;
+                        let last_byte = if remainder == 0 { 0xff } else { (1u8 << remainder) - 1 };
+                        Emit::AllValid { length: rows.div_ceil(8), last_byte }
+                    } else {
+                        Emit::Copy
+                    }
                 } else if layout.offsets && index == 1 && node.length() == 0 { Emit::Drop } else { Emit::Copy };
-                let written = match &emit { Emit::Copy => input_length, Emit::Drop => 0, Emit::Fill(bytes) => bytes.len() };
+                let written = match emit {
+                    Emit::Copy => input_length,
+                    Emit::Drop => 0,
+                    Emit::AllValid { length, .. } => length,
+                };
                 let padding = (8 - written % 8) % 8;
                 buffers.push(arrow_ipc::Buffer::new(output, i64::try_from(written).ok()?));
-                output = output.checked_add(i64::try_from(written + padding).ok()?)?;
+                output = output.checked_add(i64::try_from(written.checked_add(padding)?).ok()?)?;
                 segments.push(Segment { start, length: input_length, emit, padding });
             }
         }
         if segments.windows(2).any(|pair| pair[1].start < pair[0].start + pair[0].length) { return None; }
-        Some((Self { segments, index: 0, position: 0, length }, nodes, buffers))
-    }
-    fn output_length(&self) -> i64 {
-        self.segments.iter().map(|segment| (match &segment.emit { Emit::Copy => segment.length, Emit::Drop => 0, Emit::Fill(bytes) => bytes.len() } + segment.padding) as i64).sum()
+        Some((Self { segments, index: 0, position: 0, length, output_length: output }, nodes, buffers))
     }
     /// Consumes input body bytes, emitting each planned buffer once its source range has passed.
     fn write(&mut self, mut bytes: &[u8], out: &mut impl Write) -> io::Result<usize> {
@@ -192,7 +236,9 @@ impl BodyPlan {
                 self.position += count; bytes = &bytes[count..];
                 if self.position < end { break; }
             }
-            if let Emit::Fill(bitmap) = &segment.emit { out.write_all(bitmap)?; }
+            if let Emit::AllValid { length, last_byte } = segment.emit {
+                write_all_valid(out, length, last_byte)?;
+            }
             out.write_all(&[0; 8][..segment.padding])?;
             self.index += 1;
         }
@@ -205,10 +251,19 @@ impl BodyPlan {
     }
 }
 
-fn all_valid(rows: usize) -> Vec<u8> {
-    let mut bitmap = vec![0xff; rows.div_ceil(8)];
-    if rows % 8 != 0 { if let Some(last) = bitmap.last_mut() { *last = (1u8 << (rows % 8)) - 1; } }
-    bitmap
+fn write_all_valid(out: &mut impl Write, length: usize, last_byte: u8) -> io::Result<()> {
+    static FULL_BYTES: [u8; 4096] = [0xff; 4096];
+    let masked = last_byte != 0xff;
+    let mut remaining = if masked { length - 1 } else { length };
+    while remaining > 0 {
+        let count = remaining.min(FULL_BYTES.len());
+        out.write_all(&FULL_BYTES[..count])?;
+        remaining -= count;
+    }
+    if masked {
+        out.write_all(&[last_byte])?;
+    }
+    Ok(())
 }
 
 /// `MessageSerializer.writeMessageBuffer`: the length is padded so the prefix and metadata end on an 8-byte boundary.
@@ -265,7 +320,7 @@ fn java_schema<'b>(builder: &mut FlatBufferBuilder<'b>, schema: &arrow_ipc::Sche
 
 /// `ArrowFooter.writeTo` without dictionaries or custom metadata, as `ArrowUnloader`'s file mode writes it,
 /// over a Java-layout schema message and the record batches' blocks.
-pub(crate) fn footer(schema_message: &[u8], blocks: &[arrow_ipc::Block]) -> Result<Vec<u8>, String> {
+fn footer(schema_message: &[u8], blocks: &[arrow_ipc::Block]) -> Result<Vec<u8>, String> {
     let message = arrow_ipc::root_as_message(schema_message).map_err(|error| error.to_string())?;
     let schema = message.header_as_schema().ok_or("Arrow schema message has no schema")?;
     let mut builder = FlatBufferBuilder::new();

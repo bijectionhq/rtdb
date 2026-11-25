@@ -25,7 +25,7 @@ use crate::{
     archive::{self, CapturePoint},
     control::ControlKey,
     deployment::CellStorage,
-    family_custody::{FAMILY_CUSTODY_GRANT_BYTES, endorse_family_custody, grant_id, original_family_custody},
+    family_custody::{FAMILY_CUSTODY_GRANT_BYTES, WORLD_RANK_CUSTODY_GRANT_BYTES, WorldRankCustodyGrant, endorse_family_custody, grant_id, original_family_custody},
     install::Token,
     keys::KeyService,
 };
@@ -57,6 +57,10 @@ enum Action {
         manifest_sha256: String,
     },
     EndorseProtectedRootCustody {
+        manifest_sha256: String,
+        grant: String,
+    },
+    EndorseProtectedWorldRankCustody {
         manifest_sha256: String,
         grant: String,
     },
@@ -209,6 +213,10 @@ enum Reply {
         custody: [u8; 32],
     },
     ProtectedRootCustodyEndorsed {
+        grant_sha256: String,
+        endorsement: String,
+    },
+    ProtectedWorldRankCustodyEndorsed {
         grant_sha256: String,
         endorsement: String,
     },
@@ -487,15 +495,31 @@ impl RecoveryService {
         let discard_migration = matches!(request.action, Action::DiscardClassicMigrationStage { .. });
         match request.action {
             Action::ProtectedRootCustodyIdentity { manifest_sha256 } => {
-                self.protected_root_capture(&installation, request.authority, request.capture, &manifest_sha256).await?;
+                self.protected_family_capture(&installation, request.authority, request.capture, &manifest_sha256).await?;
                 let (history, custody) = original_family_custody(&installation, request.authority)?;
                 Ok(Reply::ProtectedRootCustodyIdentity { history, custody })
             }
             Action::EndorseProtectedRootCustody { manifest_sha256, grant } => {
                 let body = decode_family_custody_grant(&grant)?;
-                let (secret, point) = self.protected_root_capture(&installation, request.authority, request.capture, &manifest_sha256).await?;
+                let (secret, point) = self.protected_family_capture(&installation, request.authority, request.capture, &manifest_sha256).await?;
                 let endorsement = endorse_family_custody(secret, &installation, request.authority, point.checkpoint, &body)?;
                 Ok(Reply::ProtectedRootCustodyEndorsed {
+                    grant_sha256: lower_hex(&grant_id(&body)),
+                    endorsement: lower_hex(&endorsement),
+                })
+            }
+            Action::EndorseProtectedWorldRankCustody { manifest_sha256, grant } => {
+                let unavailable = rtdb_types::OwnedWorld::unavailable;
+                let body = decode_custody_grant::<WORLD_RANK_CUSTODY_GRANT_BYTES>(&grant)?;
+                let (secret, point) = self.protected_family_capture(
+                    &installation, request.authority, request.capture, &manifest_sha256,
+                ).await?;
+                let archive = URL_SAFE_NO_PAD.decode(&manifest_sha256).map_err(|_| unavailable())?
+                    .try_into().map_err(|_| unavailable())?;
+                let endorsement = WorldRankCustodyGrant::endorse(
+                    secret, &installation, request.capture, archive, point.checkpoint, &body,
+                )?;
+                Ok(Reply::ProtectedWorldRankCustodyEndorsed {
                     grant_sha256: lower_hex(&grant_id(&body)),
                     endorsement: lower_hex(&endorsement),
                 })
@@ -1045,7 +1069,7 @@ impl RecoveryService {
         }
     }
 
-    async fn protected_root_capture(
+    async fn protected_family_capture(
         &self, record: &DeploymentRecord, authority: Uuid, capture: Uuid, manifest: &str,
     ) -> Result<(&crate::capability::CellSecret, CapturePoint)> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
@@ -1262,14 +1286,18 @@ impl RecoveryService {
 }
 
 fn decode_family_custody_grant(grant: &str) -> Result<[u8; FAMILY_CUSTODY_GRANT_BYTES]> {
-    let invalid = || Anomaly::incorrect("rtdb.multi/family-custody-grant", "Invalid RFC1 request encoding");
-    if grant.len() != FAMILY_CUSTODY_GRANT_BYTES * 2 { return Err(invalid()); }
+    decode_custody_grant(grant)
+}
+
+fn decode_custody_grant<const WIDTH: usize>(grant: &str) -> Result<[u8; WIDTH]> {
+    let invalid = || Anomaly::incorrect("rtdb.multi/family-custody-grant", "Invalid custody grant encoding");
+    if grant.len() != WIDTH * 2 { return Err(invalid()); }
     let digit = |byte| match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         _ => Err(invalid()),
     };
-    let mut body = [0; FAMILY_CUSTODY_GRANT_BYTES];
+    let mut body = [0; WIDTH];
     for (byte, encoded) in body.iter_mut().zip(grant.as_bytes().chunks_exact(2)) {
         *byte = digit(encoded[0])? << 4 | digit(encoded[1])?;
     }

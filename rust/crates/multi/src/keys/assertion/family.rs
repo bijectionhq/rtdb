@@ -6,6 +6,14 @@ mod native_landing;
 pub use native_landing::NativeFamilyLanding;
 mod managed;
 mod transfer;
+mod world_rank_transfer;
+
+pub(crate) use world_rank_transfer::WorldRankFrame;
+pub use world_rank_transfer::{
+    AcceptedWorldRankReplay, WorldRankDestinationCustody, WorldRankSourceCensus, WorldRankSourceDrain,
+    WorldRankTransfer, WorldRankTransferAuthority, WorldRankTransferBinding, WorldRankTransferContributor,
+    WorldRankTransferDestination, WorldRankTransferRead, WorldRankTransferSource, WorldRankTransferState,
+};
 
 pub use release::{CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
 pub use managed::{ManagedFamilyTransfer, ManagedFamilyTransferSource};
@@ -195,6 +203,7 @@ pub struct FamilyFence {
     pub link_capabilities: BTreeSet<AssertionStage>,
     pub derived: BTreeSet<DerivedRow>,
     pub transfers: BTreeSet<FamilyTransferFanout>,
+    pub rank_transfers: BTreeSet<WorldRankTransferBinding>,
 }
 
 impl FamilyFence {
@@ -235,8 +244,14 @@ impl FamilyFence {
                 None => inventory.update(&[0]),
             }
         }
-        for transfer in &self.transfers {
+        for transfer in &self.rank_transfers {
             inventory.update(&[4]);
+            inventory.update(&transfer.address);
+            inventory.update(&transfer.agreement);
+        }
+        // Checkpoint fanout has its own tag. Installed World rank retains tag 4.
+        for transfer in &self.transfers {
+            inventory.update(&[5]);
             inventory.update(&transfer.address);
             inventory.update(&transfer.agreement_sha256);
         }
@@ -310,6 +325,8 @@ struct Family {
     release_sequence: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     transfers: Vec<FamilyTransferFanout>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    rank_transfers: BTreeSet<WorldRankTransferBinding>,
 }
 
 impl Family {
@@ -366,7 +383,10 @@ impl Family {
         assertion_capabilities.extend(self.derived.iter().filter_map(|row| row.capability));
         let derived = self.derived.iter().cloned().collect();
         let transfers = self.transfers.iter().copied().collect();
-        FamilyFence { order, positions, assertion_capabilities, link_capabilities, derived, transfers }
+        FamilyFence {
+            order, positions, assertion_capabilities, link_capabilities, derived, transfers,
+            rank_transfers: self.rank_transfers.clone(),
+        }
     }
 
     fn require_unclaimed(&self) -> Result<()> {
@@ -393,12 +413,14 @@ pub(in crate::keys) enum AssertionVaultRecord {
     ReleaseTerminal { family: Uuid, attempt: [u8; 32] },
     CheckpointTransfer([u8; 32]),
     ManagedCheckpointTransfer([u8; 16]),
+    WorldRankTransfer([u8; 32]),
 }
 
 impl AssertionVaultRecord {
     fn local_prefix(self) -> &'static str {
         match self {
-            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. } | Self::CheckpointTransfer(_) | Self::ManagedCheckpointTransfer(_) => LOCAL_PREFIX,
+            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. }
+            | Self::CheckpointTransfer(_) | Self::ManagedCheckpointTransfer(_) | Self::WorldRankTransfer(_) => LOCAL_PREFIX,
             Self::Issuer(_) => LOCAL_ISSUER_PREFIX,
         }
     }
@@ -417,6 +439,7 @@ impl fmt::Display for AssertionVaultRecord {
                 write!(formatter, "release-{family}-{}", URL_SAFE_NO_PAD.encode(attempt)),
             Self::CheckpointTransfer(address) => write!(formatter, "checkpoint-transfer-{}", URL_SAFE_NO_PAD.encode(address)),
             Self::ManagedCheckpointTransfer(destination) => write!(formatter, "managed-transfer-{}", URL_SAFE_NO_PAD.encode(destination)),
+            Self::WorldRankTransfer(address) => write!(formatter, "world-rank-transfer-{}", URL_SAFE_NO_PAD.encode(address)),
         }
     }
 }
@@ -465,7 +488,8 @@ impl<'a> AssertionFamilies<'a> {
             }
             let record = Family {
                 original, original_position: None, rewrites: Vec::new(),
-                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None, release_holds: Vec::new(), release_sequence: 0, transfers: Vec::new(),
+                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None,
+                release_holds: Vec::new(), release_sequence: 0, transfers: Vec::new(), rank_transfers: BTreeSet::new(),
             };
             if self.write(family, None, &record).await? {
                 return Ok(());
@@ -838,7 +862,9 @@ impl<'a> AssertionFamilies<'a> {
                 return Ok(());
             }
             let record = decode_family(&bytes)?;
-            if !record.release_holds.is_empty() || !record.native_landings_drained() || !self.checkpoint_transfers_drained(&record).await? {
+            if !record.release_holds.is_empty() || !record.native_landings_drained()
+                || !self.checkpoint_transfers_drained(&record).await? || !self.world_rank_transfers_drained(&record).await?
+            {
                 return Err(conflict());
             }
             let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);

@@ -233,6 +233,18 @@ impl CurrentAssertionFamilyRead {
         self.carrier_point(RESTORE, key).await
     }
 
+    pub async fn retired_world_rank_custody(
+        &self, address: [u8; 32], state: bool,
+    ) -> Result<HostedControlPoint> {
+        use std::fmt::Write;
+
+        let mut key = String::from(if state { "fenced-world-rank-state/" } else { "fenced-world-rank-custody/" });
+        for byte in address {
+            write!(key, "{byte:02x}").expect("writing to a string");
+        }
+        self.carrier_point(RESTORE, &key).await
+    }
+
     async fn carrier_point(&self, relation: &str, key: &str) -> Result<HostedControlPoint> {
         read_carrier_point(&self.context, relation, key).await
     }

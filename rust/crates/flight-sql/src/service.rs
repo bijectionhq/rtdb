@@ -733,7 +733,10 @@ impl FlightService for Service {
             .then_some(crate::owned_actions::DECIDE_HOSTED_STREAM_V1);
         let hosted_worlds = self.0.config.owned_world_host.is_some() && self.supports_hosted_upload(&call);
         let retired_family = self.supports_retired_original_family(&call)
-            .then_some(crate::owned_family::RETIRED_ORIGINAL_FAMILY_V1);
+            .then_some([
+                crate::owned_family::RETIRED_ORIGINAL_FAMILY_V1,
+                crate::owned_family::RETIRED_ORIGINAL_WORLD_RANK_V1,
+            ]);
         let hosted_world_actions = [
             crate::owned_actions::DECIDE_HELD_WORLDS_V3,
             crate::owned_family::RESOLVE_FAMILY_MEMBER_V1,
@@ -758,7 +761,7 @@ impl FlightService for Service {
             .chain(crate::owned_actions::WORLD_RANK_ACTIONS.into_iter().filter(|_| hosted_worlds))
             .chain(catalog_actions.into_iter().filter(|_| catalog_enabled))
             .chain(hosted_upload)
-            .chain(retired_family)
+            .chain(retired_family.into_iter().flatten())
             .map(|name| Ok(flight::ActionType { r#type: name.into(), description: name.into() })).collect())
     }
     async fn get_flight_info(&self, request: Request<flight::FlightDescriptor>) -> Result<Response<flight::FlightInfo>, Status> {

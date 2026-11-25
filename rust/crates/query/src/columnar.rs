@@ -36,6 +36,7 @@ pub(crate) enum Column {
 
 pub(crate) type ArrowVector = (ArrayRef, Arc<ArrowField>, Option<LogicalType>);
 type StoredVector = (ArrayRef, Arc<ArrowField>, Option<LogicalType>, Option<Arc<MemoryReservation>>);
+type FragmentVector<'a> = (&'a ArrayRef, &'a Arc<ArrowField>, &'a Option<LogicalType>, &'a Arc<MemoryReservation>);
 
 #[derive(Clone)]
 pub(crate) struct SelectedColumn {
@@ -66,7 +67,7 @@ enum RowExpansion {
     RepeatEach(usize),
     RepeatPage(usize),
     JoinProbe(Arc<crate::batch_join::ProbeRuns>),
-    ListSpans(Arc<ListSpans>),
+    PageSpans(Arc<PageSpans>),
     WindowSpans(Arc<window::WindowSpans>),
     UnnestParents(Arc<UnnestRows>),
     UnnestGroups(Arc<UnnestRows>),
@@ -80,7 +81,7 @@ impl RowExpansion {
             Self::RepeatEach(width) => (0, row / width),
             Self::RepeatPage(width) => (0, row % width),
             Self::JoinProbe(runs) => (0, runs.input_row(row)),
-            Self::ListSpans(spans) => spans.position(row),
+            Self::PageSpans(spans) => spans.position(row),
             Self::WindowSpans(spans) => spans.position(row),
             Self::UnnestParents(runs) => (0, runs.groups[runs.group_at(row)].parent),
             Self::UnnestGroups(runs) => (0, runs.group_at(row)),
@@ -100,7 +101,7 @@ impl RowExpansion {
             Self::RepeatEach(1) => {}
             Self::RepeatPage(width) if rows.len() <= width - start => {}
             Self::JoinProbe(runs) if runs.contiguous(&rows) => {}
-            Self::ListSpans(spans) if rows.end <= spans.ends[source] => {}
+            Self::PageSpans(spans) if rows.end <= spans.ends[source] => {}
             Self::WindowSpans(spans) if spans.contains(source, rows.end) => {}
             Self::UnnestChildren(runs) if source != 0 => {
                 let first = runs.group_at(rows.start);
@@ -119,7 +120,7 @@ impl RowExpansion {
     fn owner(&self) -> Option<&Arc<MemoryReservation>> {
         match self {
             Self::ApplyOuter(spans) => Some(spans.reservation()),
-            Self::ListSpans(spans) => Some(&spans.reservation),
+            Self::PageSpans(spans) => Some(&spans.reservation),
             Self::WindowSpans(spans) => Some(spans.reservation()),
             Self::UnnestParents(runs) | Self::UnnestGroups(runs) | Self::UnnestChildren(runs) => Some(&runs.reservation),
             Self::JoinProbe(runs) => runs.owner(),
@@ -128,12 +129,12 @@ impl RowExpansion {
     }
 }
 
-struct ListSpans {
+struct PageSpans {
     ends: Vec<usize>,
     reservation: Arc<MemoryReservation>,
 }
 
-impl ListSpans {
+impl PageSpans {
     fn position(&self, row: usize) -> (usize, usize) {
         let page = self.ends.partition_point(|&end| end <= row);
         let start = page.checked_sub(1).map_or(0, |previous| self.ends[previous]);
@@ -1459,6 +1460,100 @@ impl ColumnBatch {
         Self::take_rows(&sources, &picks, &positions, memory).map(Some)
     }
 
+    pub(crate) fn from_spill_fragments(mut sources: Vec<Self>, width: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let outside_source = || invalid("column-gather", "Row position is outside its source batch");
+        if sources.is_empty() { return Err(invalid("invalid-spill", "Spilled page has no Arrow fragments")); }
+        if sources.iter().any(|source| source.columns.len() < width) { return Err(outside_source()); }
+        if sources.len() == 1 { return Ok(sources.pop().expect("One spill fragment remains")); }
+
+        let rows = sources.iter().try_fold(0usize, |rows, source| {
+            rows.checked_add(source.len).ok_or_else(|| invalid("invalid-spill", "Spilled page row count overflow"))
+        })?;
+        if rows == 0 { return Err(outside_source()); }
+        let nonempty = sources.iter().filter(|source| source.len != 0);
+        let count = nonempty.clone().count();
+        let mut expansion = None;
+        let bytes = width.checked_mul(size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(bytes)?;
+        let lease = Arc::get_mut(&mut reservation).expect("The spill page owns its metadata");
+        let mut columns = Vec::with_capacity(width);
+        for position in 0..width {
+            let vectors = nonempty.clone().map(|source| source.spill_fragment_vector(position));
+            let mut first_layout = None;
+            let mut keep_spans = false;
+            let mut compatible = true;
+            let mut bytes = count.checked_mul(size_of::<Option<StoredVector>>())
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+            for (source, vector) in nonempty.clone().zip(vectors.clone()) {
+                let Some(vector) = vector else {
+                    compatible = false;
+                    break;
+                };
+                let layout = vector.map(|(_, field, logical, _)| (field, logical));
+                keep_spans |= *first_layout.get_or_insert(layout) != layout
+                    || matches!(&source.columns[position], Column::Selected(_));
+                if let Some((array, _, logical, _)) = vector {
+                    keep_spans |= nested_layout(array.data_type()) || array.data_type() == &DataType::Null;
+                    bytes = bytes.checked_add(logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?)
+                        .ok_or_else(size_error)?;
+                }
+            }
+            if compatible && keep_spans {
+                if expansion.is_none() {
+                    let span_bytes = count.checked_mul(size_of::<usize>())
+                        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+                    let reservation = memory.reserve(span_bytes)?;
+                    let mut end = 0;
+                    let ends = nonempty.clone().map(|source| { end += source.len; end }).collect();
+                    expansion = Some(RowExpansion::PageSpans(Arc::new(PageSpans { ends, reservation })));
+                }
+                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                let mut vectors_out = Vec::with_capacity(count);
+                vectors_out.extend(vectors.map(|vector| {
+                    vector.expect("The spill fragment has a full vector").map(|(array, field, logical, owner)| {
+                        (Arc::clone(array), Arc::clone(field), logical.clone(), Some(Arc::clone(owner)))
+                    })
+                }));
+                let cells = SelectedRows::Expanded {
+                    expansion: expansion.as_ref().expect("The spill page owns its spans").clone(),
+                    rows: 0..rows,
+                    input: None,
+                };
+                columns.push(Column::Selected(SelectedColumn { sources: Arc::new(vectors_out), cells }));
+            } else {
+                let cells = sources.iter().enumerate().flat_map(|(index, source)| {
+                    (0..source.len).map(move |row| Some((index, row)))
+                });
+                let (column, _scratch) = gather_column_cells(|index| &sources[index], cells, rows, position, false, memory)?;
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+            }
+        }
+        Self::settled(columns, rows, reservation)
+    }
+
+    fn spill_fragment_vector(&self, position: usize) -> Option<Option<FragmentVector<'_>>> {
+        let owner = self.column_reservation(position);
+        match &self.columns[position] {
+            Column::Arrow { array, field, logical } if array.len() == self.len => {
+                let absent = array.data_type() == &DataType::Null && field.is_nullable() && logical.as_ref() != Some(&LogicalType::Nothing);
+                Some((!absent).then_some((array, field, logical, owner)))
+            }
+            Column::Selected(selected) if selected.cells.len() == self.len => {
+                let (source, rows) = selected.cells.contiguous(0..self.len)?;
+                if rows.start != 0 { return None; }
+                match selected.sources.get(source)?.as_ref() {
+                    Some((array, field, logical, custody)) if array.len() == self.len => {
+                        Some(Some((array, field, logical, custody.as_ref().unwrap_or(owner))))
+                    }
+                    Some(_) => None,
+                    None => Some(None),
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn take_rows_with_custody(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize],
         retain_sources: bool, memory: &Arc<MemoryBudget>,
@@ -1653,7 +1748,7 @@ pub(crate) async fn retain_list_spans(
         ends.push(end);
         sources.push(expansion_source(array, other, other_type, page.column_reservation(0)));
     }
-    let expansion = RowExpansion::ListSpans(Arc::new(ListSpans { ends, reservation }));
+    let expansion = RowExpansion::PageSpans(Arc::new(PageSpans { ends, reservation }));
     let cells = SelectedRows::Expanded { expansion, rows: 0..end, input: None };
     Ok(Some((Column::Selected(SelectedColumn { sources: Arc::new(sources), cells }), charge)))
 }
@@ -2844,18 +2939,13 @@ fn scalar_layout(data_type: &DataType) -> bool {
 fn size_error() -> rtdb_types::Anomaly { invalid("column-size", "Column page exceeds addressable memory") }
 
 pub(crate) fn fragment_column(array: ArrayRef, field: Arc<ArrowField>, logical: Option<LogicalType>,
-    memory: &Arc<MemoryBudget>, metadata: &mut MemoryReservation) -> Result<Column> {
+    owner: &Arc<MemoryReservation>) -> Column {
     if !nested_layout(array.data_type()) {
-        metadata.grow_to(metadata.bytes().checked_add(array.get_array_memory_size()).ok_or_else(size_error)?)?;
-        return Ok(Column::Arrow { array, field, logical });
+        return Column::Arrow { array, field, logical };
     }
-    let bytes = array.len().checked_mul(std::mem::size_of::<(usize, usize)>()).and_then(|bytes| bytes.checked_add(512))
-        .and_then(|bytes| bytes.checked_add(field.size())).ok_or_else(size_error)?;
-    metadata.grow_to(metadata.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
-    let size = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
-    let reservation = memory.reserve(size)?;
-    let cells = (0..array.len()).map(|row| (0, row)).collect();
-    Ok(Column::Selected(SelectedColumn::new(vec![Some((array, field, logical, Some(reservation)))], Arc::new(cells))))
+    let cells = SelectedRows::Span(0..array.len());
+    let sources = Arc::new(vec![Some((array, field, logical, Some(Arc::clone(owner))))]);
+    Column::Selected(SelectedColumn { sources, cells })
 }
 
 pub(crate) fn nested_layout(data_type: &DataType) -> bool {

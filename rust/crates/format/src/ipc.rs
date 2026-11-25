@@ -1579,7 +1579,7 @@ impl<W: Write> JavaFile<W> {
         let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
         sink.write_all(FILE_MAGIC).map_err(invalid)?;
         sink.write_all(&[0; 2]).map_err(invalid)?;
-        let layout = java_layout::JavaLayout::starting_at(sink, 8);
+        let layout = java_layout::JavaLayout::new_file(sink, 8);
         let first = FirstSchemaWriter { inner: layout, schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
         let writer = StreamWriter::try_new_with_options(TailWriter { inner: first, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
         Ok(Self { writer, decimal_schema })
@@ -1599,8 +1599,7 @@ impl<W: Write> JavaFile<W> {
         tail.inner.write_all(&[0; 4]).map_err(invalid)?;
         if !tail.inner.complete { return Err(invalid("Arrow file ended before its schema")); }
         let layout = tail.inner.inner;
-        let schema = layout.schema.as_deref().ok_or_else(|| invalid("Arrow file has no schema message"))?;
-        let footer = java_layout::footer(schema, &layout.blocks).map_err(invalid)?;
+        let footer = layout.file_footer().map_err(invalid)?;
         let mut sink = layout.inner;
         sink.write_all(&footer).map_err(invalid)?;
         sink.write_all(&i32::try_from(footer.len()).map_err(invalid)?.to_le_bytes()).map_err(invalid)?;
@@ -1986,7 +1985,7 @@ pub fn write_uncompressed_stream_from_buffers(
 /// A page with different native field metadata is rejected before encoding; the sink may already contain a valid prefix.
 pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
     let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
-    let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
+    let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new_stream(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
     let mut writer = StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
     for page in pages { decimal_schema.validate_batch(page)?; writer.write(page).map_err(invalid)?; }
     writer.finish().map_err(invalid)?;

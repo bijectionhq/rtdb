@@ -555,3 +555,76 @@ The custody handoff describes the installed scope and the outstanding generic pl
 | `rtdb.owned/assertion-family-scope` | Forbidden | A capability names another deployment or incarnation, or a position names a foreign line. |
 | `rtdb.owned/assertion-profile-uninstalled` | Unsupported | Settlement requires the fixed assertion profile. |
 | `rtdb.world/unavailable` | Incorrect | The session is not the placed writer or the host has no family vault. |
+
+## Founding World rank transfer authority
+
+The host-only [World rank transfer authority](../../rust/crates/multi/src/keys/assertion/family/world_rank_transfer.rs) adapts the Original vault agreement, reciprocal observation and read checks from the managed checkpoint transfer.
+The agreement uses the current [retired Original handoff](../../rust/crates/node/src/node/hosted_control/retired_original.rs), the frozen archive digest, the exact destination installation, incarnation and hold, and one co-ordered Binary rank derivative per founding member.
+The Original validates the live member, both stages, the bound World and complete slot, and the registered derivative inventory.
+The host authenticates both envelopes without opening the payloads and supplies the full frozen contributor census, including retained and shadowed images.
+The Original enrolls one agreement in every contributing family before acknowledging the bound transfer.
+Its fence commitment includes those entries, and release-hold drain and family settlement require a positive destination terminal and Original copy drain for each entry.
+An installed terminal identifies the accepted replay receipt, backed data and closed copy activity.
+The destination serves the sealed Original stage through an exact held slot and receipt.
+The read gate attaches current destination generation and every contributing Original family fence to the existing plaintext delivery scope.
+The response owner still has to acquire its normal ordered release hold before exposing a result.
+
+### Retired Original action
+
+The authorized Original recovery endpoint issues
+`endorse_protected_world_rank_custody` against the accepted checkpoint capture.
+Its hex-encoded 228-byte `WRC1` grant carries the capture UUID, decoded manifest
+SHA-256, exact captured transaction, transfer address, agreement and inventory
+digests, and distinct reader and controller public keys. It returns the grant
+SHA-256 and a 32-byte endorsement. The cell endorsement binds the Original
+deployment, history, key namespace and incarnation. The controller orders the
+grant and endorsement as the Binary `binding` of
+`bj_rtdb_restore_hold/fenced-world-rank-custody/<hex address>` after the capture.
+
+The authenticated Original Flight attachment mounts
+`rtdb.owned.RetiredOriginalWorldRank.v1`. Its raw body starts with the transfer
+address and an Ed25519 signature over
+`SHA256("rtdb.owned/retired-world-rank-action/v1\0" || address || operation_and_fields)`.
+The [wire codec](../../rust/crates/multi/src/keys/assertion/family/world_rank_transfer/wire.rs)
+uses big-endian integers, 16-byte UUIDs, transaction ID and system time pairs,
+32-byte assertion positions and complete length-delimited Binary rank keys.
+
+| Operation byte | Role | Remaining body | Reply |
+| --- | --- | --- | --- |
+| 0 | Controller | u32 length and `WRT1` agreement, then two u32-length raw carriers per contributor in family order, `BJWC1` before `BJWP1` | Address and agreement SHA-256 |
+| 1 | Controller | Agreement SHA-256 | Byte 1 after durable positive drain |
+| 2 | Reader | Agreement SHA-256, family UUID, replay transaction, receipt and backing digests, generation, existing 324-byte release registration, complete `BJWP1` carrier | Rank bytes through the promoted response hold |
+| 3 | Reader | Existing `FamilyResponseRelease.v2` frame with the Original `WorldDerived` input | Existing release reply |
+| 4 | Controller | Agreement SHA-256 | Byte 1 after durable revocation |
+
+Operation 0 verifies both exact sealed frames under their current Original
+stages without opening either payload. The agreement and inventory digests
+hash the canonical `WRT1` frame and the contributor-count-and-inventory
+suffix, respectively, with their separate transfer domains. A prepare request
+carries the complete census in one bounded Flight frame. An oversized or
+incomplete census refuses preparation before transfer enrollment.
+
+The controller may attest preparation only after reading the reciprocal hold
+ordered on the exact destination deployment and incarnation. It orders the
+signed observation as the Binary `binding` of
+`bj_rtdb_restore_hold/fenced-world-rank-state/<hex address>` after enrollment.
+The frame is the 64-byte controller signature followed by phase and a 32-byte
+generation. Phase 0 has no additional fields. Phase 1 contains the actual
+accepted replay transaction, receipt and backing digests, then destination
+and Original copy drain digests. Phase 2 carries only both positive discard
+drains, in the same order. The signature covers
+`SHA256("rtdb.owned/retired-world-rank-state/v1\0" || grant_sha256 || phase_and_fields)`.
+It attests the destination ledger and the copy owners' observations. The
+ordered Original journal and live destination incarnation must still agree
+on delivery. The controller acknowledges operation 4 before it withdraws
+installed destination custody. The vault records revocation irreversibly
+and retains positive drains for Original family settlement.
+
+The ordered response registry uses the custody row name as its creator and
+the same registry frame and signature domain as the retired Root path. A
+read opens only the registered member's exact derived stage. Both the
+promoted response hold and the full Original family fence checks run at
+transport release. This path supports founding World ranks. The held restore
+owner supplies the authenticated archive census, reciprocal hold, accepted
+replay receipts and controller observations. Landed Root selectors, inherited
+members, rewrites and backfill require additional effect evidence.

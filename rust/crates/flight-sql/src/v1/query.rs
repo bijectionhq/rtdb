@@ -750,6 +750,11 @@ impl Parameters {
         })
     }
 
+    fn validate_columns(&self, memory: &Arc<MemoryBudget>) -> Result<(), Status> {
+        wire::validate_argument_columns(self.batch.batch(), self.types.as_slice(), memory)
+            .map_err(error::map_status)
+    }
+
     fn binds_arrow_without_row_admission(&self) -> bool {
         let batch = self.batch.batch();
         !batch.columns().is_empty()
@@ -959,19 +964,18 @@ async fn open_query(
     parameters: Option<&Parameters>,
     track: bool,
 ) -> Result<(QueryCursor, ClaimFootprint), Status> {
-    let (row, types, _values) = if let Some(parameters) = parameters {
-        let arguments = wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
+    let (row, types, _row_charge) = if let Some(parameters) = parameters {
+        parameters.validate_columns(&context.memory)?;
         if !track && let Some(cursor) = parameters.try_open_arrow(&prepared, &context).await? {
             return Ok((cursor, ClaimFootprint::default()));
         }
-        let row = arguments.rows().next().ok_or_else(|| error::incorrect("Parameters require one row"))?
-            .map_err(error::anomaly)?;
-        let size = row.iter().try_fold(1024usize, |bytes, value| {
-            wire::add(wire::add(bytes, size_of::<Value>())?, value.retained_bytes().map_err(error::anomaly)?)
-        }).map_err(error::map_status)?;
-        let values = context.memory.reserve(size).map_err(error::anomaly)?;
-        (row.to_vec(), parameters.types.as_slice(), Some(values))
-    } else { (Vec::new(), &[][..], None) };
+        let types = parameters.types.as_slice();
+        let (row, charge) = wire::first_query_row(parameters.batch.batch(), types, &context.memory)
+            .map_err(error::map_status)?;
+        (row, types, Some(charge))
+    } else {
+        (Vec::new(), &[][..], None)
+    };
     if track {
         prepared.open_tracked_query_columns(context, row, types).await.map_err(error::anomaly)
     } else {
@@ -988,6 +992,20 @@ mod tests {
         ListArray, NullArray, StringArray, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
+
+    #[test]
+    fn plain_parameter_validation_needs_no_additional_schema_budget() {
+        let memory = MemoryBudget::new(1 << 20);
+        let batch =
+            RecordBatch::try_from_iter([("p", Arc::new(Int64Array::from(vec![42])) as ArrayRef)])
+                .unwrap();
+        let ipc = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+            .unwrap();
+        let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
+        let _remaining = memory.reserve(memory.available_bytes()).unwrap();
+
+        parameters.validate_columns(&memory).unwrap();
+    }
 
     #[test]
     fn arrow_binding_accepts_scalar_and_type_preserving_float_list_profiles() {

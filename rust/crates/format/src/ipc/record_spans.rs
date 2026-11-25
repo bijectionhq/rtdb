@@ -283,7 +283,7 @@ impl RecordSpans {
         let options = write_options()?;
         let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
         let mut output = FirstSchemaWriter {
-            inner: java_layout::JavaLayout::new(sink), schema: Arc::clone(&decimal_schema),
+            inner: java_layout::JavaLayout::new_stream(sink), schema: Arc::clone(&decimal_schema),
             pending: Vec::new(), expected: None, complete: false,
         };
         let header = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(

@@ -1,14 +1,15 @@
 //! Scan fragments: a scan of one table split by trie prefix, so that another node can read a slice of the table at the
 //! query's basis and send back the rows it resolves, in place of this node reading those tries itself.
-use std::{io::{self, Cursor, Write}, ops::Range};
+use std::{io::{self, Cursor, Write}, mem::size_of, ops::Range};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_buffer::Buffer;
-use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_format::ipc::{ArrowStream, OwnedStream};
 use rtdb_plan::{Scan, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
@@ -269,6 +270,113 @@ const COLUMN_KEY: &str = "rtdb.fragment.column";
 const NAME_KEY: &str = "rtdb.fragment.name";
 const LOGICAL_KEY: &str = "rtdb.fragment.logical";
 const IPC_ALIGNMENT: usize = 64;
+const WIRE_FIELD_CACHE_COLUMNS: usize = 32;
+const WIRE_FIELD_CACHE_BYTES: usize = 64 << 10;
+
+struct WireFields {
+    by_position: [Option<WireField>; WIRE_FIELD_CACHE_COLUMNS],
+}
+
+struct WireField {
+    physical: Arc<ArrowField>,
+    logical: Option<LogicalType>,
+    wire: Arc<ArrowField>,
+    charge: Arc<MemoryReservation>,
+}
+
+impl WireFields {
+    fn new() -> Self {
+        Self { by_position: std::array::from_fn(|_| None) }
+    }
+
+    fn clear(&mut self) -> bool {
+        let populated = self.by_position.iter().any(Option::is_some);
+        *self = Self::new();
+        populated
+    }
+
+    fn field(&mut self, position: usize, physical: Arc<ArrowField>, logical: Option<LogicalType>,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Arc<ArrowField>> {
+        let Some(slot) = self.by_position.get_mut(position) else {
+            return wire_field(position, &physical, logical.as_ref());
+        };
+        if let Some(field) = slot
+            && (Arc::ptr_eq(&physical, &field.physical)
+                || physical == field.physical && same_dictionary_fields(&physical, &field.physical))
+            && match (&logical, &field.logical) {
+                (Some(left), Some(right)) => same_wire_logical(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+        {
+            return Ok(Arc::clone(&field.wire));
+        }
+        *slot = None;
+        let used = self.by_position.iter().flatten().map(|field| field.charge.bytes()).sum::<usize>();
+        let logical_bytes = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes);
+        let bound = physical.size().checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(logical_bytes.ok()?.checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_add(1024));
+        let charge = bound.filter(|&bytes| bytes <= WIRE_FIELD_CACHE_BYTES - used)
+            .and_then(|bytes| memory.reserve(bytes).ok());
+        let wire = wire_field(position, &physical, logical.as_ref())?;
+        if let Some(charge) = charge {
+            self.by_position[position] = Some(WireField { physical, logical, wire: Arc::clone(&wire), charge });
+        }
+        Ok(wire)
+    }
+}
+
+// Arrow field equality omits IPC dictionary properties, including those on children.
+#[allow(deprecated)]
+fn same_dictionary_fields(left: &ArrowField, right: &ArrowField) -> bool {
+    fn same_type(left: &DataType, right: &DataType) -> bool {
+        match (left, right) {
+            (DataType::Dictionary(lk, lv), DataType::Dictionary(rk, rv)) => same_type(lk, rk) && same_type(lv, rv),
+            (DataType::Struct(left), DataType::Struct(right)) => left.iter().zip(right.iter()).all(|(l, r)| same_dictionary_fields(l, r)),
+            (DataType::Union(left, _), DataType::Union(right, _)) => left.iter().zip(right.iter())
+                .all(|((_, l), (_, r))| same_dictionary_fields(l, r)),
+            (DataType::RunEndEncoded(le, lv), DataType::RunEndEncoded(re, rv)) => {
+                same_dictionary_fields(le, re) && same_dictionary_fields(lv, rv)
+            }
+            (DataType::List(l), DataType::List(r))
+            | (DataType::LargeList(l), DataType::LargeList(r))
+            | (DataType::ListView(l), DataType::ListView(r))
+            | (DataType::LargeListView(l), DataType::LargeListView(r))
+            | (DataType::FixedSizeList(l, _), DataType::FixedSizeList(r, _))
+            | (DataType::Map(l, _), DataType::Map(r, _)) => same_dictionary_fields(l, r),
+            _ => true,
+        }
+    }
+    left.dict_id() == right.dict_id() && left.dict_is_ordered() == right.dict_is_ordered()
+        && same_type(left.data_type(), right.data_type())
+}
+
+// Logical equality ignores the order that structs and unions write to the wire.
+fn same_wire_logical(left: &LogicalType, right: &LogicalType) -> bool {
+    use LogicalType::*;
+    match (left, right) {
+        (Struct(left), Struct(right)) => left.len() == right.len() && left.iter().zip(right.iter())
+            .all(|((ln, lt), (rn, rt))| ln == rn && same_wire_logical(lt, rt)),
+        (Union(left), Union(right)) => left.len() == right.len() && left.iter().zip(right.iter())
+            .all(|(l, r)| same_wire_logical(l, r)),
+        (List { kind: lk, element: l }, List { kind: rk, element: r }) => lk == rk && same_wire_logical(l, r),
+        (RunEndEncoded { width: lw, value: l }, RunEndEncoded { width: rw, value: r }) => lw == rw && same_wire_logical(l, r),
+        (Maybe(l), Maybe(r)) => same_wire_logical(l, r),
+        _ => left == right,
+    }
+}
+
+fn wire_field(position: usize, field: &ArrowField, logical: Option<&LogicalType>) -> Result<Arc<ArrowField>> {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(COLUMN_KEY.into(), "arrow".into());
+    metadata.insert(NAME_KEY.into(), field.name().clone());
+    if let Some(logical) = logical {
+        metadata.insert(LOGICAL_KEY.into(), serde_json::to_string(logical).map_err(|error| invalid("fragment-encode", error))?);
+    }
+    Ok(Arc::new(field.clone().with_name(format!("c{position}")).with_metadata(metadata)))
+}
 
 /// Fragment IPC and the reservation for the bytes it retains.
 #[derive(Debug)]
@@ -335,33 +443,53 @@ pub(crate) fn encode_batch(batch: &ColumnBatch, memory: &Arc<MemoryBudget>, out:
         batch
     };
     if !batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
-        return append_frame(batch, 0..batch.len, memory, out);
+        return append_frame(batch, 0..batch.len, memory, out, None);
     }
     let _reservation = memory.reserve(batch.len)?;
     let mut boundaries = vec![false; batch.len];
     for column in &batch.columns {
         if let Column::Selected(selected) = column { selected.fragment_boundaries(&mut boundaries); }
     }
-    let ends = boundaries.into_iter().enumerate().filter_map(|(index, boundary)| boundary.then_some(index))
-        .chain(std::iter::once(batch.len));
+    let mut ends = boundaries.into_iter().enumerate().filter_map(|(index, boundary)| boundary.then_some(index)).peekable();
+    if ends.peek().is_none() {
+        return append_frame(batch, 0..batch.len, memory, out, None);
+    }
+    let mut fields = WireFields::new();
     let mut start = 0;
-    for end in ends {
-        append_frame(batch, start..end, memory, out)?;
+    for end in ends.chain(std::iter::once(batch.len)) {
+        append_frame(batch, start..end, memory, out, Some(&mut fields))?;
         start = end;
     }
     Ok(())
 }
 
-fn append_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
+fn append_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes,
+    mut fields: Option<&mut WireFields>,
+) -> Result<()> {
     let prefix = out.bytes.len();
-    let result = encode_frame(batch, rows.clone(), memory, out);
-    if result.is_err() { out.bytes.truncate(prefix); }
+    let mut result = encode_frame(batch, rows.clone(), memory, out, fields.as_deref_mut());
+    if let Err(error) = &result {
+        out.bytes.truncate(prefix);
+        // Cache admission is optional, including when its charge would force a frame split.
+        if fields.as_deref_mut().is_some_and(WireFields::clear) && error.code == "rtdb/memory-budget-exceeded" {
+            result = encode_frame(batch, rows.clone(), memory, out, None);
+            if result.is_err() { out.bytes.truncate(prefix); }
+        }
+    }
     if rows.len() > 1 && result.as_ref().is_err_and(|error| {
         matches!(error.code.as_ref(), "rtdb/run-end-selection-width" | "rtdb/memory-budget-exceeded")
     }) {
         let middle = rows.start + rows.len() / 2;
-        append_frame(batch, rows.start..middle, memory, out)?;
-        return append_frame(batch, middle..rows.end, memory, out);
+        let mut split_fields;
+        let fields = match fields {
+            Some(fields) => fields,
+            None => {
+                split_fields = WireFields::new();
+                &mut split_fields
+            }
+        };
+        append_frame(batch, rows.start..middle, memory, out, Some(fields))?;
+        return append_frame(batch, middle..rows.end, memory, out, Some(fields));
     }
     result
 }
@@ -391,13 +519,14 @@ fn frame_slice(array: &ArrayRef, field: &ArrowField, rows: Range<usize>, memory:
     Some((array, Some(body)))
 }
 
-fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
+fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes,
+    mut wire_fields: Option<&mut WireFields>,
+) -> Result<()> {
     let mut reservations = Vec::new();
     let mut fields = Vec::with_capacity(batch.columns.len());
     let mut arrays = Vec::with_capacity(batch.columns.len());
     let mut slice_bodies = Vec::with_capacity(batch.columns.len());
     for (position, column) in batch.columns.iter().enumerate() {
-        let wire_name = format!("c{position}");
         let (array, field, logical, body) = match column {
             Column::Arrow { array, field, logical } if array.len() == batch.len => {
                 let (array, body) = if let Some(slice) = frame_slice(array, field, rows.clone(), memory, &mut reservations) {
@@ -421,13 +550,11 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
             }
             _ => return Err(invalid("fragment-encode", "Fragment column lacks its packed Arrow vector")),
         };
-        let mut metadata = field.metadata().clone();
-        metadata.insert(COLUMN_KEY.into(), "arrow".into());
-        metadata.insert(NAME_KEY.into(), field.name().clone());
-        if let Some(logical) = logical {
-            metadata.insert(LOGICAL_KEY.into(), serde_json::to_string(&logical).map_err(|error| invalid("fragment-encode", error))?);
-        }
-        fields.push(field.as_ref().clone().with_name(wire_name).with_metadata(metadata));
+        let field = match wire_fields.as_deref_mut() {
+            Some(cache) => cache.field(position, field, logical, memory)?,
+            None => wire_field(position, &field, logical.as_ref())?,
+        };
+        fields.push(field);
         arrays.push(array);
         slice_bodies.push(body);
     }
@@ -493,43 +620,147 @@ fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: 
 }
 
 fn decode_retained_fragment(frame: Buffer, memory: &Arc<MemoryBudget>, batches: &mut Vec<ColumnBatch>) -> Result<()> {
-    let stream = rtdb_format::ipc::OwnedStream::read_buffer(frame, memory).map_err(|error| {
-        if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
-    })?;
-    for page in stream.pages() {
-        batches.push(decode_fragment_batch(page.batch(), memory)?);
+    let stream = OwnedStream::read_buffer(frame, memory).map_err(fragment_decode_error)?;
+    for page in stream.into_pages() {
+        batches.push(decode_fragment_batch(page, memory)?);
     }
     Ok(())
+}
+
+fn fragment_decode_error(error: Anomaly) -> Anomaly {
+    if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
 }
 
 fn decode_copied_fragment(frame: &[u8], memory: &Arc<MemoryBudget>, batches: &mut Vec<ColumnBatch>) -> Result<()> {
-    rtdb_format::ipc::validate_complete_stream(frame).map_err(|error| invalid("fragment-decode", error))?;
-    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(frame), None)
-        .map_err(|error| invalid("fragment-decode", error))?;
-    for record in reader {
-        let record = record.map_err(|error| invalid("fragment-decode", error))?;
-        batches.push(decode_fragment_batch(&record, memory)?);
+    if let Some(page) = copy_standard_fragment(frame, memory)? {
+        batches.push(decode_fragment_batch(page, memory)?);
+    } else {
+        let stream = OwnedStream::read(frame, memory).map_err(fragment_decode_error)?;
+        for page in stream.into_pages() {
+            batches.push(decode_fragment_batch(page, memory)?);
+        }
     }
     Ok(())
 }
 
-fn decode_fragment_batch(record: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
+fn standard_message(bytes: &[u8]) -> Option<(arrow_ipc::Message<'_>, &[u8], &[u8])> {
+    let (continuation, bytes) = bytes.split_first_chunk::<4>()?;
+    if *continuation != [255; 4] { return None; }
+    let (length, bytes) = bytes.split_first_chunk::<4>()?;
+    let (header, bytes) = bytes.split_at_checked(usize::try_from(i32::from_le_bytes(*length)).ok()?)?;
+    let message = arrow_ipc::root_as_message(header).ok()?;
+    if message.version() != arrow_ipc::MetadataVersion::V5 { return None; }
+    let (body, tail) = bytes.split_at_checked(usize::try_from(message.bodyLength()).ok()?)?;
+    Some((message, body, tail))
+}
+
+fn copied_metadata_bound<'a>(entries: impl Iterator<Item = arrow_ipc::KeyValue<'a>>) -> Option<usize> {
+    entries.into_iter().try_fold(0usize, |bytes, entry| {
+        let lengths = entry.key().map_or(0, str::len).checked_add(entry.value().map_or(0, str::len))?;
+        bytes.checked_add(512)?.checked_add(lengths.checked_mul(16)?)
+    })
+}
+
+fn copied_schema_bound(schema: arrow_ipc::Schema<'_>, header: usize) -> Option<usize> {
+    fn field_bound(field: arrow_ipc::Field<'_>) -> Option<usize> {
+        if field.dictionary().is_some() { return None; }
+        let name = field.name().map_or(0, str::len);
+        let timezone = field.type_as_timestamp().and_then(|ty| ty.timezone()).map_or(0, str::len);
+        let union_ids = field.type_as_union().and_then(|ty| ty.typeIds()).map_or(0, |ids| ids.len());
+        let metadata = copied_metadata_bound(field.custom_metadata().into_iter().flatten())?;
+        let base = 2048usize.checked_add(name.checked_add(timezone)?.checked_add(union_ids)?.checked_mul(16)?)?
+            .checked_add(metadata)?;
+        field.children().into_iter().flatten().try_fold(base, |bytes, child| bytes.checked_add(field_bound(child)?))
+    }
+    let metadata = copied_metadata_bound(schema.custom_metadata().into_iter().flatten())?;
+    let base = header.checked_mul(16)?.checked_add(8192)?.checked_add(metadata)?;
+    schema.fields().into_iter().flatten().try_fold(base, |bytes, field| bytes.checked_add(field_bound(field)?))
+}
+
+fn copy_standard_fragment(frame: &[u8], memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
+    let Some((schema, [], rest)) = standard_message(frame) else { return Ok(None); };
+    let Some(schema) = schema.header_as_schema() else { return Ok(None); };
+    let Some((message, body, [255, 255, 255, 255, 0, 0, 0, 0])) = standard_message(rest) else { return Ok(None); };
+    let Some(batch) = message.header_as_record_batch() else { return Ok(None); };
+    let Some((nodes, buffers)) = batch.nodes().zip(batch.buffers()) else { return Ok(None); };
+    if batch.compression().is_some() || nodes.iter().any(|node| node.null_count() < 0)
+        || buffers.iter().any(|buffer| buffer.offset() % IPC_ALIGNMENT as i64 != 0)
+    {
+        return Ok(None);
+    }
+    rtdb_format::ipc::validate_complete_stream(frame).map_err(fragment_decode_error)?;
+
+    // These offsets let the copy fund one aligned body instead of potential per-buffer alignment copies.
+    let schema_end = frame.len() - rest.len();
+    let Some(schema_bound) = copied_schema_bound(schema, schema_end) else { return Ok(None); };
+    let overflow = || invalid("fragment-decode", "IPC copy allocation bound overflow");
+    let descriptors = nodes.iter().try_fold(8192usize, |bytes, node| {
+        let len = usize::try_from(node.length()).ok()?;
+        bytes.checked_add(4096)?.checked_add(len.div_ceil(8).checked_mul(4)?)
+    }).ok_or_else(overflow)?;
+    let bound = buffers.len().checked_mul(512).and_then(|bytes| bytes.checked_add(descriptors))
+        .and_then(|bytes| bytes.checked_add(body.len())).and_then(|bytes| bytes.checked_add(IPC_ALIGNMENT))
+        .and_then(|bytes| bytes.checked_add(schema_bound)).ok_or_else(overflow)?;
+    let mut charge = memory.reserve(bound)?;
+    let grant = Arc::get_mut(&mut charge).expect("The fragment copy owns its grant");
+    let reader = ArrowStream::from_reader(Cursor::new(&frame[..schema_end]), None).map_err(fragment_decode_error)?;
+    let schema = reader.schema();
+    drop(reader);
+    let retained_schema = schema.fields().iter().try_fold(256usize, |bytes, field| {
+        bytes.checked_add(field.size())?.checked_add(64)
+    }).and_then(|bytes| {
+        let metadata = schema.metadata();
+        metadata.iter().try_fold(bytes.checked_add(metadata.capacity().checked_mul(64)?)?, |bytes, (key, value)| {
+            bytes.checked_add(key.capacity())?.checked_add(value.capacity())
+        })
+    }).ok_or_else(overflow)?;
+    let schema_charge = grant.split_off(retained_schema)?;
+    let body = Buffer::from_slice_ref(body);
+    let record = arrow_ipc::reader::read_record_batch(&body, batch, schema, &Default::default(), None, &message.version())
+        .map_err(|error| invalid("fragment-decode", error))?;
+    OwnedBatch::with_independent_buffers(record, grant, schema_charge, |_| false).map(Some).map_err(fragment_decode_error)
+}
+
+fn decode_fragment_batch(page: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
     let malformed = |message: &str| invalid("fragment-decode", message);
-    let mut reservation = memory.reserve(256)?;
-    let metadata_charge = Arc::get_mut(&mut reservation).expect("A fragment batch owns its reservation");
+    let overflow = || malformed("Fragment column metadata exceeds addressable memory");
+    let record = page.batch();
+    let base = record.num_columns().checked_mul(size_of::<Column>())
+        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+    let mut reservation = memory.reserve_with_backing(base, std::iter::once(Arc::clone(page.reservation())))?;
     let mut columns = Vec::with_capacity(record.num_columns());
     for (field, array) in record.schema_ref().fields().iter().zip(record.columns()) {
-        let mut metadata = field.metadata().clone();
-        if metadata.remove(COLUMN_KEY).as_deref() != Some("arrow") {
+        if field.metadata().get(COLUMN_KEY).map(String::as_str) != Some("arrow") {
             return Err(malformed("A fragment column has no Arrow encoding"));
         }
-        let name = metadata.remove(NAME_KEY).ok_or_else(|| malformed("A fragment column has no name"))?;
+        if !field.metadata().contains_key(NAME_KEY) { return Err(malformed("A fragment column has no name")); }
+        let logical_bytes = field.metadata().get(LOGICAL_KEY).map_or(0, String::len);
+        let bound = field.size().checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(logical_bytes.checked_mul(32)?))
+            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
+        let nested = nested_layout(array.data_type());
+        let mut owner = if nested {
+            memory.reserve_with_backing(bound, std::iter::once(Arc::clone(page.reservation())))?
+        } else {
+            memory.reserve(bound)?
+        };
+        let mut metadata = field.metadata().clone();
+        metadata.remove(COLUMN_KEY);
+        let name = metadata.remove(NAME_KEY).expect("The fragment column has a name");
         let logical = metadata.remove(LOGICAL_KEY).map(|logical| serde_json::from_str::<LogicalType>(&logical))
             .transpose().map_err(|error| invalid("fragment-decode", error))?;
         let field = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
-        columns.push(fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?);
+        let backing = if nested { size_of::<Arc<MemoryReservation>>() } else { 0 };
+        let bytes = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?.checked_add(field.size())
+            .and_then(|bytes| bytes.checked_add(512 + backing)).ok_or_else(overflow)?;
+        let lease = Arc::get_mut(&mut owner).expect("A fragment column owns its metadata");
+        lease.shrink_to(bytes)?;
+        if !nested {
+            Arc::get_mut(&mut reservation).expect("A fragment batch owns its metadata").absorb(lease)?;
+        }
+        columns.push(fragment_column(Arc::clone(array), field, logical, &owner));
     }
-    ColumnBatch::settled(columns, record.num_rows(), reservation)
+    Ok(ColumnBatch::sharing(columns, record.num_rows(), reservation))
 }
 
 #[cfg(test)]
@@ -786,6 +1017,50 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_fragment_span_keeps_its_decoded_backing_after_the_page_drops() {
+        use arrow_array::{ListArray, StringArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer};
+
+        let reply_memory = MemoryBudget::new(8 << 20);
+        let memory = MemoryBudget::new(8 << 20);
+        let rows = 16_384;
+        let text = "x".repeat(128 << 10);
+        let item = Arc::new(ArrowField::new("item", DataType::Utf8, false));
+        let offsets = std::iter::once(0).chain(std::iter::repeat_n(1, rows)).collect::<Vec<_>>();
+        let validity = (0..rows).map(|row| row != 1).collect::<Vec<_>>();
+        let array: ArrayRef = Arc::new(ListArray::new(item, OffsetBuffer::new(offsets.into()),
+            Arc::new(StringArray::from(vec![text.as_str()])), Some(NullBuffer::from(validity))));
+        let field = Arc::new(ArrowField::new("items", array.data_type().clone(), true));
+        let input = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }], rows, memory.reserve(256).unwrap()).unwrap();
+        let mut reply = FragmentBytes::new(&reply_memory).unwrap();
+        encode_batch(&input, &memory, &mut reply).unwrap();
+        drop(input);
+        let addresses = reply.as_slice().as_ptr_range();
+        let bytes = reply.into_ipc_buffer();
+        let stream = OwnedStream::read_buffer(bytes.slice(8), &memory).unwrap();
+        let admitted = memory.used_bytes();
+        let batch = decode_fragment_batch(stream.pages()[0].clone(), &memory).unwrap();
+        assert!(memory.used_bytes() - admitted < 8 << 10);
+        let Column::Selected(selected) = &batch.columns[0] else { panic!("Expected a nested selection") };
+        assert_eq!(selected.fragment_source(0..rows).unwrap().1, 0..rows);
+        let selection = Column::Selected(selected.clone());
+        drop((bytes, stream, batch));
+
+        let Some(Some((array, _, _, row))) = selection.arrow_cell(0) else { panic!("Expected a list") };
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        let child = list.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let value = child.value(list.value_offsets()[row] as usize);
+        assert_eq!(value, text);
+        assert!(addresses.contains(&value.as_ptr()));
+        assert_eq!(selection.value(1).unwrap(), Value::Null);
+        assert_eq!(selection.value(2).unwrap(), Value::list(Vec::new()));
+        assert!(reply_memory.used_bytes() > 0);
+        drop(selection);
+        assert_eq!(reply_memory.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn a_copying_frame_keeps_the_admitted_reply_prefix() {
         use arrow_array::StringArray;
         use arrow_schema::DataType;
@@ -801,7 +1076,7 @@ mod tests {
                 logical: None,
             };
             let batch = ColumnBatch::settled(vec![column], 1, source.reserve(256).unwrap()).unwrap();
-            encode_frame(&batch, 0..1, &source, reply).unwrap();
+            encode_frame(&batch, 0..1, &source, reply, None).unwrap();
         };
         append(&mut reply, "prefix");
         let second = reply.as_slice().len();
@@ -812,6 +1087,13 @@ mod tests {
         let error = rtdb_format::ipc::OwnedStream::read_buffer(second, &memory).err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
 
+        let detached_memory = MemoryBudget::new(512 << 10);
+        let detached = decode_fragment_frames(bytes.clone(), &detached_memory, false).unwrap();
+        let refused = MemoryBudget::new(large.len() - 1);
+        let error = decode_fragment_frames(bytes.clone(), &refused, false).err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(refused.used_bytes(), 0);
+
         let decoded = decode_batches(bytes, &memory).unwrap();
         let [first, second] = decoded.as_slice() else { panic!("Expected two batches") };
         for (batch, expected, retained) in [(first, "prefix", true), (second, large.as_str(), false)] {
@@ -820,6 +1102,15 @@ mod tests {
             assert_eq!(text, expected);
             assert_eq!(addresses.contains(&text.as_ptr()), retained);
         }
+        drop(decoded);
+        assert_eq!(source.used_bytes(), 0);
+        let Column::Arrow { array, .. } = &detached[1].columns[0] else { panic!("Expected detached Arrow") };
+        let array = Arc::clone(array);
+        drop(detached);
+        assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().value(0), large);
+        assert!(detached_memory.used_bytes() >= large.len());
+        drop(array);
+        assert_eq!(detached_memory.used_bytes(), 0);
     }
 
     #[test]
@@ -884,6 +1175,92 @@ mod tests {
         for frame in frames {
             assert_eq!(frame.columns[0].value(0).unwrap(), Value::Binary(data.clone()));
         }
+    }
+
+    #[test]
+    fn a_wire_field_cache_matches_position_and_ordered_logical_metadata() {
+        use rtdb_types::{ScalarType, StructFields};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let physical = Arc::new(ArrowField::new("value", DataType::Null, true));
+        let left = LogicalType::Struct(StructFields::from([
+            ("a".into(), LogicalType::Scalar(ScalarType::I64)), ("b".into(), LogicalType::Null),
+        ]));
+        let right = LogicalType::Struct(StructFields::from([
+            ("b".into(), LogicalType::Null), ("a".into(), LogicalType::Scalar(ScalarType::I64)),
+        ]));
+        assert_eq!(left, right);
+        let mut fields = WireFields::new();
+        let first = fields.field(0, Arc::clone(&physical), Some(left.clone()), &memory).unwrap();
+        let equivalent = fields.field(0, Arc::new(physical.as_ref().clone()), Some(left.clone()), &memory).unwrap();
+        assert!(Arc::ptr_eq(&first, &equivalent));
+        let other_position = fields.field(1, Arc::clone(&physical), Some(left), &memory).unwrap();
+        assert_eq!(other_position.name(), "c1");
+        let changed = fields.field(0, Arc::clone(&physical), Some(right), &memory).unwrap();
+        assert_ne!(first.metadata()[LOGICAL_KEY], changed.metadata()[LOGICAL_KEY]);
+        let nullable = fields.field(0, Arc::new(physical.as_ref().clone().with_nullable(false)), None, &memory).unwrap();
+        assert!(!nullable.is_nullable());
+        assert!(!nullable.metadata().contains_key(LOGICAL_KEY));
+
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let unordered = Arc::new(ArrowField::new("dictionary", dictionary, true));
+        let ordered = Arc::new(unordered.as_ref().clone().with_dict_is_ordered(true));
+        let before = fields.field(0, unordered, None, &memory).unwrap();
+        let after = fields.field(0, ordered, None, &memory).unwrap();
+        assert_eq!(before.dict_is_ordered(), Some(false));
+        assert_eq!(after.dict_is_ordered(), Some(true));
+
+        let uncached = Arc::new(ArrowField::new("x".repeat(WIRE_FIELD_CACHE_BYTES), DataType::Null, true));
+        fields.field(2, uncached, None, &memory).unwrap();
+        assert!(fields.by_position[2].is_none());
+        assert!(memory.used_bytes() <= WIRE_FIELD_CACHE_BYTES);
+        drop(fields);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn wire_descriptor_charges_can_be_released_before_splitting_a_frame() {
+        use arrow_array::Int64Array;
+
+        let reply_memory = MemoryBudget::new(1 << 20);
+        let probe = MemoryBudget::new(1 << 20);
+        let column = Column::Arrow {
+            array: Arc::new(Int64Array::from(vec![1, 2, 3])),
+            field: Arc::new(ArrowField::new("value", DataType::Int64, false)),
+            logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::I64)),
+        };
+        let batch = ColumnBatch::settled(vec![column], 3, reply_memory.reserve(256).unwrap()).unwrap();
+        let mut expected = FragmentBytes::new(&reply_memory).unwrap();
+        encode_frame(&batch, 0..3, &probe, &mut expected, None).unwrap();
+
+        let memory = MemoryBudget::new(probe.peak_bytes());
+        let mut actual = FragmentBytes::new(&reply_memory).unwrap();
+        let mut fields = WireFields::new();
+        append_frame(&batch, 0..3, &memory, &mut actual, Some(&mut fields)).unwrap();
+        assert_eq!(actual.as_slice(), expected.as_slice());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn adjacent_frames_share_wire_descriptors_and_keep_their_ipc_bytes() {
+        let memory = MemoryBudget::new(1 << 20);
+        let column = Column::Arrow {
+            array: Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+            field: Arc::new(ArrowField::new("value", DataType::Int64, false)),
+            logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::I64)),
+        };
+        let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(256).unwrap()).unwrap();
+        let mut cached = FragmentBytes::new(&memory).unwrap();
+        let mut uncached = FragmentBytes::new(&memory).unwrap();
+        let mut fields = WireFields::new();
+        append_frame(&batch, 0..1, &memory, &mut cached, Some(&mut fields)).unwrap();
+        let wire = Arc::clone(&fields.by_position[0].as_ref().unwrap().wire);
+        append_frame(&batch, 1..2, &memory, &mut cached, Some(&mut fields)).unwrap();
+        assert!(Arc::ptr_eq(&wire, &fields.by_position[0].as_ref().unwrap().wire));
+        for rows in [0..1, 1..2] {
+            encode_frame(&batch, rows, &memory, &mut uncached, None).unwrap();
+        }
+        assert_eq!(cached.as_slice(), uncached.as_slice());
     }
 
     #[test]
@@ -964,7 +1341,7 @@ mod tests {
         let field = Arc::new(ArrowField::new("nested", array.data_type().clone(), true));
         let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }], 3, memory.reserve(1024).unwrap()).unwrap();
         let mut out = FragmentBytes::new(&memory).unwrap();
-        append_frame(&batch, 1..3, &memory, &mut out).unwrap();
+        append_frame(&batch, 1..3, &memory, &mut out, None).unwrap();
         assert!(!out.as_slice().windows(b"hidden-payload-under-null".len()).any(|bytes| bytes == b"hidden-payload-under-null"));
 
         let frames = decode_batches(out.into_ipc_buffer(), &memory).unwrap();
@@ -992,7 +1369,7 @@ mod tests {
         let mut out = FragmentBytes::new(&reply_memory).unwrap();
         out.write_all(&[0x42; 16]).unwrap();
 
-        let error = append_frame(&batch, 1..2, &memory, &mut out).unwrap_err();
+        let error = append_frame(&batch, 1..2, &memory, &mut out, None).unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         assert_eq!(out.as_slice(), &[0x42; 16]);
         assert_eq!(memory.used_bytes(), source_charge);

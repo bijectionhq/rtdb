@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 use arrow_array::{ArrayRef, Int32Array, Int64Array, NullArray, builder::StringBuilder};
 use num_bigint::BigInt;
@@ -6,6 +6,7 @@ use num_traits::{Signed, ToPrimitive, Zero};
 use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::invalid;
 use crate::numeric::Numeric;
+use crate::output::write_bytes;
 
 mod column;
 pub use column::read_source_binary_column;
@@ -144,30 +145,71 @@ pub(crate) fn numeric_allocation_bound(unscaled: &[u8], scale: i32) -> Result<us
 }
 
 pub(crate) fn numeric_write(unscaled: &[u8], scale: i32) -> Result<Vec<u8>> {
-    numeric_allocation_bound(unscaled, scale)?;
-    let signed = BigInt::from_signed_bytes_be(unscaled);
-    let negative = signed <= BigInt::zero();
-    let mut coefficient = signed.abs();
-    let fraction_groups = if scale > 0 { scale.wrapping_add(3) / 4 } else { 0 };
-    let zero_groups = if scale < 0 && !coefficient.is_zero() { scale.unsigned_abs() as usize / 4 } else { 0 };
-    let mut digits = Vec::<u16>::new();
-    if scale > 0 && scale % 4 != 0 {
-        let factor = BigInt::from(10).pow((scale % 4) as u32);
-        digits.push(((&coefficient % &factor) * BigInt::from(10).pow((4 - scale % 4) as u32)).to_u16().ok_or_else(|| invalid("Numeric digit overflow"))?);
-        coefficient /= factor;
-    } else if scale < 0 { coefficient *= BigInt::from(10).pow(scale.unsigned_abs() % 4); }
-    while !coefficient.is_zero() { digits.push((&coefficient % 10000u32).to_u16().ok_or_else(|| invalid("Numeric digit overflow"))?); coefficient /= 10000u32; }
-    let count = digits.len().checked_add(zero_groups).ok_or_else(crate::size_error)?;
-    let length = count.checked_mul(2).and_then(|bytes| bytes.checked_add(8)).ok_or_else(crate::size_error)?;
+    let numeric = NumericPayload::new(unscaled, scale)?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length).map_err(invalid)?;
-    bytes.extend_from_slice(&(count as i16).to_be_bytes());
-    bytes.extend_from_slice(&((count as i32).wrapping_sub(fraction_groups).wrapping_sub(1) as i16).to_be_bytes());
-    bytes.extend_from_slice(&(if negative { 0x4000i16 } else { 0 }).to_be_bytes());
-    bytes.extend_from_slice(&(scale.max(0) as i16).to_be_bytes());
-    for digit in digits.into_iter().rev() { bytes.extend_from_slice(&digit.to_be_bytes()); }
-    bytes.resize(length, 0);
+    bytes.try_reserve_exact(numeric.len).map_err(invalid)?;
+    numeric.write_to(&mut bytes)?;
     Ok(bytes)
+}
+
+pub(crate) fn write_numeric(unscaled: &[u8], scale: i32, output: &mut impl Write) -> Result<()> {
+    NumericPayload::new(unscaled, scale)?.write_to(output)
+}
+
+struct NumericPayload {
+    header: [i16; 4],
+    digits: Vec<u16>,
+    zero_groups: usize,
+    len: usize,
+}
+
+impl NumericPayload {
+    fn new(unscaled: &[u8], scale: i32) -> Result<Self> {
+        numeric_allocation_bound(unscaled, scale)?;
+        let signed = BigInt::from_signed_bytes_be(unscaled);
+        let sign = if signed <= BigInt::zero() { 0x4000 } else { 0 };
+        let mut coefficient = signed.abs();
+        let fraction_groups = if scale > 0 { scale.wrapping_add(3) / 4 } else { 0 };
+        let zero_groups = if scale < 0 && !coefficient.is_zero() { scale.unsigned_abs() as usize / 4 } else { 0 };
+        let mut digits = Vec::<u16>::new();
+        let digit_overflow = || invalid("Numeric digit overflow");
+        if scale > 0 && scale % 4 != 0 {
+            let factor = BigInt::from(10).pow((scale % 4) as u32);
+            let digit = (&coefficient % &factor) * BigInt::from(10).pow((4 - scale % 4) as u32);
+            digits.push(digit.to_u16().ok_or_else(digit_overflow)?);
+            coefficient /= factor;
+        } else if scale < 0 {
+            coefficient *= BigInt::from(10).pow(scale.unsigned_abs() % 4);
+        }
+        while !coefficient.is_zero() {
+            digits.push((&coefficient % 10000u32).to_u16().ok_or_else(digit_overflow)?);
+            coefficient /= 10000u32;
+        }
+        let count = digits.len().checked_add(zero_groups).ok_or_else(crate::size_error)?;
+        let len = count.checked_mul(2).and_then(|bytes| bytes.checked_add(8)).ok_or_else(crate::size_error)?;
+        let weight = (count as i32).wrapping_sub(fraction_groups).wrapping_sub(1);
+        let header = [count as i16, weight as i16, sign, scale.max(0) as i16];
+        Ok(Self { header, digits, zero_groups, len })
+    }
+
+    fn write_to(&self, output: &mut impl Write) -> Result<()> {
+        let mut header = [0; 8];
+        for (word, bytes) in self.header.into_iter().zip(header.chunks_exact_mut(2)) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+        write_bytes(output, &header)?;
+        for digit in self.digits.iter().rev() {
+            write_bytes(output, &digit.to_be_bytes())?;
+        }
+        const ZERO_BYTES: [u8; 2048] = [0; 2048];
+        let mut remaining = self.zero_groups * 2;
+        while remaining != 0 {
+            let chunk = remaining.min(ZERO_BYTES.len());
+            write_bytes(output, &ZERO_BYTES[..chunk])?;
+            remaining -= chunk;
+        }
+        Ok(())
+    }
 }
 
 struct Input<'a>(&'a [u8]);

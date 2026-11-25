@@ -436,7 +436,7 @@ mod tests {
     use rtdb_query::QueryOptions;
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::{
-        EntityId, Interval, OwnedChangeKind, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
+        DecimalValue, EntityId, Interval, OwnedChangeKind, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
         SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value,
     };
     use tokio_util::sync::CancellationToken;
@@ -482,7 +482,11 @@ mod tests {
         let original_schema = schema(&source_order, &source_creation, serde_json::json!({"kind": "binary"}))?;
         let next_schema = schema(&target_order, &target_creation, serde_json::json!({"kind": "union", "legs": [
             {"kind": "binary"}, {"kind": "struct", "fields": [{
-                "name": "v2_value", "type": {"kind": "list", "element": {"kind": "i64"}}, "optional": false, "nullable": true,
+                "name": "v2_value", "type": {"kind": "list", "element": {"kind":"struct", "fields":[
+                    {"name":"coefficient", "type":{"kind":"decimal","precision":38,"scale":0,"bitWidth":128},
+                        "optional":false,"nullable":false},
+                    {"name":"scale","type":{"kind":"i8"},"optional":false,"nullable":false}
+                ]}}, "optional": false, "nullable": true,
             }]}
         ]}))?;
         let state = PartitionState::empty(Default::default())?;
@@ -522,8 +526,11 @@ mod tests {
         };
         let mut original = OpenTransaction::new(state.snapshot(), key(2, 200), &options, &context)?;
         original.terms_time = Timestamp(180);
+        let mut decimal = vec![12, 6, 0, 216, 254, 253, 252];
+        decimal.resize(42, 255);
+        decimal.extend_from_slice(&[0, 0]);
         let put = Documents::new(vec![
-            document(&id, &source_order, &source_creation, Some(Value::Binary(vec![12, 0, 0]))),
+            document(&id, &source_order, &source_creation, Some(Value::Binary(decimal))),
             document(&EntityId::Binary(vec![0, 0xff, 1]), &source_order, &source_creation, None),
             document(&EntityId::Binary(vec![1]), &source_order, &source_creation, Some(Value::Binary(vec![2]))),
         ], &memory)?;
@@ -600,7 +607,15 @@ mod tests {
         assert_eq!(stored.valid_time.lower(), Timestamp(180));
         let StoredOperation::Put(fields) = stored.operation else { unreachable!() };
         assert_eq!(fields.get("_id"), Some(&id.as_value()));
-        assert!(matches!(fields.get(PAYLOAD), Some(Value::Struct(wrapper)) if wrapper.contains_key("v2_value")));
+        let Some(Value::Struct(wrapper)) = fields.get(PAYLOAD) else { unreachable!() };
+        let Some(Value::List(list)) = wrapper.get("v2_value") else { unreachable!() };
+        let item = list.iter().next().unwrap();
+        let Value::Struct(parts) = item.as_ref() else { unreachable!() };
+        assert_eq!(list.len(), 1);
+        assert_eq!(parts.get("coefficient"), Some(&Value::Decimal(DecimalValue::new(
+            (-123i128).to_be_bytes().to_vec(), 38, 0, 128,
+        )?)));
+        assert_eq!(parts.get("scale"), Some(&Value::I8(2)));
         assert_eq!(fields.get(&target_order), Some(&Value::Binary(Vec::new())));
         let StoredOperation::Put(missing) = data.view().read_event(1)?.operation else { unreachable!() };
         let StoredOperation::Put(null) = data.view().read_event(2)?.operation else { unreachable!() };

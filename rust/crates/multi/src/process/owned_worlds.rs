@@ -183,11 +183,19 @@ impl OwnedWorldHost for PlacedWorldHost {
             let deployment = self.deployment(&call)?;
             let record = self.directory.deployment(&deployment.to_string()).await?
                 .ok_or_else(OwnedWorld::unavailable)?;
-            if let rtdb_flight_sql::FamilyRequest::Retired(request) = request {
-                let secret = self.family_custody_secret(&record)?;
-                return assertion_families::serve_retired(Arc::clone(&self.keys), secret, call.session, &record, request).await;
+            match request {
+                rtdb_flight_sql::FamilyRequest::Retired(request) => {
+                    let secret = self.family_custody_secret(&record)?;
+                    assertion_families::serve_retired(Arc::clone(&self.keys), secret, call.session, &record, request).await
+                }
+                rtdb_flight_sql::FamilyRequest::RetiredWorldRank(request) => {
+                    let secret = self.family_custody_secret(&record)?;
+                    assertion_families::serve_retired_world_rank(
+                        Arc::clone(&self.keys), Arc::clone(&self.directory), secret, call.session, &record, request,
+                    ).await
+                }
+                request => assertion_families::serve(self.keys.as_ref(), call.session, deployment, &record, request).await,
             }
-            assertion_families::serve(self.keys.as_ref(), call.session, deployment, &record, request).await
         })
     }
 

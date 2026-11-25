@@ -2,7 +2,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rtdb_columnar::ArrowCell;
 use rtdb_query::owned_row_event_position;
 use rtdb_types::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -10,6 +10,8 @@ use super::*;
 const MAX_HANDOFF_BYTES: usize = 4096;
 
 /// Coordinates selected by the authenticated hosting owner for a single Original archive handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetiredOriginalFamilySource {
     pub deployment: Uuid,
     pub history: [u8; 32],
@@ -89,7 +91,7 @@ fn row(point: &HostedControlPoint) -> Result<(&rtdb_columnar::OwnedBatch, Timest
 }
 
 impl CurrentAssertionFamilyRead {
-    async fn require_retired(&self, source: &RetiredOriginalFamilySource) -> Result<()> {
+    async fn require_retired(&self, source: &RetiredOriginalFamilySource) -> Result<Uuid> {
         let unavailable = hosted_source_unavailable;
         let marker = self.carrier_point(RESTORE, ARCHIVE_FENCE).await?;
         let (fence, revision) = row(&marker)?;
@@ -125,7 +127,8 @@ impl CurrentAssertionFamilyRead {
         if ArrowCell::named(owner.batch(), "audience_tablet", 0).and_then(ArrowCell::binary) != Some(source.audience_tablet.as_slice()) {
             return Err(unavailable());
         }
-        self.context.check_cancelled()
+        self.context.check_cancelled()?;
+        Ok(handoff.capture)
     }
 }
 
@@ -134,11 +137,33 @@ pub struct RetiredOriginalFamilyRead {
     deployment: Uuid,
     installation: Uuid,
     fence: TransactionKey,
+    capture: Uuid,
 }
 
 impl RetiredOriginalFamilyRead {
     pub fn current(&self) -> &CurrentAssertionFamilyRead {
         &self.current
+    }
+
+    pub fn handoff_capture(&self) -> Uuid {
+        self.capture
+    }
+
+    /// Authenticate every selected publication against the same retired
+    /// Original read used to observe the handoff and current family fences.
+    pub async fn require_pre_fence_publications(&self, transactions: &[TransactionKey]) -> Result<()> {
+        let unavailable = hosted_source_unavailable;
+        let applied = self.current.applied_source().ok_or_else(unavailable)?;
+        if transactions.is_empty() || transactions.iter().any(|transaction| {
+            transaction.system_time.0 <= 0 || *transaction == self.fence || !transaction.at_or_before(self.fence)
+        }) {
+            return Err(unavailable());
+        }
+        for chunk in transactions.chunks(4) {
+            let floor = AppliedReadFloor::new(self.deployment, chunk.to_vec())?;
+            floor.require_transactions(&self.current.context, applied, None).await?;
+        }
+        self.current.context.check_cancelled()
     }
 
     /// Authenticates a pre-fence carrier registration's creator from its exact ordered row and installation.
@@ -258,9 +283,9 @@ impl OriginalAssertionFamilyReader {
     ) -> Result<RetiredOriginalFamilyRead> {
         let floor = source.floor(self.history_fingerprint())?;
         let current = self.current_covering(&floor, cancellation).await?;
-        current.require_retired(source).await?;
+        let capture = current.require_retired(source).await?;
         Ok(RetiredOriginalFamilyRead {
-            current, deployment: source.deployment, installation: source.installation, fence: source.fence,
+            current, deployment: source.deployment, installation: source.installation, fence: source.fence, capture,
         })
     }
 }

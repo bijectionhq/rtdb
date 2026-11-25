@@ -299,6 +299,7 @@ impl AssertionKeyService for S3KeyService {
         if record.is_empty() { return Err(Error::ErasedUnderView.into()); }
         StagedCapability::read(record)?.verify(stage, authoring, envelope)
     }
+
     async fn seal_assertion_stage(
         &self, stage: AssertionStage, authoring: AssertionAuthoring, _region: &Arc<IoRegion>,
         plaintext: Bytes,

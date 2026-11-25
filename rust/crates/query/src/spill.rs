@@ -2,14 +2,15 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use arrow_array::{RecordBatch};
+use arrow_array::{OffsetSizeTrait, RecordBatch};
 use arrow_buffer::Buffer;
+use arrow_data::ArrayData;
 use arrow_ipc::{
     MetadataVersion,
     reader::{StreamDecoder, read_record_batch},
-    writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message},
+    writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions, write_message},
 };
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::RecordSpans;
 use rtdb_types::Result;
@@ -20,6 +21,8 @@ use crate::{
     fragment::{FragmentBytes, decode_batches, encode_batch},
     invalid,
 };
+
+const IPC_ALIGNMENT: usize = 64;
 
 /// A query's spill files, in a directory created by the first of them: most queries never spill.
 pub(crate) struct SpillRegion { directory: std::sync::OnceLock<TempDir>, limit: u64, retained: AtomicU64, peak: AtomicU64 }
@@ -66,18 +69,23 @@ impl SpillWriter {
     fn write_frame_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
         let overflow = || invalid("row-size", "Spill row size overflow");
         let length = parts.iter().try_fold(0u64, |bytes, part| bytes.checked_add(part.len() as u64).ok_or_else(overflow))?;
-        self.write_frame_with(length, |file| {
+        self.write_frame_with(None, length, |file| {
             for part in parts { file.write_all(part).map_err(io_error)?; }
             Ok(())
         })
     }
 
     fn write_frame_with(
-        &mut self, length: u64, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+        &mut self, marker: Option<u8>, length: u64, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
     ) -> Result<()> {
-        let count = length.checked_add(8).ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
+        let count = length.checked_add(8 + if marker.is_some() { 9 } else { 0 })
+            .ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
         self.retained.region.reserve(count)?;
         self.retained.bytes.fetch_add(count, Ordering::Relaxed);
+        if let Some(marker) = marker {
+            self.file.write_all(&1u64.to_le_bytes()).map_err(io_error)?;
+            self.file.write_all(&[marker]).map_err(io_error)?;
+        }
         self.file.write_all(&length.to_le_bytes()).map_err(io_error)?;
         write(&mut self.file)?;
         self.position += count;
@@ -106,46 +114,59 @@ impl SpillWriter {
         let header = (metadata.len() as u64).to_le_bytes();
         let length = 8u64.checked_add(metadata.len() as u64).and_then(|len| len.checked_add(body as u64))
             .ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
-        self.write_frame_with(length, |file| {
+        self.write_frame_with(None, length, |file| {
             file.write_all(&header).map_err(io_error)?;
             file.write_all(&metadata).map_err(io_error)?;
             record.write_body(file).map_err(io_error)
         })
     }
 
-    pub fn write_arrow(&mut self, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
+    fn write_arrow(&mut self, marker: Option<u8>, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
         let batch = batch.batch();
-        let bound = batch.get_array_memory_size().checked_mul(6)
-            .and_then(|bytes| bytes.checked_add(schema_bytes.checked_mul(8)?))
-            .and_then(|bytes| bytes.checked_add(8192))
-            .ok_or_else(|| invalid(error, "Arrow spill allocation bound overflow"))?;
-        let _scratch = memory.reserve(bound)?;
-        const ALIGNMENT: usize = 64;
         const MESSAGE_PREFIX_BYTES: usize = 8;
         const END_MARKER: [u8; MESSAGE_PREFIX_BYTES] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
         let ipc_error = |cause| match cause {
             ArrowError::IoError(_, cause) => io_error(cause),
             cause => invalid(error, cause),
         };
-        let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5).map_err(ipc_error)?;
+        let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5).map_err(ipc_error)?;
         let generator = IpcDataGenerator::default();
+        let spans = match spill_record_spans(batch, memory) {
+            Ok(spans) => spans,
+            Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.format/invalid-arrow") => None,
+            Err(error) => return Err(error),
+        };
+        let _scratch = if spans.is_none() {
+            let bound = batch.get_array_memory_size().checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(schema_bytes.checked_mul(8)?))
+                .and_then(|bytes| bytes.checked_add(8192))
+                .ok_or_else(|| invalid(error, "Arrow spill allocation bound overflow"))?;
+            Some(memory.reserve(bound)?)
+        } else { None };
         let mut tracker = DictionaryTracker::new(false);
         let schema = generator.schema_to_bytes_with_dictionary_tracker(batch.schema_ref(), &mut tracker, &options);
-        let (dictionaries, record) = generator.encode(batch, &mut tracker, &options, &mut CompressionContext::default())
-            .map_err(ipc_error)?;
+        let (dictionaries, record, span_body) = if let Some(spans) = &spans {
+            let (ipc_message, body) = spans.metadata().map_err(|cause| invalid(error, cause))?;
+            (Vec::new(), EncodedData { ipc_message, arrow_data: Vec::new() }, body)
+        } else {
+            let (dictionaries, record) = generator.encode(batch, &mut tracker, &options, &mut CompressionContext::default())
+                .map_err(ipc_error)?;
+            (dictionaries, record, 0)
+        };
         let overflow = || invalid(error, "Arrow spill frame size overflow");
         let length = [&schema].into_iter().chain(&dictionaries).chain([&record])
-            .try_fold(END_MARKER.len(), |length, message| {
+            .try_fold(END_MARKER.len().checked_add(span_body).ok_or_else(overflow)?, |length, message| {
                 let metadata = message.ipc_message.len().checked_add(MESSAGE_PREFIX_BYTES)
-                    .and_then(|bytes| bytes.checked_next_multiple_of(ALIGNMENT)).ok_or_else(overflow)?;
+                    .and_then(|bytes| bytes.checked_next_multiple_of(IPC_ALIGNMENT)).ok_or_else(overflow)?;
                 i32::try_from(metadata - MESSAGE_PREFIX_BYTES).map_err(|_| overflow())?;
                 length.checked_add(metadata)
                     .and_then(|bytes| bytes.checked_add(message.arrow_data.len())).ok_or_else(overflow)
             })?;
-        self.write_frame_with(u64::try_from(length).map_err(|_| overflow())?, |file| {
+        self.write_frame_with(marker, u64::try_from(length).map_err(|_| overflow())?, |file| {
             for message in [schema].into_iter().chain(dictionaries).chain([record]) {
                 write_message(&mut *file, message, &options).map_err(ipc_error)?;
             }
+            if let Some(spans) = &spans { spans.write_body(file).map_err(io_error)?; }
             file.write_all(&END_MARKER).map_err(io_error)
         })
     }
@@ -154,13 +175,10 @@ impl SpillWriter {
         if batch.len == 0 { return self.write_frame(&[0]); }
         match batch.spill_record(schema, memory) {
             Ok(Some(record)) => {
-                let start = self.position()?;
                 let schema_bytes = crate::runtime_schema::schema_bound(schema)?;
-                let written = self.write_frame(&[1])
-                    .and_then(|()| self.write_arrow(&record, schema_bytes, memory, "spill-columns"));
-                match written {
+                match self.write_arrow(Some(1), &record, schema_bytes, memory, "spill-columns") {
                     Ok(()) => return Ok(()),
-                    Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => self.discard_from(start)?,
+                    Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => (),
                     Err(error) => return Err(error),
                 }
             }
@@ -170,8 +188,8 @@ impl SpillWriter {
         }
         let mut fragments = FragmentBytes::new(memory)?;
         encode_batch(batch, memory, &mut fragments)?;
-        self.write_frame(&[2])?;
-        self.write_frame(fragments.as_slice())
+        let bytes = fragments.as_slice();
+        self.write_frame_with(Some(2), bytes.len() as u64, |file| file.write_all(bytes).map_err(io_error))
     }
 
     /// Drops unpublished frames written after the supplied frame boundary.
@@ -190,6 +208,51 @@ impl SpillWriter {
         self.file.flush().map_err(io_error)?;
         Ok(self.retained)
     }
+}
+
+fn spill_record_spans(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<RecordSpans>> {
+    let layout = memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+    if !batch.columns().iter().all(|array| exact_span_layout(&array.to_data(), 0, array.len())) {
+        return Ok(None);
+    }
+    drop(layout);
+    RecordSpans::concat(&[batch], IPC_ALIGNMENT, memory)
+}
+
+fn exact_span_layout(data: &ArrayData, start: usize, len: usize) -> bool {
+    if let Some(nulls) = data.nulls().filter(|nulls| nulls.null_count() != 0) {
+        let bits = nulls.inner();
+        let offset = bits.offset() + start;
+        if !span_bitmap_matches(bits.inner(), offset, len) && bits.inner().count_set_bits_offset(offset, len) != len {
+            return false;
+        }
+    }
+    let offset = data.offset() + start;
+    match data.data_type() {
+        DataType::Boolean => span_bitmap_matches(&data.buffers()[0], offset, len),
+        DataType::Struct(_) => data.child_data().iter().all(|child| exact_span_layout(child, start, len)),
+        DataType::List(_) => exact_span_list::<i32>(data, start, len),
+        DataType::LargeList(_) => exact_span_list::<i64>(data, start, len),
+        DataType::FixedSizeList(_, width) => {
+            let width = *width as usize;
+            exact_span_layout(&data.child_data()[0], offset * width, len * width)
+        }
+        DataType::Null | DataType::FixedSizeBinary(_) | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => true,
+        ty => ty.primitive_width().is_some(),
+    }
+}
+
+fn exact_span_list<O: OffsetSizeTrait>(data: &ArrayData, start: usize, len: usize) -> bool {
+    let offsets = data.buffer::<O>(0);
+    let child_start = offsets[start].as_usize();
+    let child_end = offsets[start + len].as_usize();
+    exact_span_layout(&data.child_data()[0], child_start, child_end - child_start)
+}
+
+fn span_bitmap_matches(buffer: &Buffer, offset: usize, len: usize) -> bool {
+    // Arrow 58.4.1 preserves the unused bits in a byte-aligned slice of a bitmap.
+    let tail = len % 8;
+    tail == 0 || offset % 8 != 0 || buffer[offset / 8 + len / 8] >> tail == 0
 }
 
 pub(crate) struct SpillReader { file: BufReader<File>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
@@ -264,18 +327,8 @@ impl SpillReader {
                     .ok_or_else(|| invalid("invalid-spill", "Spilled Arrow fragments are absent"))?;
                 let bytes = rtdb_columnar::retain_buffer(&Buffer::from_vec(bytes), &charge);
                 drop(charge);
-                let mut batches = decode_batches(bytes, &self.memory)?;
-                if batches.len() == 1 { return Ok(batches.pop()); }
-                if batches.is_empty() { return Err(invalid("invalid-spill", "Spilled page has no Arrow fragments")); }
-                let rows = batches.iter().try_fold(0usize, |count, batch| {
-                    count.checked_add(batch.len).ok_or_else(|| invalid("invalid-spill", "Spilled page row count overflow"))
-                })?;
-                let bound = rows.checked_mul(std::mem::size_of::<(usize, usize)>())
-                    .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("invalid-spill", "Spilled page selection overflow"))?;
-                let _picks = self.memory.reserve(bound)?;
-                let picks = batches.iter().enumerate().flat_map(|(index, batch)| (0..batch.len).map(move |row| (index, row))).collect::<Vec<_>>();
-                let columns = (0..width).collect::<Vec<_>>();
-                ColumnBatch::take_rows(&batches, &picks, &columns, &self.memory).map(Some)
+                let batches = decode_batches(bytes, &self.memory)?;
+                ColumnBatch::from_spill_fragments(batches, width, &self.memory).map(Some)
             }
             _ => Err(invalid("invalid-spill", "Invalid spill page header")),
         }
@@ -411,8 +464,8 @@ fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() 
 
     let spill = Arc::new(SpillRegion::new(size).unwrap());
     let mut writer = spill.create().unwrap();
-    writer.write_arrow(&batch, 0, &memory, "spill-columns").unwrap();
-    assert_eq!(writer.write_arrow(&batch, 0, &memory, "spill-columns").unwrap_err().code, "rtdb.query/spill-limit");
+    writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap();
+    assert_eq!(writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap_err().code, "rtdb.query/spill-limit");
     assert_eq!(writer.position().unwrap(), size);
     assert_eq!(spill.retained_bytes(), size);
     let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
@@ -421,6 +474,75 @@ fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() 
     drop((reader, batch));
     assert_eq!(spill.retained_bytes(), 0);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn homogeneous_spill_streams_exact_ipc_with_only_span_scratch() {
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, ListArray, types::Int32Type};
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{Field, Schema};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let scratch = MemoryBudget::new(1 << 18);
+    let len = (1 << 15) + 1;
+    let numeric = Arc::new(Int64Array::from(vec![17; len])) as ArrayRef;
+    let flags: BooleanArray = (0..len + 1).map(|row| match row % 3 {
+        0 => Some(false), 1 => Some(true), _ => None,
+    }).collect();
+    let flags = Arc::new(flags.slice(1, len)) as ArrayRef;
+    let list = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+        (0..len).map(|row| (row % 2 == 0).then_some([Some(2), None])),
+    )) as ArrayRef;
+    let schema = Arc::new(Schema::new_with_metadata(vec![
+        Field::new("number", numeric.data_type().clone(), false).with_metadata([("unit".into(), "rows".into())].into()),
+        Field::new("flag", flags.data_type().clone(), true),
+        Field::new("list", list.data_type().clone(), true),
+    ], [("page".into(), "spill".into())].into()));
+    let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![numeric, flags, list]).unwrap(), &memory).unwrap();
+    let mut reference = StreamWriter::try_new(Vec::new(), batch.batch().schema_ref()).unwrap();
+    reference.write(batch.batch()).unwrap();
+    let expected = reference.into_inner().unwrap();
+    let size = expected.len() as u64 + 17;
+
+    let spill = Arc::new(SpillRegion::new(size + 9).unwrap());
+    let mut writer = spill.create().unwrap();
+    writer.write_arrow(Some(1), &batch, 0, &scratch, "spill-columns").unwrap();
+    let error = writer.write_arrow(Some(1), &batch, 0, &scratch, "spill-columns").unwrap_err();
+    assert_eq!(error.code, "rtdb.query/spill-limit");
+    assert_eq!(writer.position().unwrap(), size);
+    assert_eq!(spill.retained_bytes(), size);
+    assert_eq!(spill.peak_bytes(), size);
+    assert_eq!(scratch.used_bytes(), 0);
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [1]);
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, expected);
+    assert!(reader.read_frame(1).unwrap().is_none());
+}
+
+#[test]
+fn homogeneous_spill_preserves_unused_bits_in_aligned_bitmap_slices() {
+    use arrow_array::{ArrayRef, BooleanArray, Int32Array};
+    use arrow_ipc::writer::StreamWriter;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let spill = Arc::new(SpillRegion::new(1 << 16).unwrap());
+    let arrays = [
+        Arc::new(BooleanArray::from(vec![true; 8]).slice(0, 3)) as ArrayRef,
+        Arc::new(Int32Array::from(vec![None, Some(1), None, Some(2), Some(3)]).slice(0, 3)) as ArrayRef,
+    ];
+    let mut writer = spill.create().unwrap();
+    let expected = arrays.into_iter().map(|array| {
+        let record = RecordBatch::try_from_iter([("value", array)]).unwrap();
+        assert!(spill_record_spans(&record, &memory).unwrap().is_none());
+        let batch = OwnedBatch::new(record, &memory).unwrap();
+        let mut reference = StreamWriter::try_new(Vec::new(), batch.batch().schema_ref()).unwrap();
+        reference.write(batch.batch()).unwrap();
+        writer.write_arrow(None, &batch, 0, &memory, "spill-columns").unwrap();
+        reference.into_inner().unwrap()
+    }).collect::<Vec<_>>();
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    for frame in expected { assert_eq!(reader.read_frame(1).unwrap().unwrap().0, frame); }
+    assert!(reader.read_frame(1).unwrap().is_none());
 }
 
 #[test]
@@ -458,6 +580,9 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
 
     let replay_memory = MemoryBudget::new(1 << 23);
     let mut reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    let mut wide_reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    assert_eq!(wide_reader.read_columns(2).err().unwrap().code, "rtdb.query/column-gather");
+    drop(wide_reader);
     drop(file);
     let replayed = reader.read_columns(1).unwrap().unwrap();
     let Column::Selected(selected) = &replayed.columns[0] else { panic!("Expected mixed Arrow fields") };
@@ -475,4 +600,60 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     assert!(replay_memory.used_bytes() > 0);
     drop(retained);
     assert_eq!(replay_memory.used_bytes(), 0);
+}
+
+#[test]
+fn mixed_spill_assembly_keeps_whole_fragments_and_distinguishes_missing_cells() {
+    use arrow_array::{ArrayRef, Int64Array, NullArray, StructArray};
+    use arrow_schema::{Field, Schema};
+    use rtdb_types::{StructFields, Value};
+
+    let backing = MemoryBudget::new(1 << 20);
+    let memory = MemoryBudget::new(4096);
+    let short = ColumnBatch::empty_with_width(0, &backing).unwrap();
+    let error = ColumnBatch::from_spill_fragments(vec![short], 1, &memory).err().unwrap();
+    assert_eq!(error.code, "rtdb.query/column-gather");
+    let page = |array: ArrayRef| {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", array.data_type().clone(), true)]));
+        let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+        ColumnBatch::from_owned(OwnedBatch::new(record, &backing).unwrap()).unwrap()
+    };
+    let rows = 4096;
+    let input = vec![7i64; rows];
+    let nested = StructArray::from(vec![(
+        Arc::new(Field::new("a", DataType::Int64, false)), Arc::new(Int64Array::from(input)) as ArrayRef,
+    )]);
+    let fragments = vec![
+        page(Arc::new(nested)),
+        ColumnBatch::empty_with_width(1, &backing).unwrap(),
+        page(Arc::new(Int64Array::from(vec![None, Some(42)]))),
+        page(Arc::new(NullArray::new(1))),
+    ];
+    let replay = ColumnBatch::from_spill_fragments(fragments, 1, &memory).unwrap();
+    assert_eq!(replay.len, rows + 3);
+    assert_eq!(replay.columns.len(), 1);
+    let column = &replay.columns[0];
+    let nested = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
+    assert_eq!(column.value(0).unwrap(), nested);
+    assert_eq!(column.value(rows - 1).unwrap(), nested);
+    assert!(matches!(column.arrow_cell(rows), Some(Some((array, _, _, row))) if array.is_null(row)));
+    assert_eq!(column.value(rows + 1).unwrap(), Value::I64(42));
+    assert!(matches!(column.arrow_cell(rows + 2), Some(None)));
+    assert!(backing.used_bytes() > 0);
+    drop(replay);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(backing.used_bytes(), 0);
+}
+
+#[test]
+fn malformed_spill_fragments_keep_the_decoder_error() {
+    let memory = MemoryBudget::new(1 << 20);
+    let spill = Arc::new(SpillRegion::new(64).unwrap());
+    let mut writer = spill.create().unwrap();
+    writer.write_frame(&[2]).unwrap();
+    writer.write_frame(&[0; 7]).unwrap();
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let error = reader.read_columns(1).err().unwrap();
+    assert_eq!(error.code, "rtdb.query/fragment-decode");
+    assert!(error.message.as_deref().unwrap().contains("fragment frame is truncated"));
 }
