@@ -964,6 +964,34 @@ fn spatial_memory_refusal(error: &Status) -> bool {
         .is_some_and(|anomaly| anomaly["code"] == "rtdb/memory-budget-exceeded")
 }
 
+fn spatial_reply_ids(
+    memory: &Arc<MemoryBudget>, rows: &OwnedBatch, target: &Field,
+) -> Result<(ArrayRef, Arc<MemoryReservation>), Status> {
+    let batch = rows.batch();
+    let source = batch.schema_ref().field(0);
+    let array = batch.column(0);
+    if source == target {
+        return Ok((Arc::clone(array), memory.reserve(4096).map_err(status)?));
+    }
+
+    let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, target).map_err(status)?;
+    let charge = memory.reserve(wire::add(bound, 4096)?).map_err(status)?;
+    if let Ok((_, ids)) = rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target)
+        && ids.data_type() == target.data_type()
+    {
+        return Ok((ids, charge));
+    }
+
+    let ids = (0..array.len()).map(|row| read_owned_entity_id(source, array.as_ref(), row));
+    let bound = ids.clone().try_fold(4096, |bytes, id| {
+        let payload = id.map_err(status)?.owned_payload_bytes();
+        wire::add(bytes, wire::add(128, wire::mul(payload, 4)?)?)
+    })?;
+    let fallback_charge = memory.reserve(bound).map_err(status)?;
+    drop(charge);
+    Ok((try_entity_id_array(ids).map_err(status)?, fallback_charge))
+}
+
 fn spatial_document_columns(batch: &RecordBatch) -> Result<Vec<&str>, Status> {
     spatial_column_names(batch, "document_columns")
 }
@@ -3698,23 +3726,8 @@ impl Service {
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         let mut charge = None;
         let output = if let Some(rows) = page.rows().filter(|rows| rows.batch().num_rows() != 0) {
-            let batch = rows.batch();
-            let (source, target) = (batch.schema_ref().field(0), schema.field(0));
-            let array = batch.column(0);
-            let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, target).map_err(status)?;
-            charge = Some(call.reserve(wire::add(bound, 4096)?)?);
-            let ids = match rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target) {
-                Ok((_, ids)) if ids.data_type() == target.data_type() => ids,
-                _ => {
-                    let ids = (0..array.len()).map(|row| read_owned_entity_id(source, array.as_ref(), row));
-                    let bound = ids.clone().try_fold(4096, |bytes, id| {
-                        let text = id.map_err(status)?.owned_payload_bytes();
-                        wire::add(bytes, wire::add(128, wire::mul(text, 4)?)?)
-                    })?;
-                    charge = Some(call.reserve(bound)?);
-                    try_entity_id_array(ids).map_err(status)?
-                }
-            };
+            let (ids, scratch) = spatial_reply_ids(call.memory(), rows, schema.field(0))?;
+            charge = Some(scratch);
             let distances = Arc::new(page.distance_column());
             let mut columns = vec![ids, distances];
             if let Some(document) = document {
@@ -3727,6 +3740,7 @@ impl Service {
         } else { None };
         let format = if ipc_stream { OwnedReplyFormat::StreamV1 } else { OwnedReplyFormat::Unary };
         let reply = self.encode_owned_point_reply(self.memory(), &schema, output.as_ref(), present, valid_at, None, None, format)?;
+        drop(output);
         drop(charge);
         held.snapshot.check_relations([relation]).map_err(status)?;
         Ok(reply)
@@ -6483,6 +6497,49 @@ fn owned_capacity_declaration(relation: OwnedRelation, row: &StructFields<Value>
 
 #[cfg(test)]
 mod commit_tests;
+
+#[cfg(test)]
+mod spatial_reply_tests {
+    use std::sync::Arc;
+
+    use arrow_array::RecordBatch;
+    use arrow_schema::Schema;
+    use rtdb_columnar::{EntityIdRef, OwnedBatch, entity_id_array, entity_id_type, read_owned_entity_id};
+    use rtdb_types::MemoryBudget;
+
+    use super::spatial_reply_ids;
+
+    #[test]
+    fn canonical_spatial_ids_match_relayout_and_keep_the_page_funding() {
+        let memory = MemoryBudget::new(1 << 20);
+        let field = rtdb_columnar::to_field("_id", &entity_id_type()).unwrap();
+        let expected = [EntityIdRef::Binary(b"same\0\xff"), EntityIdRef::String("same")];
+        let ids = entity_id_array([EntityIdRef::String("skipped")].into_iter().chain(expected)).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![ids]).unwrap();
+        let rows = OwnedBatch::new(batch.slice(1, expected.len()), &memory).unwrap();
+        drop(batch);
+        let page_bytes = memory.used_bytes();
+
+        let (ids, scratch) = spatial_reply_ids(&memory, &rows, &field).unwrap();
+        let source = rows.batch().column(0);
+        assert!(Arc::ptr_eq(&ids, source));
+        assert_eq!(memory.used_bytes(), page_bytes + 4096);
+        {
+            let (_, baseline) = rtdb_columnar::relayout_arrow_column(Arc::clone(source), &field, &field).unwrap();
+            assert_eq!(ids.data_type(), baseline.data_type());
+            for (row, expected) in expected.into_iter().enumerate() {
+                assert_eq!(read_owned_entity_id(&field, baseline.as_ref(), row).unwrap(), expected);
+                assert_eq!(read_owned_entity_id(&field, ids.as_ref(), row).unwrap(), expected);
+            }
+        }
+
+        drop(rows);
+        drop(scratch);
+        assert_eq!(memory.used_bytes(), page_bytes);
+        drop(ids);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
 
 #[cfg(test)]
 mod protected_carrier_wire_tests {
