@@ -599,6 +599,125 @@ fn statements_prepared_in_different_sessions_share_the_nodes_plan() {
 }
 
 #[cfg(test)]
+mod shared_plan_tests {
+    use super::*;
+    use rtdb_columnar::read_value;
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, SharedPlans};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{Interval, StructFields, TableRef, Timestamp, TransactionKey, TxId};
+    use std::collections::BTreeMap;
+
+    fn put(state: &PartitionState, tx: i64, schema: &str, value: Value, memory: &Arc<MemoryBudget>) {
+        let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(memory)).unwrap();
+        buffer.put(TableRef::new(schema, "docs"), StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+        state.apply(&buffer.stage().unwrap()).unwrap();
+    }
+
+    fn session(databases: &[(&str, &PartitionState)], default: &str, timezone: &str, plans: &Arc<SharedPlans>) -> Arc<QueryContext> {
+        let snapshots = databases.iter().map(|(name, state)| ((*name).to_owned(), DatabaseSnapshot {
+            partitions: vec![state.value().snapshot()],
+            storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+        })).collect::<BTreeMap<_, _>>();
+        let catalog = CatalogSnapshot::new(default, snapshots, false).unwrap();
+        QueryContext::new(catalog, MemoryBudget::new(1 << 26), Timestamp(100), timezone, QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap()
+            .with_shared_plans(Arc::clone(plans))
+    }
+
+    async fn first_value(statement: &PreparedSql, context: &Arc<QueryContext>) -> Value {
+        let mut cursor = statement.open_query(Arc::clone(context), vec![]).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap()
+    }
+
+    async fn value_of(sql: &str, context: &Arc<QueryContext>, search_path: &[&str]) -> Value {
+        let options = PrepareOptions { search_path: search_path.iter().map(|schema| (*schema).to_owned()).collect(), ..Default::default() };
+        first_value(&PreparedSql::prepare(sql, context, options, ResultSignaturePolicy::Dynamic).unwrap(), context).await
+    }
+
+    fn plan_of(sql: &str, context: &Arc<QueryContext>) -> Arc<rtdb_plan::Relation> {
+        let statement = PreparedSql::prepare(sql, context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        Arc::clone(statement.bind(context, &[], true).unwrap().relation())
+    }
+
+    #[tokio::test]
+    async fn a_session_on_another_default_database_reads_its_own_table() {
+        let memory = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let (a, b) = (PartitionState::empty(Default::default()).unwrap(), PartitionState::empty(Default::default()).unwrap());
+        put(&a, 1, "public", Value::I64(1), &memory);
+        put(&b, 1, "public", Value::I64(2), &memory);
+        let databases = [("a", &a), ("b", &b)];
+        let sql = "SELECT v FROM docs";
+        assert_eq!(value_of(sql, &session(&databases, "a", "UTC", &plans), &["public"]).await, Value::I64(1));
+        assert_eq!(value_of(sql, &session(&databases, "b", "UTC", &plans), &["public"]).await, Value::I64(2));
+        let (first, second) = (session(&databases, "a", "UTC", &plans), session(&databases, "a", "UTC", &plans));
+        assert!(Arc::ptr_eq(&plan_of(sql, &first), &plan_of(sql, &second)), "sessions with the same inputs share the plan");
+    }
+
+    #[tokio::test]
+    async fn a_session_with_another_search_path_reads_its_own_schema() {
+        let memory = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        put(&state, 1, "public", Value::I64(1), &memory);
+        put(&state, 2, "alt", Value::I64(2), &memory);
+        let databases = [("xtdb", &state)];
+        let sql = "SELECT v FROM docs";
+        assert_eq!(value_of(sql, &session(&databases, "xtdb", "UTC", &plans), &["public"]).await, Value::I64(1));
+        assert_eq!(value_of(sql, &session(&databases, "xtdb", "UTC", &plans), &["alt"]).await, Value::I64(2));
+    }
+
+    #[tokio::test]
+    async fn a_session_in_another_timezone_does_not_reuse_the_plan() {
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let sql = "SELECT CAST(TIMESTAMP '2020-01-01 00:00:00' AS TIMESTAMP WITH TIME ZONE) AS t";
+        let utc = value_of(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), &[]).await;
+        let paris = value_of(sql, &session(&[("xtdb", &state)], "xtdb", "Europe/Paris", &plans), &[]).await;
+        assert_ne!(utc, paris);
+    }
+
+    #[tokio::test]
+    async fn sessions_binding_other_parameter_types_get_their_own_signature() {
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let typed = |ty| PrepareOptions { parameter_types: BTreeMap::from([(0, ty)]), ..Default::default() };
+        let sql = "SELECT $1 AS x";
+        let int = PreparedSql::prepare(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), typed(LogicalType::Scalar(rtdb_types::ScalarType::I32)), ResultSignaturePolicy::Exact).unwrap();
+        let text = PreparedSql::prepare(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), typed(LogicalType::Scalar(rtdb_types::ScalarType::Utf8)), ResultSignaturePolicy::Exact).unwrap();
+        assert_ne!(int.prepared_schema().unwrap().fields()[0].data_type, text.prepared_schema().unwrap().fields()[0].data_type);
+    }
+
+    #[tokio::test]
+    async fn a_column_type_change_replans_for_a_later_session() {
+        let memory = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        put(&state, 1, "public", Value::I32(1), &memory);
+        let sql = "SELECT v FROM docs";
+        let before = PreparedSql::prepare(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), Default::default(), ResultSignaturePolicy::Exact).unwrap();
+        put(&state, 2, "public", Value::Utf8("two".into()), &memory);
+        let after = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let replanned = PreparedSql::prepare(sql, &after, Default::default(), ResultSignaturePolicy::Exact).unwrap();
+        assert_ne!(before.prepared_schema(), replanned.prepared_schema());
+        assert_eq!(first_value(&replanned, &after).await, Value::Utf8("two".into()));
+    }
+
+    #[tokio::test]
+    async fn a_table_created_earlier_on_the_search_path_replans_for_a_later_session() {
+        let memory = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        put(&state, 1, "public", Value::I64(1), &memory);
+        let sql = "SELECT v FROM docs";
+        assert_eq!(value_of(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), &["alt", "public"]).await, Value::I64(1));
+        put(&state, 2, "alt", Value::I64(2), &memory);
+        assert_eq!(value_of(sql, &session(&[("xtdb", &state)], "xtdb", "UTC", &plans), &["alt", "public"]).await, Value::I64(2));
+    }
+}
+
+#[cfg(test)]
 mod argument_cast_tests {
     use super::*;
     use arrow_array::{Array, FixedSizeListArray, Float64Array, RecordBatch, StringArray, cast::AsArray, types::{Float32Type, Int32Type}};
