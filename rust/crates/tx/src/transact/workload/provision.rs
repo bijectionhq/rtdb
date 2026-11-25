@@ -7,6 +7,8 @@ pub struct LineProvision {
     pub registry: TableRef,
     pub generation: [u8; 16],
     pub owner: Point,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear_source_tables: Vec<TableRef>,
 }
 
 impl LineProvision {
@@ -19,6 +21,9 @@ impl LineProvision {
             && self.registry != self.owner.table
             && self.owner.valid_at != Timestamp::MAX
             && matches!(&self.owner.id, EntityId::String(id) if bounded(id))
+            && self.clear_source_tables.len() <= 16
+            && self.clear_source_tables.iter().all(application_table)
+            && self.clear_source_tables.windows(2).all(|pair| pair[0] < pair[1])
     }
 
     pub(super) fn check(
@@ -71,12 +76,15 @@ impl LineProvision {
                     writable: true,
                     expires_at: Some(expires),
                 } if child == &self.branch && parent == MAIN_BRANCH && fork.is_none() => {
-                    index.exact(*basis)?;
                     if index.has_custody_groups_at(*basis)
                         || *expires == Timestamp::MAX
                         || *expires <= now
                         || request.window.before.is_none_or(|before| before > *expires)
                     {
+                        return Err(denied());
+                    }
+                    let source = index.view(MAIN_BRANCH, At::Exactly(*basis), Layer::Local, now)?;
+                    if self.clear_source_tables.iter().any(|table| source.has_retained_puts(table)) {
                         return Err(denied());
                     }
                     fork = Some(*expires);

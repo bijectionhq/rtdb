@@ -947,6 +947,17 @@ impl<'a> BranchView<'a> {
         reversed
     }
 
+    pub fn has_retained_puts(&self, table: &TableRef) -> bool {
+        let Some(definition) = self.table(table) else { return false; };
+        self.layers().any(|(basis, data)| {
+            data.tables.get(table).is_some_and(|rows| {
+                rows.events.values().flat_map(|events| events.iter()).any(|(generation, event)| {
+                    *generation == definition.generation && event.cut.basis <= basis && event.image.is_some()
+                })
+            })
+        })
+    }
+
     pub fn count_at_most(&self, range: &CountRange, default_at: Timestamp) -> Result<bool> {
         if range.lower.as_ref().zip(range.upper.as_ref()).is_some_and(|(lower, upper)| lower > upper) {
             return Err(Anomaly::incorrect("rtdb/invalid-range", "Index lower bound exceeds its upper bound"));

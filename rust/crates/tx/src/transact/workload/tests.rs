@@ -272,6 +272,7 @@ fn commissioned_fork_co_orders_the_registry_and_owner_under_the_current_writer()
         registry: TableRef::new("public", "line_registry"),
         generation: [13; 16],
         owner: Point::new("public.admissions", "owner".into(), Timestamp(0)).unwrap(),
+        clear_source_tables: vec![TableRef::new("public", "legacy_carriers")],
     };
     let key = vec![12; 16];
     let expires = Timestamp(300);
@@ -307,7 +308,7 @@ fn commissioned_fork_co_orders_the_registry_and_owner_under_the_current_writer()
     });
 
     let ordinary = Authority::Write { fence: fence.clone(), writer: writer.clone() };
-    assert!(journal.turn(WRITE, submit(ordinary, 12, Some(request.clone()))).is_err());
+    assert!(journal.turn(WRITE, submit(ordinary.clone(), 12, Some(request.clone()))).is_err());
     let mut mismatched = request.clone();
     let Op::Put { rows, .. } = &mut mismatched.ops[2] else { panic!("expected registry put") };
     rows[0].cells.insert("creation_key".into(), binary_cell([9; 16]));
@@ -315,6 +316,13 @@ fn commissioned_fork_co_orders_the_registry_and_owner_under_the_current_writer()
     let mut no_owner = request.clone();
     no_owner.ops.remove(0);
     assert!(journal.turn(WRITE, submit(authority.clone(), 12, Some(no_owner))).is_err());
+
+    let legacy = write(13, line.clear_source_tables[0].clone(), EntityId::String("carrier".into()));
+    let legacy = applied(journal.turn(WRITE, submit(ordinary, 13, Some(legacy))).unwrap(), WRITE);
+    let mut inherits_carrier = request.clone();
+    let Op::Fork { from: (_, source), .. } = &mut inherits_carrier.ops[1] else { panic!("expected fork") };
+    *source = Basis::from_bytes(&legacy.basis).unwrap();
+    assert!(journal.turn(WRITE, submit(authority.clone(), 12, Some(inherits_carrier))).is_err());
 
     let receipt = applied(journal.turn(WRITE, submit(authority, 12, Some(request))).unwrap(), WRITE);
     let created = Basis::from_bytes(&receipt.basis).unwrap();

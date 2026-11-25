@@ -92,6 +92,9 @@ The authority contains the exact `fence` and applied `writer`, a `line` with `br
 Use the configured line registry for `registry` and the exact application owner/admission row's table, string row ID and valid instant for `owner`.
 Table references are objects with `schema` and `table` strings.
 The `owner` has `table`, `id` encoded as `{"String":"owner-row-id"}`, and integer `valid_at` in microseconds.
+When an application has prior carrier tables, commission `line.clear_source_tables` as their sorted, distinct table references, up to 16.
+The writer checks their retained row history on the exact Fork source, including expired or superseded valid-time versions, and refuses any retained Put.
+Omitting this field keeps the existing native custody census check.
 The `request_digest` is SHA-256 of the ASCII domain `rtdb.v1/managed-workload-attempt`, a NUL, and the unchanged action body.
 Order `ManagedWorkloadRequest.provision_branch` at tag 11 using its `WorkloadWrite` envelope and the independently commissioned bearer on the current Original.
 The outer key, inner key and registry `creation_key` are the same 16–64 raw bytes.
