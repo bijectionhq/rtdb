@@ -1,9 +1,9 @@
-use std::{borrow::Cow, collections::BTreeSet, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, ops::Range, sync::{Arc, Mutex}};
 
 use arrow_array::{Float64Array, RecordBatch, StructArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
-use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
+use geometry::{Geometry, GeometryRefusal, GeometryRefusalCode, GeometryWork, KeyRange, WorkObserver, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
     BatchBuilder, EntityIdLocator, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
     copy_selected_cells, estimate_copy_cell_bytes, read_owned_entity_id, visible_buffer_bytes,
@@ -314,6 +314,67 @@ enum RegionGeometry {
     Plain(Geometry),
 }
 
+const REGION_METADATA_BYTES: usize = 512;
+
+struct RegionAdmission(Mutex<RegionMemory>);
+
+struct RegionMemory {
+    reservation: Arc<MemoryReservation>,
+    working_bytes: usize,
+    failure: Option<Anomaly>,
+}
+
+impl RegionMemory {
+    fn allocate(&mut self, bytes: usize) -> Result<()> {
+        let working_bytes = self.working_bytes.checked_add(bytes).ok_or_else(postings::work_limit)?;
+        let total = REGION_METADATA_BYTES.checked_add(working_bytes).ok_or_else(postings::work_limit)?;
+        if total > self.reservation.bytes() {
+            Arc::get_mut(&mut self.reservation).expect("region construction owns its reservation").grow_to(total)?;
+        }
+        self.working_bytes = working_bytes;
+        Ok(())
+    }
+}
+
+impl RegionAdmission {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let reservation = memory.reserve(REGION_METADATA_BYTES)?;
+        Ok(Arc::new(Self(Mutex::new(RegionMemory { reservation, working_bytes: 0, failure: None }))))
+    }
+
+    fn references(&self, reserved: usize, retained: usize) -> Result<()> {
+        let mut memory = self.0.lock().expect("region admission is not shared across calls");
+        memory.working_bytes -= reserved;
+        memory.allocate(retained)
+    }
+
+    fn original_error(&self, fallback: Anomaly) -> Anomaly {
+        self.0.lock().expect("region admission is not shared across calls").failure.take().unwrap_or(fallback)
+    }
+}
+
+impl WorkObserver for RegionAdmission {
+    fn charge(&self, _: usize) -> std::result::Result<(), GeometryRefusal> { Ok(()) }
+
+    fn allocate(&self, bytes: usize) -> std::result::Result<(), GeometryRefusal> {
+        let mut memory = self.0.lock().expect("region admission is not shared across calls");
+        memory.allocate(bytes).map_err(|error| {
+            memory.failure = Some(error);
+            GeometryRefusal {
+                code: GeometryRefusalCode::ReadWorkLimit,
+                message: "Spatial region exceeds its memory allowance".into(),
+                bound: None,
+            }
+        })
+    }
+
+    fn release(&self, bytes: usize) {
+        // A geometry returned from a scoped calculation can still be alive at the allocation handoff.
+        let mut memory = self.0.lock().expect("region admission is not shared across calls");
+        memory.working_bytes -= bytes;
+    }
+}
+
 impl RegionGeometry {
     fn retained_bytes(&self) -> usize {
         match self {
@@ -332,7 +393,6 @@ impl RegionGeometry {
 
 impl PreparedRegion {
     pub fn new(region_bytes: &[u8], predicate: Predicate, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        const METADATA_BYTES: usize = 512;
         const FULL_RANGE: KeyRange = KeyRange { start: i64::MIN, end: i64::MAX };
 
         if matches!(predicate, Predicate::All) {
@@ -341,7 +401,7 @@ impl PreparedRegion {
                     "An unrestricted spatial read takes no region",
                 ));
             }
-            let reservation = memory.reserve(METADATA_BYTES + std::mem::size_of::<KeyRange>())?;
+            let reservation = memory.reserve(REGION_METADATA_BYTES + size_of::<KeyRange>())?;
             return Ok(Self {
                 predicate,
                 location: None,
@@ -352,15 +412,17 @@ impl PreparedRegion {
             });
         }
 
-        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
+        let admission = RegionAdmission::new(memory)?;
         let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-        let region = Location::decode(region_bytes, &mut work)?;
+        work.observe(admission.clone());
+        let region = Location::decode(region_bytes, &mut work).map_err(|error| admission.original_error(error))?;
         predicate.validate_region(&region)?;
         let point_geometry = region.is_point_geometry();
         let (geometry, ranges) = if !region.geometry.is_empty() && predicate.cover_predicate().is_some() {
             work.scoped(|work| {
-                let geometry = predicate.prepare_geometry(&region.geometry, work)?;
-                let ranges = predicate.cover(&geometry, work)?;
+                let geometry = predicate.prepare_geometry(region.geometry, work, |reserved, retained| admission.references(reserved, retained))
+                    .map_err(|(_, error)| admission.original_error(error))?;
+                let ranges = predicate.cover(&geometry, work).map_err(|error| admission.original_error(error))?;
                 Ok::<_, Anomaly>((RegionGeometry::Prepared(geometry), ranges))
             })?
         } else {
@@ -371,9 +433,10 @@ impl PreparedRegion {
                 RegionGeometry::Plain(region.geometry)
             } else {
                 let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-                match predicate.prepare_geometry(&region.geometry, &mut preparation) {
+                preparation.observe(admission.clone());
+                match preparation.scoped(|work| predicate.prepare_geometry(region.geometry, work, |reserved, retained| admission.references(reserved, retained))) {
                     Ok(geometry) => RegionGeometry::Prepared(geometry),
-                    Err(_) => RegionGeometry::Plain(region.geometry),
+                    Err((region, _)) => RegionGeometry::Plain(region),
                 }
             };
             (geometry, None)
@@ -381,14 +444,18 @@ impl PreparedRegion {
         let ranges = ranges.unwrap_or_else(|| vec![FULL_RANGE]);
         let bytes = geometry.retained_bytes()
             .checked_add(ranges.capacity() * std::mem::size_of::<KeyRange>())
-            .and_then(|bytes| bytes.checked_add(METADATA_BYTES)).ok_or_else(postings::work_limit)?;
+            .and_then(|bytes| bytes.checked_add(REGION_METADATA_BYTES)).ok_or_else(postings::work_limit)?;
+        let steps = work.usage().steps;
+        drop(work);
+        let mut reservation = Arc::into_inner(admission).expect("geometry work released its observer")
+            .0.into_inner().expect("region admission is not shared across calls").reservation;
         let lease = Arc::get_mut(&mut reservation).expect("geometry construction owns the reservation");
         if bytes > lease.bytes() {
             lease.grow_to(bytes)?;
         } else {
             lease.shrink_to(bytes)?;
         }
-        Ok(Self { predicate, location: Some(geometry), point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
+        Ok(Self { predicate, location: Some(geometry), point_geometry, ranges, steps, _reservation: reservation })
     }
 }
 
@@ -995,6 +1062,26 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use rtdb_columnar::{build_struct_array, entity_id_array, entity_id_type, read_value, to_field};
     use rtdb_types::{LogicalType, Value};
+
+    #[test]
+    fn a_small_nonempty_region_uses_its_observed_workspace_and_releases_it() -> Result<()> {
+        let memory = MemoryBudget::new(64 << 10);
+        let geometry = Geometry::new(
+            geometry::Kind::Point,
+            geometry::Coords::Point([1.0, 2.0]),
+            geometry::GeometrySpace::wgs84_xy(),
+        );
+        let mut tagged = vec![0];
+        tagged.extend_from_slice(&geometry.wkb());
+        let region = PreparedRegion::new(
+            &tagged, Predicate::Topology(geometry::predicates::TopologyPredicate::Disjoint), &memory,
+        )?;
+        assert!(matches!(&region.location, Some(RegionGeometry::Prepared(_))));
+        assert_eq!(memory.used_bytes(), region._reservation.bytes());
+        drop(region);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[test]
     fn spatial_candidate_handoff_releases_the_tree_allowance_at_the_cap() -> Result<()> {

@@ -76,7 +76,8 @@ impl Location {
         if encoding == SpatialGeometryEncoding::TaggedWkb {
             return Self::decode(bytes, work).map(Some);
         }
-        let value = crate::bijection_geometry::decode(bytes, work)?;
+        let decoded = crate::bijection_geometry::decode(bytes, work)?;
+        let value = decoded.value();
         if matches!(value.scalar(), Scalar::Null) {
             return Ok(None);
         }
@@ -184,14 +185,28 @@ impl Predicate {
         })
     }
 
-    pub(crate) fn prepare_geometry(self, region: &Geometry, work: &mut GeometryWork) -> Result<PreparedGeometry> {
-        let mut prepared = PreparedGeometry::new(region.clone(), Preparation::Topology, work)
-            .map_err(geometry_error)?;
-        if matches!(self, Self::Topology(_) | Self::WithinDistance(_) | Self::Nearest { .. }) {
+    pub(crate) fn prepare_geometry(
+        self, region: Geometry, work: &mut GeometryWork, mut account_references: impl FnMut(usize, usize) -> Result<()>,
+    ) -> std::result::Result<PreparedGeometry, (Geometry, Anomaly)> {
+        let mut prepared = PreparedGeometry::try_new(region, Preparation::Topology, work)
+            .map_err(|(region, error)| (region, geometry_error(error)))?;
+        let points = matches!(self, Self::Topology(_) | Self::WithinDistance(_) | Self::Nearest { .. });
+        let segments = matches!(self, Self::WithinDistance(_) | Self::Nearest { .. } | Self::Classification(_));
+        let mut reference = 0usize;
+        if points { reference = prepared.reference_points_bound(); }
+        if segments { reference = reference.saturating_add(prepared.reference_segments_bound()); }
+        if let Err(error) = account_references(0, reference) {
+            return Err((prepared.into_geometry(), error));
+        }
+        let before = prepared.retained_bytes();
+        if points {
             prepared.prepare_reference_points();
         }
-        if matches!(self, Self::WithinDistance(_) | Self::Nearest { .. } | Self::Classification(_)) {
+        if segments {
             prepared.prepare_reference_segments();
+        }
+        if let Err(error) = account_references(reference, prepared.retained_bytes() - before) {
+            return Err((prepared.into_geometry(), error));
         }
         Ok(prepared)
     }

@@ -25,6 +25,7 @@ entity SpatialPostings {
 -- A path can index original Bijection geometry or position images in an existing Binary document column.
 -- The encoding is part of the path declaration and stays fixed for its generation.
 -- Native WKB and Bijection images admit their binary ordinates directly into typed geometry.
+-- Canonical geometry validation records direct child boundaries while borrowing the original bytes.
 -- Admission counts the exact canonical JSON byte length with bounded scalar scratch.
 -- Readiness at a held cut requires current-generation postings on the durable sources scheduled for spatial indexing.
 -- The live tail and unscheduled durable sources must fit the fallback scan limits at that cut.
@@ -56,6 +57,7 @@ entity SpatialPostings {
 -- A held read uses the path definition, source inventory, and live segments selected by the same snapshot.
 -- An unrestricted region's memory reservation covers its full key range and retained metadata.
 -- Exact refinement reuses the prepared region topology and its ordered metric segments across candidates.
+-- Region preparation moves the decoded geometry into the index and admits index and reference allocations as they are built.
 -- Exact refinement acquires temporary workspace when a resolved batch supplies an eligible geometry cell and releases it before pulling another batch.
 -- A prepared filter belongs to its authenticated held read and retains its admitted projection and the controls used by exact fallback.
 -- Retained matches and exact fallback reuse the same authenticated held cut and validity.
