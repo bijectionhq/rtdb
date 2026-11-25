@@ -850,6 +850,29 @@ pub fn owned_tombstone_batch(
     {
         return Err(invalid("Tombstone IIDs and valid-time bounds disagree"));
     }
+    build_tombstone_batch(rows, || {
+        FixedSizeBinaryArray::try_new(16, iids.value_data().to_vec().into(), None).map_err(invalid)
+    }, system_time, delete_intervals, memory)
+}
+
+pub fn owned_delete_batch(
+    iids: impl ExactSizeIterator<Item = Result<Iid>>, system_time: Timestamp, valid_time: Interval,
+    memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
+    let rows = iids.len();
+    build_tombstone_batch(rows, || {
+        let mut column = FixedSizeBinaryBuilder::with_capacity(rows, 16);
+        for iid in iids {
+            column.append_value(iid?.0).map_err(invalid)?;
+        }
+        Ok(column.finish())
+    }, system_time, Some(std::iter::repeat_n(valid_time, rows).map(Ok)), memory)
+}
+
+fn build_tombstone_batch(
+    rows: usize, build_iids: impl FnOnce() -> Result<FixedSizeBinaryArray>, system_time: Timestamp,
+    delete_intervals: Option<impl ExactSizeIterator<Item = Result<Interval>>>, memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
     let (builder, metadata) = event_builder(rows, None, memory)?;
     let (tag, deletes, erases, from, to) = if let Some(intervals) = delete_intervals {
         let mut from = Vec::with_capacity(rows);
@@ -870,9 +893,8 @@ pub fn owned_tombstone_batch(
     ).map_err(invalid)?;
     let fields = event_fields(DataType::FixedSizeBinary(16), op.data_type().clone(), false);
     let times = |values| Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
-    let iids = FixedSizeBinaryArray::try_new(16, iids.value_data().to_vec().into(), None).map_err(invalid)?;
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![
-        Arc::new(iids), times(vec![system_time.0; rows]), times(from), times(to), Arc::new(op),
+        Arc::new(build_iids()?), times(vec![system_time.0; rows]), times(from), times(to), Arc::new(op),
     ]).map_err(invalid)?;
     builder.finish_with_metadata(batch, metadata)
 }

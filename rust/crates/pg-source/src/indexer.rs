@@ -91,15 +91,11 @@ async fn index_arrow_runs<'a>(
                 if let Some(error) = failure { return Err(error); }
             }
             RowKind::Delete => {
-                for (index, row) in rows.enumerate() {
-                    let iid = cell_iid(cell(batch, id, row))?;
-                    let valid_time = Interval::new(system_from, Timestamp::MAX)?;
-                    target.append(operation.table.clone(), StoredEvent { position: None,
-                        origin: None,
-                        commit_position: 0,
-                        entity_key: None, iid, system_from, valid_time, operation: StoredOperation::Delete, recency: None,
-                    })?;
-                    if index % 64 == 63 { tokio::task::yield_now().await; }
+                for start in rows.clone().step_by(64) {
+                    let len = (rows.end - start).min(64);
+                    let iids = (start..start + len).map(|row| cell_iid(cell(batch, id, row)));
+                    target.append_arrow_deletes(&operation.table, iids)?;
+                    if len == 64 { tokio::task::yield_now().await; }
                 }
             }
         }
