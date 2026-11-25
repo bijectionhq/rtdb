@@ -1,13 +1,13 @@
 use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
 use arrow_array::{RecordBatch, RecordBatchOptions};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
 use crate::{Lsn, read_text, vector_types::{VectorType, VectorTypes}, wire::{Column, Input, protocol}};
 use rtdb_pg_codec::{
     Format, WalArrayRow, read_snapshot_transit_column, read_source_binary, read_source_binary_column,
-    read_source_text_column, read_tstzrange, read_wal_array, tstzrange_field,
+    read_source_text_column, read_tstzrange, read_wal_array, text_value_reader, tstzrange_field,
 };
 
 mod pending;
@@ -201,11 +201,17 @@ impl Decoder {
                         Some(VectorType::Pgvector(domain_typmod)) => Some(domain_typmod.unwrap_or(*typmod)),
                         _ => None,
                     };
-                    if let Some((field, row)) = read_wal_array(name, oid, dimension, text, &self.memory)? {
-                        let cell = match row {
-                            WalArrayRow::List(row) => DecodedCell::List(row),
-                            WalArrayRow::Text(text) => DecodedCell::ArrayText(text),
-                        };
+                    let array = read_wal_array(name, oid, dimension, text, &self.memory)?;
+                    let reader = text_value_reader(oid);
+                    let staged = match array {
+                        Some((field, WalArrayRow::List(row))) => Some((field, DecodedCell::List(row))),
+                        Some((field, WalArrayRow::Text(text))) => Some((field, DecodedCell::ArrayText(text))),
+                        None if reader.is_none() => text.map(|text| {
+                            (Field::new(name.as_str(), DataType::Utf8, false), DecodedCell::Text(text.into()))
+                        }),
+                        None => None,
+                    };
+                    if let Some((field, cell)) = staged {
                         let charge = Arc::get_mut(&mut row_charge).expect("decoded row owns its reservation");
                         charge.grow_to(charge.bytes().checked_add(cell.retained()?).ok_or_else(overflow)?)?;
                         cells.push((field, cell));
@@ -224,10 +230,13 @@ impl Decoder {
                             read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
                         } else { None };
                         match typed {
-                            Some((field, _)) if field.data_type() == &arrow_schema::DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
+                            Some((field, _)) if field.data_type() == &DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
                             Some((field, array)) => (field, DecodedCell::Nested(array)),
                             None => {
-                                let value = text.map_or(Ok(Value::Null), |text| read_text(oid, text))?;
+                                let value = match text {
+                                    Some(text) => reader.expect("pass-through text is staged above")(text)?,
+                                    None => Value::Null,
+                                };
                                 DecodedCell::from_value(name, value, &self.memory)?
                             }
                         }
@@ -448,6 +457,57 @@ pub(crate) mod tests {
         assert!(memory.used_bytes() > 0);
         drop(detached);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn wal_pass_through_text_fits_the_retained_budget_and_outlives_the_frame() {
+        use arrow_array::StringArray;
+
+        let text = "é雪".repeat(8192);
+        for oid in [25, 90000] {
+            let memory = MemoryBudget::new(1 << 18);
+            let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(&memory));
+            decoder.receive_decoded(&relation(1, "docs", &[("payload", oid)])).unwrap();
+            decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+
+            let mut update = row(b'U', 1, &[Some(text.as_str())]);
+            update[5] = b'O';
+            update.extend_from_slice(b"N\0\x01u");
+            decoder.receive_decoded(&update).unwrap();
+            drop(update);
+
+            let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+            let batch = transaction.batches[0].rows.batch();
+            assert_eq!(batch.schema_ref().field(0), &Field::new("payload", DataType::Utf8, false));
+            let payload = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(payload.value(0), text.as_str());
+            drop((decoder, transaction));
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn wal_pass_through_and_decoded_text_share_the_same_group_in_event_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(&memory));
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+        for (oid, text) in [(1043, Some(" first ")), (26, None), (114, Some(r#""\u00e9""#)), (90000, Some(""))] {
+            decoder.receive_decoded(&relation(1, "docs", &[("payload", oid)])).unwrap();
+            decoder.receive_decoded(&row(b'I', 1, &[text])).unwrap();
+        }
+
+        decoder.receive_decoded(&relation(1, "docs", &[("payload", 26), ("text", 25)])).unwrap();
+        let mut invalid_utf8 = row(b'I', 1, &[Some("42"), Some("x")]);
+        *invalid_utf8.last_mut().unwrap() = 0xff;
+        assert_eq!(decoder.receive_decoded(&invalid_utf8).unwrap_err().code, "xtdb.postgres/protocol-error");
+        let unsupported = row(b'I', 1, &[Some("42"), Some("x")]);
+        assert_eq!(decoder.receive_decoded(&unsupported).unwrap_err(), read_text(26, "42").unwrap_err());
+
+        let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        assert_eq!(transaction.batches.iter().map(|batch| batch.rows.batch().num_rows()).collect::<Vec<_>>(), [3, 1]);
+        let rows = transaction.to_rows(&memory).unwrap();
+        let payloads = rows.operations.iter().map(|op| &op.row["payload"]).collect::<Vec<_>>();
+        assert_eq!(payloads, [&Value::Utf8(" first ".into()), &Value::Null, &Value::Utf8("é".into()), &Value::Utf8("".into())]);
     }
 
     #[test]
