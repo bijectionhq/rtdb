@@ -2109,6 +2109,9 @@ surface QueryAccess {
         -- The projection admits its own copied values, descriptors, and validity storage.
         -- System catalog and inspection scans batch their produced rows at the scan boundary.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- Transaction metadata projection selects compatible receipt or original event payloads by Arrow position and keeps their backing charged while the selection is held.
+        -- A transaction metadata projection requiring value reads owns its decoded results under a separate charge.
+        -- Archive history and owned event projections write resolved transaction bounds, physical timestamps and assertion coordinates into typed Arrow columns.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- It emits a null where every operand is null.
         -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.

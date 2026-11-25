@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray, builder::{BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder}, cast::AsArray};
+use arrow_array::{Array, TimestampMicrosecondArray,
+    builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, TimestampMicrosecondBuilder},
+    cast::AsArray};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
@@ -17,9 +19,10 @@ use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_iter, select_pages_with_scratch};
-use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
+use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVENT_POSITION_COLUMN,
+    Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
-use crate::columnar::BatchCursor;
+use crate::columnar::{BatchCursor, Column};
 use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 struct DataFileReader {
@@ -2488,65 +2491,23 @@ impl PartitionScan {
         let ResolvedScanTask { selected, groups, batches, reservation, _group_reservations } = task;
         let archive_history = projects_archive_history(&self.scan);
         let keyed = self.scan.table.name.table.is_owned_event_data();
+        let owned = self.execution.context.catalog.owned_identity().is_some();
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let metadata = self.retained_transaction_metadata(rows, &batches).await?;
+            let mut metadata = self.retained_transaction_metadata(rows, &batches).await?;
             let page = &self.pages.entries[selected[group]].source;
-            let (mut projected, _projected_charge) = metadata.map_or((None, None), |(column, charge)| (Some(column), Some(charge)));
-            let output = crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
-                if let Some(ranking) = &self.ranking
-                    && self.scan.columns[position].id == ranking.output
-                {
-                    return self.rank_column(ranking, rows, &batches).map(Some);
+            let memory = &self.execution.context.memory;
+            let output = crate::columnar::gather_with_funded_columns(rows, &batches, &self.scan.columns, memory, |position| {
+                let field = &self.scan.columns[position];
+                if let Some(ranking) = &self.ranking && field.id == ranking.output {
+                    return self.rank_column(ranking, rows, &batches).map(|column| Some((column, None)));
                 }
-                if keyed && self.scan.columns[position].name == "_assertion_ordinal" {
-                    let ordinals = rows.iter().map(|row| {
-                        let (batch, index) = row.source;
-                        batches[batch as usize].header(index as usize)
-                            .map(|header| Value::I64(i64::from(header.commit_position)))
-                    }).collect::<Result<Vec<_>>>()?;
-                    return Ok(Some(crate::columnar::Column::Values(ordinals)));
+                if let Some((column, charge)) = history_column(&field.name, rows, &batches, archive_history, keyed, owned, memory)? {
+                    return Ok(Some((column, Some(charge))));
                 }
-                if archive_history {
-                    let values = match self.scan.columns[position].name.as_str() {
-                        ARCHIVE_TX_FROM => rows.iter().map(|row| Value::I64(row.system_time.lower().0)).collect(),
-                        ARCHIVE_TX_TO => rows.iter().map(|row| {
-                            let end = row.system_time.upper();
-                            if end == Timestamp::MAX { Value::Null } else { Value::I64(end.0) }
-                        }).collect(),
-                        "_system_from" => rows.iter().map(|row| {
-                            let (batch, index) = row.source;
-                            let value = batches[batch as usize].header(index as usize)?.system_from.0;
-                            Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })
-                        }).collect::<Result<Vec<_>>>()?,
-                        "_system_to" => vec![Value::Null; rows.len()],
-                        _ => return self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose(),
-                    };
-                    return Ok(Some(crate::columnar::Column::Values(values)));
+                if !archive_history && field.name == "user_metadata" && let Some((column, charge)) = metadata.take() {
+                    return Ok(Some((column, Some(charge))));
                 }
-                if self.scan.columns[position].name == rtdb_types::OWNED_EVENT_POSITION_COLUMN
-                    && self.execution.context.catalog.owned_identity().is_some()
-                {
-                    let positions = rows.iter().map(|row| {
-                        let (batch, index) = row.source;
-                        batches[batch as usize].header(index as usize)
-                            .map(|header| header.position.map_or(Value::Null, |position| Value::Binary(position.to_bytes().to_vec())))
-                    }).collect::<Result<Vec<_>>>()?;
-                    return Ok(Some(crate::columnar::Column::Values(positions)));
-                }
-                if self.scan.columns[position].name == rtdb_types::HOSTED_RECEIPT_TX_ID
-                    && self.execution.context.catalog.owned_identity().is_some()
-                {
-                    let transactions = rows.iter().map(|row| {
-                        let (batch, index) = row.source;
-                        batches[batch as usize].header(index as usize)
-                            .map(|header| header.position.map_or(Value::Null, |position| Value::I64(position.transaction.0)))
-                    }).collect::<Result<Vec<_>>>()?;
-                    return Ok(Some(crate::columnar::Column::Values(transactions)));
-                }
-                if self.scan.columns[position].name == "user_metadata" && projected.is_some() {
-                    return Ok(projected.take());
-                }
-                self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose()
+                self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches).map(|column| (column, None))).transpose()
             })?;
             self.output.push_back(output);
         }
@@ -2601,6 +2562,80 @@ impl PartitionScan {
     }
 }
 
+fn history_column(name: &str, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>], archive: bool,
+    keyed: bool, owned: bool, memory: &Arc<MemoryBudget>) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let headers = || rows.iter().map(move |row| batches[row.source.0 as usize].header(row.source.1 as usize));
+    let len = rows.len();
+    let temporal_bytes = size_of::<i64>() + 1;
+    let column = match name {
+        "_assertion_ordinal" if keyed => history_integers(name, len, false, memory,
+            headers().map(|header| Ok(Some(i64::from(header?.commit_position)))))?,
+        ARCHIVE_TX_FROM if archive => history_integers(name, len, false, memory,
+            rows.iter().map(|row| Ok(Some(row.system_time.lower().0))))?,
+        ARCHIVE_TX_TO if archive => history_integers(name, len, true, memory, rows.iter().map(|row| {
+            let end = row.system_time.upper();
+            Ok((end != Timestamp::MAX).then_some(end.0))
+        }))?,
+        "_system_from" if archive => history_vector(name, len, temporal_bytes, false, memory, || {
+            let mut times = TimestampMicrosecondBuilder::with_capacity(len);
+            for header in headers() { times.append_value(header?.system_from.0); }
+            Ok(times.finish().with_timezone("UTC"))
+        })?,
+        "_system_to" if archive => history_vector(name, len, temporal_bytes, true, memory, || {
+            Ok(TimestampMicrosecondArray::from_iter((0..len).map(|_| None::<i64>)).with_timezone("UTC"))
+        })?,
+        OWNED_EVENT_POSITION_COLUMN if !archive && owned => {
+            let width = EventPosition::WIDTH as usize;
+            let max_positions = i32::MAX as usize / width;
+            history_vector(name, len, width + size_of::<i32>() + 1, true, memory, || {
+                let mut positions = BinaryBuilder::with_capacity(len, len.min(max_positions) * width);
+                let mut present = 0;
+                for header in headers() {
+                    if let Some(position) = header?.position {
+                        if present == max_positions {
+                            return Err(invalid("column-gather", "Event position bytes exceed binary offsets"));
+                        }
+                        positions.append_value(position.to_bytes());
+                        present += 1;
+                    } else {
+                        positions.append_null();
+                    }
+                }
+                Ok(positions.finish())
+            })?
+        }
+        HOSTED_RECEIPT_TX_ID if !archive && owned => history_integers(name, len, true, memory,
+            headers().map(|header| Ok(header?.position.map(|position| position.transaction.0))))?,
+        _ => return Ok(None),
+    };
+    Ok(Some(column))
+}
+
+fn history_integers(name: &str, len: usize, nullable: bool, memory: &Arc<MemoryBudget>,
+    cells: impl Iterator<Item = Result<Option<i64>>>) -> Result<(Column, Arc<MemoryReservation>)> {
+    history_vector(name, len, size_of::<i64>() + 1, nullable, memory, || {
+        let mut integers = Int64Builder::with_capacity(len);
+        for cell in cells { integers.append_option(cell?); }
+        Ok(integers.finish())
+    })
+}
+
+fn history_vector<A: Array + 'static>(name: &str, len: usize, cell_bytes: usize, nullable: bool,
+    memory: &Arc<MemoryBudget>, build: impl FnOnce() -> Result<A>) -> Result<(Column, Arc<MemoryReservation>)> {
+    let size_error = || invalid("column-size", "History column exceeds addressable memory");
+    let bound = len.checked_mul(cell_bytes).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?;
+    let mut charge = memory.reserve(bound)?;
+    let array = Arc::new(build()?);
+    let field = Arc::new(arrow_schema::Field::new(name, array.data_type().clone(), nullable));
+    let logical = from_field(&field)?;
+    let logical_bytes = logical.retained_bytes()?;
+    let bytes = array.get_array_memory_size().checked_add(field.size())
+        .and_then(|bytes| bytes.checked_add(logical_bytes)).ok_or_else(size_error)?;
+    let lease = Arc::get_mut(&mut charge).expect("The history column owns its reservation");
+    if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+    Ok((Column::Arrow { array, field, logical: Some(logical) }, charge))
+}
+
 fn live_match(live: Option<&dyn crate::LiveSearchTerms>, row: &ResolvedRow<(u32, u32)>, batches: &[Arc<IndexBatch>],
     query: &rtdb_text::Query) -> Option<Option<bool>> {
     live?.matches(&batches[row.source.0 as usize], row.source.1 as usize, query).map(Some)
@@ -2643,30 +2678,6 @@ fn resolved_text<'a>(name: &str, row: &ResolvedRow<(u32, u32)>, batches: &'a [Ar
         "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => PutText::Other,
         _ => batches[row.source.0 as usize].view().borrow_event(row.source.1 as usize)?.put_text(name)?,
     })
-}
-
-fn match_input_cell(batch: &IndexBatch, row: usize, name: &str) -> Result<Option<(StructArray, usize, usize)>> {
-    let op = batch.view().operations()?;
-    let put = op.child(op.type_id(row)).as_any().downcast_ref::<StructArray>()
-        .ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
-    Ok(put.fields().iter().position(|field| field.name() == name)
-        .map(|index| (put.clone(), index, op.value_offset(row))))
-}
-
-fn read_match_input_bound(batch: &IndexBatch, row: usize, name: &str) -> Result<usize> {
-    match match_input_cell(batch, row, name)? {
-        Some((put, index, offset)) => rtdb_columnar::estimate_read_cell_bytes(&put.fields()[index], put.column(index).as_ref(), offset),
-        None => Ok(0),
-    }
-}
-
-fn read_match_input(batch: &IndexBatch, row: usize, name: &str) -> Result<Value> {
-    let Some((put, index, offset)) = match_input_cell(batch, row, name)? else { return Ok(Value::Null); };
-    let (field, array) = (&put.fields()[index], put.column(index).as_ref());
-    match batch.put_field_type(index) {
-        Some(logical) => rtdb_columnar::read_execution_value_as(logical, field, array, offset),
-        None => rtdb_columnar::read_execution_value(field, array, offset),
-    }
 }
 
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {
@@ -5417,6 +5428,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_metadata_uses_the_captured_clock_and_keeps_receipt_and_original_cells() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let table = TableRef::new("xt", "txs");
+        let receipts = TableRef::new("xt", "idempotency_receipts");
+        let head = TransactionKey { tx_id: TxId(2), system_time: Timestamp(100) };
+        let timestamp = |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let metadata = |byte| Value::Struct(StructFields::from([("payload".into(), Value::Binary(vec![byte; 64]))]));
+        let mut write = TransactionBuffer::new(state.value().snapshot(), head, Arc::clone(&memory)).unwrap();
+        for id in 0..3 {
+            write.put(table.clone(), StructFields::from([
+                ("_id".into(), Value::I64(id)), ("system_time".into(), timestamp(100)), ("receipt_time".into(), timestamp(20)),
+                ("user_metadata".into(), metadata(id as u8)),
+            ]), Interval::ALL).unwrap();
+        }
+        for (id, value) in [(0, metadata(42)), (1, Value::Null)] {
+            write.put(receipts.clone(), StructFields::from([
+                ("_id".into(), Value::I64(id)), ("user_metadata".into(), value),
+            ]), Interval::from_micros(10, 50).unwrap()).unwrap();
+        }
+        state.apply(&write.stage().unwrap()).unwrap();
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let table = catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
+        let columns = ["_id", "user_metadata"].into_iter().enumerate().map(|(index, name)| Field {
+            id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: table.scan_column_type(name),
+        }).collect();
+        let scan = Scan {
+            table, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
+        };
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(1_000), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
+        };
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let mut pages = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() { pages.push(page); }
+        drop((cursor, state, write));
+        let mut values = BTreeMap::new();
+        for page in pages {
+            assert_eq!(page.columns.len(), 2);
+            assert!(matches!(&page.columns[1], Column::Selected(_)));
+            for row in 0..page.len {
+                let Value::I64(id) = page.columns[0].value(row).unwrap() else { panic!("Expected a transaction id"); };
+                values.insert(id, page.columns[1].value(row).unwrap());
+            }
+        }
+        assert_eq!(values, BTreeMap::from([(0, metadata(42)), (1, Value::Null), (2, metadata(2))]));
+    }
+
+    #[test]
+    fn owned_event_columns_keep_binary_order_and_missing_positions() {
+        let memory = MemoryBudget::new(1 << 20);
+        let position = EventPosition { transaction: TxId(42), ordinal: 300 };
+        let event = |position, commit_position| StoredEvent {
+            position, commit_position, origin: None, entity_key: None, iid: Iid([0; 16]), recency: None,
+            system_from: Timestamp(100), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])),
+        };
+        let batches = [event(Some(position), 2), event(None, 7)].map(|event| {
+            IndexBatch::from_events(&[event], &StructFields::new(), &memory).unwrap()
+        });
+        let rows = [1, 0, 1].map(|source| ResolvedRow { source: (source, 0), valid_time: Interval::ALL, system_time: Interval::ALL });
+        for (name, physical, expected) in [
+            (OWNED_EVENT_POSITION_COLUMN, DataType::Binary, [Value::Null, Value::Binary(position.to_bytes().to_vec()), Value::Null]),
+            (HOSTED_RECEIPT_TX_ID, DataType::Int64, [Value::Null, Value::I64(42), Value::Null]),
+            ("_assertion_ordinal", DataType::Int64, [Value::I64(7), Value::I64(2), Value::I64(7)]),
+        ] {
+            let (column, _charge) = history_column(name, &rows, &batches, false, true, true, &memory).unwrap().unwrap();
+            let Column::Arrow { array, field, .. } = &column else { panic!("Expected typed history output"); };
+            assert_eq!(array.data_type(), &physical);
+            assert_eq!(field.is_nullable(), name != "_assertion_ordinal");
+            assert_eq!((0..rows.len()).map(|row| column.value(row).unwrap()).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn frozen_control_history_resolves_ties_by_position_and_respects_erase() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let table = TableRef::new("public", "bj_archive_fixture");
@@ -5443,7 +5536,7 @@ mod tests {
         assert!(!catalog.table(&name).unwrap().unwrap().columns.contains_key(ARCHIVE_TX_FROM));
         let catalog = catalog.with_archive_history();
         let binding = catalog.table(&name).unwrap().unwrap();
-        let columns = ["v", ARCHIVE_TX_FROM, ARCHIVE_TX_TO, "_system_from"].into_iter().enumerate()
+        let columns = ["v", ARCHIVE_TX_FROM, ARCHIVE_TX_TO, "_system_from", "_system_to"].into_iter().enumerate()
             .map(|(index, name)| Field {
                 id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false,
                 unnamed: false, data_type: binding.scan_column_type(name),
@@ -5459,13 +5552,19 @@ mod tests {
         };
         let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(page) = cursor.next_page().await.unwrap() {
-            rows.extend(page.rows().iter().map(|row| row.values.clone()));
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            let timestamp = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()));
+            for (column, ty) in page.columns[1..].iter().zip([DataType::Int64, DataType::Int64, timestamp.clone(), timestamp]) {
+                assert!(matches!(column, Column::Arrow { array, .. } if array.data_type() == &ty));
+            }
+            for row in 0..page.len {
+                rows.push(page.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>());
+            }
         }
         let time = Value::Timestamp { value: 100, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         assert_eq!(rows, [
-            vec![Value::I64(10), Value::I64(1), Value::Null, time.clone()],
-            vec![Value::I64(9), Value::I64(0), Value::I64(1), time],
+            vec![Value::I64(10), Value::I64(1), Value::Null, time.clone(), Value::Null],
+            vec![Value::I64(9), Value::I64(0), Value::I64(1), time, Value::Null],
         ]);
     }
 
