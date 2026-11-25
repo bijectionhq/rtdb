@@ -13,8 +13,9 @@ use rtdb_index::{
 };
 use rtdb_storage::MemoryStore;
 use rtdb_trie::TrieConfig;
+use rtdb_tx::transact::{Outcome, Receipt};
 use rtdb_types::{
-    BlockIndex, EntityId, EventOp, Interval, StorageEpoch, StructFields, TableRef, TermSequence,
+    BlockIndex, EntityId, EventOp, Interval, SourcePosition, StorageEpoch, StructFields, TableRef, TermSequence,
     TransactionKey, TxId, Value, rtdb_v1::MAIN_BRANCH,
 };
 
@@ -213,16 +214,27 @@ async fn a_native_erase_rewrites_classic_and_native_rows_into_independent_files(
             written: Default::default(),
         },
     };
-    let write =
-        serving::classic::stage_main(partition.snapshot(), &prior, tx(2), &[write], &memory)?;
+    let receipt = |position: u64| Receipt {
+        key: vec![position as u8; 16],
+        basis: Basis::new(incarnation, position),
+        system_time: Timestamp(position as i64),
+        outcome: Outcome::Then,
+        replayed: false,
+        erasure: None,
+        decision_clock: None,
+    };
+    let write = serving::classic::stage_source(
+        partition.snapshot(), &prior, SourcePosition(2), &receipt(2), &[write], &memory,
+    )?;
     partition.apply(&write)?;
     let erase = BranchEffect::Erase {
         branch: None,
         table: table.clone(),
         id: erased.clone(),
     };
-    let write =
-        serving::classic::stage_main(partition.snapshot(), &prior, tx(3), &[erase], &memory)?;
+    let write = serving::classic::stage_source(
+        partition.snapshot(), &prior, SourcePosition(3), &receipt(3), &[erase], &memory,
+    )?;
     let targets = erasure_targets(&write, &memory)?;
     partition.apply(&write)?;
     let snapshot = partition.snapshot();

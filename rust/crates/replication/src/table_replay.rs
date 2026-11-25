@@ -5,7 +5,6 @@ use rtdb_index::{LiveIndex, LiveTable, Snapshot, TableCatalog, TrieCatalog};
 use rtdb_storage::{log::LogRange, object_store::ReadReservation};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, EventHeader, EventOrigin, MemoryBudget, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TransactionKey};
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, TermFence, blocks::matches_catalog_boundary, repair_decision::exclusive_replay_end,
