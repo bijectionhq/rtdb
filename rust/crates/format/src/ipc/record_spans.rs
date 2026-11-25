@@ -3,7 +3,7 @@ use std::{io::Write, sync::Arc};
 use arrow_array::{OffsetSizeTrait, RecordBatch};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer};
 use arrow_data::ArrayData;
-use arrow_ipc::writer::{DictionaryTracker, EncodedData, IpcDataGenerator, write_message};
+use arrow_ipc::writer::{DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions, write_message};
 use arrow_schema::{DataType, Schema, UnionMode};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::Result;
@@ -89,6 +89,18 @@ impl RecordSpans {
         };
         self.buffers.push(vec![value]);
         Ok(true)
+    }
+
+    /// Plans a single record when its spans match Arrow's uncompressed V5 encoding byte for byte.
+    /// Uses the same 8- or 64-byte alignment as [`Self::concat`].
+    /// The caller retains the input and its allocation charges through emission.
+    pub fn exact(batch: &RecordBatch, alignment: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let layout = memory.reserve(schema_translation_bound(batch.schema_ref())?)?;
+        if !batch.columns().iter().all(|array| exact_span_layout(&array.to_data(), 0, array.len())) {
+            return Ok(None);
+        }
+        drop(layout);
+        Self::concat(&[batch], alignment, memory)
     }
 
     /// Plans one record with the same logical buffers as concatenating the input pages.
@@ -264,6 +276,22 @@ impl RecordSpans {
         Ok((builder.finished_data().to_vec(), length))
     }
 
+    /// Returns the aligned V5 continuation prefix and record metadata, plus the body length.
+    pub fn framed_metadata(&self) -> Result<(Vec<u8>, usize)> {
+        const PREFIX_BYTES: usize = 8;
+        let (ipc_message, body_len) = self.metadata()?;
+        let framed_len = pad(allocation_add(ipc_message.len(), PREFIX_BYTES)?, self.alignment)?;
+        i32::try_from(framed_len - PREFIX_BYTES).map_err(invalid)?;
+        let options = IpcWriteOptions::try_new(self.alignment, false, arrow_ipc::MetadataVersion::V5).map_err(invalid)?;
+        let mut frame = Vec::with_capacity(framed_len);
+        write_message(
+            &mut frame,
+            EncodedData { ipc_message, arrow_data: Vec::new() },
+            &options,
+        ).map_err(invalid)?;
+        Ok((frame, body_len))
+    }
+
     pub fn write_body(&self, output: &mut impl Write) -> std::io::Result<()> {
         const PADDING: [u8; 64] = [0; 64];
         for spans in &self.buffers {
@@ -300,6 +328,42 @@ impl RecordSpans {
     }
 }
 
+fn exact_span_layout(data: &ArrayData, start: usize, len: usize) -> bool {
+    if let Some(nulls) = data.nulls().filter(|nulls| nulls.null_count() != 0) {
+        let bits = nulls.inner();
+        let offset = bits.offset() + start;
+        if !span_bitmap_matches(bits.inner(), offset, len) && bits.inner().count_set_bits_offset(offset, len) != len {
+            return false;
+        }
+    }
+    let offset = data.offset() + start;
+    match data.data_type() {
+        DataType::Boolean => span_bitmap_matches(&data.buffers()[0], offset, len),
+        DataType::Struct(_) => data.child_data().iter().all(|child| exact_span_layout(child, start, len)),
+        DataType::List(_) => exact_span_list::<i32>(data, start, len),
+        DataType::LargeList(_) => exact_span_list::<i64>(data, start, len),
+        DataType::FixedSizeList(_, width) => {
+            let width = *width as usize;
+            exact_span_layout(&data.child_data()[0], offset * width, len * width)
+        }
+        DataType::Null | DataType::FixedSizeBinary(_) | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => true,
+        ty => ty.primitive_width().is_some(),
+    }
+}
+
+fn exact_span_list<O: OffsetSizeTrait>(data: &ArrayData, start: usize, len: usize) -> bool {
+    let offsets = data.buffer::<O>(0);
+    let child_start = offsets[start].as_usize();
+    let child_end = offsets[start + len].as_usize();
+    exact_span_layout(&data.child_data()[0], child_start, child_end - child_start)
+}
+
+fn span_bitmap_matches(buffer: &Buffer, offset: usize, len: usize) -> bool {
+    // Arrow 58.4.1 preserves the unused bits in a byte-aligned slice of a bitmap.
+    let tail = len % 8;
+    tail == 0 || offset % 8 != 0 || buffer[offset / 8 + len / 8] >> tail == 0
+}
+
 fn supported(data_type: &DataType) -> bool {
     match data_type {
         DataType::Null | DataType::Boolean | DataType::FixedSizeBinary(_)
@@ -318,7 +382,7 @@ fn pad(bytes: usize, alignment: usize) -> Result<usize> {
 mod tests {
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Int32Array, ListArray, StringArray, types::Int32Type};
-    use arrow_ipc::writer::{CompressionContext, IpcWriteOptions};
+    use arrow_ipc::writer::CompressionContext;
 
     #[test]
     fn spans_match_one_concatenated_record_and_its_canonical_stream() {
@@ -336,17 +400,25 @@ mod tests {
         let pages = [&empty, &left, &right];
         let combined = arrow_select::concat::concat_batches(batch.schema_ref(), pages).unwrap();
         let memory = MemoryBudget::new(1 << 20);
-        let spans = RecordSpans::concat(&pages, 64, &memory).unwrap().unwrap();
-        let (metadata, size) = spans.metadata().unwrap();
-        let mut body = Vec::new();
-        spans.write_body(&mut body).unwrap();
-        let (_, expected) = IpcDataGenerator::default().encode(
-            &combined, &mut DictionaryTracker::new(false), &IpcWriteOptions::default(),
-            &mut CompressionContext::default(),
-        ).unwrap();
-        assert_eq!(metadata, expected.ipc_message);
-        assert_eq!(size, expected.arrow_data.len());
-        assert_eq!(body, expected.arrow_data);
+        for alignment in [8, 64] {
+            let spans = RecordSpans::concat(&pages, alignment, &memory).unwrap().unwrap();
+            let options = IpcWriteOptions::try_new(alignment, false, arrow_ipc::MetadataVersion::V5).unwrap();
+            let (_, expected) = IpcDataGenerator::default().encode(
+                &combined, &mut DictionaryTracker::new(false), &options,
+                &mut CompressionContext::default(),
+            ).unwrap();
+            let (metadata, size) = spans.metadata().unwrap();
+            assert_eq!(metadata, expected.ipc_message);
+            assert_eq!(size, expected.arrow_data.len());
+
+            let mut framed = Vec::new();
+            let (header_len, body_len) = write_message(&mut framed, expected, &options).unwrap();
+            let (mut header, size) = spans.framed_metadata().unwrap();
+            assert_eq!(header, framed[..header_len]);
+            assert_eq!(size, body_len);
+            spans.write_body(&mut header).unwrap();
+            assert_eq!(header, framed);
+        }
 
         let spans = RecordSpans::concat(&pages, STREAM_ALIGNMENT, &memory).unwrap().unwrap();
         let mut stream = Vec::new();

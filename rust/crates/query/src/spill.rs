@@ -2,15 +2,14 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use arrow_array::{OffsetSizeTrait, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
-use arrow_data::ArrayData;
 use arrow_ipc::{
     MetadataVersion,
     reader::{StreamDecoder, read_record_batch},
     writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions, write_message},
 };
-use arrow_schema::{ArrowError, DataType, SchemaRef};
+use arrow_schema::{ArrowError, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::RecordSpans;
 use rtdb_types::Result;
@@ -91,6 +90,14 @@ impl SpillWriter {
         Ok(())
     }
 
+    pub fn write_single_join_record(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
+        self.write_frame(&[3])?;
+        if let Some(spans) = exact_spill_spans(batch, memory)? {
+            return self.write_spanned_record(&spans);
+        }
+        self.write_record(batch, memory)
+    }
+
     /// Writes a batch whose fixed schema the caller retains through spill and replay.
     pub fn write_record(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
         let overflow = || invalid("join-spill", "Arrow spill encoding exceeds addressable memory");
@@ -130,11 +137,7 @@ impl SpillWriter {
         };
         let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5).map_err(ipc_error)?;
         let generator = IpcDataGenerator::default();
-        let spans = match spill_record_spans(batch, memory) {
-            Ok(spans) => spans,
-            Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.format/invalid-arrow") => None,
-            Err(error) => return Err(error),
-        };
+        let spans = exact_spill_spans(batch, memory)?;
         let _scratch = if spans.is_none() {
             let bound = batch.get_array_memory_size().checked_mul(6)
                 .and_then(|bytes| bytes.checked_add(schema_bytes.checked_mul(8)?))
@@ -209,49 +212,12 @@ impl SpillWriter {
     }
 }
 
-fn spill_record_spans(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<RecordSpans>> {
-    let layout = memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
-    if !batch.columns().iter().all(|array| exact_span_layout(&array.to_data(), 0, array.len())) {
-        return Ok(None);
+fn exact_spill_spans(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<RecordSpans>> {
+    match RecordSpans::exact(batch, IPC_ALIGNMENT, memory) {
+        // A small record can fit its generic encoding reservation even when span planning runs out of scratch.
+        Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.format/invalid-arrow") => Ok(None),
+        result => result,
     }
-    drop(layout);
-    RecordSpans::concat(&[batch], IPC_ALIGNMENT, memory)
-}
-
-fn exact_span_layout(data: &ArrayData, start: usize, len: usize) -> bool {
-    if let Some(nulls) = data.nulls().filter(|nulls| nulls.null_count() != 0) {
-        let bits = nulls.inner();
-        let offset = bits.offset() + start;
-        if !span_bitmap_matches(bits.inner(), offset, len) && bits.inner().count_set_bits_offset(offset, len) != len {
-            return false;
-        }
-    }
-    let offset = data.offset() + start;
-    match data.data_type() {
-        DataType::Boolean => span_bitmap_matches(&data.buffers()[0], offset, len),
-        DataType::Struct(_) => data.child_data().iter().all(|child| exact_span_layout(child, start, len)),
-        DataType::List(_) => exact_span_list::<i32>(data, start, len),
-        DataType::LargeList(_) => exact_span_list::<i64>(data, start, len),
-        DataType::FixedSizeList(_, width) => {
-            let width = *width as usize;
-            exact_span_layout(&data.child_data()[0], offset * width, len * width)
-        }
-        DataType::Null | DataType::FixedSizeBinary(_) | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => true,
-        ty => ty.primitive_width().is_some(),
-    }
-}
-
-fn exact_span_list<O: OffsetSizeTrait>(data: &ArrayData, start: usize, len: usize) -> bool {
-    let offsets = data.buffer::<O>(0);
-    let child_start = offsets[start].as_usize();
-    let child_end = offsets[start + len].as_usize();
-    exact_span_layout(&data.child_data()[0], child_start, child_end - child_start)
-}
-
-fn span_bitmap_matches(buffer: &Buffer, offset: usize, len: usize) -> bool {
-    // Arrow 58.4.1 preserves the unused bits in a byte-aligned slice of a bitmap.
-    let tail = len % 8;
-    tail == 0 || offset % 8 != 0 || buffer[offset / 8 + len / 8] >> tail == 0
 }
 
 pub(crate) struct SpillReader { file: BufReader<File>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
@@ -410,11 +376,12 @@ fn malformed_column_spill_markers_fail_before_body_admission() {
 }
 
 #[test]
-fn arrow_records_share_one_schema_across_spill_offsets() {
+fn join_spill_replays_small_records_across_offsets_with_generic_scratch() {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     let memory = MemoryBudget::new(1 << 20);
+    let scratch = MemoryBudget::new(32 << 10);
     let spill = Arc::new(SpillRegion::new(1536).unwrap());
     let schema = Arc::new(Schema::new(vec![
         Field::new("key", DataType::Int64, false),
@@ -426,20 +393,70 @@ fn arrow_records_share_one_schema_across_spill_offsets() {
     let first = batch(1, Some("first"));
     let second = batch(2, None);
     let mut writer = spill.create().unwrap();
-    writer.write_record(&first, &memory).unwrap();
+    writer.write_single_join_record(&first, &scratch).unwrap();
     let offset = writer.position().unwrap();
-    writer.write_record(&second, &memory).unwrap();
+    writer.write_single_join_record(&second, &scratch).unwrap();
+    assert_eq!(scratch.used_bytes(), 0);
     let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
     reader.seek(offset).unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
     assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &second);
     assert!(reader.read_record(&schema, 0).unwrap().is_none());
     reader.rewind().unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
     assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &first);
     drop(reader);
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(spill.retained_bytes(), 0);
 }
 
+#[test]
+fn single_join_spill_matches_the_encoded_record_with_only_span_scratch() {
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let scratch = MemoryBudget::new(1 << 17);
+    let rows = 1 << 15;
+    let flags: BooleanArray = (0..=rows).map(|row| (row % 3 != 0).then_some(row % 2 == 0)).collect();
+    let batch = RecordBatch::try_from_iter([
+        ("key", Arc::new(Int64Array::from(vec![17; rows])) as ArrayRef),
+        ("flag", Arc::new(flags.slice(1, rows)) as ArrayRef),
+    ]).unwrap();
+    let owned = OwnedBatch::new(batch, &memory).unwrap();
+    let batch = owned.batch();
+    let (dictionaries, encoded) = IpcDataGenerator::default().encode(
+        batch, &mut DictionaryTracker::new(false), &IpcWriteOptions::default(), &mut CompressionContext::default(),
+    ).unwrap();
+    assert!(dictionaries.is_empty());
+    assert!(encoded.arrow_data.len() > scratch.limit_bytes());
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&(encoded.ipc_message.len() as u64).to_le_bytes());
+    expected.extend_from_slice(&encoded.ipc_message);
+    expected.extend_from_slice(&encoded.arrow_data);
+    let size = expected.len() as u64 + 17;
+
+    let spill = Arc::new(SpillRegion::new(size + 9).unwrap());
+    let mut writer = spill.create().unwrap();
+    writer.write_single_join_record(batch, &scratch).unwrap();
+    assert_eq!(writer.position().unwrap(), size);
+    let error = writer.write_single_join_record(batch, &scratch).unwrap_err();
+    assert_eq!(error.code, "rtdb.query/spill-limit");
+    assert_eq!(writer.position().unwrap(), size + 9);
+    assert_eq!(spill.retained_bytes(), size + 9);
+    assert_eq!(scratch.used_bytes(), 0);
+
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, expected);
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
+    assert!(reader.read_frame(1).unwrap().is_none());
+    reader.rewind().unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, [3]);
+    assert_eq!(reader.read_record(batch.schema_ref(), 0).unwrap().unwrap().batch(), batch);
+    drop((reader, owned));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(spill.retained_bytes(), 0);
+}
 
 #[test]
 fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() {
@@ -532,7 +549,7 @@ fn homogeneous_spill_preserves_unused_bits_in_aligned_bitmap_slices() {
     let mut writer = spill.create().unwrap();
     let expected = arrays.into_iter().map(|array| {
         let record = RecordBatch::try_from_iter([("value", array)]).unwrap();
-        assert!(spill_record_spans(&record, &memory).unwrap().is_none());
+        assert!(RecordSpans::exact(&record, IPC_ALIGNMENT, &memory).unwrap().is_none());
         let batch = OwnedBatch::new(record, &memory).unwrap();
         let mut reference = StreamWriter::try_new(Vec::new(), batch.batch().schema_ref()).unwrap();
         reference.write(batch.batch()).unwrap();
@@ -604,7 +621,7 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
 #[test]
 fn mixed_spill_assembly_keeps_whole_fragments_and_distinguishes_missing_cells() {
     use arrow_array::{ArrayRef, Int64Array, NullArray, StructArray};
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use rtdb_types::{StructFields, Value};
 
     let backing = MemoryBudget::new(1 << 20);
