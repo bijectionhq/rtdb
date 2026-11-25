@@ -8,6 +8,8 @@ import "google/protobuf/empty.proto";
 // The remaining verbs use DoAction with the rtdb.v1.<verb> type and the serialized protobuf request and result bodies.
 service Rtdb {
   rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc OpenExactRead(OpenExactReadRequest) returns (OpenExactReadResponse);
+  rpc CloseExactRead(CloseExactReadRequest) returns (google.protobuf.Empty);
   rpc Query(QueryRequest) returns (stream QueryFrame);
   rpc OfferDecisionClock(OfferDecisionClockRequest) returns (DecisionClockOffer);
   rpc PrepareFundedAppointment(PrepareFundedAppointmentRequest) returns (FundedAppointment);
@@ -56,6 +58,13 @@ message Page {
   // Resume with the same Source, SQL, parameters and track flag.
   bytes after = 2;
 }
+message OpenExactReadRequest {
+  Basis basis = 1;
+  uint32 ttl_millis = 2;
+  bool track = 3;
+}
+message OpenExactReadResponse { bytes scope = 1; }
+message CloseExactReadRequest { bytes scope = 1; }
 message QueryRequest {
   Source source = 1;
   // Read-only SQL. Source supplies the statement-wide read settings. Omit for ranked_ivf.
@@ -82,6 +91,8 @@ message QueryRequest {
   optional bytes scoped_hold = 12;
   // Select reviewed occurrences from this same exact merged custody Query.
   CustodyReviewSelection custody_review = 13;
+  // Reuse the retained view owned by this assigned follower session.
+  optional bytes exact_read_scope = 16;
 }
 message RankedIvf {
   string schema = 1;
@@ -145,6 +156,8 @@ message FollowerProgress {
   string endpoint = 5;
   Basis writer_head = 6;
   uint64 writer_head_position = 7;
+  Basis retained_from = 8;
+  uint64 retained_from_position = 9;
 }
 message CustodyReadInventory {
   repeated CustodyReadContributor contributors = 1;

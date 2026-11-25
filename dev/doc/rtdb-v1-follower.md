@@ -90,8 +90,8 @@ Run `ServerDriver::run(self)` and publish `ServerHandle::address()` as `Follower
 The bound address identifies the transport, while a successful authenticated progress probe establishes readiness.
 The worker can pass that endpoint, the TLS trust and the Basic credential to `native_store_runtime::rtdb::FollowerRoute::plain_multi`.
 Send exactly one `x-xtdb-database` header on each call with the value `NAME@INCARNATION`, where the incarnation is 32 lowercase hex digits without hyphens.
-The listener admits authenticated Flight handshake, `rtdb.v1.Capabilities` and Query DoGet.
-Capabilities advertises `query`, `query.track`, `query.page`, `query.applied-position` and `query.follower-progress`.
+The listener admits authenticated Flight handshake, `rtdb.v1.Capabilities`, the exact scope actions and Query DoGet.
+Capabilities advertises `query`, `query.track`, `query.page`, `query.applied-position`, `query.follower-progress` and `query.exact-scope`.
 Transact, including effect-free validation, TxStatus, Changes, ordinary Flight SQL, administration, custody operations and other Flight actions are refused at dispatch.
 Forwarded peer and audience headers cannot admit a call on this listener, and the legacy fresh-replica proxy keeps its existing Query refusal.
 Query uses one database snapshot and read-only SQL, so SQL mutations, DDL and session commands are also refused.
@@ -110,11 +110,20 @@ Exactly echoes the retained cut byte-for-byte, including on an empty or continue
 Tracking and pagination use the existing native token authority for the same incarnation.
 Receiver clock and protected release evidence require their owning routes.
 
+Use `rtdb.v1.OpenExactRead` with the exact Basis, tracking mode and a TTL of at most 2,000 milliseconds.
+The open captures the selected native view on the verified assignment and retains its storage before returning the opaque scope.
+Send `QueryRequest.exact_read_scope` (tag 16) on every plain SQL page in the same Flight session.
+Each request must use the same exact Basis and tracking mode, and a continuation belongs to that scope and query.
+Delivery rechecks the attached follower and the captured key generation.
+Call `rtdb.v1.CloseExactRead` to release the scope early.
+An expired scope fails with `rtdb/exact-scope-expired`.
+
 For `FollowerPlacement::watermarks`, issue `SELECT 1 LIMIT 0` at `Exactly(actual_basis)` with `QueryRequest.observe_applied_position = true` (tag 9) over the same private TLS route.
 Check that `QueryTrailer.basis` (tag 1) exactly equals `actual_basis` and `QueryTrailer.applied_position` (tag 8) is present.
 Require `QueryTrailer.follower_progress` (tag 9) and compare the database, incarnation, positive placement epoch, assignment ID and endpoint to the installed assignment.
 `FollowerProgress.writer_head` (tag 6) is the opaque Basis of the settled writer head and `FollowerProgress.writer_head_position` (tag 7) is its comparable position.
-Return the selected Basis and position as `applied`, and the two writer-head fields as `writer_head`.
+Return the selected Basis and position as `applied`, the two writer-head fields as `writer_head`, and the native oldest retained cut and position as `retained_from`.
+The retained floor helps choose a worker and each native open verifies the actual cut.
 Both positions come from the incarnation's recorded transaction cuts and may skip journal positions used for controls or unsettled transactions.
 The writer head is sampled from the authenticated committed journal prefix after the replica takes its local selection, with a live writer lease in that prefix.
 Subtract positions only within the verified assignment's incarnation and keep both Basis values opaque.

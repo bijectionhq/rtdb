@@ -656,6 +656,25 @@ impl QueryContext {
         self.catalog.read_lease().and_then(|lease| lease.provider_cutoff())
     }
 
+    pub async fn retain_wire_scope(&self, until: std::time::Instant) -> Result<()> {
+        if self.catalog.read_lease().is_some_and(|lease| {
+            lease.local_cutoff().map_or(true, |cutoff| cutoff < until)
+        }) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/unretained",
+                "The catalog lease cannot cover the exact read scope"));
+        }
+        self.catalog.held_view().await?;
+        self.check_cancelled()
+    }
+
+    pub fn for_wire_scope_page(&self, cancellation: &CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            cancellation: cancellation.child_token(),
+            owner_cancellation: self.cancellation.child_token(),
+            ..self.clone()
+        })
+    }
+
     pub fn check_cancelled(&self) -> Result<()> {
         if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { return Err(cancelled()); }
         if let Some(guard) = &self.catalog.owned_read_guard { guard()?; }
