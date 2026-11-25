@@ -671,16 +671,28 @@ impl NodeAgent {
         }
     }
 
-    /// The configuration a holder opens `record` with: on its ensemble while a quorum of it is live and every member is, otherwise moving the stream to an ensemble of live logkeepers that keeps the live members (`FlushOnDegradedEnsemble`).
+    /// The configuration a holder opens `record` with.
+    /// A recorded journal placement whose destination is live moves the stream there (`JournalPlacementMovesOnNextClaim`).
+    /// Otherwise it stays on its ensemble while a quorum of it is live and every member is, and else moves to an ensemble of live logkeepers that keeps the live members (`FlushOnDegradedEnsemble`).
     fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
         let now = now_ms();
         let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
         let servers = ensemble_servers(record, members)?;
         let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
-        if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {
+        let quorate = alive.len() >= crate::deployment::write_quorum(record.ensemble.len());
+        if let Some(placement) = record.journal_placement.as_ref().filter(|placement| !placement.reached_by(&record.ensemble))
+            && quorate
+            && let Some(destination) = placement.destination.iter().map(|id| members.get(id)
+                .filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now))
+                .map(journal_endpoint)).collect::<Option<Vec<_>>>()
+        {
+            return Ok(crate::deployment::moving_config(record, destination, Some(servers), &self.options.storage, Role::Holder));
+        }
+        if alive.len() == record.ensemble.len() || !quorate {
             return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
         }
-        let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
+        let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper
+            && member.state == MemberState::Eligible && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
         let live_members = alive.iter().map(|id| &members[id]).collect();
         let selected = select_logkeepers(&record.storage_identity(), record.ensemble.len(), live_members, &candidates);
         if selected.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }

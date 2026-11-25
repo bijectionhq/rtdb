@@ -206,6 +206,9 @@ impl EnsembleRecorder for DirectoryRecorder {
             }
             let mut next = current.clone();
             next.ensemble = ensemble.clone();
+            if next.journal_placement.as_ref().is_some_and(|placement| placement.reached_by(&ensemble)) {
+                next.journal_placement = None;
+            }
             if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))

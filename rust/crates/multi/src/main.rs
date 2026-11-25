@@ -59,6 +59,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
+       rtdb-multi place-journals --directory DIR --name NAME --journals ID,ID,ID [--cell-secret FILE]\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
        rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
@@ -1224,6 +1225,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     return Err(Anomaly::fault("rtdb.multi/audit-log", "The retained journal digest differs from the expected value"));
                 }
             }
+            Ok(())
+        }
+        "place-journals" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let journals = arguments.required("journals")?.split(',').map(|id| rtdb_directory::MemberId(id.trim().to_owned())).collect();
+            let placed = admin::place_journals(directory.as_ref(), arguments.required("name")?, journals, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?;
+            println!("{}", serde_json::to_string_pretty(&placed.ensemble).expect("an ensemble serializes"));
             Ok(())
         }
         "drain" => {

@@ -3124,6 +3124,33 @@ async fn journal_replacement_keeps_acknowledged_history_after_interrupted_trim()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journal_placement_moves_a_held_deployment_onto_the_named_journals_and_keeps_its_history() {
+    let mut cell = Cell::start_durable(1).await;
+    cell.add_logkeeper().await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let extra = cell.logkeepers.iter().map(|keeper| keeper.lease.id()).find(|id| !before.ensemble.contains(id)).unwrap();
+    let leaving = before.ensemble[0].clone();
+    let destination: Vec<_> = before.ensemble.iter().skip(1).cloned().chain([extra.clone()]).collect();
+
+    let moved = admin::place_journals(cell.directory.as_ref(), "shop", destination.clone(), &control()).await.unwrap();
+    assert!(moved.epoch > before.epoch);
+    assert_eq!(moved.journal_placement, None);
+    assert!(moved.ensemble.contains(&extra) && !moved.ensemble.contains(&leaving));
+
+    let index = cell.logkeepers.iter().position(|keeper| keeper.lease.id() == leaving).unwrap();
+    cell.logkeepers.remove(index).stop().await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletion_drops_a_recorded_copy_outside_the_current_ensemble() {
     use rtdb_multi::logs::{DirectoryRecorder, EnsembleRecorder};
     use rtdb_storage::log::{Log, LogOffset};

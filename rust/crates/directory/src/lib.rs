@@ -142,6 +142,24 @@ pub struct PlacementMove {
     pub expires_at_ms: i64,
 }
 
+/// A durability-placement decision: the journals the deployment's next holder copies its stream onto before it appends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalPlacement {
+    pub operation: uuid::Uuid,
+    pub destination: Vec<MemberId>,
+}
+
+impl JournalPlacement {
+    /// Whether `ensemble` already names exactly the destination journals.
+    pub fn reached_by(&self, ensemble: &[MemberId]) -> bool {
+        let mut destination: Vec<_> = self.destination.iter().collect();
+        let mut ensemble: Vec<_> = ensemble.iter().collect();
+        destination.sort_unstable();
+        ensemble.sort_unstable();
+        destination == ensemble
+    }
+}
+
 /// A cross-cell move owned by the source record until cutover is complete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellMove {
@@ -287,6 +305,8 @@ pub struct DeploymentRecord {
     pub move_intent: Option<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_move: Option<PlacementMove>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_placement: Option<JournalPlacement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writer_handoffs: Vec<RetainedWriterHandoff>,
     /// The namespace of the deployment's log positions; bumped when it starts again on fresh logs over existing objects, as a fork does.
@@ -1270,7 +1290,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), classic_catalog_drain: None, classic_flight: None, catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), classic_catalog_drain: None, classic_flight: None, catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, journal_placement: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
             cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }

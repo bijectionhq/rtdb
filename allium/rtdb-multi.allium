@@ -496,6 +496,7 @@ contract LogService {
     @invariant WriterReplacementRetainsInstalledJournals
         -- A worker opening an installed deployment uses its installed journal ensemble.
         -- A separate durability-placement decision authorises a change of journals.
+        -- For a directory ensemble the decision is the deployment's journal placement, which only its next holder applies.
 
     @invariant InstalledJournalIdentityExcludesDirectoryAdmission
         -- A cutover provisions a fresh deployment identity for the installed journal.
@@ -1137,6 +1138,12 @@ value PlacementMove {
     expires_at: Timestamp
 }
 
+value JournalPlacement {
+    -- A durability-placement decision: the journals the deployment's next holder moves its log onto.
+    operation: String
+    destination: List<MemberId>
+}
+
 value StorageNamespaces {
     objects: String
     keys: String
@@ -1173,6 +1180,8 @@ entity DeploymentRecord {
     -- The chain of loglets whose records are above the checkpoint.
     -- Empty when the tail is sealed and flushed.
     loglets: List<Loglet>
+    -- Cleared in the directory change that records the destination as the ensemble.
+    journal_placement: JournalPlacement?
     checkpoint: Checkpoint?
     replica_anchor: CertifiedReplicaPrefix?
     replica_replays: Set<ReplicaReplayHold>
@@ -1604,6 +1613,8 @@ rule Claim {
     requires: record.epoch = expected_epoch
     requires: not record.is_held or record.holder = member
 
+    -- A recorded journal placement whose destination is live, over an ensemble that keeps a quorum, supplies the fresh loglet's journals.
+    -- The holder then copies the retained history onto them under a handoff certificate before it appends.
     ensures:
         let e = Epoch(value: expected_epoch.value + 1)
         let fresh = Loglet.created(epoch: e, ensemble: InstalledEnsembleFor(record), start_lsn: NextLsn(record))
@@ -2584,6 +2595,21 @@ rule AnswerMoved {
 
     ensures:
         Replied(tx, moved: Directory.read(holding.deployment.id).holder)
+}
+
+rule PlaceJournals {
+    -- An operator records a journal placement for a live residence outside a transfer, recovery, staged checkpoint or fork.
+    -- The destination names as many distinct eligible journals as the ensemble, at distinct addresses, spread over no fewer availability zones.
+    -- A pending placement for the same destination keeps its operation, and one the ensemble already names is cleared.
+    -- A held deployment is parked and activated again, so the placement applies at that claim rather than at its next natural one.
+    when: JournalPlacementRequested(record, destination)
+
+    requires: record.lifecycle in {live, quarantined}
+
+    ensures:
+        Directory.cas(record.id, record.epoch, change: {
+            journal_placement: JournalPlacement(operation: Fresh, destination: destination)
+        })
 }
 
 rule DrainMember {

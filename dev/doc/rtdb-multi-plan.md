@@ -577,6 +577,10 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    Assignment spreads an ensemble across distinct declared zones where possible.
    A replacement holder opens the installed journals and must reach their original quorum.
    A separate durability placement operation changes which journals hold the deployment.
+   `rtdb-multi place-journals` records that decision as the deployment's journal placement, parks a held deployment and activates it again.
+   The claiming holder copies the retained history onto the destination under a handoff certificate, and records the new ensemble and clears the placement in one directory change.
+   A placement whose destination is not live waits for a later claim.
+   Installed ordered journals do not read the directory placement.
 
    An installed ordered journal route supplies the node's exact worker enrollment and the gateway's read-only journal identity.
    On that route the journal owns nominations, the writer fence, append reconciliation, fresh read markers and checkpoint publication.

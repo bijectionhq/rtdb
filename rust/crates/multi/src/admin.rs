@@ -24,6 +24,8 @@ mod holder;
 pub use holder::{HolderObservation, observe_holder};
 pub(crate) use holder::observe_holder_record;
 mod holder_handoff;
+mod journals;
+pub use journals::place_journals;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 const CONCURRENT_SUSPICION_PROBES: usize = 16;
@@ -1451,6 +1453,7 @@ async fn prepare_cell_move(
         record.holder = None;
         record.move_intent = None;
         record.placement_move = None;
+        record.journal_placement = None;
         record.storage_namespaces = bound_source.storage_namespaces;
         record.replica_journals.extend(source_stream.servers.iter().cloned());
         record.cell_transfer = Some(Box::new(CellTransfer {
@@ -1472,6 +1475,7 @@ async fn prepare_cell_move(
         staged.incarnation = arrival.incarnation;
         staged.replica_payload_trim = None;
         staged.ensemble = arrival.ensemble;
+        staged.journal_placement = None;
         staged.storage_generation = Some(source.cell_transfer.as_ref()
             .and_then(|transfer| transfer.attempt.as_ref())
             .map_or_else(uuid::Uuid::new_v4, |attempt| attempt.generation));
