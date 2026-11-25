@@ -355,7 +355,11 @@ async fn open_constraint_projection(
         database: context.catalog.default_database().to_owned(),
         table: relation.table(owner),
     };
-    let selection = iids.map_or(OwnedSelection::Relation, OwnedSelection::Candidates);
+    let selection = match iids {
+        Some(iids) => OwnedSelection::Candidates(iids),
+        None if columns.contains(&rtdb_types::OWNED_EVENT_POSITION_COLUMN) => OwnedSelection::PositionedProjection,
+        None => OwnedSelection::Relation,
+    };
     let context = context.for_owned_selection(name.clone(), selection);
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
     let columns = columns.iter().enumerate().map(|(index, name)| Field {

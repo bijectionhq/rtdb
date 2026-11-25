@@ -2517,7 +2517,7 @@ impl PartitionScan {
         let ResolvedScanTask { selected, groups, batches, reservation, _group_reservations } = task;
         let archive_history = projects_archive_history(&self.scan);
         let keyed = self.scan.table.name.table.is_owned_event_data();
-        let owned = self.execution.context.catalog.owned_identity().is_some();
+        let owned = self.execution.context.catalog.admits_owned_event_positions(&self.scan.table.name);
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
             let mut metadata = self.retained_transaction_metadata(rows, &batches).await?;
             let page = &self.pages.entries[selected[group]].source;
@@ -3313,7 +3313,13 @@ mod tests {
         let context = QueryContext::new(catalog, memory, original.system_time, "UTC", QueryOptions::default(), &cancellation).unwrap();
         assert_eq!(crate::read_owned_root_publication(Arc::clone(&context), "alice").await.unwrap(), Some(next));
         let context = context.with_owned_transaction_cut(original, &cancellation).unwrap();
-        assert_eq!(crate::read_owned_root_publication(context, "alice").await.unwrap(), Some(original));
+        assert_eq!(crate::read_owned_root_publication(Arc::clone(&context), "alice").await.unwrap(), Some(original));
+        let mut projection = crate::open_owned_root_projection(
+            context, "alice", &relation, original.system_time, &["_id", OWNED_EVENT_POSITION_COLUMN],
+        ).await.unwrap().unwrap();
+        let batch = projection.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.batch().num_rows(), 1);
+        assert_eq!(crate::owned_row_event_position(batch.batch(), 0).unwrap().transaction, original.tx_id);
     }
 
     #[tokio::test]

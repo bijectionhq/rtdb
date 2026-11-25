@@ -607,11 +607,19 @@ on delivery. The controller acknowledges operation 4 before it withdraws
 installed destination custody. The vault records revocation irreversibly
 and retains positive drains for Original family settlement.
 
-The ordered response registry uses the custody row name as its creator and
-the same registry frame and signature domain as the retired Root path. A
-read opens only the registered member's exact derived stage. Both the
-promoted response hold and the full Original family fence checks run at
-transport release. This path supports founding World ranks. The held restore
-owner supplies the authenticated archive census, reciprocal hold, accepted
-replay receipts and controller observations. Landed Root selectors, inherited
-members, rewrites and backfill require additional effect evidence.
+The ordered response registry uses the custody row name as its creator and the same registry frame and signature domain as the retired Root path.
+A read opens only the registered member's exact derived stage.
+Both the promoted response hold and the full Original family fence checks run at transport release.
+The held restore owner supplies the authenticated archive census, reciprocal hold, accepted replay receipts and controller observations.
+The separate `WRT2` agreement admits one non-expiring accepted Proposal landing and its exact Original rank derivative.
+
+## Inherited Held Root rank
+
+A retained child of a Held Root publication can rank a co-ordered `BJFR2` derivative with non-expiring membership while it shares the Original installation.
+The installed Held search and nearest paths carry the retained world and pin, exact registration occurrence, parent transaction receipt, writer epoch, incarnation and storage generation into Root rank admission.
+The rank projection also supplies the original event positions of the carrier, assertion journal and derivative.
+The serving owner checks those positions against the current winners at the requested valid instant and checks the same active landing in the Original family vault.
+It checks the original applied transactions, exact current world registration, complete Binary-key purge floors and the ordered erasure marker for the rank relation.
+It repeats the checks during the existing plaintext delivery handoff and bounds the response by the retained pin's cutoff.
+The scope is the exact retained parent publication in the same installation.
+Independent restores still require reciprocal destination evidence and dependent erasure projection and settlement under the Original family fence.
