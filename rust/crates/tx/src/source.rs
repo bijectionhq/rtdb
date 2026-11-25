@@ -1,4 +1,4 @@
-use rtdb_types::StructFields;
+use rtdb_types::{HOSTED_INSTANT_MICROS, StructFields};
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 
@@ -24,8 +24,6 @@ const TX_OPS_TAG: u32 = 1;
 // Keep the IPC start on an eight-byte boundary within the allocation for retained replay.
 const SOURCE_PREFIX_SPACE: usize = (1 + key_len(SOURCE_TX_TAG) + key_len(TX_OPS_TAG)
     + 2 * encoded_len_varint(u64::MAX)).next_multiple_of(8);
-// The hosted value model admits UTC years 0001 through 9999.
-const HOSTED_INSTANT_MICROS: std::ops::Range<i64> = -62_135_596_800_000_000..253_402_300_800_000_000;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {

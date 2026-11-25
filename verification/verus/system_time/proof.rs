@@ -13,6 +13,7 @@ const CORRESPONDENCE: &[&str] = &[
     include_str!("../../../rust/crates/flight-sql/src/owned_actions.rs"),
     include_str!("../../../rust/crates/tx/src/decision_clock.rs"),
     include_str!("../../../rust/crates/tx/src/source.rs"),
+    include_str!("../../../rust/crates/types/src/owned_schema.rs"),
     include_str!("../../../rust/crates/tx/src/resolver.rs"),
     include_str!("../../../rust/crates/node/src/node/funded_mutation_clock.rs"),
     include_str!("../../../rust/crates/tx/src/resolver/hosted_control.rs"),
