@@ -24,6 +24,7 @@ pub(super) enum Request {
         branch_created_basis: String,
         write_key: String,
         disclosure_sha256: String,
+        line_binding: Option<LineBinding>,
         rewrite: Option<Rewrite>,
     },
     SealAuthoring {
@@ -129,6 +130,13 @@ impl Request {
         };
         Ok(Some(nonzero(family)?))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LineBinding {
+    pub(super) line_generation: String,
+    pub(super) creation_key: String,
 }
 
 #[derive(Deserialize)]

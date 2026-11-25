@@ -17,7 +17,7 @@ use crate::{
 };
 
 mod reviewed_landing;
-pub use reviewed_landing::{NativeAuthoring, NativeAuthoringRewrite, NativeLandingOrder, NativeLandingReview, NativeLandingWitness, VerifiedNativeLanding};
+pub use reviewed_landing::{NativeAuthoring, NativeAuthoringLine, NativeAuthoringRewrite, NativeLandingOrder, NativeLandingReview, NativeLandingWitness, VerifiedNativeLanding};
 
 pub type CustodyContributors = BTreeSet<(CustodyGroupId, [u8; 32])>;
 

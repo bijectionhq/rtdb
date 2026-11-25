@@ -179,7 +179,9 @@ impl Service {
                                 } else if self.reviewed_custody_writer(&call, &database).await.is_ok() {
                                     features.push(REVIEWED_CUSTODY_PLACEMENT.into());
                                     if original_family_landing::installed_native_authority(&database)
-                                        && self.custody_route(&call).is_ok_and(|route| route.family_vault.is_some())
+                                        && self.custody_route(&call).is_ok_and(|route| {
+                                            route.family_vault.is_some() && route.family_line_registry.is_some()
+                                        })
                                     {
                                         features.push(original_family_landing::FEATURE.into());
                                     }

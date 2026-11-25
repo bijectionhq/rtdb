@@ -39,11 +39,13 @@ The native Original route uses the existing v1 Original writer, receipt and occu
 
 #### Native Original installation
 
-Set `originalFamilyVault` on the matching `flightSql.custodyProviders` entry.
+Set `originalFamilyVault` and `originalFamilyLineRegistry` on the matching `flightSql.custodyProviders` entry.
 The path is an existing private, durable directory shared by all processes that can own the exact Original installation.
 The vault uses durable file locking, atomic record replacement and a separate family stage key namespace.
 Reopen the same directory through restart and retain the installed Original custody authority.
 Authoritative writer identity changes require a custody handoff before the replacement can reopen these records.
+The configured line registry is a qualified table on the native Original attachment.
+The family vault pins that table for the database incarnation.
 
 The action takes JSON and returns one JSON object.
 Unless a field ends in `_b64`, byte fields use lowercase hex.
@@ -55,6 +57,15 @@ Every operation except `scope` names the family UUID.
 
 1. Call `enroll_authoring` with `family`, `assertion`, `stage`, `group`, `native_target_b64`, `branch_created_basis`, `write_key` and `disclosure_sha256`.
    The target is a v1 `CustodyPlacementTarget` protobuf and the branch Basis identifies the physical branch creation.
+   A named branch also requires `line_binding` with `line_generation` and `creation_key`.
+   The line generation is the enrolled nonzero 16-byte UUID in lowercase hex.
+   The creation key is the exact 16–64-byte Fork transaction key in lowercase hex.
+   The same accepting arm writes the configured registry row on `main`, keyed by the physical branch name, with the UUID in its binary `line_generation` cell at valid time zero.
+   RTDB confirms the writer, keyed `Then` receipt, branch creation Basis and exact registration row at that Basis.
+   The independent vault binds the UUID to that physical branch creation before enrolling the stage.
+   Existing named enrollments without an authenticated line binding cannot authorize new named authoring or review.
+   Reserved stages and holds remain in their family close and drain.
+   The permanent main line keeps its native identity.
    The vault retains the exact writer and enrolls the stage before it can be sealed.
 2. Call `seal_authoring` with `family`, `assertion`, `write_key` and the unit-sealed `carrier_b64`.
    Persist the returned opaque `carrier_b64` and `carrier_sha256`, which the same request recovers after reply loss.
@@ -62,6 +73,7 @@ Every operation except `scope` names the family UUID.
 3. Call `confirm_authoring` with `family`, `assertion` and `write_key`.
    The verifier confirms the keyed `Then` receipt and the exact physical branch, slot, validity and carrier occurrence at the write Basis.
    It returns the 104-byte `member` and `occurrence_b64` containing the v1 `CustodyReadContributor` protobuf.
+   A named member's Position contains the enrolled UUID, exact writing clock and native ordinal.
    A rewrite returns its own authored position and occurrence.
    Keep the first occurrence's returned member as the Original family member.
 4. For an existing family rewrite, include `rewrite` in enrollment with `source_occurrence_sha256`, `link_stage`, `reserve_key` and `review_sha256`.

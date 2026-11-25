@@ -6,12 +6,12 @@ use rtdb_node::{
     DatabaseAccess, SystemClock,
     serving::custody_release::{
         CustodyCarrierAuthority, CustodyReleaseRegistration, MountedResponseRelease, NativeAuthoring,
-        NativeAuthoringRewrite, NativeLandingOrder, NativeLandingReview,
+        NativeAuthoringLine, NativeAuthoringRewrite, NativeLandingOrder, NativeLandingReview,
     },
 };
 use rtdb_tx::transact::{CustodyReview, ROW_CUSTODY};
 use rtdb_types::{
-    AssertionId, Position, RootLandingBinding, RootLandingTarget,
+    AssertionId, Position, RootLandingBinding, RootLandingTarget, TableRef,
     rtdb_v1::{Basis, MAIN_BRANCH},
 };
 use serde_json::{Value, json};
@@ -58,7 +58,13 @@ impl Service {
         let authority = mounted.native_landing_authority();
         let request: Request = serde_json::from_slice(body).map_err(|_| invalid())?;
         let result = if let Some(family) = request.family()? {
-            let operation = FamilyCall { vault, mounted: &mounted, authority, family };
+            let operation = FamilyCall {
+                vault,
+                mounted: &mounted,
+                authority,
+                family,
+                line_registry: route.family_line_registry.as_ref(),
+            };
             call.cancellation
                 .run_until_cancelled(operation.execute(call, request))
                 .await
@@ -81,6 +87,7 @@ struct FamilyCall<'a> {
     mounted: &'a MountedResponseRelease<'a>,
     authority: CustodyCarrierAuthority,
     family: [u8; 16],
+    line_registry: Option<&'a TableRef>,
 }
 
 impl FamilyCall<'_> {
@@ -95,6 +102,7 @@ impl FamilyCall<'_> {
             branch_created_basis,
             write_key,
             disclosure_sha256,
+            line_binding,
             rewrite,
             ..
         } = request
@@ -108,6 +116,7 @@ impl FamilyCall<'_> {
                 let original = family
                     .authors
                     .iter()
+                    .filter(|author| author.order.has_bound_line())
                     .filter_map(|author| author.confirmed.as_ref())
                     .find(|authored| authored.occurrence == source)
                     .map(|authored| authored.original)
@@ -127,6 +136,22 @@ impl FamilyCall<'_> {
             } else {
                 None
             };
+            let target = transact::custody_target(decode_proto(&native_target_b64)?, call.memory())?;
+            let line = match (target.branch.as_str() == MAIN_BRANCH, line_binding) {
+                (true, None) => None,
+                (false, Some(line)) => {
+                    let generation = nonzero(&line.line_generation)?;
+                    if generation == root_line_generation(Basis::new(scope.incarnation, 0)) {
+                        return Err(invalid());
+                    }
+                    Some(NativeAuthoringLine {
+                        generation,
+                        creation_key: key(&line.creation_key)?,
+                        registry: self.line_registry.ok_or_else(|| error::unsupported(FEATURE))?.clone(),
+                    })
+                }
+                _ => return Err(error::incorrect("A named authoring branch requires its ordered line binding")),
+            };
             let author = Author {
                 assertion,
                 disclosure: nonzero(&disclosure_sha256)?,
@@ -134,8 +159,9 @@ impl FamilyCall<'_> {
                     group: nonzero(&group)?,
                     placement,
                     write_key,
+                    line,
                     rewrite,
-                    target: transact::custody_target(decode_proto(&native_target_b64)?, call.memory())?,
+                    target,
                     branch_created: basis(&branch_created_basis)?,
                 },
                 payload: None,
@@ -344,6 +370,7 @@ impl FamilyCall<'_> {
             .collect();
         family.check_new_stages(&stages)?;
         self.mounted.verify_native_authoring_scope(&author.order).await?;
+        self.vault.bind_line(self.authority, &author.order).await?;
         family.authors.push(author);
         lock.save(family, false).await?;
         Ok(ok())
@@ -363,6 +390,9 @@ impl FamilyCall<'_> {
             .iter_mut()
             .find(|entry| entry.assertion == assertion && entry.order.write_key == key)
             .ok_or_else(conflict)?;
+        if !author.order.has_bound_line() {
+            return Err(conflict());
+        }
         if let Some(payload) = &author.payload {
             if payload.input != hash(carrier) {
                 return Err(conflict());
@@ -409,6 +439,9 @@ impl FamilyCall<'_> {
             .iter_mut()
             .find(|entry| entry.assertion == assertion && entry.order.write_key == key)
             .ok_or_else(conflict)?;
+        if !author.order.has_bound_line() {
+            return Err(conflict());
+        }
         self.mounted.verify_native_landing_live(family.group).await?;
         if let Some(confirmed) = &author.confirmed {
             return Ok(confirmation(self.authority, author, confirmed));
@@ -418,9 +451,13 @@ impl FamilyCall<'_> {
             .mounted
             .confirm_native_authoring(&author.order, payload.digest, author.link.as_ref().map(|link| link.digest))
             .await?;
+        let line_generation = author
+            .order
+            .line
+            .as_ref()
+            .map_or_else(|| root_line_generation(author.order.branch_created), |line| line.generation);
         let authored = Authored {
-            position: position(&author.order.target.branch, author.order.branch_created, clock, occurrence.ordinal)?
-                .to_bytes(),
+            position: position(line_generation, clock, occurrence.ordinal)?.to_bytes(),
             original,
             occurrence: occurrence.commitment(family.group),
             evidence: URL_SAFE_NO_PAD.encode(contributor(family.group, original, &occurrence, clock).encode_to_vec()),
@@ -445,6 +482,11 @@ impl FamilyCall<'_> {
         if family.group != review.group || review.cut.branch == MAIN_BRANCH {
             return Err(conflict());
         }
+        let (member, original) = authored_at(&family, review.original)?;
+        let (winner, selected) = authored_at(&family, review.selected)?;
+        if !member.order.has_bound_line() || !winner.order.has_bound_line() {
+            return Err(conflict());
+        }
         if let Some(prior) = family.landings.iter().find(|prior| prior.assertion == landing.assertion) {
             if !prior.same_reservation(&landing) {
                 return Err(conflict());
@@ -456,8 +498,6 @@ impl FamilyCall<'_> {
             return Err(conflict());
         }
         family.check_new_stages(&[landing.order.destination, landing.order.link])?;
-        let (member, original) = authored_at(&family, review.original)?;
-        let (winner, selected) = authored_at(&family, review.selected)?;
         if member.order.rewrite.is_some()
             || selected.original != original.occurrence
             || member_bytes(self.authority, member, original) != landing.member
@@ -488,7 +528,8 @@ impl FamilyCall<'_> {
     ) -> rtdb_types::Result<Value> {
         family.live()?;
         self.mounted.verify_native_landing_live(family.group).await?;
-        let landing = find_landing(&mut family, assertion)?;
+        let slot = bound_landing_index(&family, assertion)?;
+        let landing = &mut family.landings[slot];
         if let Some(payload) = &landing.payload {
             if payload.input != hash(carrier) {
                 return Err(conflict());
@@ -514,7 +555,8 @@ impl FamilyCall<'_> {
     ) -> rtdb_types::Result<Value> {
         family.live()?;
         self.mounted.verify_native_landing_live(family.group).await?;
-        let landing = find_landing(&mut family, assertion)?;
+        let slot = bound_landing_index(&family, assertion)?;
+        let landing = &mut family.landings[slot];
         if landing.payload.as_ref().is_none_or(|payload| payload.digest != payload_sha256) {
             return Err(conflict());
         }
@@ -540,7 +582,8 @@ impl FamilyCall<'_> {
     ) -> rtdb_types::Result<Value> {
         family.live()?;
         self.mounted.verify_native_landing_live(family.group).await?;
-        let landing = find_landing(&mut family, assertion)?;
+        let slot = bound_landing_index(&family, assertion)?;
+        let landing = &mut family.landings[slot];
         if landing.order.accept_key != key || landing.payload.is_none() || landing.link.is_none() {
             return Err(conflict());
         }
@@ -561,7 +604,8 @@ impl FamilyCall<'_> {
     ) -> rtdb_types::Result<Value> {
         family.live()?;
         let group = family.group;
-        let landing = find_landing(&mut family, assertion)?;
+        let slot = bound_landing_index(&family, assertion)?;
+        let landing = &mut family.landings[slot];
         if landing.order.accept_key != key {
             return Err(conflict());
         }
@@ -573,8 +617,7 @@ impl FamilyCall<'_> {
             return Err(conflict());
         }
         let position = position(
-            MAIN_BRANCH,
-            Basis::new(self.authority.incarnation, 0),
+            root_line_generation(Basis::new(self.authority.incarnation, 0)),
             accepted.receipt().system_time,
             accepted.occurrence().ordinal,
         )?;
@@ -613,7 +656,7 @@ impl FamilyCall<'_> {
         require_registration(&family, registration, Some(assertion))?;
         let (stage, authoring, digest) = match binding {
             Some(binding) => {
-                let landing = find_landing(&mut family, assertion)?;
+                let landing = &family.landings[bound_landing_index(&family, assertion)?];
                 let accepted = landing.accepted.as_ref().ok_or_else(conflict)?;
                 if accepted.binding != binding || accepted.occurrence != registration.occurrence {
                     return Err(conflict());
@@ -626,6 +669,9 @@ impl FamilyCall<'_> {
             }
             None => {
                 let (author, _) = authored_at(&family, registration.occurrence)?;
+                if !author.order.has_bound_line() {
+                    return Err(conflict());
+                }
                 (author.order.placement, author_binding(author)?, author.payload.as_ref().ok_or_else(conflict)?.digest)
             }
         };
@@ -773,8 +819,15 @@ fn landing_binding(landing: &Landing) -> rtdb_types::Result<[u8; 32]> {
     .map_err(|_| invalid_record())
 }
 
-fn find_landing(family: &mut Family, assertion: [u8; 32]) -> rtdb_types::Result<&mut Landing> {
-    family.landings.iter_mut().find(|entry| entry.assertion == assertion).ok_or_else(conflict)
+fn bound_landing_index(family: &Family, assertion: [u8; 32]) -> rtdb_types::Result<usize> {
+    let slot = family.landings.iter().position(|entry| entry.assertion == assertion).ok_or_else(conflict)?;
+    let review = &family.landings[slot].order.review;
+    let (member, _) = authored_at(family, review.original)?;
+    let (winner, _) = authored_at(family, review.selected)?;
+    if !member.order.has_bound_line() || !winner.order.has_bound_line() {
+        return Err(conflict());
+    }
+    Ok(slot)
 }
 
 fn authored_at(family: &Family, occurrence: [u8; 32]) -> rtdb_types::Result<(&Author, &Authored)> {
@@ -805,12 +858,16 @@ fn require_registration(
     if author || landing { Ok(()) } else { Err(conflict()) }
 }
 
-fn position(branch: &str, created: Basis, clock: rtdb_types::Timestamp, ordinal: u64) -> rtdb_types::Result<Position> {
+fn root_line_generation(created: Basis) -> [u8; 16] {
     let line = hash(
-        &[b"rtdb/v1/original-family-authoring-line\0".as_slice(), &created.to_bytes(), branch.as_bytes()].concat(),
+        &[b"rtdb/v1/original-family-authoring-line\0".as_slice(), &created.to_bytes(), MAIN_BRANCH.as_bytes()].concat(),
     );
+    line[..16].try_into().expect("line width")
+}
+
+fn position(line_generation: [u8; 16], clock: rtdb_types::Timestamp, ordinal: u64) -> rtdb_types::Result<Position> {
     Ok(Position {
-        line_generation: line[..16].try_into().expect("line width"),
+        line_generation,
         publication: clock.0.try_into().map_err(|_| conflict())?,
         ordinal: NonZeroU64::new(ordinal).ok_or_else(conflict)?,
     })

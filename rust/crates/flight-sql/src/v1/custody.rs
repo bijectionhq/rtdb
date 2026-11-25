@@ -88,6 +88,7 @@ pub struct CustodyProviderRoute {
     owner: Option<String>,
     mount: Mutex<Option<CustodyProviderMount>>,
     pub(super) family_vault: Option<super::original_family_landing::NativeFamilyVault>,
+    pub(super) family_line_registry: Option<rtdb_types::TableRef>,
 }
 impl fmt::Debug for CustodyProviderRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,6 +103,7 @@ impl CustodyProviderRoute {
             owner: None,
             mount: Mutex::new(None),
             family_vault: None,
+            family_line_registry: None,
         }
     }
 
@@ -116,6 +118,18 @@ impl CustodyProviderRoute {
 
     pub fn with_original_family_vault(mut self, path: &std::path::Path) -> rtdb_types::Result<Self> {
         self.family_vault = Some(super::original_family_landing::NativeFamilyVault::open(path, self.installation.authority)?);
+        Ok(self)
+    }
+
+    pub fn with_original_family_line_registry(mut self, table: rtdb_types::TableRef) -> rtdb_types::Result<Self> {
+        let vault = self.family_vault.as_ref().ok_or_else(|| {
+            rtdb_types::Anomaly::incorrect(
+                "rtdb/custody-provider-configuration",
+                "An Original family line registry requires a family vault",
+            )
+        })?;
+        vault.bind_line_registry(self.installation.authority, &table)?;
+        self.family_line_registry = Some(table);
         Ok(self)
     }
 

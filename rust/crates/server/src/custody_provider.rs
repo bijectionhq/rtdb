@@ -21,6 +21,7 @@ pub struct Settings {
     pub database: String,
     pub(crate) owner: Option<String>,
     pub(crate) original_family_vault: Option<std::path::PathBuf>,
+    pub(crate) original_family_line_registry: Option<TableRef>,
     endpoint: Url,
     ca_certificate: Option<String>,
     bearer: Secret,
@@ -79,6 +80,15 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
     let public_key = fixed_hex(&fields.required_string("providerPublicKey")?)?;
     let ca_certificate = fields.nullable_string("caCertificate")?;
     let original_family_vault = fields.string("originalFamilyVault")?.map(std::path::PathBuf::from);
+    let original_family_line_registry = fields
+        .string("originalFamilyLineRegistry")?
+        .map(|name| {
+            if !name.contains('.') {
+                return Err(invalid());
+            }
+            TableRef::parse(&name).map_err(|_| invalid())
+        })
+        .transpose()?;
     fields.finish()?;
     if authority.incarnation == [0; 16]
         || authority.installation == [0; 16]
@@ -93,6 +103,7 @@ pub(crate) fn read_settings(value: Yaml) -> Result<Settings> {
         database,
         owner,
         original_family_vault,
+        original_family_line_registry,
         endpoint,
         ca_certificate,
         bearer: Secret::new(bearer),

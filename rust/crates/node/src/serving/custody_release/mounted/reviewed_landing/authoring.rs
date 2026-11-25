@@ -7,7 +7,22 @@ pub struct NativeAuthoring {
     pub target: CustodyTarget<ValidTime>,
     pub branch_created: Basis,
     pub write_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<NativeAuthoringLine>,
     pub rewrite: Option<NativeAuthoringRewrite>,
+}
+
+impl NativeAuthoring {
+    pub fn has_bound_line(&self) -> bool {
+        if self.target.branch == MAIN_BRANCH { self.line.is_none() } else { self.line.is_some() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeAuthoringLine {
+    pub generation: [u8; 16],
+    pub creation_key: Vec<u8>,
+    pub registry: TableRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +39,10 @@ impl MountedResponseRelease<'_> {
         let release = self.release();
         let authority = self.native_landing_authority();
         self.while_mounted(async {
-            let index = release.current(authority).await?;
+            if !authoring.has_bound_line() {
+                return Err(release_unavailable());
+            }
+            let (index, writer) = release.current_with_writer(authority).await?;
             let view = index.view(&authoring.target.branch, At::Latest, Layer::Merged, self.clock.now())?;
             if !view.lineage().iter().any(|branch| {
                 branch.branch == authoring.target.branch
@@ -33,6 +51,18 @@ impl MountedResponseRelease<'_> {
                     && branch.dropped.is_none()
             }) {
                 return Err(release_unavailable());
+            }
+            if let Some(line) = &authoring.line {
+                let receipt = release.driver.tx_status(&line.creation_key, self.cancellation).await?;
+                if receipt.outcome != Outcome::Then
+                    || receipt.key != line.creation_key
+                    || receipt.basis != authoring.branch_created
+                    || index.exact(receipt.basis)?.system_time != receipt.system_time
+                {
+                    return Err(release_unavailable());
+                }
+                require_writer_at(&index, &writer, receipt.basis, receipt.system_time)?;
+                require_line_registration(&index, authoring, line, receipt.system_time)?;
             }
             if let Some(rewrite) = &authoring.rewrite {
                 let (original, source) =
@@ -64,6 +94,9 @@ impl MountedResponseRelease<'_> {
         let authority = self.native_landing_authority();
         let confirmed = self
             .while_mounted(async {
+                if !authoring.has_bound_line() {
+                    return Err(release_unavailable());
+                }
                 let (index, writer) = release.current_with_writer(authority).await?;
                 let receipt = release.driver.tx_status(&authoring.write_key, self.cancellation).await?;
                 if receipt.outcome != Outcome::Then || receipt.key != authoring.write_key {
@@ -185,5 +218,107 @@ fn require_writer_at(index: &BranchIndex, writer: &CustodyWriterFence, basis: Ba
         Ok(())
     } else {
         Err(release_unavailable())
+    }
+}
+
+fn require_line_registration(
+    index: &BranchIndex,
+    authoring: &NativeAuthoring,
+    line: &NativeAuthoringLine,
+    clock: Timestamp,
+) -> Result<()> {
+    let created = index.view(MAIN_BRANCH, At::Exactly(authoring.branch_created), Layer::Local, clock)?;
+    let registration = created
+        .row(&line.registry, &EntityId::String(authoring.target.branch.clone()), Timestamp(0))
+        .ok_or_else(release_unavailable)?;
+    let image = registration.image_at(Timestamp(0)).ok_or_else(release_unavailable)?;
+    if registration.cut != created.cut()
+        || registration.written_basis() != Some(authoring.branch_created)
+        || image.custody_group.is_some()
+        || line.generation == [0; 16]
+        || !matches!(image.cells.get("line_generation"),
+            Some(Value::Binary(bytes) | Value::FixedSizeBinary(bytes)) if bytes.as_slice() == line.generation.as_slice())
+    {
+        return Err(release_unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, RowImage, WrittenVersion};
+    use rtdb_types::{Interval, StructFields};
+
+    use super::*;
+
+    #[test]
+    fn named_authoring_line_is_the_exact_creation_row_value() -> Result<()> {
+        let incarnation = [1; 16];
+        let mut index = BranchIndex::new(incarnation);
+        let created = BranchCut { basis: Basis::new(incarnation, 1), system_time: Timestamp(10) };
+        let later = BranchCut { basis: Basis::new(incarnation, 2), system_time: Timestamp(20) };
+        let unwritten = BranchCut { basis: Basis::new(incarnation, 3), system_time: Timestamp(30) };
+        let branch = "authored".to_owned();
+        let line = NativeAuthoringLine {
+            generation: [2; 16],
+            creation_key: vec![3; 16],
+            registry: TableRef::new("public", "registered_lines"),
+        };
+        let authoring = NativeAuthoring {
+            group: [4; 16],
+            placement: [5; 16],
+            target: CustodyTarget {
+                branch: branch.clone(),
+                table: TableRef::new("public", "facts"),
+                id: EntityId::Integer(42),
+                valid: Interval::ALL.into(),
+            },
+            branch_created: created.basis,
+            write_key: vec![6; 16],
+            line: Some(line.clone()),
+            rewrite: None,
+        };
+        let registration = |cut, generation: [u8; 16]| BranchEffect::Write {
+            branch: MAIN_BRANCH.into(),
+            table: line.registry.clone(),
+            event: BranchEvent {
+                id: EntityId::String(branch.clone()),
+                cut,
+                valid: Interval::ALL,
+                written: WrittenVersion::Branch,
+                image: Some(Arc::new(RowImage {
+                    cells: StructFields::from([("line_generation".into(), Value::Binary(generation.to_vec()))]),
+                    expires_at: None,
+                    custody_group: None,
+                    custody_payload: None,
+                })),
+            },
+        };
+        index.advance(created)?;
+        index.apply(BranchEffect::Fork {
+            child: branch.clone(),
+            from: (MAIN_BRANCH.into(), Basis::new(incarnation, 0)),
+            writable: true,
+            expires_at: None,
+        })?;
+        index.apply(registration(created, line.generation))?;
+        index.advance(later)?;
+        index.apply(registration(later, [7; 16]))?;
+        index.advance(unwritten)?;
+
+        require_line_registration(&index, &authoring, &line, created.system_time)?;
+        let forged = NativeAuthoringLine { generation: [7; 16], ..line.clone() };
+        assert!(require_line_registration(&index, &authoring, &forged, created.system_time).is_err());
+        let stale = NativeAuthoring { branch_created: unwritten.basis, ..authoring.clone() };
+        assert!(require_line_registration(&index, &stale, &forged, unwritten.system_time).is_err());
+        let wrong_row = NativeAuthoring {
+            target: CustodyTarget { branch: "different".into(), ..authoring.target.clone() },
+            ..authoring.clone()
+        };
+        assert!(require_line_registration(&index, &wrong_row, &line, created.system_time).is_err());
+        assert!(!NativeAuthoring { line: None, ..authoring }.has_bound_line());
+        Ok(())
     }
 }

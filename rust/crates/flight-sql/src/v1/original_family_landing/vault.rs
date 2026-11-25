@@ -13,7 +13,7 @@ use rtdb_node::{
         CustodyCarrierAuthority, CustodyReleaseRegistration, NativeAuthoring, NativeLandingOrder,
     },
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef, Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -44,6 +44,27 @@ impl NativeFamilyVault {
         FileKms::create_directory(&keys)?;
         let keys = Arc::new(FileKms::open(&keys, || SystemClock.now().0)?);
         Ok(Self { root, keys })
+    }
+
+    pub(in crate::v1) fn bind_line_registry(&self, authority: CustodyCarrierAuthority, table: &TableRef) -> Result<()> {
+        let id = Uuid::from_bytes(authority.incarnation);
+        bind_record(&self.root.join(format!("original-family-line-registry-{id}.json")), table)
+    }
+
+    pub(super) async fn bind_line(
+        &self,
+        authority: CustodyCarrierAuthority,
+        authoring: &NativeAuthoring,
+    ) -> Result<()> {
+        let Some(line) = &authoring.line else {
+            return Ok(());
+        };
+        let id = Uuid::from_bytes(authority.incarnation);
+        let generation = Uuid::from_bytes(line.generation);
+        let path = self.root.join(format!("original-family-line-{id}-{generation}.json"));
+        let branch = authoring.target.branch.clone();
+        let created = authoring.branch_created;
+        tokio::task::spawn_blocking(move || bind_record(&path, &(branch, created))).await.map_err(task_error)?
     }
 
     pub(super) async fn lock(&self, authority: CustodyCarrierAuthority, family: [u8; 16]) -> Result<LockedFamily> {
@@ -145,6 +166,15 @@ impl LockedFamily {
         })
         .await
         .map_err(task_error)?
+    }
+}
+
+fn bind_record<T: Serialize + serde::de::DeserializeOwned + PartialEq>(path: &Path, value: &T) -> Result<()> {
+    let _lock = lock_file(path)?;
+    match read_record::<T>(path, 4096)? {
+        Some(prior) if &prior != value => Err(conflict()),
+        Some(_) => Ok(()),
+        None => write_record(path, value, 4096),
     }
 }
 
