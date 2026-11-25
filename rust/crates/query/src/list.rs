@@ -49,8 +49,9 @@ impl crate::columnar::BatchCursor for ListCursor {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         let Some(batch) = self.next_list_batch().await? else { return Ok(None); };
         if batch.values().array().is_some() {
+            let backing = batch.backing().cloned();
             let (field, array, reservation) = batch.into_packed_column()?;
-            let output = crate::columnar::ColumnBatch::from_packed_list(array, field, reservation)?;
+            let output = crate::columnar::ColumnBatch::from_packed_list(array, field, reservation, backing)?;
             return Ok(Some(output));
         }
         let memory = &self.context.memory;

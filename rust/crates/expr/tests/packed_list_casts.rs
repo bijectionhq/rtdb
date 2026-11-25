@@ -50,6 +50,68 @@ fn packed_numeric_lists_cast_to_float_elements_with_the_scalar_casts_bits() {
 }
 
 #[test]
+fn same_width_float_cast_retains_only_a_proportionate_funded_slice() {
+    use arrow_array::{RecordBatch, cast::AsArray, types::Float32Type};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
+    use rtdb_expr::{EvaluationScope, ParameterLookup, Parameters};
+
+    struct Bound(OwnedBatch);
+    impl ParameterLookup for Bound {
+        fn width(&self) -> usize { 1 }
+        fn value(&self, _: usize) -> rtdb_types::Result<Option<&V>> { panic!("Arrow list should stay packed") }
+        fn known_value(&self, _: usize) -> Option<&V> { None }
+        fn arrow_cell(&self, _: usize) -> Option<ArrowCell<'_>> {
+            ArrowCell::named(self.0.batch(), "xs", 0)
+        }
+        fn arrow_backing(&self, _: usize) -> Option<&Arc<MemoryReservation>> {
+            self.0.buffer_backing()
+        }
+    }
+
+    let element = L::Scalar(S::F32);
+    let cast = Expr::Cast {
+        expr: Box::new(Expr::Parameter { index: 0, data_type: L::list(element.clone().maybe()) }),
+        target: CastTarget::List(Box::new(CastTarget::fixed(element))),
+    };
+    let nan = f32::from_bits(0x7f80_0100);
+    for (prefix, certified, shares) in [(3, true, true), (8193, true, false), (3, false, false)] {
+        let mut components = vec![Some(5.0); prefix];
+        components.extend([Some(-0.0), None, Some(nan)]);
+        let child: ArrayRef = Arc::new(Float32Array::from(components));
+        let item = Arc::new(Field::new("$data$", DataType::Float32, true));
+        let offsets = vec![prefix as i32, prefix as i32 + 3].into();
+        let list = rtdb_columnar::build_list_array(item, offsets, &child, None).unwrap();
+        let field = Field::new("xs", list.data_type().clone(), false);
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![list]).unwrap();
+        let source = MemoryBudget::new(1 << 20);
+        let bound = Bound(if certified {
+            let grant = source.reserve(batch.get_array_memory_size()).unwrap();
+            OwnedBatch::with_reservation(batch, grant).unwrap()
+        } else {
+            OwnedBatch::new(batch, &source).unwrap()
+        });
+        let lease = Arc::downgrade(bound.0.reservation());
+        let ptr = bound.0.batch().column(0).as_list::<i32>().values()
+            .as_primitive::<Float32Type>().values().as_ptr().wrapping_add(prefix);
+        let scope = EvaluationScope::new(&MemoryBudget::new(1 << 20)).unwrap();
+        let output = {
+            let context = EvalContext { parameters: Parameters::Lookup(&bound), allocation: Some(&scope), ..Default::default() };
+            evaluate(&cast, &Schema::default(), &[], &context).unwrap()
+        };
+        drop(bound);
+        let V::List(output) = output else { panic!("expected list"); };
+        let values = output.array().unwrap().as_primitive::<Float32Type>();
+        assert_eq!(values.values().as_ptr() == ptr, shares);
+        assert_eq!(lease.upgrade().is_some(), shares);
+        assert_eq!(values.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>(),
+            [Some((-0.0f32).to_bits()), None, Some(nan.to_bits())]);
+        drop(output);
+        assert!(lease.upgrade().is_none());
+    }
+}
+
+#[test]
 fn lists_without_a_present_component_cast_as_their_components_do() {
     for list in [V::List(ListValue::from_f32(Float32Array::from(vec![None, None]))), V::list(vec![])] {
         let cast = Expr::Cast { expr: Box::new(Expr::Literal(list.clone())), target: CastTarget::List(Box::new(CastTarget::Fixed(L::Scalar(S::F64)))) };

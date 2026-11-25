@@ -251,12 +251,15 @@ impl PreparedSql {
     }
 
     fn cast_arrow_arguments(&self, arguments: OwnedBatch, types: &[LogicalType], context: &QueryContext) -> Result<OwnedBatch> {
-        use arrow_array::RecordBatch;
-        use rtdb_columnar::ArrowCell;
+        use arrow_array::{ArrayRef, ListArray, RecordBatch};
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::DataType;
+        use rtdb_columnar::{ArrowCell, ResultArrayFunding, retain_result_array};
 
+        let batch = arguments.batch();
+        let backing = arguments.buffer_backing();
         let mut replacement = None;
         for (&index, declared) in &self.0.options.parameter_types {
-            let batch = arguments.batch();
             let source = types.get(index).ok_or_else(|| parameter_error("Parameter field count differs from the prepared statement"))?;
             let target = rtdb_columnar::execution_type(declared);
             if rtdb_columnar::execution_type(source).maybe() == target.clone().maybe() { continue; }
@@ -264,34 +267,73 @@ impl PreparedSql {
             let field = batch.schema_ref().field(index);
             let cell = ArrowCell { field, array: array.as_ref(), row: 0 };
             if cell.is_null()? { continue; }
-            let (fields, arrays, allocation) = match &mut replacement {
+            let (fields, pending, setup) = match &mut replacement {
                 Some(replacement) => replacement,
                 None => {
-                    let allocation = rtdb_expr::EvaluationScope::new(&context.memory)?;
-                    allocation.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
-                    replacement.insert((batch.schema_ref().fields().to_vec(), batch.columns().to_vec(), allocation))
+                    let slots = self.0.options.parameter_types.len().checked_mul(std::mem::size_of::<(usize, ArrayRef, Arc<MemoryReservation>, bool)>())
+                        .and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+                    let bound = rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?
+                        .checked_add(slots).ok_or_else(size_error)?;
+                    let setup = rtdb_expr::EvaluationScope::new(&context.memory)?;
+                    setup.reserve(bound)?;
+                    replacement.insert((batch.schema_ref().fields().to_vec(), Vec::with_capacity(self.0.options.parameter_types.len()), setup))
                 }
             };
-            let value = match rtdb_expr::cast_bound_float_list(cell, &target, allocation)? {
-                Some(value) => value,
+            let allocation = setup.scratch();
+            let (field, array, shared): (_, ArrayRef, _) = match rtdb_expr::cast_bound_float_list(cell, &target, &allocation, backing)? {
+                Some((element, child, shared)) => {
+                    let length = i32::try_from(child.len()).map_err(|_| {
+                        Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets")
+                    })?;
+                    allocation.reserve(field.name().len().checked_add(1024).ok_or_else(size_error)?)?;
+                    let field = rtdb_columnar::to_field(field.name(), &LogicalType::list(element))?;
+                    let DataType::List(item) = field.data_type() else { unreachable!("float list binding") };
+                    let array = ListArray::try_new(Arc::clone(item), OffsetBuffer::new(vec![0, length].into()), child, None)
+                        .map_err(rtdb_columnar::arrow_error)?;
+                    (field, Arc::new(array), shared)
+                }
                 None => {
                     allocation.reserve(rtdb_columnar::estimate_read_cell_bytes(field, array.as_ref(), 0)?)?;
                     let value = rtdb_columnar::read_execution_value_as(source, field, array.as_ref(), 0)?;
                     let value = rtdb_expr::cast(&value, &target, &context.timezone)?;
                     allocation.reserve(value.retained_bytes()?)?;
-                    value
+                    let logical = value.logical_type();
+                    let values = std::slice::from_ref(&value);
+                    allocation.reserve(rtdb_columnar::estimate_builder_bytes(&logical, values)?)?;
+                    let array = rtdb_columnar::copy_array(&logical, values)?;
+                    (rtdb_columnar::to_field(field.name(), &logical)?, array, false)
                 }
             };
-            let logical = value.logical_type();
-            let values = std::slice::from_ref(&value);
-            allocation.reserve(rtdb_columnar::estimate_builder_bytes(&logical, values)?)?;
-            arrays[index] = rtdb_columnar::copy_array(&logical, values)?;
-            fields[index] = Arc::new(rtdb_columnar::to_field(field.name(), &logical)?);
+            fields[index] = Arc::new(field);
+            let grant = allocation.into_reservation()?.expect("Argument cast has a construction grant");
+            pending.push((index, array, grant, shared));
         }
-        let Some((fields, arrays, _allocation)) = replacement else { return Ok(arguments); };
+        let Some((fields, pending, _setup)) = replacement else { return Ok(arguments); };
+        let schema_bytes = fields.iter().try_fold(256usize, |bytes, field| {
+            field.size().checked_add(32).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+        })?;
+        let schema_charge = context.memory.reserve(schema_bytes)?;
+        let page_bytes = batch.num_columns().checked_mul(std::mem::size_of::<ArrayRef>())
+            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+        let page_bytes = batch.columns().iter().enumerate().try_fold(page_bytes, |bytes, (index, array)| {
+            if pending.binary_search_by_key(&index, |(position, ..)| *position).is_ok() {
+                return Ok(bytes);
+            }
+            array.get_array_memory_size().checked_sub(array.get_buffer_memory_size())
+                .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+        })?;
+        let mut reservation = context.memory.reserve(page_bytes)?;
+        let page = Arc::get_mut(&mut reservation).expect("Argument batch owns its descriptor charge");
+        let mut arrays = batch.columns().to_vec();
+        for (index, array, grant, shared) in pending {
+            let funding = if shared {
+                ResultArrayFunding::Relayout(batch.column(index), backing.expect("Shared cast has a source lease"))
+            } else { ResultArrayFunding::Copy };
+            arrays[index] = retain_result_array(array, grant, funding, page, &schema_charge)?;
+        }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays)
             .map_err(|error| parameter_error(&error.to_string()))?;
-        OwnedBatch::new(batch, &context.memory)
+        Ok(OwnedBatch::with_funded_columns(batch, reservation).with_schema_reservation(schema_charge))
     }
 
     /// Uses the first Arrow parameter row directly when the query only projects parameters.
@@ -476,4 +518,89 @@ fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
     drop(bound);
     assert_eq!(query_budget.used_bytes(), 0);
     assert!(statement_budget.used_bytes() > 0);
+}
+
+#[cfg(test)]
+mod argument_cast_tests {
+    use super::*;
+    use arrow_array::{Array, FixedSizeListArray, Float64Array, RecordBatch, StringArray, cast::AsArray, types::{Float32Type, Int32Type}};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{ListKind, ScalarType, Timestamp};
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn prepared_cast_retains_unchanged_owners_and_funds_the_one_row_replacements() {
+        let memory = MemoryBudget::new(1 << 20);
+        let source_memory = MemoryBudget::new(1 << 24);
+        let database = DatabaseSnapshot {
+            partitions: Vec::new(),
+            storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let options = PrepareOptions {
+            parameter_types: [
+                (0, LogicalType::list(LogicalType::Scalar(ScalarType::F32))),
+                (2, LogicalType::Scalar(ScalarType::I32)),
+            ].into(),
+            ..Default::default()
+        };
+        let prepared = PreparedSql::prepare(
+            "SELECT $1 AS xs, $2 AS kept, $3 AS converted", &context, options, ResultSignaturePolicy::Dynamic,
+        ).unwrap();
+        let source_element = Arc::new(ArrowField::new("client-child", DataType::Float64, true));
+        let vectors = FixedSizeListArray::try_new(source_element, 3,
+            Arc::new(Float64Array::from(vec![Some(-0.0), None, Some(8.5)])), None).unwrap();
+        let text = "x".repeat(2 << 20);
+        let kept_field = ArrowField::new("client-text", DataType::Utf8, false)
+            .with_metadata([("label".into(), "original".into())].into());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("client-vector", vectors.data_type().clone(), false),
+            kept_field.clone(),
+            ArrowField::new("client-number", DataType::Utf8, false),
+        ]));
+        let input = RecordBatch::try_new(schema, vec![
+            Arc::new(vectors),
+            Arc::new(StringArray::from(vec![text.as_str()])),
+            Arc::new(StringArray::from(vec!["17"])),
+        ]).unwrap();
+        let input = OwnedBatch::new(input, &source_memory).unwrap();
+        let kept_ptr = input.batch().column(1).as_string::<i32>().value(0).as_ptr();
+        let types = [
+            LogicalType::List { kind: ListKind::FixedSizeList(3), element: Box::new(LogicalType::Scalar(ScalarType::F64).maybe()) },
+            LogicalType::Scalar(ScalarType::Utf8),
+            LogicalType::Scalar(ScalarType::Utf8),
+        ];
+
+        let before = memory.used_bytes();
+        let output = prepared.cast_arrow_arguments(input, &types, &context).unwrap();
+        let record = output.batch();
+        assert_eq!(record.num_rows(), 1);
+        assert_eq!(record.schema_ref().field(1), &kept_field);
+        assert_eq!(record.schema_ref().field(0).name(), "client-vector");
+        assert!(!record.schema_ref().field(0).is_nullable());
+        let DataType::List(item) = record.schema_ref().field(0).data_type() else { panic!("expected variable list"); };
+        assert_eq!(item.as_ref(), &ArrowField::new("$data$", DataType::Float32, true));
+        let list = record.column(0).as_list::<i32>();
+        assert_eq!(list.value_offsets(), &[0, 3]);
+        assert_eq!(list.values().as_primitive::<Float32Type>().iter()
+            .map(|cell| cell.map(f32::to_bits)).collect::<Vec<_>>(),
+            [Some((-0.0f32).to_bits()), None, Some(8.5f32.to_bits())]);
+        assert_eq!(record.column(2).as_primitive::<Int32Type>().value(0), 17);
+
+        let kept = Arc::clone(record.column(1));
+        let cast = Arc::clone(record.column(0));
+        drop(output);
+        assert_eq!(kept.as_string::<i32>().value(0).as_ptr(), kept_ptr);
+        assert_eq!(kept.as_string::<i32>().value(0).len(), text.len());
+        assert_eq!(cast.as_list::<i32>().value_length(0), 3);
+        assert!(memory.used_bytes() > before);
+        assert!(source_memory.used_bytes() > 0);
+        drop(kept);
+        assert_eq!(source_memory.used_bytes(), 0);
+        drop(cast);
+        assert_eq!(memory.used_bytes(), before);
+    }
 }
