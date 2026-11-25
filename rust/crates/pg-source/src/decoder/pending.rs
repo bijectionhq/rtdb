@@ -7,6 +7,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_pg_codec::{WalListColumn, WalListRow};
 use rtdb_types::{LogicalType, Result, TableRef, Value};
 
 use super::{ArrowChanges, DecodedTransaction, RowKind, overflow};
@@ -27,7 +28,7 @@ pub(super) struct PendingTransaction {
 
 impl PendingTransaction {
     pub fn push(
-        &mut self, id: u32, table: &TableRef, kind: RowKind, cells: Vec<(Field, DecodedCell)>,
+        &mut self, id: u32, table: &TableRef, kind: RowKind, cells: Vec<(Field, DecodedCell<'_>)>,
         mut reservation: Arc<MemoryReservation>, metadata: usize,
     ) -> Result<()> {
         let mut layout = DefaultHasher::new();
@@ -39,14 +40,17 @@ impl PendingTransaction {
         let charge = Arc::get_mut(&mut reservation).expect("decoded row owns its reservation");
         if new_run { charge.grow_to(charge.bytes().checked_add(128).ok_or_else(overflow)?)?; }
         let row = if let Some(index) = existing {
-            charge.shrink_to(charge.bytes() - metadata)?;
             let group = &mut self.groups[index];
+            group.check_append(&cells)?;
             let row = group.count;
             Arc::get_mut(&mut group.reservation).expect("pending batch owns its reservation").absorb(charge)?;
             group.push(cells);
+            let charge = Arc::get_mut(&mut group.reservation).expect("pending batch owns its reservation");
+            charge.shrink_to(charge.bytes() - metadata)?;
             row
         } else {
             let mut group = PendingBatch::new(table.clone(), kind, &cells, reservation, metadata);
+            group.check_append(&cells)?;
             group.push(cells);
             self.groups.push(group);
             candidates.push(batch);
@@ -75,21 +79,25 @@ struct PendingBatch {
 
 impl PendingBatch {
     fn new(
-        table: TableRef, kind: RowKind, cells: &[(Field, DecodedCell)], reservation: Arc<MemoryReservation>, metadata: usize,
+        table: TableRef, kind: RowKind, cells: &[(Field, DecodedCell<'_>)], reservation: Arc<MemoryReservation>, metadata: usize,
     ) -> Self {
         let columns = cells.iter().map(|(field, cell)| PendingColumn {
             field: field.clone(),
-            values: ColumnValues::new(cell),
+            values: ColumnValues::new(field, cell),
         }).collect();
         Self { table, kind, count: 0, metadata, columns, reservation }
     }
 
-    fn matches(&self, table: &TableRef, cells: &[(Field, DecodedCell)]) -> bool {
+    fn matches(&self, table: &TableRef, cells: &[(Field, DecodedCell<'_>)]) -> bool {
         self.table == *table && self.columns.len() == cells.len()
             && self.columns.iter().zip(cells).all(|(column, (field, cell))| column.field == *field && column.values.accepts(cell))
     }
 
-    fn push(&mut self, cells: Vec<(Field, DecodedCell)>) {
+    fn check_append(&self, cells: &[(Field, DecodedCell<'_>)]) -> Result<()> {
+        self.columns.iter().zip(cells).try_for_each(|(column, (_, cell))| column.values.check_append(cell))
+    }
+
+    fn push(&mut self, cells: Vec<(Field, DecodedCell<'_>)>) {
         for (column, (_, cell)) in self.columns.iter_mut().zip(cells) { column.values.push(cell); }
         self.count += 1;
     }
@@ -110,12 +118,14 @@ impl PendingBatch {
     }
 }
 
-pub(super) enum DecodedCell {
+pub(super) enum DecodedCell<'a> {
     Scalar(Value),
     Nested(ArrayRef),
+    List(WalListRow<'a>),
+    ArrayText(&'a str),
 }
 
-impl DecodedCell {
+impl DecodedCell<'_> {
     pub fn from_value(name: &str, value: Value, memory: &Arc<MemoryBudget>) -> Result<(Field, Self)> {
         let logical = LogicalType::join_all([&value.logical_type()]);
         let field = rtdb_columnar::to_field(name, &logical)?;
@@ -136,6 +146,8 @@ impl DecodedCell {
             Self::Scalar(Value::Binary(bytes) | Value::Transit(bytes)) => bytes.len(),
             Self::Scalar(_) => 0,
             Self::Nested(array) => array.get_array_memory_size(),
+            Self::List(row) => row.builder_bytes()?,
+            Self::ArrayText(text) => text.len(),
         };
         bytes.checked_mul(4).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)
     }
@@ -154,31 +166,50 @@ macro_rules! columns {
             Uuid(FixedSizeBinaryBuilder),
             Timestamp(Vec<i64>),
             Nested(Vec<ArrayRef>),
+            List(WalListColumn),
+            ArrayText(StringBuilder),
         }
 
         impl ColumnValues {
-            fn new(cell: &DecodedCell) -> Self {
+            fn new(field: &Field, cell: &DecodedCell<'_>) -> Self {
                 match cell {
                     $(DecodedCell::Scalar($(Value::$value(_))|+) => Self::$variant($new),)+
                     DecodedCell::Scalar(Value::Null) => Self::Null,
                     DecodedCell::Scalar(Value::Uuid(_)) => Self::Uuid(FixedSizeBinaryBuilder::with_capacity(0, 16)),
                     DecodedCell::Scalar(Value::Timestamp { .. }) => Self::Timestamp(Vec::new()),
-                    DecodedCell::Nested(_) => Self::Nested(Vec::new()),
+                    DecodedCell::Nested(_) => WalListColumn::new(field).map_or_else(|| Self::Nested(Vec::new()), Self::List),
+                    DecodedCell::List(_) => Self::List(WalListColumn::new(field).expect("WAL list field has a builder")),
+                    DecodedCell::ArrayText(_) => Self::ArrayText(StringBuilder::with_capacity(0, 0)),
                     _ => unreachable!("decoded WAL scalar has a column builder"),
                 }
             }
 
-            fn accepts(&self, cell: &DecodedCell) -> bool {
+            fn accepts(&self, cell: &DecodedCell<'_>) -> bool {
                 matches!((self, cell),
                     $((Self::$variant(_), DecodedCell::Scalar($(Value::$value(_))|+)) |)+
                     (Self::Null, DecodedCell::Scalar(Value::Null)) |
                     (Self::Uuid(_), DecodedCell::Scalar(Value::Uuid(_))) |
                     (Self::Timestamp(_), DecodedCell::Scalar(Value::Timestamp { .. })) |
-                    (Self::Nested(_), DecodedCell::Nested(_))
+                    (Self::Nested(_), DecodedCell::Nested(_)) |
+                    (Self::List(_), DecodedCell::List(_) | DecodedCell::Nested(_)) |
+                    (Self::ArrayText(_), DecodedCell::ArrayText(_))
                 )
             }
 
-            fn push(&mut self, cell: DecodedCell) {
+            fn check_append(&self, cell: &DecodedCell<'_>) -> Result<()> {
+                match (self, cell) {
+                    (Self::List(builder), DecodedCell::List(row)) => builder.check_row(row),
+                    (Self::List(builder), DecodedCell::Nested(array)) => builder.check_array(array.as_ref()),
+                    (Self::ArrayText(builder), DecodedCell::ArrayText(text)) => {
+                        let end = builder.values_slice().len().checked_add(text.len()).ok_or_else(overflow)?;
+                        i32::try_from(end).map_err(protocol)?;
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+
+            fn push(&mut self, cell: DecodedCell<'_>) {
                 match (self, cell) {
                     $((Self::$variant(builder), DecodedCell::Scalar($(Value::$value(value))|+)) => builder.append_value(value),)+
                     (Self::Null, DecodedCell::Scalar(Value::Null)) => {},
@@ -187,6 +218,9 @@ macro_rules! columns {
                     }
                     (Self::Timestamp(values), DecodedCell::Scalar(Value::Timestamp { value, .. })) => values.push(value),
                     (Self::Nested(cells), DecodedCell::Nested(array)) => cells.push(array),
+                    (Self::List(builder), DecodedCell::List(row)) => builder.push(row),
+                    (Self::List(builder), DecodedCell::Nested(array)) => builder.push_array(array.as_ref()),
+                    (Self::ArrayText(builder), DecodedCell::ArrayText(text)) => builder.append_value(text),
                     _ => unreachable!("pending column accepts its decoded layout"),
                 }
             }
@@ -197,6 +231,8 @@ macro_rules! columns {
                     Self::Null => Ok(Arc::new(NullArray::new(count))),
                     Self::Uuid(mut builder) => Ok(Arc::new(builder.finish())),
                     Self::Timestamp(values) => timestamp_column(field, values),
+                    Self::List(builder) => builder.finish(field),
+                    Self::ArrayText(mut builder) => Ok(Arc::new(builder.finish())),
                     Self::Nested(mut cells) if cells.len() == 1 => Ok(cells.remove(0)),
                     Self::Nested(cells) => {
                         let arrays = cells.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
