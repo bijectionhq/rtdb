@@ -718,23 +718,25 @@ const ARROW_LEAF_HEADER: [u8; 16] = {
     header
 };
 
-pub(super) fn encode_leaf(postings: Option<&Postings>, metadata: &[Entry]) -> Result<Vec<u8>> {
+pub(super) fn encode_leaf(
+    postings: Option<&Postings>, metadata: &[Entry], grant: &Arc<MemoryReservation>,
+) -> Result<Vec<u8>> {
     let correction = correction::CorrectionPage::prepare(metadata)?;
     let correction_batch = correction
         .as_ref()
-        .map(correction::CorrectionPage::stage)
+        .map(|page| page.stage(grant))
         .transpose()?;
     let correction_len = correction_batch.as_ref().map_or(0, |batch| batch.encoded_len());
     let posting_batch = postings
-        .map(|postings| postings.stage(&ARROW_LEAF_HEADER, correction_len))
+        .map(|postings| postings.stage(&ARROW_LEAF_HEADER, correction_len, grant))
         .transpose()?;
     let len = posting_batch.as_ref().map_or(correction_len, |batch| batch.encoded_len());
     let mut bytes = Vec::with_capacity(len);
     if let Some(batch) = posting_batch {
-        batch.append_batch(&mut bytes);
+        batch.append_batch(&mut bytes)?;
     }
     if let Some((page, batch)) = correction.as_ref().zip(correction_batch) {
-        batch.append_batch(&mut bytes);
+        batch.append_batch(&mut bytes)?;
         page.append_groups(&mut bytes);
     }
     Ok(bytes)
@@ -1281,7 +1283,7 @@ impl Tree {
                     let encoded = if leaf.postings.is_some()
                         || matches!(leaf.metadata[0].key, Key::Row(_))
                     {
-                        encode_leaf(leaf.postings.as_ref(), &leaf.metadata)?
+                        encode_leaf(leaf.postings.as_ref(), &leaf.metadata, &encoding)?
                     } else {
                         let revisions = leaf
                             .metadata

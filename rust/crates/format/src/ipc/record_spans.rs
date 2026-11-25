@@ -4,7 +4,7 @@ use arrow_array::{OffsetSizeTrait, RecordBatch};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer};
 use arrow_data::ArrayData;
 use arrow_ipc::writer::{DictionaryTracker, EncodedData, IpcDataGenerator, write_message};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, UnionMode};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::Result;
 
@@ -20,6 +20,77 @@ pub struct RecordSpans {
 }
 
 impl RecordSpans {
+    /// Plans the native V5 body of an ordered leaf under the caller's encoding grant.
+    pub fn ordered_leaf(batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Option<Self>> {
+        let mut plan = Self {
+            alignment: 16,
+            rows: batch.num_rows(),
+            nodes: Vec::new(),
+            buffers: Vec::new(),
+            charge,
+        };
+        for column in batch.columns() {
+            if !plan.ordered_column(&column.to_data())? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(plan))
+    }
+
+    fn ordered_column(&mut self, data: &ArrayData) -> Result<bool> {
+        let rows = data.len();
+        let nulls = match data.data_type() {
+            DataType::Null => rows,
+            _ => data.null_count(),
+        };
+        self.nodes.push(arrow_ipc::FieldNode::new(
+            i64::try_from(rows).map_err(invalid)?, i64::try_from(nulls).map_err(invalid)?,
+        ));
+        match data.data_type() {
+            DataType::Null => return Ok(true),
+            DataType::Union(_, UnionMode::Dense) if data.offset() == 0 => {
+                self.buffers.extend(data.buffers().iter().map(|buffer| vec![buffer.clone()]));
+                for child in data.child_data() {
+                    if !self.ordered_column(child)? { return Ok(false); }
+                }
+                return Ok(true);
+            }
+            _ => {}
+        }
+        self.buffers.push(match data.nulls().filter(|_| nulls != 0) {
+            Some(nulls) => vec![nulls.inner().sliced()],
+            None => Vec::new(),
+        });
+        let value = match data.data_type() {
+            DataType::Boolean => data.buffers()[0].bit_slice(data.offset(), rows),
+            DataType::Utf8 | DataType::Binary => {
+                let offsets = &data.buffer::<i32>(0)[..=rows];
+                if offsets[0] != 0 {
+                    return self.offset_column::<i32>(std::slice::from_ref(data), rows);
+                }
+                let width = size_of::<i32>();
+                self.buffers.push(vec![data.buffers()[0].slice_with_length(
+                    allocation_mul(data.offset(), width)?, allocation_mul(allocation_add(rows, 1)?, width)?,
+                )]);
+                data.buffers()[1].slice_with_length(0, usize::try_from(offsets[rows]).map_err(invalid)?)
+            }
+            ty => {
+                let width = match ty {
+                    DataType::FixedSizeBinary(width) => usize::try_from(*width).map_err(invalid)?,
+                    _ => match ty.primitive_width() {
+                        Some(width) => width,
+                        None => return Ok(false),
+                    },
+                };
+                data.buffers()[0].slice_with_length(
+                    allocation_mul(data.offset(), width)?, allocation_mul(rows, width)?,
+                )
+            }
+        };
+        self.buffers.push(vec![value]);
+        Ok(true)
+    }
+
     /// Plans one record with the same logical buffers as concatenating the input pages.
     /// The caller retains the input and its allocation charges through emission.
     pub fn concat(

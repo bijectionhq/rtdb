@@ -72,8 +72,8 @@ impl<'a> CorrectionPage<'a> {
         }))
     }
 
-    pub fn stage(&self) -> Result<KeyBatchEncoding<'_>> {
-        self.batch.stage(&HEADER, self.groups_len)
+    pub fn stage(&self, grant: &Arc<MemoryReservation>) -> Result<KeyBatchEncoding<'_>> {
+        self.batch.stage(&HEADER, self.groups_len, grant)
     }
 
     pub fn append_groups(&self, bytes: &mut Vec<u8>) {
@@ -205,7 +205,8 @@ mod tests {
             key: Key::Row(address.clone()),
             item: Item::Row(Arc::from([span.clone()])),
         }];
-        let bytes = encode_leaf(None, &entries).unwrap();
+        let encoding = budget.reserve(32 << 10).unwrap();
+        let bytes = encode_leaf(None, &entries, &encoding).unwrap();
         assert!(
             !bytes
                 .windows(b"omitted-key".len())
@@ -225,7 +226,7 @@ mod tests {
             cells[0],
             address.view(),
         )]).unwrap();
-        let leaf = encode_leaf(Some(&postings), &entries).unwrap();
+        let leaf = encode_leaf(Some(&postings), &entries, &encoding).unwrap();
         let (_, suffix) = Postings::decode(Buffer::from_vec(leaf).slice(16), 64).unwrap();
         assert_eq!(suffix.as_ref(), bytes.as_slice());
 

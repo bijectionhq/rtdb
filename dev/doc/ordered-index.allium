@@ -38,6 +38,7 @@ entity Checkpoint {
 -- Compact contiguous selections may share the backing allocations of index-owned Arrow keys.
 -- A rebuilt leaf transfers its construction grant to new backing and retains the existing owners of shared buffers.
 -- A correction page serializes just the Arrow key rows for the validity spans it owns.
+-- Ordered leaf publication writes canonical IPC body buffers into the final page allocation.
 -- A decoded correction group shares the admitted page backing with its validity spans.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A snapshot may reuse decoded index definitions for the same catalog read time.

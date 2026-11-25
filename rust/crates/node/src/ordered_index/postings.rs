@@ -11,12 +11,13 @@ use arrow_ipc::{
     MetadataVersion,
     reader::read_record_batch,
     root_as_message,
-    writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions},
+    writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
 };
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 #[cfg(test)]
 use bytes::Bytes;
 use rtdb_columnar::{MemoryReservation, RetainedArray};
+use rtdb_format::ipc::RecordSpans;
 use rtdb_types::{Iid, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
 
@@ -663,15 +664,16 @@ impl Postings {
         self.0.batch.columns().get(self.0.prefix + slot)
     }
 
-    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
-        self.0.stage(header, suffix_len)
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize, grant: &Arc<MemoryReservation>) -> Result<KeyBatchEncoding<'a>> {
+        self.0.stage(header, suffix_len, grant)
     }
 
     #[cfg(test)]
     fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
-        let encoding = self.stage(header, suffix.len())?;
+        let grant = rtdb_columnar::MemoryBudget::new(32 << 20).reserve(32 << 20)?;
+        let encoding = self.stage(header, suffix.len(), &grant)?;
         let mut bytes = Vec::with_capacity(encoding.encoded_len());
-        encoding.append_batch(&mut bytes);
+        encoding.append_batch(&mut bytes)?;
         bytes.extend_from_slice(suffix);
         Ok(bytes)
     }
@@ -948,9 +950,15 @@ pub(super) struct KeyBatchEncoding<'a> {
     header: &'a [u8],
     lengths: [u32; 3],
     layouts: &'a [Layout],
-    data: EncodedData,
+    metadata: Vec<u8>,
+    body: KeyBatchBody,
     body_start: usize,
     len: usize,
+}
+
+enum KeyBatchBody {
+    Spans(RecordSpans),
+    Staged(Vec<u8>),
 }
 
 impl KeyBatchEncoding<'_> {
@@ -958,7 +966,7 @@ impl KeyBatchEncoding<'_> {
         self.len
     }
 
-    pub fn append_batch(self, bytes: &mut Vec<u8>) {
+    pub fn append_batch(self, bytes: &mut Vec<u8>) -> Result<()> {
         let start = bytes.len();
         bytes.extend_from_slice(self.header);
         for length in self.lengths {
@@ -967,9 +975,13 @@ impl KeyBatchEncoding<'_> {
         for layout in self.layouts {
             bytes.extend_from_slice(&layout.0.to_le_bytes());
         }
-        bytes.extend_from_slice(&self.data.ipc_message);
+        bytes.extend_from_slice(&self.metadata);
         bytes.resize(start + self.body_start, 0);
-        bytes.extend_from_slice(&self.data.arrow_data);
+        match self.body {
+            KeyBatchBody::Spans(spans) => spans.write_body(bytes).map_err(format_error)?,
+            KeyBatchBody::Staged(body) => bytes.extend_from_slice(&body),
+        }
+        Ok(())
     }
 }
 
@@ -1159,23 +1171,25 @@ impl KeyBatch {
     }
 
     // One schema-bound IPC record batch. The short layout prefix identifies its typed columns.
-    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
-        let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)
-            .map_err(format_error)?;
-        let (dictionaries, data) = IpcDataGenerator::default()
-            .encode(
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize, grant: &Arc<MemoryReservation>) -> Result<KeyBatchEncoding<'a>> {
+        let (metadata, body_len, body) = if let Some(spans) = RecordSpans::ordered_leaf(&self.batch, Arc::clone(grant))? {
+            let (metadata, body_len) = spans.metadata()?;
+            (metadata, body_len, KeyBatchBody::Spans(spans))
+        } else {
+            let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)
+                .map_err(format_error)?;
+            let (dictionaries, data) = IpcDataGenerator::default().encode(
                 &self.batch,
                 &mut DictionaryTracker::new(false),
                 &options,
                 &mut CompressionContext::default(),
-            )
-            .map_err(format_error)?;
-        if !dictionaries.is_empty() {
-            return Err(invalid());
-        }
+            ).map_err(format_error)?;
+            if !dictionaries.is_empty() { return Err(invalid()); }
+            (data.ipc_message, data.arrow_data.len(), KeyBatchBody::Staged(data.arrow_data))
+        };
         let lengths = [
             u32::try_from(self.layouts.len()).map_err(format_error)?,
-            u32::try_from(data.ipc_message.len()).map_err(format_error)?,
+            u32::try_from(metadata.len()).map_err(format_error)?,
             u32::try_from(suffix_len).map_err(format_error)?,
         ];
         let layouts_bytes = self.layouts.len()
@@ -1184,11 +1198,11 @@ impl KeyBatch {
         let body_start = header.len()
             .checked_add(size_of_val(&lengths))
             .and_then(|len| len.checked_add(layouts_bytes))
-            .and_then(|len| len.checked_add(data.ipc_message.len()))
+            .and_then(|len| len.checked_add(metadata.len()))
             .and_then(|len| len.checked_next_multiple_of(ALIGNMENT))
             .ok_or_else(invalid)?;
         let len = body_start
-            .checked_add(data.arrow_data.len())
+            .checked_add(body_len)
             .and_then(|len| len.checked_add(suffix_len))
             .filter(|&len| len <= isize::MAX as usize)
             .ok_or_else(invalid)?;
@@ -1196,7 +1210,8 @@ impl KeyBatch {
             header,
             lengths,
             layouts: &self.layouts,
-            data,
+            metadata,
+            body,
             body_start,
             len,
         })
@@ -1491,9 +1506,19 @@ mod tests {
     use super::*;
 
     fn encode_keys(keys: &KeyBatch) -> Vec<u8> {
-        let encoding = keys.stage(&[], 0).unwrap();
+        let grant = rtdb_columnar::MemoryBudget::new(32 << 20).reserve(32 << 20).unwrap();
+        let encoding = keys.stage(&[], 0, &grant).unwrap();
+        let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5).unwrap();
+        let (dictionaries, original) = IpcDataGenerator::default().encode(
+            keys.batch(), &mut DictionaryTracker::new(false), &options, &mut CompressionContext::default(),
+        ).unwrap();
+        assert!(dictionaries.is_empty());
+        assert!(matches!(&encoding.body, KeyBatchBody::Spans(_)));
+        assert_eq!(encoding.metadata, original.ipc_message);
+        let body = encoding.body_start;
         let mut bytes = Vec::with_capacity(encoding.encoded_len());
-        encoding.append_batch(&mut bytes);
+        encoding.append_batch(&mut bytes).unwrap();
+        assert_eq!(&bytes[body..], original.arrow_data.as_slice());
         bytes
     }
 
