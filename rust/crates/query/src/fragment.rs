@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_buffer::Buffer;
+use arrow_ipc::{MetadataVersion, writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter, write_message}};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_format::ipc::{ArrowStream, OwnedStream};
+use rtdb_format::ipc::{ArrowStream, OwnedStream, RecordSpans};
 use rtdb_plan::{Scan, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
@@ -405,15 +406,9 @@ impl FragmentBytes {
     pub fn as_slice(&self) -> &[u8] { &self.bytes }
     pub fn into_bytes(self) -> Vec<u8> { self.bytes }
     pub(crate) fn into_ipc_buffer(self) -> Buffer { Buffer::from(Bytes::from_owner(self)) }
-}
 
-impl AsRef<[u8]> for FragmentBytes {
-    fn as_ref(&self) -> &[u8] { self.as_slice() }
-}
-
-impl Write for FragmentBytes {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let required = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| io::Error::other("Fragment byte length overflow"))?;
+    fn reserve_append(&mut self, bytes: usize) -> io::Result<()> {
+        let required = self.bytes.len().checked_add(bytes).ok_or_else(|| io::Error::other("Fragment byte length overflow"))?;
         if required > self.bytes.capacity() {
             let lease = Arc::get_mut(&mut self.reservation).expect("The fragment writer owns its reservation");
             let capacity = required.max(self.bytes.capacity().saturating_mul(2));
@@ -426,6 +421,17 @@ impl Write for FragmentBytes {
             };
             self.bytes.try_reserve_exact(admitted - self.bytes.len()).map_err(io::Error::other)?;
         }
+        Ok(())
+    }
+}
+
+impl AsRef<[u8]> for FragmentBytes {
+    fn as_ref(&self) -> &[u8] { self.as_slice() }
+}
+
+impl Write for FragmentBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.reserve_append(bytes.len())?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -560,6 +566,14 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
     }
     let schema = Arc::new(ArrowSchema::new(fields));
     let record = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &RecordBatchOptions::new().with_row_count(Some(rows.len()))).map_err(|error| invalid("fragment-encode", error))?;
+    let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5).map_err(fragment_arrow_error)?;
+    match try_write_spanned_frame(&record, &options, memory, out) {
+        Ok(true) => return Ok(()),
+        Ok(false) => (),
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+        Err(error) => return Err(error),
+    }
+
     let schema_bound = rtdb_format::ipc::schema_translation_bound(&schema)?;
     let scratch = record.columns().iter().zip(slice_bodies).try_fold(schema_bound, |bound, (array, body)| {
         let bytes = match body {
@@ -573,9 +587,7 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
     let prefix = out.bytes.len();
     out.write_all(&[0; 8]).map_err(fragment_io)?;
     {
-        let options = arrow_ipc::writer::IpcWriteOptions::try_new(IPC_ALIGNMENT, false, arrow_ipc::MetadataVersion::V5)
-            .map_err(fragment_arrow_error)?;
-        let mut writer = arrow_ipc::writer::StreamWriter::try_new_with_options(&mut *out, &schema, options).map_err(fragment_arrow_error)?;
+        let mut writer = StreamWriter::try_new_with_options(&mut *out, &schema, options).map_err(fragment_arrow_error)?;
         writer.write(&record).map_err(fragment_arrow_error)?;
         writer.finish().map_err(fragment_arrow_error)?;
     }
@@ -583,6 +595,33 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
     let bytes = u64::try_from(out.bytes.len() - start).map_err(|error| invalid("fragment-encode", error))?;
     out.bytes[prefix..start].copy_from_slice(&bytes.to_be_bytes());
     Ok(())
+}
+
+fn try_write_spanned_frame(record: &RecordBatch, options: &IpcWriteOptions, memory: &Arc<MemoryBudget>,
+    out: &mut FragmentBytes,
+) -> Result<bool> {
+    let Some(spans) = RecordSpans::exact(record, IPC_ALIGNMENT, memory)? else { return Ok(false); };
+    const EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+    let (metadata, body) = spans.framed_metadata().map_err(|error| invalid("fragment-encode", error))?;
+    let mut schema = Vec::new();
+    let message = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        record.schema_ref(), &mut DictionaryTracker::new(false), options,
+    );
+    write_message(&mut schema, message, options).map_err(fragment_arrow_error)?;
+
+    let overflow = || invalid("fragment-encode", "Fragment byte length overflow");
+    let length = schema.len().checked_add(metadata.len())
+        .and_then(|length| length.checked_add(body))
+        .and_then(|length| length.checked_add(EOS.len())).ok_or_else(overflow)?;
+    let prefix = u64::try_from(length).map_err(|error| invalid("fragment-encode", error))?.to_be_bytes();
+    // Pre-admit the frame so a budget refusal leaves the reply intact for the generic writer.
+    out.reserve_append(length.checked_add(prefix.len()).ok_or_else(overflow)?).map_err(fragment_io)?;
+    out.write_all(&prefix).map_err(fragment_io)?;
+    out.write_all(&schema).map_err(fragment_io)?;
+    out.write_all(&metadata).map_err(fragment_io)?;
+    spans.write_body(out).map_err(fragment_io)?;
+    out.write_all(&EOS).map_err(fragment_io)?;
+    Ok(true)
 }
 
 /// The batches `encode_batch` wrote into `bytes`, each charged to `memory` for what it retains.
@@ -985,6 +1024,38 @@ mod tests {
     }
 
     #[test]
+    fn a_sliced_fragment_fits_without_staging_and_matches_the_arrow_writer() {
+        use arrow_array::StringArray;
+        use rtdb_types::ScalarType;
+
+        let source_memory = MemoryBudget::new(1 << 20);
+        let memory = MemoryBudget::new(256 << 10);
+        let value = "x".repeat(128 << 10);
+        let array: ArrayRef = Arc::new(StringArray::from(vec![Some("before"), Some(value.as_str()), None, Some("after")]));
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, true)
+            .with_metadata([("unit".into(), "text".into())].into()));
+        let logical = LogicalType::Scalar(ScalarType::Utf8);
+        let batch = ColumnBatch::settled(vec![Column::Arrow {
+            array: Arc::clone(&array), field: Arc::clone(&field), logical: Some(logical.clone()),
+        }], 4, source_memory.reserve(256).unwrap()).unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![wire_field(0, &field, Some(&logical)).unwrap()]));
+        let record = RecordBatch::try_new(Arc::clone(&schema), vec![array.slice(1, 2)]).unwrap();
+        let options = IpcWriteOptions::try_new(IPC_ALIGNMENT, false, MetadataVersion::V5).unwrap();
+        let mut writer = StreamWriter::try_new_with_options(Vec::new(), &schema, options).unwrap();
+        writer.write(&record).unwrap();
+        let expected = writer.into_inner().unwrap();
+
+        let mut actual = FragmentBytes::new(&memory).unwrap();
+        append_frame(&batch, 1..3, &memory, &mut actual, None).unwrap();
+        assert_eq!(&actual.as_slice()[..8], &(expected.len() as u64).to_be_bytes());
+        assert_eq!(&actual.as_slice()[8..], expected.as_slice());
+        assert_eq!(memory.used_bytes(), actual.bytes.capacity());
+        drop(actual);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn decoded_fragment_values_keep_the_charged_reply_allocation() {
         use arrow_array::StringArray;
 
@@ -1165,7 +1236,12 @@ mod tests {
             field: Arc::new(ArrowField::new("data", arrow_schema::DataType::Binary, false)),
             logical: None,
         };
-        let batch = ColumnBatch::settled(vec![column], 2, source_memory.reserve(256).unwrap()).unwrap();
+        let flags = Column::Arrow {
+            array: Arc::new(arrow_array::BooleanArray::from(vec![true; 8]).slice(0, 2)),
+            field: Arc::new(ArrowField::new("flag", DataType::Boolean, false)),
+            logical: None,
+        };
+        let batch = ColumnBatch::settled(vec![column, flags], 2, source_memory.reserve(256).unwrap()).unwrap();
         let mut out = FragmentBytes::new(&memory).unwrap();
 
         encode_batch(&batch, &memory, &mut out).unwrap();
@@ -1174,6 +1250,7 @@ mod tests {
         assert_eq!(frames.iter().map(|frame| frame.len).collect::<Vec<_>>(), [1, 1]);
         for frame in frames {
             assert_eq!(frame.columns[0].value(0).unwrap(), Value::Binary(data.clone()));
+            assert_eq!(frame.columns[1].value(0).unwrap(), Value::Bool(true));
         }
     }
 
@@ -1224,19 +1301,20 @@ mod tests {
 
         let reply_memory = MemoryBudget::new(1 << 20);
         let probe = MemoryBudget::new(1 << 20);
+        let rows = 4096;
         let column = Column::Arrow {
-            array: Arc::new(Int64Array::from(vec![1, 2, 3])),
+            array: Arc::new(Int64Array::from(vec![7; rows])),
             field: Arc::new(ArrowField::new("value", DataType::Int64, false)),
             logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::I64)),
         };
-        let batch = ColumnBatch::settled(vec![column], 3, reply_memory.reserve(256).unwrap()).unwrap();
+        let batch = ColumnBatch::settled(vec![column], rows, reply_memory.reserve(256).unwrap()).unwrap();
         let mut expected = FragmentBytes::new(&reply_memory).unwrap();
-        encode_frame(&batch, 0..3, &probe, &mut expected, None).unwrap();
+        encode_frame(&batch, 0..rows, &probe, &mut expected, None).unwrap();
 
         let memory = MemoryBudget::new(probe.peak_bytes());
         let mut actual = FragmentBytes::new(&reply_memory).unwrap();
         let mut fields = WireFields::new();
-        append_frame(&batch, 0..3, &memory, &mut actual, Some(&mut fields)).unwrap();
+        append_frame(&batch, 0..rows, &memory, &mut actual, Some(&mut fields)).unwrap();
         assert_eq!(actual.as_slice(), expected.as_slice());
         assert_eq!(memory.used_bytes(), 0);
     }

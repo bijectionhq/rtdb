@@ -19,6 +19,14 @@ pub(crate) struct ApplicationLayout {
     pub(super) inventory: Vec<TableRef>,
     pub(super) sql_release: SqlReleaseLayout,
     pub(super) external_key_recovery: Option<TableRef>,
+    pub(super) named_holds: Option<NamedHoldLayout>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NamedHoldLayout {
+    pub(super) table: TableRef,
+    pub(super) id_prefix: String,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +87,12 @@ impl ApplicationLayout {
                 !layout.inventory.contains(table)
                     || points.iter().any(|point| &point.table == table)
                     || sql.contains(&table)
+            })
+            || layout.named_holds.as_ref().is_some_and(|named| {
+                !inventory.contains(&named.table)
+                    || named.id_prefix.is_empty()
+                    || named.id_prefix.len() > 128
+                    || !named.id_prefix.bytes().all(|byte| byte.is_ascii_graphic())
             })
         {
             return Err(invalid());

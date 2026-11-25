@@ -3005,6 +3005,39 @@ impl OwnedReadSession {
         Ok((page, evidence))
     }
 
+    pub async fn range_page_by_key_covered(
+        &self,
+        relation: &rtdb_types::OwnedRelation,
+        path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedRangeRequest<'_>,
+    ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>, Option<Timestamp>)> {
+        self.admit_read().await?;
+        if self.lifetime_point_duration(relation).await?.is_some() {
+            return Err(crate::ordered_index::uncovered_owned_range());
+        }
+        let (page, until) = crate::ordered_index::owned_range_in(
+            self.relation_context(relation)?, &self.owner, relation, path,
+            crate::ordered_index::RowBounds::Compound(request), None, Some(self.witness_until),
+        ).await?;
+        let until = until.ok_or_else(crate::ordered_index::uncovered_owned_range)?;
+        let mut witness = self.relation_witness(relation)?
+            .ok_or_else(crate::ordered_index::uncovered_owned_range)?;
+        witness.until = until;
+        self.check_covered_range_release(relation, until)?;
+        Ok((page, Some(witness), Some(until)))
+    }
+
+    pub fn check_covered_range_release(
+        &self, relation: &rtdb_types::OwnedRelation, until: Timestamp,
+    ) -> Result<()> {
+        self.check_relation(relation)?;
+        if until <= self.node.now() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/range-clock-expired",
+                "The covered range reached its valid-time cutoff"));
+        }
+        Ok(())
+    }
+
     /// A live lifetime page certifies its release horizon at held present.
     pub async fn range_page_by_key_lifetime(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,

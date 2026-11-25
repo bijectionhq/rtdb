@@ -33,6 +33,7 @@ use crate::{
 mod classic_destination;
 mod classic_flight;
 pub(crate) mod classic_provider;
+mod classic_world;
 
 const FRAME_BYTES: usize = 2048;
 const ORIGINAL_RECEIPT_FRAME_BYTES: usize = 4096;
@@ -123,6 +124,9 @@ enum Action {
     },
     ObserveClassicMigrationSource {
         source_manifest_sha256: String,
+    },
+    ReopenClassicMigrationRetainedWorld {
+        selection: classic_world::Selection,
     },
     DiscardClassicMigrationStage {
         destination: Uuid,
@@ -347,6 +351,9 @@ enum Reply {
         source: ClassicMigrationSource,
         current_checkpoint: rtdb_directory::Checkpoint,
         directory_version: rtdb_directory::Version,
+    },
+    ClassicMigrationRetainedWorldReopened {
+        evidence: classic_world::Evidence,
     },
     ClassicMigrationStageDiscarded {
         authority: Uuid,
@@ -874,6 +881,16 @@ impl RecoveryService {
                     },
                     current_checkpoint, directory_version: holder.directory_version,
                 })
+            }
+            Action::ReopenClassicMigrationRetainedWorld { selection } => {
+                Box::pin(self.reopen_classic_retained_world(
+                    directory.as_ref(),
+                    installation,
+                    request.authority,
+                    request.capture,
+                    selection,
+                ))
+                .await
             }
             Action::SealClassicMigrationSource { destination, stage_operation, source_manifest_sha256, source }
             | Action::DiscardClassicMigrationStage { destination, stage_operation, source_manifest_sha256, source } => {

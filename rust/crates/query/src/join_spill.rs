@@ -94,11 +94,6 @@ impl SpillSchema {
         Ok(Some((record, copied, reservation)))
     }
 
-    fn write_record(&self, writer: &mut SpillWriter, record: &RecordBatch, context: &QueryContext) -> Result<()> {
-        writer.write_frame(&[3])?;
-        writer.write_record(record, &context.memory)
-    }
-
     fn read(&self, reader: &mut SpillReader) -> Result<Option<ColumnBatch>> {
         let Some((marker, _charge)) = reader.read_frame(1)? else { return Ok(None); };
         if marker == [3] {
@@ -178,7 +173,7 @@ impl BlockWriter {
         context.check_cancelled()?;
         match self.queued.as_slice() {
             [] => return Ok(()),
-            [record] => self.schema.write_record(&mut self.writer, &record.record, context)?,
+            [record] => self.writer.write_single_join_record(&record.record, &context.memory)?,
             many => {
                 let _references = context.memory.reserve(many.len().checked_mul(size_of::<&RecordBatch>()).ok_or_else(size_error)?)?;
                 let records = many.iter().map(|record| &record.record).collect::<Vec<_>>();
@@ -213,7 +208,8 @@ fn write_compacted_records(
             arrow_schema::ArrowError::OffsetOverflowError(_) => layout_error(),
             error => invalid("join-spill", error),
         })?;
-    schema.write_record(writer, &batch, context)
+    writer.write_frame(&[3])?;
+    writer.write_record(&batch, &context.memory)
 }
 
 pub(crate) struct SpilledBlocks {
@@ -255,7 +251,7 @@ impl SpilledBlocks {
                 let at = writer.position()?;
                 if compatible_schema(&self.schema.logical)
                     && let Some((record, _copied, _reservation)) = self.schema.record(&selected, context)? {
-                    self.schema.write_record(&mut writer, &record, context)?;
+                    writer.write_single_join_record(&record, memory)?;
                 } else {
                     writer.write_columns(&selected, &self.schema.logical, memory)?;
                 }

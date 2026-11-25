@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions, make_array};
+use arrow_buffer::{ArrowNativeType, Buffer};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, FieldRef, Schema, SchemaRef, UnionFields, UnionMode};
+use rtdb_columnar::{MemoryBudget, retain_buffer};
 use rtdb_types::Result;
 
 use super::invalid;
@@ -40,6 +42,94 @@ pub(super) fn normalize_stream_validity(batch: &RecordBatch) -> Result<RecordBat
     }).collect::<Result<Vec<_>>>()?;
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
     RecordBatch::try_new_with_options(schema, columns, &options).map_err(invalid)
+}
+
+pub(super) fn normalize_native_stream(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<RecordBatch> {
+    let schema = adapt_schema(batch.schema_ref(), true)?;
+    let columns = batch.columns().iter().zip(schema.fields()).map(|(column, field)| {
+        let data = rebase_native_stream(column.to_data(), memory)?;
+        retype(data, field.data_type()).map(make_array)
+    }).collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(invalid)
+}
+
+fn rebase_native_stream(data: ArrayData, memory: &Arc<MemoryBudget>) -> Result<ArrayData> {
+    match data.data_type() {
+        DataType::List(_) | DataType::Map(_, _) => return rebase_list::<i32>(data, memory),
+        DataType::LargeList(_) => return rebase_list::<i64>(data, memory),
+        DataType::FixedSizeList(_, width) => {
+            let width = usize::try_from(*width).map_err(invalid)?;
+            let start = super::allocation_mul(data.offset(), width)?;
+            let length = super::allocation_mul(data.len(), width)?;
+            let child = rebase_native_stream(data.child_data()[0].slice(start, length), memory)?;
+            return data.into_builder().offset(0).child_data(vec![child]).build().map_err(invalid);
+        }
+        DataType::RunEndEncoded(ends, _) => return match ends.data_type() {
+            DataType::Int16 => rebase_runs::<i16>(data, memory),
+            DataType::Int32 => rebase_runs::<i32>(data, memory),
+            DataType::Int64 => rebase_runs::<i64>(data, memory),
+            _ => Err(invalid("Unsupported Arrow run-end width")),
+        },
+        _ if data.child_data().is_empty() => return Ok(data),
+        _ => {}
+    }
+    let offset = if matches!(data.data_type(), DataType::Struct(_)) { 0 } else { data.offset() };
+    let children = data.child_data().iter().map(|child| rebase_native_stream(child.clone(), memory))
+        .collect::<Result<Vec<_>>>()?;
+    data.into_builder().offset(offset).child_data(children).build().map_err(invalid)
+}
+
+fn rebase_list<T: ArrowNativeType>(data: ArrayData, memory: &Arc<MemoryBudget>) -> Result<ArrayData> {
+    let offset_count = super::allocation_add(data.len(), 1)?;
+    let offsets = &data.buffer::<T>(0)[..offset_count];
+    let (start, end) = if data.is_empty() { (0, 0) } else {
+        (offsets[0].as_usize(), offsets[data.len()].as_usize())
+    };
+    let child = rebase_native_stream(data.child_data()[0].slice(start, end - start), memory)?;
+    let offsets = if offsets[0].as_usize() == 0 {
+        let start = super::allocation_mul(data.offset(), size_of::<T>())?;
+        let length = super::allocation_mul(offset_count, size_of::<T>())?;
+        data.buffers()[0].slice_with_length(start, length)
+    } else {
+        let start = offsets[0].as_usize();
+        funded_offsets(memory, offset_count, offsets.iter().map(|offset| offset.as_usize() - start))?
+    };
+    data.into_builder().offset(0).buffers(vec![offsets]).child_data(vec![child]).build().map_err(invalid)
+}
+
+fn rebase_runs<T: ArrowNativeType + Ord>(data: ArrayData, memory: &Arc<MemoryBudget>) -> Result<ArrayData> {
+    let [ends, values] = data.child_data() else { return Err(invalid("Arrow run layout lacks its children")); };
+    let run_ends = &ends.buffer::<T>(0)[..ends.len()];
+    let start = data.offset();
+    let end = super::allocation_add(start, data.len())?;
+    let (first, count) = if data.is_empty() { (0, 0) } else {
+        let first = run_ends.partition_point(|run_end| run_end.as_usize() <= start);
+        let last = run_ends.partition_point(|run_end| run_end.as_usize() < end);
+        (first, last + 1 - first)
+    };
+    let selected = run_ends.get(first..first + count).ok_or_else(|| invalid("Arrow run ends do not cover their slice"))?;
+    let values = rebase_native_stream(values.slice(first, count), memory)?;
+    let ends = if start == 0 && count == run_ends.len()
+        && selected.last().map_or(0, |last| last.as_usize()) == end
+    {
+        ends.clone()
+    } else {
+        let ends_buffer = funded_offsets::<T>(memory, count, selected.iter().map(|run_end| run_end.as_usize().min(end) - start))?;
+        ArrayData::builder(ends.data_type().clone()).len(count).add_buffer(ends_buffer).build().map_err(invalid)?
+    };
+    data.into_builder().offset(0).child_data(vec![ends, values]).build().map_err(invalid)
+}
+
+fn funded_offsets<T: ArrowNativeType>(memory: &Arc<MemoryBudget>, count: usize, offsets: impl Iterator<Item = usize>) -> Result<Buffer> {
+    let bytes = super::allocation_mul(count, size_of::<T>())?;
+    let charge = memory.reserve(super::allocation_add(bytes, 256)?)?;
+    let mut values = Vec::with_capacity(count);
+    for offset in offsets {
+        let value = T::from_usize(offset).ok_or_else(|| invalid("Arrow offset exceeds its width"))?;
+        values.push(value);
+    }
+    Ok(retain_buffer(&Buffer::from_vec(values), &charge))
 }
 
 fn strip_masked_nulls(field: &arrow_schema::Field, data: ArrayData) -> Result<ArrayData> {

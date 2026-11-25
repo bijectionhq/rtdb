@@ -97,6 +97,8 @@ struct DispositionRelation {
 struct DispositionRow {
     id: EntityId,
     stamp: Stamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_sha256: Option<[u8; 32]>,
 }
 
 impl Application {
@@ -331,9 +333,16 @@ impl Application {
                 };
                 let cells = &row.image_at(at).ok_or_else(invalid)?.cells;
                 require_sql_disposition(&layout.sql_release, &view, at, table, row, cells)?;
+                let selected_named_hold = layout.named_holds.as_ref().is_some_and(|named| {
+                    &named.table == table
+                        && matches!(id, EntityId::String(id) if id.starts_with(&named.id_prefix))
+                });
                 let row = DispositionRow {
                     id: id.clone(),
                     stamp: self.stamp(table, row, cells)?,
+                    admission_sha256: selected_named_hold
+                        .then(|| binary(cells, "admission").map(sha256))
+                        .transpose()?,
                 };
                 let len = encode(&row)?.len();
                 bytes = bytes

@@ -72,6 +72,8 @@ entity Checkpoint {
 -- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
 -- A seek evaluates each bound expression once for its comparison keys.
 -- A held range compares variable-width selector values within their caller's lifetime.
+-- A live range can require a valid-time interval over the complete requested key bounds, including a vacant range.
+-- The horizon stops at or before any matching posting's activation or expiry and is enforced at ordered acceptance.
 -- A point scan funds merge heads by bucket count, tree frames as paths grow, and result staging by batch size.
 -- A candidate scope has one sorted Arrow IID column for membership and range intersection.
 -- Filtering and output use the same resolved payload batches.

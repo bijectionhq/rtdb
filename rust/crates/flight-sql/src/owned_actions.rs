@@ -3283,16 +3283,23 @@ impl Service {
         }
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
+        let covers_clock = batch.batch().column_by_name("cover_valid").is_some();
+        if covers_clock && (!matches!(version, HeldRangeFormat::Full) || audience) {
+            return Err(invalid("Valid-time range coverage requires the original live hold"));
+        }
         let expected_fields = match version {
             HeldRangeFormat::Leading => 4,
             HeldRangeFormat::Full => 6,
             HeldRangeFormat::FixedValid => 7,
             HeldRangeFormat::Historical => 8,
         };
-        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_fields {
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_fields + usize::from(covers_clock) {
             return Err(invalid("Owned range requires one row with the fields for its action version"));
         }
         let (row, _decoded) = OrderedControls::read(batch.batch(), self)?;
+        if covers_clock && row.boolean("cover_valid") != Some(true) {
+            return Err(invalid("The valid-time coverage selector must be true"));
+        }
         let (Some(path), true, true, Some(limit)) =
             (row.text("path"), row.contains("lower"), row.contains("upper"), row.integer("limit"))
         else { return Err(invalid("Owned range fields have invalid types")); };
@@ -3332,7 +3339,9 @@ impl Service {
                     return Err(invalid("The audience page requires its bounded inline address order"));
                 }
             }
-            if let (Some(system), Some(valid)) = (system, valid_at) {
+            if covers_clock {
+                held.snapshot.range_page_by_key_covered(&relation, &path, request).await
+            } else if let (Some(system), Some(valid)) = (system, valid_at) {
                 held.snapshot.range_page_by_key_at_system(&relation, &path, request, system, valid)
                     .await.map(|page| (page, None, None))
             } else {
@@ -3348,7 +3357,10 @@ impl Service {
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
         let reply = self.encode_owned_point_reply(self.memory(), schema, page.batch.as_ref().map(OwnedBatch::batch),
             present, valid_at.unwrap_or(present), None, expiry, reply_format)?;
-        if system.is_none() && !matches!(version, HeldRangeFormat::Leading) {
+        if covers_clock {
+            let until = expiry.ok_or_else(|| Status::internal("Covered range omitted its valid-time cutoff"))?;
+            held.snapshot.check_covered_range_release(&relation, until).map_err(status)?;
+        } else if system.is_none() && !matches!(version, HeldRangeFormat::Leading) {
             held.snapshot.check_lifetime_range_release(&relation, expiry).map_err(status)?;
         } else {
             held.snapshot.check_relation(&relation).map_err(status)?;

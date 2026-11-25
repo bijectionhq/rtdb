@@ -650,6 +650,11 @@ contract LogService {
         -- Private release status joins one exact registered family response part, its ordered application settlement, and its immutable Original vault terminal.
         -- An exact status retry reopens the same provider terminal while the Original and scratch authorities retain its evidence.
 
+    @invariant ClassicMigrationRetainedWorldReadback
+        -- Before the source fence, authenticated Original Recovery selects the commissioned Begin, Original catalog, source capture and one active retained root World pin.
+        -- The provider verifies the selected archive and its World-owned suffix at the exact transaction key under the installed archive authority.
+        -- A positive observation records the unchanged retention and source selection after the archive read drains.
+
     @invariant ClassicMigrationOrdinaryFlightDrain
         -- The Original can reobserve the exact ordered transfer fence from its capture and private scratch before the keeper seal completes.
         -- The Original directory orders admission of each ordinary gateway and receiver generation against the same source revision as the transfer fence.
