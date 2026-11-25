@@ -2,7 +2,7 @@ use rtdb_types::rtdb_v1::{
     DependentCustodyReceipt, DependentKeyCustody, DependentKeyTerminal, NativeCheckpointMember,
     NativeCustodyFence, NativeDependentCheckpointMember, NativeDependentCheckpointMetadata,
     NativeDependentCheckpointRow, NativeDependentCustodyDisposition,
-    NativeDependentCustodyEnrollment, NativeDependentCustodyScope,
+    NativeDependentCustodyEnrollment, NativeDependentCustodyScope, NativeDependentRead,
 };
 
 use super::*;
@@ -16,6 +16,87 @@ pub(super) struct Dependent {
 }
 
 impl BranchIndex {
+    pub fn check_native_dependent_destination(&self, read: &NativeDependentRead, now: Timestamp) -> Result<&NativeCheckpointCustody> {
+        let scope = read.scope;
+        let custody = self.inherited_custody().ok_or_else(dependent_conflict)?;
+        if custody.reservation != scope.reservation
+            || custody.enrolled_at != scope.source_enrolled_at
+            || scope.destination.incarnation() != scope.reservation.target.incarnation
+            || scope.destination.position() != scope.reservation.source.basis.position()
+            || custody.groups.binary_search(&(scope.group, scope.checkpoint_group_sha256)).is_err()
+        {
+            return Err(dependent_conflict());
+        }
+        self.native_dependent_point(read, scope.destination, now)?;
+        Ok(custody)
+    }
+
+    pub fn native_dependent_original(
+        &self,
+        custody: &NativeCheckpointCustody,
+        read: &NativeDependentRead,
+        now: Timestamp,
+    ) -> Result<(&NativeDependentCustodyEnrollment, [u8; 32], &CustodyOccurrence)> {
+        let scope = read.scope;
+        self.check_native_export_read(custody, scope.destination, scope.group, read.occurrence)?;
+        let Some((enrollment, None)) = self.native_dependent_custody(scope)? else {
+            return Err(dependent_conflict());
+        };
+        let pinned = scope.reservation.source.basis;
+        let selected = self.native_dependent_point(read, pinned, now)?;
+        let (original, occurrence) = self.custody_read_occurrence(pinned, scope.group, read.occurrence)?;
+        let member = NativeCheckpointMember {
+            placement: occurrence.placement_id,
+            reservation: occurrence.reservation,
+            occurrence: Some(read.occurrence),
+            carrier_sha256: occurrence.carrier_sha256,
+            link_sha256: occurrence.link_sha256,
+        };
+        if selected != occurrence {
+            return Err(dependent_conflict());
+        }
+        if !enrollment.members.iter().any(|enrolled| {
+            enrolled.native == member && enrolled.application_keys.iter().any(|key| {
+                key.key == read.application_key
+                    && key.carriers.contains(&member.carrier_sha256)
+                    && member.link_sha256.is_none_or(|link| key.carriers.contains(&link))
+            })
+        }) {
+            return Err(dependent_conflict());
+        }
+        Ok((enrollment, original, occurrence))
+    }
+
+    fn native_dependent_point(&self, read: &NativeDependentRead, pinned: Basis, now: Timestamp) -> Result<&CustodyOccurrence> {
+        if read.branch_created.incarnation() != read.scope.destination.incarnation() {
+            return Err(dependent_conflict());
+        }
+        let created = Basis::new(pinned.incarnation(), read.branch_created.position());
+        if self.lineage_at(&read.branch, pinned).is_none_or(|line| line.created != created)
+            || self.lineage_at(&read.branch, self.head.basis).is_none_or(|line| line.created != created)
+        {
+            return Err(dependent_conflict());
+        }
+        let historical = self.view(&read.branch, At::Exactly(pinned), Layer::Local, now)?;
+        let current = self.view(&read.branch, At::Latest, Layer::Local, now)?;
+        let selected = historical.row(&read.table, &read.id, read.valid_at).ok_or_else(dependent_conflict)?;
+        if current.row(&read.table, &read.id, read.valid_at).is_none_or(|row| !std::ptr::eq(row, selected)) {
+            return Err(dependent_conflict());
+        }
+        let envelope = selected.image_at(now.max(self.head.system_time))
+            .filter(|image| image.custody_group == Some(read.scope.group))
+            .and_then(|image| image.custody_payload.as_ref())
+            .ok_or_else(dependent_conflict)?;
+        let occurrence = self.checkpoint_occurrence(read.scope.group, &read.branch, &read.table, selected, &envelope.envelope)?;
+        if occurrence.placement_id != read.placement
+            || occurrence.commitment(read.scope.group) != read.occurrence
+            || matches!(selected.written, WrittenVersion::Custody(Some(ordinal)) if ordinal != occurrence.ordinal)
+        {
+            return Err(dependent_conflict());
+        }
+        Ok(occurrence)
+    }
+
     pub fn native_dependent_custody_roster(
         &self,
         scope: NativeDependentCustodyScope,

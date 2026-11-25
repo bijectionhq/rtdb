@@ -578,7 +578,7 @@ The distinct destination needs an installed application-key and response-registr
 Commission the exact destination installation, application key namespace, reader admission owner and durable response registry, and bind their retained receipts to the same scope.
 The Original retirement worker can continue using its current drain call once the trusted host drives each dependent settlement.
 Upgrade source journal readers and managed catalog publishers before enabling the new ordered records.
-The private inherited read remains closed until a paired consumer supplies a current destination generation, exact slot and source occurrence, all contributing live fences and a durable registration through admitted response-part delivery and disposal.
+Carrier delivery requires a paired consumer with independent application family and key-reader authority and ordered Original response admission through disposal.
 
 #### Stock private custody transport
 
@@ -624,6 +624,45 @@ The request file contains `{"version":1,"settlement":{"destination":"...","scope
 Results are `kind: "pending"` with the stable `key` or `kind: "settled"` with `key` and the applied source `basis`.
 After an uncertain settlement, submit the exact same request to status or retry it on the selected writer.
 The operator client rejects redirects and verifies the raw request digest, derived receipt key and positive receipt Basis.
+
+#### Private native inherited proof
+
+Add an `inherited` entry to the Original host ingress profile with a distinct `client_certificate_sha256`, the exact `source_incarnation`, `destination_incarnation`, destination catalog name in `destination`, and the enrolled `owner` and `application_scope`.
+The source ingress uses the existing mTLS server and the existing bounded JSON reply envelope.
+Use the selected current Original writer host with its mounted Original custody provider.
+
+An observer with `inherited_reads: true` receives an additional `source_generation` field in the `/observe` enrollment request.
+The witness is `{pinned_source,writer_epoch,key_generation}` for the selected native source journal.
+Before retaining that enrollment, read the same witness through the independently pinned source connection at `POST /rtdb/native-dependent-custody/v1/enrollment/source` with `{"version":1,"scope":SCOPE}`.
+The source replies with `kind: "source_generation"` and `source_generation` for the exact copied scope, even before destination publication.
+The destination binds the matching witness and exact metadata roster into its retained enrollment evidence and returns the existing enrollment shape.
+The Original checks the witness again when ordering the enrollment.
+If the generation or writer epoch changes during witness acquisition, the owners must reconcile the same enrollment before publication.
+
+`POST /rtdb/native-dependent-custody/v1/inherited/read` takes `{"version":1,"read":READ}` from the dedicated mTLS destination owner.
+`READ` contains `scope`, `destination_generation`, `branch`, `branch_created`, `table`, `id`, `valid_at`, `placement`, `occurrence` and `application_key`.
+Use a physical branch and its destination-coordinate creation Basis, a `{schema,table}` relation, the typed entity ID, and the exact enrolled application-key commitment covering the carrier and any link.
+The operation selects one physical winner at the exact native restore and checks that it still wins the same valid point on the destination and the Original.
+The Original fold checks the complete reciprocal copy and every copied group's live fence and resolves the selected member's retained applied carrier receipt.
+The reply is `kind: "read"` with `proof` containing `read`, `owner`, `application_scope`, `enrollment`, `authority`, `original_writer`, `source_generation`, `original`, `carrier_receipt`, `carrier_sha256`, `link_sha256` and `envelope_sha256`.
+`original_writer` is the current Original writer's Basis, and `carrier_receipt` contains `key`, `basis` and `system_time`.
+Carrier extraction requires a separately commissioned same-cut opener and positive independent application-family generation and key-reader admission.
+
+`POST /rtdb/native-dependent-custody/v1/inherited/release` takes `{"version":1,"release":RELEASE}`.
+`RELEASE` contains `proof`, `part`, `frame_sha256` and `expires_at`.
+Use the existing `CustodyResponsePart` and `custody_frame_commitment` for the exact reserved transport part and actual frame.
+The source calls the commissioned destination `/observe` with `observation.kind: "inherited_registration"` and the exact `release`.
+The independent destination registry returns `kind: "inherited_registration"` and `registration: {release,receipt}` for the same still-live persisted part, or `kind: "pending"` while evidence is unresolved.
+The `receipt` carries the retained `key` and `evidence_sha256`.
+The source re-derives the complete proof on both sides of the destination registry observation and verifies the exclusive cutoff before returning `kind: "release_checked"` with `receipt` and `expires_at`.
+An Original owner or journal generation move requires a fresh proof and corresponding registered part before any new release check can succeed.
+
+For actual delivery, the current Original authority must prepare, stage and promote the same registrations, then order the frame using `MountedResponseRelease::admit_registered_response`.
+The existing Flight action `rtdb.custody.v1.Release` takes `operation: "admit"`, `registrations`, `frame_sha256` and Original Flight `read_proofs`.
+Each registration contains `authority`, `group`, `original`, `occurrence`, `carrier_receipt_sha256`, `part` and `expires_at`.
+The inherited proof needs an adapter to the Original admission that exposes the exact destination registration through the independently authenticated Original response and carrier observations.
+Use only fresh `admitted` for the one reserved enqueue before cutoff.
+The separate Original disposal caller submits `operation: "dispose"` and the same `registration` after the independent registry confirms the exact positive transport terminal.
 
 Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
 Qualify `managed_catalog_waits_for_confirmation_and_drains_and_recovers_a_lost_unpin_reply` for the private catalog and mounted destination attachment gates.

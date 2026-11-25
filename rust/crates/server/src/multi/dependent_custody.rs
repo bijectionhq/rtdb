@@ -13,8 +13,10 @@ use zeroize::Zeroizing;
 use super::MultiRuntime;
 
 mod client;
+mod inherited;
 mod ingress;
 pub(crate) mod operator;
+pub use inherited::{InheritedReadProof, InheritedRegistration, InheritedRelease};
 pub(super) use ingress::Ingress;
 
 const VERSION: u32 = 1;
@@ -23,6 +25,9 @@ const MAX_CONFIG_BYTES: usize = 64 << 10;
 const DEADLINE: Duration = Duration::from_secs(15);
 const OBSERVE: &str = "/rtdb/native-dependent-custody/v1/observe";
 const METADATA: &str = "/rtdb/native-dependent-custody/v1/metadata";
+const ENROLLMENT_SOURCE: &str = "/rtdb/native-dependent-custody/v1/enrollment/source";
+const INHERITED_READ: &str = "/rtdb/native-dependent-custody/v1/inherited/read";
+const INHERITED_RELEASE: &str = "/rtdb/native-dependent-custody/v1/inherited/release";
 const SETTLE: &str = "/rtdb/native-dependent-custody/v1/settle";
 const STATUS: &str = "/rtdb/native-dependent-custody/v1/status";
 

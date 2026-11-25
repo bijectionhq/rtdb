@@ -4,8 +4,8 @@ use rtdb_crypt::{Kms, Plaintext, tokens::ExportTicket};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::{BranchCut, BranchIndex};
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
-use rtdb_tx::transact::{Outcome, Receipt, Transact, TransactState};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, NativeDependentCustodyScope, PinnedCheckpointIdentity}};
+use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, Transact, TransactState};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, DependentCustodyReceipt, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, NativeDependentCustodyScope, NativeDependentRead, NativeDependentSourceGeneration, PinnedCheckpointIdentity}};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -28,6 +28,18 @@ enum Restore<'a> {
 pub struct NativeCheckpointInstallation {
     basis: Basis,
     custody: NativeCheckpointCustody,
+}
+
+pub struct NativeDependentOriginal {
+    pub source_generation: NativeDependentSourceGeneration,
+    pub owner: [u8; 32],
+    pub application_scope: [u8; 32],
+    pub enrollment: DependentCustodyReceipt,
+    pub original: [u8; 32],
+    pub carrier_sha256: [u8; 32],
+    pub link_sha256: Option<[u8; 32]>,
+    pub envelope_sha256: [u8; 32],
+    pub receipt: Receipt,
 }
 
 impl NativeCheckpointInstallation {
@@ -301,7 +313,19 @@ impl MultiDatabase {
     }
 
     pub async fn record_native_dependent_custody(&mut self, order: NativeDependentCustodyOrder) -> Result<Receipt> {
+        self.record_native_dependent_in_generation(order, None).await
+    }
+
+    pub async fn record_native_dependent_in_generation(
+        &mut self,
+        order: NativeDependentCustodyOrder,
+        expected: Option<NativeDependentSourceGeneration>,
+    ) -> Result<Receipt> {
         self.require_managed_checkpoint_writer().await?;
+        if let Some(expected) = expected {
+            let current = self.native_dependent_source_generation(order.scope()).await?;
+            if current != expected { return Err(native_terminal_required()); }
+        }
         let state = self.durable_transactions();
         let prior = state.index().native_dependent_custody(order.scope())?;
         let recorded = match &order {
@@ -457,6 +481,59 @@ impl MultiDatabase {
         let custody = index.inherited_custody().filter(|custody| custody.reservation == reservation)
             .ok_or_else(native_terminal_required)?;
         Ok(NativeCheckpointInstallation { basis, custody: custody.clone() })
+    }
+
+    pub async fn native_dependent_original(
+        &mut self,
+        custody: &NativeCheckpointCustody,
+        read: &NativeDependentRead,
+        writer: &CustodyWriterFence,
+    ) -> Result<NativeDependentOriginal> {
+        self.refresh().await?;
+        let lease = self.authority()?;
+        let generation = self.state().generation;
+        self.check_generation(generation).await?;
+        self.require_authority(lease)?;
+        let now = (self.clock)();
+        let transactions = self.durable_transactions();
+        let index = transactions.index();
+        if !writer.matches(index, now)? {
+            return Err(native_terminal_required());
+        }
+        let (enrollment, original, occurrence) = index.native_dependent_original(custody, read, now)?;
+        let receipt = transactions.original_custody_receipt(&occurrence.receipt_key, occurrence.written)?;
+        Ok(NativeDependentOriginal {
+            source_generation: NativeDependentSourceGeneration {
+                pinned_source: read.scope.reservation.source.basis,
+                writer_epoch: lease.epoch.0,
+                key_generation: generation,
+            },
+            owner: enrollment.owner,
+            application_scope: enrollment.application_scope,
+            enrollment: enrollment.receipt,
+            original,
+            carrier_sha256: occurrence.carrier_sha256,
+            link_sha256: occurrence.link_sha256,
+            envelope_sha256: occurrence.envelope_sha256,
+            receipt,
+        })
+    }
+
+    pub async fn native_dependent_source_generation(
+        &mut self,
+        scope: NativeDependentCustodyScope,
+    ) -> Result<NativeDependentSourceGeneration> {
+        self.refresh().await?;
+        let lease = self.authority()?;
+        self.durable_transactions().index().native_dependent_custody(scope)?;
+        let generation = self.state().generation;
+        self.check_generation(generation).await?;
+        self.require_authority(lease)?;
+        Ok(NativeDependentSourceGeneration {
+            pinned_source: scope.reservation.source.basis,
+            writer_epoch: lease.epoch.0,
+            key_generation: generation,
+        })
     }
 
     /// Recovers the applied destination terminal even after the source pin has expired.

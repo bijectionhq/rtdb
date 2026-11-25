@@ -26,7 +26,7 @@ mod ranked;
 mod rotation;
 mod retirement;
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
-pub use pin::{NativeCheckpointInstallation, PinnedExport};
+pub use pin::{NativeCheckpointInstallation, NativeDependentOriginal, PinnedExport};
 pub use pipeline::WritePipeline;
 pub use ranked::{RankedBuild, RankedFiles, RankedPublication};
 use pipeline::{Append, AttemptError, Planned, receipt_for};

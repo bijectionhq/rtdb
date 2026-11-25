@@ -5,6 +5,7 @@ use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use rtdb_node::Node;
 use rtdb_tx::transact::{Outcome, native_dependent_disposition_key};
 use rtdb_types::TableRef;
 use tokio::{
@@ -18,6 +19,7 @@ use uuid::Uuid;
 
 use super::{
     client::{json_content_type, read_chain, read_key, read_roots},
+    inherited::{InheritedProfile, InheritedReadRequest, InheritedReleaseRequest},
     *,
 };
 use crate::multi::{DatabaseOpen, open_database, retryable};
@@ -33,6 +35,8 @@ pub(super) struct Profile {
     operators: Vec<OperatorProfile>,
     #[serde(default)]
     metadata: Vec<MetadataProfile>,
+    #[serde(default)]
+    inherited: Vec<InheritedProfile>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +63,7 @@ pub(in crate::multi) struct Ingress {
     tls: TlsAcceptor,
     operators: Vec<OperatorProfile>,
     metadata: Vec<MetadataProfile>,
+    inherited: Vec<InheritedProfile>,
     settlements: Arc<Semaphore>,
 }
 
@@ -67,7 +72,9 @@ impl Ingress {
         if profile.port == 0
             || profile.port == 3000
             || profile.port == crate::multi::peer::PORT
-            || profile.operators.is_empty() && profile.metadata.is_empty()
+            || profile.operators.is_empty()
+                && profile.metadata.is_empty()
+                && profile.inherited.is_empty()
         {
             return Err(invalid());
         }
@@ -107,6 +114,25 @@ impl Ingress {
                 return Err(invalid());
             }
         }
+        let mut inherited = BTreeSet::new();
+        for reader in &profile.inherited {
+            let certificate = reader.client_certificate_sha256;
+            if !valid_binding(
+                certificate,
+                reader.source_incarnation,
+                reader.destination_incarnation,
+            ) || operators
+                .iter()
+                .chain(&metadata)
+                .any(|(cert, _)| *cert == certificate)
+                || !inherited.insert((certificate, reader.destination_incarnation))
+                || reader.destination.is_empty()
+                || reader.owner == [0; 32]
+                || reader.application_scope == [0; 32]
+            {
+                return Err(invalid());
+            }
+        }
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(
             Arc::new(read_roots(&profile.client_ca_file)?),
@@ -131,6 +157,7 @@ impl Ingress {
             tls: TlsAcceptor::from(Arc::new(tls)),
             operators: profile.operators,
             metadata: profile.metadata,
+            inherited: profile.inherited,
             settlements: Arc::new(Semaphore::new(1)),
         })
     }
@@ -142,6 +169,7 @@ impl Ingress {
     pub(in crate::multi) async fn serve(
         self: &Arc<Self>,
         runtime: &MultiRuntime,
+        node: &Node,
         stop: &CancellationToken,
     ) -> Result<()> {
         let listener = TcpListener::bind(SocketAddr::new(runtime.backends.node, self.port))
@@ -156,10 +184,12 @@ impl Ingress {
                     let (socket, _) = accepted.map_err(|_| pending())?;
                     let Ok(memory) = runtime.memory.reserve(6 * MAX_BYTES) else { continue; };
                     let runtime = runtime.clone();
+                    let node = node.clone();
+                    let stop = stop.child_token();
                     let ingress = Arc::clone(self);
                     connections.spawn(async move {
                         let _memory = memory;
-                        let _ = tokio::time::timeout(DEADLINE, ingress.exchange(runtime, socket)).await;
+                        let _ = tokio::time::timeout(DEADLINE, stop.run_until_cancelled(ingress.exchange(runtime, node, socket, &stop))).await;
                     });
                 }
             }
@@ -168,7 +198,13 @@ impl Ingress {
         Ok(())
     }
 
-    async fn exchange(self: Arc<Self>, runtime: MultiRuntime, socket: TcpStream) {
+    async fn exchange(
+        self: Arc<Self>,
+        runtime: MultiRuntime,
+        node: Node,
+        socket: TcpStream,
+        stop: &CancellationToken,
+    ) {
         let Ok(socket) = self.tls.accept(socket).await else {
             return;
         };
@@ -189,6 +225,10 @@ impl Ingress {
                 .metadata
                 .iter()
                 .any(|reader| reader.client_certificate_sha256 == certificate)
+            && !self
+                .inherited
+                .iter()
+                .any(|reader| reader.client_certificate_sha256 == certificate)
         {
             return;
         }
@@ -204,8 +244,14 @@ impl Ingress {
                 service_fn(move |request| {
                     let ingress = Arc::clone(&self);
                     let runtime = runtime.clone();
+                    let node = node.clone();
+                    let stop = stop.clone();
                     async move {
-                        Ok::<_, Infallible>(ingress.respond(&runtime, certificate, request).await)
+                        Ok::<_, Infallible>(
+                            ingress
+                                .respond(&runtime, &node, certificate, request, &stop)
+                                .await,
+                        )
                     }
                 }),
             )
@@ -215,8 +261,10 @@ impl Ingress {
     async fn respond(
         &self,
         runtime: &MultiRuntime,
+        node: &Node,
         certificate: [u8; 32],
         request: Request<Incoming>,
+        stop: &CancellationToken,
     ) -> Response<Full<Bytes>> {
         let (parts, body) = request.into_parts();
         if parts.method != Method::POST || parts.uri.query().is_some() {
@@ -232,6 +280,10 @@ impl Ingress {
                 .operators
                 .iter()
                 .any(|operator| operator.client_certificate_sha256 == certificate),
+            ENROLLMENT_SOURCE | INHERITED_READ | INHERITED_RELEASE => self
+                .inherited
+                .iter()
+                .any(|reader| reader.client_certificate_sha256 == certificate),
             _ => return empty(StatusCode::NOT_FOUND),
         };
         if !role {
@@ -251,13 +303,16 @@ impl Ingress {
             self.metadata(runtime, certificate, request)
                 .await
                 .and_then(|result| reply(&body, result))
-        } else {
+        } else if matches!(path, SETTLE | STATUS) {
             let Ok(request) = serde_json::from_slice::<SettlementRequest>(&body) else {
                 return empty(StatusCode::BAD_REQUEST);
             };
             self.settlement(runtime, certificate, path == SETTLE, request)
                 .await
                 .and_then(|result| reply(&body, result))
+        } else {
+            self.inherited(runtime, node, certificate, path, &body, stop)
+                .await
         };
         match wire {
             Ok(wire) => Response::builder()
@@ -269,6 +324,58 @@ impl Ingress {
             }
             Err(_) => empty(StatusCode::CONFLICT),
         }
+    }
+
+    async fn inherited(
+        &self,
+        runtime: &MultiRuntime,
+        node: &Node,
+        certificate: [u8; 32],
+        path: &str,
+        body: &[u8],
+        stop: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        let profile = |version, scope| {
+            if version != VERSION {
+                return Err(refused());
+            }
+            self.inherited
+                .iter()
+                .find(|profile| {
+                    profile.client_certificate_sha256 == certificate
+                        && matches_scope(
+                            profile.source_incarnation,
+                            profile.destination_incarnation,
+                            scope,
+                        )
+                })
+                .ok_or_else(refused)
+        };
+        let result = match path {
+            ENROLLMENT_SOURCE => {
+                let request =
+                    serde_json::from_slice::<MetadataRequest>(body).map_err(|_| refused())?;
+                profile(request.version, request.scope)?
+                    .source_generation(runtime, request.scope)
+                    .await?
+            }
+            INHERITED_READ => {
+                let request =
+                    serde_json::from_slice::<InheritedReadRequest>(body).map_err(|_| refused())?;
+                profile(request.version, request.read.scope)?
+                    .read(runtime, node, request.read, stop)
+                    .await?
+            }
+            INHERITED_RELEASE => {
+                let request = serde_json::from_slice::<InheritedReleaseRequest>(body)
+                    .map_err(|_| refused())?;
+                profile(request.version, request.release.proof.read.scope)?
+                    .release(runtime, node, request.release, stop)
+                    .await?
+            }
+            _ => return Err(refused()),
+        };
+        reply(body, result)
     }
 
     async fn metadata(

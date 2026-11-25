@@ -1,9 +1,11 @@
 use rtdb_types::{EntityId, TableRef, Timestamp};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OriginalReceipt {
     pub key: Vec<u8>,
     pub basis: Basis,

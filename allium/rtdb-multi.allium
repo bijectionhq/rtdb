@@ -4030,6 +4030,13 @@ surface ScopedRowVisibility {
         -- Managed Original release and disposal use separately issued credentials pinned to the database, Original owner and provider authority.
         -- Managed admission derives the exact hold registrations from the checked Original response and enrolled receipts.
 
+    @guarantee NativeDependentReadEvidence
+        -- A commissioned destination owner selects one physical branch creation, valid point and enrolled placement at an exact native restore and current destination generation.
+        -- The current Original writer confirms the same occurrence at the pinned source cut and current point, the applied carrier receipt and each copied group's live fence.
+        -- The independently commissioned destination registry recovers the exact retained enrollment, registered frame, selected application key and exclusive cutoff for the response part.
+        -- The release proof rechecks the Original writer, journal epoch and key generation and the destination generation after observing the registered part.
+        -- A transport enqueues protected data only under fresh ordered Original admission and retains the part through its positive disposition.
+
     @guarantee ScopedWrites
         -- The transaction resolver enforces the write scope and any SingleLabelPerTx declaration in both modes.
         -- dev/doc/tx.allium defines label checks, claim validation and guard outcomes.

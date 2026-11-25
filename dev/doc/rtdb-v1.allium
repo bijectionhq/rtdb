@@ -15,6 +15,9 @@
 -- The source orders one forward enrollment for the exact copy and includes it in every contributing group's revocation inventory and drain.
 -- The destination checkpoint retains the reciprocal enrollment and the source orders its drain after observing that readable backing.
 -- Inherited native custody stays behind the original group authority and the original response admission.
+-- A separately authenticated source observation can bind the pinned source cut, current writer epoch and current journal generation into the destination enrollment receipt.
+-- A private inherited point proof binds the exact destination restore and generation, physical branch creation, placement, selected application key and Original receipt.
+-- Its release check observes the independently retained destination part and freshly verifies both attachments and the current Original writer fence.
 
 external entity ConsumerClient {
     -- A caller with credentials for the selected database.

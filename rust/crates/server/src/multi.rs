@@ -47,6 +47,7 @@ pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
 mod native_checkpoint;
 pub use native_checkpoint::NativeDependentCustodyAuthority;
+pub use dependent_custody::{InheritedReadProof, InheritedRegistration, InheritedRelease};
 mod peer;
 use catalog::{Status, TransferExport};
 
@@ -947,7 +948,7 @@ impl MultiRuntime {
                 if self.classic_ingress.is_some() => result,
             result = async { self.classic_opening_ingress.as_ref().expect("Classic opening ingress enabled").serve(self, stop).await },
                 if self.classic_opening_ingress.is_some() => result,
-            result = async { self.native_dependent_ingress.as_ref().expect("Native dependent custody ingress enabled").serve(self, stop).await },
+            result = async { self.native_dependent_ingress.as_ref().expect("Native dependent custody ingress enabled").serve(self, node, stop).await },
                 if self.native_dependent_ingress.is_some() => result,
             result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
             result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },

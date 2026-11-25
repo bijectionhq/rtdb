@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use rtdb_types::rtdb_v1::{
     NativeCheckpointMember, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
+    NativeDependentSourceGeneration,
 };
 use tokio_rustls::rustls::{
     self, ClientConfig, RootCertStore,
@@ -157,6 +158,8 @@ pub(super) struct ObserverProfile {
     destination_incarnation: Uuid,
     owner: [u8; 32],
     application_scope: [u8; 32],
+    #[serde(default)]
+    inherited_reads: bool,
     connection: ConnectionProfile,
 }
 
@@ -166,6 +169,7 @@ struct Commissioned {
     source: [u8; 16],
     owner: [u8; 32],
     application_scope: [u8; 32],
+    inherited_reads: bool,
     connection: Connection,
 }
 
@@ -185,6 +189,7 @@ impl Observer {
                 source: *profile.source_incarnation.as_bytes(),
                 owner: profile.owner,
                 application_scope: profile.application_scope,
+                inherited_reads: profile.inherited_reads,
                 connection: Connection::from_profile(profile.connection)?,
             };
             if commissioned
@@ -207,51 +212,25 @@ impl Observer {
             .filter(|profile| profile.source == scope.reservation.source.basis.incarnation())
             .ok_or_else(pending)
     }
-}
 
-#[derive(Serialize)]
-struct ObservationRequest<'a> {
-    version: u32,
-    observation: Observation<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum Observation<'a> {
-    Enrollment {
-        scope: NativeDependentCustodyScope,
-        native: &'a [NativeCheckpointMember],
-    },
-    Disposition {
-        enrollment: &'a NativeDependentCustodyEnrollment,
-        fence: &'a NativeCustodyFence,
-    },
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ObservationResult {
-    Pending,
-    Enrollment {
-        enrollment: NativeDependentCustodyEnrollment,
-    },
-    Disposition {
-        disposition: NativeDependentCustodyDisposition,
-    },
-}
-
-#[async_trait::async_trait]
-impl NativeDependentCustodyAuthority for Observer {
-    async fn observe_enrollment(
+    async fn enrollment(
         &self,
         scope: NativeDependentCustodyScope,
         native: &[NativeCheckpointMember],
+        source_generation: Option<NativeDependentSourceGeneration>,
         cancellation: &CancellationToken,
     ) -> Result<NativeDependentCustodyEnrollment> {
         let profile = self.select(scope)?;
+        if profile.inherited_reads != source_generation.is_some() {
+            return Err(refused());
+        }
         let request = ObservationRequest {
             version: VERSION,
-            observation: Observation::Enrollment { scope, native },
+            observation: Observation::Enrollment {
+                scope,
+                native,
+                source_generation,
+            },
         };
         let result = cancellation
             .run_until_cancelled(profile.connection.post(OBSERVE, &request))
@@ -268,6 +247,73 @@ impl NativeDependentCustodyAuthority for Observer {
             ObservationResult::Pending => Err(pending()),
             _ => Err(refused()),
         }
+    }
+}
+
+#[derive(Serialize)]
+struct ObservationRequest<'a> {
+    version: u32,
+    observation: Observation<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Observation<'a> {
+    Enrollment {
+        scope: NativeDependentCustodyScope,
+        native: &'a [NativeCheckpointMember],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_generation: Option<NativeDependentSourceGeneration>,
+    },
+    Disposition {
+        enrollment: &'a NativeDependentCustodyEnrollment,
+        fence: &'a NativeCustodyFence,
+    },
+    InheritedRegistration {
+        release: &'a InheritedRelease,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ObservationResult {
+    Pending,
+    Enrollment {
+        enrollment: NativeDependentCustodyEnrollment,
+    },
+    Disposition {
+        disposition: NativeDependentCustodyDisposition,
+    },
+    InheritedRegistration {
+        registration: InheritedRegistration,
+    },
+}
+
+#[async_trait::async_trait]
+impl NativeDependentCustodyAuthority for Observer {
+    fn enrollment_uses_source_generation(&self, scope: NativeDependentCustodyScope) -> bool {
+        self.select(scope)
+            .is_ok_and(|profile| profile.inherited_reads)
+    }
+
+    async fn observe_enrollment(
+        &self,
+        scope: NativeDependentCustodyScope,
+        native: &[NativeCheckpointMember],
+        cancellation: &CancellationToken,
+    ) -> Result<NativeDependentCustodyEnrollment> {
+        self.enrollment(scope, native, None, cancellation).await
+    }
+
+    async fn observe_enrollment_in_generation(
+        &self,
+        scope: NativeDependentCustodyScope,
+        native: &[NativeCheckpointMember],
+        generation: NativeDependentSourceGeneration,
+        cancellation: &CancellationToken,
+    ) -> Result<NativeDependentCustodyEnrollment> {
+        self.enrollment(scope, native, Some(generation), cancellation)
+            .await
     }
 
     async fn observe_disposition(
@@ -298,6 +344,33 @@ impl NativeDependentCustodyAuthority for Observer {
             {
                 Ok(disposition)
             }
+            ObservationResult::Pending => Err(pending()),
+            _ => Err(refused()),
+        }
+    }
+
+    async fn observe_inherited_registration(
+        &self,
+        release: &InheritedRelease,
+        cancellation: &CancellationToken,
+    ) -> Result<InheritedRegistration> {
+        let profile = self.select(release.proof.read.scope)?;
+        if !profile.inherited_reads
+            || profile.owner != release.proof.owner
+            || profile.application_scope != release.proof.application_scope
+        {
+            return Err(refused());
+        }
+        let request = ObservationRequest {
+            version: VERSION,
+            observation: Observation::InheritedRegistration { release },
+        };
+        let result = cancellation
+            .run_until_cancelled(profile.connection.post(OBSERVE, &request))
+            .await
+            .ok_or_else(pending)??;
+        match result {
+            ObservationResult::InheritedRegistration { registration } => Ok(registration),
             ObservationResult::Pending => Err(pending()),
             _ => Err(refused()),
         }

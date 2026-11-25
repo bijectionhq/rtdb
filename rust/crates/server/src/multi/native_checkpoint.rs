@@ -2,7 +2,7 @@ use rtdb_tx::transact::Receipt;
 use rtdb_types::rtdb_v1::{
     NativeCheckpointCustody, NativeCheckpointMember, NativeCustodyFence,
     NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
-    NativeDependentCustodyOrder, NativeDependentCustodyScope,
+    NativeDependentCustodyOrder, NativeDependentCustodyScope, NativeDependentSourceGeneration,
 };
 
 use super::{catalog::ManagedTransfer, managed_transfer::reservation_conflict, *};
@@ -19,6 +19,10 @@ pub(super) struct NativeCheckpointProvider<'a> {
 /// The commissioned observer authenticates both records in the destination owner's durable custody.
 #[async_trait::async_trait]
 pub trait NativeDependentCustodyAuthority: Send + Sync {
+    fn enrollment_uses_source_generation(&self, _scope: NativeDependentCustodyScope) -> bool {
+        false
+    }
+
     async fn observe_enrollment(
         &self,
         scope: NativeDependentCustodyScope,
@@ -26,12 +30,30 @@ pub trait NativeDependentCustodyAuthority: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<NativeDependentCustodyEnrollment>;
 
+    async fn observe_enrollment_in_generation(
+        &self,
+        _scope: NativeDependentCustodyScope,
+        _native: &[NativeCheckpointMember],
+        _generation: NativeDependentSourceGeneration,
+        _cancellation: &CancellationToken,
+    ) -> Result<NativeDependentCustodyEnrollment> {
+        Err(dependent_required())
+    }
+
     async fn observe_disposition(
         &self,
         enrollment: &NativeDependentCustodyEnrollment,
         fence: &NativeCustodyFence,
         cancellation: &CancellationToken,
     ) -> Result<NativeDependentCustodyDisposition>;
+
+    async fn observe_inherited_registration(
+        &self,
+        _release: &super::InheritedRelease,
+        _cancellation: &CancellationToken,
+    ) -> Result<super::InheritedRegistration> {
+        Err(dependent_required())
+    }
 }
 
 impl MultiRuntime {
@@ -102,10 +124,20 @@ impl MultiRuntime {
     ) -> Result<NativeDependentCustodyEnrollment> {
         let authority = self.native_dependent_custody.as_deref().ok_or_else(dependent_required)?;
         let roster = source.native_dependent_custody_roster(scope).await?;
-        let enrollment = cancellation.run_until_cancelled(authority.observe_enrollment(scope, &roster, cancellation))
+        let generation = if authority.enrollment_uses_source_generation(scope) {
+            Some(source.native_dependent_source_generation(scope).await?)
+        } else {
+            None
+        };
+        let enrollment = cancellation.run_until_cancelled(async {
+            match generation {
+                Some(generation) => authority.observe_enrollment_in_generation(scope, &roster, generation, cancellation).await,
+                None => authority.observe_enrollment(scope, &roster, cancellation).await,
+            }
+        })
             .await.ok_or_else(transfer_interrupted)??;
         if enrollment.scope != scope { return Err(dependent_required()); }
-        source.record_native_dependent_custody(NativeDependentCustodyOrder::Enroll(enrollment.clone())).await?;
+        source.record_native_dependent_in_generation(NativeDependentCustodyOrder::Enroll(enrollment.clone()), generation).await?;
         Ok(enrollment)
     }
 

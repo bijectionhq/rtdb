@@ -160,6 +160,29 @@ pub struct NativeDependentCustodyScope {
     pub checkpoint_group_sha256: [u8; 32],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentRead {
+    pub scope: NativeDependentCustodyScope,
+    pub destination_generation: u64,
+    pub branch: Branch,
+    pub branch_created: Basis,
+    pub table: TableRef,
+    pub id: EntityId,
+    pub valid_at: Timestamp,
+    pub placement: [u8; 16],
+    pub occurrence: [u8; 32],
+    pub application_key: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDependentSourceGeneration {
+    pub pinned_source: Basis,
+    pub writer_epoch: u64,
+    pub key_generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeCheckpointMember {
     pub placement: [u8; 16],

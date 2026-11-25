@@ -391,11 +391,11 @@ async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
 
 #[tokio::test]
 async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain() {
-    use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments};
+    use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, CustodyWriterFence};
     use rtdb_types::rtdb_v1::{
         DependentApplicationKey, DependentCustodyReceipt, DependentKeyCustody, DependentKeyDisposition,
         DependentKeyTerminal, NativeCustodyFence, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
-        NativeDependentCustodyMember, NativeDependentCustodyOrder, NativeDependentCustodyScope,
+        NativeDependentCustodyMember, NativeDependentCustodyOrder, NativeDependentCustodyScope, NativeDependentRead,
     };
     use sha2::{Digest, Sha256};
 
@@ -477,7 +477,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let installation = follower.native_checkpoint_installation(reservation).await.unwrap();
     let installed = installation.basis();
     assert_eq!(installation.custody(), &claim);
-    let (_, view, _) = follower.require_managed_checkpoint_restore(reservation).await.unwrap();
+    let (_, view, destination_generation) = follower.require_managed_checkpoint_restore(reservation).await.unwrap();
     assert_eq!(view.require_local_custody().unwrap_err().code, "rtdb/inherited-custody");
     assert!(view.custody_inventory(*group).is_none());
     let scope = NativeDependentCustodyScope {
@@ -502,8 +502,33 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     assert_eq!(view.native_inherited_carrier(MAIN_BRANCH, &table(), &EntityId::Integer(2), envelope).unwrap_err().code, "rtdb/native-checkpoint-binding");
     assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/native-checkpoint-binding");
 
+    let read = NativeDependentRead {
+        scope,
+        destination_generation,
+        branch: MAIN_BRANCH.into(),
+        branch_created: view.lineage_at(MAIN_BRANCH, installed).unwrap().created,
+        table: table(),
+        id: EntityId::Integer(1),
+        valid_at: original.system_time,
+        placement: *group,
+        occurrence,
+        application_key: [14; 32],
+    };
+    assert_eq!(view.check_native_dependent_destination(&read, original.system_time).unwrap(), &claim);
+    let mut substituted = read.clone();
+    substituted.placement = *other_group;
+    assert!(view.check_native_dependent_destination(&substituted, original.system_time).is_err());
+    substituted = read.clone();
+    substituted.branch_created = installed;
+    assert!(view.check_native_dependent_destination(&substituted, original.system_time).is_err());
+    let writer = CustodyWriterFence {
+        table: table(), id: read.id.clone(), valid_at: read.valid_at, written: original.basis,
+    };
+
     source.record_native_checkpoint_drain(installation).await.unwrap();
     assert!(source.fresh_index().await.unwrap().require_native_dependent_publication(reservation, installed).is_err());
+    assert!(source.native_dependent_original(&claim, &read, &writer).await.is_err());
+    let witness = source.native_dependent_source_generation(read.scope).await.unwrap();
     source.release_managed_checkpoint(reservation).await.unwrap();
     let mut enrollments = Vec::new();
     for &(group, checkpoint_group_sha256) in &claim.groups {
@@ -524,7 +549,12 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
                 key: [14; 32], custody: DependentKeyCustody::OriginalReference, carriers: vec![roster[0].carrier_sha256],
             }],
         });
-        source.record_native_dependent_custody(NativeDependentCustodyOrder::Enroll(enrollment.clone())).await.unwrap();
+        let generation = source.native_dependent_source_generation(scope).await.unwrap();
+        let mut stale_generation = generation;
+        stale_generation.writer_epoch += 1;
+        let order = NativeDependentCustodyOrder::Enroll(enrollment.clone());
+        assert!(source.record_native_dependent_in_generation(order.clone(), Some(stale_generation)).await.is_err());
+        source.record_native_dependent_in_generation(order, Some(generation)).await.unwrap();
         enrollments.push(enrollment);
     }
     source.fresh_index().await.unwrap().require_native_dependent_publication(reservation, installed).unwrap();
@@ -536,6 +566,20 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let (_, retained) = original_view.custody_read_occurrence(selected.basis, inherited, occurrence).unwrap();
     assert_eq!(retained.written, original.basis);
     assert_eq!(retained.receipt_key, original.key);
+    let checked = source.native_dependent_original(&claim, &read, &writer).await.unwrap();
+    assert_eq!(checked.receipt.key, original.key);
+    assert_eq!(checked.source_generation, witness);
+    let mut wrong_reader = read.clone();
+    wrong_reader.application_key = [20; 32];
+    assert!(source.native_dependent_original(&claim, &wrong_reader, &writer).await.is_err());
+    assert!(original_follower.native_dependent_original(&claim, &read, &writer).await.is_err());
+    assert_eq!(source.tick(&live(3)).await.unwrap(), Role::Follower);
+    assert_eq!(original_follower.tick(&live(3)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert!(source.native_dependent_original(&claim, &read, &writer).await.is_err());
+    let mut source = original_follower;
+    let successor = source.native_dependent_original(&claim, &read, &writer).await.unwrap();
+    assert_eq!(successor.receipt.basis, checked.receipt.basis);
+    assert_ne!(successor.source_generation, checked.source_generation);
 
     let stale = request(3, Op::RevokeCustodyGroup { group: *other_group, inventory_sha256: other_inventory });
     let stale = append_custody_fixture(&mut source, &stale).await;
@@ -545,6 +589,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     let revoked = append_custody_fixture(&mut source, &revoke).await;
     assert_eq!(revoked.outcome, Outcome::Then);
     assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/erased-under-view");
+    assert!(source.native_dependent_original(&claim, &read, &writer).await.is_err());
     assert!(!source.fresh_index().await.unwrap().custody_releases_drained(*other_group));
 
     let enrollment = enrollments.iter().find(|enrollment| enrollment.scope.group == *other_group).unwrap();
