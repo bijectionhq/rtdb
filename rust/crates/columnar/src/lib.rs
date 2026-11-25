@@ -22,7 +22,7 @@ pub use entity_id::{EntityIdRef, entity_id_array, entity_id_type, read_entity_id
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value, read_execution_value_as};
 pub use read_allocation::{estimate_copy_cell_bytes, estimate_event_copy_cell_bytes, estimate_event_null_cell_bytes, estimate_null_copy_cell_bytes,
     estimate_read_cell_bytes, estimate_read_value_bytes};
-pub use read_check::{ColumnPresence, validate_readable_cell, validate_readable_column};
+pub use read_check::{CellReadCheck, ColumnPresence, validate_readable_cell, validate_readable_column};
 pub use iid::{IidView, build_iids};
 pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells, interleave};
 pub use hash::{decimal_cell_as_f64, hash_cell, hash_float_components, hash_value, hash_value_murmur3, murmur3_32, xxhash32};

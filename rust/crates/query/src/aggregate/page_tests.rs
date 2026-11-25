@@ -247,6 +247,92 @@ fn count_does_not_use_the_parent_bitmap_for_nested_cells_that_can_fail_to_read()
     assert!(marked_nulls(&column).is_none());
 }
 
+#[test]
+fn aggregate_argument_positions_follow_first_use_after_group_keys() {
+    let ty = LogicalType::Scalar(ScalarType::I64);
+    let schema = Schema::new((0..3).map(|id| field(id, ty.clone())).collect()).unwrap();
+    let argument = |position: usize| schema.fields()[position].expression();
+    let groups = vec![NamedExpr { field: field(3, ty.clone()), expr: argument(0) }];
+    let order_by = [2, 2, 0].into_iter().map(|position| SortExpr {
+        expr: argument(position), descending: false, nulls_first: false,
+    }).collect();
+    let array = AggregateExpr {
+        field: field(4, LogicalType::list(ty)), function: AggregateFunction::ArrayAgg,
+        argument: Some(argument(0)), order_by, ..count(4, None)
+    };
+    let count_arg = |id, position| AggregateExpr {
+        function: AggregateFunction::Count, argument: Some(argument(position)), ..count(id, None)
+    };
+    assert_eq!(AggregateCursor::positions(&schema, &groups, &[array, count_arg(5, 1), count_arg(6, 2)]),
+        Some(vec![0, 2, 0, 1]));
+}
+
+#[test]
+fn aggregate_preflight_reads_selected_cells_in_page_order() {
+    use arrow_array::{ArrayRef, Int64Array, NullArray, StringArray, UnionArray};
+    use arrow_schema::{Field as ArrowField, UnionFields};
+    use crate::columnar::SelectedColumn;
+
+    let execution = execution(8);
+    let context = &execution.context;
+    let uri = rtdb_columnar::to_field("other", &LogicalType::Scalar(ScalarType::Uri)).unwrap();
+    let union_fields = UnionFields::try_new([0, 2], [ArrowField::new("uri", DataType::Utf8, false), uri]).unwrap();
+    let union: ArrayRef = Arc::new(UnionArray::try_new(union_fields, vec![0_i8, 0].into(), Some(vec![0_i32, 1].into()), vec![
+        Arc::new(StringArray::from(vec!["bad uri", "https://example.com/"])),
+        Arc::new(StringArray::from(Vec::<&str>::new())),
+    ]).unwrap());
+    let union_field = Arc::new(ArrowField::new("arg", union.data_type().clone(), false));
+    let uri_error = rtdb_columnar::read_value(&union_field, union.as_ref(), 0).unwrap_err().code;
+    let page = |cells: Vec<(usize, usize)>| {
+        let len = cells.len();
+        let selected = SelectedColumn::new(vec![
+            Some((Arc::new(NullArray::new(1)), Arc::new(ArrowField::new("arg", DataType::Null, false)), None, None)),
+            Some((Arc::clone(&union), Arc::clone(&union_field), None, None)),
+            Some((Arc::new(Int64Array::from(vec![7])), Arc::new(ArrowField::new("arg", DataType::Int64, false)),
+                Some(LogicalType::Scalar(ScalarType::I64)), None)),
+            None,
+        ], Arc::new(cells));
+        ColumnBatch::settled(vec![Column::Selected(selected)], len, context.memory.reserve(4096).unwrap()).unwrap()
+    };
+    let valid = [(3, 0), (1, 1), (2, 0), (1, 1), (2, 0)];
+    let batch = page(valid.to_vec());
+    let baseline = context.memory.used_bytes();
+    assert!(Rows::columns(&batch, &[0], false, context).is_ok());
+    assert_eq!(context.memory.used_bytes(), baseline);
+
+    for (tail, expected) in [([(1, 0), (0, 0)], uri_error.as_str()), ([(0, 0), (1, 0)], "xtdb/zero-leg-read")] {
+        let batch = page(valid.into_iter().chain(tail).collect());
+        assert_eq!(Rows::columns(&batch, &[0], false, context).err().unwrap().code, expected);
+    }
+}
+
+#[tokio::test]
+async fn fallback_argument_preflight_precedes_aggregate_filters() {
+    use arrow_array::StringArray;
+
+    let execution = execution(2);
+    let memory = &execution.context.memory;
+    let uri = LogicalType::Scalar(ScalarType::Uri);
+    let schema = Schema::new(vec![field(0, uri.clone())]).unwrap();
+    let aggregates = vec![count(1, Some(divide_filter())), AggregateExpr {
+        function: AggregateFunction::Count, argument: Some(schema.fields()[0].expression()), ..count(2, None)
+    }];
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input, groups: vec![], aggregates: aggregates.clone(),
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let field = Arc::new(rtdb_columnar::to_field("c0", &uri).unwrap());
+    let array = Arc::new(StringArray::from(vec!["https://example.com/", "bad uri"]));
+    let expected = rtdb_columnar::read_value(&field, array.as_ref(), 1).unwrap_err().code;
+    let column = Column::Arrow { array, field, logical: None };
+    let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(4096).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false, schema,
+        vec![], aggregates, runtime, execution.clone()).unwrap();
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, expected);
+}
+
 #[tokio::test]
 async fn percentile_collects_arrow_positions_before_sorting_the_group() {
     for object_sort in [rtdb_types::ObjectSort::TimSort, rtdb_types::ObjectSort::LegacyMergeSort] {
