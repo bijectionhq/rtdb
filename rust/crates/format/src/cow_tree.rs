@@ -541,6 +541,7 @@ struct Writer<'a> {
     memory: &'a Arc<MemoryBudget>,
     written: BTreeSet<PageDigest>,
     generation: Option<PageGeneration>,
+    admit_leaf_edits: bool,
 }
 
 impl Writer<'_> {
@@ -624,6 +625,20 @@ impl Writer<'_> {
         Ok(parents)
     }
 
+    fn merge_leaf(&self, rows: Vec<Row>, edits: &[Edit]) -> Result<(Vec<Row>, Option<Arc<MemoryReservation>>)> {
+        let scratch = self.admit_leaf_edits.then(|| {
+            let bytes = edits.iter().fold(rows.len().saturating_mul(2 * size_of::<Row>()), |bytes, edit| {
+                bytes.saturating_add(2 * size_of::<Row>())
+                    .saturating_add(match edit {
+                        Edit::Put(row) => row.key.len().saturating_add(row.value.len()),
+                        Edit::Delete(_) => 0,
+                    })
+            });
+            self.memory.reserve(bytes)
+        }).transpose()?;
+        Ok((merge(rows, edits), scratch))
+    }
+
     fn rewrite<'a>(
         &'a mut self,
         root: &'a RootRef,
@@ -636,9 +651,8 @@ impl Writer<'_> {
             let children = match page {
                 DecodedPage::Branch(children) => children.into_edges(None),
                 DecodedPage::Leaf(rows) => {
-                    return self
-                        .leaves(merge(rows.into_rows(None), edits), Some(root))
-                        .await;
+                    let (rows, _merge) = self.merge_leaf(rows.into_rows(None), edits)?;
+                    return self.leaves(rows, Some(root)).await;
                 }
             };
             let mut updated = Vec::new();
@@ -662,7 +676,7 @@ impl Writer<'_> {
                     else {
                         unreachable!()
                     };
-                    let mut rows = merge(rows.into_rows(None), touching);
+                    let (mut rows, _merge) = self.merge_leaf(rows.into_rows(None), touching)?;
                     if !rows.is_empty()
                         && rows.len() < MAX_LEAF_ROWS / 2
                         && let Some(next) = children.peek()
@@ -701,21 +715,21 @@ fn split_width(count: usize, max: usize) -> usize {
 }
 
 fn merge(rows: Vec<Row>, edits: &[Edit]) -> Vec<Row> {
-    let mut rows: std::collections::BTreeMap<_, _> =
-        rows.into_iter().map(|row| (row.key, row.value)).collect();
+    let mut merged = Vec::with_capacity(rows.len().saturating_add(edits.len()));
+    let mut rows = rows.into_iter().peekable();
     for edit in edits {
-        match edit {
-            Edit::Put(row) => {
-                rows.insert(row.key.clone(), row.value.clone());
-            }
-            Edit::Delete(key) => {
-                rows.remove(key);
-            }
+        while rows.peek().is_some_and(|row| row.key.as_slice() < edit.key()) {
+            merged.push(rows.next().expect("one existing row was present"));
+        }
+        if rows.peek().is_some_and(|row| row.key.as_slice() == edit.key()) {
+            rows.next();
+        }
+        if let Edit::Put(row) = edit {
+            merged.push(row.clone());
         }
     }
-    rows.into_iter()
-        .map(|(key, value)| Row { key, value })
-        .collect()
+    merged.extend(rows);
+    merged
 }
 
 pub async fn apply(
@@ -737,34 +751,84 @@ pub async fn apply_with_generation(
     memory: &Arc<MemoryBudget>,
     generation: Option<PageGeneration>,
 ) -> Result<(Option<RootRef>, Vec<PageDigest>)> {
+    apply_edits(store, base, edits, None, summary, memory, generation).await
+}
+
+/// Applies sorted edits whose key, value and vector allocations are already admitted.
+pub async fn apply_admitted_with_generation(
+    store: &dyn PageStore,
+    base: Option<&RootRef>,
+    edits: Vec<Edit>,
+    input: Arc<MemoryReservation>,
+    summary: &dyn Summary,
+    generation: PageGeneration,
+) -> Result<(Option<RootRef>, Vec<PageDigest>)> {
+    let memory = Arc::clone(input.budget());
+    apply_edits(store, base, edits, Some(input), summary, &memory, Some(generation)).await
+}
+
+async fn apply_edits(
+    store: &dyn PageStore,
+    base: Option<&RootRef>,
+    edits: Vec<Edit>,
+    input: Option<Arc<MemoryReservation>>,
+    summary: &dyn Summary,
+    memory: &Arc<MemoryBudget>,
+    generation: Option<PageGeneration>,
+) -> Result<(Option<RootRef>, Vec<PageDigest>)> {
     if edits.is_empty() {
         return Ok((base.cloned(), Vec::new()));
     }
     if edits.windows(2).any(|pair| pair[0].key() >= pair[1].key()) {
         return Err(invalid("Edits must be strictly ordered by key"));
     }
-    let bytes = edits.iter().fold(4096usize, |bytes, edit| {
-        bytes
-            .saturating_add(128)
-            .saturating_add(edit.key().len())
-            .saturating_add(match edit {
-                Edit::Put(row) => row.value.len(),
-                Edit::Delete(_) => 0,
+    let admit_leaf_edits = input.is_some();
+    let workspace = if let Some(input) = &input {
+        let retained = edits.iter().fold(edits.capacity().saturating_mul(size_of::<Edit>()), |bytes, edit| {
+            bytes.saturating_add(match edit {
+                Edit::Put(row) => row.key.capacity().saturating_add(row.value.capacity()),
+                Edit::Delete(key) => key.capacity(),
             })
-    });
-    let _charge = memory.reserve(bytes.saturating_mul(2))?;
+        });
+        if retained > input.bytes() {
+            return Err(invalid("Edits exceed their received allocation"));
+        }
+        edits.iter().fold(4096usize, |bytes, edit| {
+            bytes.saturating_add(128)
+                .saturating_add(edit.key().len().saturating_mul(2))
+                .saturating_add(if base.is_none() { 2 * size_of::<Row>() } else { 0 })
+        })
+    } else {
+        edits.iter().fold(4096usize, |bytes, edit| {
+            bytes.saturating_add(128)
+                .saturating_add(edit.key().len())
+                .saturating_add(match edit {
+                    Edit::Put(row) => row.value.len(),
+                    Edit::Delete(_) => 0,
+                })
+        }).saturating_mul(2)
+    };
+    let _workspace = memory.reserve(workspace)?;
     let mut writer = Writer {
         store,
         summary,
         memory,
         written: BTreeSet::new(),
         generation,
+        admit_leaf_edits,
     };
     let mut edges = if let Some(base) = base {
-        writer.rewrite(base, None, &edits, true).await?
+        let edges = writer.rewrite(base, None, &edits, true).await?;
+        drop(edits);
+        edges
     } else {
-        writer.leaves(merge(Vec::new(), &edits), None).await?
+        let rows = edits.into_iter().filter_map(|edit| match edit {
+            Edit::Put(row) => Some(row),
+            Edit::Delete(_) => None,
+        }).collect();
+        writer.leaves(rows, None).await?
     };
+    drop(input);
     while edges.len() > 1 {
         let height = edges[0].root.height + 1;
         edges = writer.branches(edges, height, None).await?;

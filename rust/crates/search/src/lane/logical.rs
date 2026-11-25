@@ -557,7 +557,7 @@ impl SearchBuilder {
                 for run in before.iter().copied().filter(|run| is_replaced(run)) {
                     self.collect_term_edits(&entry.slug, columns, run, &mut edits, true, cancellation).await?;
                 }
-                edits.apply(&pages, base.as_ref(), &self.memory).await
+                edits.apply(&pages, base.as_ref()).await
             };
             match incremental.await {
                 Ok(root) => Some(root),
@@ -573,7 +573,7 @@ impl SearchBuilder {
                 for run in before.iter().copied().filter(|run| !is_replaced(run)) {
                     self.collect_term_edits(&entry.slug, columns, run, &mut edits, false, cancellation).await?;
                 }
-                edits.apply(&pages, None, &self.memory).await?
+                edits.apply(&pages, None).await?
             }
         };
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
