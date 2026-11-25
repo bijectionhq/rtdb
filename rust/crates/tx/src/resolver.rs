@@ -1090,13 +1090,15 @@ impl<'a> OpenTransaction<'a> {
                 MutationKind::Put => self.stage_mutation_puts(&table.table, &batch, system_time)?,
                 MutationKind::Erase => {
                     let batch = batch.batch();
-                    mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?;
+                    stage_mutation_tombstones(&mut self.buffer, &table.table, batch, kind, system_time, &self.context.memory)?;
                     let iids = mutation_column(batch, "_iid")?;
                     for row in 0..batch.num_rows() {
                         self.retire_unit_metadata(&table.table, iids.iid(row)?, None).await?;
                     }
                 }
-                MutationKind::Delete => mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
+                MutationKind::Delete => stage_mutation_tombstones(
+                    &mut self.buffer, &table.table, batch.batch(), kind, system_time, &self.context.memory,
+                )?,
             }
         }
         Ok(())
@@ -4608,6 +4610,40 @@ fn mutation_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<OutputColum
     OutputColumn::new(schema.field(index), batch.column(index).as_ref())
 }
 
+fn stage_mutation_tombstones(
+    buffer: &mut TransactionBuffer, table: &TableRef, batch: &RecordBatch, kind: MutationKind,
+    system_time: Timestamp, memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    if !table.is_owned_event_data() && let Ok(Some(())) = mutation_tombstone_batch(batch, kind, system_time, memory)
+        .and_then(|page| page.map(|page| buffer.append_batch(table, page)).transpose())
+    {
+        return Ok(());
+    }
+    // Row staging can fail on an earlier row than a whole-page validation or reservation.
+    mutation_events(batch, kind, system_time, |event| buffer.append_to(table, event).map(drop))
+}
+
+fn mutation_tombstone_batch(
+    batch: &RecordBatch, kind: MutationKind, system_time: Timestamp, memory: &Arc<MemoryBudget>,
+) -> Result<Option<OwnedBatch>> {
+    if batch.num_rows() == 0 { return Ok(None); }
+    let OutputColumn::Iids(iids) = mutation_column(batch, "_iid")? else { return Ok(None); };
+    let times = match kind {
+        MutationKind::Delete => {
+            let from = mutation_column(batch, "_valid_from")?;
+            let to = mutation_column(batch, "_valid_to")?;
+            if !matches!((&from, &to), (OutputColumn::Times(_), OutputColumn::Times(_))) { return Ok(None); }
+            Some((from, to))
+        }
+        MutationKind::Erase => None,
+        MutationKind::Put => return Ok(None),
+    };
+    let intervals = times.map(|(from, to)| {
+        (0..batch.num_rows()).map(move |row| interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?))
+    });
+    rtdb_format::data::owned_tombstone_batch(iids, system_time, intervals, memory).map(Some)
+}
+
 /// The events one batch of a mutation's output writes, in its row order.
 fn mutation_events(batch: &RecordBatch, kind: MutationKind, system_time: Timestamp, mut append: impl FnMut(StoredEvent) -> Result<()>) -> Result<()> {
     let column = |name| mutation_column(batch, name);
@@ -5915,6 +5951,121 @@ mod tests {
         assert_eq!(output.batch(), expected.arrow());
         assert_eq!(events[0].valid_time, Interval::from_micros(12, 20).unwrap());
         assert_eq!(events[1].valid_time, Interval::from_micros(50, 75).unwrap());
+    }
+
+    fn tombstone_selection(
+        iids: Vec<Option<[u8; 16]>>, from: Vec<Option<i64>>, to: Vec<Option<i64>>,
+    ) -> RecordBatch {
+        use arrow_array::{FixedSizeBinaryArray, TimestampMicrosecondArray};
+
+        RecordBatch::try_from_iter([
+            ("_iid", Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(iids.into_iter(), 16).unwrap()) as ArrayRef),
+            ("_valid_from", Arc::new(TimestampMicrosecondArray::from(from).with_timezone("Australia/Sydney"))),
+            ("_valid_to", Arc::new(TimestampMicrosecondArray::from(to).with_timezone("UTC"))),
+        ]).unwrap()
+    }
+
+    #[test]
+    fn tombstone_pages_keep_ordinals_and_replica_bytes_across_mixed_writes() -> Result<()> {
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let table = TableRef::new("public", "items");
+        let other = TableRef::new("public", "other");
+        let memory = MemoryBudget::new(1 << 24);
+        let input_memory = MemoryBudget::new(1 << 24);
+        let base = rtdb_index::PartitionState::empty(Default::default())?;
+        let stage = |typed| {
+            let mut buffer = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
+            let page = OwnedBatch::new(tombstone_selection(
+                vec![Some([1; 16]), Some([2; 16]), Some([3; 16]), Some([4; 16])],
+                vec![None, None, Some(20), None], vec![None, Some(40), None, None],
+            ), &input_memory)?;
+            let selection = page.batch().slice(1, 2);
+            let tombstones = |buffer: &mut TransactionBuffer, table, kind| {
+                if typed { stage_mutation_tombstones(buffer, table, &selection, kind, key.system_time, &memory) }
+                else { mutation_events(&selection, kind, key.system_time, |event| buffer.append_to(table, event).map(drop)) }
+            };
+            let document = StructFields::from([("_id".into(), Value::I64(1))]);
+            buffer.put(table.clone(), document.clone(), Interval::ALL)?;
+            tombstones(&mut buffer, &table, MutationKind::Delete)?;
+            tombstones(&mut buffer, &other, MutationKind::Erase)?;
+            let fields = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
+            let put = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None,
+                iid: EntityId::Integer(1).iid(), system_from: key.system_time, valid_time: Interval::ALL,
+                operation: StoredOperation::Put(document), recency: None };
+            buffer.append_batch(&table, rtdb_format::data::owned_event_batch(&[put], Some(fields), false, &memory)?)?;
+            tombstones(&mut buffer, &table, MutationKind::Erase)?;
+            tombstones(&mut buffer, &other, MutationKind::Delete)?;
+            drop(selection);
+            drop(page);
+            assert_eq!(input_memory.used_bytes(), 0);
+            buffer.stage()
+        };
+        let rows = stage(false)?;
+        let batches = stage(true)?;
+        for (target, ordinals) in [(&table, &[0, 1, 2, 5, 6, 7][..]), (&other, &[3, 4, 8, 9][..])] {
+            let actual = batches.tables()[target].batch().unwrap();
+            let expected = rows.tables()[target].batch().unwrap();
+            let bytes = |page: &RecordBatch| crate::ipc::encode(page.schema_ref(), [page], &memory);
+            assert_eq!(bytes(actual.arrow())?.as_slice(), bytes(expected.arrow())?.as_slice());
+            let positions = (0..actual.len()).map(|row| actual.header(row).unwrap().position.unwrap().ordinal).collect::<Vec<_>>();
+            assert_eq!(positions.as_slice(), ordinals);
+        }
+        let actual = batches.tables()[&table].batch().unwrap();
+        let headers = (1..=2).map(|row| actual.header(row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(headers[0].iid, Iid([2; 16]));
+        assert_eq!(headers[0].valid_time, Interval::from_micros(10, 40)?);
+        assert_eq!(headers[1].iid, Iid([3; 16]));
+        assert_eq!(headers[1].valid_time, Interval::new(Timestamp(20), Timestamp::MAX)?);
+        assert_eq!(actual.header(4)?.valid_time, Interval::ALL);
+        Ok(())
+    }
+
+    #[test]
+    fn tombstone_page_fallback_keeps_row_errors_and_empty_schema_validation() -> Result<()> {
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let table = TableRef::new("public", "items");
+        let base = rtdb_index::PartitionState::empty(Default::default())?;
+        let page = tombstone_selection(vec![Some([1; 16]), Some([2; 16]), None],
+            vec![None, Some(20), None], vec![None, Some(20), None]);
+        for (budget, error) in [(1, "rtdb/memory-budget-exceeded"), (1 << 20, "xtdb.indexer/invalid-valid-times")] {
+            let memory = MemoryBudget::new(budget);
+            let mut buffer = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
+            let actual = stage_mutation_tombstones(&mut buffer, &table, &page, MutationKind::Delete, key.system_time, &memory).unwrap_err();
+            assert_eq!(actual.code, error);
+        }
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut buffer = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
+        let empty = page.slice(0, 0);
+        stage_mutation_tombstones(&mut buffer, &table, &empty, MutationKind::Delete, key.system_time, &memory)?;
+        assert!(!buffer.has_pending_table(&table));
+        let missing = empty.project(&[0]).unwrap();
+        let error = stage_mutation_tombstones(&mut buffer, &table, &missing, MutationKind::Delete, key.system_time, &memory).unwrap_err();
+        assert_eq!(error.code, "rtdb.tx/mutation-schema");
+
+        let untyped_bounds = RecordBatch::try_from_iter([
+            ("_iid", Arc::clone(page.slice(0, 1).column(0))),
+            ("_valid_from", Arc::new(arrow_array::NullArray::new(1))),
+            ("_valid_to", Arc::new(arrow_array::NullArray::new(1))),
+        ]).unwrap();
+        stage_mutation_tombstones(&mut buffer, &table, &untyped_bounds, MutationKind::Delete, key.system_time, &memory)?;
+        let writes = buffer.stage()?;
+        let event = writes.tables()[&table].batch().unwrap().header(0)?;
+        assert_eq!(event.valid_time, Interval::new(key.system_time, Timestamp::MAX)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tombstone_page_does_not_retain_a_reservation_per_row() -> Result<()> {
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let table = TableRef::new("public", "items");
+        let base = rtdb_index::PartitionState::empty(Default::default())?;
+        let memory = MemoryBudget::new(128 << 10);
+        let page = tombstone_selection(vec![Some([1; 16]); 64], vec![None; 64], vec![None; 64]);
+        let mut buffer = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
+        stage_mutation_tombstones(&mut buffer, &table, &page, MutationKind::Erase, key.system_time, &memory)?;
+        assert_eq!(buffer.stage()?.tables()[&table].batch().unwrap().len(), 64);
+        Ok(())
     }
 
     #[tokio::test]

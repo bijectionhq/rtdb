@@ -840,6 +840,43 @@ pub fn owned_live_event_schema(
     Ok((schema, reservation))
 }
 
+pub fn owned_tombstone_batch(
+    iids: &FixedSizeBinaryArray, system_time: Timestamp,
+    delete_intervals: Option<impl ExactSizeIterator<Item = Result<Interval>>>, memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
+    let rows = iids.len();
+    if iids.value_length() != 16 || iids.null_count() != 0
+        || delete_intervals.as_ref().is_some_and(|intervals| intervals.len() != rows)
+    {
+        return Err(invalid("Tombstone IIDs and valid-time bounds disagree"));
+    }
+    let (builder, metadata) = event_builder(rows, None, memory)?;
+    let (tag, deletes, erases, from, to) = if let Some(intervals) = delete_intervals {
+        let mut from = Vec::with_capacity(rows);
+        let mut to = Vec::with_capacity(rows);
+        for interval in intervals {
+            let interval = interval?;
+            from.push(interval.lower().0);
+            to.push(interval.upper().0);
+        }
+        (0, rows, 0, from, to)
+    } else {
+        (1, 0, rows, vec![Interval::ALL.lower().0; rows], vec![Interval::ALL.upper().0; rows])
+    };
+    let offsets = (0..rows).map(|offset| i32::try_from(offset).map_err(invalid)).collect::<Result<Vec<_>>>()?;
+    let op = UnionArray::try_new(
+        operation_fields(None, PutLeg::Last, false), ScalarBuffer::from(vec![tag; rows]),
+        Some(ScalarBuffer::from(offsets)), vec![Arc::new(NullArray::new(deletes)), Arc::new(NullArray::new(erases))],
+    ).map_err(invalid)?;
+    let fields = event_fields(DataType::FixedSizeBinary(16), op.data_type().clone(), false);
+    let times = |values| Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
+    let iids = FixedSizeBinaryArray::try_new(16, iids.value_data().to_vec().into(), None).map_err(invalid)?;
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![
+        Arc::new(iids), times(vec![system_time.0; rows]), times(from), times(to), Arc::new(op),
+    ]).map_err(invalid)?;
+    builder.finish_with_metadata(batch, metadata)
+}
+
 /// `source_bytes` is the shared source allocation held by the document buffers.
 pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     put_batch(documents, headers, None, source_bytes, false, memory)

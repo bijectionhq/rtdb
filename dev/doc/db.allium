@@ -1119,6 +1119,8 @@ rule LeaderProcessesTx {
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
+        -- Ordinary SQL delete and erase stage compatible Arrow selections as event pages in selection order.
+        -- Each SQL erase page is staged before its rows drive receipt metadata retirement in selection order.
         -- A SQL put can retain a complete scalar Arrow column when it encodes the same document bytes as canonical staging.
         -- An ordered put run retains a common Arrow struct layout across the dense union legs that supply its documents.
         -- Alternating put runs admit each Arrow source once and admit payload by the selected row positions.

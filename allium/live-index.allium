@@ -244,6 +244,7 @@ entity StagedTxTable {
     -- A typed staging copy reserves its selected positions and output arrays under the transaction memory budget.
     -- Staging packs row-backed writes and collects their positions alongside the existing Arrow event positions in command order.
     -- Native SQL puts can stage compatible document columns directly from the mutation query batch.
+    -- Compatible SQL tombstone pages receive the same transaction ordinals as row-backed writes in command order.
     -- A run of puts from one Arrow struct layout retains its schema and event order across the union legs that supply it.
     -- Puts from different struct layouts can share one Arrow batch while retaining the declarations of their original layouts.
     -- Staging preserves event assembly when a batch from different struct layouts is combined with other writes.
