@@ -13,6 +13,11 @@ impl AllocationScope {
     /// This does not transfer the scope's charges; admit owned storage before allocation.
     pub fn memory_budget(&self) -> &Arc<MemoryBudget> { &self.memory }
 
+    /// Transfers the charge for retained allocations to their next owner.
+    pub fn into_reservation(self) -> Result<Option<Arc<MemoryReservation>>> {
+        self.lease.into_inner().map_err(|_| Anomaly::fault("rtdb.expr/allocation-scope", "Expression allocation scope was poisoned"))
+    }
+
     /// Acquires the scope's bookkeeping reservation from the supplied finite budget.
     pub fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
         let initial = memory.reserve(4096)?;

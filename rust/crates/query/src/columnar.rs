@@ -65,6 +65,7 @@ enum RowExpansion {
     RepeatEach(usize),
     RepeatPage(usize),
     JoinProbe(Arc<crate::batch_join::ProbeRuns>),
+    ListSpans(Arc<ListSpans>),
     UnnestParents(Arc<UnnestRows>),
     UnnestGroups(Arc<UnnestRows>),
     UnnestChildren(Arc<UnnestRows>),
@@ -77,6 +78,7 @@ impl RowExpansion {
             Self::RepeatEach(width) => (0, row / width),
             Self::RepeatPage(width) => (0, row % width),
             Self::JoinProbe(runs) => (0, runs.input_row(row)),
+            Self::ListSpans(spans) => spans.position(row),
             Self::UnnestParents(runs) => (0, runs.groups[runs.group_at(row)].parent),
             Self::UnnestGroups(runs) => (0, runs.group_at(row)),
             Self::UnnestChildren(runs) => {
@@ -95,6 +97,7 @@ impl RowExpansion {
             Self::RepeatEach(1) => {}
             Self::RepeatPage(width) if rows.len() <= width - start => {}
             Self::JoinProbe(runs) if runs.contiguous(&rows) => {}
+            Self::ListSpans(spans) if rows.end <= spans.ends[source] => {}
             Self::UnnestChildren(runs) if source != 0 => {
                 let first = runs.group_at(rows.start);
                 let last = runs.group_at(rows.end - 1);
@@ -112,10 +115,24 @@ impl RowExpansion {
     fn owner(&self) -> Option<&Arc<MemoryReservation>> {
         match self {
             Self::ApplyOuter(spans) => Some(spans.reservation()),
+            Self::ListSpans(spans) => Some(&spans.reservation),
             Self::UnnestParents(runs) | Self::UnnestGroups(runs) | Self::UnnestChildren(runs) => Some(&runs.reservation),
             Self::JoinProbe(runs) => runs.owner(),
             Self::RepeatEach(_) | Self::RepeatPage(_) => None,
         }
+    }
+}
+
+struct ListSpans {
+    ends: Vec<usize>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl ListSpans {
+    fn position(&self, row: usize) -> (usize, usize) {
+        let page = self.ends.partition_point(|&end| end <= row);
+        let start = page.checked_sub(1).map_or(0, |previous| self.ends[previous]);
+        (page, row - start)
     }
 }
 
@@ -1043,6 +1060,26 @@ impl ColumnBatch {
         Ok(Some((batch, reservation)))
     }
 
+    pub(crate) fn from_packed_list(
+        array: ArrayRef, field: Arc<ArrowField>, mut reservation: Arc<MemoryReservation>,
+    ) -> Result<Self> {
+        let base = array.get_array_memory_size().checked_add(size_of::<Column>() + 256).ok_or_else(size_error)?;
+        let occupied = |field: &ArrowField| base.checked_add(field.size()).ok_or_else(size_error);
+        let lease = Arc::get_mut(&mut reservation).expect("A packed list page owns its reservation");
+        let field = if field.name() == "value" {
+            field
+        } else {
+            let bound = occupied(&field)?
+                .checked_add(field.size()).and_then(|bytes| bytes.checked_add(64)).ok_or_else(size_error)?;
+            if bound > lease.bytes() { lease.grow_to(bound)?; }
+            Arc::new(Arc::unwrap_or_clone(field).with_name("value"))
+        };
+        let retained = occupied(&field)?;
+        if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
+        let len = array.len();
+        Ok(Self::sharing(vec![Column::Arrow { array, field, logical: None }], len, reservation))
+    }
+
     pub(crate) fn from_list_parameter(
         source: &rtdb_columnar::OwnedBatch, position: usize, row: usize,
         parameter_type: &LogicalType, memory: &Arc<MemoryBudget>,
@@ -1506,6 +1543,56 @@ pub(crate) fn gather_column_rows<'a>(
     source: impl Fn(usize) -> &'a ColumnBatch, rows: &[(usize, usize)], position: usize, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
     gather_column_cells(source, rows.iter().copied().map(Some), rows.len(), position, false, memory)
+}
+
+pub(crate) async fn retain_list_spans(
+    pages: &[ColumnBatch], context: &crate::QueryContext,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let [Column::Arrow { field, logical, .. }] = pages[0].columns.as_slice() else { return Ok(None); };
+    let memory = &context.memory;
+    let span_bytes = pages.len().checked_mul(size_of::<usize>())
+        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+    let logical_bytes = logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?;
+    let source_bytes = size_of::<Option<StoredVector>>().checked_add(logical_bytes)
+        .and_then(|bytes| bytes.checked_mul(pages.len()))
+        .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?;
+    let bound = span_bytes.checked_add(source_bytes).ok_or_else(size_error)?;
+    let mut charge = match memory.reserve(bound) {
+        Ok(charge) => charge,
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let reservation = Arc::get_mut(&mut charge).expect("List spans own their metadata").split_off(span_bytes)?;
+    let mut ends = Vec::with_capacity(pages.len());
+    let mut sources = Vec::with_capacity(pages.len());
+    let mut end = 0usize;
+    for (index, page) in pages.iter().enumerate() {
+        if index % 1024 == 0 {
+            tokio::task::yield_now().await;
+            context.check_cancelled()?;
+        }
+        let [Column::Arrow { array, field: other, logical: other_type }] = page.columns.as_slice() else { return Ok(None); };
+        if other != field || other_type != logical || array.data_type() != field.data_type() || array.len() != page.len {
+            return Ok(None);
+        }
+        end = end.checked_add(page.len).ok_or_else(size_error)?;
+        ends.push(end);
+        sources.push(expansion_source(array, other, other_type, page.column_reservation(0)));
+    }
+    let expansion = RowExpansion::ListSpans(Arc::new(ListSpans { ends, reservation }));
+    let cells = SelectedRows::Expanded { expansion, rows: 0..end, input: None };
+    Ok(Some((Column::Selected(SelectedColumn { sources: Arc::new(sources), cells }), charge)))
+}
+
+pub(crate) fn gather_list_pages(
+    pages: &[ColumnBatch], rows: usize, context: &crate::QueryContext,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let positions = pages.iter().flat_map(|page| {
+        let column = &page.columns[0];
+        let owner = page.column_reservation(0);
+        (0..page.len).map(move |row| Some((column, owner, row)))
+    });
+    take_arrow_rows(positions, rows, false, &context.memory, Some(context))
 }
 
 pub(crate) fn gather_nullable_column<'a>(

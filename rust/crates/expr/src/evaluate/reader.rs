@@ -328,7 +328,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                         rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
                     }
                     position += count;
-                    yield super::ListEvent::Batch(super::ListBatch { values, _scope: scope });
+                    yield super::ListEvent::Batch(super::ListBatch { values, scope });
                     continue;
                 }
                 let mut values = rtdb_types::ListBuilder::with_capacity(count);
@@ -340,7 +340,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                     }
                 }
                 position += count;
-                yield super::ListEvent::Batch(super::ListBatch { values: values.finish(), _scope: scope });
+                yield super::ListEvent::Batch(super::ListBatch { values: values.finish(), scope });
             }
         }
     })
@@ -510,6 +510,7 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
                 });
             }
             let Some(slice) = items.slice_packed(offset, count) else { return Ok(None); };
+            // A yielded page can outlive the source reader, even when its Arrow slice retains the whole parent buffer.
             context.reserve(slice.retained_payload_bytes()?)?;
             Ok(Some(slice))
         }

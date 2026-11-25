@@ -48,17 +48,15 @@ impl ListCursor {
 impl crate::columnar::BatchCursor for ListCursor {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         let Some(batch) = self.next_list_batch().await? else { return Ok(None); };
-        let values = batch.values();
+        if batch.values().array().is_some() {
+            let (field, array, reservation) = batch.into_packed_column()?;
+            let output = crate::columnar::ColumnBatch::from_packed_list(array, field, reservation)?;
+            return Ok(Some(output));
+        }
         let memory = &self.context.memory;
+        let values = batch.values();
         let mut output = crate::columnar::ColumnBatch::settled(Vec::new(), values.len(), memory.reserve(256)?)?;
-        let (column, charge) = if let Some((field, array)) = values.packed_column() {
-            let charge = memory.reserve(array.get_array_memory_size().checked_add(field.size())
-                .ok_or_else(|| invalid("column-size", "List column exceeds addressable memory"))?)?;
-            let field = Arc::new(field.as_ref().clone().with_name("value"));
-            (crate::columnar::Column::Arrow { array, field, logical: None }, charge)
-        } else {
-            crate::columnar::pack_evaluated_column(values.scalar_values().expect("unpacked list"), memory)?
-        };
+        let (column, charge) = crate::columnar::pack_evaluated_column(values.scalar_values().expect("unpacked list"), memory)?;
         output.append_column(column, charge, memory)?;
         Ok(Some(output))
     }
