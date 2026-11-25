@@ -37,6 +37,7 @@ entity Checkpoint {
 -- Each rebuilt slot derives its layout from selected rows and assigns dense-union offsets in selection order.
 -- Compact contiguous selections may share the backing allocations of index-owned Arrow keys.
 -- A correction page serializes just the Arrow key rows for the validity spans it owns.
+-- A decoded correction group shares the admitted page backing with its validity spans.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A snapshot may reuse decoded index definitions for the same catalog read time.
 -- A snapshot may reuse projected tail changes from the same definition and captured source block.
@@ -83,6 +84,8 @@ entity Checkpoint {
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- Replay can retain decoded input pages through erase discovery and key projection within its memory budget.
+-- Replay validates every input row's event controls before projecting selected rows in bounded chunks.
+-- Revisions assembled in the same replay share each complete identity's retained bytes and reservation.
 -- When retention is declined, replay can read exact IPC blocks from the held source in file order.
 -- Each range agrees with the observed file identity, and the replay releases its backing after key projection.
 -- A checkpoint's page scope is zero before the first captured erase, and one past the last source block containing an erase afterward.

@@ -77,7 +77,9 @@ impl RevisionRoots {
             .at(tree, IndexRevision::MAX)
             .await?
             .map_or((None, None), |(revision, root)| (Some(revision), root));
-        for (revision, rows) in changes.revisions {
+        let Changes { revisions, addresses } = changes;
+        drop(addresses);
+        for (revision, rows) in revisions {
             if last.is_some_and(|last| last > revision) {
                 return Err(format_error(
                     "Ordered index replay crossed its revision frontier",
@@ -250,6 +252,7 @@ struct Event {
 #[derive(Default)]
 pub(super) struct Changes {
     revisions: BTreeMap<IndexRevision, BTreeMap<Address, Vec<Event>>>,
+    addresses: BTreeMap<Bytes, Arc<MemoryReservation>>,
 }
 
 impl Changes {
@@ -313,8 +316,9 @@ impl Changes {
         if batch.has_entity_keys() != keyed {
             return Err(format_error("Ordered source events have the wrong physical identity layout"));
         }
-        let _headers = memory.reserve(batch.len().saturating_mul(256))?;
-        let events = batch.page_events()?;
+        let _headers = memory.reserve(4096usize.saturating_add(columns.len().saturating_mul(size_of::<KeyColumn<'_>>())))?;
+        let event_at = batch.prepare_page_events()?;
+        (0..batch.len()).try_for_each(|row| event_at(row).map(drop))?;
         let document = batch.put_document()?;
         let column = |name: &str| document.and_then(|document| document.fields().iter().zip(document.columns())
             .find(|(field, _)| field.name() == name))
@@ -322,28 +326,29 @@ impl Changes {
         let projection: Vec<_> = columns.iter().map(|name| KeyColumn::new(column(name))).collect();
         let identity = keyed.then(|| column("_id")).flatten();
         let marker = matches!(layout, KeyLayout::World).then(|| column(WorldShadow::FIELDS)).flatten();
-        for events in events[skip.min(events.len())..].chunks(128) {
+        for start in (skip.min(batch.len())..batch.len()).step_by(128) {
+            let end = start.saturating_add(128).min(batch.len());
+            let len = end - start;
             let _scratch = memory.reserve(
-                events
-                    .len()
+                len
                     .saturating_mul(columns.len())
                     .saturating_mul(size_of::<AtomRef<'_>>())
                     .saturating_add(8192)
                     .saturating_add(if keyed {
-                        events.len().saturating_mul(128)
+                        len.saturating_mul(128)
                     } else {
                         0
                     }),
             )?;
             let mut retained = Vec::new();
             let mut rows = Vec::new();
-            for event in events {
+            for index in start..end {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
+                let event = event_at(index)?;
                 let header = event.header();
-                let address = AddressRef { iid: header.iid, key: event.entity_key().unwrap_or_default() };
-                let _key = memory.reserve(address.key.len().saturating_add(128))?;
+                let address = AddressRef { iid: header.iid, key: batch.entity_key(index)?.unwrap_or_default() };
                 let id = if keyed {
                     Some(rtdb_columnar::EntityIdRef::from_handle_bytes(address.key)?)
                 } else {
@@ -368,7 +373,7 @@ impl Changes {
                             return Err(format_error("Governed ordered put differs from its physical identity"));
                         }
                     }
-                    if matches!(layout, KeyLayout::World) && world_tombstone(event, marker, offset, memory)? {
+                    if matches!(layout, KeyLayout::World) && world_tombstone(&event, marker, offset, memory)? {
                         None
                     } else {
                         let row = rows.len();
@@ -399,21 +404,23 @@ impl Changes {
                     .shrink_to(keys.retained_bytes())?;
                 Some(ProjectedKeys::new(keys, allocation))
             };
-            let mut address_keys = BTreeMap::new();
             for (header, address, row) in retained {
-                let allocation = memory.reserve(address.key.len().saturating_add(256))?;
+                let allocation = memory.reserve(256)?;
                 let key = if address.key.is_empty() {
                     Bytes::new()
+                } else if let Some((key, _)) = self.addresses.get_key_value(address.key) {
+                    key.clone()
                 } else {
-                    address_keys
-                        .entry(address.key)
-                        .or_insert_with(|| Bytes::copy_from_slice(address.key))
-                        .clone()
+                    let slot = memory.reserve(128)?;
+                    let backing = memory.reserve(address.key.len().saturating_add(128))?;
+                    let key = Address::retain_bytes(address.key.to_vec(), backing);
+                    self.addresses.insert(key.clone(), slot);
+                    key
                 };
                 self.revisions
                     .entry(IndexRevision::of_event(header))
                     .or_default()
-                    .entry(Address::new(address.iid, key))
+                    .entry(Address::from_retained(address.iid, key))
                     .or_default()
                     .push(Event {
                         header,
@@ -567,6 +574,14 @@ mod tests {
             |_, _| true,
         )?;
         drop(batch);
+        let mut later = events[1].clone();
+        later.system_from = Timestamp(2);
+        let batch = IndexBatch::from_events(&[later], &StructFields::new(), &source_memory)?;
+        changes.add_batch(
+            batch.view(), 0, &["key".into()], &projection_memory,
+            &CancellationToken::new(), KeyLayout::Governed, |_, _| true,
+        )?;
+        drop(batch);
 
         let mut rows = changes
             .revisions
@@ -580,6 +595,7 @@ mod tests {
         assert_eq!(value, "one");
         assert_ne!(value.as_ptr(), source);
         assert_eq!(first.view().key.as_ptr(), second.view().key.as_ptr());
+        assert_eq!(first.view().key.as_ptr(), rows.next().unwrap().0.view().key.as_ptr());
         assert_eq!(source_memory.used_bytes(), 0);
         assert!(projection_memory.used_bytes() > 0);
         drop(changes);

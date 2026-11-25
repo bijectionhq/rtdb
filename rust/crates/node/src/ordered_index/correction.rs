@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::Int64Array;
 use arrow_buffer::Buffer;
+use bytes::Bytes;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Interval, Result, Timestamp};
 
@@ -9,7 +10,7 @@ use super::{
     PAGE_LAYOUT_VERSION, format_error,
     key::arrow,
     postings::{BatchKind, KeyBatch, KeyBatchEncoding, ProjectedKeys},
-    tree::{AddressRef, Entry, Item, Key, Span},
+    tree::{Address, Entry, Item, Key, Span},
 };
 
 pub(super) const HEADER: [u8; 16] = {
@@ -117,6 +118,7 @@ pub(super) fn decode(
     let to = arrow::<Int64Array>(batch.batch().column(1).as_ref())?.clone();
     let mut entries = Vec::new();
     let mut offset = 0usize;
+    let mut retained_addresses = None;
     while !groups.is_empty() {
         if entries.len() == max_entries || groups.len() < GROUP_HEADER_BYTES { return Err(invalid()); }
         let group = &groups[..GROUP_HEADER_BYTES];
@@ -125,7 +127,15 @@ pub(super) fn decode(
         let key_len = u32::from_le_bytes(group[20..24].try_into().map_err(format_error)?) as usize;
         groups.advance(GROUP_HEADER_BYTES);
         let key = groups.get(..key_len).ok_or_else(invalid)?;
-        if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(key).map_err(format_error)?; }
+        let key = if key.is_empty() {
+            Bytes::new()
+        } else {
+            rtdb_columnar::EntityIdRef::from_handle_bytes(key).map_err(format_error)?;
+            if retained_addresses.is_none() {
+                retained_addresses = Some(Address::retain_bytes(bytes.clone(), opening.split_off(128)?));
+            }
+            retained_addresses.as_ref().expect("group backing is retained").slice_ref(key)
+        };
         let end = offset
             .checked_add(length)
             .filter(|&end| end <= rows)
@@ -133,7 +143,7 @@ pub(super) fn decode(
         if length == 0 {
             return Err(invalid());
         }
-        entries.push((AddressRef { iid, key }.owned(), offset..end));
+        entries.push((Address::from_retained(iid, key), offset..end));
         groups.advance(key_len);
         offset = end;
     }
@@ -169,7 +179,7 @@ mod tests {
     use crate::ordered_index::{
         key::{Atom, Bucket},
         postings::{Postings, Tuple},
-        tree::encode_leaf,
+        tree::{AddressRef, encode_leaf},
     };
 
     #[test]
@@ -222,9 +232,12 @@ mod tests {
         let mut opening = budget.reserve(16 << 10).unwrap();
         let opening = Arc::get_mut(&mut opening).unwrap();
         let buffer = Buffer::from_vec(bytes);
+        let source = buffer[group_start + GROUP_HEADER_BYTES..].as_ptr();
         let backing = rtdb_columnar::retain_buffer(&buffer, &opening.split_off(buffer.capacity()).unwrap());
         let entries = decode(backing, 64, opening).unwrap();
         assert_eq!(entries[0].key, Key::Row(address));
+        let Key::Row(address) = &entries[0].key else { unreachable!() };
+        assert_eq!(address.view().key.as_ptr(), source);
         let Item::Row(decoded) = &entries[0].item else {
             panic!("Expected correction spans");
         };

@@ -37,6 +37,19 @@ pub(super) struct Address {
         deserialize_with = "Address::deserialize_key"
     )]
     key: Bytes,
+    #[serde(skip)]
+    retained: bool,
+}
+
+struct RetainedAddressBytes<T> {
+    bytes: T,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for RetainedAddressBytes<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,7 +75,19 @@ impl AddressRef<'_> {
 
 impl Address {
     pub fn new(iid: Iid, key: Bytes) -> Self {
-        Self { iid, key }
+        Self { iid, key, retained: false }
+    }
+
+    pub fn retain_bytes<T: AsRef<[u8]> + Send + 'static>(bytes: T, memory: Arc<MemoryReservation>) -> Bytes {
+        Bytes::from_owner(RetainedAddressBytes { bytes, _memory: memory })
+    }
+
+    pub fn from_retained(iid: Iid, key: Bytes) -> Self {
+        Self { iid, key, retained: true }
+    }
+
+    fn owned_backing_bytes(&self) -> usize {
+        if self.retained { 0 } else { self.key.len() }
     }
 
     pub fn view(&self) -> AddressRef<'_> {
@@ -162,7 +187,7 @@ impl Key {
         match self {
             Self::Posting { tuple: KeyRow::Arrow(..), .. } | Self::Revision(_) => 0,
             Self::Posting { tuple: KeyRow::Fence(atoms), address, .. } => {
-                let initial = ARC_HEADER_BYTES.saturating_add(address.key.len());
+                let initial = ARC_HEADER_BYTES.saturating_add(address.owned_backing_bytes());
                 atoms.iter().fold(initial, |bytes, atom| {
                     let payload = match atom {
                         Atom::Text(value) => value.capacity(),
@@ -172,7 +197,7 @@ impl Key {
                     bytes.saturating_add(size_of::<Atom>()).saturating_add(payload)
                 })
             }
-            Self::Row(address) => address.key.len(),
+            Self::Row(address) => address.owned_backing_bytes(),
         }
     }
 
@@ -181,6 +206,15 @@ impl Key {
             Self::Posting { tuple: KeyRow::Arrow(..), .. } => self.clone(),
             _ => self.view().owned(),
         }
+    }
+
+    fn pointer_backing_bytes(&self) -> usize {
+        let detached = match self {
+            Self::Row(address) | Self::Posting { tuple: KeyRow::Fence(_), address, .. }
+                if address.retained => address.key.len(),
+            _ => 0,
+        };
+        self.owned_backing_bytes().saturating_add(detached)
     }
 }
 
@@ -1272,8 +1306,8 @@ impl Tree {
             let last = link.last();
             let memory = self.memory.reserve(
                 (size_of::<Pointer>() + ARC_HEADER_BYTES + 64)
-                    .saturating_add(first.owned_backing_bytes())
-                    .saturating_add(last.owned_backing_bytes()),
+                    .saturating_add(first.pointer_backing_bytes())
+                    .saturating_add(last.pointer_backing_bytes()),
             )?;
             let digest = format!("{:x}", Sha256::digest(&encoded));
             let size = encoded.len();

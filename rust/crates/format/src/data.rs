@@ -476,6 +476,18 @@ impl EventBatch {
 
     /// Appends event positions in page order and leaves earlier positions intact if decoding fails.
     pub fn extend_page_events(&self, events: &mut Vec<PageEvent>) -> Result<()> {
+        let event_at = self.prepare_page_events()?;
+        let start = events.len();
+        let result = (0..self.len()).try_for_each(|row| {
+            events.push(event_at(row)?);
+            Ok(())
+        });
+        if result.is_err() { events.truncate(start); }
+        result
+    }
+
+    /// Binds a page once so callers can validate or project rows without retaining descriptors.
+    pub fn prepare_page_events(&self) -> Result<impl Fn(usize) -> Result<PageEvent> + '_> {
         let union = self.operations()?;
         let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
         let put = match legs.iter().find(|(_, leg)| leg.name() == "put") {
@@ -497,20 +509,29 @@ impl EventBatch {
         let (system_from, valid_from, valid_to) = (times(self.system_from)?, times(self.valid_from)?, times(self.valid_to)?);
         let recency = self.recency.map(times).transpose()?;
         let positions = self.positions();
-        let start = events.len();
-        let result = (0..self.len()).try_for_each(|row| {
+        let fixed = |index: Option<usize>, message| {
+            index.map(|index| self.batch.column(index).as_any().downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| invalid(message))).transpose()
+        };
+        let origins = fixed(self.origins, "Event origin array type changed")?;
+        let event_positions = fixed(self.event_positions, "Event position array type changed")?;
+        Ok(move |row| {
+            if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
             let op = usize::try_from(union.type_id(row)).ok().and_then(|id| ops[id]).ok_or_else(|| invalid("Event operation type ID has no leg"))?;
-            let origin = self.origin(row)?;
+            let origin = origins.filter(|origins| origins.is_valid(row)).map(|origins| {
+                EventOrigin(origins.value(row).try_into().expect("validated event origin width"))
+            });
             let valid_time = Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?;
             Self::require_redacted_position(op, origin, valid_time)?;
-            events.push(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
-                position: self.event_position(row)?,
+            let iid = iids.get(row)?;
+            let position = event_positions.map(|positions| {
+                positions.value(row).try_into().map(EventPosition::from_bytes).map_err(invalid)
+            }).transpose()?;
+            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid, system_from: Timestamp(system_from[row]),
+                position,
                 commit_position: positions.map_or(0, |positions| positions.value(row)),
-                valid_time, op, recency: recency.map(|recency| Timestamp(recency[row])), origin, bytes: std::sync::OnceLock::new() });
-            Ok(())
-        });
-        if result.is_err() { events.truncate(start); }
-        result
+                valid_time, op, recency: recency.map(|recency| Timestamp(recency[row])), origin, bytes: std::sync::OnceLock::new() })
+        })
     }
     /// The dense union of each row's operation, whose put leg holds its document.
     pub fn operations(&self) -> Result<&UnionArray> {
