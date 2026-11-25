@@ -1,13 +1,12 @@
 //! Vectorised expression evaluation through DataFusion's physical expressions.
 //! Only shapes whose results match the scalar evaluator exactly are lowered: the declared result type of each node is
-//! kept by casting its operands, arithmetic is checked, and a batch whose evaluation fails, or meets a zero divisor,
-//! is left to the evaluator so that the evaluator raises its own error.
-use std::sync::{Arc, LazyLock};
+//! kept by casting its operands, and checked arithmetic leaves failures to the scalar evaluator.
+use std::{fmt, sync::{Arc, LazyLock}};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
-use arrow_array::{cast::AsArray, types::{ArrowPrimitiveType, Float64Type, Int64Type}};
-use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
-use datafusion_common::ScalarValue;
+use arrow_array::{cast::AsArray, types::{ArrowPrimitiveType, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type}};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_common::arrow::compute::kernels::arity::try_binary;
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, Operator, ScalarUDF, Volatility, create_udf};
@@ -45,8 +44,105 @@ fn modulo_function<T: ArrowPrimitiveType>(compute: fn(T::Native, T::Native) -> R
     })))
 }
 
-static SIGNED_MODULO: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| modulo_function::<Int64Type>(rtdb_expr::signed_modulo));
-static FLOAT_MODULO: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| modulo_function::<Float64Type>(rtdb_expr::float_modulo));
+#[derive(Debug, Eq, Hash)]
+struct CheckedDivisor(Arc<dyn PhysicalExpr>);
+
+impl PartialEq for CheckedDivisor {
+    fn eq(&self, other: &Self) -> bool { self.0.eq(&other.0) }
+}
+
+impl fmt::Display for CheckedDivisor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
+}
+
+impl PhysicalExpr for CheckedDivisor {
+    fn return_field(&self, schema: &ArrowSchema) -> datafusion_common::Result<FieldRef> {
+        self.0.return_field(schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> datafusion_common::Result<ColumnarValue> {
+        let value = self.0.evaluate(batch)?;
+        // A CASE branch can invoke its expression on zero selected rows, even with a scalar divisor.
+        if batch.num_rows() != 0 && zero_present(&value) {
+            return Err(ArrowError::DivideByZero.into());
+        }
+        Ok(value)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> { vec![&self.0] }
+
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn PhysicalExpr>>)
+        -> datafusion_common::Result<Arc<dyn PhysicalExpr>> {
+        let [child]: [Arc<dyn PhysicalExpr>; 1] = children.try_into()
+            .map_err(|_| DataFusionError::Internal("A checked divisor has one child".into()))?;
+        Ok(Arc::new(Self(child)))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt_sql(f) }
+}
+
+fn zero_present(value: &ColumnarValue) -> bool {
+    match value {
+        ColumnarValue::Scalar(value) => match value {
+            ScalarValue::Int8(v) => *v == Some(0),
+            ScalarValue::Int16(v) => *v == Some(0),
+            ScalarValue::Int32(v) => *v == Some(0),
+            ScalarValue::Int64(v) => *v == Some(0),
+            ScalarValue::Float64(v) => *v == Some(0.0),
+            _ => true,
+        },
+        ColumnarValue::Array(array) => match array.data_type() {
+            DataType::Int8 => array.as_primitive::<Int8Type>().iter().any(|v| v == Some(0)),
+            DataType::Int16 => array.as_primitive::<Int16Type>().iter().any(|v| v == Some(0)),
+            DataType::Int32 => array.as_primitive::<Int32Type>().iter().any(|v| v == Some(0)),
+            DataType::Int64 => array.as_primitive::<Int64Type>().iter().any(|v| v == Some(0)),
+            DataType::Float64 => array.as_primitive::<Float64Type>().iter().any(|v| v == Some(0.0)),
+            _ => true,
+        },
+    }
+}
+
+static FUNCTION_CONFIG: LazyLock<Arc<ConfigOptions>> = LazyLock::new(|| Arc::new(ConfigOptions::default()));
+
+struct FunctionLayout {
+    function: Arc<ScalarUDF>,
+    input: DataType,
+    output: FieldRef,
+}
+
+impl FunctionLayout {
+    fn new(function: Arc<ScalarUDF>, input: DataType, arity: usize) -> Option<Self> {
+        // These UDFs derive their return fields from argument types alone. Validate each signature once.
+        let fields: Vec<_> = (0..arity).map(|i| ArrowField::new(format!("c{i}"), input.clone(), true)).collect();
+        let arguments = fields.iter().enumerate()
+            .map(|(i, field)| Arc::new(df::Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>).collect();
+        let schema = ArrowSchema::new(fields);
+        let call = ScalarFunctionExpr::try_new(Arc::clone(&function), arguments, &schema, Arc::clone(&FUNCTION_CONFIG)).ok()?;
+        Some(Self { function, input, output: call.return_field(&schema).ok()? })
+    }
+
+    fn call(&self, arguments: Vec<Arc<dyn PhysicalExpr>>, expected: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
+        (self.output.data_type() == expected).then(|| {
+            Arc::new(ScalarFunctionExpr::new(self.function.name(), Arc::clone(&self.function), arguments,
+                Arc::clone(&self.output), Arc::clone(&FUNCTION_CONFIG))) as Arc<dyn PhysicalExpr>
+        })
+    }
+}
+
+static SIGNED_MODULO: LazyLock<Option<FunctionLayout>> = LazyLock::new(||
+    FunctionLayout::new(modulo_function::<Int64Type>(rtdb_expr::signed_modulo), DataType::Int64, 2));
+static FLOAT_MODULO: LazyLock<Option<FunctionLayout>> = LazyLock::new(||
+    FunctionLayout::new(modulo_function::<Float64Type>(rtdb_expr::float_modulo), DataType::Float64, 2));
+static UPPER: LazyLock<Option<FunctionLayout>> = LazyLock::new(||
+    FunctionLayout::new(datafusion_functions::string::upper(), DataType::Utf8, 1));
+static LOWER: LazyLock<Option<FunctionLayout>> = LazyLock::new(||
+    FunctionLayout::new(datafusion_functions::string::lower(), DataType::Utf8, 1));
+static LENGTH: LazyLock<Option<FunctionLayout>> = LazyLock::new(||
+    FunctionLayout::new(datafusion_functions::unicode::character_length(), DataType::Utf8, 1));
+static ABS: LazyLock<[Option<FunctionLayout>; 5]> = LazyLock::new(|| {
+    [DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64, DataType::Float64]
+        .map(|input| FunctionLayout::new(datafusion_functions::math::abs(), input, 1))
+});
 
 /// The input columns an expression reads, in the order the lowered expression addresses them.
 struct Inputs<'a> {
@@ -88,8 +184,7 @@ impl Inputs<'_> {
     }
 }
 
-/// A lowered expression, with the divisors whose zeros the evaluator would reject.
-struct Lowering<'a> { inputs: Inputs<'a>, parameters: rtdb_expr::Parameters<'a>, divisors: Vec<Arc<dyn PhysicalExpr>>, functions: Vec<(Arc<datafusion_expr::ScalarUDF>, Vec<Arc<dyn PhysicalExpr>>, usize)> }
+struct Lowering<'a> { inputs: Inputs<'a>, parameters: rtdb_expr::Parameters<'a> }
 
 fn literal(value: &Value, expected: &DataType) -> Option<ScalarValue> {
     Some(match (value, expected) {
@@ -129,7 +224,12 @@ impl Lowering<'_> {
                 if !(integer(&data_type) || data_type == DataType::Float64) { return None; }
                 let left = self.cast_to(left, &data_type)?;
                 let right = self.cast_to(right, &data_type)?;
-                let op = match op { BinaryOp::Add => Operator::Plus, BinaryOp::Subtract => Operator::Minus, BinaryOp::Multiply => Operator::Multiply, _ => { self.divisors.push(Arc::clone(&right)); Operator::Divide } };
+                let (op, right) = match op {
+                    BinaryOp::Add => (Operator::Plus, right),
+                    BinaryOp::Subtract => (Operator::Minus, right),
+                    BinaryOp::Multiply => (Operator::Multiply, right),
+                    _ => (Operator::Divide, Arc::new(CheckedDivisor(right)) as Arc<dyn PhysicalExpr>),
+                };
                 Arc::new(df::BinaryExpr::new(left, op, right).with_fail_on_overflow(true))
             }
             Expr::Binary { op: BinaryOp::Modulo, left, right } => self.modulo(left, right, &data_type)?,
@@ -187,20 +287,16 @@ impl Lowering<'_> {
                 self.modulo(left, right, &data_type)?
             }
             Expr::Call { name, args, .. } if args.len() == 1 => {
-                let function = match (name.to_ascii_lowercase().as_str(), &data_type) {
-                    ("upper", DataType::Utf8) => datafusion_functions::string::upper(),
-                    ("lower", DataType::Utf8) => datafusion_functions::string::lower(),
-                    ("length" | "character_length" | "char_length", DataType::Int32) => datafusion_functions::unicode::character_length(),
-                    ("abs", data_type) if integer(data_type) || *data_type == DataType::Float64 => datafusion_functions::math::abs(),
+                let layout = match (name.to_ascii_lowercase().as_str(), &data_type) {
+                    ("upper", DataType::Utf8) => UPPER.as_ref()?,
+                    ("lower", DataType::Utf8) => LOWER.as_ref()?,
+                    ("length" | "character_length" | "char_length", DataType::Int32) => LENGTH.as_ref()?,
+                    ("abs", data_type) => ABS.iter().flatten().find(|layout| &layout.input == data_type)?,
                     _ => return None,
                 };
-                let (_, argument_type) = arrow_type(&args[0].data_type())?;
-                let expected_argument = if matches!(name.to_ascii_lowercase().as_str(), "abs") { data_type.clone() } else { DataType::Utf8 };
-                if argument_type != expected_argument { return None; }
-                let (argument, _) = self.lower(&args[0])?;
-                let index = self.functions.len();
-                self.functions.push((function, vec![argument], index));
-                return self.function(index, data_type);
+                let (argument, argument_type) = self.lower(&args[0])?;
+                if argument_type != layout.input { return None; }
+                layout.call(vec![argument], &data_type)?
             }
             _ => return None,
         };
@@ -217,23 +313,13 @@ impl Lowering<'_> {
     }
 
     fn modulo(&mut self, left: &Expr, right: &Expr, result_type: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
-        let (function, input_type) = if integer(result_type) { (Arc::clone(&SIGNED_MODULO), DataType::Int64) }
-            else if matches!(result_type, DataType::Float32 | DataType::Float64) { (Arc::clone(&FLOAT_MODULO), DataType::Float64) }
+        let layout = if integer(result_type) { SIGNED_MODULO.as_ref()? }
+            else if matches!(result_type, DataType::Float32 | DataType::Float64) { FLOAT_MODULO.as_ref()? }
             else { return None; };
-        let arguments = vec![self.cast_to(left, &input_type)?, self.cast_to(right, &input_type)?];
-        let index = self.functions.len();
-        self.functions.push((function, arguments, index));
-        let (call, _) = self.function(index, input_type.clone())?;
-        if *result_type == input_type { return Some(call); }
+        let arguments = vec![self.cast_to(left, &layout.input)?, self.cast_to(right, &layout.input)?];
+        let call = layout.call(arguments, &layout.input)?;
+        if *result_type == layout.input { return Some(call); }
         Some(Arc::new(df::CastExpr::new(call, result_type.clone(), Some(datafusion_common::arrow::compute::CastOptions { safe: false, ..Default::default() }))))
-    }
-
-    /// A function call over the inputs gathered so far, built against their schema.
-    fn function(&mut self, index: usize, data_type: DataType) -> Option<(Arc<dyn PhysicalExpr>, DataType)> {
-        let (function, arguments, _) = self.functions[index].clone();
-        let schema = ArrowSchema::new(self.inputs.fields.clone());
-        let call = ScalarFunctionExpr::try_new(function, arguments, &schema, Arc::new(ConfigOptions::default())).ok()?;
-        (call.return_type() == &data_type).then(|| (Arc::new(call) as Arc<dyn PhysicalExpr>, data_type))
     }
 }
 
@@ -282,35 +368,95 @@ pub(crate) fn evaluate(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parame
 
 fn evaluate_at(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: rtdb_expr::Parameters<'_>, arguments: Option<&[Column]>) -> Option<ArrayRef> {
     let inputs = Inputs { schema, columns, arguments, positions: Vec::new(), fields: Vec::new(), arrays: Vec::new() };
-    let mut lowering = Lowering { inputs, parameters, divisors: Vec::new(), functions: Vec::new() };
+    let mut lowering = Lowering { inputs, parameters };
     let (lowered, data_type) = lowering.lower(expr)?;
     let input = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(lowering.inputs.fields)), lowering.inputs.arrays,
         &arrow_array::RecordBatchOptions::new().with_row_count(Some(len))).ok()?;
-    for divisor in &lowering.divisors {
-        let divisor = divisor.evaluate(&input).ok()?.into_array(len).ok()?;
-        if zero_present(&divisor) { return None; }
-    }
     let result = match lowered.evaluate(&input).ok()? { ColumnarValue::Array(array) => array, scalar => scalar.into_array(len).ok()? };
     (result.data_type() == &data_type && result.len() == len).then_some(result)
-}
-
-/// Whether any non-null cell of a divisor is zero, which the evaluator rejects even for doubles.
-fn zero_present(array: &ArrayRef) -> bool {
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float64Type, Int8Type, Int16Type, Int32Type, Int64Type};
-    match array.data_type() {
-        DataType::Int8 => array.as_primitive::<Int8Type>().iter().any(|v| v == Some(0)),
-        DataType::Int16 => array.as_primitive::<Int16Type>().iter().any(|v| v == Some(0)),
-        DataType::Int32 => array.as_primitive::<Int32Type>().iter().any(|v| v == Some(0)),
-        DataType::Int64 => array.as_primitive::<Int64Type>().iter().any(|v| v == Some(0)),
-        DataType::Float64 => array.as_primitive::<Float64Type>().iter().any(|v| v == Some(0.0)),
-        _ => true,
-    }
 }
 
 /// The column `evaluate` computed, typed as the expression's declared scalar.
 pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<Column> {
     computed_column(expr, evaluate(expr, schema, batch, parameters)?)
+}
+
+pub(crate) fn comparison_operand_bound(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<usize> {
+    if !lowerable(expr) { return None; }
+    let mut bound = EvaluationBound {
+        schema, batch, parameters,
+        bytes: crate::runtime_schema::expression_bound(expr).ok()?.checked_mul(4)?,
+        per_array: batch.len.checked_mul(64)?.checked_add(512)?,
+        inputs: 0,
+        selections: 0,
+    };
+    bound.expression(expr)?;
+    // DataFusion's CASE and short-circuit AND can copy their input batch for a selection.
+    bound.bytes.checked_add(bound.inputs.checked_mul(bound.selections)?.checked_mul(4)?)
+}
+
+struct EvaluationBound<'a> {
+    schema: &'a Schema,
+    batch: &'a ColumnBatch,
+    parameters: rtdb_expr::Parameters<'a>,
+    bytes: usize,
+    per_array: usize,
+    inputs: usize,
+    selections: usize,
+}
+
+impl EvaluationBound<'_> {
+    fn expression(&mut self, expr: &Expr) -> Option<usize> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.expression_at(expr))
+    }
+
+    fn expression_at(&mut self, expr: &Expr) -> Option<usize> {
+        self.bytes = self.bytes.checked_add(self.per_array)?;
+        let text = match expr {
+            Expr::Column { id, .. } => {
+                let Column::Arrow { array, .. } = self.batch.columns.get(self.schema.position(*id)?)? else { return None; };
+                let text = array.as_any().downcast_ref::<StringArray>().map_or(0, |strings| {
+                    let offsets = strings.value_offsets();
+                    (offsets[strings.len()] - offsets[0]) as usize
+                });
+                self.inputs = self.inputs.checked_add(self.per_array)?.checked_add(text)?;
+                text
+            }
+            Expr::Literal(Value::Utf8(text)) => text.len().checked_mul(self.batch.len.max(1))?,
+            Expr::Literal(_) => 0,
+            Expr::Parameter { index, .. } => match self.parameters.known(*index) {
+                Some(Value::Utf8(text)) => text.len().checked_mul(self.batch.len.max(1))?,
+                _ => 0,
+            },
+            Expr::Cast { expr, target: CastTarget::Fixed(_) } => self.expression(expr)?,
+            Expr::Unary { expr, .. } => { self.expression(expr)?; 0 }
+            Expr::Binary { op, left, right } => {
+                self.expression(left)?;
+                self.expression(right)?;
+                if *op == BinaryOp::And { self.selections = self.selections.checked_add(1)?; }
+                0
+            }
+            Expr::Case { branches, otherwise } => {
+                self.selections = self.selections.checked_add(branches.len())?;
+                let mut text = 0usize;
+                for (condition, value) in branches {
+                    self.expression(condition)?;
+                    text = text.checked_add(self.expression(value)?)?;
+                }
+                text.checked_add(self.expression(otherwise)?)?
+            }
+            Expr::Call { name, args, .. } => {
+                let text = args.iter().try_fold(0usize, |text, arg| text.checked_add(self.expression(arg)?))?;
+                if name.eq_ignore_ascii_case("upper") || name.eq_ignore_ascii_case("lower") {
+                    // A Unicode case mapping emits up to three code points of up to four bytes each.
+                    text.checked_mul(12)?
+                } else { 0 }
+            }
+            _ => return None,
+        };
+        self.bytes = self.bytes.checked_add(text.checked_mul(4)?)?;
+        Some(text)
+    }
 }
 
 pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arguments: &[Column],
@@ -371,6 +517,101 @@ mod tests {
     use rtdb_columnar::MemoryBudget;
     use rtdb_plan::{ColumnId, Field};
     use rtdb_types::Timestamp;
+
+    fn arrow(array: ArrayRef, scalar: ScalarType) -> Column {
+        let field = Arc::new(ArrowField::new("value", array.data_type().clone(), true));
+        Column::Arrow { array, field, logical: Some(LogicalType::Scalar(scalar)) }
+    }
+
+    #[test]
+    fn division_checks_the_divisor_in_the_rows_that_reach_it() {
+        let memory = MemoryBudget::new(1 << 20);
+        let numerator = field(0, ScalarType::F64);
+        let divisor = field(1, ScalarType::F64);
+        let condition = field(2, ScalarType::Bool);
+        let schema = Schema::new(vec![numerator.clone(), divisor.clone(), condition.clone()]).unwrap();
+        let divide = |right| Expr::binary(BinaryOp::Divide, numerator.expression(), right);
+        let guarded = Expr::Case {
+            branches: vec![(condition.expression(), divide(divisor.expression()))],
+            otherwise: Box::new(Expr::Literal(Value::F64(7.0))),
+        };
+        let batch = ColumnBatch::settled(vec![
+            arrow(Arc::new(Float64Array::from(vec![Some(8.0), Some(8.0), None, None, Some(8.0)])), ScalarType::F64),
+            arrow(Arc::new(Float64Array::from(vec![Some(2.0), None, Some(2.0), Some(-0.0), Some(0.0)])), ScalarType::F64),
+            arrow(Arc::new(BooleanArray::from(vec![true, true, true, false, false])), ScalarType::Bool),
+        ], 5, memory.reserve(0).unwrap()).unwrap();
+        let parameters = rtdb_expr::Parameters::Values(&[]);
+        let values = evaluate(&guarded, &schema, &batch, parameters).unwrap();
+        assert_eq!(values.as_primitive::<Float64Type>().iter().collect::<Vec<_>>(), [Some(4.0), None, None, Some(7.0), Some(7.0)]);
+        assert!(evaluate(&divide(divisor.expression()), &schema, &batch, parameters).is_none());
+        for zero in [0.0, -0.0] {
+            assert!(evaluate(&divide(Expr::Literal(Value::F64(zero))), &schema, &batch, parameters).is_none());
+            let empty = ColumnBatch::settled(vec![], 0, memory.reserve(0).unwrap()).unwrap();
+            let constant = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::F64(8.0)), Expr::Literal(Value::F64(zero)));
+            let empty_result = evaluate(&constant, &Schema::default(), &empty, parameters).unwrap();
+            assert!(empty_result.is_empty());
+        }
+
+        let null = Expr::Parameter { index: 0, data_type: numerator.data_type.clone() };
+        let null_divided_by_zero = Expr::binary(BinaryOp::Divide, null, Expr::Literal(Value::F64(-0.0)));
+        let arguments = [arrow(Arc::new(Float64Array::from(vec![None::<f64>])), ScalarType::F64)];
+        assert!(bound_column(&null_divided_by_zero, &Schema::default(), &[], &arguments, &memory).unwrap().is_none());
+    }
+
+    #[test]
+    fn division_fallback_reports_the_first_reached_scalar_error() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::default();
+        let batch = ColumnBatch::settled(vec![], 1, memory.reserve(0).unwrap()).unwrap();
+        let division = |left, right| Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(left)), Expr::Literal(Value::I64(right)));
+        let overflow = division(i64::MIN, -1);
+        let zero = division(1, 0);
+        let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Values(&[]), parameter_types: None,
+            current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC", outer_rows: &[], snapshot_token: None,
+            allocation: Some(&scope), catalog: None };
+        for (left, right, code) in [
+            (overflow.clone(), zero.clone(), "xtdb/numeric-value-out-of-range"),
+            (zero.clone(), overflow, "xtdb.expression/division-by-zero"),
+        ] {
+            let expr = Expr::binary(BinaryOp::Add, left, right);
+            assert!(evaluate(&expr, &schema, &batch, context.parameters).is_none());
+            assert_eq!(rtdb_expr::evaluate(&expr, &schema, &[], &context).unwrap_err().code, code);
+        }
+        let unreachable = Expr::binary(BinaryOp::And, Expr::Literal(Value::Bool(false)),
+            Expr::binary(BinaryOp::Eq, zero, Expr::Literal(Value::I64(1))));
+        assert_eq!(truth(&unreachable, &schema, &batch, context.parameters), Some(vec![Some(false)]));
+    }
+
+    #[test]
+    fn function_layouts_reuse_types_and_bind_live_arrays_and_parameters() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::I32);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let abs = Expr::Call {
+            name: "abs".into(),
+            args: vec![Expr::binary(BinaryOp::Add, input.expression(), Expr::Parameter { index: 0, data_type: input.data_type.clone() })],
+            return_type: input.data_type.clone(),
+        };
+        for (value, argument, expected) in [(-7, 3, 4), (11, -2, 9)] {
+            let batch = ColumnBatch::settled(vec![arrow(Arc::new(Int32Array::from(vec![value])), ScalarType::I32)],
+                1, memory.reserve(0).unwrap()).unwrap();
+            let argument = [Value::I32(argument)];
+            let result = evaluate(&abs, &schema, &batch, rtdb_expr::Parameters::Values(&argument)).unwrap();
+            assert_eq!(result.as_primitive::<Int32Type>().value(0), expected);
+        }
+
+        let upper = Expr::Call {
+            name: "upper".into(),
+            args: vec![Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) }],
+            return_type: LogicalType::Scalar(ScalarType::Utf8),
+        };
+        for (value, expected) in [("abc", "ABC"), ("Straße", "STRASSE")] {
+            let arguments = [arrow(Arc::new(StringArray::from(vec![value])), ScalarType::Utf8)];
+            let result = bound_column(&upper, &Schema::default(), &[], &arguments, &memory).unwrap().unwrap();
+            assert_eq!(result.value(0).unwrap(), Value::Utf8(expected.into()));
+        }
+    }
 
     #[test]
     fn modulo_projects_primitive_arrow_cells_and_feeds_an_integer_predicate() {

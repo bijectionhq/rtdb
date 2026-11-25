@@ -2165,6 +2165,7 @@ surface QueryAccess {
         -- A compatible cast to nullable or union list elements checks the types observed in the selected input.
         -- Text conversion of packed numeric lists renders the selected typed components into one text buffer.
         -- Compatible Boolean expressions select rows or produce a result vector directly from Arrow inputs, including selections across multiple source vectors.
+        -- Direct predicate comparisons keep their computed arithmetic operands in admitted Arrow buffers from construction through comparison.
         -- Checked numeric arithmetic can produce a result vector from selected Arrow positions with a compatible physical type.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
