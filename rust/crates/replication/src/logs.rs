@@ -422,6 +422,13 @@ impl PartitionLogs {
             else { ReplicaFrame::decode_bytes(record.payload.clone())? };
         let (term, sequence) = (frame.term, frame.term_sequence);
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
+        if let ReplicaBody::NoOp(message) = &envelope.message
+            && let Some((_, _, cutoff)) = crate::serving::funded_guard(message)?
+            && record.timed_original != Some(cutoff)
+        {
+            return Err(Anomaly::fault("rtdb/timed-original-proof",
+                "The replica delivery does not attest the funded record's original journal cutoff"));
+        }
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
             .then(|| observed.unwrap_or_else(|| fingerprint(&record.payload)));
         let oversized = matches!(&envelope.message, ReplicaBody::OversizedMessage(_));
@@ -508,6 +515,11 @@ impl PartitionLogs {
                 } else { record.envelope.unwrap_payload_bytes(payload)? }
             }
         };
+        if let ReplicaBody::NoOp(message) = &envelope.message
+            && crate::serving::is_funded_original(message)
+        {
+            return Err(Anomaly::fault("rtdb/timed-original-proof", "A funded original must be an inline replica record"));
+        }
         let fingerprint = record.fingerprint.and(digest);
         Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery: None })
     }

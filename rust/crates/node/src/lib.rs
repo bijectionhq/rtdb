@@ -67,4 +67,6 @@ pub use operations::{CompactorReset, SnapshotExport};
 /// and stack overflow aborts the process rather than failing the query. It is reserved, not committed, up front.
 pub const WORKER_STACK_BYTES: usize = 16 << 20;
 
+mod receiver_clock;
+pub use receiver_clock::CertifiedDecisionClock;
 pub use rtdb_tx::{DecisionClock, DecisionObservation};

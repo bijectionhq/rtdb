@@ -190,7 +190,9 @@ pub(crate) struct Writer {
 }
 
 fn record(entry: &Entry) -> LogRecord {
-    LogRecord::new(LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, entry.payload.clone())
+    let mut record = LogRecord::new(LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, entry.payload.clone());
+    record.timed_original = super::committed_timed_original(entry);
+    record
 }
 
 /// Seals every server and gathers a write quorum of replies, plus any that arrive shortly after.

@@ -105,18 +105,26 @@ impl ServerDriver {
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, Backend::Configured(None, None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, Backend::Configured(None, None), None).await
+    }
+
+    pub async fn open_with_certified_clock(
+        config: NodeConfiguration, limit: usize, resources: NativeResources,
+        tls: Option<tokio_rustls::rustls::ServerConfig>,
+        clock: Arc<rtdb_node::CertifiedDecisionClock>,
+    ) -> Result<(ServerHandle, Self)> {
+        Self::open_installed_with_clock(config, limit, resources, tls.map(Arc::new), Some(clock)).await
     }
 
     /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
     /// Its holders claim as soon as they reach the tip and append nothing while idle.
     pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), Backend::Configured(None, None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), Backend::Configured(None, None), None).await
     }
 
     /// Uses a host clock for transactions appended to in-memory and local source logs.
     pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, Backend::Configured(None, None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, Backend::Configured(None, None), None).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -132,7 +140,7 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, Backend::Configured(None, None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, Backend::Configured(None, None), None).await
     }
 
     #[cfg(feature = "multi")]
@@ -142,8 +150,25 @@ impl ServerDriver {
 
     #[cfg(feature = "multi")]
     pub async fn open_with_multi_tls(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime, tls: Option<tokio_rustls::rustls::ServerConfig>) -> Result<(ServerHandle, Self)> {
+        Self::open_with_multi_clock(config, limit, memory, multi, tls, None).await
+    }
+
+    #[cfg(feature = "multi")]
+    pub async fn open_with_multi_certified_clock(
+        config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime,
+        tls: Option<tokio_rustls::rustls::ServerConfig>, clock: Arc<rtdb_node::CertifiedDecisionClock>,
+    ) -> Result<(ServerHandle, Self)> {
+        Self::open_with_multi_clock(config, limit, memory, multi, tls, Some(clock)).await
+    }
+
+    #[cfg(feature = "multi")]
+    async fn open_with_multi_clock(
+        config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime,
+        tls: Option<tokio_rustls::rustls::ServerConfig>, clock: Option<Arc<rtdb_node::CertifiedDecisionClock>>,
+    ) -> Result<(ServerHandle, Self)> {
         multi.validate_assignment_peer_auth(&config.auth)?;
-        Self::open_mode(config, limit, memory, false, None, None, Backend::Configured(Some(multi.resource_override()), tls.map(Arc::new))).await
+        let backend = Backend::Configured(Some(multi.resource_override()), tls.map(Arc::new));
+        Self::open_mode(config, limit, memory, false, None, None, backend, clock).await
     }
 
     #[cfg(all(feature = "multi", feature = "s3"))]
@@ -174,14 +199,22 @@ impl ServerDriver {
     }
 
     pub(crate) async fn open_installed(config: NodeConfiguration, limit: usize, resources: NativeResources, tls: Option<Tls>) -> Result<(ServerHandle, Self)> {
+        Self::open_installed_with_clock(config, limit, resources, tls, None).await
+    }
+
+    async fn open_installed_with_clock(
+        config: NodeConfiguration, limit: usize, resources: NativeResources, tls: Option<Tls>,
+        certified_clock: Option<Arc<rtdb_node::CertifiedDecisionClock>>,
+    ) -> Result<(ServerHandle, Self)> {
         if tls.is_none() && (config.server.is_some() || config.flight_sql.is_some()) {
             return Err(Anomaly::incorrect("rtdb.server/standalone", "Installed listeners require TLS"));
         }
         let memory = MemoryBudget::new(config.node_options(limit)?.execution_memory_bytes);
-        Self::open_mode(config, limit, memory, false, None, None, Backend::Installed { resources: Box::new(resources), tls }).await
+        let backend = Backend::Installed { resources: Box::new(resources), tls };
+        Self::open_mode(config, limit, memory, false, None, None, backend, certified_clock).await
     }
 
-    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, backend: Backend) -> Result<(ServerHandle, Self)> {
+    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, backend: Backend, certified_clock: Option<Arc<rtdb_node::CertifiedDecisionClock>>) -> Result<(ServerHandle, Self)> {
         if matches!(&config.auth, AuthConfig::ManagedWorkloadOidc(_))
             && !matches!(&backend, Backend::Configured(Some(_), _))
         {
@@ -231,7 +264,8 @@ impl ServerDriver {
             None => resources,
         };
         let compaction_relay = placed.as_ref().and_then(|placed| placed.compaction_relay.clone());
-        let decision_clock = placed.as_ref().and_then(|placed| placed.decision_clock.clone());
+        let decision_clock = certified_clock.map(|clock| clock as Arc<dyn rtdb_tx::DecisionClock>)
+            .or_else(|| placed.as_ref().and_then(|placed| placed.decision_clock.clone()));
         let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());

@@ -2007,11 +2007,11 @@ impl ReplicationDriver {
         };
         let mut request = request;
         if let Ok(candidate) = &mut request
-            && let Some(funding) = &mut candidate.funding
+            && candidate.funding.is_some()
         {
             let clock = self.resolve.decision_clock.as_ref().filter(|clock| clock.supports_funded_offers());
             if let Some(clock) = clock.filter(|_| self.logs.replica_timed_original_append_limit().is_some()) {
-                self.cancellation.run_until_cancelled(funding.verify(&candidate.transaction, clock.as_ref()))
+                self.cancellation.run_until_cancelled(candidate.verify_funding(serving, clock.as_ref()))
                     .await.ok_or_else(stopped)?;
             } else {
                 request = Err(rtdb_tx::transact::funding_unsupported());

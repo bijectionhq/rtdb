@@ -244,10 +244,10 @@ impl Authority {
             return Err(AttemptError::Local(Anomaly::new(AnomalyCategory::Conflict,
                 "rtdb/window-expired", "The original timed append missed its admission bounds")));
         }
-        let appended = batch.append_timed_original(self.stream.id(), self.lease.epoch, write.at, bytes, cutoff)
+        let original = self.stream.timed_original(write.at, self.lease.epoch, &bytes, cutoff);
+        let proof = batch.append_timed_original(original, bytes)
             .await.map_err(AttemptError::Journal)?;
-        if appended != write.at { return Err(AttemptError::Local(order_error("The journal acknowledged a different funded position"))); }
-        Ok(())
+        proof.verify_exact(original).map_err(AttemptError::Local)
     }
 
     fn upper(&self) -> Timestamp {
@@ -636,7 +636,7 @@ impl MultiDatabase {
             .ok_or_else(rtdb_tx::transact::funding_unsupported)?.saturating_sub(1024);
         let claims = self.tokens.verify_claims_in(request.claims(), scope.map(|scope| scope.labels)).await;
         let mut funding = rtdb_tx::transact::FundingInput::new(command, owner);
-        funding.verify(request, clock).await;
+        funding.verify(request, self.durable_transactions(), scope, clock).await;
         let lease = self.authority()?;
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;

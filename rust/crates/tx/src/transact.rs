@@ -425,7 +425,7 @@ impl TransactionRecord {
         let (version, record): (u8, Self) = serde_json::from_slice(bytes)
             .map_err(|error| Anomaly::fault("rtdb/transaction-decoding", error.to_string()))?;
         if (version, record.carries_funding()) != (RECORD_VERSION, false)
-            && (version, record.carries_funding()) != (FUNDED_RECORD_VERSION, true)
+            && ((version, record.carries_funding()) != (FUNDED_RECORD_VERSION, true) || !funded_record(bytes))
         {
             return Err(Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version"));
         }
@@ -438,6 +438,17 @@ impl TransactionRecord {
     fn carries_funding(&self) -> bool {
         matches!(self, Self::Tx(tx) if tx.receipt.decision_clock.is_some())
     }
+
+    pub fn funded_journal_cutoff(bytes: &[u8]) -> Result<Option<rtdb_types::TimedJournalCutoff>> {
+        if !funded_record(bytes) { return Ok(None); }
+        let Self::Tx(tx) = Self::decode(bytes)? else { return Err(invalid_record()); };
+        Ok(tx.funded_guard()?.map(|(_, _, cutoff)| cutoff))
+    }
+}
+
+fn funded_record(bytes: &[u8]) -> bool {
+    // The admitted encoder emits this exact version prefix. A funded decode rejects alternate framing.
+    bytes.starts_with(b"[3,")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

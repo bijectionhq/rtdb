@@ -18,7 +18,13 @@ pub enum FundingInput {
         issued: Option<OfferClock>,
         booking: [u8; 16],
     },
-    Consume { owner: [u8; 32], booking: [u8; 16], observed: Option<DecisionObservation> },
+    Consume {
+        owner: [u8; 32],
+        booking: [u8; 16],
+        observed: Option<DecisionObservation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate: Option<[u8; 32]>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,14 +56,32 @@ impl FundingInput {
     pub fn new(command: FundingCommand, owner: [u8; 32]) -> Self {
         match command {
             FundingCommand::Book { predecessor, booking } => Self::Book { owner, predecessor, booking, issued: None },
-            FundingCommand::Consume { booking } => Self::Consume { owner, booking, observed: None },
+            FundingCommand::Consume { booking } => Self::Consume { owner, booking, observed: None, certificate: None },
         }
     }
 
-    pub async fn verify(&mut self, request: &Transact, clock: &dyn DecisionClock) {
+    pub async fn verify(
+        &mut self, request: &Transact, state: &TransactState, scope: Option<ScopedTransact<'_>>, clock: &dyn DecisionClock,
+    ) {
+        let namespace = scope.map(|scope| scope.receipt_namespace);
+        let stored = state.receipts.get(&namespace).and_then(|receipts| receipts.get(&request.key));
+        let original = stored.and_then(|stored| stored.receipt.decision_clock)
+            .filter(|offer| offer.matches(*self) && offer.booked());
         match self {
-            Self::Book { predecessor, issued, .. } => *issued = request.offer_clock(*predecessor, clock).await.ok(),
-            Self::Consume { observed, .. } => *observed = clock.observe().await.ok(),
+            Self::Book { predecessor, issued, .. } => {
+                *issued = None;
+                if stored.is_none() && let Ok(original) = original_predecessor(state.index(), *predecessor, scope) {
+                    *issued = request.offer_clock(original, clock).await.ok();
+                }
+            }
+            Self::Consume { observed, certificate, .. } => {
+                *observed = None;
+                *certificate = None;
+                if let Some(offer) = original && let Ok(sample) = clock.observe().await {
+                    *observed = Some(sample);
+                    *certificate = clock.funded_certificate(offer.original, sample);
+                }
+            }
         }
     }
 }
@@ -82,7 +106,8 @@ impl Transact {
         let before = self.window.before.map_or(end, |before| before.min(end));
         let lower = self.window.not_before.map_or(reading, |start| start.max(reading));
         let cutoff = clock.authorize_offer(predecessor, issued, before).await?;
-        if cutoff.decision_before <= lower || cutoff.decision_before > before
+        if clock.funded_certificate(predecessor, issued) != Some(cutoff.journal.certificate_sha256())
+            || cutoff.decision_before <= lower || cutoff.decision_before > before
             || cutoff.journal.before() < cutoff.decision_before || cutoff.journal.before() > before
         {
             return Err(funding_invalid());
@@ -177,7 +202,7 @@ pub(super) fn resolve_funding(
         return match input {
             FundingInput::Book { .. } => Ok(FundingDecision::Replay(replay(&stored.receipt))),
             FundingInput::Consume { .. } if !offer.booked() => Ok(FundingDecision::Replay(replay(&stored.receipt))),
-            FundingInput::Consume { observed, .. } => {
+            FundingInput::Consume { observed, certificate, .. } => {
                 let observed = observed.ok_or_else(funding_unsupported)?;
                 if !observed.covers(offer.clock.issued)
                     || DecisionObservation::decode(&observed.encode()).is_err()
@@ -191,6 +216,9 @@ pub(super) fn resolve_funding(
                 let refusal = (observed.instant >= offer.clock.before).then(|| {
                     Anomaly::new(AnomalyCategory::Conflict, "rtdb/window-expired", "The transaction window has expired")
                 });
+                if refusal.is_none() && certificate != Some(offer.clock.certificate) {
+                    return Err(funding_unsupported());
+                }
                 Ok(FundingDecision::Consume {
                     sample: observed.instant, refusal,
                     receipt: FundedReceipt { phase: Phase::Terminal { observed }, ..offer },
@@ -204,12 +232,16 @@ pub(super) fn resolve_funding(
     if owner == [0; 32] || booking == [0; 16] || scope.is_some_and(|scope| owner != scope.receipt_namespace) {
         return Err(funding_invalid());
     }
+    let original = original_predecessor(view.durable_index, predecessor, scope)?;
     let clock = issued.ok_or_else(funding_unsupported)?;
-    let original = match scope {
-        Some(scope) => view.durable_index.project_main_visibility(scope.labels)?.source_basis(predecessor)?,
-        None => view.durable_index.exact(predecessor)?.basis,
-    };
     Ok(FundingDecision::Book(FundedReceipt { booking, owner, predecessor, original, clock, phase: Phase::Booked }))
+}
+
+fn original_predecessor(index: &BranchIndex, predecessor: Basis, scope: Option<ScopedTransact<'_>>) -> Result<Basis> {
+    match scope {
+        Some(scope) => index.project_main_visibility(scope.labels)?.source_basis(predecessor),
+        None => Ok(index.exact(predecessor)?.basis),
+    }
 }
 
 pub fn funding_unsupported() -> Anomaly {
@@ -249,7 +281,7 @@ mod tests {
     }
 
     fn consume(micros: i64) -> FundingInput {
-        FundingInput::Consume { owner: OWNER, booking: BOOKING, observed: Some(observation(2, micros)) }
+        FundingInput::Consume { owner: OWNER, booking: BOOKING, observed: Some(observation(2, micros)), certificate: Some([8; 32]) }
     }
 
     fn request(key: u8, ops: Vec<Op>) -> Transact {
@@ -305,10 +337,12 @@ mod tests {
         foreign.window.before = Some(Timestamp(1_960_000));
         assert!(funded(&mut pipeline, &foreign, None, consume(1_200_000)).is_err());
         assert!(funded(&mut pipeline, &request, None,
-            FundingInput::Consume { owner: [7; 32], booking: BOOKING, observed: Some(observation(2, 1_200_000)) }).is_err());
+            FundingInput::Consume { owner: [7; 32], booking: BOOKING, observed: Some(observation(2, 1_200_000)), certificate: Some([8; 32]) }).is_err());
         let foreign_receiver = DecisionObservation { domain: [7; 16], ..observation(2, 1_200_000) };
         assert!(funded(&mut pipeline, &request, None,
-            FundingInput::Consume { owner: OWNER, booking: BOOKING, observed: Some(foreign_receiver) }).is_err());
+            FundingInput::Consume { owner: OWNER, booking: BOOKING, observed: Some(foreign_receiver), certificate: Some([8; 32]) }).is_err());
+        assert!(funded(&mut pipeline, &request, None,
+            FundingInput::Consume { owner: OWNER, booking: BOOKING, observed: Some(observation(2, 1_200_000)), certificate: Some([7; 32]) }).is_err());
 
         let terminal = funded(&mut pipeline, &request, None, consume(1_200_000)).unwrap();
         let (receipt, record) = append(&mut pipeline, terminal);

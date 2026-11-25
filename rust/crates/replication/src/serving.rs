@@ -350,6 +350,12 @@ impl NativeServingHandle {
 }
 
 impl<C> NativeRequest<C> {
+    pub(crate) async fn verify_funding(&mut self, serving: &NativeServing, clock: &dyn rtdb_tx::DecisionClock) {
+        if let Some(funding) = &mut self.funding {
+            funding.verify(&self.transaction, serving.durable(), self.scope.as_ref().map(NativeServingScope::authority), clock).await;
+        }
+    }
+
     fn is_validation(&self) -> bool {
         self.funding.is_none() && self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
     }

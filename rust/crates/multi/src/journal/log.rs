@@ -730,6 +730,7 @@ impl Cursor {
             let record = LogRecord {
                 metadata: head.metadata,
                 replica_objects,
+                timed_original: None,
                 payload: Bytes::from_owner(Delivery {
                     bytes: payload,
                     _held: Arc::clone(held),

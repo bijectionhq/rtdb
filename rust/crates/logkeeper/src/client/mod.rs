@@ -547,7 +547,16 @@ impl QuorumLog {
 }
 
 fn record(entry: crate::protocol::Entry) -> LogRecord {
-    LogRecord::new(LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, entry.payload)
+    let timed_original = committed_timed_original(&entry);
+    let mut record = LogRecord::new(LogMetadata { offset: LogOffset(entry.lsn), timestamp: Timestamp(entry.timestamp) }, entry.payload);
+    record.timed_original = timed_original;
+    record
+}
+
+fn committed_timed_original(entry: &crate::protocol::Entry) -> Option<rtdb_types::TimedJournalCutoff> {
+    if !entry.valid_guard() { return None; }
+    let certificate = entry.timed_origin.as_ref()?.clock_certificate_sha256.as_ref().try_into().ok()?;
+    rtdb_types::TimedJournalCutoff::new(Timestamp(entry.guarded_before?), certificate).ok()
 }
 
 fn unavailable(stream: &str, message: impl Into<String>) -> Error { Error::Remote { key: stream.to_owned(), message: message.into() } }

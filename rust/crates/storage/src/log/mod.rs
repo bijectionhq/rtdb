@@ -73,13 +73,15 @@ pub struct LogRecord {
     pub metadata: LogMetadata,
     pub payload: Bytes,
     pub replica_objects: Option<ReplicaObjectCustody>,
+    /// The committed provider frame's timed authority, separate from the payload's claim.
+    pub timed_original: Option<rtdb_types::TimedJournalCutoff>,
 }
 
 const LOG_RECORD_OVERHEAD_BYTES: usize = 256;
 
 impl LogRecord {
     pub fn new(metadata: LogMetadata, payload: Bytes) -> Self {
-        Self { metadata, payload, replica_objects: None }
+        Self { metadata, payload, replica_objects: None, timed_original: None }
     }
 
     /// Keeps the caller's pre-read charge alive for every clone of the payload.
@@ -95,6 +97,7 @@ impl LogRecord {
             metadata: self.metadata,
             payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }),
             replica_objects: self.replica_objects,
+            timed_original: self.timed_original,
         }
     }
 }

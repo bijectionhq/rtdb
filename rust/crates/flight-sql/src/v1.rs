@@ -226,12 +226,13 @@ impl Service {
                         features.push(custody::SCOPED_CUSTODY.into());
                     }
                 }
-                if funding_owner(&call).is_some() && self.0.node.funded_offer_clock().is_some()
+                if funding_owner(&call).is_some() && let Some(clock) = self.0.node.funded_offer_clock()
                     && features.iter().any(|feature| feature == "transact")
                     && (scoped || call.session.caller.principal.authorize_database(&call.database, DatabaseAccess::Write).is_ok())
                     && let Ok(database) = self.0.node.catalog().database(&call.database)
                     && !database.read_only()
                     && let Some(driver) = database.serving_driver()
+                    && clock.funded_offers_for(driver.incarnation(), self.0.node.now())
                     && driver.supports_funded_transact().await
                 {
                     features.push(DECISION_CLOCK_OFFER.into());

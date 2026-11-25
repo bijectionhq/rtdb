@@ -4,11 +4,40 @@ use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, StreamId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_tx::transact::TransactionRecord;
+use rtdb_types::{Anomaly, AnomalyCategory, Result, TimedJournalCutoff, Timestamp};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const ENVELOPE_VERSION: u8 = 1;
 const PAGE_SIZE: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedOriginal {
+    pub stream: StreamId,
+    pub epoch: Epoch,
+    pub at: Lsn,
+    pub payload_sha256: [u8; 32],
+    pub cutoff: TimedJournalCutoff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedOriginalProof {
+    pub original: TimedOriginal,
+    pub quorum_sync_at: Timestamp,
+    pub evidence_sha256: [u8; 32],
+}
+
+impl TimedOriginalProof {
+    pub(crate) fn verify_exact(self, original: TimedOriginal) -> Result<()> {
+        if self.original != original || self.evidence_sha256 == [0; 32]
+            || self.quorum_sync_at.0 <= 0 || self.quorum_sync_at >= original.cutoff.before()
+        {
+            return Err(Anomaly::fault("rtdb/timed-original-proof", "The provider returned a different timed original quorum proof"));
+        }
+        Ok(())
+    }
+}
 
 /// Commits a contiguous append group through its returned head.
 /// An error may leave a committed prefix of the group.
@@ -22,16 +51,20 @@ pub trait JournalBatchAppender: Send + Sync {
 
     fn maximum_timed_original_bytes(&self) -> Option<usize> { None }
 
-    /// A committed entry attests the exact payload, writer epoch and certificate
-    /// under the original quorum, before the exclusive journal cutoff.
+    /// Returns verified original quorum evidence for the exact sealed bytes.
     fn append_timed_original(
         &self,
-        _stream: StreamId,
-        _epoch: Epoch,
-        _at: Lsn,
+        _original: TimedOriginal,
         _payload: Bytes,
-        _cutoff: rtdb_types::TimedJournalCutoff,
-    ) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+    ) -> BoxFuture<'_, journal_contract::Result<TimedOriginalProof>> {
+        Box::pin(async { Err(JournalError::Unavailable) })
+    }
+
+    /// Reopens retained proofs under the original keeper identities after writer replacement.
+    fn prove_timed_original(
+        &self,
+        _original: TimedOriginal,
+    ) -> BoxFuture<'_, journal_contract::Result<TimedOriginalProof>> {
         Box::pin(async { Err(JournalError::Unavailable) })
     }
 }
@@ -60,8 +93,12 @@ impl Stream {
         }
     }
 
-    pub(crate) fn id(&self) -> StreamId {
+    fn id(&self) -> StreamId {
         StreamId(u128::from_be_bytes(*self.database.as_bytes()))
+    }
+
+    pub(crate) fn timed_original(&self, at: Lsn, epoch: Epoch, payload: &[u8], cutoff: TimedJournalCutoff) -> TimedOriginal {
+        TimedOriginal { stream: self.id(), epoch, at, payload_sha256: Sha256::digest(payload).into(), cutoff }
     }
 
     pub(crate) async fn create(&self) -> Result<()> {
@@ -124,11 +161,15 @@ impl Stream {
         if epoch == Epoch(0) {
             return Err(invalid_entry());
         }
-        Ok(Entry {
-            epoch,
-            generation: plaintext.generation.number,
-            record: Record::decode(record)?,
-        })
+        let record = Record::decode(record)?;
+        if let Record::Tx { payload, .. } = &record
+            && let Some(cutoff) = TransactionRecord::funded_journal_cutoff(payload)?
+        {
+            let batch = self.batch.as_ref().ok_or_else(rtdb_tx::transact::funding_unsupported)?;
+            let original = self.timed_original(lsn, epoch, bytes, cutoff);
+            batch.prove_timed_original(original).await.map_err(journal_error)?.verify_exact(original)?;
+        }
+        Ok(Entry { epoch, generation: plaintext.generation.number, record })
     }
 
     pub(crate) async fn append(
@@ -185,4 +226,22 @@ pub(crate) fn journal_error(error: JournalError) -> Anomaly {
         JournalError::Unavailable => (AnomalyCategory::Unavailable, "rtdb/journal-unavailable"),
     };
     Anomaly::new(category, code, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timed_original_proof_requires_exact_sealed_bytes_and_an_exclusive_quorum_sample() {
+        let original = TimedOriginal {
+            stream: StreamId(1), epoch: Epoch(2), at: Lsn(3), payload_sha256: [4; 32],
+            cutoff: TimedJournalCutoff::new(Timestamp(20), [5; 32]).unwrap(),
+        };
+        let proof = TimedOriginalProof { original, quorum_sync_at: Timestamp(19), evidence_sha256: [6; 32] };
+        assert!(proof.verify_exact(original).is_ok());
+        assert!(proof.verify_exact(TimedOriginal { payload_sha256: [7; 32], ..original }).is_err());
+        assert!(proof.verify_exact(TimedOriginal { epoch: Epoch(8), ..original }).is_err());
+        assert!(TimedOriginalProof { quorum_sync_at: Timestamp(20), ..proof }.verify_exact(original).is_err());
+    }
 }
