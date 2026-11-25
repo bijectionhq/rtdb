@@ -478,7 +478,10 @@ impl AppendTimestampSource for JournalTimestamp {
 async fn initialize_journal(path: &Path) -> Result<Uuid> {
     let (log, driver) = rtdb_storage::log::LocalLog::open_replica(
         path,
-        LocalLogOptions::default(),
+        LocalLogOptions {
+            maximum_message_bytes: ReadOnlyLocalLogOptions::default().maximum_message_bytes,
+            queue_capacity: 1,
+        },
         Arc::new(JournalTimestamp),
         IoRegion::new(),
         None,

@@ -9,6 +9,7 @@ use rtdb_maintenance::ArtefactDefinition;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, Instant, ListKind, LogicalType, Result, ScalarType, TableRef, Value};
+use rtdb_plan::Catalog;
 use tokio_util::sync::CancellationToken;
 
 use crate::shortlist::admit_growth;

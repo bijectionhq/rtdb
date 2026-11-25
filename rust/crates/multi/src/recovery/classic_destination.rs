@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::{RecoveryService, Reply, classic_provider, valid_manifest};
 use crate::archive::{
     self, ApplicationEvidence, ClassicProjection, ClassicRead, PointHistoryRead, ReceiptHistory,
-    ReceiptLookup, ReceiptLookups, StageSelector,
+    ReceiptLookup, ReceiptLookups, ReceiptPolicySelection, StageSelector,
 };
 
 #[derive(Deserialize, Serialize)]
@@ -128,6 +128,7 @@ pub(super) enum Operation {
         candidate_binding: Binding,
         classic_cut: TransactionKey,
         points: Option<PointHistoryRead>,
+        receipt_policy: Option<ReceiptPolicySelection>,
         provider: Option<classic_provider::Population>,
     },
 }
@@ -263,10 +264,15 @@ impl RecoveryService {
             evidence.original_receipt_coverage = readback.coverage;
             return Ok(Reply::ClassicMigrationDestination { evidence });
         }
-        if let Operation::Application { candidate_binding, classic_cut, points, provider } = operation {
+        if let Operation::Application { candidate_binding, classic_cut, points, receipt_policy, provider } = operation {
             let Some(layout) = &self.classic_application_layout else {
                 return Ok(Reply::Refused);
             };
+            if receipt_policy.is_some() && (!layout.registered_receipt_policy
+                || points.is_some() || provider.is_some())
+            {
+                return Ok(Reply::Refused);
+            }
             if !evidence.matches_binding(&candidate_binding)
                 || candidate_binding.begin_sha256 == [0; 32]
                 || candidate_binding.catalog.is_nil()
@@ -305,7 +311,7 @@ impl RecoveryService {
                 authority, evidence.selection.ciphertext_sha256, self.hosted_task.clone(),
                 ClassicRead::Application {
                     request: request_sha256, begin: candidate_binding.begin_sha256, cut: classic_cut,
-                    points, provider_release, layout: Arc::clone(layout),
+                    points, receipt_policy, provider_release, layout: Arc::clone(layout),
                 },
             )).await?;
             let prepared = prepared.ok_or_else(conflict)?;
@@ -383,6 +389,10 @@ impl RecoveryService {
             return Ok(match application {
                 ApplicationEvidence::Closure(application) => Reply::ClassicMigrationApplicationReadback {
                     selection: evidence.selection, candidate_binding, application,
+                },
+                ApplicationEvidence::ReceiptPolicy(policy) => Reply::ClassicMigrationReceiptPolicyReadback {
+                    selection: evidence.selection, candidate_binding, classic_cut,
+                    terminal: evidence.terminal, terminal_sha256, policy,
                 },
                 ApplicationEvidence::Points(histories) => Reply::ClassicMigrationPointHistories {
                     selection: evidence.selection, candidate_binding, classic_cut,

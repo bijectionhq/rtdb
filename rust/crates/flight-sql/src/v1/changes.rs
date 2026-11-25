@@ -1209,12 +1209,15 @@ fn write_values<'a>(
         .unzip::<_, _, Vec<_>, Vec<_>>();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|error| error::map_status(Status::internal(error.to_string())))?;
-    write_image(
-        &batch,
-        0,
-        &(0..batch.num_columns()).collect::<Vec<_>>(),
-        memory,
+    let size = wire::add(
+        wire::mul(batch.get_array_memory_size(), 4).map_err(error::map_status)?,
+        wire::schema_bound(batch.schema().as_ref()).map_err(error::map_status)?,
     )
+    .map_err(error::map_status)?;
+    let charge = memory.reserve(size).map_err(error::anomaly)?;
+    let bytes = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+        .map_err(error::anomaly)?;
+    Ok(wire::retain(bytes, charge))
 }
 
 fn tables(names: &[String]) -> Result<BTreeSet<TableRef>, Status> {

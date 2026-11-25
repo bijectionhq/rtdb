@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::layout::{ApplicationLayout, SqlReleaseLayout};
 use super::points::{PointHistories, PointHistoryRead, PointSelector};
+use super::receipt_policy::{ReceiptPolicyReadback, ReceiptPolicySelection};
 use super::{RelationInventory, RetainedInventory, inconsistent, unavailable};
 use crate::archive::{encode, sha256};
 use crate::recovery::classic_provider::ReleaseSelection;
@@ -32,12 +33,14 @@ pub(super) struct Application {
     events: BTreeMap<(TableRef, EntityId, TxId, Timestamp, Timestamp), EventHeader>,
     charges: Vec<Arc<MemoryReservation>>,
     points: Option<PointHistoryRead>,
+    receipt_policy: Option<ReceiptPolicySelection>,
     provider_release: Option<ReleaseSelection>,
 }
 
 pub(crate) enum ApplicationEvidence {
     Closure(ApplicationReadback),
     Points(PointHistories),
+    ReceiptPolicy(ReceiptPolicyReadback),
 }
 
 #[derive(Deserialize)]
@@ -117,12 +120,18 @@ impl Application {
             events: BTreeMap::new(),
             charges: Vec::new(),
             points: None,
+            receipt_policy: None,
             provider_release: None,
         }
     }
 
     pub(super) fn with_points(mut self, points: Option<PointHistoryRead>) -> Self {
         self.points = points;
+        self
+    }
+
+    pub(super) fn with_receipt_policy(mut self, selection: Option<ReceiptPolicySelection>) -> Self {
+        self.receipt_policy = selection;
         self
     }
 
@@ -215,6 +224,7 @@ impl Application {
         index: &BranchIndex,
         retained: &RetainedInventory,
         relations: &[RelationInventory],
+        terminal_key: TransactionKey,
         memory: &Arc<MemoryBudget>,
     ) -> Result<ApplicationEvidence> {
         if self.committed.is_none() {
@@ -280,12 +290,10 @@ impl Application {
         }).transpose()?;
 
         let terminal = index.head();
-        let end = index.view(
-            MAIN_BRANCH,
-            At::Exactly(terminal.basis),
-            Layer::Local,
-            terminal.system_time,
-        )?;
+        let end = self.view(index, terminal_key)?;
+        if end.cut() != terminal {
+            return Err(invalid());
+        }
         if point(&end, &layout.closure, terminal.system_time)?.0 != closure
             || point(&end, &cutoff, terminal.system_time)?.0 != release
             || point(&end, &layout.writer, terminal.system_time)?.0 != closed
@@ -304,6 +312,12 @@ impl Application {
         }
         if let Some(points) = self.points.take() {
             return Ok(ApplicationEvidence::Points(points.finish(&view, self.cut)?));
+        }
+
+        if let Some(read) = self.receipt_policy.take() {
+            return Ok(ApplicationEvidence::ReceiptPolicy(read.read(
+                &end, relations, terminal_key, memory,
+            )?));
         }
 
         let mut inventory = Vec::with_capacity(layout.inventory.len());
@@ -566,7 +580,7 @@ fn before(before: TransactionKey, after: TransactionKey) -> bool {
     before.tx_id < after.tx_id && before.system_time < after.system_time
 }
 
-fn transaction(row: &BranchEvent) -> Result<TransactionKey> {
+pub(super) fn transaction(row: &BranchEvent) -> Result<TransactionKey> {
     let id = row
         .cut
         .basis
@@ -708,7 +722,7 @@ mod tests {
                 ),
             ],
         )?;
-        let marker = StructFields::from([("binding".into(), Value::Binary(body.clone()))]);
+        let marker = StructFields::from([("binding".into(), Value::Binary(body.to_vec()))]);
         let response = StructFields::from([
             ("cell_history".into(), Value::Utf8("01".repeat(16))),
             ("usher".into(), Value::Utf8("02".repeat(16))),
@@ -775,10 +789,10 @@ mod tests {
             pending_capture_releases: 0,
             sha256: [7; 32],
         };
-        assert!(other_cut.finish(&index, &retained, &[], &memory).is_err());
+        assert!(other_cut.finish(&index, &retained, &[], key(4), &memory).is_err());
         application.observe_transaction(&committed, [6; 32])?;
         let ApplicationEvidence::Closure(proof) =
-            application.finish(&index, &retained, &[], &memory)?
+            application.finish(&index, &retained, &[], key(4), &memory)?
         else {
             unreachable!()
         };

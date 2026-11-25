@@ -88,6 +88,96 @@ pub async fn read_owned_point_version(
     Ok(version)
 }
 
+/// Whether a stored column belongs to a reader's revealed projection: every
+/// column except system time, validity endpoints, private RTDB metadata and
+/// the columns the reader could not open.
+fn owned_revealed_column(name: &str, hidden: &[String]) -> bool {
+    !matches!(name, "_system_from" | "_system_to" | "_valid_from" | "_valid_to" | "_assertion_ordinal")
+        && !name.starts_with("_rtdb_")
+        && hidden.binary_search_by(|column| column.as_str().cmp(name)).is_err()
+}
+
+/// Commit to one row's revealed projection, ordered by column name.
+pub fn owned_revealed_digest(batch: &arrow_array::RecordBatch, row: usize, hidden: &[String]) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    if row >= batch.num_rows() {
+        return Err(Anomaly::fault("rtdb.owned/revealed-row", "The revealed point row is outside its batch"));
+    }
+    let schema = batch.schema_ref();
+    let mut columns: Vec<_> = schema.fields().iter().enumerate()
+        .filter(|(_, field)| owned_revealed_column(field.name(), hidden))
+        .collect();
+    columns.sort_by(|(_, left), (_, right)| left.name().cmp(right.name()));
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb.owned.revealed.v1");
+    for (index, field) in columns {
+        let value = rtdb_columnar::read_value(field, batch.column(index).as_ref(), row)?;
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|_| Anomaly::fault("rtdb.owned/revealed-value", "A revealed point value has no canonical encoding"))?;
+        digest.update((field.name().len() as u64).to_be_bytes());
+        digest.update(field.name().as_bytes());
+        digest.update((encoded.len() as u64).to_be_bytes());
+        digest.update(&encoded);
+    }
+    Ok(digest.finalize().into())
+}
+
+/// One point's revealed projection over `valid` at the context's cut, as
+/// maximal valid-time slices of equal digests; gaps are absence. `None` when
+/// a row has no canonical encoding, so the caller cannot compare it.
+pub async fn owned_revealed_timeline(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+    hidden: &[String],
+) -> Result<Option<Vec<(Timestamp, Timestamp, [u8; 32])>>> {
+    use arrow_array::{Array, TimestampMicrosecondArray};
+
+    if owner.is_empty() || relation.is_world_catalog() || valid.is_empty() { return Err(address_unavailable()); }
+    let Some(mut cursor) = open_owned_table_point_with_edges(
+        Arc::clone(&context), relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true, false,
+    ).await? else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut slices = Vec::new();
+    while let Some(rows) = cursor.next_batch().await? {
+        let batch = rows.batch();
+        let edge = |name: &str, row: usize, open: Timestamp| -> Result<Timestamp> {
+            let array = batch.column_by_name(name)
+                .and_then(|array| array.as_any().downcast_ref::<TimestampMicrosecondArray>())
+                .ok_or_else(address_unavailable)?;
+            Ok(if array.is_valid(row) { Timestamp(array.value(row)) } else { open })
+        };
+        for row in 0..batch.num_rows() {
+            context.check_cancelled()?;
+            let Ok(digest) = owned_revealed_digest(batch, row, hidden) else { return Ok(None); };
+            let from = edge("_valid_from", row, Timestamp::MIN)?.max(valid.lower());
+            let to = edge("_valid_to", row, Timestamp::MAX)?.min(valid.upper());
+            if from < to { slices.push((from, to, digest)); }
+        }
+    }
+    slices.sort();
+    let mut merged: Vec<(Timestamp, Timestamp, [u8; 32])> = Vec::with_capacity(slices.len());
+    for (from, to, digest) in slices {
+        match merged.last_mut() {
+            Some(last) if last.1 > from => return Ok(None),
+            Some(last) if last.1 == from && last.2 == digest => last.1 = to,
+            _ => merged.push((from, to, digest)),
+        }
+    }
+    Ok(Some(merged))
+}
+
+/// The single projection a timeline shows throughout `valid`: absence or one
+/// digest. `None` when it changes inside `valid`, so the read is undetermined.
+pub fn owned_revealed_constant(timeline: &[(Timestamp, Timestamp, [u8; 32])], valid: Interval) -> Option<Option<[u8; 32]>> {
+    let inside: Vec<_> = timeline.iter().filter(|(from, to, _)| *from < valid.upper() && valid.lower() < *to).collect();
+    match inside.as_slice() {
+        [] => Some(None),
+        [(from, to, digest)] if *from <= valid.lower() && valid.upper() <= *to => Some(Some(*digest)),
+        _ => None,
+    }
+}
+
 pub fn owned_row_event_position(batch: &arrow_array::RecordBatch, row: usize) -> Result<rtdb_types::EventPosition> {
     use arrow_array::{Array, BinaryArray};
 
@@ -355,7 +445,11 @@ async fn open_constraint_projection(
         database: context.catalog.default_database().to_owned(),
         table: relation.table(owner),
     };
-    let selection = iids.map_or(OwnedSelection::Relation, OwnedSelection::Candidates);
+    let selection = match iids {
+        Some(iids) => OwnedSelection::Candidates(iids),
+        None if columns.contains(&rtdb_types::OWNED_EVENT_POSITION_COLUMN) => OwnedSelection::PositionedProjection,
+        None => OwnedSelection::Relation,
+    };
     let context = context.for_owned_selection(name.clone(), selection);
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
     let columns = columns.iter().enumerate().map(|(index, name)| Field {

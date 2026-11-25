@@ -4,7 +4,7 @@ use rtdb_flight_sql::FrozenWorldWinner;
 use rtdb_types::{OwnedIdentityScan, ROOT_ROW_CARRIERS, RootRowCarrier, SharedColumnCarrierPrefix};
 use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedPathColumns, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
-use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
+use rtdb_storage::{cache::CacheBudget, sealing::{InheritedRootRankCut, PlaintextDependencies, PlaintextScopes, PlaintextView}};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -279,6 +279,7 @@ enum ArchiveRead {
         reply: oneshot::Sender<Result<OwnedPathColumns>>,
     },
     Search {
+        inherited_rank: Option<InheritedRootRankCut>,
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
         frontiers: Vec<i64>,
         query: String,
@@ -294,6 +295,7 @@ enum ArchiveRead {
         reply: oneshot::Sender<Result<rtdb_node::OwnedSearchBatch>>,
     },
     Nearest {
+        inherited_rank: Option<InheritedRootRankCut>,
         partitions: Vec<rtdb_node::nearest::NearestPartition>,
         frontiers: Vec<i64>,
         query: rtdb_node::nearest::NearestQuery,
@@ -480,6 +482,28 @@ impl HeldCheckpointWorld {
     pub fn check_relation(&self, relation: &OwnedRelation) -> Result<()> {
         self.check()?;
         self.open.snapshot.check_relation(relation)
+    }
+
+    async fn inherited_root_rank_cut(&self) -> Result<Option<InheritedRootRankCut>> {
+        let open = &self.open;
+        if open.record.mode != WorldClockMode::Retained || !open.record.ancestors.is_empty()
+            || open.record.fork_lineage.is_empty() || open.record.parent_publication.is_none()
+        {
+            return Ok(None);
+        }
+        let registration = open.snapshot.world_registration_version(open.record.id).await?
+            .filter(|registration| registration.history == open.registered)
+            .ok_or_else(OwnedWorld::unavailable)?;
+        Ok(Some(InheritedRootRankCut {
+            world: open.record.id,
+            pin: open.record.pin,
+            basis: open.retained.basis,
+            registration,
+            writer: open.writer,
+            incarnation: open.incarnation,
+            storage_generation: open.storage_generation,
+            until: open.retained.until,
+        }))
     }
 
     pub async fn changes(
@@ -1211,6 +1235,7 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Search {
+            inherited_rank: self.inherited_root_rank_cut().await?,
             partitions, frontiers, query, overlay, historical: earlier.is_some() || historical,
             ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1363,6 +1388,7 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Nearest {
+            inherited_rank: self.inherited_root_rank_cut().await?,
             partitions, frontiers, query, overlay, historical,
             ancestor_schemas, ancestor_system, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -3160,7 +3186,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     send_archive_answer(&plaintext, reply, response).await;
                                 }
-                                ArchiveRead::Search { partitions, frontiers, query, overlay, historical, ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard, mut reply } => {
+                                ArchiveRead::Search { inherited_rank, partitions, frontiers, query, overlay, historical, ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
@@ -3205,7 +3231,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                         } else {
                                             overlay
                                         };
-                                        let page = rtdb_node::rank_owned_overlay_batch(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
+                                        let page = PlaintextView::reading_inherited_root_rank(inherited_rank,
+                                            rtdb_node::rank_owned_overlay_batch(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay),
+                                        ).await?;
                                         guard()?;
                                         Ok(page)
                                     };
@@ -3216,7 +3244,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     send_archive_answer(&plaintext, reply, response).await;
                                 }
-                                ArchiveRead::Nearest { partitions, frontiers, query, overlay, historical, ancestor_schemas, ancestor_system, valid, parent_at, guard, mut reply } => {
+                                ArchiveRead::Nearest { inherited_rank, partitions, frontiers, query, overlay, historical, ancestor_schemas, ancestor_system, valid, parent_at, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
@@ -3257,7 +3285,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                         } else {
                                             overlay
                                         };
-                                        let (page, _) = rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay).await?;
+                                        let (page, _) = PlaintextView::reading_inherited_root_rank(inherited_rank,
+                                            rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay),
+                                        ).await?;
                                         guard()?;
                                         Ok(page)
                                     };

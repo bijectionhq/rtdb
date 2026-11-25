@@ -543,7 +543,7 @@ async fn find_retained_publication(
     blocks: &BlockStore, authority: &NativeServingAuthority, latest: &BlockCatalog, basis: Basis,
     cancellation: &CancellationToken,
 ) -> Result<BlockCatalog> {
-    let store = blocks.object_store().as_ref();
+    let store = blocks.object_store();
     let has_basis = async |block: &BlockCatalog| -> Result<bool> {
         let wire = block.as_proto();
         let Some(image) = authority.read_checkpoint(

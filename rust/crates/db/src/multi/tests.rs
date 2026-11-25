@@ -473,7 +473,7 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
             branch: MAIN_BRANCH.into(), table: registry.clone(), if_absent: true,
             rows: vec![Row {
                 id: EntityId::String(format!("{:032x}:member", u128::from_be_bytes(group))),
-                valid: None, cells: StructFields::from([("body".into(), Value::Binary(br#"{"member":true}"#.to_vec()))]),
+                valid: None, cells: StructFields::from([("body".into(), Cell::Value(Value::Binary(br#"{"member":true}"#.to_vec())))]),
                 custody_group: None, protected_columns: Vec::new(), custody_payload: None,
             }],
         });

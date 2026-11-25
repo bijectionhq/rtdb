@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rtdb_index::Snapshot;
 use rtdb_types::{
-    FixedRangeEvidence, FixedRangeKey, OwnedChange, OwnedEntityRegion, OwnedRelation, Result,
+    FixedRangeEvidence, FixedRangeKey, Interval, OwnedChange, OwnedChangeKind, OwnedEntityRegion, OwnedRelation, OwnedRevealed, Result,
     TransactionKey, Value, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS, OWNED_CHANGE_PAGE_GROUPS,
 };
 
@@ -183,6 +183,85 @@ pub async fn verify_owned_entity_region(
         for touch in touches.iter() {
             if region.intersects(&OwnedChange::from_value(touch.as_ref())?) {
                 return Ok(false);
+            }
+        }
+        previous = entry.publication;
+        through = entry.through_events;
+    }
+    Ok(through == head_frontier)
+}
+
+/// Validate a range by what its reader revealed after its relation frontier
+/// moved. Each later change must leave the touched row's revealed projection
+/// the same at the reader's cut and now, so a change to columns the reader
+/// could not open keeps the range valid; a row entering, leaving or changing
+/// visibly aborts it. With a clock interval, a touched row must also keep one
+/// projection throughout it. Erasure, redaction and expiry always count as changes.
+pub async fn verify_owned_revealed_range(
+    context: &Arc<QueryContext>,
+    base: &Snapshot,
+    owner: &str,
+    relation: &OwnedRelation,
+    basis: TransactionKey,
+    frontier: i64,
+    head_frontier: i64,
+    revealed: &OwnedRevealed,
+) -> Result<bool> {
+    let journal = relation.change_journal(owner)?;
+    let head = base.relation_event_frontier(&journal)?.saturating_sub(1);
+    let Some(head_publication) = base.tx_basis() else {
+        return Ok(false);
+    };
+    // The newest journal entry at the reader's frontier anchors the walk.
+    let mut anchor = None;
+    for revision in (head.saturating_sub(OWNED_CHANGE_PAGE_GROUPS as i64).max(0)..=head).rev() {
+        context.check_cancelled()?;
+        let entry = crate::read_owned_change_entry(Arc::clone(context), owner, relation, revision).await?;
+        if entry.through_events < frontier { break; }
+        if entry.through_events != frontier { continue; }
+        let anchored = if revision == 0 {
+            frontier == 0 && entry.value == Value::Null
+        } else {
+            entry.publication.at_or_before(basis) && matches!(entry.value, Value::List(ref touches) if !touches.is_empty())
+        };
+        if anchored { anchor = Some(revision); }
+        break;
+    }
+    let Some(anchor) = anchor.filter(|anchor| *anchor < head) else {
+        return Ok(false);
+    };
+    let then = context.with_owned_system_cut(basis.system_time, &context.cancellation)?;
+    let mut previous = basis;
+    let mut through = frontier;
+    for revision in anchor + 1..=head {
+        context.check_cancelled()?;
+        let entry = crate::read_owned_change_entry(Arc::clone(context), owner, relation, revision).await?;
+        let Value::List(touches) = entry.value else { return Ok(false); };
+        let count = i64::try_from(touches.len()).map_err(|_| rtdb_types::change_feed_uncovered())?;
+        if count == 0 || !ordered_group(previous, entry.publication, head_publication)
+            || through.checked_add(count) != Some(entry.through_events)
+        {
+            return Ok(false);
+        }
+        for touch in touches.iter() {
+            let touch = OwnedChange::from_value(touch.as_ref())?;
+            if matches!(touch.kind, OwnedChangeKind::Erase | OwnedChangeKind::Redacted | OwnedChangeKind::Expired(_)) {
+                return Ok(false);
+            }
+            let original = crate::owned_revealed_timeline(
+                Arc::clone(&then), owner, relation, &touch.id, touch.valid, &revealed.hidden,
+            ).await?;
+            let current = crate::owned_revealed_timeline(
+                Arc::clone(context), owner, relation, &touch.id, touch.valid, &revealed.hidden,
+            ).await?;
+            let (Some(original), Some(current)) = (original, current) else { return Ok(false); };
+            if original != current { return Ok(false); }
+            if let Some(clock) = revealed.clock {
+                let lower = clock.lower().max(touch.valid.lower());
+                let upper = clock.upper().min(touch.valid.upper());
+                if lower < upper && crate::owned_revealed_constant(&current, Interval::new(lower, upper)?).is_none() {
+                    return Ok(false);
+                }
             }
         }
         previous = entry.publication;

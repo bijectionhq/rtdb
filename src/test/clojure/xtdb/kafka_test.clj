@@ -36,7 +36,7 @@
     (with-open [node (xtn/start-node {:log-clusters {:my-kafka [:kafka {:bootstrap-servers *bootstrap-servers*}]}
                                       :log [:kafka {:cluster :my-kafka
                                                     :topic (str "xtdb.kafka-test." test-uuid)}]})]
-      (t/is (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :foo}]]))
+      (t/is (xt/execute-tx node [[:put-docs {:into :xt_docs :valid-from #inst "2020"} {:xt/id :foo}]]))
 
       (t/is (= [{:xt/id :foo}]
                (tu/query-ra '[:scan {:db-name "xtdb", :table #xt/table xt_docs, :columns [_id]}]
@@ -56,8 +56,8 @@
       (with-open [secondary-conn (.build (-> (.createConnectionBuilder node)
                                              (.database "secondary")))]
 
-        (t/is (xt/submit-tx xtdb-conn [[:put-docs :docs {:xt/id :primary}]]))
-        (t/is (xt/submit-tx secondary-conn [[:put-docs :docs {:xt/id :secondary}]]))
+        (t/is (xt/submit-tx xtdb-conn [[:put-docs {:into :docs :valid-from #inst "2020"} {:xt/id :primary}]]))
+        (t/is (xt/submit-tx secondary-conn [[:put-docs {:into :docs :valid-from #inst "2020"} {:xt/id :secondary}]]))
 
         (t/is (= [{:xt/id :primary}] (xt/q xtdb-conn "SELECT _id FROM docs")))
         (t/is (= [{:xt/id :secondary}] (xt/q secondary-conn "SELECT _id FROM docs")))

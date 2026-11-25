@@ -187,6 +187,12 @@ enum Action {
         candidate_binding: CandidateBinding,
         classic_cut: rtdb_types::TransactionKey,
     },
+    ReadClassicMigrationRegisteredReceiptPolicy {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        classic_cut: rtdb_types::TransactionKey,
+        receipt: archive::ReceiptPolicySelection,
+    },
     ClassicMigrationProviderDrainStatus {
         selection: classic_destination::Selection,
         candidate_binding: CandidateBinding,
@@ -380,6 +386,14 @@ enum Reply {
         selection: classic_destination::Selection,
         candidate_binding: CandidateBinding,
         application: archive::ApplicationReadback,
+    },
+    ClassicMigrationReceiptPolicyReadback {
+        selection: classic_destination::Selection,
+        candidate_binding: CandidateBinding,
+        classic_cut: rtdb_types::TransactionKey,
+        terminal: rtdb_types::TransactionKey,
+        terminal_sha256: [u8; 32],
+        policy: archive::ReceiptPolicyReadback,
     },
     ClassicMigrationProviderDrain {
         selection: classic_destination::Selection,
@@ -1022,11 +1036,17 @@ impl RecoveryService {
             )).await,
             Action::ReadClassicMigrationApplicationClosure { selection, candidate_binding, classic_cut } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
-                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, provider: None },
+                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, receipt_policy: None, provider: None },
+            )).await,
+            Action::ReadClassicMigrationRegisteredReceiptPolicy { selection, candidate_binding, classic_cut, receipt } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection,
+                classic_destination::Operation::Application {
+                    candidate_binding, classic_cut, points: None, receipt_policy: Some(receipt), provider: None,
+                },
             )).await,
             Action::ClassicMigrationProviderDrainStatus { selection, candidate_binding, classic_cut, provider } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
-                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, provider: Some(provider) },
+                classic_destination::Operation::Application { candidate_binding, classic_cut, points: None, receipt_policy: None, provider: Some(provider) },
             )).await,
             Action::ObserveClassicMigrationOrdinaryFlightFence { selection } => {
                 let intent = selection.intent(request.authority, request.capture, &self.org)?;
@@ -1068,7 +1088,7 @@ impl RecoveryService {
             Action::ReadClassicMigrationPointHistories { selection, candidate_binding, classic_cut, valid_at, points } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection,
                 classic_destination::Operation::Application {
-                    candidate_binding, classic_cut, points: Some(archive::PointHistoryRead::new(valid_at, points)?), provider: None,
+                    candidate_binding, classic_cut, points: Some(archive::PointHistoryRead::new(valid_at, points)?), receipt_policy: None, provider: None,
                 },
             )).await,
             Action::InspectClassicMigrationInventory { destination, stage_operation, staged_manifest_sha256, ciphertext_sha256 } => {
@@ -1455,6 +1475,7 @@ fn admits_frame_size(action: &Action, bytes: usize) -> bool {
         | Action::ClassicMigrationDestinationStatus { .. } | Action::HoldClassicMigrationDestinationReady { .. }
         | Action::ClassicMigrationDestinationReadyStatus { .. }
         | Action::ReadClassicMigrationApplicationClosure { .. }
+        | Action::ReadClassicMigrationRegisteredReceiptPolicy { .. }
         | Action::ClassicMigrationProviderDrainStatus { .. }
         | Action::CommissionClassicMigrationOrdinaryFlight { .. }
         | Action::ReadClassicMigrationPointHistories { .. } => CANDIDATE_FRAME_BYTES,

@@ -20,6 +20,7 @@ use crate::keys::{
     LandingReservation, WorldRowSlot, assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment,
 };
 
+mod inherited_rank;
 mod release;
 mod retired;
 mod retired_world_rank;
@@ -384,6 +385,9 @@ impl rtdb_storage::sealing::RootRankAuthority for RootRankCustody {
             position, assertion: selected.assertion, target: selected.target,
             stage: *stage.identity().as_bytes(), payload_digest: selected.payload_digest, link_digest: selected.link_digest,
         };
+        if let Some(proof) = selected.inherited {
+            return inherited_rank::admit(self, selected.family, stage, binding, selected.relation, selected.selector, proof).await;
+        }
         let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(OwnedWorld::unavailable)?
             .with_original_reader(&self.original, self.deployment, &self.cancellation);
         families.require_root_rank_landing(scope.family(selected.family), stage, binding, selected.relation, selected.selector)

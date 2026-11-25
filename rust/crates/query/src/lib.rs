@@ -89,7 +89,7 @@ mod owned_relation;
 mod owned_unique;
 mod owned_range;
 mod owned_range_order;
-pub use owned_range::{verify_owned_entity_region, verify_owned_fixed_range};
+pub use owned_range::{verify_owned_revealed_range, verify_owned_entity_region, verify_owned_fixed_range};
 pub use cursor::{SpatialProbeCells, SpatialProbeFallback};
 pub use owned_relation::{OwnedSpatialScan, open_native_spatial_builds, open_owned_spatial_refinement};
 pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, OWNED_UNIQUE_PATHS_MAX, OWNED_UNIQUE_POLICY_ID, lookup_owned_unique, owned_unique_key_id, owned_unique_path_key, read_owned_unique_policy};
@@ -100,7 +100,7 @@ pub use owned_relation::{
 };
 pub use owned_relation::{
     open_owned_lifetime_point, open_owned_point_with_position_mask, open_owned_valid_during_with_position_mask, open_owned_world_constraint_projection,
-    owned_receipt_transaction, owned_row_event_position, read_owned_point_version, owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
+    owned_receipt_transaction, owned_revealed_constant, owned_revealed_digest, owned_revealed_timeline, owned_row_event_position, read_owned_point_version, owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
     try_owned_lifetime_range_expiry,
 };
 

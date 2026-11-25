@@ -4,6 +4,7 @@ use rtdb_index::{TrieState, branches::{RankedIndexDeclaration, RankedIndexKind}}
 use rtdb_query::QueryContext;
 use rtdb_storage::{ObjectKey, cache::CacheLease};
 use rtdb_types::{Anomaly, Result, TableRef, TemporalBounds};
+use rtdb_plan::Catalog;
 
 use crate::{definition::{self, CatalogDefinition, VectorDefinition}, file::{Directory, Locator, verified_directory}};
 

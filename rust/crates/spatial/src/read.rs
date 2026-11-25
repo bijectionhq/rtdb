@@ -261,9 +261,8 @@ pub async fn committed_native_ready(
         let mut bytes_read = 0;
         for trie in snapshot.trie_entries(table) {
             let Some(record) = trie.artefact(&artefact.kind, &artefact.id, artefact.version) else { return Ok(false); };
-            let Some(size) = record.file_size.and_then(|size| u64::try_from(size).ok())
-                .filter(|size| (1..=postings::MAX_FILE_BYTES).contains(size)) else { return Ok(false); };
-            let Some(digest) = record.stats.as_deref().filter(|digest| digest.len() == 32) else { return Ok(false); };
+            let Ok(root) = postings::Root::from_record(record) else { return Ok(false); };
+            let size = root.range().end;
             if record.scope() != rtdb_format::log::proto::ArtefactScope::Trie || !record.pack_members.is_empty() {
                 return Ok(false);
             }
@@ -272,10 +271,11 @@ pub async fn committed_native_ready(
             context.check_cancelled()?;
             let Some(bytes) = database.storage.get_published_exact_or(&key, usize::try_from(size).map_err(|_| postings::work_limit())?,
                 record.published_version.as_ref(), &context.memory).await? else { return Ok(false); };
-            let check = || context.check_cancelled();
-            postings::verify_digest(bytes.sha256(|bytes| postings::sha256(bytes, &check))?, digest)?;
-            postings::candidates(bytes, None, &[geometry::KeyRange { start: i64::MIN, end: i64::MAX }],
-                &context.memory, check, |_| Ok(()))?;
+            let bytes = &bytes;
+            postings::candidates(root, None, &[geometry::KeyRange { start: i64::MIN, end: i64::MAX }],
+                &context.memory, || context.check_cancelled(), |range: Range<u64>| std::future::ready(
+                    bytes.slice(range.start as usize..range.end as usize).map(Bytes::from_owner).map_err(posting_read_error),
+                ), |_| Ok(())).await?;
             found = true;
         }
         Ok(found)

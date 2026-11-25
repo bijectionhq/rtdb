@@ -402,7 +402,7 @@ impl SearchAccelerator {
         let locator = record.stats.as_deref().and_then(crate::file::decode_footer_locator)
             .filter(|locator| i64::try_from(locator.length).ok() == record.file_size);
         let sections = record.stats.as_deref().and_then(crate::file::decode_sections);
-        let tree = record.stats.as_deref().and_then(crate::file::decode_tree_locator)
+        let tree = record.stats.as_deref().and_then(|stats| crate::file::CatalogStatsReader::open(stats)?.tree_locator())
             .filter(|locator| locator.format() == format && i64::try_from(locator.length).ok() == record.file_size);
         Ok(Some(Recorded {
             key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?,
@@ -1438,7 +1438,7 @@ mod tests {
         rank.insert_at(0, 0, RankedIdentity::Covered(key), 1.0);
         let EntityIdRef::String(held) = rank.hits[0].id.key() else { panic!("expected string identity") };
         assert_eq!(held.as_ptr(), file.run_identity_bytes(run).unwrap()[1..].as_ptr());
-        assert_eq!(rank.bytes, 4096 + 128);
+        assert_eq!(rank.memory.bytes(), 4096 + size_of::<RankedHit<'_>>());
         let page = rank.finish_batch().unwrap().into_page().unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.hits[0].id, id);

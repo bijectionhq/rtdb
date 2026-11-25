@@ -44,7 +44,7 @@ use crate::{
 mod owned_inventory;
 pub(crate) use owned_inventory::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, inspect_staged_owned_relations, stream_staged_owned_event_files};
 mod classic_migration;
-pub(crate) use classic_migration::{ApplicationEvidence, ApplicationLayout, ApplicationReadback, ClassicMigrationInventory, ClassicProjection, ClassicRead, PointHistory, PointHistoryRead, PointSelector, ReceiptHistory, ReceiptLookup, ReceiptLookups, inspect_classic_migration_inventory, read_classic_migration};
+pub(crate) use classic_migration::{ApplicationEvidence, ApplicationLayout, ApplicationReadback, ClassicMigrationInventory, ClassicProjection, ClassicRead, PointHistory, PointHistoryRead, PointSelector, ReceiptHistory, ReceiptLookup, ReceiptLookups, ReceiptPolicyReadback, ReceiptPolicySelection, inspect_classic_migration_inventory, read_classic_migration};
 
 pub struct StagedReaderSettings {
     pub destination: Uuid,
@@ -666,7 +666,7 @@ mod tests {
         ));
         assert!(store.put(&selected, bytes).await.is_err());
         assert!(store.delete(&selected).await.is_err());
-        let stage = VerifiedStage { store: Arc::new(store), contents: CheckpointContents::Replay, legacy_trie_data: true };
+        let stage = VerifiedStage { store: Arc::new(store), region: IoRegion::new(), contents: CheckpointContents::Replay, legacy_trie_data: true };
         assert!(stage.require_serving_envelope().is_err());
         Ok(())
     }

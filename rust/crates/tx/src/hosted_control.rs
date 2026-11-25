@@ -1101,6 +1101,7 @@ mod world_read_tests {
         let owner = HostedControlWrite::check(controls, scope, Some(Timestamp(1)), value)?;
         let point = TxOp::OwnedCheck {
             relation: branch.clone(), id: id.clone(), valid_at: Timestamp(4), expected: None,
+            revealed: None,
         };
         let purge = TxOp::OwnedCheckWorldPurge {
             relation: branch.clone(), pin: Iid([2; 16]), frontier: 0, local_frontier: None,
@@ -1343,11 +1344,13 @@ mod retained_release_tests {
         assert_eq!(hosted_proposal_overlay(&operations), None);
         operations.push(Operation::Public(TxOp::OwnedCheck {
             relation: facts.clone(), id: id.clone(), valid_at: Timestamp(11), expected: None,
+            revealed: None,
         }));
         assert_eq!(hosted_proposal_overlay(&operations), None);
         operations.pop();
         operations.push(Operation::Public(TxOp::OwnedCheck {
             relation: facts, id, valid_at: Timestamp(10), expected: None,
+            revealed: None,
         }));
         assert_eq!(hosted_proposal_overlay(&operations), Some(world));
         let search = OwnedRelation::new("protected_search")?;
@@ -1406,11 +1409,13 @@ mod retained_release_tests {
             operations.push(Operation::Public(TxOp::OwnedCheck {
                 relation: relation.clone(), id: EntityId::String("other".into()),
                 valid_at: Timestamp(4), expected: None,
+                revealed: None,
             }));
             assert_eq!(hosted_proposal_overlay(&operations), None);
             operations.pop();
             operations.push(Operation::Public(TxOp::OwnedCheck {
                 relation, id: id.clone(), valid_at: Timestamp(4), expected: None,
+                revealed: None,
             }));
             assert_eq!(hosted_proposal_overlay(&operations), (name != "facts").then_some(world));
         }
@@ -1445,6 +1450,7 @@ mod retained_release_tests {
             operations.push(Operation::Public(TxOp::OwnedCheck {
                 relation: relation.clone(), id: EntityId::String(id.into()),
                 valid_at: Timestamp(4), expected: None,
+                revealed: None,
             }));
         }
         assert_eq!(hosted_proposal_overlay(&operations), Some(world));
@@ -1495,13 +1501,13 @@ mod retained_release_tests {
             TxOp::HostedControl(HostedControlWrite::check(admission.clone(), scope, Some(Timestamp(1)), row("installed"))?),
             control(&format!("root_proposal_head:{}", "a".repeat(64)), Some(Timestamp(2)))?,
             control(&format!("root_proposal_landing:{}", "b".repeat(64)), None)?,
-            TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at: Timestamp(4), expected: None },
+            TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at: Timestamp(4), expected: None, revealed: None },
             TxOp::OwnedInsertDocs {
                 relation: relation.clone(), documents: crate::Documents::new(vec![row("key")], &memory)?,
                 valid_from: None, valid_to: None,
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id, valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(3), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
+            TxOp::OwnedCheck { relation: local.clone(), id, valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(3), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(Timestamp(3)), advance_to: None, drop_world: true,
@@ -1552,13 +1558,14 @@ mod retained_release_tests {
                 valid_from: None, valid_to: None,
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local, id: replacement.clone(), valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(2), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
-            TxOp::OwnedCheck { relation: relation.clone(), id: replacement.clone(), valid_at: Timestamp(4), expected: None },
+            TxOp::OwnedCheck { relation: local, id: replacement.clone(), valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(2), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
+            TxOp::OwnedCheck { relation: relation.clone(), id: replacement.clone(), valid_at: Timestamp(4), expected: None, revealed: None },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.pop();
         operations.push(Operation::Public(TxOp::OwnedCheck {
             relation, id: replacement, valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(1), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }),
+            revealed: None,
         }));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
             world, pin, effect: ProposalLandingEffect::WithPoints,
@@ -1619,17 +1626,17 @@ mod retained_release_tests {
             let local = source_relation.in_world(world)?;
             ops.extend([
                 TxOp::OwnedCheck { relation: relation.clone(), id: target_id,
-                    valid_at: Timestamp(4), expected: None },
+                    valid_at: Timestamp(4), expected: None, revealed: None },
                 TxOp::OwnedInsertDocs { relation: relation.clone(), documents: crate::Documents::new(vec![document], &memory)?,
                     valid_from: None, valid_to: None },
                 TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
                 TxOp::OwnedCheck { relation: local, id: source_id,
-                    valid_at: Timestamp(3), expected: Some(source) },
+                    valid_at: Timestamp(3), expected: Some(source), revealed: None },
             ]);
         }
         ops.extend([
             TxOp::OwnedCheck { relation: search, id: alias,
-                valid_at: Timestamp(4), expected: None },
+                valid_at: Timestamp(4), expected: None, revealed: None },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(Timestamp(3)), advance_to: None, drop_world: true,
@@ -1715,7 +1722,7 @@ mod retained_release_tests {
                 valid_from: Some(start), valid_to: Some(Timestamp(20)),
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(2), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
+            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(2), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(generation), advance_to: None, drop_world: true,
@@ -1726,6 +1733,7 @@ mod retained_release_tests {
         operations.push(Operation::Public(TxOp::OwnedCheckRange {
             relation: relation.clone(), basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(3), system_time: Timestamp(4) },
             scope, frontier: 0, until: Timestamp(100), region: None,
+            revealed: None,
         }));
         let local_window = TxOp::OwnedCheckWorldPurge {
             relation: local.clone(), pin, frontier: 0, local_frontier: Some(0),
@@ -1733,6 +1741,7 @@ mod retained_release_tests {
         operations.push(Operation::Public(local_window.clone()));
         let root_point = |valid_at| Operation::Public(TxOp::OwnedCheck {
             relation: relation.clone(), id: id.clone(), valid_at, expected: None,
+            revealed: None,
         });
         operations.push(root_point(Timestamp(11)));
         assert_eq!(hosted_proposal_land(&operations), None);
@@ -1776,11 +1785,12 @@ mod retained_release_tests {
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.extend([
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: later_start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
+            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: later_start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.push(Operation::Public(TxOp::OwnedCheck {
             relation: relation.clone(), id: id.clone(), valid_at: later_start, expected: None,
+            revealed: None,
         }));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
             world, pin, effect: ProposalLandingEffect::FixedPeriods,
@@ -1794,9 +1804,10 @@ mod retained_release_tests {
                 valid_from: Some(second_start), valid_to: Some(Timestamp(30)),
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local, id: second.clone(), valid_at: second_start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
+            TxOp::OwnedCheck { relation: local, id: second.clone(), valid_at: second_start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
             TxOp::OwnedCheck {
                 relation, id: second, valid_at: second_start, expected: None,
+                revealed: None,
             },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
@@ -1812,8 +1823,8 @@ mod retained_release_tests {
                 valid_from: None, valid_to: None,
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local, id: point.clone(), valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
-            TxOp::OwnedCheck { relation: points, id: point, valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(1), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
+            TxOp::OwnedCheck { relation: local, id: point.clone(), valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
+            TxOp::OwnedCheck { relation: points, id: point, valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(1), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }), revealed: None },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
             world, pin, effect: ProposalLandingEffect::WithPoints,
@@ -1888,7 +1899,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation, local_frontier, .. }) => {
                 if local_frontier.is_some() { timelines.insert(relation); }
             }
-            Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) => {
+            Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected, .. }) => {
                 points.entry((relation, id.handle_bytes())).or_default().insert((*valid_at, expected.is_none()));
             }
             Operation::Public(TxOp::OwnedPublishWorld {
@@ -2436,7 +2447,7 @@ fn landing_local_point(
     unique_landing_point(operations.windows(2).filter_map(|pair| match pair {
         [
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
-            Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: Some(revision) }),
+            Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: Some(revision), .. }),
         ] if guarded == &local && relation == &local && observed == id && *original == pin =>
             Some((*valid_at, *revision)),
         _ => None,
@@ -2448,7 +2459,7 @@ fn landing_root_absence(
 ) -> Option<Timestamp> {
     use crate::{TxOp, source::Operation};
     unique_landing_point(operations.iter().filter_map(|op| match op {
-        Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: None })
+        Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: None, .. })
             if checked == relation && observed == id => Some(*valid_at),
         _ => None,
     }))
@@ -2656,7 +2667,7 @@ pub(crate) fn hosted_proposal_land(
     for ProposalLandingKey { relation, id, extents, create_only } in writes.values() {
         let create_only = *create_only;
         let root_checked = extents.iter().all(|extent| operations.iter().any(|op| matches!(op,
-            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected })
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected, .. })
                 if checked == *relation && observed == id
                     && extent.map_or_else(|| expected.is_none() == create_only, |extent| extent.lower() == *valid_at)
         )));
@@ -2727,7 +2738,7 @@ pub(crate) fn hosted_proposal_land(
         let local_id = local_carrier.as_ref().unwrap_or(id);
         let local_checked = extents.iter().all(|extent| operations.windows(2).any(|pair| matches!(pair, [
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
-            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision) })
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision), .. })
         ] if guarded == &local && checked == &local && observed == local_id && *original == pin
             && extent.is_none_or(|extent| {
                 extent.lower() == *valid_at && expected_clock.is_some_and(|tip| revision.history <= tip)

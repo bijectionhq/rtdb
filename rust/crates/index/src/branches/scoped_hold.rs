@@ -16,7 +16,7 @@ pub struct ScopedHold {
     pub publication_written: Basis,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScopedHoldCommand {
     Retain(ScopedHold),
     Release { id: [u8; 16], owner: [u8; 32] },

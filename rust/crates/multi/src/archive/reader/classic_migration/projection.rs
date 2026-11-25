@@ -249,7 +249,7 @@ impl Projection {
             }
         }
         let application = self.application.take()
-            .map(|application| application.finish(&index, retained, inventory, &self.memory))
+            .map(|application| application.finish(&index, retained, inventory, self.terminal, &self.memory))
             .transpose()?;
         let mut transactions = TransactState::new(incarnation);
         transactions.replace_applied_index(index)?;

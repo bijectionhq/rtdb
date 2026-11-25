@@ -100,7 +100,7 @@ impl NativeSession {
         Ok(DurableRange {
             scoped: evidence.scoped,
             evidence: OwnedRangeWitness { relation, scope, basis: evidence.basis,
-                frontier: evidence.frontier, until: evidence.until, region },
+                frontier: evidence.frontier, until: evidence.until, region, revealed: None },
         })
     }
 }

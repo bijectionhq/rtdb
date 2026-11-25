@@ -218,6 +218,9 @@ At that instant, two nulls in `_read_system_micros: Int64` and `_read_event_posi
 A present point requires both the observed SQL history coordinate and the 16-byte event position.
 The event position contains the original signed 64-bit transaction position and unsigned 64-bit event ordinal, in big-endian order.
 A mutation without a valid instant carries no observation.
+A nullable `_read_revealed: Binary` makes the check compare the reader's revealed projection instead of the version: every stored column except system time, validity endpoints, private `_rtdb_` metadata and the columns the reader could not open.
+Its encoding is one flag byte (1 when a clock interval follows), the interval's signed 64-bit big-endian lower and exclusive upper microseconds, then an unsigned 16-bit big-endian count of hidden column names in strictly ascending order, each as an unsigned 16-bit big-endian length and UTF-8 bytes.
+The check holds when the projection at the observed winner's system time and at acceptance is the same, and constant throughout the clock interval (the decision's interval when given, else the observed valid instant through the acceptance reading); a change only to hidden columns keeps it valid, and a change inside the interval leaves it undetermined and aborts the transaction.
 The point reply includes `rtdb.owned.valid_micros` as signed decimal microseconds.
 For a present row it also includes `rtdb.owned.revision_micros` as signed decimal microseconds and `rtdb.owned.event_position` as hexadecimal.
 A successful commit reply has the same schema as the create reply.
@@ -468,7 +471,9 @@ The response uses the same covering schema and held time metadata as v1, with no
 A covered v2 page on a placed attachment with a live catalogue lease also returns `rtdb.owned.range_witness`, an opaque 32-digit hexadecimal nonce in the response schema.
 A covered empty page can carry a witness.
 Each held handle issues one nonce per observed relation, up to 32 relations.
-`rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many pairs of 16 raw held-handle bytes and 16 raw nonce bytes.
+`rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many entries of 16 raw held-handle bytes, 16 raw nonce bytes, and an unsigned 16-bit big-endian length followed by that many bytes of the range's revealed projection in the `_read_revealed` encoding (empty keeps exact frontier validation).
+When the relation frontier moved, a range with a revealed projection is still valid if every later change leaves each touched row's projection the same at the witness basis and at acceptance, and constant over the clock interval; erasure, redaction and expiry always count as changes.
+Acceptance outside the projection's clock interval, or at or after the witness's valid-time cutoff (the earliest boundary among the matched rows and the covered absence of a `cover_valid` page), leaves the range undetermined.
 The commit reply is unchanged.
 `rtdb.owned.Commit.v4` uses the same framing and accepts zero through 32 witnesses.
 It adds the `erase` mutation for an exact root identity.
@@ -882,7 +887,7 @@ It quorum-certifies a bounded applied interval, resolves the held publication to
 The normal suffix owner pins and archives that prefix, validates its replay, and reopens the full transaction key under the existing world registration. The discovery interval is bounded to 4,096 replica records and 8 MiB, and any unsupported replay frame, lost hold, trim, or custody gap refuses.
 Once the source checkpoint is superseded, the archive retirement owner can close an automatic copy without a live world, suffix, repair, or I/O pin.
 Archive discovery does not create a capture or advance the original hold.
-Next come a big-endian u16 range witness count and its original 16-byte Root handle and 16-byte nonce pairs, then the big-endian u32 byte length and ordered Root fact groups.
+Next come a big-endian u16 range witness count and its original 16-byte Root handle, 16-byte nonce and length-prefixed revealed projection entries, then the big-endian u32 byte length and ordered Root fact groups.
 Root groups may supply point checks, inserts, replacements and deletes.
 The remainder contains the common hosted groups with at least one check and optional checked replacements.
 With Root fact writes, the resolver publishes the Root head in the same transaction as the world registration, facts, hosted replacements and one shared immutable attempt marker.
@@ -920,7 +925,7 @@ The worlds precede the held observations and any final count conditions.
 A count scope of 0 selects Root and 1 selects the single held Proposal.
 The next byte selects the Root section kind, starting with no Root section (0), Root validation (1), and Root publication (2).
 Kinds 1 and 2 carry the original 16-byte Root hold. Kind 2 also carries its 22-byte attempt ID.
-Next come a u16 Root range witness count and the original handle/nonce pairs, then the u32 byte length and ordered Root fact groups.
+Next come a u16 Root range witness count and the original handle, nonce and revealed projection entries, then the u32 byte length and ordered Root fact groups.
 Kind 1 supplies point checks, range checks, or both. Kind 2 also supplies Root inserts, replacements, or deletes.
 A length-prefixed refusal control stream precedes the primary hosted controls when the refusal bit is set.
 Root kind 3 carries the original live Root handle and selects a single retained world Drop with zero world witnesses and no Root fact operations.

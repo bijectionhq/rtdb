@@ -5,7 +5,7 @@ use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RankedIndexKind, RowImage}};
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
-use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
+use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value,
     rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SEARCH_BUILD_CATALOG, SPATIAL_BUILD_CATALOG, VECTOR_BUILD_CATALOG, ranked_build_id}};
 use tokio_util::sync::CancellationToken;
 

@@ -235,7 +235,7 @@ impl Peer {
         runtime: &MultiRuntime,
         node: &Node,
         frame: Request,
-        reservation: MemoryReservation,
+        reservation: Arc<MemoryReservation>,
     ) -> Result<Answer> {
         let target = self.selected(Uuid::from_bytes(frame.incarnation));
         if target != Some(self.address) && !matches!(&frame.admission, Admission::Workload { .. }) {
@@ -260,7 +260,7 @@ impl Peer {
                     return Err(unavailable());
                 }
                 if let workload::Operation::Submit { transaction: Some(transaction), .. } = &mut request.operation {
-                    transaction.request_memory = Some(Arc::new(reservation));
+                    transaction.request_memory = Some(reservation);
                 }
                 let reply = writer.managed_workload_local(*request).await?;
                 if !node.catalog().database(name).is_ok_and(|current| Arc::ptr_eq(&current, &attached)) {
@@ -653,17 +653,17 @@ impl MultiWriteRoute for DatabaseRoute {
     }
 }
 
-fn transaction(raw: Option<Box<RawValue>>, reservation: MemoryReservation) -> Result<Transact> {
+fn transaction(raw: Option<Box<RawValue>>, reservation: Arc<MemoryReservation>) -> Result<Transact> {
     let raw = raw.ok_or_else(unavailable)?;
     let mut request = Transact::decode_canonical_request(raw.get().as_bytes())?;
-    request.request_memory = Some(Arc::new(reservation));
+    request.request_memory = Some(reservation);
     Ok(request)
 }
 
 async fn read_frame(
     stream: &mut TcpStream,
     memory: &Arc<MemoryBudget>,
-) -> Result<(Vec<u8>, MemoryReservation)> {
+) -> Result<(Vec<u8>, Arc<MemoryReservation>)> {
     let size = stream.read_u32().await.map_err(network)? as usize;
     if !(1..=MAX_FRAME_BYTES).contains(&size) {
         return Err(overloaded());

@@ -74,6 +74,6 @@ impl Service {
         let receipt = call.cancellation.run_until_cancelled(plaintext.reading(work)).await
             .ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         self.publish();
-        handoff_action_results(call, [Ok(receipt)], plaintext).await
+        handoff_action_results(call, [Ok(receipt)], plaintext, false).await
     }
 }

@@ -70,7 +70,7 @@ pub use type_edn::{TypeForm, function_type_mismatch};
 pub use position::*;
 pub use term::{Term, TermSequence};
 pub use pg::{PgType, PgTypeDescriptor, pg_name_oid, pg_table_oid};
-pub use time::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, OWNED_EVENT_POSITION_COLUMN, OwnedPointVersion, EventHeader, EventOp, EventOrigin, EventPosition, Instant, Interval, RowVersion, TemporalBounds, TimedJournalCutoff};
+pub use time::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, OWNED_EVENT_POSITION_COLUMN, OwnedPointVersion, OwnedRevealed, EventHeader, EventOp, EventOrigin, EventPosition, Instant, Interval, RowVersion, TemporalBounds, TimedJournalCutoff};
 pub use timestamp::Timestamp;
 pub use list_value::{FloatComponent, FloatListSlice, ListBuilder, ListValue, ListView};
 pub use numeric_list::{NumericCell, NumericSpan};

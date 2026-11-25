@@ -330,7 +330,7 @@ impl ReplayHold {
                     point: self.point.clone(),
                     namespace,
                     expires_at: self.expires_at,
-                    operation: Operation::ReadRoot {
+                    operation: workload::Operation::ReadRoot {
                         fence: self.fence.clone(),
                         writer: self.writer.clone(),
                     },

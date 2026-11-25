@@ -609,7 +609,7 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
     let create = TxOp::OwnedInsertDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
     let replace = || TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
     let delete = || TxOp::OwnedDelete { relation: relation.clone(), id: id.clone(), valid_from: Some(Timestamp(0)), valid_to: None };
-    let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected };
+    let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected, revealed: None };
     let first = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![create]), &context).await.unwrap();
     assert!(first.result().committed());
     let point_version = |resolved: &rtdb_tx::ResolvedTx| rtdb_types::OwnedPointVersion {
@@ -1275,6 +1275,7 @@ async fn owned_range_witness_checks_only_its_relation_before_mutation() {
     let check = |witness_scope, until| TxOp::OwnedCheckRange {
         relation: watched.clone(), basis: initial.result().tx_key(), scope: witness_scope, frontier: 1, until: Timestamp(until),
         region: None,
+        revealed: None,
     };
     let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put(&other)]), &context).await.unwrap();
@@ -1338,6 +1339,7 @@ async fn entity_region_refuses_a_shadowed_phantom_and_allows_disjoint_assertions
         region: Some(Arc::new(OwnedRangeEvidence::Entity {
             anchor: 1, region: OwnedEntityRegion { id: id.clone(), valid },
         })),
+        revealed: None,
     };
     let disjoint = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put("other", 425, 475), put("wanted", 500, 600)]), &context).await.unwrap();
@@ -1401,6 +1403,7 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
     let check = |basis, frontier, revision| TxOp::OwnedCheckRange {
         relation: relation.clone(), basis, scope, frontier, until: Timestamp(200),
         region: Some(Arc::new(rtdb_types::OwnedRangeEvidence::FixedPath(FixedRangeEvidence { rule: rule.clone(), revision, lower: Some(lower.clone()), upper: Some(upper.clone()) }))),
+        revealed: None,
     };
     let other = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put("zz", 5, 400, 500), put("middle", 8, 500, 550)]), &context).await.unwrap();

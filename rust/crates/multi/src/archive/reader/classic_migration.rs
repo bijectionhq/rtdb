@@ -5,11 +5,13 @@ mod layout;
 mod outcomes;
 mod points;
 mod projection;
+mod receipt_policy;
 pub(crate) use application::{ApplicationEvidence, ApplicationReadback};
 pub(crate) use layout::ApplicationLayout;
 pub(crate) use outcomes::{ReceiptHistory, ReceiptLookup, ReceiptLookups, ReceiptReadback};
 pub(crate) use points::{PointHistory, PointHistoryRead, PointSelector};
 pub(crate) use projection::{ClassicPrepared, ClassicProjection};
+pub(crate) use receipt_policy::{ReceiptPolicyReadback, ReceiptPolicySelection};
 use std::time::Duration;
 
 use ring::digest::{Context, SHA256};
@@ -142,6 +144,7 @@ pub(crate) enum ClassicRead {
         begin: [u8; 32],
         cut: rtdb_types::TransactionKey,
         points: Option<PointHistoryRead>,
+        receipt_policy: Option<ReceiptPolicySelection>,
         provider_release: Option<crate::recovery::classic_provider::ReleaseSelection>,
         layout: Arc<ApplicationLayout>,
     },
@@ -312,10 +315,10 @@ pub(crate) async fn read_classic_migration(
                 let (mut projection, mut receipt) = match read {
                     ClassicRead::Inventory => (None, None),
                     ClassicRead::Projection(request) => (Some(projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))), None),
-                    ClassicRead::Application { request, begin, cut, points, provider_release, layout } if !serving_suffix => (Some(
+                    ClassicRead::Application { request, begin, cut, points, receipt_policy, provider_release, layout } if !serving_suffix => (Some(
                         projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))
                             .with_application(application::Application::new(layout, begin, cut, destination)
-                                .with_points(points).with_provider_release(provider_release)),
+                                .with_points(points).with_receipt_policy(receipt_policy).with_provider_release(provider_release)),
                     ), None),
                     ClassicRead::Application { .. } => return Err(unavailable("Application closure lookup requires the complete canonical suffix replay")),
                     ClassicRead::Receipt(lookup) if !serving_suffix => (None, Some(lookup)),

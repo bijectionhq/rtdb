@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(table_hlls(&metadata, false).unwrap_err().code, "rtdb.format/invalid-hll");
         let error = vec![0xc1];
         let expected = rtdb_format::transit::decode_anomaly(&error).unwrap_err().code;
-        let body = ReplicaBody::ResolvedTx(proto::ResolvedTx { error: Some(error), ..Default::default() });
+        let body = ReplicaBody::ResolvedTx(proto::ResolvedTx { error: Some(error.into()), ..Default::default() });
         assert_eq!(replica_message(&body, false).unwrap_err().code, expected);
     }
 

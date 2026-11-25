@@ -181,7 +181,7 @@ impl OpenTransaction<'_> {
                         && control.expected().is_some()
                         && matches!(control.id(), EntityId::String(id) if id == crate::hosted_control::INSTALLATION_AUTHORITY_ID);
                 },
-                Operation::Public(TxOp::OwnedCheck { relation, id: checked, valid_at, expected: Some(expected) })
+                Operation::Public(TxOp::OwnedCheck { relation, id: checked, valid_at, expected: Some(expected), .. })
                     if relation == carriers && checked == id && selection.is_none() => {
                     selection = Some((*valid_at, expected.history));
                 },
@@ -284,7 +284,7 @@ impl OpenTransaction<'_> {
                 Operation::Public(TxOp::OwnedErase { .. }) => return Err(invalid()),
                 Operation::Public(TxOp::OwnedCheckRange { relation, .. }) if relation.name() == SEALED_SEARCH_UNIT_ROWS =>
                     witness += 1,
-                Operation::Public(TxOp::OwnedCheck { relation, id: EntityId::String(alias), expected, valid_at })
+                Operation::Public(TxOp::OwnedCheck { relation, id: EntityId::String(alias), expected, valid_at, .. })
                     if relation.name() == "fact_unit_fences" => {
                     if alias.starts_with("row/") {
                         if expected.is_some() || !row_checks.insert(alias.as_str()) { return Err(invalid()); }
@@ -526,7 +526,7 @@ impl OpenTransaction<'_> {
             return Err(invalid());
         }
         let mut witnesses = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedCheck { relation: checked, id: selected, valid_at, expected: Some(expected) })
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: selected, valid_at, expected: Some(expected), .. })
                 if checked == &relation && selected == id => Some((*valid_at, *expected)),
             _ => None,
         });

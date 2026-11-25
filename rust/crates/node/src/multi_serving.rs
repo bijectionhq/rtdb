@@ -1170,6 +1170,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use journal_contract::{Identity, reference::MemoryJournal};
+    use rtdb_tx::transact::TRANSACT_REQUIRES;
     use rtdb_crypt::LocalKms;
     use rtdb_db::MultiOptions;
     use rtdb_query::{

@@ -804,7 +804,7 @@ async fn start_disposal_node(
         keys,
         cache_dir: root.join("cache"),
         local_compaction: false,
-        capabilities: Some(common::secret()),
+        capabilities: Some(common::secret()), classic_retained_flight_key: None,
     };
     drop(pgwire);
     drop(control);
@@ -1617,7 +1617,7 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
             keys: keys.clone(),
             cache_dir: authority.data.path().join(format!("cache-{index}")),
             local_compaction: false,
-            capabilities: Some(common::secret()),
+            capabilities: Some(common::secret()), classic_retained_flight_key: None,
         };
         if !prepare_before_loss && index == 1 {
             standby = Some((settings, pgwire, control));
@@ -2314,7 +2314,7 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
             keys: keys.clone(),
             cache_dir: root.join("runtime-cache"),
             local_compaction: false,
-            capabilities: Some(common::secret()),
+            capabilities: Some(common::secret()), classic_retained_flight_key: None,
         }
     };
     drop(control_port);
