@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
-    BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
+    BatchBuilder, EntityIdLocator, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
     copy_selected_cells, estimate_copy_cell_bytes, read_owned_entity_id, visible_buffer_bytes,
 };
 use rtdb_format::data::EventBatch;
@@ -54,6 +54,11 @@ pub(super) struct SelectedHit {
     pub(super) probe: Option<Arc<crate::probe::DeferredPage>>,
     pub(super) row: usize,
     pub(super) distance_m: Option<f64>,
+}
+
+struct PageHit {
+    id: EntityIdLocator,
+    hit: SelectedHit,
 }
 
 pub struct Page {
@@ -189,6 +194,18 @@ pub(super) fn empty_projected_documents(
     if !matches!(projection, Projection::SelectedDocuments(_)) {
         return Ok(None);
     }
+    let logical_bound = match schema {
+        Some((schema, columns)) => columns.iter().try_fold(4096usize, |bytes, &column| {
+            let field = schema.fields().get(column).ok_or_else(inconsistent_projection)?;
+            field.data_type.retained_bytes()?
+                .checked_add(field.name.len())
+                .and_then(|size| size.checked_mul(32))
+                .and_then(|size| bytes.checked_add(size))
+                .ok_or_else(postings::work_limit)
+        })?,
+        None => 16 << 10,
+    };
+    let mut reservation = memory.reserve(logical_bound)?;
     let schema = match schema {
         Some((schema, columns)) => Schema::new(columns.iter().map(|&column| {
             let field = schema.fields().get(column).ok_or_else(inconsistent_projection)?;
@@ -199,9 +216,10 @@ pub(super) fn empty_projected_documents(
             Field::new("_system_from", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
         ]),
     };
-    let scratch = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+    let bound = rtdb_format::ipc::schema_translation_bound(&schema)?.max(logical_bound);
+    Arc::get_mut(&mut reservation).expect("empty projection owns its reservation").grow_to(bound)?;
     let arrays = RecordBatch::new_empty(Arc::new(schema));
-    OwnedBatch::with_reservation(arrays, scratch).map(Some)
+    OwnedBatch::with_reservation(arrays, reservation).map(Some)
 }
 
 pub async fn path_ready(
@@ -461,8 +479,8 @@ async fn read_page_capturing(
     let capacity = request.limit;
     let _selection = context
         .memory
-        .reserve(capacity * std::mem::size_of::<SelectedHit>())?;
-    let mut selected = Vec::<SelectedHit>::with_capacity(capacity);
+        .reserve(capacity * (size_of::<PageHit>() + size_of::<SelectedHit>()))?;
+    let mut selected = Vec::<PageHit>::with_capacity(capacity);
     let mut more = false;
     let mut point_intersects = probe.is_some_and(|probe| probe.certify_point && probe.point_column.is_some());
     let (projection_layout, document_columns) = visit_matches(
@@ -474,18 +492,23 @@ async fn read_page_capturing(
                 {
                     *retained = None;
                 }
-                let index = selection_position(&selected, id, distance_m)?;
+                let index = selection_position(&selected, id, distance_m);
                 if index < capacity {
+                    let batch = source.batch();
+                    let id = EntityIdLocator::read_owned(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
                     if selected.len() == capacity {
                         selected.pop();
                         more = true;
                     }
-                    selected.insert(index, SelectedHit { source: Arc::clone(source), probe: fallback.cloned(), row, distance_m });
+                    selected.insert(index, PageHit {
+                        id, hit: SelectedHit { source: Arc::clone(source), probe: fallback.cloned(), row, distance_m },
+                    });
                 } else {
                     more = true;
                 }
                 Ok(())
         }).await?;
+    let selected: Vec<_> = selected.into_iter().map(|entry| entry.hit).collect();
     if matches!(request.page, PageOrder::NearestOnce) {
         more = false;
     }
@@ -633,7 +656,7 @@ impl PreparedRange {
         if !(1..=128).contains(&limit) {
             return Err(kernel::invalid("Invalid spatial page size or continuation"));
         }
-        let start = after.map(|after| self.matches.seek_after(after)).transpose()?.unwrap_or(0);
+        let start = after.map_or(0, |after| self.matches.seek_after(after));
         let end = (start + limit).min(self.matches.len());
         let _selection = context.memory.reserve(std::mem::size_of::<(EntityIdRef<'_>, Iid)>() * (end - start))?;
         let selection = (start..end)
@@ -868,21 +891,21 @@ fn partition_matches(
     Ok(true)
 }
 
-fn selection_position(selected: &[SelectedHit], id: EntityIdRef<'_>, distance: Option<f64>) -> Result<usize> {
+fn selection_position(selected: &[PageHit], id: EntityIdRef<'_>, distance: Option<f64>) -> usize {
+    let mut integer = [0; 8];
+    let key = id.handle_parts(&mut integer);
     let mut lower = 0;
     let mut upper = selected.len();
     while lower < upper {
         let mid = lower + (upper - lower) / 2;
         let hit = &selected[mid];
-        let batch = hit.source.batch();
-        let previous = read_owned_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), hit.row)?;
-        let order = match (hit.distance_m, distance) {
-            (Some(left), Some(right)) => left.total_cmp(&right).then_with(|| previous.cmp(&id)),
-            _ => previous.cmp(&id),
+        let order = match (hit.hit.distance_m, distance) {
+            (Some(left), Some(right)) => left.total_cmp(&right).then_with(|| hit.id.cmp_parts(key)),
+            _ => hit.id.cmp_parts(key),
         };
         if order.is_lt() { lower = mid + 1; } else { upper = mid; }
     }
-    Ok(lower)
+    lower
 }
 
 struct Candidates {
@@ -1002,14 +1025,16 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![to_field("_id", &entity_id_type())?]));
         let batch = RecordBatch::try_new(schema, vec![ids]).unwrap();
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
-        let selected = [2.0, 2.0, 3.0].into_iter().enumerate().map(|(row, distance_m)| SelectedHit {
-            source: Arc::clone(&source), probe: None, row, distance_m: Some(distance_m),
-        }).collect::<Vec<_>>();
+        let batch = source.batch();
+        let selected = [2.0, 2.0, 3.0].into_iter().enumerate().map(|(row, distance_m)| Ok(PageHit {
+            id: EntityIdLocator::read_owned(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?,
+            hit: SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: Some(distance_m) },
+        })).collect::<Result<Vec<_>>>()?;
 
-        assert_eq!(selection_position(&selected, EntityIdRef::Keyword("same"), Some(2.0))?, 1);
-        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(1.0))?, 0);
-        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(2.0))?, 2);
-        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(4.0))?, 3);
+        assert_eq!(selection_position(&selected, EntityIdRef::Keyword("same"), Some(2.0)), 1);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(1.0)), 0);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(2.0)), 2);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(4.0)), 3);
         Ok(())
     }
 

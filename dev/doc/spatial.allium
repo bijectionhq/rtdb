@@ -75,14 +75,14 @@ entity SpatialPostings {
 -- Range refinement reads the complete typed identity, IID, geometry and equality partition of each candidate.
 -- A range page advances in complete typed identity order at the original hold.
 -- A held range continuation reuses refined matches after its original anchor.
--- Retained range and probe matches carry complete typed keys and physical IIDs in Arrow columns ordered by row positions.
+-- Retained range and probe matches carry complete typed keys and physical IIDs in Arrow columns with optional row positions for unordered input.
 -- A continuation before the initial range anchor refines the original held cut again.
 -- A held probe can refine its original held cut again when bounded match retention is unavailable.
 -- Each range page gathers documents for the IIDs selected by that page.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
 -- A ranked distance window excludes its exact lower radius and includes its upper radius when supplied.
 -- Consecutive distance windows opened on one held read use its original snapshot and valid instant.
--- The held nearest capability retains complete keys, physical IIDs, and exact distances in ranked Arrow columns.
+-- The held nearest capability retains complete keys, physical IIDs, and exact distances in Arrow columns with optional rank positions.
 -- A ranked continuation anchors on the exact previous distance and complete identity.
 -- Each ranked page resolves only its selected IIDs against the original held cut and validates complete identity before gathering the document columns.
 -- The next ranked row's distance bounds the remaining results.
@@ -90,7 +90,7 @@ entity SpatialPostings {
 -- When a nearest page has a successor, the page carries the exact distance of the first omitted hit.
 -- A document projection includes the resolved document and its system revision in hit order at the original hold.
 -- Selection retains the winning row positions until it gathers the final identities and requested document projection.
--- Selection compares complete identity cells on the retained Arrow pages.
+-- First-page selection compares validated identity locators backed by the retained Arrow pages.
 -- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
 -- An empty selected document page carries the same projection schema as a populated page at the same hold.
 -- A current Root probe uses the identity order and carries the full projection and the fields eligible for omission.

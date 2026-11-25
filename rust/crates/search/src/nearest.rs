@@ -305,7 +305,7 @@ impl NearestWindow {
             size.checked_add(identity_charge(EntityIdRef::from(&hit.id)).saturating_mul(4).saturating_add(128))
                 .ok_or_else(|| Anomaly::fault("rtdb.search/nearest-output", "Nearest output size overflow"))
         })?;
-        let reservation = self.memory.budget().reserve(bound)?;
+        let mut reservation = self.memory.budget().reserve(bound)?;
         let ids = rtdb_columnar::entity_id_array(self.hits.iter().map(|hit| EntityIdRef::from(&hit.id)))?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", ids.data_type().clone(), false),
@@ -316,7 +316,12 @@ impl NearestWindow {
         let partition = Arc::new(UInt64Array::from_iter_values(self.hits.iter().map(|hit| hit.partition as u64)));
         let output = RecordBatch::try_new(schema, vec![ids, distance, partition])
             .map_err(|error| Anomaly::fault("rtdb.search/nearest-output", error.to_string()))?;
-        Ok(OwnedSearchBatch { hits: OwnedBatch::with_reservation(output, reservation)?, total: self.total })
+        let retained = rtdb_columnar::shared_allocation_size(&output)?;
+        let output_reservation = Arc::get_mut(&mut reservation)
+            .expect("nearest output owns its construction reservation")
+            .split_off(retained)?;
+        let hits = OwnedBatch::with_reservation(output, output_reservation)?;
+        Ok(OwnedSearchBatch { hits, total: self.total })
     }
 }
 
@@ -661,6 +666,7 @@ mod tests {
         assert_eq!(page.total, 8);
         let batch = page.hits.batch();
         assert_eq!(batch.num_rows(), 5);
+        assert_eq!(memory.used_bytes(), rtdb_columnar::shared_allocation_size(batch).unwrap());
         let field = batch.schema_ref().field(0);
         assert_eq!(field, &rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type()).unwrap());
         let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();

@@ -18,7 +18,7 @@ pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs, estima
 pub use cell::ArrowCell;
 pub use conform::{DeclaredBatch, DeclaredSchema, arrow_relayout_bound, conform_batch, event_relayout_bound, relayout_arrow_column, relayout_event_column};
 pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DECIMAL_SCALE_KEY, decimal_field_parameters, decimal_parameters, decimal_scale, decimal_storage_precision, decimal_storage_scale, map_schema_fields, validate_projected_decimals, with_decimal_parameters, with_decimal_scale};
-pub use entity_id::{EntityIdRef, entity_id_array, entity_id_type, read_entity_id, read_owned_entity_id, try_entity_id_array};
+pub use entity_id::{EntityIdLocator, EntityIdRef, entity_id_array, entity_id_type, read_entity_id, read_owned_entity_id, try_entity_id_array};
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value, read_execution_value_as};
 pub use read_allocation::{estimate_copy_cell_bytes, estimate_event_copy_cell_bytes, estimate_event_null_cell_bytes, estimate_null_copy_cell_bytes,
     estimate_read_cell_bytes, estimate_read_value_bytes};

@@ -6,7 +6,7 @@ use arrow_array::{
     cast::AsArray,
     types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
 };
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_types::{Anomaly, EntityId, Iid, Keyword, LogicalType, Result, ScalarType};
 
@@ -22,6 +22,20 @@ pub enum EntityIdRef<'a> {
 }
 
 impl<'a> EntityIdRef<'a> {
+    /// The handle tag and sign-biased integer payload preserve typed identity order bytewise.
+    pub fn handle_parts<'b>(&'b self, integer: &'b mut [u8; 8]) -> (u8, &'b [u8]) {
+        match self {
+            Self::String(value) => (0, value.as_bytes()),
+            Self::Keyword(value) => (1, value.as_bytes()),
+            Self::Integer(value) => {
+                *integer = ((*value as u64) ^ (1 << 63)).to_be_bytes();
+                (2, integer)
+            }
+            Self::Uuid(value) => (3, value),
+            Self::Binary(value) => (4, value),
+        }
+    }
+
     pub fn from_handle_bytes(handle: &'a [u8]) -> Result<Self> {
         let invalid = || Anomaly::incorrect("rtdb.owned/invalid-handle", "Invalid complete typed identity");
         let (tag, payload) = handle.split_first().ok_or_else(invalid)?;
@@ -86,19 +100,25 @@ pub fn read_owned_entity_id<'a>(field: &Field, array: &'a dyn Array, row: usize)
 }
 
 fn read_id<'a>(field: &Field, array: &'a dyn Array, row: usize, owned: bool) -> Result<EntityIdRef<'a>> {
+    let (field, array, row) = id_cell(field, array, row)?;
+    let logical = from_field(field)?;
+    borrow_id_scalar(&logical, array, row, false, owned).ok_or_else(invalid)
+}
+
+fn id_cell<'f, 'a>(field: &'f Field, array: &'a dyn Array, row: usize) -> Result<(&'f Field, &'a dyn Array, usize)> {
     if row >= array.len() || field.data_type() != array.data_type() { return Err(invalid()); }
     match field.data_type() {
         DataType::Union(fields, UnionMode::Dense) => {
             let union = array.as_union();
             let id = union.type_id(row);
             let (_, child) = fields.iter().find(|(tag, _)| *tag == id).ok_or_else(invalid)?;
-            read_id(child, union.child(id).as_ref(), union.value_offset(row), owned)
+            id_cell(child, union.child(id).as_ref(), union.value_offset(row))
         }
         DataType::RunEndEncoded(ends, child) => {
             macro_rules! read_run {
                 ($ty:ty) => {{
                     let runs = array.as_run::<$ty>();
-                    read_id(child, runs.values().as_ref(), runs.get_physical_index(row), owned)
+                    id_cell(child, runs.values().as_ref(), runs.get_physical_index(row))
                 }};
             }
             match ends.data_type() {
@@ -109,10 +129,55 @@ fn read_id<'a>(field: &Field, array: &'a dyn Array, row: usize, owned: bool) -> 
             }
         }
         _ if array.is_null(row) => Err(invalid()),
-        _ => {
-            let logical = from_field(field)?;
-            borrow_id_scalar(&logical, array, row, false, owned).ok_or_else(invalid)
-        }
+        _ => Ok((field, array, row)),
+    }
+}
+
+/// The caller keeps the Arrow source charge alive with this validated identity.
+pub struct EntityIdLocator {
+    tag: u8,
+    payload: IdentityPayload,
+}
+
+enum IdentityPayload {
+    Integer([u8; 8]),
+    Uuid([u8; 16]),
+    Shared(Buffer),
+}
+
+impl EntityIdLocator {
+    pub fn read_owned(field: &Field, array: &dyn Array, row: usize) -> Result<Self> {
+        let (field, array, row) = id_cell(field, array, row)?;
+        let logical = from_field(field)?;
+        let id = borrow_id_scalar(&logical, array, row, false, true).ok_or_else(invalid)?;
+        let mut integer = [0; 8];
+        let (tag, _) = id.handle_parts(&mut integer);
+        let slice = |values: &Buffer, offsets: &[i32]| {
+            let start = offsets[row] as usize;
+            IdentityPayload::Shared(values.slice_with_length(start, offsets[row + 1] as usize - start))
+        };
+        let payload = match id {
+            EntityIdRef::String(_) | EntityIdRef::Keyword(_) => {
+                let text = array.as_string_opt::<i32>().ok_or_else(invalid)?;
+                slice(text.values(), text.value_offsets())
+            }
+            EntityIdRef::Binary(_) => {
+                let bytes = array.as_binary_opt::<i32>().ok_or_else(invalid)?;
+                slice(bytes.values(), bytes.value_offsets())
+            }
+            EntityIdRef::Integer(_) => IdentityPayload::Integer(integer),
+            EntityIdRef::Uuid(uuid) => IdentityPayload::Uuid(uuid),
+        };
+        Ok(Self { tag, payload })
+    }
+
+    pub fn cmp_parts(&self, parts: (u8, &[u8])) -> std::cmp::Ordering {
+        let payload = match &self.payload {
+            IdentityPayload::Integer(bytes) => bytes.as_slice(),
+            IdentityPayload::Uuid(bytes) => bytes.as_slice(),
+            IdentityPayload::Shared(bytes) => bytes.as_slice(),
+        };
+        (self.tag, payload).cmp(&parts)
     }
 }
 
