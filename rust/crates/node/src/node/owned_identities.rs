@@ -142,7 +142,7 @@ impl OwnedReadSession {
         }
         let context = self.relation_context(relation)?;
         if !rtdb_query::read_owned_relation_schema(context, &self.owner, relation).await?
-            .is_some_and(|(schema, _)| schema.is_shared_column_carrier())
+            .is_some_and(|(schema, _)| schema.is_opaque_root_carrier())
         {
             return Err(protected_page_unavailable());
         }
@@ -383,19 +383,38 @@ fn invalid_page() -> Anomaly {
 }
 
 fn is_protected_row_carrier(relation: &OwnedRelation, id: &EntityId) -> bool {
-    relation.name() == "fact_unit_column_payloads"
-        && matches!(id, EntityId::String(id) if id.starts_with("row/") && id.len() > 4)
+    use rtdb_types::{ROOT_ROW_CARRIERS, RootRowCarrier};
+
+    relation.name() == ROOT_ROW_CARRIERS
+        && matches!(id, EntityId::Binary(id) if RootRowCarrier::parse(id).is_some())
 }
 
 #[cfg(test)]
 #[test]
 fn held_carrier_existence_has_only_the_row_payload_target() -> Result<()> {
-    let payloads = OwnedRelation::new("fact_unit_column_payloads")?;
-    let row = EntityId::String("row/opaque".to_owned());
+    use rtdb_types::{ROOT_ROW_CARRIERS, RootRowCarrier};
+
+    let payloads = OwnedRelation::new(ROOT_ROW_CARRIERS)?;
+    let mut image = RootRowCarrier::table_prefix(&[17; 16]).to_vec();
+    image.extend_from_slice(&[0, 255, 0, 255]);
+    image.extend_from_slice(&[1; 64]);
+    image.extend_from_slice(&[0, 1]);
+    let row = EntityId::Binary(image);
     assert!(is_protected_row_carrier(&payloads, &row));
-    assert!(!is_protected_row_carrier(&payloads, &EntityId::String("row/".to_owned())));
-    assert!(!is_protected_row_carrier(&payloads, &EntityId::String("column/opaque".to_owned())));
-    assert!(!is_protected_row_carrier(&OwnedRelation::new("fact_unit_fences")?, &row));
+    let EntityId::Binary(image) = &row else { unreachable!() };
+    let scope = RootRowCarrier::parse(image).unwrap();
+    assert_eq!(scope.assertion_key()[1..], image[..]);
+    assert_eq!(scope.retirement_key()[1..], image[..]);
+    assert!(RootRowCarrier::is_assertion_key(&scope.assertion_key()));
+    assert!(!RootRowCarrier::is_assertion_key(&scope.retirement_key()));
+    let fence = scope.fence_name();
+    assert_eq!(RootRowCarrier::decode_named_address(fence.strip_prefix("row/").unwrap()).as_deref(), Some(image.as_slice()));
+    let mut invalid = image.clone();
+    invalid[18] = 1;
+    assert!(RootRowCarrier::parse(&invalid).is_none());
+    assert!(!is_protected_row_carrier(&payloads, &EntityId::String("row/opaque".to_owned())));
+    assert!(!is_protected_row_carrier(&payloads, &EntityId::Binary(vec![11; 18])));
+    assert!(!is_protected_row_carrier(&OwnedRelation::new("fact_unit_column_payloads")?, &row));
     Ok(())
 }
 

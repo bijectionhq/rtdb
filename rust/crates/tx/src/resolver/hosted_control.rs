@@ -432,10 +432,14 @@ impl OpenTransaction<'_> {
         &self, owner: &str, id: &EntityId, winner: rtdb_types::Position,
     ) -> Result<OwnedBatch> {
         let invalid = invalid_family_fence;
-        let relation = OwnedRelation::new("fact_unit_column_payloads")?;
+        let EntityId::String(fence) = id else { return Err(invalid()); };
+        let address = fence.strip_prefix("row/").ok_or_else(invalid)?;
+        let _key = self.context.memory.reserve(address.len() + 128)?;
+        let id = EntityId::Binary(rtdb_types::RootRowCarrier::decode_named_address(address).ok_or_else(invalid)?);
+        let relation = OwnedRelation::new(rtdb_types::ROOT_ROW_CARRIERS)?;
         let at = self.tx_key().system_time;
-        let rows = self.root_point(owner, &relation, id, at, invalid).await?;
-        let revision = rtdb_query::owned_row_revision(rows.batch(), 0, id, &self.context.memory)?;
+        let rows = self.root_point(owner, &relation, &id, at, invalid).await?;
+        let revision = rtdb_query::owned_row_revision(rows.batch(), 0, &id, &self.context.memory)?;
         if u64::try_from(revision.0).ok() != Some(winner.publication) {
             return Err(invalid());
         }

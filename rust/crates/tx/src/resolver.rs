@@ -14,7 +14,7 @@ use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, OwnedRelation, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
-use rtdb_types::{SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix};
+use rtdb_types::{ROOT_ROW_CARRIERS, RootRowCarrier, SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix};
 use tokio_util::sync::CancellationToken;
 
 use crate::bounded_retry::is_bounded_receipts_table;
@@ -1374,9 +1374,7 @@ impl<'a> OpenTransaction<'a> {
     async fn declare_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, schema: &rtdb_types::OwnedSchema) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        if relation.name() == SHARED_COLUMN_CARRIERS && !schema.is_shared_column_carrier() {
-            return Err(invalid_shared_column_carrier());
-        }
+        require_root_carrier_schema(relation, Some(schema))?;
         let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
             "The owned relation already has a different declaration or inferred data");
         let existing = self.read_owned_schema(owner, relation).await?;
@@ -2556,6 +2554,7 @@ impl<'a> OpenTransaction<'a> {
                 continue;
             }
             let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
+            require_root_carrier_id(relation, id.into())?;
             let observed = if self.buffer.base_snapshot().contains_table(&relation.lifetime_table(owner)) {
                 let accepted = self.decision_time();
                 if *valid_at > accepted {
@@ -2758,7 +2757,7 @@ impl<'a> OpenTransaction<'a> {
         &mut self, relation: &rtdb_types::OwnedRelation, id: &EntityId,
         origin: rtdb_types::EventOrigin, valid: Interval,
     ) -> Result<()> {
-        require_shared_column_carrier_id(relation, id.into())?;
+        require_root_carrier_id(relation, id.into())?;
         let replay = self.hosted_replay.as_ref()
             .filter(|_| relation.is_root_data())
             .ok_or_else(replay_period_unavailable)?;
@@ -2802,7 +2801,7 @@ impl<'a> OpenTransaction<'a> {
         if relation.world().is_some() || relation.is_world_catalog() {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        require_shared_column_carrier_id(relation, id.into())?;
+        require_root_carrier_id(relation, id.into())?;
         let replay_lifetime = if self.hosted_replay.is_some() {
             let (schema, _) = self.read_owned_schema(owner, relation).await?.ok_or_else(replay_period_unavailable)?;
             schema.lifetime_micros().map(|duration| {
@@ -2929,7 +2928,7 @@ impl<'a> OpenTransaction<'a> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        require_shared_column_carrier_id(relation, id.into())?;
+        require_root_carrier_id(relation, id.into())?;
         let selected_valid = if let Some(source) = self.hosted_replay.as_ref().map(|replay| replay.source_time()) {
             let (schema, _retained) = self.read_owned_schema(owner, relation).await?.ok_or_else(replay_period_unavailable)?;
             let valid = replay_period(from, to)?;
@@ -3050,13 +3049,17 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         let declaration = self.read_owned_schema(owner, relation).await?;
-        if relation.name() == SHARED_COLUMN_CARRIERS {
-            if !declaration.as_ref().is_some_and(|(schema, _)| schema.is_shared_column_carrier()) {
-                return Err(invalid_shared_column_carrier());
-            }
+        require_root_carrier_schema(relation, declaration.as_ref().map(|(schema, _)| schema))?;
+        if matches!(relation.name(), SHARED_COLUMN_CARRIERS | ROOT_ROW_CARRIERS) {
             for row in documents.rows() {
-                let Some(Value::Binary(id)) = row.get("_id") else { return Err(invalid_shared_column_carrier()); };
-                require_shared_column_carrier_id(relation, EntityIdRef::Binary(id))?;
+                let Some(Value::Binary(id)) = row.get("_id") else {
+                    return Err(if relation.name() == SHARED_COLUMN_CARRIERS {
+                        invalid_shared_column_carrier()
+                    } else {
+                        invalid_root_row_carrier()
+                    });
+                };
+                require_root_carrier_id(relation, EntityIdRef::Binary(id))?;
             }
         }
         let filled = if uses_ordered_micros {
@@ -3159,7 +3162,7 @@ impl<'a> OpenTransaction<'a> {
         use rtdb_types::WorldClockMode;
 
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        if root.name() == SHARED_COLUMN_CARRIERS { return Err(unavailable()); }
+        if matches!(root.name(), SHARED_COLUMN_CARRIERS | ROOT_ROW_CARRIERS) { return Err(unavailable()); }
         let world = relation.world().ok_or_else(unavailable)?;
         let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
         let schema = record.schemas.relation(root)
@@ -3352,11 +3355,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let table = relation.table(owner);
         let declaration = self.read_owned_schema(owner, relation).await?;
-        if relation.name() == SHARED_COLUMN_CARRIERS
-            && !declaration.as_ref().is_some_and(|(schema, _)| schema.is_shared_column_carrier())
-        {
-            return Err(invalid_shared_column_carrier());
-        }
+        require_root_carrier_schema(relation, declaration.as_ref().map(|(schema, _)| schema))?;
         if legacy && (declaration.is_some() || self.hosted_replay.is_some()) {
             let typed_lifetime = declaration.as_ref().is_some_and(|(schema, _)| schema.lifetime_micros().is_some())
                 && matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Exact(_) | LegacyOwnedPresence::Submitted));
@@ -3441,7 +3440,7 @@ impl<'a> OpenTransaction<'a> {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/missing-id", "Owned row has no _id"))?;
             let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(id_cell.field, id_cell.array, row)?.saturating_mul(4))?;
             let id = documents.owned_id(row)?;
-            require_shared_column_carrier_id(relation, (&id).into())?;
+            require_root_carrier_id(relation, (&id).into())?;
             let iid = id.iid();
             if !cell_is_present(id_cell)? || replay.is_some_and(|(iids, _)| iids[row] != iid) {
                 return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
@@ -4085,13 +4084,27 @@ fn invalid_shared_column_carrier() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/shared-column-carrier", "Shared-column Root carriers require the installed opaque relation and a complete Binary BFCP2 identity")
 }
 
-fn require_shared_column_carrier_id(relation: &OwnedRelation, id: EntityIdRef<'_>) -> Result<()> {
-    if relation.name() == SHARED_COLUMN_CARRIERS
-        && !matches!(id, EntityIdRef::Binary(id) if SharedColumnCarrierPrefix::of_identity(id).is_some())
-    {
-        return Err(invalid_shared_column_carrier());
+fn invalid_root_row_carrier() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/root-row-carrier", "Protected Root rows require the installed opaque relation and a complete Binary address")
+}
+
+fn require_root_carrier_schema(relation: &OwnedRelation, schema: Option<&rtdb_types::OwnedSchema>) -> Result<()> {
+    if schema.is_some_and(rtdb_types::OwnedSchema::is_opaque_root_carrier) { return Ok(()); }
+    match relation.name() {
+        SHARED_COLUMN_CARRIERS => Err(invalid_shared_column_carrier()),
+        ROOT_ROW_CARRIERS => Err(invalid_root_row_carrier()),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+fn require_root_carrier_id(relation: &OwnedRelation, id: EntityIdRef<'_>) -> Result<()> {
+    match relation.name() {
+        SHARED_COLUMN_CARRIERS if !matches!(id, EntityIdRef::Binary(id) if SharedColumnCarrierPrefix::of_identity(id).is_some()) =>
+            Err(invalid_shared_column_carrier()),
+        ROOT_ROW_CARRIERS if !matches!(id, EntityIdRef::Binary(id) if RootRowCarrier::parse(id).is_some()) =>
+            Err(invalid_root_row_carrier()),
+        _ => Ok(()),
+    }
 }
 
 fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Value>) -> Result<()> {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::ArrowCell;
 use rtdb_query::{QueryContext, read_hosted_control_point, owned_row_event_position};
-use rtdb_types::{AssertionFamilyFenceMarker, Position, RootLandingBinding, TransactionKey, TxId};
+use rtdb_types::{AssertionFamilyFenceMarker, Position, RootLandingBinding, RootRowCarrier, TransactionKey, TxId};
 use sha2::{Digest, Sha256};
 
 use crate::{TxOp, source::Operation};
@@ -83,6 +83,8 @@ impl<'a> RetiredFamilyFence<'a> {
     pub(crate) fn require_batch(&self, operations: &[Operation], retirement: &str) -> Result<()> {
         let address = retirement.strip_prefix("row/").filter(|address| !address.is_empty())
             .ok_or_else(authority_required)?;
+        let address = RootRowCarrier::decode_named_address(address).ok_or_else(authority_required)?;
+        let marker = RootRowCarrier::parse(&address).ok_or_else(authority_required)?.retirement_key();
         let mut marker_seen = false;
         let mut row_marker_seen = false;
         for operation in operations {
@@ -122,7 +124,7 @@ impl<'a> RetiredFamilyFence<'a> {
                 _ if !row_marker_seen && row_journal_relation(name) => {
                     row_marker_seen = true;
                     write.create_only && write.documents.row_count() == 1
-                        && write.documents.rows().all(|row| only_columns(&row, &["_id"]) && row_id(&row) == Some(address))
+                        && write.documents.rows().all(|row| only_columns(&row, &["_id"]) && row.binary_id() == Some(marker.as_slice()))
                 }
                 _ => false,
             };
