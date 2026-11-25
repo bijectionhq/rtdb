@@ -1226,7 +1226,10 @@ impl TransactionBuffer {
         self.append(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Delete, recency: None })
     }
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
-        self.append(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
+        self.erase_iid(&table, id.iid())
+    }
+    pub fn erase_iid(&mut self, table: &TableRef, iid: Iid) -> Result<()> {
+        self.append_to(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid, system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None }).map(drop)
     }
     pub fn puts_metadata_unit(&self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<bool> {
         let Some(pending) = self.tables.get(table) else { return Ok(false); };

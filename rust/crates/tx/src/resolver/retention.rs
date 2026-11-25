@@ -1,4 +1,5 @@
-use rtdb_columnar::read_value;
+use arrow_array::{Array, RecordBatch};
+use rtdb_columnar::{ColumnReader, read_value};
 use rtdb_types::{Anomaly, Iid, Result, TableRef, TimeUnit, TxId, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
@@ -124,11 +125,7 @@ impl OpenTransaction<'_> {
             vec![value],
         ).await?;
         while let Some(page) = cursor.next_batch().await? {
-            let batch = page.batch();
-            for row in 0..batch.num_rows() {
-                let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), row)?.entity_id()?;
-                self.buffer.erase(receipts.clone(), &id)?;
-            }
+            self.stage_receipt_erasures(&receipts, page.batch())?;
         }
         Ok(())
     }
@@ -201,12 +198,48 @@ impl OpenTransaction<'_> {
     async fn retire_receipt_rows(&mut self, table: rtdb_types::TableRef, sql: &str, observed: Timestamp) -> Result<()> {
         let mut cursor = self.open_query(sql, vec![super::time_value(observed)]).await?;
         while let Some(page) = cursor.next_batch().await? {
-            let page = page.batch();
-            for row in 0..page.num_rows() {
-                let id = read_value(page.schema().field(0), page.column(0).as_ref(), row)?;
-                self.buffer.erase(table.clone(), &id.entity_id()?)?;
-            }
+            self.stage_receipt_erasures(&table, page.batch())?;
         }
         Ok(())
     }
+
+    fn stage_receipt_erasures(&mut self, table: &TableRef, page: &RecordBatch) -> Result<()> {
+        if page.num_rows() == 0 { return Ok(()); }
+        let ids = page.column(0).as_ref();
+        let reader = ColumnReader::new(page.schema_ref().field(0))?;
+        for row in 0..page.num_rows() {
+            self.buffer.erase_iid(table, receipt_erasure_iid(&reader, ids, row)?)?;
+        }
+        Ok(())
+    }
+}
+
+fn receipt_erasure_iid(reader: &ColumnReader<'_>, ids: &dyn Array, row: usize) -> Result<Iid> {
+    match reader.read_entity_id(ids, row) {
+        Ok(Some(id)) => Ok(id.iid()),
+        _ => Ok(reader.read(ids, row)?.entity_id()?.iid()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn receipt_erasure_iids_match_raw_value_id_semantics() -> Result<()> {
+    use rtdb_columnar::{build_array, to_field};
+    use rtdb_types::{Keyword, LogicalType};
+
+    let valid = [
+        Value::Utf8("reçu/東京".into()), Value::Keyword(Keyword::from_name(":legacy/receipt")),
+        Value::I8(-7), Value::I16(-123), Value::I32(-400), Value::I64(i64::MIN), Value::Uuid([0x12; 16]),
+    ];
+    let invalid = [Value::Null, Value::DateDay(42), Value::U64(u64::MAX), Value::Binary(vec![1, 2])];
+    let values: Vec<_> = valid.into_iter().chain(invalid).collect();
+    let ty = LogicalType::from_legs(values.iter().map(Value::logical_type));
+    let field = to_field("_id", &ty)?;
+    let array = build_array(&ty, &values)?;
+    let reader = ColumnReader::new(&field)?;
+    for row in 0..values.len() {
+        let expected = read_value(&field, array.as_ref(), row).and_then(|value| value.entity_id()).map(|id| id.iid());
+        assert_eq!(receipt_erasure_iid(&reader, array.as_ref(), row), expected);
+    }
+    Ok(())
 }

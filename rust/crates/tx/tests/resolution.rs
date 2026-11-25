@@ -1733,6 +1733,42 @@ async fn erasing_a_record_retires_only_metadata_bound_to_that_record() {
     let event = events.view().read_event(0).unwrap();
     assert_eq!(event.iid, EntityId::Integer(0).iid());
     assert!(matches!(event.operation, StoredOperation::Erase));
+    let tombstone = erased.writes().tables()[&table()].batch().unwrap().header(0).unwrap();
+    assert!(tombstone.position.unwrap().ordinal < event.position.unwrap().ordinal);
+}
+
+#[tokio::test]
+async fn retiring_a_legacy_receipt_uses_the_id_hash_even_with_a_noncanonical_stored_iid() -> Result<()> {
+    use rtdb_format::data::StoredEvent;
+    use rtdb_index::TransactionBuffer;
+    use rtdb_types::{EntityId, Iid, TransactionKey, TxId};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default())?;
+    let predecessor = TransactionKey { tx_id: TxId(63), system_time: Timestamp(100) };
+    let receipts = TableRef::new("xt", "idempotency_receipts");
+    let id = EntityId::String("historical/reçu".into());
+    let stored_iid = Iid([0x5a; 16]);
+    let mut legacy = TransactionBuffer::new(state.snapshot(), predecessor, Arc::clone(&context.memory))?;
+    legacy.append(receipts.clone(), StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: None,
+        iid: stored_iid, system_from: predecessor.system_time, valid_time: Interval::from_micros(0, 90)?,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])), recency: None,
+    })?;
+    state.apply(&legacy.stage()?)?;
+
+    let mut resolver = TxResolver::new(Some(predecessor), SourcePosition(63), None, &context.memory)?;
+    let retired = resolver.resolve_source(state.snapshot(), SourcePosition(64), Timestamp(110), request(vec![], &context), &context).await?;
+    assert!(retired.result().committed(), "{:?}", retired.result().error());
+    let batch = retired.writes().tables()[&receipts].batch().unwrap();
+    assert_eq!(batch.len(), 1);
+    let event = batch.view().read_event(0)?;
+    assert_ne!(event.iid, stored_iid);
+    assert_eq!(event.iid, id.iid());
+    assert_eq!(event.operation, StoredOperation::Erase);
+    assert_eq!(event.valid_time, Interval::ALL);
+    assert_eq!(event.system_from, retired.result().tx_key().system_time);
+    Ok(())
 }
 
 #[tokio::test]
