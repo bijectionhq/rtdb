@@ -16,7 +16,7 @@ use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Sna
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
-use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
+use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages_from_iter, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
 use crate::columnar::BatchCursor;
@@ -2330,9 +2330,11 @@ impl PartitionScan {
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
         self.read_statistics(&task.pages)?;
-        let summaries: Vec<_> = task.pages.iter().map(|index|self.pages.entries[*index].summary.clone()).collect();
+        let entries = &self.pages.entries;
+        let summaries = task.pages.iter().map(|&index| &entries[index].summary);
         let pruning = self.pruning();
-        let mut selected: Vec<_> = select_pages(&summaries,pruning,|summary|self.pages.entries[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
+        let mut selected: Vec<_> = select_pages_from_iter(summaries, pruning, |summary| entries[summary.page_index as usize].content_matches)
+            .into_iter().map(|summary| summary.page_index as usize).collect();
         if let Some(iid) = pruning.iid.filter(|_| !pruning.bypass_temporal_pruning) {
             self.prune_covered_iid_pages(&mut selected, iid).await?;
         }
