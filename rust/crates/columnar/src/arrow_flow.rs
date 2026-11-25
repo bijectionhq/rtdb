@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Default)]
 pub struct Measures {
     pub layout: Option<&'static str>,
+    pub fallback_reason: Option<&'static str>,
     pub rows: Option<usize>,
     pub encoded_bytes: Option<usize>,
     pub copied_bytes: Option<usize>,
@@ -74,7 +75,7 @@ impl Sample {
                 "arrow-flow {{\"version\":1,\"process\":{},\"session\":\"{}\",\"operation\":{},",
                 "\"edge\":\"{}\",\"rows\":{},\"encoded_bytes\":{},\"copied_bytes\":{},",
                 "\"new_backing_bytes\":{},\"reservation_bytes\":{},",
-                "\"input_buffer\":{},\"output_buffer\":{},\"layout\":\"{}\"}}"
+                "\"input_buffer\":{},\"output_buffer\":{},\"layout\":\"{}\",\"fallback_reason\":\"{}\"}}"
             ),
             std::process::id(),
             self.session,
@@ -88,6 +89,7 @@ impl Sample {
             Number(measures.input_buffer),
             Number(measures.output_buffer),
             measures.layout.unwrap_or_default(),
+            measures.fallback_reason.unwrap_or_default(),
         );
     }
 }
