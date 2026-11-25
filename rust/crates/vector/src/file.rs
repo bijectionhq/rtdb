@@ -403,6 +403,20 @@ pub(crate) struct Cluster {
     pub(crate) digest: [u8; 32],
 }
 
+impl Cluster {
+    pub(crate) fn read_len(&self) -> usize {
+        usize::try_from(self.range.end - self.range.start).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn decode_bound(&self) -> usize {
+        // Even an unaligned canonical block copies at most its body plus four rounded value buffers.
+        self.read_len().saturating_add(
+            DECODE_SCRATCH_BYTES + size_of::<rtdb_storage::cache::CacheLease>() + 2 * BUFFER_OWNER_BYTES
+                + 4 * (64 + BUFFER_OWNER_BYTES),
+        )
+    }
+}
+
 /// A generation's directory: its clusters and their unit centroids.
 pub(crate) struct Directory {
     pub(crate) dimensions: usize,

@@ -65,9 +65,12 @@ entity ProbePlan {
 -- The route applies only at a valid-time point and a system-time point, without transaction overlays.
 -- The published frontier is the set of live current tries that carry a generation of the definition.
 -- Tries above the frontier and the live segments are read exactly, up to a byte budget; beyond it the scan ranks exactly.
+-- Source planning admits descriptor growth and can decline as soon as uncovered trie sizes exceed the budget.
 -- An equality filter that fixes every partition column selects the clusters of that partition before any ranking.
 -- An IID scope from another accelerator small enough to rank exactly leaves the scan exact.
 -- Each generation probes its eligible clusters nearest centroid first; the recall target sets the starting probe fraction and shortlist.
+-- Cluster reads limit concurrent range and decode work using available admission.
+-- A read refused by concurrent memory pressure is retried alone after the other reads settle.
 -- The directory is validated in place, including ascending partition order.
 -- A partition filter seeks its contiguous directory row range.
 -- The read reserves ranking scratch before retaining the eligible cluster descriptions.

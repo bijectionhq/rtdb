@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_buffer::Buffer;
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EncodedEvent, EventBatch}, ipc::{ArrowFile, inspect_file_reserved}};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
@@ -80,6 +80,7 @@ pub struct Shortlist {
     partition: Option<Partition>,
     scores: Scores,
     opened: Vec<Opened>,
+    _opened_allocation: Arc<MemoryReservation>,
 }
 
 impl Shortlist {
@@ -90,51 +91,57 @@ impl Shortlist {
         let bounds = cut.bounds;
         if !(bounds.valid_time.is_point() && bounds.system_time.is_point()) || cut.snapshot.has_overlays() { return Ok(None); }
         if probe.values().len() != definition.dimensions { return Ok(None); }
-        let Some(sources) = sources(cut, definition, budget) else { return Ok(None) };
+        let Some(sources) = sources(cut, definition, budget)? else { return Ok(None) };
         let mut scores = Scores::new(cut.memory, budget.max_candidates)?;
         FrontierRanker {
             definition, probe: probe.values(), partition, scope, bounds, scores: &mut scores,
-        }.rank(cut, &sources).await?;
+        }.rank(cut, &sources.entries).await?;
         if scores.overflowed { return Ok(None); }
+        let mut opened_allocation = cut.memory.reserve(0)?;
         let mut opened = Vec::new();
-        for source in &sources {
-            let Source::Generation { key, locator } = source else { continue };
+        for source in &sources.entries {
+            let SourceKind::Generation { key, locator } = &source.kind else { continue };
+            if cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
             let lease = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
             let directory = Directory::read(lease, locator, cut.memory)?;
             if directory.dimensions != definition.dimensions { return Ok(None); }
             if let Some(generation) = Opened::rank(key, &directory, probe.values(), partition, cut.memory)? {
+                admit_growth(&mut opened, 0, Arc::get_mut(&mut opened_allocation).expect("shortlist owns its allocation"))?;
                 opened.push(generation);
             }
         }
-        Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, scores, opened }))
+        Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, scores, opened, _opened_allocation: opened_allocation }))
     }
 
     /// Probes the clusters the current plan reaches and returns the nearest distinct IIDs, or `None` past the candidate budget.
     pub async fn round(&mut self, cut: Cut<'_>, scope: Option<IidScope<'_>>) -> Result<Option<Round>> {
-        let bounds = cut.bounds;
-        let dimensions = self.probe.values().len();
         for generation in &mut self.opened {
             let probes = self.plan.probes(generation.clusters.len());
-            let start = generation.probed.min(probes);
-            generation.probed = generation.probed.max(probes);
-            let key = &generation.key;
-            let clusters = &generation.clusters;
-            let blocks = futures::stream::iter((start..probes).map(|index| {
-                let cluster = &clusters[index];
-                async move {
-                    let lease = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
-                    Block::read(lease, cluster, dimensions, cut.memory)
+            let mut start = generation.probed.min(probes);
+            while start < probes {
+                let clusters = &generation.clusters[start..probes];
+                let width = read_width(cut, &generation.key, clusters);
+                let clusters = &clusters[..width];
+                let dimensions = self.probe.values().len();
+                let key = &generation.key;
+                let blocks = futures::stream::iter(clusters.iter().enumerate().map(|(index, cluster)| {
+                    async move { (index, read_block(cut, key, cluster, dimensions).await) }
+                })).buffer_unordered(width);
+                futures::pin_mut!(blocks);
+                let mut retry = [false; MAX_CLUSTER_READS];
+                while let Some((index, block)) = blocks.next().await {
+                    match block {
+                        Ok(block) => rank_block(&block, cut, self.probe.values(), scope, &mut self.scores)?,
+                        Err(error) if width > 1 && refused_read_memory(&error) => retry[index] = true,
+                        Err(error) => return Err(error),
+                    }
                 }
-            })).buffer_unordered(8);
-            futures::pin_mut!(blocks);
-            while let Some(block) = blocks.try_next().await? {
-                for row in 0..block.len() {
-                    if row % 4096 == 0 && cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
-                    let iid = block.iid(row)?;
-                    let (valid_from, valid_to, system_from) = block.extent(row);
-                    if scope.is_some_and(|scope| !scope.contains(&iid)) || !may_be_visible(valid_from, valid_to, system_from, bounds) { continue; }
-                    self.scores.add(iid, rows::unit_distance(self.probe.values(), block.unit(row)))?;
+                for (_, cluster) in clusters.iter().enumerate().filter(|(index, _)| retry[*index]) {
+                    let block = read_block(cut, key, cluster, dimensions).await?;
+                    rank_block(&block, cut, self.probe.values(), scope, &mut self.scores)?;
                 }
+                start += width;
+                generation.probed = start;
             }
         }
         let Some((candidates, truncated)) = self.scores.nearest(self.plan.target(), cut.memory)? else { return Ok(None) };
@@ -148,31 +155,127 @@ impl Shortlist {
     pub fn partition(&self) -> Option<Partition> { self.partition }
 }
 
-/// A source of candidates at the cut.
-enum Source { Generation { key: ObjectKey, locator: Locator }, Frontier { data: ObjectKey } }
+const MAX_CLUSTER_READS: usize = 8;
+
+fn read_width(cut: Cut<'_>, key: &ObjectKey, clusters: &[Cluster]) -> usize {
+    let mut available = cut.memory.available_bytes();
+    let mut width = 0;
+    for cluster in clusters.iter().take(MAX_CLUSTER_READS) {
+        let Ok(read) = cut.storage.object_store().scan_range_allocation(key, cluster.read_len()) else { break };
+        let needed = read.retained_bytes.saturating_add(read.scratch_bytes.max(cluster.decode_bound()));
+        let Some(remaining) = available.checked_sub(needed) else { break };
+        available = remaining;
+        width += 1;
+    }
+    width.max(1)
+}
+
+async fn read_block(cut: Cut<'_>, key: &ObjectKey, cluster: &Cluster, dimensions: usize) -> Result<Block> {
+    let lease = cut.cancellation.run_until_cancelled(cut.storage.get_range_or(key, cluster.range.clone(), cut.memory))
+        .await.ok_or_else(crate::kmeans::cancelled)??;
+    Block::read(lease, cluster, dimensions, cut.memory)
+}
+
+fn rank_block(block: &Block, cut: Cut<'_>, probe: &[f32], scope: Option<IidScope<'_>>, scores: &mut Scores) -> Result<()> {
+    for row in 0..block.len() {
+        if row % 4096 == 0 && cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
+        let iid = block.iid(row)?;
+        let (valid_from, valid_to, system_from) = block.extent(row);
+        if scope.is_some_and(|scope| !scope.contains(&iid)) || !may_be_visible(valid_from, valid_to, system_from, cut.bounds) {
+            continue;
+        }
+        scores.add(iid, rows::unit_distance(probe, block.unit(row)))?;
+    }
+    Ok(())
+}
+
+fn refused_read_memory(error: &Anomaly) -> bool {
+    error.category != AnomalyCategory::Interrupted
+        && matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit")
+}
+
+enum SourceKind { Generation { key: ObjectKey, locator: Locator }, Frontier { data: ObjectKey } }
+
+struct Source<'a> {
+    trie: &'a CatalogTrie,
+    ordinal: usize,
+    kind: SourceKind,
+}
+
+struct Sources<'a> {
+    entries: Vec<Source<'a>>,
+    _allocation: Arc<MemoryReservation>,
+}
 
 /// The cut's sources, or `None` where the frontier is too large to rank exactly within budget.
-fn sources(cut: Cut<'_>, definition: &VectorDefinition, budget: Budget) -> Option<Vec<Source>> {
+fn sources<'a>(cut: Cut<'a>, definition: &VectorDefinition, budget: Budget) -> Result<Option<Sources<'a>>> {
     let table = &definition.table;
-    let entry = cut.snapshot.table_entry(table)?;
+    let Some(entry) = cut.snapshot.table_entry(table) else { return Ok(None) };
     let earliest = cut.bounds.valid_time.lower().0.min(cut.bounds.system_time.lower().0);
-    let visible = |trie: &&CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
+    let visible = |trie: &&CatalogTrie| trie.state == TrieState::Live
+        && trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
+    let mut allocation = cut.memory.reserve(0)?;
+    let mut entries = Vec::new();
     let mut uncovered = 0i64;
-    let mut sources = Vec::new();
-    for trie in cut.snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
-        let recorded = trie.artefact(definition::KIND, &definition.artefact_id(), definition.generation)
+    let _id = cut.memory.reserve(definition.name.len().saturating_add(64))?;
+    let artefact_id = definition.artefact_id();
+    for (ordinal, trie) in cut.snapshot.trie_catalog().iter_tries(table).filter(visible).enumerate() {
+        if cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
+        let recorded = trie.artefact(definition::KIND, &artefact_id, definition.generation)
             .and_then(|record| Some((record, Locator::decode(record.stats.as_deref()?)?)))
-            .filter(|(_, locator)| locator.dimensions as usize == definition.dimensions)
-            .and_then(|(record, locator)| Some((ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record).ok()?).ok()?, locator)));
-        match recorded {
-            Some((key, locator)) => sources.push(Source::Generation { key, locator }),
+            .filter(|(_, locator)| locator.dimensions as usize == definition.dimensions);
+        let key_bytes = entry.slug.as_str().len().saturating_add(trie.key.part().len());
+        let key_bytes = recorded.as_ref().map_or(key_bytes, |(record, _)| {
+            record.pack_members.iter().fold(key_bytes.saturating_add(artefact_id.len()), |size, member| {
+                size.saturating_add(member.len()).saturating_add(128)
+            })
+        });
+        let mut key_scratch = recorded.map(|_| cut.memory.reserve(key_scratch_bytes(key_bytes))).transpose()?;
+        let generation = recorded.and_then(|(record, locator)| {
+            let key = ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record).ok()?).ok()?;
+            Some((key, locator))
+        });
+        let (key, locator) = match generation {
+            Some((key, locator)) => (key, Some(locator)),
             None => {
+                if trie.data_file_size < 0 { return Ok(None); }
                 uncovered = uncovered.saturating_add(trie.data_file_size);
-                sources.push(Source::Frontier { data: ObjectKey::new(entry.slug.data_key(&trie.key)).ok()? });
+                if uncovered > budget.max_uncovered_bytes { return Ok(None); }
+                if key_scratch.is_none() {
+                    key_scratch = Some(cut.memory.reserve(key_scratch_bytes(key_bytes))?);
+                }
+                let Ok(key) = ObjectKey::new(entry.slug.data_key(&trie.key)) else { return Ok(None) };
+                (key, None)
             }
-        }
+        };
+        let bytes = key.as_str().len().saturating_mul(2);
+        let kind = match locator {
+            Some(locator) => SourceKind::Generation { key, locator },
+            None => SourceKind::Frontier { data: key },
+        };
+        admit_growth(&mut entries, bytes, Arc::get_mut(&mut allocation).expect("source plan owns its allocation"))?;
+        entries.push(Source { trie, ordinal, kind });
+        drop(key_scratch);
     }
-    (uncovered <= budget.max_uncovered_bytes).then_some(sources)
+    if uncovered > budget.max_uncovered_bytes { return Ok(None); }
+    entries.sort_unstable_by(|left, right| left.trie.key.scan_precedence().cmp(&right.trie.key.scan_precedence())
+        .then_with(|| left.ordinal.cmp(&right.ordinal)));
+    Ok(Some(Sources { entries, _allocation: allocation }))
+}
+
+fn key_scratch_bytes(key_bytes: usize) -> usize {
+    512usize.saturating_add(key_bytes.saturating_mul(4))
+}
+
+pub(crate) fn admit_growth<T>(values: &mut Vec<T>, additional: usize, allocation: &mut MemoryReservation) -> Result<()> {
+    let held = allocation.bytes().saturating_add(additional);
+    if values.len() < values.capacity() { return allocation.grow_to(held); }
+    let current = values.capacity();
+    let capacity = current.saturating_mul(2).max(1);
+    allocation.grow_to(held.saturating_add(capacity.saturating_mul(size_of::<T>())))?;
+    values.try_reserve_exact(capacity - values.len())
+        .map_err(|error| Anomaly::fault("rtdb.vector/staging", error.to_string()))?;
+    allocation.shrink_to(held.saturating_add((values.capacity() - current).saturating_mul(size_of::<T>())))
 }
 
 struct FrontierRanker<'a> {
@@ -185,10 +288,10 @@ struct FrontierRanker<'a> {
 }
 
 impl FrontierRanker<'_> {
-    async fn rank(mut self, cut: Cut<'_>, sources: &[Source]) -> Result<()> {
+    async fn rank(mut self, cut: Cut<'_>, sources: &[Source<'_>]) -> Result<()> {
         let definition = self.definition;
         for source in sources {
-            let Source::Frontier { data } = source else { continue };
+            let SourceKind::Frontier { data } = &source.kind else { continue };
             let columns = definition.put_columns();
             self.rank_file(cut, data, &columns).await?;
         }
@@ -347,6 +450,29 @@ mod tests {
     use crate::definition::{Approximate, Method};
 
     #[test]
+    fn cluster_fanout_leaves_room_for_range_and_decode_bytes() -> Result<()> {
+        let snapshot = rtdb_index::PartitionValue::loaded(Default::default(), Default::default(), Default::default())?.snapshot();
+        let storage = Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 0));
+        let memory = MemoryBudget::new(65_536);
+        let cancellation = CancellationToken::new();
+        let point = Interval::at(Timestamp(10))?;
+        let cut = Cut { snapshot: &snapshot, storage: &storage, memory: &memory, cancellation: &cancellation,
+            bounds: TemporalBounds { valid_time: point, system_time: point } };
+        let key = ObjectKey::new("generation").unwrap();
+        let clusters = [
+            Cluster { range: 0..4096, rows: 1, digest: [0; 32] },
+            Cluster { range: 4096..8192, rows: 1, digest: [0; 32] },
+        ];
+        let needed = clusters[0].decode_bound() + clusters[0].read_len();
+        assert_eq!(read_width(cut, &key, &clusters), 2);
+        let held = memory.reserve(65_536 - needed)?;
+        assert_eq!(read_width(cut, &key, &clusters), 1);
+        drop(held);
+        assert_eq!(read_width(cut, &key, &clusters), 2);
+        Ok(())
+    }
+
+    #[test]
     fn directory_ranking_funds_only_the_selected_partitions_and_keeps_the_grants() {
         use crate::{file::write_generation, rows::IndexedRows};
         use rtdb_types::{EventHeader, EventOp};
@@ -499,7 +625,7 @@ mod tests {
         let cut = Cut { snapshot: &snapshot, storage: &storage, memory: &memory, cancellation: &cancellation,
             bounds: TemporalBounds { valid_time: point, system_time: point } };
         let mut shortlist = Shortlist {
-            probe: UnitProbe::from_slice(&[1.0, 0.0], &memory)?.unwrap(), plan: probe::Plan::new(0.9, 1), budget, partition: None, scores, opened: Vec::new(),
+            probe: UnitProbe::from_slice(&[1.0, 0.0], &memory)?.unwrap(), plan: probe::Plan::new(0.9, 1), budget, partition: None, scores, opened: Vec::new(), _opened_allocation: memory.reserve(0)?,
         };
         let first = shortlist.round(cut, None).await?.unwrap();
         assert_eq!(first.candidates.iter().collect::<Vec<_>>(), (1..=64).map(iid).collect::<Vec<_>>());
