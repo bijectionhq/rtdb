@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -40,46 +41,39 @@ impl TransitDocuments {
 pub(super) fn read(
     file: &mut File, format: CopyFormat, size: usize, owns_transaction: bool, memory: &Arc<MemoryBudget>,
 ) -> Result<TransitDocuments> {
-    let mut pages = Some(DocumentPages::default());
-    let mut conversion = Ok(());
-    visit(file, format, size, |value| {
-        if let Some(builder) = pages.as_mut() && conversion.is_ok() {
-            match builder.append(value) {
-                Ok(valid_id) => {
-                    if !valid_id || (builder.rows == PAGE_ROWS && !builder.flush(owns_transaction, memory)) {
-                        pages = None;
-                    }
-                }
-                Err(error) => conversion = Err(error),
-            }
-        }
-    })?;
-    conversion?;
-    if let Some(mut pages) = pages
-        && pages.flush(owns_transaction, memory)
-        && !pages.finished.is_empty()
-        && let Ok(documents) = ArrowDocuments::coalesce_pages(pages.finished, memory)
     {
-        return Ok(TransitDocuments::Arrow(documents));
+        let mut pages = DocumentPages::default();
+        let staged = visit(file, format, size, |value| {
+            let valid_id = pages.append(value)?;
+            if !valid_id || (pages.rows == PAGE_ROWS && !pages.flush(owns_transaction, memory)) {
+                pages = DocumentPages::default();
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if staged.is_continue()
+            && pages.flush(owns_transaction, memory)
+            && !pages.finished.is_empty()
+            && let Ok(documents) = ArrowDocuments::coalesce_pages(pages.finished, memory)
+        {
+            return Ok(TransitDocuments::Arrow(documents));
+        }
     }
 
     // The row writer owns layouts whose union order or nested field presence can change across
     // pages or operations, and the original document used by a missing-ID diagnostic.
     let mut rows = Vec::new();
-    let mut conversion = Ok(());
-    visit(file, format, size, |value| {
-        if conversion.is_ok() {
-            conversion = value.and_then(|value| match value {
-                Value::Struct(fields) => { rows.push(fields); Ok(()) }
-                _ => Err(expected_document()),
-            });
-        }
+    let _ = visit(file, format, size, |value| {
+        let Value::Struct(fields) = value else { return Err(expected_document()); };
+        rows.push(fields);
+        Ok(ControlFlow::Continue(()))
     })?;
-    conversion?;
     Ok(TransitDocuments::Rows(rows))
 }
 
-fn visit(file: &mut File, format: CopyFormat, size: usize, consume: impl FnMut(Result<Value>)) -> Result<()> {
+fn visit(
+    file: &mut File, format: CopyFormat, size: usize, consume: impl FnMut(Value) -> Result<ControlFlow<()>>,
+) -> Result<ControlFlow<()>> {
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
     let reader = BufReader::new(file);
     let format = if format == CopyFormat::TransitJson { Format::Text } else { Format::Binary };
@@ -99,8 +93,8 @@ struct DocumentPages {
 }
 
 impl DocumentPages {
-    fn append(&mut self, value: Result<Value>) -> Result<bool> {
-        let Value::Struct(fields) = value? else { return Err(expected_document()); };
+    fn append(&mut self, value: Value) -> Result<bool> {
+        let Value::Struct(fields) = value else { return Err(expected_document()); };
         let mut valid_id = false;
         for (name, value) in fields {
             if name == "_id" {
@@ -140,12 +134,7 @@ impl DocumentPages {
         let mut fields = Vec::with_capacity(self.columns.len());
         let mut arrays = Vec::with_capacity(self.columns.len());
         for (name, entries) in std::mem::take(&mut self.columns) {
-            let mut cells = vec![Value::Null; self.rows];
-            for (row, value) in entries { cells[row] = value; }
-            let ty = cells.iter().fold(LogicalType::Nothing, |ty, cell| {
-                let actual = cell.logical_type();
-                if ty == actual { ty } else { ty.join(&actual) }
-            });
+            let ty = sparse_column_type(self.rows, &entries);
             let shape = match &ty { LogicalType::Maybe(inner) => inner.as_ref(), _ => &ty };
             if !compatible(shape) || (!owns_transaction && ty.nullable()) { return Ok(None); }
             if *shape != LogicalType::Null {
@@ -155,14 +144,36 @@ impl DocumentPages {
                     None => { self.types.insert(name.clone(), shape.clone()); }
                 }
             }
-            let bound = rtdb_columnar::estimate_builder_bytes(&ty, &cells)?;
-            arrays.push(output.column(bound, || rtdb_columnar::copy_array(&ty, &cells))?);
+            let cells = || sparse_column_cells(self.rows, &entries);
+            let bound = rtdb_columnar::estimate_builder_bytes_refs(&ty, cells())?;
+            arrays.push(output.column(bound, || {
+                let borrowed = cells().collect::<Vec<_>>();
+                rtdb_columnar::copy_array_refs(&ty, &borrowed)
+            })?);
             fields.push(rtdb_columnar::to_field(name, &ty)?);
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(io_error)?;
         let batch = output.finish_with_metadata(batch, 4096)?;
         ArrowDocuments::from_owned_payload(&batch, memory)
     }
+}
+
+fn sparse_column_type(rows: usize, entries: &[(usize, Value)]) -> LogicalType {
+    let mut ty = LogicalType::Nothing;
+    let mut next_row = 0;
+    for (row, value) in entries {
+        if *row > next_row { ty = ty.join(&LogicalType::Null); }
+        let actual = value.logical_type();
+        if ty != actual { ty = ty.join(&actual); }
+        next_row = *row + 1;
+    }
+    if next_row < rows { ty = ty.join(&LogicalType::Null); }
+    ty
+}
+
+fn sparse_column_cells(rows: usize, entries: &[(usize, Value)]) -> impl ExactSizeIterator<Item = &Value> {
+    let mut entries = entries.iter().peekable();
+    (0..rows).map(move |row| entries.next_if(|(index, _)| *index == row).map_or(&Value::Null, |(_, value)| value))
 }
 
 fn compatible(ty: &LogicalType) -> bool {
@@ -205,10 +216,20 @@ mod tests {
         let memory = MemoryBudget::new(1 << 28);
         let messages = (0..PAGE_ROWS + 2).map(|row| {
             let mut fields = vec![
-                (T::Keyword("xt/id".into()), T::Integer(row as i64)),
+                (T::Keyword("xt/id".into()), T::Bool(false)),
                 (T::String("vector".into()), T::Array(vec![T::Float(-0.0), T::Null, T::Float(2.5)])),
-                (T::String("label".into()), if row % 2 == 0 { T::String("text".into()) } else { T::Null }),
+                (T::String("_id".into()), T::Integer(row as i64)),
             ];
+            let label = match row % PAGE_ROWS {
+                1 => Some(T::Null),
+                3 => Some(T::String("text".into())),
+                0 if row >= PAGE_ROWS => Some(T::String("new page".into())),
+                _ => None,
+            };
+            if let Some(label) = label {
+                fields.push((T::String("label".into()), T::Bool(true)));
+                fields.push((T::Keyword("label".into()), label));
+            }
             if row >= PAGE_ROWS {
                 fields.push((T::String("new".into()), T::Bool(row % 2 == 0)));
             }
@@ -241,16 +262,19 @@ mod tests {
     fn transit_copy_reports_wire_errors_before_document_conversion_errors() {
         let memory = MemoryBudget::new(1 << 22);
         for (format, tail) in [(CopyFormat::TransitJson, b"\n\n}".as_slice()), (CopyFormat::TransitMsgpack, b"\xdd\0".as_slice())] {
-            let mut bytes = encode(format, &T::Integer(1));
-            let Err(document) = read_bytes(&bytes, format, false, &memory) else { panic!("Expected invalid document") };
-            assert_eq!(document, expected_document());
-            bytes.extend_from_slice(tail);
-            let expected = match format {
-                CopyFormat::TransitJson => transit::decode_json_sequence(&bytes),
-                _ => transit::decode_msgpack_sequence(&bytes),
-            }.unwrap_err();
-            let Err(actual) = read_bytes(&bytes, format, false, &memory) else { panic!("Expected invalid wire value") };
-            assert_eq!(actual, expected);
+            for prefix in [Vec::new(), encode(format, &T::Map(Vec::new()))] {
+                let mut bytes = prefix;
+                bytes.extend(encode(format, &T::Integer(1)));
+                let Err(document) = read_bytes(&bytes, format, false, &memory) else { panic!("Expected invalid document") };
+                assert_eq!(document, expected_document());
+                bytes.extend_from_slice(tail);
+                let expected = match format {
+                    CopyFormat::TransitJson => transit::decode_json_sequence(&bytes),
+                    _ => transit::decode_msgpack_sequence(&bytes),
+                }.unwrap_err();
+                let Err(actual) = read_bytes(&bytes, format, false, &memory) else { panic!("Expected invalid wire value") };
+                assert_eq!(actual, expected);
+            }
         }
         assert_eq!(memory.used_bytes(), 0);
     }
@@ -258,12 +282,22 @@ mod tests {
     #[test]
     fn transit_copy_keeps_original_missing_id_diagnostics() {
         let memory = MemoryBudget::new(1 << 22);
-        let value = T::Map(vec![(T::String("field".into()), T::Null)]);
-        let bytes = encode(CopyFormat::TransitJson, &value);
-        let actual = read_bytes(&bytes, CopyFormat::TransitJson, true, &memory).unwrap();
-        let TransitDocuments::Rows(rows) = actual else { panic!("Expected row diagnostic input") };
-        assert_eq!(rows[0].keys().map(String::as_str).collect::<Vec<_>>(), ["field"]);
-        assert_eq!(rows[0].get("field"), Some(&Value::Null));
+        let document = |id| T::Map(vec![(T::String("_id".into()), T::Integer(id))]);
+        let rejected = T::Map(vec![(T::String("field".into()), T::Null)]);
+        for format in FORMATS {
+            let messages = (0..PAGE_ROWS as i64).map(document).chain([rejected.clone(), document(-1)]);
+            let bytes = messages.flat_map(|message| encode(format, &message)).collect::<Vec<_>>();
+            let actual = read_bytes(&bytes, format, true, &memory).unwrap();
+            let TransitDocuments::Rows(rows) = actual else { panic!("Expected row diagnostic input") };
+            assert_eq!(rows.len(), PAGE_ROWS + 2);
+            for (row, fields) in rows[..PAGE_ROWS].iter().enumerate() {
+                assert_eq!(fields.get("_id"), Some(&Value::I64(row as i64)));
+            }
+            assert_eq!(rows[PAGE_ROWS].keys().map(String::as_str).collect::<Vec<_>>(), ["field"]);
+            assert_eq!(rows[PAGE_ROWS].get("field"), Some(&Value::Null));
+            assert_eq!(rows[PAGE_ROWS + 1].get("_id"), Some(&Value::I64(-1)));
+        }
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

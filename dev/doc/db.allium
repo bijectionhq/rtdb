@@ -460,7 +460,8 @@ variant TxMessage : SourceMessage {
     -- Coalescing those documents uses submitted field presence and type order to preserve the source layout.
     -- Compatible numeric list columns are coalesced from their submitted Arrow buffers in that layout.
     -- Embedded Transit delete and erase arguments retain their ID column in the row writer's source layout, with the request order and valid-time bounds.
-    -- Pgwire Transit COPY constructs Arrow document pages for compatible layouts and joins them in input order into one source operation.
+    -- Pgwire Transit COPY builds compatible Arrow page columns from ordered field entries and fills omitted cells with nulls.
+    -- Pgwire Transit COPY joins those pages in input order into one document struct for the source operation.
     -- The source operation preserves the submitted document layout and the original document data used in rejection diagnostics.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
