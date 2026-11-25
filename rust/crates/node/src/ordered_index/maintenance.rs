@@ -546,7 +546,7 @@ async fn apply_block(tree: &Tree, block: i64, roots: &mut RevisionRoots, changes
     roots.apply(tree, changes, EventOrder::NewestFirst, cancellation).await?;
     // A rebuild and incremental replay must write identical addresses for the same block.
     roots.archived = checkpoint::store_roots(tree, block, roots, cancellation).await?;
-    roots.changes.clear();
+    roots.clear_changes();
     Ok(())
 }
 

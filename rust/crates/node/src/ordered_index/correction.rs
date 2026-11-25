@@ -10,7 +10,7 @@ use super::{
     LEAF_LAYOUT_VERSION, format_error,
     key::arrow,
     postings::{BatchKind, KeyBatch, KeyBatchEncoding, ProjectedKeys},
-    tree::{Address, Entry, Item, Key, Span},
+    tree::{Address, Entry, Item, Key, Span, Spans},
 };
 
 pub(super) const HEADER: [u8; 16] = {
@@ -106,10 +106,10 @@ pub(super) fn decode(
     }
     let rows = batch.batch().num_rows();
     let keys_bytes = batch.bytes_excluding(&bytes)?
-        .saturating_add(ProjectedKeys::allocation_bytes())
-        .saturating_add(rows.saturating_mul(size_of::<Span>()));
+        .saturating_add(ProjectedKeys::allocation_bytes());
     if keys_bytes
-        .saturating_add(max_entries.saturating_mul(size_of::<Entry>()))
+        .saturating_add(max_entries.saturating_mul(size_of::<Entry>() + Spans::allocation_bytes(0)))
+        .saturating_add(rows.saturating_mul(size_of::<Span>()))
         > opening.bytes()
     {
         return Err(invalid());
@@ -150,9 +150,9 @@ pub(super) fn decode(
     if offset != rows {
         return Err(invalid());
     }
-    let bytes = keys_bytes.saturating_add(entries.len().saturating_mul(2 * size_of::<usize>()));
-    let keys = ProjectedKeys::new(batch, opening.split_off(bytes)?);
+    let keys = ProjectedKeys::new(batch, opening.split_off(keys_bytes)?);
     entries.into_iter().map(|(address, range)| {
+        let memory = opening.split_off(Spans::allocation_bytes(range.len()))?;
         let mut spans = Vec::with_capacity(range.len());
         let mut prior_end = Timestamp::MIN;
         for row in range {
@@ -163,7 +163,7 @@ pub(super) fn decode(
             prior_end = valid.upper();
             spans.push(Span { valid, tuple: keys.row(row) });
         }
-        Ok(Entry { key: Key::Row(address), item: Item::Row(spans.into()) })
+        Ok(Entry { key: Key::Row(address), item: Item::Row(Spans::new(spans, memory)) })
     }).collect()
 }
 
@@ -203,7 +203,7 @@ mod tests {
         }.owned();
         let entries = [Entry {
             key: Key::Row(address.clone()),
-            item: Item::Row(Arc::from([span.clone()])),
+            item: Item::Row(Spans::new(vec![span.clone()], budget.reserve(Spans::allocation_bytes(1)).unwrap())),
         }];
         let encoding = budget.reserve(32 << 10).unwrap();
         let bytes = encode_leaf(None, &entries, &encoding).unwrap();

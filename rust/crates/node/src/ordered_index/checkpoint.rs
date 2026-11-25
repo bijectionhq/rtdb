@@ -110,6 +110,7 @@ impl Checkpoint {
         RevisionRoots {
             archived: self.revisions.clone().map(Link::Stored),
             changes: BTreeMap::new(),
+            allocation: None,
         }
     }
 
@@ -350,6 +351,7 @@ pub(super) async fn store_roots(
     roots: &RevisionRoots,
     cancellation: &CancellationToken,
 ) -> Result<Root> {
+    let _edits = tree.memory.reserve(roots.changes.len().saturating_mul(size_of::<(Key, Option<Item>)>()))?;
     let mut edits = Vec::with_capacity(roots.changes.len());
     let mut written = BTreeMap::new();
     for (&time, root) in &roots.changes {
@@ -553,7 +555,7 @@ mod tests {
         Definition,
         key::{Atom, Bucket},
         postings::KeyRow,
-        tree::{Address, Cursor, IndexRevision, KeyRef, Span},
+        tree::{Address, Cursor, IndexRevision, KeyRef, Span, Spans},
     };
 
     use super::*;
@@ -616,6 +618,7 @@ mod tests {
         let roots = RevisionRoots {
             archived: None,
             changes: (0..128).map(|instant| (IndexRevision { time: Timestamp(10), transaction: instant }, None)).collect(),
+            allocation: None,
         };
         let root = store_roots(&tree, 0, &roots, &token).await?;
         publish(&tree, 0, 128, root, &token).await?;
@@ -701,7 +704,9 @@ mod tests {
                 None,
                 vec![
                     (posting.clone(), Some(Item::Posting)),
-                    (Key::Row(address.clone()), Some(Item::Row(Arc::from([span.clone()])))),
+                    (Key::Row(address.clone()), Some(Item::Row(Spans::new(
+                        vec![span.clone()], memory.reserve(Spans::allocation_bytes(1))?,
+                    )))),
                 ],
             ).await?;
             let revisions = RevisionRoots {
@@ -709,6 +714,7 @@ mod tests {
                 changes: (0..129)
                     .map(|transaction| (IndexRevision { time: Timestamp(10), transaction }, root.clone()))
                     .collect(),
+                allocation: None,
             };
             let root = store_roots(&tree, 7, &revisions, &token).await?;
             let cancelled = CancellationToken::new();
@@ -750,6 +756,7 @@ mod tests {
         let roots = RevisionRoots {
             archived: None,
             changes: BTreeMap::from([(IndexRevision::through_time(Timestamp(10)), None)]),
+            allocation: None,
         };
         let root = store_roots(&tree, 0, &roots, &token).await?;
         publish(&tree, 0, 1, root, &token).await?;

@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::Arc,
 };
 
@@ -16,7 +16,7 @@ use super::{
     key::{AtomRef, Bucket},
     maintenance::cancelled,
     postings::{BatchKind, KeyBatch, KeyColumn, KeyRow, ProjectedKeys, Tuple},
-    tree::{Address, AddressRef, Cursor, Hit, IndexRevision, Item, Key, KeyRef, Link, Root, Span, Tree},
+    tree::{Address, AddressRef, Cursor, Hit, IndexRevision, Item, Key, KeyRef, Link, Root, Span, Spans, Tree},
 };
 
 /// The roots for the partition's ordered history, with erasures applied to every affected root.
@@ -24,9 +24,27 @@ use super::{
 pub(super) struct RevisionRoots {
     pub archived: Root,
     pub changes: BTreeMap<IndexRevision, Root>,
+    pub(super) allocation: Option<Arc<MemoryReservation>>,
 }
 
 impl RevisionRoots {
+    pub fn clear_changes(&mut self) {
+        self.changes.clear();
+        self.allocation = None;
+    }
+
+    fn insert(&mut self, revision: IndexRevision, root: Root, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if !self.changes.contains_key(&revision) {
+            if self.allocation.is_none() {
+                self.allocation = Some(memory.reserve(0)?);
+            }
+            let grant = Arc::get_mut(self.allocation.as_mut().unwrap()).expect("revision roots own the directory");
+            grant.grow_to(grant.bytes().saturating_add(256))?;
+        }
+        self.changes.insert(revision, root);
+        Ok(())
+    }
+
     pub async fn at(
         &self,
         tree: &Tree,
@@ -58,7 +76,9 @@ impl RevisionRoots {
                 return Err(cancelled());
             }
             let (time, root) = archived_revision(entry)?;
-            self.changes.entry(time).or_insert(root);
+            if !self.changes.contains_key(&time) {
+                self.insert(time, root, &tree.memory)?;
+            }
         }
         Ok(())
     }
@@ -85,7 +105,7 @@ impl RevisionRoots {
                     "Ordered index replay crossed its revision frontier",
                 ));
             }
-            let mut edits = BTreeMap::new();
+            let mut edits = EditBatch::new(&tree.memory)?;
             let mut cut_at_revision = false;
             for (address, mut events) in rows {
                 if cancellation.is_cancelled() {
@@ -95,6 +115,7 @@ impl RevisionRoots {
                     events.reverse();
                 }
                 if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
+                    let _order = tree.memory.reserve(events.len().saturating_mul(size_of::<Event>()))?;
                     events.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
                 }
                 let before = tree.spans(&root, &address).await?;
@@ -106,21 +127,19 @@ impl RevisionRoots {
                     for (_, historical) in self.changes.range_mut(..revision) {
                         let spans = tree.spans(historical, &address).await?;
                         if !spans.is_empty() {
-                            let mut removals = BTreeMap::new();
-                            project(&mut removals, &address, &spans, Arc::from([]));
-                            *historical = tree
-                                .edit(historical.clone(), removals.into_iter().collect())
-                                .await?;
+                            let mut removals = EditBatch::new(&tree.memory)?;
+                            removals.project(&address, &spans, Spans::default())?;
+                            *historical = removals.apply(tree, historical.clone()).await?;
                         }
                     }
                 }
-                if before.as_ref() != after.as_slice() {
-                    project(&mut edits, &address, &before, after.into());
+                if before.as_ref() != after.as_ref() {
+                    edits.project(&address, &before, after)?;
                 }
             }
-            if cut_at_revision || !edits.is_empty() {
-                root = tree.edit(root, edits.into_iter().collect()).await?;
-                self.changes.insert(revision, root.clone());
+            if cut_at_revision || !edits.entries.is_empty() {
+                root = edits.apply(tree, root).await?;
+                self.insert(revision, root.clone(), &tree.memory)?;
             }
             last = Some(revision);
         }
@@ -144,20 +163,19 @@ fn resolve<'a>(
     before: &[Span],
     events: impl IntoIterator<Item = &'a Event>,
     memory: &Arc<MemoryBudget>,
-) -> Result<Vec<Span>> {
+) -> Result<Spans> {
     let bounds = TemporalBounds {
         valid_time: Interval::ALL,
         system_time: Interval::at(time)?,
     };
     let mut resolver = HistoryResolver::new_in(bounds, false, Arc::clone(memory));
+    let mut grant = memory.reserve(Spans::allocation_bytes(0))?;
+    let workspace = Arc::get_mut(&mut grant).expect("span construction owns its reservation");
     let mut after = Vec::new();
     for event in events {
         resolver.resolve_fragments(&event.header, |valid, _| {
             if let Some(tuple) = &event.tuple {
-                after.push(Span {
-                    valid,
-                    tuple: tuple.clone(),
-                });
+                push_reserved(&mut after, Span { valid, tuple: tuple.clone() }, workspace)?;
             }
             Ok(())
         })?;
@@ -172,51 +190,89 @@ fn resolve<'a>(
             op: EventOp::Put,
         };
         resolver.resolve_fragments(&header, |valid, _| {
-            after.push(Span {
-                valid,
-                tuple: span.tuple.clone(),
-            });
+            push_reserved(&mut after, Span { valid, tuple: span.tuple.clone() }, workspace)?;
             Ok(())
         })?;
     }
     after.sort_unstable_by_key(|span| span.valid);
-    let mut coalesced: Vec<Span> = Vec::new();
-    for span in after {
-        if let Some(previous) = coalesced.last_mut()
-            && previous.valid.upper() == span.valid.lower()
-            && previous.tuple == span.tuple
+    let mut written = 0usize;
+    for row in 0..after.len() {
+        if written > 0
+            && after[written - 1].valid.upper() == after[row].valid.lower()
+            && after[written - 1].tuple == after[row].tuple
         {
-            previous.valid = Interval::new(previous.valid.lower(), span.valid.upper())?;
+            after[written - 1].valid =
+                Interval::new(after[written - 1].valid.lower(), after[row].valid.upper())?;
         } else {
-            coalesced.push(span);
+            after.swap(written, row);
+            written += 1;
         }
     }
-    Ok(coalesced)
+    after.truncate(written);
+    Ok(Spans::new(after, grant))
 }
 
-fn project(edits: &mut BTreeMap<Key, Option<Item>>, address: &Address, before: &[Span], after: Arc<[Span]>) {
-    let postings = |spans: &[Span]| -> BTreeSet<Key> {
-        spans
-            .iter()
-            .flat_map(|span| {
-                Bucket::cover(span.valid).map(|bucket| Key::Posting {
-                    bucket,
-                    tuple: span.tuple.clone(),
-                    address: address.clone(),
-                })
-            })
-            .collect()
-    };
-    let old = postings(before);
-    let new = postings(&after);
-    for key in old.difference(&new) {
-        edits.insert(key.clone(), None);
+fn push_reserved<T>(values: &mut Vec<T>, value: T, grant: &mut MemoryReservation) -> Result<()> {
+    let capacity = values.capacity();
+    if values.len() == capacity {
+        let next = capacity.saturating_mul(2).max(1);
+        let previous = grant.bytes();
+        let requested = previous.saturating_add(next.saturating_mul(size_of::<T>()));
+        grant.grow_to(requested)?;
+        values.try_reserve_exact(next - capacity).map_err(format_error)?;
+        grant.shrink_to(requested - capacity * size_of::<T>())?;
     }
-    for key in new.difference(&old) {
-        edits.insert(key.clone(), Some(Item::Posting));
+    values.push(value);
+    Ok(())
+}
+
+struct EditBatch {
+    entries: Vec<(Key, Option<Item>)>,
+    allocation: Arc<MemoryReservation>,
+}
+
+impl EditBatch {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { entries: Vec::new(), allocation: memory.reserve(0)? })
     }
-    let spans = (!after.is_empty()).then_some(Item::Row(after));
-    edits.insert(Key::Row(address.clone()), spans);
+
+    fn project(&mut self, address: &Address, before: &[Span], after: Spans) -> Result<()> {
+        let start = self.entries.len();
+        let grant = Arc::get_mut(&mut self.allocation).expect("edit staging owns its reservation");
+        for (spans, replacement) in [(before, None), (after.as_ref(), Some(Item::Posting))] {
+            for span in spans {
+                for bucket in Bucket::cover(span.valid) {
+                    let key = Key::Posting { bucket, tuple: span.tuple.clone(), address: address.clone() };
+                    push_reserved(&mut self.entries, (key, replacement.clone()), grant)?;
+                }
+            }
+        }
+
+        let entries = &mut self.entries[start..];
+        entries.sort_unstable_by(|(left, removed), (right, inserted)| {
+            left.cmp(right).then_with(|| removed.is_some().cmp(&inserted.is_some()))
+        });
+        let (mut row, mut written) = (0, 0);
+        while row < entries.len() {
+            let next = row + 1 + entries[row + 1..].partition_point(|entry| entry.0 == entries[row].0);
+            if entries[row].1.is_some() == entries[next - 1].1.is_some() {
+                entries.swap(written, row);
+                written += 1;
+            }
+            row = next;
+        }
+        self.entries.truncate(start + written);
+        let spans = (!after.is_empty()).then_some(Item::Row(after));
+        push_reserved(&mut self.entries, (Key::Row(address.clone()), spans), grant)
+    }
+
+    async fn apply(self, tree: &Tree, root: Root) -> Result<Root> {
+        let Self { mut entries, allocation } = self;
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let result = tree.edit(root, entries).await;
+        drop(allocation);
+        result
+    }
 }
 
 pub(super) enum EventOrder {
@@ -268,7 +324,7 @@ impl Changes {
         cancellation: &CancellationToken,
     ) -> Result<Root> {
         for (&revision, rows) in &self.revisions {
-            let mut edits = BTreeMap::new();
+            let mut edits = EditBatch::new(&tree.memory)?;
             for (address, events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
@@ -279,7 +335,7 @@ impl Changes {
                 }
                 let before = tree.spans(&root, address).await?;
                 let after = if revision > through {
-                    Vec::new()
+                    Spans::default()
                 } else if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
                     let _scratch = tree.memory.reserve(events.len().saturating_mul(2 * size_of::<&Event>()))?;
                     let mut ordered: Vec<_> = events.iter().collect();
@@ -293,11 +349,11 @@ impl Changes {
                 } else {
                     resolve(address.iid, revision.time, &before, events, &tree.memory)?
                 };
-                if before.as_ref() != after.as_slice() {
-                    project(&mut edits, address, &before, after.into());
+                if before.as_ref() != after.as_ref() {
+                    edits.project(address, &before, after)?;
                 }
             }
-            root = tree.edit(root, edits.into_iter().collect()).await?;
+            root = edits.apply(tree, root).await?;
         }
         Ok(root)
     }
@@ -507,6 +563,26 @@ mod tests {
             )
             .unwrap();
         changes
+    }
+
+    #[test]
+    fn correction_staging_keeps_unchanged_buckets_out_of_the_edit_batch() -> Result<()> {
+        use super::super::key::Atom;
+        let memory = MemoryBudget::new(1 << 20);
+        let address = Address::new(Iid::MIN, Bytes::new());
+        let tuple = KeyRow::Fence(Arc::from([Atom::Integer(7)]));
+        let span = |from, to| Span { valid: Interval::from_micros(from, to).unwrap(), tuple: tuple.clone() };
+        let unchanged = span(0, 4);
+        let before = [unchanged.clone(), span(8, 10)];
+        let after = Spans::new(vec![unchanged, span(8, 12)], memory.reserve(Spans::allocation_bytes(2))?);
+        let mut edits = EditBatch::new(&memory)?;
+        edits.project(&address, &before, after)?;
+        assert_eq!(edits.entries.len(), 3);
+        assert_eq!(edits.entries.iter().filter(|(_, item)| item.is_none()).count(), 1);
+        assert!(matches!(edits.entries.last(), Some((Key::Row(_), Some(Item::Row(_))))));
+        drop(edits);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
     }
 
     async fn keys(tree: &Tree, root: Root, valid: Timestamp) -> Vec<(i128, Iid)> {
@@ -719,7 +795,7 @@ mod tests {
         roots.apply(&tree, changes(&[second, first], &memory, &token), EventOrder::NewestFirst, &token)
             .await.unwrap();
         roots.archived = super::super::checkpoint::store_roots(&tree, 0, &roots, &token).await.unwrap();
-        roots.changes.clear();
+        roots.clear_changes();
         let captured = IndexRevision { time: Timestamp(40), transaction: 10 };
         let (_, early) = roots.at(&tree, captured).await.unwrap().unwrap();
         let (_, late) = roots.at(&tree, IndexRevision::through_time(Timestamp(40))).await.unwrap().unwrap();

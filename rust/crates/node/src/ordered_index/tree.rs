@@ -259,10 +259,44 @@ pub(super) struct Span {
     pub tuple: KeyRow,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct Spans(Option<Arc<SpanAllocation>>);
+
+#[derive(Debug)]
+struct SpanAllocation {
+    values: Vec<Span>,
+    _memory: Arc<MemoryReservation>,
+}
+
+impl Spans {
+    pub fn allocation_bytes(capacity: usize) -> usize {
+        capacity.saturating_mul(size_of::<Span>())
+            .saturating_add(size_of::<SpanAllocation>() + ARC_HEADER_BYTES)
+    }
+
+    pub fn new(values: Vec<Span>, memory: Arc<MemoryReservation>) -> Self {
+        Self((!values.is_empty()).then(|| Arc::new(SpanAllocation { values, _memory: memory })))
+    }
+}
+
+impl AsRef<[Span]> for Spans {
+    fn as_ref(&self) -> &[Span] {
+        self.0.as_ref().map_or(&[][..], |allocation| allocation.values.as_slice())
+    }
+}
+
+impl std::ops::Deref for Spans {
+    type Target = [Span];
+
+    fn deref(&self) -> &[Span] {
+        self.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum Item {
     Posting,
-    Row(Arc<[Span]>),
+    Row(Spans),
     Revision(Option<Arc<Pointer>>),
 }
 
@@ -1050,7 +1084,7 @@ impl Tree {
         }
     }
 
-    pub async fn spans(&self, root: &Root, address: &Address) -> Result<Arc<[Span]>> {
+    pub async fn spans(&self, root: &Root, address: &Address) -> Result<Spans> {
         let key = Key::Row(address.clone());
         let mut link = root.clone();
         while let Some(page) = link.take() {
@@ -1064,7 +1098,7 @@ impl Tree {
                         let Item::Row(spans) = &leaf.metadata[slot].item else {
                             return Err(format_error("Ordered index row has another item type"));
                         };
-                        return Ok(Arc::clone(spans));
+                        return Ok(spans.clone());
                     }
                     break;
                 }
@@ -1074,7 +1108,7 @@ impl Tree {
                 }
             }
         }
-        Ok(Arc::from([]))
+        Ok(Spans::default())
     }
 
     pub async fn edit(&self, root: Root, edits: Vec<(Key, Option<Item>)>) -> Result<Root> {
