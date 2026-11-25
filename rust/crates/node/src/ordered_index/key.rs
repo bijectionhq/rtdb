@@ -46,45 +46,7 @@ pub(super) enum Family {
 
 impl Atom {
     pub(super) fn of(value: &Value) -> Option<Self> {
-        Some(match value {
-            Value::Null | Value::Undefined => Self::Null,
-            Value::Bool(value) => Self::Bool(*value),
-            Value::I8(value) => Self::Integer((*value).into()),
-            Value::I16(value) => Self::Integer((*value).into()),
-            Value::I32(value) => Self::Integer((*value).into()),
-            Value::I64(value) => Self::Integer((*value).into()),
-            Value::U8(value) => Self::Integer(i128::from(*value as i8)),
-            Value::U16(value) => Self::Integer(i128::from(*value as i16)),
-            Value::U32(value) => Self::Integer(i128::from(*value as i32)),
-            Value::U64(value) => Self::Integer(i128::from(*value as i64)),
-            // SQL equality groups signed zeros and refuses to equate NaNs.
-            // A single ordered key cannot witness those equality bounds.
-            Value::F32(value) if *value != 0.0 && !value.is_nan() => {
-                Self::FloatOrder(float_order(f64::from(*value)))
-            }
-            Value::F64(value) if *value != 0.0 && !value.is_nan() => {
-                Self::FloatOrder(float_order(*value))
-            }
-            Value::Utf8(value) => Self::Text(value.clone()),
-            Value::Binary(value) => Self::Binary(value.clone()),
-            Value::Uuid(value) => Self::Uuid(*value),
-            Value::Decimal(value) if value.bit_width == 128 => {
-                let precision = value.precision.try_into().ok()?;
-                let scale = value.scale.try_into().ok()?;
-                let coefficient = i128::from_be_bytes(value.unscaled.as_slice().try_into().ok()?);
-                if !decimal_coefficient_fits(precision, coefficient) { return None; }
-                Self::Decimal128(precision, scale, coefficient)
-            },
-            Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => {
-                Self::Day(value.date_days()?)
-            }
-            Value::Timestamp {
-                value,
-                unit: TimeUnit::Microsecond,
-                timezone: Some(_),
-            } => Self::InstantMicros(*value),
-            _ => return None,
-        })
+        AtomRef::of(value).map(AtomRef::owned)
     }
 
     pub(super) fn borrowed(&self) -> AtomRef<'_> {
@@ -105,6 +67,48 @@ impl Atom {
 }
 
 impl<'a> AtomRef<'a> {
+    pub(super) fn of(value: &'a Value) -> Option<Self> {
+        Some(match value {
+            Value::Null | Value::Undefined => Self::Null,
+            Value::Bool(value) => Self::Bool(*value),
+            Value::I8(value) => Self::Integer((*value).into()),
+            Value::I16(value) => Self::Integer((*value).into()),
+            Value::I32(value) => Self::Integer((*value).into()),
+            Value::I64(value) => Self::Integer((*value).into()),
+            Value::U8(value) => Self::Integer(i128::from(*value as i8)),
+            Value::U16(value) => Self::Integer(i128::from(*value as i16)),
+            Value::U32(value) => Self::Integer(i128::from(*value as i32)),
+            Value::U64(value) => Self::Integer(i128::from(*value as i64)),
+            // SQL equality groups signed zeros and refuses to equate NaNs.
+            // A single ordered key cannot witness those equality bounds.
+            Value::F32(value) if *value != 0.0 && !value.is_nan() => {
+                Self::FloatOrder(float_order(f64::from(*value)))
+            }
+            Value::F64(value) if *value != 0.0 && !value.is_nan() => {
+                Self::FloatOrder(float_order(*value))
+            }
+            Value::Utf8(value) => Self::Text(value),
+            Value::Binary(value) => Self::Binary(value),
+            Value::Uuid(value) => Self::Uuid(*value),
+            Value::Decimal(value) if value.bit_width == 128 => {
+                let precision = value.precision.try_into().ok()?;
+                let scale = value.scale.try_into().ok()?;
+                let coefficient = i128::from_be_bytes(value.unscaled.as_slice().try_into().ok()?);
+                if !decimal_coefficient_fits(precision, coefficient) { return None; }
+                Self::Decimal128(precision, scale, coefficient)
+            },
+            Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => {
+                Self::Day(value.date_days()?)
+            }
+            Value::Timestamp {
+                value,
+                unit: TimeUnit::Microsecond,
+                timezone: Some(_),
+            } => Self::InstantMicros(*value),
+            _ => return None,
+        })
+    }
+
     pub(super) fn is_bound(self) -> bool {
         !matches!(self, Self::FloatOrder(bits)
             if bits == FLOAT_NAN_ORDER || bits == float_order(0.0) || bits == float_order(-0.0))
@@ -303,9 +307,9 @@ pub(super) struct Bucket {
 }
 
 impl Bucket {
-    pub fn at(time: Timestamp) -> impl Iterator<Item = Self> {
+    pub fn at(time: Timestamp) -> impl ExactSizeIterator<Item = Self> {
         let point = offset(time.0);
-        (0..=64).map(move |level| Self {
+        (0..65).map(move |level| Self {
             level,
             start: bucket_start(point, level),
         })

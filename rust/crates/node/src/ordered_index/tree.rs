@@ -1489,6 +1489,7 @@ fn sparse(link: &Link) -> bool {
 /// A directed tree walk starting at the first leaf whose fence can meet the seek.
 pub(super) struct Cursor {
     pages: Vec<(Arc<Node>, usize)>,
+    frames: Option<Arc<MemoryReservation>>,
     root: Root,
     reverse: bool,
 }
@@ -1544,9 +1545,28 @@ impl Cursor {
     pub fn new(root: Root, reverse: bool) -> Self {
         Self {
             pages: Vec::new(),
+            frames: None,
             root,
             reverse,
         }
+    }
+
+    fn push(&mut self, tree: &Tree, node: Arc<Node>, offset: usize) -> Result<()> {
+        let capacity = self.pages.capacity();
+        if self.pages.len() == capacity {
+            let next = capacity.saturating_mul(2).max(1);
+            let frame = size_of::<(Arc<Node>, usize)>();
+            if self.frames.is_none() {
+                self.frames = Some(tree.memory.reserve(0)?);
+            }
+            let granted = self.frames.as_mut().expect("the cursor has a frame reservation");
+            let granted = Arc::get_mut(granted).expect("the cursor owns its frames");
+            granted.grow_to(capacity.saturating_add(next).saturating_mul(frame))?;
+            self.pages.try_reserve_exact(next - capacity).map_err(format_error)?;
+            granted.shrink_to(self.pages.capacity().saturating_mul(frame))?;
+        }
+        self.pages.push((node, offset));
+        Ok(())
     }
 
     pub async fn next(
@@ -1647,7 +1667,7 @@ impl Cursor {
                     } else {
                         seek::partition(leaf.len(), |i| position(leaf.key(i)) == before)
                     };
-                    self.pages.push((node, offset));
+                    self.push(tree, node, offset)?;
                     return Ok(Some(()));
                 }
                 Page::Branch(children) => {
@@ -1666,7 +1686,7 @@ impl Cursor {
                             format_error("Ordered index seek contradicts its page fences")
                         })?;
                     link = children[slot].clone();
-                    self.pages.push((node, skipped + 1));
+                    self.push(tree, node, skipped + 1)?;
                 }
             }
         }

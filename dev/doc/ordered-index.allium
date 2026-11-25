@@ -66,6 +66,8 @@ entity Checkpoint {
 -- A negotiated standalone held range reply emits complete Arrow IPC messages under the original witness and lifetime release checks.
 -- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
 -- A seek evaluates each bound expression once for its comparison keys.
+-- A held range compares variable-width selector values within their caller's lifetime.
+-- A point scan funds merge heads by bucket count, tree frames as paths grow, and result staging by batch size.
 -- A candidate scope has one sorted Arrow IID column for membership and range intersection.
 -- Filtering and output use the same resolved payload batches.
 -- Gathering nested payloads preserves their source Arrow vectors and composes their selected positions in index order.
