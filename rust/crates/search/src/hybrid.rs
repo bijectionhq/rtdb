@@ -1,6 +1,6 @@
 //! Reciprocal rank fusion of exact rankings taken at one held cut.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cmp::Ordering, collections::{BTreeMap, BinaryHeap}, sync::Arc};
 
 use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{DataType, Field, Schema};
@@ -18,9 +18,11 @@ pub const RANK_CONSTANT: f64 = 60.0;
 /// Equal scores order by typed identity, then partition ordinal; `total` counts the distinct fused hits.
 /// Each window's name labels a nullable UInt32 column with the hit's rank in that window.
 pub fn fuse_ranked(windows: &[(&str, &OwnedSearchBatch)], limit: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedSearchBatch> {
-    let mut scores = BTreeMap::<(usize, EntityIdRef<'_>), (f64, Vec<Option<u32>>)>::new();
+    let ranks_bytes = windows.len().saturating_mul(size_of::<Option<u32>>());
     let mut bytes = 4096usize;
     let mut scratch = memory.reserve(bytes)?;
+    let charge = Arc::get_mut(&mut scratch).expect("fusion owns its scratch");
+    let mut scores = BTreeMap::<(usize, EntityIdRef<'_>), (f64, Vec<Option<u32>>)>::new();
     for (ordinal, (_, window)) in windows.iter().enumerate() {
         let batch = window.hits.batch();
         let ids = batch.column(0).as_ref();
@@ -33,8 +35,8 @@ pub fn fuse_ranked(windows: &[(&str, &OwnedSearchBatch)], limit: usize, memory: 
             let (score, ranks) = match scores.entry((partition, id)) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    bytes = bytes.saturating_add(hit_bytes(id));
-                    Arc::get_mut(&mut scratch).expect("fusion owns its scratch").grow_to(bytes)?;
+                    bytes = bytes.saturating_add(192).saturating_add(ranks_bytes);
+                    charge.grow_to(bytes)?;
                     entry.insert((0.0, vec![None; windows.len()]))
                 }
             };
@@ -43,13 +45,22 @@ pub fn fuse_ranked(windows: &[(&str, &OwnedSearchBatch)], limit: usize, memory: 
         }
     }
     let total = scores.len();
-    let mut fused: Vec<_> = scores.into_iter().map(|((partition, id), (score, ranks))| (partition, id, score, ranks)).collect();
-    fused.sort_by(|left, right| right.2.total_cmp(&left.2)
-        .then_with(|| left.1.cmp(&right.1))
-        .then_with(|| left.0.cmp(&right.0)));
-    fused.truncate(limit);
-    let bound = fused.iter().fold(4096usize, |size, (_, id, _, _)| {
-        size.saturating_add(hit_bytes(*id).saturating_mul(4)).saturating_add(8 * windows.len())
+    let keep = limit.min(total);
+    let heap_bytes = keep.saturating_mul(size_of::<FusedHit<'_>>());
+    charge.grow_to(bytes.saturating_add(heap_bytes))?;
+    let mut best = BinaryHeap::with_capacity(keep);
+    for ((partition, id), (score, ranks)) in scores {
+        let hit = FusedHit { partition, id, score, ranks };
+        if best.len() < keep {
+            best.push(hit);
+        } else if let Some(mut worst) = best.peek_mut() {
+            if hit < *worst { *worst = hit; }
+        }
+    }
+    let fused = best.into_sorted_vec();
+    charge.shrink_to(heap_bytes.saturating_add(keep.saturating_mul(ranks_bytes)))?;
+    let bound = fused.iter().fold(4096usize, |size, hit| {
+        size.saturating_add(hit_bytes(hit.id).saturating_mul(4)).saturating_add(ranks_bytes)
     });
     let reservation = memory.reserve(bound)?;
     let mut fields = vec![
@@ -58,18 +69,43 @@ pub fn fuse_ranked(windows: &[(&str, &OwnedSearchBatch)], limit: usize, memory: 
         Field::new("partition", DataType::UInt64, false),
     ];
     let mut columns: Vec<ArrayRef> = vec![
-        rtdb_columnar::entity_id_array(fused.iter().map(|(_, id, _, _)| *id))?,
-        Arc::new(Float64Array::from_iter_values(fused.iter().map(|(_, _, score, _)| *score))),
-        Arc::new(UInt64Array::from_iter_values(fused.iter().map(|(partition, _, _, _)| *partition as u64))),
+        rtdb_columnar::entity_id_array(fused.iter().map(|hit| hit.id))?,
+        Arc::new(Float64Array::from_iter_values(fused.iter().map(|hit| hit.score))),
+        Arc::new(UInt64Array::from_iter_values(fused.iter().map(|hit| hit.partition as u64))),
     ];
     for (ordinal, (name, _)) in windows.iter().enumerate() {
         fields.push(Field::new(*name, DataType::UInt32, true));
-        columns.push(Arc::new(UInt32Array::from_iter(fused.iter().map(|(_, _, _, ranks)| ranks[ordinal]))));
+        columns.push(Arc::new(UInt32Array::from_iter(fused.iter().map(|hit| hit.ranks[ordinal]))));
     }
     let output = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|error| Anomaly::fault("rtdb.search/hybrid-output", error.to_string()))?;
     Ok(OwnedSearchBatch { hits: OwnedBatch::with_reservation(output, reservation)?, total })
 }
+
+struct FusedHit<'a> {
+    partition: usize,
+    id: EntityIdRef<'a>,
+    score: f64,
+    ranks: Vec<Option<u32>>,
+}
+
+impl Ord for FusedHit<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.score.total_cmp(&self.score)
+            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| self.partition.cmp(&other.partition))
+    }
+}
+
+impl PartialOrd for FusedHit<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+
+impl PartialEq for FusedHit<'_> {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+
+impl Eq for FusedHit<'_> {}
 
 fn hit_bytes(id: EntityIdRef<'_>) -> usize {
     size_of::<rtdb_types::Value>().saturating_add(id.owned_payload_bytes()).saturating_add(128)
@@ -117,6 +153,18 @@ mod tests {
             (1, EntityId::String("b".into()), rrf(2.0)),
         ]);
         assert!(fuse_ranked(&[("rank", &window(&[(0, EntityIdRef::String("a")), (0, EntityIdRef::String("a"))], &memory))], 1, &memory).is_err());
+    }
+
+    #[test]
+    fn fusion_keeps_the_bounded_prefix_and_total_distinct_hits() {
+        let memory = MemoryBudget::new(1 << 20);
+        let first = window(&[(0, EntityIdRef::Binary(b"a")), (0, EntityIdRef::String("a"))], &memory);
+        let second = window(&[(0, EntityIdRef::String("a")), (0, EntityIdRef::Binary(b"a"))], &memory);
+        let windows = [("first", &first), ("second", &second)];
+        let one = fuse_ranked(&windows, 1, &memory).unwrap().into_page().unwrap();
+        assert_eq!(one.total, 2);
+        assert_eq!(one.hits.len(), 1);
+        assert_eq!(one.hits[0].id, EntityId::String("a".into()));
     }
 
     #[test]

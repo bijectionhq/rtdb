@@ -4053,11 +4053,17 @@ impl BatchCursor for BatchExpressions {
         for (index, (expression, kernel)) in self.expressions.iter().zip(clocked).enumerate() {
             if let Some(projection) = self.cosine.as_ref().and_then(|items| items[index].as_ref()) {
                 let bytes = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
-                if let Ok(scratch) = self.execution.context.memory.reserve(bytes)
+                if let Ok(mut scratch) = self.execution.context.memory.reserve(bytes)
                     && let Some(column) = projection.column(&batch) {
+                    let charge = Arc::get_mut(&mut scratch).expect("Cosine projection owns its reservation");
+                    let retained = column.retained_bytes()?;
+                    if retained <= charge.bytes() {
+                        charge.shrink_to(retained)?;
+                    } else {
+                        charge.grow_to(retained)?;
+                    }
                     let lease = Arc::get_mut(&mut reservation).expect("Batch projection owns its reservation");
-                    drop(scratch);
-                    lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                    lease.absorb(charge)?;
                     columns.push(column);
                     continue;
                 }

@@ -85,11 +85,11 @@ impl VectorAccelerator {
             if found.is_none() && let Expr::Call { name, args, .. } = expression
                 && name.eq_ignore_ascii_case(PREDICATE) && let [Expr::Column { id, .. }, probe, limit] = args.as_slice()
                 && let Some(field) = scan.columns.iter().find(|field| field.id == *id) {
-                found = Some((field.name.clone(), probe.clone(), limit.clone()));
+                found = Some((field.name.as_str(), probe, limit));
             }
         }); }
         let Some((column, probe, limit)) = found else { return Ok(None) };
-        let (Some(probe), Some(limit)) = (request.constants.constant(&probe).await?, request.constants.constant(&limit).await?) else { return Ok(None) };
+        let (Some(probe), Some(limit)) = (request.constants.constant(probe).await?, request.constants.constant(limit).await?) else { return Ok(None) };
         let Some(limit) = row_count(&limit) else { return Ok(None) };
         let table = &scan.table.name.table;
         let definition = if table.is_owned_event_data() {
@@ -97,7 +97,7 @@ impl VectorAccelerator {
                 partitions: request.partitions.to_vec(), storage: Arc::clone(request.storage),
             })]), false)?;
             let context = QueryContext::new(catalog, Arc::clone(request.memory), request.current_time, "UTC", QueryOptions::default(), request.cancellation)?;
-            definition::owned_definition(context, table, &column).await?
+            definition::owned_definition(context, table, column).await?
         } else {
             definition::definitions_in(request.database, request.partitions.to_vec(), Arc::clone(request.storage),
                 Arc::clone(request.memory), request.current_time, request.cancellation).await?
@@ -117,21 +117,26 @@ async fn partition_filter(request: &ScanRequest<'_>, definition: &VectorDefiniti
     for predicate in &scan.predicates { conjuncts(predicate, &mut |expression| {
         if let Expr::Binary { op: BinaryOp::Eq, left, right } = expression {
             let column = |side: &Expr| match side {
-                Expr::Column { id, .. } => scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.clone()),
+                Expr::Column { id, .. } => scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str()),
                 _ => None,
             };
-            if let Some(name) = column(left) { equalities.push((name, (**right).clone())); }
-            else if let Some(name) = column(right) { equalities.push((name, (**left).clone())); }
+            let binding = column(left).map(|name| (name, right.as_ref()))
+                .or_else(|| column(right).map(|name| (name, left.as_ref())));
+            if let Some((name, operand)) = binding
+                && definition.partition.iter().any(|column| column == name)
+            {
+                equalities.push((name, operand));
+            }
         }
     }); }
     let mut fixed = BTreeMap::new();
     for (name, expression) in equalities {
-        if !definition.partition.contains(&name) || fixed.contains_key(&name) { continue; }
-        if let Some(value) = request.constants.constant(&expression).await? { fixed.insert(name, value); }
+        if fixed.contains_key(name) { continue; }
+        if let Some(value) = request.constants.constant(expression).await? { fixed.insert(name, value); }
     }
     let mut parts = Vec::with_capacity(definition.partition.len());
     for column in &definition.partition {
-        let Some(value) = fixed.remove(column) else { return Ok(None) };
+        let Some(value) = fixed.remove(column.as_str()) else { return Ok(None) };
         if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
         parts.push(Some(std::borrow::Cow::Owned(value)));
     }

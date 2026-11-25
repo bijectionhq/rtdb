@@ -824,7 +824,8 @@ fn owned_nearest_request(call: &Call, request: &[u8]) -> Result<OwnedNearestRequ
     let (count, mut rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest has no partition count"))?;
     let count = usize::from(u16::from_be_bytes(*count));
     if !(1..=32).contains(&count) { return Err(invalid("Owned held nearest partition count is out of range")); }
-    let reservation = call.reserve(count * 512 * (2 + filters))?;
+    let mut reservation = call.reserve(count * 512 * (2 + filters))?;
+    let charge = Arc::get_mut(&mut reservation).expect("nearest request owns its reservation");
     let mut partitions = Vec::with_capacity(count);
     for _ in 0..count {
         let (relation, tail) = split_relation(rest)?;
@@ -846,13 +847,17 @@ fn owned_nearest_request(call: &Call, request: &[u8]) -> Result<OwnedNearestRequ
         let length = usize::from(u16::from_be_bytes(*length));
         if !(1..=MAX_NEAREST_FILTER_VALUES).contains(&length) { return Err(invalid("Owned held nearest filter value count is out of range")); }
         rest = tail;
-        let mut allowed = BTreeSet::new();
+        charge.grow_to(charge.bytes() + 512).map_err(status)?;
+        let mut allowed = BTreeSet::<Vec<u8>>::new();
         for _ in 0..length {
             let (size, tail) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest filter value has no length"))?;
             let size = usize::from(u16::from_be_bytes(*size));
             if size > MAX_NEAREST_FILTER_BYTES { return Err(invalid("Owned held nearest filter value exceeds its size bound")); }
             let (value, tail) = tail.split_at_checked(size).ok_or_else(|| invalid("Owned held nearest filter value is truncated"))?;
-            allowed.insert(value.to_vec());
+            if !allowed.contains(value) {
+                charge.grow_to(charge.bytes() + 128 + size).map_err(status)?;
+                allowed.insert(value.to_vec());
+            }
             rest = tail;
         }
         values.push(allowed);
@@ -875,6 +880,7 @@ fn owned_nearest_request(call: &Call, request: &[u8]) -> Result<OwnedNearestRequ
     if !(1..=MAX_NEAREST_DIMENSIONS).contains(&dimensions) || rest.len() != dimensions * 4 {
         return Err(invalid("Owned held nearest probe does not match its dimension count"));
     }
+    charge.grow_to(charge.bytes() + dimensions * size_of::<f32>()).map_err(status)?;
     let probe = rest.chunks_exact(4)
         .map(|bytes| f32::from_be_bytes(bytes.try_into().expect("four-byte probe component")))
         .collect::<Vec<_>>();
