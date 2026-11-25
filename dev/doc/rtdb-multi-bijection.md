@@ -617,7 +617,6 @@ Supply the port separately and the TLS material in the version-pinned JSON as `c
 The optional verifier has `endpoint`, `history_id`, `target`, `ca_pem`, `client_certificate_pem` and `client_private_key_pem`.
 Keep the caller leaf digest fields and the paired operator and verifier requirement.
 Only one configuration form can be installed.
-The operator follows any selected-writer redirect over the same commissioned TLS trust profile.
 The Bijection reconciler uses its distinct read-only credential and neither peer operation consumes the Original recovery bearer.
 
 The private request and reply each frame one UTF-8 JSON object with a big-endian 32-bit length and a 16 KiB limit.
@@ -630,7 +629,7 @@ Requests have `operation`, the complete `decision`, and `held_ready`.
 - `exclude_classic_migration_opening` verifies the same live interlock and orders `excluded` only while the held-ready row still has no opening reservation.
   Opening and exclusion contend on that row and its ordered Basis.
   A reserved opening remains unresolved until the same operation completes.
-- `classic_migration_opening_status` reads the exact historical terminal over the read-only credential.
+- `classic_migration_opening_status` reads the exact historical terminal over either commissioned client credential.
   It does not call the live verifier, and returns `unresolved` while no positive terminal can be read for this selection.
 
 Positive terminals carry `outcome`, `decision`, `held_ready` and the stable `ordered_at` native catalog Basis.
@@ -642,6 +641,68 @@ An advance requires a verified closed writer or vacant predecessor at or after t
 The active writer verifies the referenced receipt, ordered placement and exact current authority row before a write.
 Scoped attempt settlement retains the original namespace, key, family and digest and exposes only terminals ordered after the imported fence.
 Ordinary SQL, ordinary v1 writes and generic provisioning remain closed for this candidate, and the old Original keeps its independent close and retained receipt authority.
+
+##### Native operator command and recovery
+
+Use the Multi-enabled native `rtdb` binary from an operator host that can reach the commissioned private ingress.
+Save the exact `opening` witness for the applied Bijection route decision in `opening-witness.json`, with the complete `decision` and `held_ready` objects and their original values.
+Keep that file for status and recovery, including after Bijection has settled the interlock.
+The command takes the action on the command line and uses the same witness file for all three actions.
+
+Provision `opening-operator.json` with the native catalog incarnation, private ingress, server trust and the distinct enrolled operator certificate and key.
+For example, a connection using the same commissioned DNS identity on all eligible peers is:
+
+```json
+{
+  "entry": "opening-entry.internal",
+  "port": 7443,
+  "catalog": "dc2d50a4-4e26-4ca8-a87f-3cbcdb53f687",
+  "ca_file": "/run/operator/peer-ca.pem",
+  "client_certificate_file": "/run/operator/opening-operator.pem",
+  "client_private_key_file": "/run/operator/opening-operator-key.pem",
+  "server_identity": {"server_name": "opening-peer.internal"}
+}
+```
+
+`entry` is the private ingress hostname or IP address.
+Use the installed opening ingress port and the exact commissioned catalog UUID.
+For leaf verification, replace `server_identity` with an object whose sole field is `leaf_sha256`, the SHA-256 of the commissioned server leaf DER encoded as a JSON array of 32 bytes.
+Both modes verify the peer chain against the supplied CA, and the chosen name or leaf digest applies to every hop.
+For a deployment with distinct peer leaves, use the commissioned name shared by the eligible peers, or target a peer with its exact digest and refresh the commissioned peer configuration before any operator retry requiring a different leaf.
+Open follows up to two authenticated selected-writer redirects with the same request and port within a single 90-second exchange deadline.
+Status and Exclude each address a single peer.
+
+To request opening, run
+
+```sh
+rtdb classic-opening open --connection-file opening-operator.json --witness-file opening-witness.json
+```
+
+To request exclusion before an opening reservation, run
+
+```sh
+rtdb classic-opening exclude --connection-file opening-operator.json --witness-file opening-witness.json
+```
+
+To read back the historical result, run
+
+```sh
+rtdb classic-opening status --connection-file opening-operator.json --witness-file opening-witness.json
+```
+
+Exit zero with one JSON object means the command read a correlated native terminal.
+Inspect `outcome` to distinguish `opened` from `excluded`, including when an opening request returns the prior ordered exclusion.
+The command checks the full decision and held-ready record, the native catalog Basis after the hold, and the workload fence on an opened result.
+Exit 2 identifies a CLI argument or local input error.
+A refusal, unresolved reply, transport failure, or uncorrelated reply returns exit 1 and a diagnostic on stderr.
+
+After a lost, malformed or unresolved reply, run `status` with the same witness against a commissioned peer.
+If status returns a terminal, use that ordered result and retain the witness with it.
+If the result is still unresolved and the original action is still authorized, the operator can explicitly repeat that same action with the exact witness.
+An opening reservation can be recovered only by repeating Open, and an exclusion request against that reservation is refused.
+Keep the route and holder under the pending interlock until the separately credentialed Bijection reconciler observes an exact native terminal through its read-only status path.
+
+##### Retained Classic projection and custody
 
 The literal projection covers positioned clear puts and deletes with unambiguous physical addresses.
 It preserves valid intervals, system times and original written transaction identity.

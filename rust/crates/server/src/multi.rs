@@ -40,7 +40,7 @@ pub use rtdb_flight_sql::NativeFollowerAssignment;
 mod catalog;
 pub mod classic_ingress;
 mod classic_migration;
-mod classic_opening;
+pub(crate) mod classic_opening;
 mod timed_stream;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;

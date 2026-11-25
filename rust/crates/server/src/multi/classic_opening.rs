@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use super::{DatabaseOpen, MultiRuntime, classic_ingress::HeldReady, open_database};
 
+pub(crate) mod operator;
 mod transport;
 pub(super) use transport::Ingress;
 
@@ -126,8 +127,8 @@ pub(super) enum Transition {
     Finish { profile: [u8; 32], fence: Fence },
 }
 
-#[derive(Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 enum Reply {
     Opened {
         decision: Decision,

@@ -88,9 +88,9 @@ struct VerifierSecret {
     client_private_key_pem: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
+pub(super) enum Request {
     OpenClassicMigrationDestination {
         decision: Decision,
         held_ready: HeldReady,
