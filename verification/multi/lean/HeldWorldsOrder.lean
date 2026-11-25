@@ -161,18 +161,6 @@ theorem reopen_uses_one_chosen_history (project : Cut → Predecessor)
   rw [sameCut, resolving] at recovered
   exact ⟨sameCut, (Option.some.inj recovered).symm⟩
 
-private theorem step_preserves_chosen_cut
-    (chosen : state.chosen cut.next = some cut) (within : cut.next ≤ state.head.next)
-    (step : OrderedJournal.Step readers activations state next) :
-    next.chosen cut.next = some cut ∧ cut.next ≤ next.head.next := by
-  cases step <;> try exact ⟨chosen, within⟩
-  case append cohort writer attempt receipt auth quorum issuer fresh advances =>
-    have distinct : cut.next ≠ receipt.cut.next := by omega
-    constructor
-    · simpa [OrderedJournal.update, distinct] using chosen
-    · change cut.next ≤ receipt.cut.next
-      omega
-
 theorem chosen_recovery_basis_survives_resolution_on_its_history (project : Cut → Predecessor)
     (recovered : atChosen state project cut = some prefixAtCut)
     (within : cut.next ≤ state.head.next)
@@ -182,13 +170,8 @@ theorem chosen_recovery_basis_survives_resolution_on_its_history (project : Cut 
     by_cases chosen : state.chosen cut.next = some cut
     · exact chosen
     · simp [atChosen, chosen] at recovered
-  have kept : next.chosen cut.next = some cut ∧ cut.next ≤ next.head.next := by
-    induction path with
-    | nil => exact ⟨original, within⟩
-    | cons step _ ih =>
-      have kept := step_preserves_chosen_cut original within step
-      exact ih (by simpa [atChosen, original, kept.1] using recovered) kept.2 kept.1
-  simpa [atChosen, original, kept.1] using recovered
+  have kept := OrderedJournal.trace_preserves_chosen_cut path original within
+  simpa [atChosen, original, kept] using recovered
 
 theorem reopened_claim_is_compared_at_a_later_order {predecessor : Predecessor}
     {claim key : Key}
