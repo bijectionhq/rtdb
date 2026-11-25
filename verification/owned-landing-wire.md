@@ -72,6 +72,7 @@ The staged destination must have a zero data frontier and a virgin data, journal
 The receiver compares the two witness frontiers to the durable predecessor, then derives the data and journal event counts for that same predecessor.
 The population returned by a held count describes winners at its valid instant.
 The receiver's data inventory includes every original put and delete and its journal inventory includes the coverage floor, so neither inventory is a caller-supplied field.
+Current compacted files qualify when their authenticated versions, exact row counts and positioned events cover both frontiers. The same journal comparison checks every event's full address, operation, interval and position. A pruned, overlapping or unpositioned history fails the census before successor publication.
 
 Carry the adoption group in the existing Bijection deployment attempt fingerprint.
 The create-only marker and the placed outcome are installed with the successor and predecessor retirement.

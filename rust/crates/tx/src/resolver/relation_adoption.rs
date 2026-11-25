@@ -258,11 +258,11 @@ impl OpenTransaction<'_> {
         if catalog.iter_tries(table).take(MAX_FILES + 1).count() > MAX_FILES {
             return Err(uncovered("The source exceeds its trie inventory bound"));
         }
+        // Compaction can replace the physical files without changing their
+        // positioned events. The authenticated file census and journal check
+        // must still cover every Original event before the successor is staged.
         for trie in catalog.current_tries(table) {
             *files = files.checked_sub(1).ok_or_else(|| uncovered("The source exceeds its file count bound"))?;
-            if trie.key.level() != 0 {
-                return Err(uncovered("The bounded adoption requires original L0 history"));
-            }
             let entry = base.table_entry(table).ok_or_else(|| uncovered("The trie has no admitted table entry"))?;
             let path = ObjectKey::new(entry.slug.data_key(&trie.key))?;
             let publication = trie.published_files.as_ref().and_then(|files| files.data.as_ref())
