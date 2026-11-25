@@ -46,7 +46,7 @@ python3 rust/release/build.py --phase-two --engine jvm \
 
 The output directory must not exist.
 `package.json` records the actual image ID, source revision and manifest, build arguments, platform, extracted artifact hashes and saved image archive hash.
-The driver creates an owned container to extract artifacts and starts the native container's two build-information commands before removing it.
+The driver creates an owned container to extract artifacts, checks that jemalloc is loaded in the native image, and starts its build-information commands before removing it.
 `rtdb --build-info` and `rtdb-config --build-info` report compiled version, full source revision, TZDB version and TZDB SHA-256, independently of runtime version overrides.
 Packaging compares both reports with the archived source revision and selected time-zone bytes, and retains the reports and `tzdb.dat` alongside executable hashes.
 Client, recovery and performance runners validate those same retained reports and bytes before starting a packaged server, and the client evidence importer repeats that validation after relocation.
@@ -62,6 +62,7 @@ The default native image starts a local persistent node using `/var/lib/rtdb/log
 Mount persistent storage at `/var/lib/rtdb` with ownership for UID/GID 20000.
 Set `RTDB_ROOT_PASSWORD` for the default root account or mount an explicit configuration and select it with `node --file`.
 The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
+The image uses jemalloc with a background purge thread, a one-second dirty-page decay and immediate release of muzzy pages.
 `playground --port 5439 --flight-sql-port 3000` selects the original client-suite mode.
 The process receives SIGTERM directly and drains its database and listener owners before returning.
 

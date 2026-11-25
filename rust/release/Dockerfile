@@ -37,7 +37,7 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = bookworm \
     && rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates tzdata libstdc++6 libsasl2-2 libsasl2-modules-gssapi-mit \
+    && apt-get install --no-install-recommends -y ca-certificates tzdata libstdc++6 libjemalloc2 libsasl2-2 libsasl2-modules-gssapi-mit \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 20000 rtdb \
     && useradd --uid 20000 --gid rtdb --create-home --shell /usr/sbin/nologin rtdb \
@@ -71,6 +71,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=multi-build /source/rust/target/release/rtdb-multi /usr/local/bin/rtdb-multi
 COPY --chmod=0555 rust/release/multi-entrypoint.sh /usr/local/bin/rtdb-multi-entrypoint
+ENV LD_PRELOAD=libjemalloc.so.2
+ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 USER rtdb
 ENTRYPOINT ["/usr/local/bin/rtdb-multi-entrypoint"]
 LABEL io.rtdb.held-root-catalog=true
@@ -83,6 +85,8 @@ COPY --from=build /source/rust/target/release/librtdb_ffi.a /usr/local/lib/librt
 COPY rust/crates/ffi/include/rtdb.h /usr/local/include/rtdb.h
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
 COPY rust/release/cluster-default.yaml rust/release/cluster-multi.yaml /etc/rtdb/
+ENV LD_PRELOAD=libjemalloc.so.2
+ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 USER rtdb
 EXPOSE 5432 3000 8080
 ENTRYPOINT ["/usr/local/bin/rtdb"]

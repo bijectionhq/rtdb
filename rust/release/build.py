@@ -146,7 +146,8 @@ def extract_artifacts(commands, image, engine, output, variant=None):
                           "librtdb_ffi.a": "/usr/local/lib/librtdb_ffi.a",
                           "rtdb.h": "/usr/local/include/rtdb.h"})
         entrypoint = ["--entrypoint", "/bin/sh", image["Id"], "-ec",
-                      "\n".join(f"{paths[executable]} --build-info" for executable in executables)]
+                      "\n".join(["grep -Fq libjemalloc.so.2 /proc/$$/maps",
+                                 *(f"{paths[executable]} --build-info" for executable in executables)])]
     else:
         paths = {"xtdb.jar": "/usr/local/lib/xtdb/xtdb.jar"}
         entrypoint = ["--entrypoint", "/bin/true", image["Id"]]
@@ -175,7 +176,7 @@ def extract_artifacts(commands, image, engine, output, variant=None):
                 _, report = commands.run("artifact-build-info", ["docker", "start", "--attach", name])
                 state = capture_container().get("State", {})
                 if state.get("Running") is not False or state.get("Status") != "exited" or state.get("ExitCode") != 0:
-                    raise ValueError("packaged build-information commands did not complete successfully")
+                    raise ValueError("packaged allocator and build-information checks did not complete successfully")
                 lines = report.read_text().splitlines()
                 if len(lines) != len(executables):
                     raise ValueError("packaged executables must each emit one build-information record")
