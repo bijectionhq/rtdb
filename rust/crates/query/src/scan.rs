@@ -3,7 +3,7 @@ mod retained_metadata;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, TimestampMicrosecondArray,
     builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, TimestampMicrosecondBuilder},
@@ -70,7 +70,7 @@ impl DataFileReader {
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
-        let bound = page_decode_bound(reader, page, &bytes, include_builder_bound)?;
+        let bound = opened.layout.page_decode_bound(page, &bytes, include_builder_bound)?;
         audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
         let batch = reader.decode_event_page(page, page_buffer(bytes), put_columns)?;
@@ -84,7 +84,7 @@ impl DataFileReader {
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let wire = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
-        let bound = page_decode_bound(reader, page, &wire, true)?;
+        let bound = opened.layout.page_decode_bound(page, &wire, true)?;
 
         if let Some(reservation) = self.storage.admit(bound) {
             let range = reader.page_metadata_range(page)?;
@@ -184,25 +184,17 @@ impl DataFileReader {
         }
         // Dictionary buffers are charged to this query. Cache only directories that do not retain those buffers.
         if dictionaries.is_empty() && let Some(reservation) = self.storage.admit(bound) {
-            let layout = Arc::new(CachedLayout { decoder, _reservation: reservation, _dictionaries: dictionaries });
+            let layout = Arc::new(CachedLayout {
+                decoder, builder_bound: OnceLock::new(), _reservation: reservation, _dictionaries: dictionaries,
+            });
             self.storage.insert_view(&self.key, View::Layout, Arc::clone(&layout));
             return Ok((layout, opening));
         }
-        let layout = Arc::new(CachedLayout { decoder, _reservation: Arc::clone(&opening), _dictionaries: dictionaries });
+        let layout = Arc::new(CachedLayout {
+            decoder, builder_bound: OnceLock::new(), _reservation: Arc::clone(&opening), _dictionaries: dictionaries,
+        });
         Ok((layout, opening))
     }
-}
-
-fn page_decode_bound(reader: &PageDecoder, page: usize, wire: &CacheLease, include_builder_bound: bool) -> Result<usize> {
-    let mut bound = reader.page_bound(page, wire.as_slice())?;
-    // Arrow-only visitors can project a file whose full schema has no SQL builder layout.
-    if include_builder_bound {
-        for field in reader.schema().fields() {
-            bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
-                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
-        }
-    }
-    Ok(bound)
 }
 
 fn decode_projected_page(
@@ -2759,9 +2751,34 @@ impl Cached for CachedMetadata { fn in_use(&self) -> bool { Arc::strong_count(&s
 
 struct CachedLayout {
     decoder: PageDecoder,
+    builder_bound: OnceLock<Option<usize>>,
     _reservation: Arc<MemoryReservation>,
     _dictionaries: Vec<Arc<MemoryReservation>>,
 }
+
+impl CachedLayout {
+    fn page_decode_bound(&self, page: usize, wire: &CacheLease, include_builder_bound: bool) -> Result<usize> {
+        let bound = self.decoder.page_bound(page, wire.as_slice())?;
+        // Arrow-only visitors can project a file whose full schema has no SQL builder layout.
+        if !include_builder_bound {
+            return Ok(bound);
+        }
+        match self.builder_bound.get_or_init(|| self.add_builder_bound(0).ok()) {
+            Some(builder) => bound.checked_add(*builder)
+                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow")),
+            // Preserve field error order relative to overflow for this page's starting bound.
+            None => self.add_builder_bound(bound),
+        }
+    }
+
+    fn add_builder_bound(&self, bound: usize) -> Result<usize> {
+        self.decoder.schema().fields().iter().try_fold(bound, |bound, field| {
+            bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
+                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))
+        })
+    }
+}
+
 impl Cached for CachedLayout {}
 
 /// A decoded data page, whose batch retains the pool's reservation, and the bound a query admits for it.
@@ -3789,8 +3806,12 @@ mod tests {
         assert_eq!(visit_trie_iids(&context, Arc::clone(&storage), &slug, &trie, 3, &mut visit).await.unwrap(), Some(3));
         let mut reader = DataFileReader::new(&storage, key.clone());
         let warmup = MemoryBudget::new(16 << 20);
+        let layout = Arc::clone(&reader.open(&warmup).await.unwrap().layout);
+        assert!(layout.builder_bound.get().is_none());
+        let builder_bound = layout.add_builder_bound(0).unwrap();
         for page in 0..2 {
             let (batch, charged) = reader.decode_scan_page(page, &warmup, Vec::new).await.unwrap();
+            assert_eq!(layout.builder_bound.get(), Some(&Some(builder_bound)));
             let bound = charged.unwrap().bytes();
             if page == 1 { assert!(bound > context.memory.limit_bytes()); }
             assert!(storage.insert_view(&key, View::Page(page), Arc::new(CachedPage { batch, bound })));
