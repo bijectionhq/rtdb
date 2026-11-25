@@ -363,10 +363,18 @@ impl MultiServing {
                 };
                 return self.writes.workload(request).await;
             }
+            if let workload::Operation::Settle { key, family, digest } = &request.operation {
+                request.operation = workload::Operation::ImportedSettle {
+                    key: key.clone(), family: *family, digest: *digest,
+                    after: Basis::from_bytes(&expected.applied.basis)?,
+                };
+                return self.writes.workload(request).await;
+            }
             let covered = match &request.operation {
-                workload::Operation::Submit { authority, .. } => authority.matches_imported_fence(expected),
+                workload::Operation::Submit { authority, .. } => authority.permits_imported_workload(expected),
                 workload::Operation::Observe(fence) | workload::Operation::ReadRoot { fence, .. }
-                | workload::Operation::ReadCustody { fence, .. } => fence == expected,
+                | workload::Operation::ReadCustody { fence, .. } => fence.at_or_after_import(expected),
+                workload::Operation::Predecessor(predecessor) => predecessor.fence.at_or_after_import(expected),
                 _ => false,
             };
             if !covered { return Err(workload::denied()); }

@@ -81,6 +81,46 @@ fn placement(epoch: u64, assignment: u8) -> Placement {
     }
 }
 
+#[test]
+fn imported_placement_accepts_only_the_exact_initial_fence_or_a_later_epoch() {
+    let fence = |epoch, position, incarnation, marker| Fence {
+        placement: placement(epoch, marker),
+        applied: Applied {
+            namespace: [marker; 32],
+            key: vec![marker; 16],
+            basis: Basis::new(incarnation, position).to_bytes(),
+            system_time_micros: i64::try_from(position).unwrap(),
+        },
+    };
+    let imported = fence(2, 10, INCARNATION, 1);
+    let later = fence(3, 13, INCARNATION, 2);
+    assert!(imported.at_or_after_import(&imported));
+    assert!(later.at_or_after_import(&imported));
+    assert!(!fence(1, 9, INCARNATION, 3).at_or_after_import(&imported));
+    assert!(!fence(2, 10, INCARNATION, 3).at_or_after_import(&imported));
+    assert!(!fence(2, 11, INCARNATION, 3).at_or_after_import(&imported));
+    assert!(!fence(3, 13, [4; 16], 3).at_or_after_import(&imported));
+
+    let predecessor = Predecessor {
+        fence: later.clone(),
+        writer: later.applied.clone(),
+        close: later.applied.clone(),
+        closure: [2; 16],
+    };
+    let advance = Authority::AdvancePlacement {
+        installation_intent: [3; 16],
+        previous: Previous::Closed { predecessor },
+        next: placement(4, 3),
+    };
+    assert!(advance.permits_imported_workload(&imported));
+    let empty = Authority::AdvancePlacement {
+        installation_intent: [3; 16],
+        previous: Previous::Empty,
+        next: placement(4, 3),
+    };
+    assert!(!empty.permits_imported_workload(&imported));
+}
+
 fn applied(reply: Reply, namespace: [u8; 32]) -> Applied {
     let Reply::Receipt(receipt) = reply else {
         panic!("expected receipt")
@@ -136,6 +176,39 @@ fn begin(writer: &mut Writer) -> (Fence, Applied) {
         )
         .unwrap();
     (fence, applied(claim, CLAIM))
+}
+
+#[test]
+fn imported_settlement_preserves_receipts_at_the_import_floor() {
+    let mut journal = Writer::new();
+    let (_, claim) = begin(&mut journal);
+    let after = Basis::from_bytes(&claim.basis).unwrap();
+    let existing = Operation::ImportedSettle {
+        key: claim.key,
+        family: Family::ClaimWriter,
+        digest: [11; 32],
+        after,
+    };
+    assert_eq!(
+        journal.turn(CLAIM, existing).err().unwrap().code,
+        "rtdb/unknown-transaction"
+    );
+
+    let settle = || Operation::ImportedSettle {
+        key: vec![21; 16],
+        family: Family::Write,
+        digest: [21; 32],
+        after,
+    };
+    assert!(matches!(
+        journal.turn(WRITE, settle()).unwrap(),
+        Reply::Receipt(receipt) if receipt.basis > after && matches!(receipt.outcome, Outcome::Refused { .. })
+    ));
+    journal.restart();
+    assert!(matches!(
+        journal.turn(WRITE, settle()).unwrap(),
+        Reply::Receipt(receipt) if receipt.replayed && receipt.basis > after
+    ));
 }
 
 fn write(marker: u8, table: TableRef, id: EntityId) -> Transact {

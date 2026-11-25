@@ -644,6 +644,9 @@ contract LogService {
         -- Native opening and exclusion contend for the exact closed held-ready version, and an ordered opening reservation prevents later exclusion.
         -- The native writer recovers or installs the exact initial workload fence at the mapped application cut before the native catalog orders opening.
         -- Opening admits only the matching commissioned workload, holder, assignment and epoch, and the Original remains closed.
+        -- The active writer verifies a later workload fence on the same native stream from its exact ordered receipt and current authority row.
+        -- Later placement advances require an ordered closed writer or vacant predecessor at or beyond the imported fence.
+        -- Exact attempt settlement on the imported stream exposes only terminals ordered after that fence.
         -- Historical readback returns the exact ordered opening or exclusion independently of current authority.
 
     @invariant InstalledJournalErasureCommit

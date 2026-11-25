@@ -580,7 +580,10 @@ Positive terminals carry `outcome`, `decision`, `held_ready` and the stable `ord
 `opened` also carries `workload_fence` with `placement` and the exact native `applied` receipt coordinate from the selected stream.
 An identical open retry can recover a lost data-stream append before ordering the native catalog terminal.
 Historical status after loss or Bijection settlement reports that ordered outcome and carries no live authorization.
-Only the exact initial workload fence admits native workload claims and effects on the imported candidate.
+The exact initial workload fence or a later positively ordered fence on the same native stream admits managed workload claims and effects.
+An advance requires a verified closed writer or vacant predecessor at or after the imported fence.
+The active writer verifies the referenced receipt, ordered placement and exact current authority row before a write.
+Scoped attempt settlement retains the original namespace, key, family and digest and exposes only terminals ordered after the imported fence.
 Ordinary SQL, ordinary v1 writes and generic provisioning remain closed for this candidate, and the old Original keeps its independent close and retained receipt authority.
 
 The literal projection covers positioned clear puts and deletes with unambiguous physical addresses.

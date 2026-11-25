@@ -121,9 +121,11 @@ impl Call {
         let caller = &self.session.caller;
         let allowed = caller.verified_credential && caller.principal.workload_grant()
             .and_then(|grant| grant.assignment(&self.database, driver.incarnation(), self.service.0.node.now()).ok())
-            .is_some_and(|(authority, _, _)| authority.matches_imported_fence(fence)
+            .is_some_and(|(authority, _, _)| authority.permits_imported_workload(fence)
                 || matches!(self.kind, CallKind::Handshake | CallKind::TxStatus)
-                    && matches!(authority, rtdb_tx::transact::workload::Authority::ReceiptRecovery { .. }));
+                    && matches!(authority, rtdb_tx::transact::workload::Authority::ReceiptRecovery { .. })
+                || matches!(self.kind, CallKind::Handshake | CallKind::ManagedWorkload)
+                    && matches!(authority, rtdb_tx::transact::workload::Authority::AttemptSettlement { .. }));
         if allowed { Ok(()) } else { Err(Status::permission_denied("This deployment requires its exact imported workload assignment")) }
     }
 

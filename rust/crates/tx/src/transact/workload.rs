@@ -57,6 +57,26 @@ pub struct Fence {
     pub applied: Applied,
 }
 
+impl Fence {
+    /// Bound a workload to the imported placement or a later ordered fence.
+    /// The writer still verifies the actual receipt and the current control row.
+    pub fn at_or_after_import(&self, imported: &Self) -> bool {
+        if self == imported {
+            return true;
+        }
+        let (Ok(basis), Ok(origin)) = (
+            Basis::from_bytes(&self.applied.basis),
+            Basis::from_bytes(&imported.applied.basis),
+        ) else {
+            return false;
+        };
+        basis.incarnation() == origin.incarnation()
+            && basis > origin
+            && self.placement.epoch > imported.placement.epoch
+            && self.applied.system_time_micros > imported.applied.system_time_micros
+    }
+}
+
 pub struct ImportedPlacement {
     point: Point,
     placement: Placement,
@@ -156,15 +176,19 @@ pub enum Authority {
 }
 
 impl Authority {
-    pub fn matches_imported_fence(&self, expected: &Fence) -> bool {
-        match self {
+    pub fn permits_imported_workload(&self, imported: &Fence) -> bool {
+        let fence = match self {
             Self::ClaimWriter { fence } | Self::ReadRoot { fence, .. }
             | Self::ReadCustody { fence, .. } | Self::Write { fence, .. }
             | Self::CustodyWrite { fence, .. } | Self::CloseWriter { fence, .. }
             | Self::CloseWriterGuarded { fence, .. } | Self::CloseEmptyAssignment { fence, .. }
-            | Self::ObservePlacement { fence } => fence == expected,
-            _ => false,
-        }
+            | Self::ObservePlacement { fence }
+            | Self::AdvancePlacement { previous: Previous::Vacant { fence }, .. } => fence,
+            Self::AdvancePlacement { previous: Previous::Closed { predecessor }, .. }
+            | Self::PredecessorEvidence { predecessor } => &predecessor.fence,
+            _ => return false,
+        };
+        fence.at_or_after_import(imported)
     }
 
     pub fn valid(&self, incarnation: [u8; 16]) -> bool {
@@ -339,6 +363,12 @@ pub enum Operation {
         key: Vec<u8>,
         family: Family,
         digest: [u8; 32],
+    },
+    ImportedSettle {
+        key: Vec<u8>,
+        family: Family,
+        digest: [u8; 32],
+        after: Basis,
     },
     Status {
         key: Vec<u8>,
@@ -537,23 +567,13 @@ impl Request {
                 key,
                 family,
                 digest,
-            } => {
-                let commitment = Commitment {
-                    family: *family,
-                    digest: *digest,
-                };
-                if let Some(receipt) = state.recover_workload(self.namespace, key, commitment)? {
-                    return Ok(Prepared::Answer(Reply::Receipt(receipt)));
-                }
-                Ok(Prepared::Append {
-                    transaction: empty_transaction(key.clone()),
-                    admission: Admission {
-                        namespace: self.namespace,
-                        ordering: Ordering::Settle,
-                        commitment,
-                    },
-                })
-            }
+            } => self.prepare_settlement(state, key, *family, *digest, None),
+            Operation::ImportedSettle {
+                key,
+                family,
+                digest,
+                after,
+            } => self.prepare_settlement(state, key, *family, *digest, Some(*after)),
             Operation::Submit {
                 key,
                 authority,
@@ -596,6 +616,37 @@ impl Request {
                 })
             }
         }
+    }
+
+    fn prepare_settlement(
+        &self,
+        state: &TransactState,
+        key: &[u8],
+        family: Family,
+        digest: [u8; 32],
+        after: Option<Basis>,
+    ) -> Result<Prepared> {
+        let head = state.index.head().basis;
+        if after.is_some_and(|after| head.incarnation() != after.incarnation() || head < after) {
+            return Err(stale());
+        }
+        let commitment = Commitment { family, digest };
+        if let Some(receipt) = state.recover_workload(self.namespace, key, commitment)? {
+            if after.is_some_and(|after| {
+                receipt.basis.incarnation() != after.incarnation() || receipt.basis <= after
+            }) {
+                return Err(super::unknown_receipt());
+            }
+            return Ok(Prepared::Answer(Reply::Receipt(receipt)));
+        }
+        Ok(Prepared::Append {
+            transaction: empty_transaction(key.to_vec()),
+            admission: Admission {
+                namespace: self.namespace,
+                ordering: Ordering::Settle,
+                commitment,
+            },
+        })
     }
 
     pub fn check_expiry(&self, now: Timestamp) -> Result<()> {
