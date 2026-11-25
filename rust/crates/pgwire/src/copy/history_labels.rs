@@ -151,6 +151,26 @@ mod tests {
     }
 
     #[test]
+    fn replacement_pages_match_fresh_writer_frames() {
+        use super::super::{CopyArrowEncoder, CopyChunks};
+
+        let first = text_batch(&["[]", "top"]);
+        let labels = HistoryLabels::for_schema(first.schema_ref()).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let mut encoder = CopyArrowEncoder::new(&labels.schema).unwrap();
+        let header = encoder.chunks.take_header();
+        for input in [first, text_batch(&["top", "[]"]), text_batch(&["top", "[]"])] {
+            let (batch, _charge) = labels.encode(&input, &memory).unwrap();
+            let mut previous = arrow_ipc::writer::StreamWriter::try_new(
+                CopyChunks::new(), &labels.schema,
+            ).unwrap();
+            assert_eq!(previous.get_mut().take_header(), header);
+            previous.write(&batch).unwrap();
+            assert_eq!(encoder.write(&batch, true).unwrap(), previous.get_mut().take_batch());
+        }
+    }
+
+    #[test]
     fn history_label_dictionary_refuses_oversized_symbols_and_budgets_allocations() {
         let batch = text_batch(&["[]", "top", "[]"]);
         let encoder = HistoryLabels::for_schema(batch.schema_ref()).unwrap();

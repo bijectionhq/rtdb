@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use arrow_array::RecordBatch;
+use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{AccessSettings, CommitResult, NativeSession, Node, TransactionSettings, TransactionStatus};
@@ -68,6 +69,47 @@ impl Write for CopyChunks {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
+struct CopyArrowEncoder {
+    chunks: CopyChunks,
+    options: IpcWriteOptions,
+    tracker: DictionaryTracker,
+}
+
+impl CopyArrowEncoder {
+    fn new(schema: &arrow_schema::Schema) -> Result<Self> {
+        let options = IpcWriteOptions::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let message = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
+        let mut chunks = CopyChunks::new();
+        write_message(&mut chunks, message, &options).map_err(arrow_output_error)?;
+        Ok(Self { chunks, options, tracker })
+    }
+
+    fn write(&mut self, batch: &RecordBatch, replace_dictionaries: bool) -> Result<Vec<Vec<u8>>> {
+        let mut page_tracker;
+        let tracker = if replace_dictionaries {
+            // Keep the stream's dictionary IDs without carrying spellings across delivery grants.
+            page_tracker = DictionaryTracker::new(false);
+            for &id in self.tracker.dict_id() {
+                let page_id = page_tracker.next_dict_id();
+                debug_assert_eq!(id, page_id);
+            }
+            &mut page_tracker
+        } else {
+            &mut self.tracker
+        };
+        let (dictionaries, record) = IpcDataGenerator::default()
+            .encode(batch, tracker, &self.options, &mut CompressionContext::default())
+            .map_err(arrow_output_error)?;
+        for message in dictionaries.into_iter().chain([record]) {
+            write_message(&mut self.chunks, message, &self.options).map_err(arrow_output_error)?;
+        }
+        Ok(self.chunks.take_batch())
+    }
+}
+
+const COPY_ARROW_END: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+
 /// Encodes each batch while its source buffers are in scope and releases
 /// them before waiting on the connection.
 pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
@@ -88,10 +130,9 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
         CopyOutFormat::HistoryLabelDictionaryV1 => history_labels::HistoryLabels::for_schema(&schema),
     };
     let wire_schema = labels.as_ref().map_or(&schema, |labels| labels.schema.as_ref());
-    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(CopyChunks::new(), wire_schema)
-        .map_err(arrow_output_error)?;
+    let mut encoder = CopyArrowEncoder::new(wire_schema)?;
     wire.send(b'H', &[1, 0, 1, 0, 1]).await?;
-    wire.send(b'd', &encoder.get_mut().take_header()).await?;
+    wire.send(b'd', &encoder.chunks.take_header()).await?;
     wire.flush().await?;
     let mut count = 0u64;
     loop {
@@ -107,17 +148,7 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
             let bytes = batch.get_array_memory_size().checked_mul(6)
                 .and_then(|bytes| bytes.checked_add(bound)).ok_or_else(|| protocol("COPY TO batch is too large"))?;
             let reservation = memory.reserve(bytes)?;
-            let out = if labels.is_some() {
-                // A fresh tracker emits replacement dictionaries without retaining spellings across delivery grants.
-                let mut page = arrow_ipc::writer::StreamWriter::try_new(CopyChunks::new(), wire_schema)
-                    .map_err(arrow_output_error)?;
-                page.get_mut().take_header();
-                page.write(batch).map_err(arrow_output_error)?;
-                page.get_mut().take_batch()
-            } else {
-                encoder.write(batch).map_err(arrow_output_error)?;
-                encoder.get_mut().take_batch()
-            };
+            let out = encoder.write(batch, labels.is_some())?;
             Ok((batch.num_rows() as u64, out, reservation))
         }).await?;
         let Some(encoded) = encoded else { break };
@@ -131,10 +162,9 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
             wire.flush().await
         }).await.map_err(crate::wire::delivery_error)?;
     }
-    encoder.finish().map_err(arrow_output_error)?;
     let grant = cursor.delivery_grant().await?;
     grant.deliver(async {
-        wire.send(b'd', &encoder.get_ref().chunks[0]).await?;
+        wire.send(b'd', COPY_ARROW_END).await?;
         wire.empty(b'c').await?;
         wire.string(b'C', &format!("COPY {count}")).await?;
         if grant.is_bounded() { wire.flush().await?; }
