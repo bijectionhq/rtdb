@@ -45,6 +45,7 @@ mod timed_stream;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
 mod native_checkpoint;
+pub use native_checkpoint::NativeDependentCustodyAuthority;
 mod peer;
 use catalog::{Status, TransferExport};
 
@@ -104,6 +105,7 @@ pub struct MultiRuntime {
     peer: Option<Arc<peer::Peer>>,
     managed_sources: Arc<BTreeMap<Uuid, Arc<dyn ManagedCheckpointSource>>>,
     native_checkpoint_source: Option<native_checkpoint::NativeCheckpointSource>,
+    native_dependent_custody: Option<Arc<dyn NativeDependentCustodyAuthority>>,
     managed_operations: TaskTracker,
     follower: Option<NativeFollowerAssignment>,
     classic_ingress: Option<Arc<classic_ingress::Ingress>>,
@@ -429,6 +431,7 @@ impl MultiRuntime {
             peer,
             managed_sources: Arc::default(),
             native_checkpoint_source: None,
+            native_dependent_custody: None,
             managed_operations: TaskTracker::new(),
             follower,
             classic_ingress: None,

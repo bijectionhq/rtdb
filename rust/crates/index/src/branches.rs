@@ -8,7 +8,7 @@ type Map<K, V> = imbl::OrdMap<K, V>;
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Iid, Interval, LogicalType, Result, StructFields, TableRef,
     Timestamp, TxId, Value,
-    rtdb_v1::{At, Basis, Branch, ClaimEvidence, ClaimRegion, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody},
+    rtdb_v1::{At, Basis, Branch, ClaimEvidence, ClaimRegion, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, NativeDependentCustodyOrder},
 };
 use serde::{Deserialize, Serialize};
 
@@ -193,6 +193,7 @@ pub enum BranchEffect {
     CustodyRelease(CustodyRelease),
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
     ScopedHold { command: ScopedHoldCommand, observed_at: Timestamp },
+    NativeDependentCustody(NativeDependentCustodyOrder),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -790,6 +791,7 @@ impl BranchIndex {
             BranchEffect::CustodyRelease(release) => self.apply_custody_release(release)?,
             BranchEffect::NativeCustodyTransfer { custody, destination } => self.apply_native_custody_transfer(custody, destination)?,
             BranchEffect::ScopedHold { command, observed_at } => self.apply_scoped_hold(command, observed_at),
+            BranchEffect::NativeDependentCustody(order) => self.apply_native_dependent_custody(order)?,
         }
         Ok(())
     }

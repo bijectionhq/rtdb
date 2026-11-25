@@ -157,6 +157,10 @@ impl Candidate<'_> {
                     self.require_unrestricted()?;
                     self.push(BranchEffect::NativeCustodyTransfer { custody: custody.clone(), destination: *destination })?;
                 }
+                Op::NativeDependentCustody(order) => {
+                    self.require_unrestricted()?;
+                    self.push(BranchEffect::NativeDependentCustody(order.clone()))?;
+                }
             }
         }
         Ok(())

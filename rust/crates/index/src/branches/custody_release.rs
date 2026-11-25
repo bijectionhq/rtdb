@@ -250,7 +250,7 @@ impl BranchIndex {
         self.custody
             .get(&group)
             .is_some_and(|group| group.revoked.is_some() && group.live_releases == 0)
-            && self.native_custody_copies_drained(group)
+            && self.native_custody_dependents_drained(group)
     }
 
     pub(super) fn apply_custody_release(&mut self, release: CustodyRelease) -> Result<()> {

@@ -3,10 +3,14 @@ use sha2::{Digest, Sha256};
 use super::*;
 use rtdb_types::rtdb_v1::ManagedCheckpointReservation;
 
+mod dependent;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Forward {
     custody: NativeCheckpointCustody,
     destination: Option<Basis>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    dependents: Map<CustodyGroupId, dependent::Dependent>,
 }
 
 impl BranchIndex {
@@ -199,6 +203,7 @@ impl BranchIndex {
             Forward {
                 custody,
                 destination,
+                dependents: Map::new(),
             },
         );
         Ok(())
@@ -239,10 +244,12 @@ impl BranchIndex {
         Some(inventory)
     }
 
-    pub(super) fn native_custody_copies_drained(&self, group: CustodyGroupId) -> bool {
+    pub(super) fn native_custody_dependents_drained(&self, group: CustodyGroupId) -> bool {
         self.custody_transfers
             .values()
-            .all(|forward| forward.destination.is_some() || !contains(&forward.custody, group))
+            .filter(|forward| contains(&forward.custody, group))
+            .all(|forward| forward.destination.is_some()
+                && forward.dependents.get(&group).is_some_and(|dependent| dependent.disposition.is_some()))
     }
 
     pub fn restore_native_checkpoint(&mut self, custody: &NativeCheckpointCustody) -> Result<()> {

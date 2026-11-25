@@ -151,6 +151,103 @@ pub struct NativeCheckpointCustody {
     pub enrolled_at: Basis,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDependentCustodyScope {
+    pub reservation: ManagedCheckpointReservation,
+    pub destination: Basis,
+    pub source_enrolled_at: Basis,
+    pub group: [u8; 16],
+    pub checkpoint_group_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCheckpointMember {
+    pub placement: [u8; 16],
+    pub reservation: Option<[u8; 32]>,
+    pub occurrence: Option<[u8; 32]>,
+    pub carrier_sha256: [u8; 32],
+    pub link_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependentApplicationKey {
+    pub key: [u8; 32],
+    pub custody: DependentKeyCustody,
+    pub carriers: Vec<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DependentKeyCustody {
+    DestinationOwned,
+    OriginalReference,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDependentCustodyMember {
+    pub native: NativeCheckpointMember,
+    pub application_keys: Vec<DependentApplicationKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependentCustodyReceipt {
+    pub key: [u8; 32],
+    pub evidence_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDependentCustodyEnrollment {
+    pub scope: NativeDependentCustodyScope,
+    pub owner: [u8; 32],
+    pub application_scope: [u8; 32],
+    pub receipt: DependentCustodyReceipt,
+    pub members: Vec<NativeDependentCustodyMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCustodyFence {
+    pub revoke_key: Vec<u8>,
+    pub revoked_at: Basis,
+    pub inventory_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependentKeyDisposition {
+    pub key: [u8; 32],
+    pub reader_drain_sha256: [u8; 32],
+    pub part_disposition_sha256: [u8; 32],
+    pub terminal: DependentKeyTerminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DependentKeyTerminal {
+    Destroyed([u8; 32]),
+    ReleasedOriginalReference([u8; 32]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDependentCustodyDisposition {
+    pub scope: NativeDependentCustodyScope,
+    pub fence: NativeCustodyFence,
+    pub enrollment: DependentCustodyReceipt,
+    pub receipt: DependentCustodyReceipt,
+    pub keys: Vec<DependentKeyDisposition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeDependentCustodyOrder {
+    Enroll(NativeDependentCustodyEnrollment),
+    Dispose(NativeDependentCustodyDisposition),
+}
+
+impl NativeDependentCustodyOrder {
+    pub fn scope(&self) -> NativeDependentCustodyScope {
+        match self {
+            Self::Enroll(enrollment) => enrollment.scope,
+            Self::Dispose(disposition) => disposition.scope,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum At {
     #[default]

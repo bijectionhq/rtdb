@@ -606,6 +606,16 @@ contract LogService {
         -- Protected delivery checks the selected destination generation together with every contributing original family.
         -- An exact copy terminal can release the export pin and its copy holds while the installed destination remains subject to the original family fence.
 
+    @invariant NativeDependentCheckpointCustody
+        -- The native source forward binds the pinned source cut, complete group inventory and exact restored destination.
+        -- A destination owner durably enrolls its application scope and accounts for every retained native placement, reserved placement, carrier and link at that cut.
+        -- The source orders the exact reciprocal enrollment for each contributing group before the managed catalog marks the destination ready.
+        -- A dependent disposition names that enrollment and the source group's applied revocation key, basis and inventory.
+        -- The source orders a terminal only with positive reader and response-part closure for each enrolled key.
+        -- The destination destroys its own keys and positively releases its references to keys under Original custody.
+        -- The source group's release drain requires its own releases and every dependent disposition.
+        -- The native inherited attachment withholds plaintext until it has an exact destination response-release authority.
+
     @invariant ClassicMigrationSourceSeal
         -- The authenticated recovery observer returns the exact capture, the current checkpoint and the live writer epoch from the same directory observation.
         -- A seal request overtaken by a later checkpoint can return its exact scratch closure once the directory excludes a fence for that attempt.

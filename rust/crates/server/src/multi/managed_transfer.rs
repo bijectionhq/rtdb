@@ -146,6 +146,9 @@ impl MultiRuntime {
             .await
             .ok_or_else(transfer_interrupted)??;
 
+        if let Some(provider) = self.native_checkpoint_provider(name, &transfer) {
+            provider.require_publication(basis).await?;
+        }
         self.catalog
             .mark_managed_transfer_ready(name, transfer, basis)
             .await?;
@@ -375,9 +378,12 @@ impl MultiRuntime {
         let reservation = transfer.reservation;
         let source_id = Uuid::from_bytes(reservation.source.basis.incarnation());
         let destination = self.ready_driver(name, database).await?;
-        if let Some(provider) = self.native_checkpoint_provider(name, &transfer) {
-            return cancellation.run_until_cancelled(provider.require_read(&destination, read))
-                .await.ok_or_else(transfer_interrupted)?;
+        let (_, view, _) = destination.managed_checkpoint_view(reservation).await?;
+        if view.inherited_custody().is_some() {
+            return Err(Anomaly::unsupported(
+                "rtdb/native-dependent-release",
+                "Inherited native plaintext needs a paired destination response release authority",
+            ));
         }
         self.managed_source(source_id)?
             .bind(reservation, cancellation)?

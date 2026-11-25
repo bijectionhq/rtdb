@@ -9,7 +9,11 @@ use rtdb_tx::transact::{
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, MemoryBudget, Result, TableRef, Timestamp,
-    rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity},
+    rtdb_v1::{
+        At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget,
+        NativeCheckpointCustody, NativeCheckpointMember, NativeCustodyFence, NativeDependentCustodyDisposition,
+        NativeDependentCustodyEnrollment, NativeDependentCustodyOrder, NativeDependentCustodyScope, PinnedCheckpointIdentity,
+    },
 };
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -252,6 +256,29 @@ impl MultiServing {
 
     pub async fn record_native_checkpoint_drain(&self, installed: NativeCheckpointInstallation) -> Result<()> {
         self.database.lock().await.record_native_checkpoint_drain(installed).await
+    }
+
+    pub async fn native_dependent_custody(
+        &self, scope: NativeDependentCustodyScope,
+    ) -> Result<Option<(NativeDependentCustodyEnrollment, Option<NativeDependentCustodyDisposition>)>> {
+        Ok(self.database.lock().await.fresh_index().await?.native_dependent_custody(scope)?
+            .map(|(enrollment, disposition)| (enrollment.clone(), disposition.cloned())))
+    }
+
+    pub async fn native_dependent_custody_roster(&self, scope: NativeDependentCustodyScope) -> Result<Vec<NativeCheckpointMember>> {
+        self.database.lock().await.fresh_index().await?.native_dependent_custody_roster(scope)
+    }
+
+    pub async fn require_native_dependent_publication(&self, reservation: ManagedCheckpointReservation, basis: Basis) -> Result<()> {
+        self.database.lock().await.fresh_index().await?.require_native_dependent_publication(reservation, basis)
+    }
+
+    pub async fn require_native_dependent_fence(&self, scope: NativeDependentCustodyScope, fence: &NativeCustodyFence) -> Result<()> {
+        self.database.lock().await.require_native_dependent_fence(scope, fence).await
+    }
+
+    pub async fn record_native_dependent_custody(&self, order: NativeDependentCustodyOrder) -> Result<Receipt> {
+        self.database.lock().await.record_native_dependent_custody(order).await
     }
 
     pub async fn native_checkpoint_installation(&self, reservation: ManagedCheckpointReservation) -> Result<NativeCheckpointInstallation> {
@@ -923,7 +950,7 @@ fn require_ordinary_request(request: &Transact) -> Result<()> {
         return Err(crate::serving::custody_release::release_unavailable());
     }
     if request.contains_native_custody_transfer() {
-        return Err(Anomaly::unsupported("rtdb/native-checkpoint-command", "Native copy enrollment requires the installed custody provider"));
+        return Err(Anomaly::unsupported("rtdb/native-checkpoint-command", "Native checkpoint custody commands require the installed custody provider"));
     }
     Ok(())
 }

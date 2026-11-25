@@ -1,5 +1,9 @@
-use rtdb_storage::sealing::{PlaintextReleaseCheck, PlaintextView};
-use rtdb_types::rtdb_v1::NativeCheckpointCustody;
+use rtdb_tx::transact::Receipt;
+use rtdb_types::rtdb_v1::{
+    NativeCheckpointCustody, NativeCheckpointMember, NativeCustodyFence,
+    NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
+    NativeDependentCustodyOrder, NativeDependentCustodyScope,
+};
 
 use super::{catalog::ManagedTransfer, managed_transfer::reservation_conflict, *};
 
@@ -12,7 +16,87 @@ pub(super) struct NativeCheckpointProvider<'a> {
     transfer: &'a ManagedTransfer,
 }
 
+/// The commissioned observer authenticates both records in the destination owner's durable custody.
+#[async_trait::async_trait]
+pub trait NativeDependentCustodyAuthority: Send + Sync {
+    async fn observe_enrollment(
+        &self,
+        scope: NativeDependentCustodyScope,
+        native: &[NativeCheckpointMember],
+        cancellation: &CancellationToken,
+    ) -> Result<NativeDependentCustodyEnrollment>;
+
+    async fn observe_disposition(
+        &self,
+        enrollment: &NativeDependentCustodyEnrollment,
+        fence: &NativeCustodyFence,
+        cancellation: &CancellationToken,
+    ) -> Result<NativeDependentCustodyDisposition>;
+}
+
 impl MultiRuntime {
+    pub fn with_native_dependent_custody(
+        mut self, authority: Arc<dyn NativeDependentCustodyAuthority>,
+    ) -> Result<Self> {
+        if self.native_dependent_custody.is_some() { return Err(reservation_conflict()); }
+        self.native_dependent_custody = Some(authority);
+        Ok(self)
+    }
+
+    pub async fn settle_native_dependent_custody(
+        &self,
+        destination: &str,
+        reservation: ManagedCheckpointReservation,
+        group: [u8; 16],
+        fence: &NativeCustodyFence,
+        cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        let selected = self.managed_entry(destination, Uuid::from_bytes(reservation.target.incarnation)).await?;
+        let transfer = selected.managed_transfer()?;
+        if transfer.reservation != reservation
+            || self.native_checkpoint_provider(destination, &transfer).is_none()
+        {
+            return Err(reservation_conflict());
+        }
+        let source = self.transfer_source_writer(&transfer).await?;
+        let Some((custody, Some(basis))) = source.native_checkpoint_forward(reservation).await? else {
+            return Err(terminal_required());
+        };
+        let scope = dependent_scope(&custody, basis, group)?;
+        source.require_native_dependent_fence(scope, fence).await?;
+
+        let enrollment = match source.native_dependent_custody(scope).await? {
+            Some((_, Some(terminal))) => {
+                if &terminal.fence != fence { return Err(dependent_required()); }
+                return source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(terminal)).await;
+            }
+            Some((enrollment, None)) => enrollment,
+            None => self.enroll_native_dependent(&source, scope, cancellation).await?,
+        };
+        let authority = self.native_dependent_custody.as_deref().ok_or_else(dependent_required)?;
+        let disposition = cancellation.run_until_cancelled(authority.observe_disposition(&enrollment, fence, cancellation))
+            .await.ok_or_else(transfer_interrupted)??;
+        if disposition.scope != scope || &disposition.fence != fence {
+            return Err(dependent_required());
+        }
+        source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(disposition)).await
+    }
+
+    async fn enroll_native_dependent(
+        &self,
+        source: &MultiServing,
+        scope: NativeDependentCustodyScope,
+        cancellation: &CancellationToken,
+    ) -> Result<NativeDependentCustodyEnrollment> {
+        let authority = self.native_dependent_custody.as_deref().ok_or_else(dependent_required)?;
+        let roster = source.native_dependent_custody_roster(scope).await?;
+        let enrollment = cancellation.run_until_cancelled(authority.observe_enrollment(scope, &roster, cancellation))
+            .await.ok_or_else(transfer_interrupted)??;
+        if enrollment.scope != scope { return Err(dependent_required()); }
+        source.record_native_dependent_custody(NativeDependentCustodyOrder::Enroll(enrollment.clone())).await?;
+        Ok(enrollment)
+    }
+
     pub(super) fn native_checkpoint_provider<'a>(
         &'a self,
         destination: &'a str,
@@ -77,6 +161,11 @@ impl MultiRuntime {
 }
 
 impl NativeCheckpointProvider<'_> {
+    pub(super) async fn require_publication(&self, basis: Basis) -> Result<()> {
+        self.runtime.transfer_source_writer(self.transfer).await?
+            .require_native_dependent_publication(self.transfer.reservation, basis).await
+    }
+
     pub(super) async fn install_or_recover(&self, destination: &MultiServing) -> Result<Basis> {
         let reservation = self.transfer.reservation;
         let source = self.runtime.transfer_source_writer(self.transfer).await?;
@@ -133,85 +222,42 @@ impl NativeCheckpointProvider<'_> {
         let installed = destination
             .native_checkpoint_installation(reservation)
             .await?;
+        let custody = installed.custody().clone();
+        let basis = installed.basis();
         source.record_native_checkpoint_drain(installed).await?;
+        let cancellation = CancellationToken::new();
+        for &(group, _) in &custody.groups {
+            let scope = dependent_scope(&custody, basis, group)?;
+            if source.native_dependent_custody(scope).await?.is_none() {
+                self.runtime.enroll_native_dependent(source, scope, &cancellation).await?;
+            }
+        }
         source.release_managed_checkpoint(reservation).await
     }
-
-    pub(super) async fn require_read(
-        &self,
-        destination: &Arc<MultiServing>,
-        read: ManagedCheckpointRead<'_>,
-    ) -> Result<()> {
-        if !PlaintextView::has_delivery_scope() {
-            return Err(terminal_required());
-        }
-        let reservation = self.transfer.reservation;
-        let (basis, view, generation) = destination.managed_checkpoint_view(reservation).await?;
-        let custody = view
-            .inherited_custody()
-            .filter(|custody| custody.reservation == reservation)
-            .ok_or_else(terminal_required)?;
-        if generation != read.generation {
-            return Err(rtdb_crypt::erased_under_view());
-        }
-        let (group, occurrence) =
-            view.native_inherited_carrier(read.branch, read.table, read.id, read.carrier)?;
-        let source = self.runtime.transfer_source_writer(self.transfer).await?;
-        let check = Arc::new(InheritedRead {
-            source,
-            destination: Arc::clone(destination),
-            custody: custody.clone(),
-            basis,
-            generation,
-            group,
-            occurrence,
-        });
-        check.require_current().await?;
-        let mut key = Sha256::new();
-        key.update(b"rtdb/v1/native-checkpoint-read\0");
-        key.update(basis.to_bytes());
-        key.update(generation.to_be_bytes());
-        key.update(group);
-        key.update(occurrence);
-        PlaintextView::track_release_check(key.finalize().into(), check)
-    }
 }
 
-struct InheritedRead {
-    source: Arc<MultiServing>,
-    destination: Arc<MultiServing>,
-    custody: NativeCheckpointCustody,
-    basis: Basis,
-    generation: u64,
+fn dependent_scope(
+    custody: &NativeCheckpointCustody,
+    destination: Basis,
     group: [u8; 16],
-    occurrence: [u8; 32],
+) -> Result<NativeDependentCustodyScope> {
+    let member = custody.groups.binary_search_by_key(&group, |(group, _)| *group)
+        .map_err(|_| dependent_required())?;
+    Ok(NativeDependentCustodyScope {
+        reservation: custody.reservation,
+        destination,
+        source_enrolled_at: custody.enrolled_at,
+        group,
+        checkpoint_group_sha256: custody.groups[member].1,
+    })
 }
 
-#[async_trait::async_trait]
-impl PlaintextReleaseCheck for InheritedRead {
-    async fn require_current(&self) -> Result<()> {
-        let (basis, view, generation) = self
-            .destination
-            .managed_checkpoint_view(self.custody.reservation)
-            .await?;
-        if basis != self.basis
-            || generation != self.generation
-            || view.inherited_custody() != Some(&self.custody)
-        {
-            return Err(rtdb_crypt::erased_under_view());
-        }
-        self.source
-            .check_native_export_read(&self.custody, self.basis, self.group, self.occurrence)
-            .await?;
-        let (_, _, generation) = self
-            .destination
-            .managed_checkpoint_view(self.custody.reservation)
-            .await?;
-        if generation != self.generation {
-            return Err(rtdb_crypt::erased_under_view());
-        }
-        Ok(())
-    }
+fn dependent_required() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Conflict,
+        "rtdb/native-dependent-custody",
+        "The exact destination custody enrollment or positive disposition is unavailable",
+    )
 }
 
 fn terminal_required() -> Anomaly {

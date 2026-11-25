@@ -439,17 +439,60 @@ Ordinary `BranchIndex::checkpoint_at` and `restore_in` still refuse custody grou
 
 The active source writer enrolls the full native inventory and one copy owner before the destination reads the pinned export.
 The enrollment joins each contributing group's revocation inventory and prevents copy drain from being inferred from missing state.
-The destination writes the reciprocal enrollment into its sealed restore checkpoint and retains the original occurrence coordinates as it changes the destination row coordinates.
-The source writer requires a verified destination checkpoint before recording the native copy drain and releasing the pin.
+The destination writes the reciprocal native copy binding into its sealed restore checkpoint and retains the original occurrence coordinates as it changes the destination row coordinates.
+The source writer requires a verified destination checkpoint before recording the native copy drain.
 The same destination terminal can be recovered from its applied checkpoint after a lost restore reply, and source recovery retains the forward enrollment after unpin and trim.
 An interrupted copy claim with no applied destination terminal leaves the destination private and the pin held.
 
-The installed native provider checks the exact inherited slot and outer ciphertext with the destination generation and live original contributor groups in the existing private read check.
-Inherited deployments refuse ordinary Query, Changes, transaction admission and onward fork while the original response owner remains the authority for opening and release.
+The retained native index can identify the exact inherited slot and outer ciphertext against the original occurrence.
+The installed native route withholds the private plaintext check until the destination response release is paired.
+Inherited deployments refuse ordinary Query, Changes, transaction admission and onward fork.
 General `ROW_CUSTODY` advertisement still depends on the producer and reader qualification.
 Uncatalogued owned payloads, rewritten world members, external checkpoint files, and governed Root carriers remain closed.
 Root-derived rows need an authenticated dependent erasure projection and settlement before inherited reads can open.
 `FamilyFence.transfers` exposes the exact forward roster to that projection, while the installed Flight fence reply retains its existing shape.
+
+#### Native dependent custody producer and consumer
+
+Install one trusted `NativeDependentCustodyAuthority` with `MultiRuntime::with_native_dependent_custody` on the hosts eligible to own the source writer.
+The authority resolves the independently commissioned destination owner and application scope from the exact `NativeDependentCustodyScope`.
+The scope binds the source incarnation, cut, pin and manifest, catalog reservation and request, destination incarnation and restore Basis, source enrollment Basis, group and pinned group commitment.
+The provider reads local authoritative state or an authenticated owner endpoint selected for that scope.
+The same destination owner and application scope cover every group in the transfer.
+
+`observe_enrollment` confirms an immutable positive record from the destination owner for that scope.
+The consumer independently reconciles its durable key and carrier registry against the committed destination and the expected native roster.
+It returns the enrolled application keys and exact carrier and link digests for each placement in ascending placement-ID order, including pending reservations.
+Order each placement's application keys by key commitment and their carrier digests in ascending order.
+The same key may occur on multiple placements with one custody classification.
+The RTDB fold compares the native records and carrier digest sets to the pinned source cut and bounds both the members and key references to 512 per group.
+The consumer defines the canonical key commitments over its typed key coordinates in the commissioned application scope.
+The owner supplies a stable key and evidence digest for its positive durable receipt.
+Unknown members, extra carriers, unsupported populations and uncertain ownership leave the destination private.
+The source journals each exact enrollment and the managed catalog verifies the complete set before the first ready transition.
+An existing native forward with only a copy terminal remains an outstanding obligation after replay.
+
+After the Original orders its group revocation, call `MultiRuntime::settle_native_dependent_custody` on the selected source writer with the exact destination name, reservation, group and `NativeCustodyFence`.
+RTDB confirms the retained `Then` at the source revoke key and the group's matching revoked Basis and inventory before querying the destination authority.
+`observe_disposition` independently recovers the durable terminal for the enrolled scope and that exact fence.
+The destination owner closes admission and confirms that its final application-key and carrier census still matches the enrollment.
+Return one positively evidenced terminal per distinct enrolled key in ascending key order.
+Reader drain and response-part disposition commitments cover complete, closed populations, including authenticated empty populations.
+Use `Destroyed` for a destination-owned key and `ReleasedOriginalReference` for a destination reference to an Original key.
+The destination recovery record binds these terminals and the exact enrollment receipt, with its own stable key and evidence digest.
+The source returns its own ordered `Then` receipt and recovers the same key and Basis on retry, including after source checkpointing.
+The Original drain now waits for the source's existing holds and every contributing native destination terminal.
+Source group keys and the Original's application keys remain with their existing owners.
+
+On Bijection `1a1c478c50e`, `fact_points/row_addresses/revocation.rs` matches `fact_custody_members` to the native placements and pending reservations, binds the Original `HostedRecordCustody` and `ReaderKey` coordinates, and co-orders the application fences with the native revocation.
+`fact_points/row_addresses/retirements/native.rs` verifies the keyed revocation and current Original legal holds and fences its application keys.
+It waits for the RTDB provider drain and Original key-reader drain before destroying its keys and ordering its own terminal.
+The distinct destination needs an installed application-key and response-registry authority that can establish a complete destination reverse roster and independently confirm the irreversible close.
+Commission the exact destination installation, application key namespace, reader admission owner and durable response registry, and bind their retained receipts to the same scope.
+The Original retirement worker can continue using its current drain call once the trusted host drives each dependent settlement.
+Upgrade source journal readers and managed catalog publishers before enabling the new ordered records.
+The stock launcher has no destination authority mount for this contract.
+The private inherited read remains closed until a paired consumer supplies a current destination generation, exact slot and source occurrence, all contributing live fences and a durable registration through admitted response-part delivery and disposal.
 
 Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
 Qualify `managed_catalog_waits_for_confirmation_and_drains_and_recovers_a_lost_unpin_reply` for the private catalog and mounted destination attachment gates.

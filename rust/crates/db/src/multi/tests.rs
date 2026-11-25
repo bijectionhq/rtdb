@@ -392,6 +392,11 @@ async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
 #[tokio::test]
 async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the_reciprocal_drain() {
     use rtdb_tx::transact::{CustodyPayload, CustodyPlacement, CustodyPlacementCommitments};
+    use rtdb_types::rtdb_v1::{
+        DependentApplicationKey, DependentCustodyReceipt, DependentKeyCustody, DependentKeyDisposition,
+        DependentKeyTerminal, NativeCustodyFence, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
+        NativeDependentCustodyMember, NativeDependentCustodyOrder, NativeDependentCustodyScope,
+    };
     use sha2::{Digest, Sha256};
 
     let journal = MemoryJournal::default();
@@ -472,7 +477,31 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/native-checkpoint-binding");
 
     source.record_native_checkpoint_drain(installation).await.unwrap();
+    assert!(source.fresh_index().await.unwrap().require_native_dependent_publication(reservation, installed).is_err());
     source.release_managed_checkpoint(reservation).await.unwrap();
+    let mut enrollments = Vec::new();
+    for &(group, checkpoint_group_sha256) in &claim.groups {
+        let scope = NativeDependentCustodyScope {
+            reservation, destination: installed, source_enrolled_at: claim.enrolled_at, group, checkpoint_group_sha256,
+        };
+        let roster = source.fresh_index().await.unwrap().native_dependent_custody_roster(scope).unwrap();
+        assert_eq!(roster.len(), 1);
+        let mut enrollment = NativeDependentCustodyEnrollment {
+            scope, owner: [11; 32], application_scope: [12; 32],
+            receipt: DependentCustodyReceipt { key: checkpoint_group_sha256, evidence_sha256: [13; 32] },
+            members: Vec::new(),
+        };
+        assert!(source.record_native_dependent_custody(NativeDependentCustodyOrder::Enroll(enrollment.clone())).await.is_err());
+        enrollment.members.push(NativeDependentCustodyMember {
+            native: roster[0],
+            application_keys: vec![DependentApplicationKey {
+                key: [14; 32], custody: DependentKeyCustody::OriginalReference, carriers: vec![roster[0].carrier_sha256],
+            }],
+        });
+        source.record_native_dependent_custody(NativeDependentCustodyOrder::Enroll(enrollment.clone())).await.unwrap();
+        enrollments.push(enrollment);
+    }
+    source.fresh_index().await.unwrap().require_native_dependent_publication(reservation, installed).unwrap();
     assert_eq!(source.pin_managed_checkpoint(pin, selected.basis, reservation.target).await.unwrap_err().code, "rtdb/native-checkpoint-pin-used");
     source.checkpoint(Vec::new()).await.unwrap();
     let mut original_follower = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
@@ -487,8 +516,37 @@ async fn native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
     assert!(matches!(stale.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-inventory-changed"));
     let inventory = source.fresh_index().await.unwrap().custody_inventory(*other_group).unwrap().sha256;
     let revoke = request(4, Op::RevokeCustodyGroup { group: *other_group, inventory_sha256: inventory });
-    assert_eq!(append_custody_fixture(&mut source, &revoke).await.outcome, Outcome::Then);
+    let revoked = append_custody_fixture(&mut source, &revoke).await;
+    assert_eq!(revoked.outcome, Outcome::Then);
     assert_eq!(source.fresh_index().await.unwrap().check_native_export_read(&claim, installed, inherited, occurrence).unwrap_err().code, "rtdb/erased-under-view");
+    assert!(!source.fresh_index().await.unwrap().custody_releases_drained(*other_group));
+
+    let enrollment = enrollments.iter().find(|enrollment| enrollment.scope.group == *other_group).unwrap();
+    let mut disposition = NativeDependentCustodyDisposition {
+        scope: enrollment.scope,
+        fence: NativeCustodyFence { revoke_key: revoked.key, revoked_at: revoked.basis, inventory_sha256: inventory },
+        enrollment: enrollment.receipt,
+        receipt: DependentCustodyReceipt { key: [15; 32], evidence_sha256: [16; 32] },
+        keys: Vec::new(),
+    };
+    assert!(source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(disposition.clone())).await.is_err());
+    disposition.keys.push(DependentKeyDisposition {
+        key: [14; 32], reader_drain_sha256: [17; 32], part_disposition_sha256: [18; 32],
+        terminal: DependentKeyTerminal::Destroyed([19; 32]),
+    });
+    assert!(source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(disposition.clone())).await.is_err());
+    disposition.keys[0].terminal = DependentKeyTerminal::ReleasedOriginalReference([19; 32]);
+    let mut wrong_fence = disposition.clone();
+    wrong_fence.fence.revoke_key = original.key.clone();
+    assert!(source.record_native_dependent_custody(NativeDependentCustodyOrder::Dispose(wrong_fence)).await.is_err());
+    let order = NativeDependentCustodyOrder::Dispose(disposition);
+    let terminal = source.record_native_dependent_custody(order.clone()).await.unwrap();
+    assert!(source.fresh_index().await.unwrap().custody_releases_drained(*other_group));
+    source.checkpoint(Vec::new()).await.unwrap();
+    let recovered = source.record_native_dependent_custody(order).await.unwrap();
+    assert_eq!(recovered.key, terminal.key);
+    assert_eq!(recovered.basis, terminal.basis);
+    assert!(recovered.replayed);
 }
 
 async fn append_custody_fixture(database: &mut MultiDatabase, request: &Transact) -> Receipt {

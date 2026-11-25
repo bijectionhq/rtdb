@@ -13,7 +13,7 @@ pub use rtdb_index::branches::{
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
     Term, TimeUnit, Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, valid_branch_name},
+    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, valid_branch_name},
 };
 pub use rtdb_types::rtdb_v1::{ValidTime, ValidTimeBound};
 use serde::{Deserialize, Serialize, Serializer};
@@ -112,11 +112,12 @@ impl Transact {
 
     pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
         scope.or_else(|| self.is_response_release().then_some(CUSTODY_RELEASE_NAMESPACE))
-            .or_else(|| self.contains_native_custody_transfer().then(|| Sha256::digest(b"rtdb/v1/native-checkpoint-receipt\0").into()))
+            .or_else(|| self.contains_native_custody_transfer().then(native_checkpoint_namespace))
     }
 
     pub fn contains_native_custody_transfer(&self) -> bool {
-        self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::NativeCustodyTransfer { .. }))
+        self.ops.iter().chain(&self.otherwise)
+            .any(|op| matches!(op, Op::NativeCustodyTransfer { .. } | Op::NativeDependentCustody(_)))
     }
 
     pub fn native_custody_transfer(custody: NativeCheckpointCustody, destination: Option<Basis>) -> Self {
@@ -124,6 +125,14 @@ impl Transact {
         Self {
             key, require: Vec::new(), window: Window::default(), guards: Vec::new(),
             ops: vec![Op::NativeCustodyTransfer { custody, destination }], otherwise: Vec::new(),
+            requires: Vec::new(), custody_request_digest: None, request_memory: None,
+        }
+    }
+
+    pub fn native_dependent_custody(order: NativeDependentCustodyOrder) -> Self {
+        Self {
+            key: dependent_custody_key(&order), require: Vec::new(), window: Window::default(),
+            guards: Vec::new(), ops: vec![Op::NativeDependentCustody(order)], otherwise: Vec::new(),
             requires: Vec::new(), custody_request_digest: None, request_memory: None,
         }
     }
@@ -246,6 +255,8 @@ pub enum Op {
     #[serde(skip_deserializing)]
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
     ScopedHold(ScopedHoldCommand),
+    #[serde(skip_deserializing)]
+    NativeDependentCustody(NativeDependentCustodyOrder),
 }
 
 fn invalid_scoped_hold() -> Anomaly {
@@ -257,6 +268,27 @@ fn native_custody_key(custody: &NativeCheckpointCustody, installed: bool) -> Vec
     hash.update(b"rtdb/v1/native-checkpoint-command\0");
     hash.update(custody.reservation.target.incarnation);
     hash.update([u8::from(installed)]);
+    hash.finalize().to_vec()
+}
+
+fn native_checkpoint_namespace() -> [u8; 32] {
+    Sha256::digest(b"rtdb/v1/native-checkpoint-receipt\0").into()
+}
+
+fn dependent_custody_key(order: &NativeDependentCustodyOrder) -> Vec<u8> {
+    let scope = order.scope();
+    let mut hash = Sha256::new();
+    hash.update(b"rtdb/v1/native-dependent-custody-command\0");
+    hash.update(scope.reservation.source.basis.to_bytes());
+    hash.update(scope.reservation.source.pin);
+    hash.update(scope.reservation.source.manifest_sha256);
+    hash.update(scope.reservation.target.request);
+    hash.update(scope.reservation.reserved_at.to_bytes());
+    hash.update(scope.destination.to_bytes());
+    hash.update(scope.source_enrolled_at.to_bytes());
+    hash.update(scope.group);
+    hash.update(scope.checkpoint_group_sha256);
+    hash.update([u8::from(matches!(order, NativeDependentCustodyOrder::Dispose(_)))]);
     hash.finalize().to_vec()
 }
 
@@ -754,24 +786,35 @@ impl TransactState {
     }
 
     pub fn original_custody_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
-        self.exact_original_receipt(key, basis, |family| matches!(family,
-            WorkloadFamily::CustodyWrite | WorkloadFamily::OriginalFamilyWrite))
+        Self::exact_original_receipt(&self.receipts, key, basis, original_custody_family)
+    }
+
+    pub fn require_native_custody_fence(&self, fence: &NativeCustodyFence) -> Result<()> {
+        Self::check_native_custody_fence(&self.receipts, fence)
+    }
+
+    fn check_native_custody_fence(receipts: &Receipts, fence: &NativeCustodyFence) -> Result<()> {
+        let receipt = Self::exact_original_receipt(receipts, &fence.revoke_key, fence.revoked_at, original_custody_family)?;
+        if receipt.outcome != Outcome::Then || receipt.erasure.is_some() {
+            return Err(native_custody_command_error());
+        }
+        Ok(())
     }
 
     pub fn original_writer_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
-        self.exact_original_receipt(key, basis, |family| matches!(family,
+        Self::exact_original_receipt(&self.receipts, key, basis, |family| matches!(family,
             WorkloadFamily::CustodyWrite | WorkloadFamily::ClaimWriter))
     }
 
     pub fn original_line_creation_receipt(&self, key: &[u8], basis: Basis) -> Result<Receipt> {
-        self.exact_original_receipt(key, basis, |family| family == WorkloadFamily::ProvisionBranch)
+        Self::exact_original_receipt(&self.receipts, key, basis, |family| family == WorkloadFamily::ProvisionBranch)
     }
 
     fn exact_original_receipt(
-        &self, key: &[u8], basis: Basis, allows_family: impl Fn(WorkloadFamily) -> bool,
+        receipts: &Receipts, key: &[u8], basis: Basis, allows_family: impl Fn(WorkloadFamily) -> bool,
     ) -> Result<Receipt> {
         validate_key(key)?;
-        let mut matches = self.receipts.iter().filter_map(|(namespace, receipts)| {
+        let mut matches = receipts.iter().filter_map(|(namespace, receipts)| {
             let stored = receipts.get(key)?;
             (stored.receipt.basis == basis
                 && (namespace.is_none() || stored.workload.is_some_and(&allows_family))
@@ -980,6 +1023,12 @@ impl TransactState {
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         view.index.require_local_custody()?;
         validate_key(&request.key)?;
+        if request.contains_native_custody_transfer() && (authority.is_some() || workload.is_some()) {
+            return Err(native_custody_command_error());
+        }
+        if let [Op::NativeDependentCustody(NativeDependentCustodyOrder::Dispose(disposition))] = request.ops.as_slice() {
+            Self::check_native_custody_fence(view.receipts, &disposition.fence)?;
+        }
         let appointment = funding.filter(|input| input.is_appointment());
         let funding = funding.filter(|input| !input.is_appointment());
         let funded_request = funding.is_some() || appointment.is_some();
@@ -1206,12 +1255,14 @@ impl TransactState {
             return Err(Anomaly::incorrect("rtdb/custody-review", "A reviewed placement requires original writer authority and the accepting arm"));
         }
         if request.contains_native_custody_transfer() {
-            let [Op::NativeCustodyTransfer { custody, destination }] = request.ops.as_slice() else {
-                return Err(native_custody_command_error());
+            let key = match request.ops.as_slice() {
+                [Op::NativeCustodyTransfer { custody, destination }] => native_custody_key(custody, destination.is_some()),
+                [Op::NativeDependentCustody(order)] => dependent_custody_key(order),
+                _ => return Err(native_custody_command_error()),
             };
             if scope.is_some() || !request.otherwise.is_empty() || !request.guards.is_empty()
                 || !request.requires.is_empty() || request.window != Window::default()
-                || request.custody_request_digest.is_some() || request.key != native_custody_key(custody, destination.is_some())
+                || request.custody_request_digest.is_some() || request.key != key
             {
                 return Err(native_custody_command_error());
             }
@@ -1406,6 +1457,17 @@ impl TransactState {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
+            if let BranchEffect::NativeDependentCustody(order) = &effect {
+                if receipt_namespace != Some(native_checkpoint_namespace())
+                    || receipt.key != dependent_custody_key(order)
+                    || receipt.outcome != Outcome::Then || workload.is_some()
+                {
+                    return Err(invalid_record());
+                }
+                if let NativeDependentCustodyOrder::Dispose(disposition) = order {
+                    self.require_native_custody_fence(&disposition.fence)?;
+                }
+            }
             if let BranchEffect::ReserveReviewedCustodyPlacement { reviewed, .. } = &effect
                 && (receipt_namespace.is_some() && workload != Some(WorkloadFamily::OriginalFamilyWrite)
                     || reviewed.receipt_key != receipt.key)
@@ -1429,6 +1491,10 @@ impl TransactState {
 
 fn native_custody_command_error() -> Anomaly {
     Anomaly::incorrect("rtdb/native-checkpoint-command", "Native transfer requires one private ordered custody command")
+}
+
+fn original_custody_family(family: WorkloadFamily) -> bool {
+    matches!(family, WorkloadFamily::CustodyWrite | WorkloadFamily::OriginalFamilyWrite)
 }
 
 fn erasure_pending() -> Anomaly {

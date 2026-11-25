@@ -4,8 +4,8 @@ use rtdb_crypt::{Kms, Plaintext, tokens::ExportTicket};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::{BranchCut, BranchIndex};
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
-use rtdb_tx::transact::{Outcome, Transact, TransactState};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, PinnedCheckpointIdentity}};
+use rtdb_tx::transact::{Outcome, Receipt, Transact, TransactState};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, NativeDependentCustodyScope, PinnedCheckpointIdentity}};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -284,6 +284,35 @@ impl MultiDatabase {
         match receipt.outcome {
             Outcome::Then => Ok(()),
             Outcome::Refused { error } => Err(error),
+            _ => Err(native_terminal_required()),
+        }
+    }
+
+    pub async fn require_native_dependent_fence(&mut self, scope: NativeDependentCustodyScope, fence: &NativeCustodyFence) -> Result<()> {
+        self.require_managed_checkpoint_writer().await?;
+        let state = self.durable_transactions();
+        state.index().require_native_dependent_fence(scope, fence)?;
+        state.require_native_custody_fence(fence)
+    }
+
+    pub async fn record_native_dependent_custody(&mut self, order: NativeDependentCustodyOrder) -> Result<Receipt> {
+        self.require_managed_checkpoint_writer().await?;
+        let state = self.durable_transactions();
+        let prior = state.index().native_dependent_custody(order.scope())?;
+        let recorded = match &order {
+            NativeDependentCustodyOrder::Enroll(enrollment) => prior.is_some_and(|(prior, _)| prior == enrollment),
+            NativeDependentCustodyOrder::Dispose(disposition) => {
+                state.require_native_custody_fence(&disposition.fence)?;
+                prior.is_some_and(|(_, prior)| prior == Some(disposition))
+            }
+        };
+        if !recorded {
+            state.index().check_native_dependent_custody(&order)?;
+        }
+        let receipt = self.transact(&Transact::native_dependent_custody(order)).await?;
+        match &receipt.outcome {
+            Outcome::Then => Ok(receipt),
+            Outcome::Refused { error } => Err(error.clone()),
             _ => Err(native_terminal_required()),
         }
     }
