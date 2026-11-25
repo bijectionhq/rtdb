@@ -563,7 +563,7 @@ Requests have `operation`, the complete `decision`, and `held_ready`.
 
 - `open_classic_migration_destination` verifies the live interlock and orders an opening reservation against the exact closed held-ready Basis.
   The selected native writer reopens the imported stream and checks the closed Classic application row at the exact mapped cut.
-  It installs the initial native fence at the commissioned `public.bj_installation` authority point for the held assignment and epoch, then the native catalog orders `opened`.
+  It installs the initial native fence at the exact authority point of the commissioned workload profile for the held assignment and epoch, then the native catalog orders `opened`.
   The mounted assignment issuer profile is held through native ordering and compared again at attachment.
 - `exclude_classic_migration_opening` verifies the same live interlock and orders `excluded` only while the held-ready row still has no opening reservation.
   Opening and exclusion contend on that row and its ordered Basis.

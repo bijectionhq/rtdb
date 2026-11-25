@@ -181,14 +181,7 @@ impl MultiRuntime {
             .as_ref()
             .and_then(|peer| peer.workload_profile())
             .ok_or_else(denied)?;
-        let point = workload::Point::new(
-            "public.bj_installation",
-            "authority".into(),
-            rtdb_types::Timestamp(0),
-        )?;
-        if profile.point != point {
-            return Err(denied());
-        }
+        let point = profile.point.clone();
         let writer = preferred(witness.database(), live).ok_or_else(unavailable)?;
         if writer != self.backends.node {
             return Ok(Reply::Redirect { writer });
@@ -280,7 +273,7 @@ mod tests {
             .stage_classic_candidate(name, database, binding, [2; 32])
             .await?;
         let point =
-            workload::Point::new("public.bj_installation", "authority".into(), Timestamp(0))?;
+            workload::Point::new("public.workload_installation", "authority".into(), Timestamp(0))?;
         let mut state = TransactState::new(*database.as_bytes());
         let mut index = state.index().clone();
         let application_cut = TransactionKey {
@@ -408,7 +401,7 @@ mod tests {
         ));
         let ready = &witness.held_ready.ready;
         let placement = workload::ImportedPlacement::new(
-            workload::Point::new("public.bj_installation", "authority".into(), Timestamp(0))?,
+            workload::Point::new("public.workload_installation", "authority".into(), Timestamp(0))?,
             witness.placement(),
             witness.decision.decision_sha256,
             ready.native_basis,
