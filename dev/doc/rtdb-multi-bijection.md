@@ -501,6 +501,34 @@ It proves the same retained Begin and application close for the requested points
 The consumer compares the literal binding bytes and the exact closed writer fields with its independently retained Bijection selection and fence.
 This outcome carries no Original obligation inventory or disposition and excludes the selected business receipt relation.
 
+#### Sealed registered receipt Policy observations
+
+Enable `registered_receipt_policy: true` in the independently installed
+Classic application replay layout for the selected Original. It defaults off.
+The authenticated Original recovery request
+`read_classic_migration_registered_receipt_policy` takes the usual exact
+`selection`, `candidate_binding`, application `classic_cut`, and
+`receipt: {receipt_epoch, session, request}`. The session uses the canonical
+hyphenated UUID form.
+
+The `classic_migration_receipt_policy_readback` reply repeats the selection,
+candidate, application cut, terminal and terminal digest. Its `policy` holds
+the exact receipt selection and terminal, the complete bounded Root
+declaration rows and their relation history digest, and a fixed list of
+covered control points. Each control includes its relation, ID, history
+digest and optional winning image and recorded revision. RTDB derives the
+standing and decision IDs from the registered receipt identity. Coverage
+requires the retained literal history of every selected relation. An
+unavailable or projected-away relation, erased or redacted history, segmented
+control, changed application close or unverified candidate fails the read.
+
+This source is input to the independent Original Policy evaluator. The
+existing exact receipt and explicit Cedar Policy absence readbacks, caller
+proof, retention assignment and conditional signed decision still govern
+release. The authorization point exposes presence and revision only. The
+action accepts no caller-supplied relation or arbitrary key and does not issue
+a serving grant or advance the migration.
+
 #### Classic provider drain status
 
 On the authenticated Original recovery envelope, use `classic_migration_provider_drain_status` with the same `selection`, full `candidate_binding` and `classic_cut` as the application closure readback.

@@ -20,6 +20,8 @@ pub(crate) struct ApplicationLayout {
     pub(super) sql_release: SqlReleaseLayout,
     pub(super) external_key_recovery: Option<TableRef>,
     pub(super) named_holds: Option<NamedHoldLayout>,
+    #[serde(default)]
+    pub(crate) registered_receipt_policy: bool,
 }
 
 #[derive(Deserialize)]
