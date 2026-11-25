@@ -659,6 +659,23 @@ impl<'a> AssertionFamilies<'a> {
         if record.derived_capability(stage, member, slot) { Ok(()) } else { Err(conflict()) }
     }
 
+    pub(crate) async fn require_world_rank_occurrence(
+        &self, family: Uuid, stage: AssertionStage, assertion: AssertionId, slot: WorldRowSlot<'_>,
+    ) -> Result<FamilyOccurrence> {
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        let occurrence = record.admitted_member(assertion).ok_or_else(conflict)?;
+        if !record.derived_capability(stage, assertion, slot)
+            || occurrence.capability.deployment() != stage.deployment()
+            || occurrence.capability.incarnation() != stage.incarnation()
+            || occurrence.capability == stage
+        {
+            return Err(conflict());
+        }
+        self.require_position_open(occurrence.position).await?;
+        Ok(occurrence)
+    }
+
     /// Admits sealing the private link of an enrolled reservation.
     pub async fn require_reserved(&self, family: Uuid, reservation: LandingReservation) -> Result<()> {
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
@@ -1133,6 +1150,7 @@ mod tests {
         let slot = WorldRowSlot { world, relation: &derived.relation, key: &derived.key };
         let capability = derived.capability.unwrap();
         families.require_derived_capability(family, capability, original.assertion, slot).await?;
+        assert!(families.require_world_rank_occurrence(family, capability, original.assertion, slot).await.is_err());
         families.require_row_capability(family, enrolled, slot).await?;
         let elsewhere = WorldRowSlot { world: Uuid::new_v4(), ..slot };
         assert!(families.require_derived_capability(family, capability, original.assertion, elsewhere).await.is_err());
@@ -1153,6 +1171,13 @@ mod tests {
         families.register(family, original).await?;
         families.register(family, original).await?;
         families.require_live_occurrence(family, original).await?;
+        assert_eq!(families.require_world_rank_occurrence(family, capability, original.assertion, slot).await?, original);
+        assert!(families.require_world_rank_occurrence(family, capability, original.assertion, elsewhere).await.is_err());
+        let different_incarnation = AssertionStage::new(
+            capability.deployment(), NonZeroU64::new(capability.incarnation().get() + 1).unwrap(),
+            capability.identity(),
+        )?;
+        assert!(families.require_world_rank_occurrence(family, different_incarnation, original.assertion, slot).await.is_err());
         let reservation = LandingReservation {
             source: original.position,
             destination: AssertionId::from_bytes([3; 32]),
@@ -1177,6 +1202,7 @@ mod tests {
         assert!(fence.assertion_capabilities.contains(&rewrite.capability));
         assert_eq!(fence.derived, BTreeSet::from([derived.clone(), rewritten, root]));
         assert!(families.require_derived_capability(family, capability, original.assertion, slot).await.is_err());
+        assert!(families.require_world_rank_occurrence(family, capability, original.assertion, slot).await.is_err());
         assert!(families.require_row_capability(family, rewrite, slot).await.is_err());
         assert!(families.register_derived(family, &[derived]).await.is_err());
         Ok(())
