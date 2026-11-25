@@ -26,6 +26,33 @@ pub(super) fn adapt_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> {
     with_schema(batch, schema).map(Some)
 }
 
+pub(super) fn normalize_stream_validity(batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = batch.schema_ref().fields().iter().zip(batch.columns()).map(|(field, column)| {
+        strip_masked_nulls(field, column.to_data()).map(make_array)
+    }).collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    let normalized = RecordBatch::try_new_with_options(batch.schema(), columns, &options).map_err(invalid)?;
+    Ok(adapt_batch(&normalized)?.unwrap_or(normalized))
+}
+
+fn strip_masked_nulls(field: &arrow_schema::Field, data: ArrayData) -> Result<ArrayData> {
+    let children: Vec<_> = match field.data_type() {
+        DataType::Struct(fields) => fields.iter().collect(),
+        DataType::Union(fields, _) => fields.iter().map(|(_, field)| field).collect(),
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => vec![field],
+        _ => Vec::new(),
+    };
+    if children.len() != data.child_data().len() {
+        return Err(invalid("Arrow stream validity layout differs from its field"));
+    }
+    let children = children.into_iter().zip(data.child_data()).map(|(field, data)| {
+        strip_masked_nulls(field, data.clone())
+    }).collect::<Result<Vec<_>>>()?;
+    let nulls = if field.is_nullable() { data.nulls().cloned() } else { None };
+    data.into_builder().nulls(nulls).child_data(children).build().map_err(invalid)
+}
+
 pub(super) fn with_schema(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let columns = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
         retype(array.to_data(), field.data_type()).map(make_array)

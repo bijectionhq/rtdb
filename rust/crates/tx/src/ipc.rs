@@ -38,6 +38,12 @@ impl Output {
         Ok(())
     }
 
+    pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.reserve(bytes.len())?;
+        self.data.extend_from_slice(bytes);
+        Ok(())
+    }
+
     pub(crate) fn write_stream<'a>(&mut self, schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>) -> Result<()> {
         let _schema = self.reservation.budget().reserve(rtdb_format::ipc::schema_translation_bound(schema)?)?;
         rtdb_format::ipc::write_stream_to(schema, pages, self)?;
@@ -65,8 +71,7 @@ fn reserve_growth(
 
 impl Write for Output {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.reserve(bytes.len()).map_err(io::Error::other)?;
-        self.data.extend_from_slice(bytes);
+        self.append_bytes(bytes).map_err(io::Error::other)?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> { Ok(()) }

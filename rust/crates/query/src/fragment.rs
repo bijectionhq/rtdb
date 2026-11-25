@@ -462,6 +462,7 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
 pub(crate) fn decode_batches(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
     match decode_fragment_frames(bytes.clone(), memory, true) {
         Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+            // A retained prefix can tie up more of the budget than an entirely copied reply.
             decode_fragment_frames(bytes, memory, false)
         }
         result => result,
@@ -479,24 +480,37 @@ fn decode_fragment_frames(mut rest: Buffer, memory: &Arc<MemoryBudget>, retain: 
         let frame = rest.slice_with_length(8, length);
         rest.advance(8 + length);
         if retain {
-            let stream = rtdb_format::ipc::OwnedStream::read_buffer(frame, memory).map_err(|error| {
-                if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
-            })?;
-            for page in stream.pages() {
-                batches.push(decode_fragment_batch(page.batch(), memory)?);
-            }
-        } else {
-            let frame = frame.as_slice();
-            rtdb_format::ipc::validate_complete_stream(frame).map_err(|error| invalid("fragment-decode", error))?;
-            let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(frame), None)
-                .map_err(|error| invalid("fragment-decode", error))?;
-            for record in reader {
-                let record = record.map_err(|error| invalid("fragment-decode", error))?;
-                batches.push(decode_fragment_batch(&record, memory)?);
+            let prefix = batches.len();
+            match decode_retained_fragment(frame.clone(), memory, &mut batches) {
+                Ok(()) => continue,
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => batches.truncate(prefix),
+                Err(error) => return Err(error),
             }
         }
+        decode_copied_fragment(&frame, memory, &mut batches)?;
     }
     Ok(batches)
+}
+
+fn decode_retained_fragment(frame: Buffer, memory: &Arc<MemoryBudget>, batches: &mut Vec<ColumnBatch>) -> Result<()> {
+    let stream = rtdb_format::ipc::OwnedStream::read_buffer(frame, memory).map_err(|error| {
+        if error.code == "rtdb.format/invalid-arrow" { invalid("fragment-decode", error) } else { error }
+    })?;
+    for page in stream.pages() {
+        batches.push(decode_fragment_batch(page.batch(), memory)?);
+    }
+    Ok(())
+}
+
+fn decode_copied_fragment(frame: &[u8], memory: &Arc<MemoryBudget>, batches: &mut Vec<ColumnBatch>) -> Result<()> {
+    rtdb_format::ipc::validate_complete_stream(frame).map_err(|error| invalid("fragment-decode", error))?;
+    let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(frame), None)
+        .map_err(|error| invalid("fragment-decode", error))?;
+    for record in reader {
+        let record = record.map_err(|error| invalid("fragment-decode", error))?;
+        batches.push(decode_fragment_batch(&record, memory)?);
+    }
+    Ok(())
 }
 
 fn decode_fragment_batch(record: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<ColumnBatch> {
@@ -769,6 +783,43 @@ mod tests {
         drop(array);
         assert_eq!(reply_memory.used_bytes(), 0);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_copying_frame_keeps_the_admitted_reply_prefix() {
+        use arrow_array::StringArray;
+        use arrow_schema::DataType;
+
+        let source = MemoryBudget::new(16 << 20);
+        let memory = MemoryBudget::new(512 << 10);
+        let large = "x".repeat(128 << 10);
+        let mut reply = FragmentBytes::new(&source).unwrap();
+        let append = |reply: &mut FragmentBytes, text: &str| {
+            let column = Column::Arrow {
+                array: Arc::new(StringArray::from(vec![text])),
+                field: Arc::new(ArrowField::new("text", DataType::Utf8, false)),
+                logical: None,
+            };
+            let batch = ColumnBatch::settled(vec![column], 1, source.reserve(256).unwrap()).unwrap();
+            encode_frame(&batch, 0..1, &source, reply).unwrap();
+        };
+        append(&mut reply, "prefix");
+        let second = reply.as_slice().len();
+        append(&mut reply, &large);
+        let addresses = reply.as_slice().as_ptr_range();
+        let bytes = reply.into_ipc_buffer();
+        let second = bytes.slice(second + 8);
+        let error = rtdb_format::ipc::OwnedStream::read_buffer(second, &memory).err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+
+        let decoded = decode_batches(bytes, &memory).unwrap();
+        let [first, second] = decoded.as_slice() else { panic!("Expected two batches") };
+        for (batch, expected, retained) in [(first, "prefix", true), (second, large.as_str(), false)] {
+            let Column::Arrow { array, .. } = &batch.columns[0] else { panic!("Expected an Arrow column") };
+            let text = array.as_any().downcast_ref::<StringArray>().unwrap().value(0);
+            assert_eq!(text, expected);
+            assert_eq!(addresses.contains(&text.as_ptr()), retained);
+        }
     }
 
     #[test]

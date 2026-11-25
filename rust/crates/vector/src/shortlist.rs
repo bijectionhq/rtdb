@@ -257,8 +257,8 @@ impl FrontierRanker<'_> {
         let (mut reader, _metadata) = open_frontier_file(Bytes::from_owner(lease), cut.memory)?;
         for page in 0..reader.page_count() {
             check_cancelled()?;
-            let _page = cut.memory.reserve(reader.page_allocation_bound(page)?)?;
-            let events = EventBatch::new(reader.read_event_page(page, columns)?)?;
+            let (batch, _page) = reader.read_event_page_reserved(page, columns, cut.memory)?;
+            let events = EventBatch::new(batch)?;
             self.rank_batch(&events)?;
         }
         Ok(())

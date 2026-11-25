@@ -121,8 +121,8 @@ fn read_indexed_rows(source: impl Read + Seek + Send + 'static, definition: &Vec
     let columns = definition.put_columns();
     for page in 0..reader.page_count() {
         if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
-        let _page = memory.reserve(reader.page_allocation_bound(page)?)?;
-        let events = EventBatch::new(reader.read_event_page(page, &columns)?)?;
+        let (batch, _page) = reader.read_event_page_reserved(page, &columns, memory)?;
+        let events = EventBatch::new(batch)?;
         for row in 0..events.len() {
             output.push_event(&events.borrow_event(row)?, definition, staging)?;
         }

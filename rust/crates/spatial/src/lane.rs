@@ -119,8 +119,8 @@ impl ArtefactBuilder for Builder {
                 if cancel.is_cancelled() {
                     return Err(postings::cancelled());
                 }
-                let _page = memory.reserve(reader.page_allocation_bound(page)?)?;
-                let events = EventBatch::new(reader.read_event_page(page, &put_columns)?)?;
+                let (batch, _page) = reader.read_event_page_reserved(page, &put_columns, &memory)?;
+                let events = EventBatch::new(batch)?;
                 for row in 0..events.len() {
                     let mut work =
                         GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
