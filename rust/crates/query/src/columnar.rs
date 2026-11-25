@@ -61,6 +61,7 @@ struct ExpansionInput {
 enum RowExpansion {
     RepeatEach(usize),
     RepeatPage(usize),
+    JoinProbe(Arc<crate::batch_join::ProbeRuns>),
     UnnestParents(Arc<UnnestRows>),
     UnnestGroups(Arc<UnnestRows>),
     UnnestChildren(Arc<UnnestRows>),
@@ -71,6 +72,7 @@ impl RowExpansion {
         match self {
             Self::RepeatEach(width) => (0, row / width),
             Self::RepeatPage(width) => (0, row % width),
+            Self::JoinProbe(runs) => (0, runs.input_row(row)),
             Self::UnnestParents(runs) => (0, runs.groups[runs.group_at(row)].parent),
             Self::UnnestGroups(runs) => (0, runs.group_at(row)),
             Self::UnnestChildren(runs) => {
@@ -87,6 +89,7 @@ impl RowExpansion {
         match self {
             Self::RepeatEach(1) => {}
             Self::RepeatPage(width) if rows.len() <= width - start => {}
+            Self::JoinProbe(runs) if runs.contiguous(&rows) => {}
             Self::UnnestChildren(runs) if source != 0 => {
                 let first = runs.group_at(rows.start);
                 let last = runs.group_at(rows.end - 1);
@@ -104,6 +107,7 @@ impl RowExpansion {
     fn owner(&self) -> Option<&Arc<MemoryReservation>> {
         match self {
             Self::UnnestParents(runs) | Self::UnnestGroups(runs) | Self::UnnestChildren(runs) => Some(&runs.reservation),
+            Self::JoinProbe(runs) => runs.owner(),
             Self::RepeatEach(_) | Self::RepeatPage(_) => None,
         }
     }
@@ -1405,8 +1409,7 @@ pub(crate) fn ordinal_column_by(len: usize, name: &str, context: &crate::QueryCo
     Ok((Column::Arrow { array, field, logical }, reservation))
 }
 
-#[cfg(test)]
-fn gather_column_rows<'a>(
+pub(crate) fn gather_column_rows<'a>(
     source: impl Fn(usize) -> &'a ColumnBatch, rows: &[(usize, usize)], position: usize, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
     gather_column_cells(source, rows.iter().copied().map(Some), rows.len(), position, false, memory)
@@ -1420,6 +1423,39 @@ pub(crate) fn gather_nullable_column<'a>(
     let lease = Arc::get_mut(&mut reservation).expect("A nullable gather owns its reservation");
     if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
     Ok((column, reservation))
+}
+
+pub(crate) fn gather_join_probe(
+    probe: Option<(&ColumnBatch, crate::batch_join::ProbeRuns)>, count: usize, width: usize,
+    columns: &mut Vec<Column>, lease: &mut MemoryReservation,
+) -> Result<()> {
+    if width == 0 { return Ok(()); }
+    let memory = Arc::clone(lease.budget());
+    let probe = probe.map(|(batch, runs)| (batch, Arc::new(runs)));
+    let expansion = probe.as_ref().map(|(_, runs)| RowExpansion::JoinProbe(Arc::clone(runs)));
+    for position in 0..width {
+        let (column, mut charge) = match &probe {
+            Some((batch, runs)) => match &batch.columns[position] {
+                Column::Values(_) => gather_column_cells(|_| *batch, runs.picks(), count, position, true, &memory)?,
+                column => {
+                    let expansion = expansion.as_ref().expect("A present probe has an expansion");
+                    expanded_column(column, batch.column_reservation(position), expansion, count, &memory)?
+                }
+            },
+            None => {
+                let charge = memory.reserve(512)?;
+                let cells = SelectedRows::Span(0..count);
+                let sources = Arc::new(vec![None]);
+                (Column::Selected(SelectedColumn { sources, cells }), charge)
+            },
+        };
+        let bytes = column.retained_bytes()?;
+        let charge = Arc::get_mut(&mut charge).expect("The probe gather owns its output reservation");
+        if bytes <= charge.bytes() { charge.shrink_to(bytes)?; } else { charge.grow_to(bytes)?; }
+        lease.absorb(charge)?;
+        columns.push(column);
+    }
+    Ok(())
 }
 
 #[test]

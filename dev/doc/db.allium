@@ -2133,6 +2133,7 @@ surface QueryAccess {
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
+        -- Hash join fan-out shares one charged run per contributing probe row across the retained Arrow probe columns.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
         -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- Join, sort, membership, and materialized-relation spills replay Arrow batches under the query's spill budget.

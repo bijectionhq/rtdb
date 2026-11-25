@@ -61,6 +61,57 @@ async fn memory_hash_join_finishes_each_probe_page_before_client_batching() {
 }
 
 #[tokio::test]
+async fn hash_fanout_retains_the_probe_payload_in_probe_order() {
+    for kind in [JoinKind::Inner, JoinKind::Full] {
+        for residual in [false, true] {
+            let execution = execution(32, 100);
+            let baseline = execution.context.memory.used_bytes();
+            let build = numbers(0, &[10, 11]);
+            let probe = table(1, &[Value::Utf8("first".into()), Value::Utf8("second".into())]);
+            let condition = residual.then(|| Expr::binary(BinaryOp::NotEq,
+                probe.schema().fields()[0].expression(), Expr::Literal(Value::Utf8("skip".into()))));
+            let mut cursor = open(join(build, probe, kind, condition), &execution).await;
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert!(cursor.next_batch().await.unwrap().is_none());
+            drop(cursor);
+            let probe = &page.columns[1];
+            let (source, _, _, _) = probe.arrow_cell(0).unwrap().unwrap();
+            assert_eq!(source.len(), 2);
+            for (output, expected) in [0, 0, 1, 1].into_iter().enumerate() {
+                let (array, _, _, offset) = probe.arrow_cell(output).unwrap().unwrap();
+                assert!(std::ptr::eq(source, array));
+                assert_eq!(offset, expected);
+            }
+            assert_eq!((0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>(),
+                [Value::I64(10), Value::I64(11), Value::I64(10), Value::I64(11)]);
+            drop(page);
+            assert_eq!(execution.context.memory.used_bytes(), baseline);
+        }
+    }
+}
+
+#[tokio::test]
+async fn hash_membership_preserves_complete_consecutive_and_gapped_probe_selections() {
+    use Value::{I64, Null};
+
+    for (kind, build, probe, expected) in [
+        (JoinKind::Semi, vec![I64(1), I64(2), I64(3)], vec![I64(3), I64(2), I64(1)], vec![I64(3), I64(2), I64(1)]),
+        (JoinKind::Semi, vec![I64(2), I64(3)], vec![I64(1), I64(3), I64(2), I64(4)], vec![I64(3), I64(2)]),
+        (JoinKind::Semi, vec![I64(1), I64(3), Null], vec![I64(1), Null, I64(3)], vec![I64(1), I64(3)]),
+        (JoinKind::Anti, vec![I64(9)], vec![I64(3), I64(2), I64(1)], vec![I64(3), I64(2), I64(1)]),
+        (JoinKind::Anti, vec![I64(1), I64(4)], vec![I64(1), I64(3), I64(2), I64(4)], vec![I64(3), I64(2)]),
+        (JoinKind::Anti, vec![I64(2)], vec![I64(1), I64(2), Null, I64(3)], vec![I64(1), Null, I64(3)]),
+    ] {
+        let execution = execution(32, 100);
+        let probe = table(0, &probe);
+        let build = table(1, &build);
+        let condition = equal(&probe, &build);
+        let batches = collect(open(join(probe, build, kind, Some(condition)), &execution).await).await;
+        assert_eq!(batches, [expected.into_iter().map(|value| vec![value]).collect::<Vec<_>>()]);
+    }
+}
+
+#[tokio::test]
 async fn spill_shuffle_replays_probe_partitions_within_each_build_partition() {
     for batch_rows in [1,1024] {
         let execution = execution(batch_rows,0);let baseline = execution.context.memory.used_bytes();

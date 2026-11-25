@@ -134,11 +134,13 @@
 -- Its ordinal vector marks the synthetic outer row of an empty list as null.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
+-- Hash join fan-out retains Arrow probe payloads under their source owners and shares the repeated probe positions across columns.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Its Bloom and entity ID filters use those same build-side vectors.
 -- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
 -- Supported computed keys and integer residual comparisons retain the payload positions through match selection.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
+-- A complete Arrow probe page or an admissible consecutive span can supply semi and anti output directly.
 -- Their columnar output keeps the configured transport row limit.
 -- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
 -- A single equijoin fails when more than one build row matches a probe row.
