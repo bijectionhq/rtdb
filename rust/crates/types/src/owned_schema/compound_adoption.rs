@@ -28,10 +28,8 @@ fn compound_shape(kind: &Kind) -> Option<bool> {
             for leg in legs { compound |= compound_shape(leg)?; }
             compound
         }
-        _ => {
-            tag(kind)?;
-            false
-        }
+        Kind::Decimal { .. } => return None,
+        _ => false,
     })
 }
 
