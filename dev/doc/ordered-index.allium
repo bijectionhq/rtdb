@@ -36,6 +36,7 @@ entity Checkpoint {
 -- Leaf edits and correction writes select key slots from their Arrow columns across plain and dense-union layouts.
 -- Each rebuilt slot derives its layout from selected rows and assigns dense-union offsets in selection order.
 -- Compact contiguous selections may share the backing allocations of index-owned Arrow keys.
+-- A rebuilt leaf transfers its construction grant to new backing and retains the existing owners of shared buffers.
 -- A correction page serializes just the Arrow key rows for the validity spans it owns.
 -- A decoded correction group shares the admitted page backing with its validity spans.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.

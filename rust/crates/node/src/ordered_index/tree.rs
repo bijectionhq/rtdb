@@ -277,6 +277,7 @@ pub(super) struct Entry {
 #[derive(Clone, Copy)]
 struct EntryView<'a> {
     key: KeyRef<'a>,
+    owned_key: Option<&'a Key>,
     item: &'a Item,
     posting: Option<(&'a Postings, usize)>,
 }
@@ -306,8 +307,12 @@ impl EntryView<'_> {
     }
 
     fn owned(self) -> Entry {
+        let key = match self.owned_key {
+            Some(Key::Row(address)) if address.retained => Key::Row(address.clone()),
+            _ => self.key.owned(),
+        };
         Entry {
-            key: self.key.owned(),
+            key,
             item: self.item.clone(),
         }
     }
@@ -317,6 +322,7 @@ impl Entry {
     fn view(&self) -> EntryView<'_> {
         EntryView {
             key: self.key.view(),
+            owned_key: Some(&self.key),
             item: &self.item,
             posting: None,
         }
@@ -552,12 +558,7 @@ impl Page {
                     .map(|postings| postings.heap_bytes_excluding(backing))
                     .transpose()?
                     .unwrap_or(0);
-                leaf.metadata.iter().fold(
-                    postings.saturating_add(leaf.metadata.capacity().saturating_mul(size_of::<Entry>()))
-                        .saturating_add(leaf.first.owned_backing_bytes())
-                        .saturating_add(leaf.last.owned_backing_bytes()),
-                    |bytes, entry| bytes.saturating_add(entry.key.owned_backing_bytes()),
-                )
+                postings.saturating_add(leaf.metadata_bytes())
             }
             Self::Branch(children) => children.capacity().saturating_mul(size_of::<Link>()),
         };
@@ -574,7 +575,7 @@ struct Leaf {
 }
 
 impl Leaf {
-    fn from_entries(entries: Vec<EntryView<'_>>) -> Result<Self> {
+    fn from_entries(entries: &[EntryView<'_>]) -> Result<Self> {
         let count = entries.partition_point(|entry| matches!(entry.key, KeyRef::Posting(..)));
         let (keys, metadata) = entries.split_at(count);
         let postings = if keys.is_empty() {
@@ -666,12 +667,22 @@ impl Leaf {
         if row < self.posting_count() {
             EntryView {
                 key: self.key(row),
+                owned_key: None,
                 item: &POSTING_ITEM,
                 posting: self.postings.as_ref().map(|postings| (postings, row)),
             }
         } else {
             self.metadata[row - self.posting_count()].view()
         }
+    }
+
+    fn metadata_bytes(&self) -> usize {
+        let slots = self.metadata.capacity().saturating_mul(size_of::<Entry>());
+        self.metadata.iter().fold(
+            slots.saturating_add(self.first.owned_backing_bytes())
+                .saturating_add(self.last.owned_backing_bytes()),
+            |bytes, entry| bytes.saturating_add(entry.key.owned_backing_bytes()),
+        )
     }
 
     fn bytes(&self) -> usize {
@@ -843,26 +854,43 @@ impl Tree {
     }
 
     fn leaf_link(&self, entries: Vec<EntryView<'_>>) -> Result<Link> {
-        let bytes = entries.iter().map(|entry| entry.bytes()).sum::<usize>();
+        let bytes = entries.iter().map(|entry| match entry.key {
+            KeyRef::Posting(..) => entry.bytes(),
+            KeyRef::Row(address) => size_of::<Entry>().saturating_add(address.key.len()),
+            KeyRef::Revision(_) => size_of::<Entry>(),
+        }).fold(0, usize::saturating_add);
         let width = match entries.first().map(|entry| entry.key) {
             Some(KeyRef::Posting(_, tuple, _)) => tuple.len(),
             _ => 0,
         };
-        let _scratch = self.memory.reserve(
+        let mut scratch = self.memory.reserve(
             bytes
                 .saturating_mul(4)
-                .saturating_add(width.saturating_mul(1024))
+                .saturating_add(width.saturating_mul(8192))
                 .saturating_add(4096),
         )?;
-        self.link(Page::Leaf(Leaf::from_entries(entries)?))
+        let mut leaf = Leaf::from_entries(&entries)?;
+        let mut retained = leaf.metadata_bytes().saturating_add(size_of::<Node>() + ARC_HEADER_BYTES);
+        let grant = Arc::get_mut(&mut scratch).expect("the leaf builder owns its workspace");
+        if let Some(postings) = &mut leaf.postings {
+            retained = retained.saturating_add(postings.fund_new(
+                grant, entries.iter().filter_map(|entry| entry.posting.map(|(postings, _)| postings)),
+            )?);
+        }
+        Self::link(Page::Leaf(leaf), grant.split_off(retained)?)
     }
 
-    fn link(&self, page: Page) -> Result<Link> {
+    fn branch_link(&self, children: Vec<Link>) -> Result<Link> {
+        let memory = self.memory.reserve(
+            children.capacity().saturating_mul(size_of::<Link>())
+                .saturating_add(size_of::<Node>() + ARC_HEADER_BYTES),
+        )?;
+        Self::link(Page::Branch(children), memory)
+    }
+
+    fn link(page: Page, memory: Arc<MemoryReservation>) -> Result<Link> {
         let entries = page.entry_count()?;
         let measure = page.measure()?;
-        let memory = self
-            .memory
-            .reserve(page.bytes().saturating_mul(2).saturating_add(256))?;
         Ok(Link::New(Arc::new(Node {
             page,
             entries,
@@ -1053,22 +1081,24 @@ impl Tree {
         }
         let mut pages = match root {
             Some(root) => self.edit_page(root, &edits).await?,
-            None => self.pack(
-                edits
+            None => {
+                let _views = self.memory.reserve(edits.len().saturating_mul(size_of::<EntryView<'_>>()))?;
+                let views = edits
                     .iter()
                     .filter_map(|(key, item)| {
                         item.as_ref().map(|item| EntryView {
                             key: key.view(),
+                            owned_key: Some(key),
                             item,
                             posting: None,
                         })
                     })
-                    .collect(),
-                |entries| self.leaf_link(entries),
-            )?,
+                    .collect();
+                self.pack(views, |entries| self.leaf_link(entries))?
+            }
         };
         while pages.len() > 1 {
-            pages = self.pack(pages, |children| self.link(Page::Branch(children)))?;
+            pages = self.pack(pages, |children| self.branch_link(children))?;
         }
         let Some(mut root) = pages.pop() else {
             return Ok(None);
@@ -1099,7 +1129,7 @@ impl Tree {
                 Page::Leaf(leaf) => {
                     let _scratch = self
                         .memory
-                        .reserve(leaf.bytes().saturating_mul(2).saturating_add(4096))?;
+                        .reserve((leaf.len() + edits.len()).saturating_mul(size_of::<EntryView<'_>>()))?;
                     let mut changed = Vec::with_capacity(leaf.len() + edits.len());
                     let mut row = 0;
                     for (key, item) in edits {
@@ -1116,6 +1146,7 @@ impl Tree {
                         if let Some(item) = item {
                             changed.push(EntryView {
                                 key: key.view(),
+                                owned_key: Some(key),
                                 item,
                                 posting: None,
                             });
@@ -1142,7 +1173,7 @@ impl Tree {
                         }
                     }
                     self.pack(self.merge_sparse(changed).await?, |children| {
-                        self.link(Page::Branch(children))
+                        self.branch_link(children)
                     })
                 }
             }
@@ -1159,10 +1190,7 @@ impl Tree {
                 let page = match (&left.page, &right.page) {
                     (Page::Leaf(left), Page::Leaf(right)) if left.len() + right.len() <= FANOUT => {
                         let _scratch = self.memory.reserve(
-                            left.bytes()
-                                .saturating_add(right.bytes())
-                                .saturating_mul(2)
-                                .saturating_add(4096),
+                            (left.len() + right.len()).saturating_mul(size_of::<EntryView<'_>>()),
                         )?;
                         Some(
                             self.leaf_link(
@@ -1176,7 +1204,7 @@ impl Tree {
                     (Page::Branch(left), Page::Branch(right))
                         if left.len() + right.len() <= FANOUT =>
                     {
-                        Some(self.link(Page::Branch(left.iter().chain(right).cloned().collect()))?)
+                        Some(self.branch_link(left.iter().chain(right).cloned().collect())?)
                     }
                     _ => None,
                 };
