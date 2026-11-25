@@ -156,6 +156,7 @@ config {
 -- Bloom metadata sets each distinct position derived from a page's cells before serializing the bitmap.
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
+-- A page whose events hold strictly increasing IIDs, with no erase, no empty valid time and no maximum system time, is already resolved and keeps its events unchanged.
 -- Their order holds only within their page, and the recency split separates them into different files.
 -- Within one IID and system time, an ordinary put or delete contributes only valid-time points outside all higher-priority command intervals.
 -- These fragments are disjoint and preserve the winning command at every valid-time point.
