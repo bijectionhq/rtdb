@@ -378,11 +378,24 @@ require distinct attestation keys. Retain the keys for original proofs while
 the corresponding journal records are retained. A trust profile with no
 payload limit can verify retained records and provides no timed append capacity.
 
-Use the matching keeper's commissioned original-clock authority and an
-RTDB `CertifiedDecisionClock` on the same native attachment before admitting
-funded transactions. The verified guard binds the receiver certificate to the
-exact original database and clock domain. Exercise an identical append after
-reply loss, a distinct successor after sealing the new epoch, and proof readback
-after keeper restart and checkpoint recovery. The RTDB adapter checks the
-original stream, epoch, LSN, sealed-payload digest, exclusive cutoff and
-certificate digest in the returned proof before the fold applies effects.
+Use the matching keeper's commissioned original-clock authority and mount the independently durable receiver on the same attachment using the [native receiver installation](rtdb-native-runtime.adoc#funded-decision-clock-receiver).
+The keeper trust file and the receiver installation are supplied independently.
+Confirm the original keeper signers cover the certificate's guarded journal clock scale and the configured payload limit.
+The RTDB adapter checks the original stream, epoch, LSN, sealed-payload digest, exclusive cutoff and certificate digest in the returned proof before the fold applies effects.
+
+Qualify the exact installed route with the following cases.
+
+- Check that `transact.decision-clock-offer` appears for the matching authenticated, writable attachment with a live receiver and commissioned timed journal.
+- Remove the receiver, expire its certificate, change the domain or original source, and repeat with proof-only keeper trust, Multi FileJournal, and ordinary Default Local and Kafka profiles.
+  Confirm the funded feature is absent in each case and literal `Window` remains available on the ordinary write routes.
+- Rebook after offer-reply loss using the same key, transaction and predecessor.
+  Recover the original terminal and its offer with the same consume request and keyed `TxStatus` after terminal-reply loss, writer takeover, and checkpoint recovery.
+- Try a changed owner, key, request body, predecessor, receiver lineage and certificate digest.
+  Exercise a read before the decision interval, staging at its exclusive end, and original keeper durability at the exclusive journal cutoff.
+- Recover proof after keeper restart and successor sealing with a distinct writer.
+  Compare the exact original proof before and after takeover and verify that a current-quorum copy cannot satisfy it.
+- Use two scoped projected histories with the same visible state and hidden-only changes.
+  Compare the outcomes for effect-free funded guards, including recovery through `TxStatus`.
+  The funded reply carries an opaque booking and the projected predecessor with both clock numbers omitted.
+
+These cases require the actual receiver and keeper mounts and remain pending local qualification.

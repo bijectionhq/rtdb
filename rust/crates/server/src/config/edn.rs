@@ -37,6 +37,7 @@ impl NodeConfiguration {
                 "xtdb.authn/openid-connect-authn" => ("authn", authentication("openid-connect", value)?),
                 "server" | "xtdb.pgwire/server" => ("server", server(value)?),
                 "flight-sql" | "xtdb.flight-sql/server" => ("flightSql", durations(fields(value, &[("host", "host"), ("port", "port"), ("transaction-idle-timeout", "transactionIdleTimeout"), ("prepared-statement-idle-timeout", "preparedStatementIdleTimeout"), ("session-idle-timeout", "sessionIdleTimeout"), ("session-unclaimed-timeout", "sessionUnclaimedTimeout")])?, &["transactionIdleTimeout", "preparedStatementIdleTimeout", "sessionIdleTimeout", "sessionUnclaimedTimeout"])?),
+                "funded-receiver-clock" => ("fundedReceiverClock", fields(value, &[("installation-file", "installationFile"), ("domain", "domain"), ("placement-epoch", "placementEpoch"), ("purpose", "purpose")])?),
                 "healthz" | "xtdb/healthz" => ("healthz", host(fields(value, &[("host", "host"), ("port", "port")])?, value)?),
                 "garbage-collector" | "xtdb/garbage-collector" => ("garbageCollector", fields(value, &[("enabled?", "enabled"), ("blocks-to-keep", "blocksToKeep"), ("garbage-lifetime", "garbageLifetime"), ("reader-lease", "readerLease"), ("reader-lease-margin", "readerLeaseMargin")])?),
                 "tracer" | "xtdb/tracer" => ("tracer", fields(value, &[("enabled?", "enabled"), ("endpoint", "endpoint"), ("service-name", "serviceName"), ("query-tracing?", "queryTracing"), ("transaction-tracing?", "transactionTracing")])?),

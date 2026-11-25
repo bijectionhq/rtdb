@@ -36,6 +36,46 @@ The Java foreign-memory adapter implements ADBC and the existing Clojure connect
 Applications depending on concrete JVM `Xtdb.Connection` or `RelationReader` classes need the migration described in link:../../rust/crates/ffi/README.adoc[the embedded binding reference].
 Native buffer owners survive statement closure until the foreign consumer releases them.
 
+[[funded-decision-clock-receiver]]
+== Funded DecisionClock receiver
+
+An installed native host can pair the existing signed site receiver certificate with an independently authenticated, durable `DecisionClock`.
+The native setting is optional.
+
+[source,yaml]
+----
+fundedReceiverClock:
+  installationFile: /etc/rtdb/site-receiver-clock.json
+  domain: 12345678-1234-4234-8234-123456789abc
+  placementEpoch: 7
+  purpose: bijection.rtdb.durable-acceptance-clock.v4
+----
+
+The EDN spelling is `:funded-receiver-clock` with `:installation-file`, `:domain`, `:placement-epoch` and `:purpose`.
+Use the commissioned receiver's nonzero domain UUID and the site's original nonzero placement epoch.
+The site placement epoch is independent of the receiver publisher epoch and the journal writer epoch.
+Set `purpose` to the exact purpose commissioned for the certificate.
+
+`installationFile` is an absolute path to an operator-controlled JSON object of at most 16 KiB, with the existing site fields `deployment`, `source`, `placement_epoch`, `certificate`, `issuer`, `image`, `cell` and `service_scope`.
+Its `deployment` and `source` are UUIDs and `source` is the exact original RTDB incarnation.
+Its `issuer` is the independently pinned 32-byte Ed25519 verification key in hex, `service_scope` is the installed 32-byte scope digest in hex, and `cell` and `image` are the commissioned values.
+Keep those values and the placement epoch under the host's deployment authority.
+Its `certificate` string holds the original signed JSON envelope of at most 4 KiB.
+Pass through the envelope bytes exactly so its digest agrees with the original keeper evidence.
+The verifier checks the signature and the exact purpose, deployment, source, cell, image and service scope against these installed settings.
+
+The host calls `NodeConfiguration::certify_receiver_clock` with its commissioned `Arc<dyn DecisionClock>` and passes the returned configuration and clock to `ServerDriver::open_with_multi_certified_clock`, or `ServerDriver::open_with_certified_clock` with the installed Default resources.
+The receiver must provide fresh, authenticated microsecond observations from the configured durable domain, with epoch, sequence and time lineage that survives publisher and writer replacement.
+The receiver and journal must satisfy the clock scale and timing margins commissioned by the same certificate.
+The existing directory-backed publisher uses a process wall-time anchor and is outside this commissioning contract.
+Native launchers still need a host integration that provisions the commissioned receiver and invokes the certified opener.
+A launcher handed an unresolved `fundedReceiverClock` setting rejects startup.
+
+Only an authenticated, writable attachment with the matching source, live receiver and a timed-original provider can advertise `transact.decision-clock-offer`.
+Default requires `defaultV1Serving` and a mounted provider such as the guarded `QuorumLog` that supplies recoverable original-quorum evidence on the same replica path.
+Ordinary Default Local and Kafka and native Multi FileJournal keep funded offers gated.
+See link:rtdb-multi-local-qualification.md[the local qualification checklist] for the paired StreamJournal and receiver cases.
+
 == Expression equality
 
 Strict expression equality (`===`) compares native set-reader identities without reading their elements.

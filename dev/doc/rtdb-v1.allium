@@ -206,6 +206,7 @@ surface StatelessDatabase {
 
     @guarantee FundedDecisionClock
         -- A writer advertises transact.decision-clock-offer after installing an authenticated receiver clock, a certificate verifier and a journal provider that attests the timed original quorum.
+        -- The receiver supplies a live observation from the installed durable clock domain when the writer checks certificate expiry for advertisement.
         -- The installed issuer signs the exact attachment, service scope, expiry and clock margins.
         -- The admitted predecessor belongs to that attachment even when its coordinate is projected on the wire.
         -- A funded request lists transact.decision-clock-offer among its required capabilities.

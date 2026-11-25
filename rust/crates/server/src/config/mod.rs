@@ -3,6 +3,7 @@ mod remotes;
 mod node;
 mod edn;
 mod bounded;
+mod receiver_clock;
 pub(crate) mod properties;
 
 use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, time::Duration};
@@ -64,6 +65,7 @@ pub struct NodeConfiguration {
     pub playground: bool,
     pub server: Option<PgwireSettings>,
     pub flight_sql: Option<FlightSettings>,
+    pub(crate) funded_receiver_clock: Option<receiver_clock::Installation>,
     #[cfg(feature = "multi")]
     pub(crate) deployment_admin: Option<std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>>,
     #[cfg(feature = "multi")]
@@ -151,7 +153,7 @@ impl NodeConfiguration {
                 Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
                 None => BTreeMap::new(),
             };
-            Self { playground: false, server: None, flight_sql: None,
+            Self { playground: false, server: None, flight_sql: None, funded_receiver_clock: None,
                 #[cfg(feature = "multi")]
                 deployment_admin: None,
                 #[cfg(feature = "multi")]
@@ -162,6 +164,7 @@ impl NodeConfiguration {
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
+            let funded_receiver_clock = fields.take("fundedReceiverClock").map(receiver_clock::Installation::decode).transpose()?;
             let default_timezone = fields.string("defaultTz")?.as_deref().map(rtdb_expr::normalize_timezone).transpose()?;
             let compactor = compactor(fields.take("compactor"), environment)?;
             let garbage = garbage(fields.take("garbageCollector"))?;
@@ -189,7 +192,7 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql,
+            Self { playground: false, server, flight_sql, funded_receiver_clock,
                 #[cfg(feature = "multi")]
                 deployment_admin,
                 #[cfg(feature = "multi")]

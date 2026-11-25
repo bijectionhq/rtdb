@@ -3,6 +3,23 @@ use rtdb_server::{ServerDriver, config::NodeConfiguration};
 use tokio::net::TcpStream;
 
 #[tokio::test]
+async fn configured_funded_receiver_requires_a_live_host_mount() {
+    let config = NodeConfiguration::from_yaml_with_environment(
+        r#"
+fundedReceiverClock:
+  installationFile: /etc/rtdb/site-receiver-clock.json
+  domain: 12345678-1234-4234-8234-123456789abc
+  placementEpoch: 7
+  purpose: bijection.rtdb.durable-acceptance-clock.v4
+"#,
+        &|_| None,
+        false,
+    ).unwrap();
+    let error = ServerDriver::open(config, 128 * 1024 * 1024).await.err().unwrap();
+    assert_eq!(error.code, "rtdb.clock/installation");
+}
+
+#[tokio::test]
 async fn production_composition_binds_drives_and_joins_all_listeners() {
     let config = NodeConfiguration::from_yaml_with_environment("server: {port: 0, readOnlyPort: 0}\nflightSql: {port: 0}\nhealthz: {port: 0}\ncompactor: {threads: 0}", &|_| None, false).unwrap();
     let (server, driver) = ServerDriver::open(config, 128 * 1024 * 1024).await.unwrap();

@@ -256,8 +256,8 @@ impl Service {
                     && let Ok(database) = self.0.node.catalog().database(&call.database)
                     && !database.read_only()
                     && let Some(driver) = database.serving_driver()
-                    && clock.funded_offers_for(driver.incarnation(), self.0.node.now())
                     && driver.supports_funded_transact().await
+                    && clock.funded_offers_for(driver.incarnation()).await
                 {
                     features.push(DECISION_CLOCK_OFFER.into());
                 }

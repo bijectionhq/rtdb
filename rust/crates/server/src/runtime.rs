@@ -215,6 +215,10 @@ impl ServerDriver {
     }
 
     async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, backend: Backend, certified_clock: Option<Arc<rtdb_node::CertifiedDecisionClock>>) -> Result<(ServerHandle, Self)> {
+        if config.funded_receiver_clock.is_some() {
+            return Err(Anomaly::incorrect("rtdb.clock/installation",
+                "fundedReceiverClock requires a host-installed live receiver and a certified server opener"));
+        }
         if matches!(&config.auth, AuthConfig::ManagedWorkloadOidc(_))
             && !matches!(&backend, Backend::Configured(Some(_), _))
         {

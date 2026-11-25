@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_crypt::receiver_clock::VerifiedReceiverCertificate;
 use rtdb_tx::{DecisionClock, DecisionObservation, FundedCutoff, transact::funding_unsupported};
-use rtdb_types::{Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 
 pub struct CertifiedDecisionClock {
     receiver: Arc<dyn DecisionClock>,
@@ -23,19 +23,25 @@ impl CertifiedDecisionClock {
 #[async_trait]
 impl DecisionClock for CertifiedDecisionClock {
     async fn observe(&self) -> Result<DecisionObservation> {
-        let sample = self.receiver.observe().await?;
-        if sample.domain != self.domain { return Err(funding_unsupported()); }
+        let sample = tokio::time::timeout(Duration::from_secs(1), self.receiver.observe()).await
+            .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.clock/unavailable",
+                "No fresh receiver clock sample is installed"))??;
+        if sample.domain != self.domain || sample.epoch == 0 || sample.sequence < sample.epoch || sample.instant.0 <= 0 {
+            return Err(funding_unsupported());
+        }
         Ok(sample)
     }
 
     fn supports_funded_offers(&self) -> bool { true }
 
-    fn funded_offers_for(&self, incarnation: [u8; 16], now: Timestamp) -> bool {
-        incarnation == self.certificate.source() && self.certificate.live_at(now)
+    async fn funded_offers_for(&self, incarnation: [u8; 16]) -> bool {
+        incarnation == self.certificate.source()
+            && self.observe().await.is_ok_and(|sample| self.certificate.live_at(sample.instant))
     }
 
     fn funded_certificate(&self, original: Basis, receiver: DecisionObservation) -> Option<[u8; 32]> {
-        (original.incarnation() == self.certificate.source() && receiver.domain == self.domain)
+        (original.incarnation() == self.certificate.source() && receiver.domain == self.domain
+            && self.certificate.live_at(receiver.instant))
             .then(|| self.certificate.digest())
     }
 

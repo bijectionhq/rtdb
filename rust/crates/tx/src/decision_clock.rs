@@ -99,7 +99,7 @@ pub trait DecisionClock: Send + Sync {
 
     fn supports_funded_offers(&self) -> bool { false }
 
-    fn funded_offers_for(&self, _incarnation: [u8; 16], _now: Timestamp) -> bool { false }
+    async fn funded_offers_for(&self, _incarnation: [u8; 16]) -> bool { false }
 
     fn funded_certificate(&self, _predecessor: Basis, _receiver: DecisionObservation) -> Option<[u8; 32]> { None }
 
