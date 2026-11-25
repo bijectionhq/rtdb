@@ -844,7 +844,7 @@ impl BranchData {
             (!rows.events.is_empty() || !rows.erased.is_empty()).then(|| (table.clone(), Arc::new(rows)))
         }).collect();
         let changed = self.changed.filter(|changed| *changed <= at).or_else(|| {
-            tables.values().flat_map(|rows| {
+            tables.values().flat_map(|rows: &Arc<BranchRows>| {
                 rows.events.values().filter_map(|events| events.last().map(|(_, event)| event.cut.basis))
                     .chain(rows.erased.values().copied())
                     .chain(rows.retired_labels.values().flat_map(|labels| labels.values().map(|label| label.revoked)))
