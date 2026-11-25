@@ -4,7 +4,7 @@ use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, PgType, Result, ScalarType
 use crate::interval::parse as interval;
 
 mod column;
-pub use column::{read_source_text_column, read_text_column, read_vector_column, tstzrange_field};
+pub use column::{read_snapshot_transit_column, read_source_text_column, read_text_column, read_vector_column, tstzrange_field};
 mod wal_array;
 pub use wal_array::{WalArrayRow, WalListColumn, WalListRow, read_wal_array};
 mod transit_input;
