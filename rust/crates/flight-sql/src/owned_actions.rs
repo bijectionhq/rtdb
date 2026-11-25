@@ -437,10 +437,59 @@ pub(crate) struct OwnedReadResource {
 
 struct RetainedSpatialFilter {
     relation: OwnedRelation,
-    batch: OwnedBatch,
+    columns: Vec<zeroize::Zeroizing<String>>,
+    controls: SpatialContinuationControls,
     query: RetainedSpatialQuery,
     valid_at: Timestamp,
     _reservation: Arc<MemoryReservation>,
+}
+
+enum SpatialContinuationControls {
+    None,
+    Earlier {
+        after: SpatialAnchor,
+        partition: Vec<zeroize::Zeroizing<Vec<u8>>>,
+    },
+    Probe {
+        partition: Vec<zeroize::Zeroizing<Vec<u8>>>,
+        fields: Vec<zeroize::Zeroizing<String>>,
+        point_column: Option<zeroize::Zeroizing<String>>,
+    },
+}
+
+enum SpatialAnchor {
+    String(zeroize::Zeroizing<String>),
+    Keyword(zeroize::Zeroizing<String>),
+    Integer(i64),
+    Uuid([u8; 16]),
+    Binary(zeroize::Zeroizing<Vec<u8>>),
+}
+
+impl SpatialAnchor {
+    fn new(id: EntityIdRef<'_>) -> Self {
+        use zeroize::Zeroizing;
+        match id {
+            EntityIdRef::String(value) => Self::String(Zeroizing::new(value.to_owned())),
+            EntityIdRef::Keyword(value) => Self::Keyword(Zeroizing::new(value.to_owned())),
+            EntityIdRef::Integer(value) => Self::Integer(value),
+            EntityIdRef::Uuid(value) => Self::Uuid(value),
+            EntityIdRef::Binary(value) => Self::Binary(Zeroizing::new(value.to_vec())),
+        }
+    }
+
+    fn as_ref(&self) -> EntityIdRef<'_> {
+        match self {
+            Self::String(value) => EntityIdRef::String(value.as_str()),
+            Self::Keyword(value) => EntityIdRef::Keyword(value.as_str()),
+            Self::Integer(value) => EntityIdRef::Integer(*value),
+            Self::Uuid(value) => EntityIdRef::Uuid(*value),
+            Self::Binary(value) => EntityIdRef::Binary(value.as_slice()),
+        }
+    }
+}
+
+fn borrow_spatial_partition(partition: &[zeroize::Zeroizing<Vec<u8>>]) -> Vec<std::borrow::Cow<'_, [u8]>> {
+    partition.iter().map(|part| std::borrow::Cow::Borrowed(part.as_slice())).collect()
 }
 
 enum RetainedSpatialQuery {
@@ -1026,15 +1075,15 @@ fn spatial_after(input: &RecordBatch) -> Result<Option<EntityIdRef<'_>>, Status>
     }
 }
 
-fn spatial_probe_request<'a>(
-    batch: &'a RecordBatch, fields: &'a [&str], columns: &[&str], certify_point: bool,
-) -> Result<rtdb_spatial::Probe<'a>, Status> {
+fn spatial_probe_point<'a>(
+    batch: &'a RecordBatch, fields: &[&str], columns: &[&str],
+) -> Result<Option<&'a str>, Status> {
     let point_column = owned_scalar::<StringArray>(batch, "point_column")?
         .map(|(array, row)| array.value(row));
     if fields.iter().chain(point_column.iter()).any(|field| !field.starts_with("c_") || !columns.contains(field)) {
         return Err(invalid("Spatial probe fields must belong to the full fact projection"));
     }
-    Ok(rtdb_spatial::Probe { fields, point_column, certify_point })
+    Ok(point_column)
 }
 
 fn spatial_partition(batch: &RecordBatch) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, Status> {
@@ -3495,7 +3544,11 @@ impl Service {
         let valid_at = Timestamp(valid_at.value(valid_row));
         let limit = usize::try_from(limit.value(limit_row)).map_err(|_| invalid("Invalid spatial limit"))?;
         let observe = observe.value(observe_row);
-        let request = rtdb_spatial::Request { partition, region: region.into(), predicate, valid_at, page, limit };
+        let request = rtdb_spatial::Request {
+            partition: partition.iter().map(|part| std::borrow::Cow::Borrowed(part.as_ref())).collect(),
+            region: region.into(), predicate, valid_at, page, limit,
+        };
+        let mut probe_controls = None;
         let (page, witness, prepared) = if ranked {
             let (ranking, page, witness) = held.snapshot.open_spatial_nearest(&relation, &path, request, after_radius, observe, projection)
                 .await.map_err(status)?;
@@ -3505,10 +3558,12 @@ impl Service {
             let region = rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?;
             let columns = document_columns.as_deref().expect("selected projection");
             let fields = spatial_column_names(input, "omittable_columns")?;
-            let request_probe = spatial_probe_request(input, &fields, columns, true)?;
+            let point_column = spatial_probe_point(input, &fields, columns)?;
+            let request_probe = rtdb_spatial::Probe { fields: &fields, point_column, certify_point: true };
             let (page, witness, matches) = held.snapshot.open_spatial_probe(
                 &relation, &path, request, observe, columns, &region, request_probe,
             ).await.map_err(status)?;
+            probe_controls = Some((fields, point_column));
             let certify_point = page.certifies_point_intersects();
             let matches = Mutex::new(matches.map(Arc::new));
             (page, witness, Some(RetainedSpatialQuery::Probe { path, region, certify_point, matches }))
@@ -3537,17 +3592,49 @@ impl Service {
             if guard.len() >= MAX_SPATIAL_FILTERS { return Err(Status::resource_exhausted("The held read has too many spatial filters")); }
             let nonce = Uuid::new_v4();
             if guard.contains_key(&nonce) { return Err(spatial_filters_unavailable()); }
-            let reservation = match call.reserve(1024) {
-                Err(error) if spatial_memory_refusal(&error) && query.discard_probe_matches()? => call.reserve(1024)?,
+            let columns = document_columns.as_deref().expect("a held filter has a selected projection");
+            let measure_names = |names: &[&str]| names.iter().map(|name| name.len() + size_of::<String>()).sum::<usize>();
+            let fallback = matches!(query, RetainedSpatialQuery::Range { earlier: Some(_), .. } | RetainedSpatialQuery::Probe { .. });
+            let partition_bytes = if fallback {
+                partition.iter().map(|part| part.len() + size_of::<Vec<u8>>()).sum::<usize>()
+            } else { 0 };
+            let after_bytes = after.map_or(0, EntityIdRef::owned_payload_bytes);
+            let probe_bytes = probe_controls.as_ref().map_or(0, |(fields, point)| {
+                measure_names(fields) + point.map_or(0, str::len)
+            });
+            let bytes = wire::add(1024 + measure_names(columns) + partition_bytes + probe_bytes, after_bytes)?;
+            let reservation = match call.reserve(bytes) {
+                Err(error) if spatial_memory_refusal(&error) && query.discard_probe_matches()? => call.reserve(bytes)?,
                 reservation => reservation?,
             };
-            retained = Some((guard, reservation));
+            let retain_names = |names: &[&str]| names.iter().map(|name| zeroize::Zeroizing::new((*name).to_owned())).collect();
+            let retain_partition = || partition.iter().map(|part| zeroize::Zeroizing::new(part.as_ref().to_vec())).collect();
+            let controls = match query {
+                RetainedSpatialQuery::Range { earlier: Some(_), .. } => SpatialContinuationControls::Earlier {
+                    after: SpatialAnchor::new(after.expect("an earlier range has an initial anchor")),
+                    partition: retain_partition(),
+                },
+                RetainedSpatialQuery::Probe { .. } => {
+                    let (fields, point_column) = probe_controls.as_ref().expect("probe controls were admitted");
+                    SpatialContinuationControls::Probe {
+                        partition: retain_partition(),
+                        fields: retain_names(fields),
+                        point_column: point_column.map(|column| zeroize::Zeroizing::new(column.to_owned())),
+                    }
+                }
+                _ => SpatialContinuationControls::None,
+            };
+            retained = Some((guard, reservation, retain_names(columns), controls));
             token = Some(nonce);
         }
+        drop(probe_controls);
+        drop(document_columns);
+        drop(partition);
+        drop(batch);
         let reply = self.spatial_reply(call, &held, &relation, valid_at, &page, witness, selected_documents, token, prepared.as_ref(), ipc_stream)?;
-        if let (Some((mut filters, reservation)), Some(token), Some(query)) = (retained, token, prepared) {
+        if let (Some((mut filters, reservation, columns, controls)), Some(token), Some(query)) = (retained, token, prepared) {
             filters.insert(token, Arc::new(RetainedSpatialFilter {
-                relation, batch, query, valid_at, _reservation: reservation,
+                relation, columns, controls, query, valid_at, _reservation: reservation,
             }));
         }
         Ok(reply)
@@ -3569,15 +3656,16 @@ impl Service {
         let after = EntityIdRef::from_handle_bytes(after).map_err(status)?;
         let filter = held.spatial_filters.lock().map_err(|_| spatial_filters_unavailable())?
             .get(&token).cloned().ok_or_else(|| Status::not_found("Unknown held spatial filter"))?;
-        let columns = spatial_document_columns(filter.batch.batch())?;
+        let columns = filter.columns.iter().map(|name| name.as_str()).collect::<Vec<_>>();
         let projection = rtdb_spatial::Projection::SelectedDocuments(&columns);
         let (page, witness) = match (&filter.query, distance) {
             (RetainedSpatialQuery::Range { matches, earlier }, None) => {
                 if let Some((path, region)) = earlier
-                    && spatial_after(filter.batch.batch())?.is_some_and(|initial| after < initial)
+                    && let SpatialContinuationControls::Earlier { after: initial, partition } = &filter.controls
+                    && after < initial.as_ref()
                 {
                     let request = rtdb_spatial::Request {
-                        partition: spatial_partition(filter.batch.batch())?,
+                        partition: borrow_spatial_partition(partition),
                         region: Default::default(), predicate: rtdb_spatial::Predicate::All,
                         valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
                     };
@@ -3587,9 +3675,15 @@ impl Service {
                 }
             }
             (RetainedSpatialQuery::Probe { path, region, certify_point, matches }, None) => {
-                let input = filter.batch.batch();
-                let fields = spatial_column_names(input, "omittable_columns")?;
-                let probe = spatial_probe_request(input, &fields, &columns, *certify_point)?;
+                let SpatialContinuationControls::Probe { partition, fields, point_column } = &filter.controls else {
+                    unreachable!("held probes retain their admitted controls")
+                };
+                let fields = fields.iter().map(|name| name.as_str()).collect::<Vec<_>>();
+                let probe = rtdb_spatial::Probe {
+                    fields: &fields,
+                    point_column: point_column.as_ref().map(|name| name.as_str()),
+                    certify_point: *certify_point,
+                };
                 let retained = matches.lock().map_err(|_| spatial_filters_unavailable())?.clone();
                 let cached = if let Some(retained) = retained {
                     let result = held.snapshot.next_spatial_probe(&retained, after, limit, observe, &columns, probe).await;
@@ -3608,7 +3702,7 @@ impl Service {
                     result
                 } else {
                     let request = rtdb_spatial::Request {
-                        partition: spatial_partition(input)?,
+                        partition: borrow_spatial_partition(partition),
                         region: Default::default(), predicate: rtdb_spatial::Predicate::All,
                         valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
                     };

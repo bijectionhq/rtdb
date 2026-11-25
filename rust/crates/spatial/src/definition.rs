@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_schema::DataType;
-use rtdb_columnar::{ArrowCell, MemoryBudget};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_format::keys::spatial_posting_id;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::ArtefactDefinition;
@@ -19,6 +19,7 @@ pub(crate) struct Definition {
     pub(crate) encoding: SpatialGeometryEncoding,
     pub(crate) partition: Vec<String>,
     pub(crate) generation: i64,
+    pub(crate) reservation: Arc<MemoryReservation>,
 }
 
 impl Definition {
@@ -79,7 +80,10 @@ pub(crate) async fn definitions(
         if let Some(cursor) =
             rtdb_query::open_owned_path_catalog(Arc::clone(&context), &table, None).await?
         {
-            output.extend(collect(cursor, &table).await?);
+            visit(cursor, &table, &context.memory, |definition| {
+                output.reserve_exact(1);
+                output.push(definition);
+            }).await?;
         }
     }
     Ok(output)
@@ -98,12 +102,20 @@ pub(crate) async fn held_definition(
             "Owned relation has no such spatial path at the held cut",
         )
     };
-    let cursor = rtdb_query::open_owned_path_catalog(context, &catalog, Some(path.name()))
+    let cursor = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, Some(path.name()))
         .await?
         .ok_or_else(absent)?;
-    let mut definitions = collect(cursor, &catalog).await?;
-    let definition = definitions.pop().ok_or_else(absent)?;
-    if !definitions.is_empty()
+    let mut definition = None;
+    let mut duplicate = false;
+    visit(cursor, &catalog, &context.memory, |candidate| {
+        if definition.is_some() {
+            duplicate = true;
+        } else {
+            definition = Some(candidate);
+        }
+    }).await?;
+    let definition = definition.ok_or_else(absent)?;
+    if duplicate
         || definition.name != path.name()
         || definition.table != relation.table(owner)
     {
@@ -125,8 +137,9 @@ fn malformed() -> Anomaly {
     Anomaly::fault("rtdb.spatial/path-catalog", "The spatial path catalog contains an invalid declaration")
 }
 
-async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Definition>> {
-    let mut output = Vec::new();
+async fn visit(
+    mut cursor: QueryCursor, catalog: &TableRef, memory: &Arc<MemoryBudget>, mut accept: impl FnMut(Definition),
+) -> Result<()> {
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         for row in 0..batch.num_rows() {
@@ -142,30 +155,37 @@ async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Defi
                 .and_then(ArrowCell::int64)
                 .ok_or_else(malformed)?;
             let encoding = path_geometry_encoding(cell("geometry_encoding"))?;
-            let table = TableRef::new(schema, table);
-            if !(1..=16).contains(&columns.len()) || !catalog.owns_path_target(&table) {
+            if !(1..=16).contains(&columns.len()) {
                 return Err(malformed());
             }
-            let mut columns = columns.map(|column| {
-                column
-                    .utf8()
-                    .filter(|name| !name.starts_with('_'))
-                    .map(str::to_owned)
-                    .ok_or_else(malformed)
-            });
-            let geometry = columns.next().ok_or_else(malformed)??;
-            let partition = columns.collect::<Result<_>>()?;
-            output.push(Definition {
+            let base = 2 * size_of::<Definition>() + 256 + 2 * (schema.len() + table.len() + name.len());
+            let mut reservation = memory.reserve(base)?;
+            let table = TableRef::new(schema, table);
+            if !catalog.owns_path_target(&table) {
+                return Err(malformed());
+            }
+            let count = columns.len();
+            let mut names = [""; 16];
+            for (target, column) in names.iter_mut().zip(columns) {
+                *target = column.utf8().filter(|name| !name.starts_with('_')).ok_or_else(malformed)?;
+            }
+            let partition = &names[1..count];
+            let bytes = base.checked_add((count - 1) * size_of::<String>())
+                .and_then(|bytes| names[..count].iter().try_fold(bytes, |sum, name| sum.checked_add(name.len())))
+                .ok_or_else(crate::postings::work_limit)?;
+            Arc::get_mut(&mut reservation).expect("catalog row owns its reservation").grow_to(bytes)?;
+            accept(Definition {
                 name: name.to_owned(),
                 table,
-                geometry,
+                geometry: names[0].to_owned(),
                 encoding,
-                partition,
+                partition: partition.iter().map(|name| (*name).to_owned()).collect(),
                 generation,
+                reservation,
             });
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]

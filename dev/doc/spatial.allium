@@ -57,7 +57,8 @@ entity SpatialPostings {
 -- An unrestricted region's memory reservation covers its full key range and retained metadata.
 -- Exact refinement reuses the prepared region topology and its ordered metric segments across candidates.
 -- Exact refinement acquires temporary workspace when a resolved batch supplies an eligible geometry cell and releases it before pulling another batch.
--- A prepared filter belongs to its authenticated held read and retains its request projection and range or ranked matches.
+-- A prepared filter belongs to its authenticated held read and retains its admitted projection and the controls used by exact fallback.
+-- Retained matches and exact fallback reuse the same authenticated held cut and validity.
 -- A continuation sends the filter capability, complete typed identity, bound, and observation flag.
 -- A negotiated ordinary Flight reply emits spatial page IPC as complete messages under the original hold and release checks.
 -- Repeating a continuation evaluates the same filter and held cut.

@@ -679,6 +679,7 @@ pub(super) struct DocumentColumns {
     pub(super) geometry: String,
     pub(super) refined_geometry: bool,
     pub(super) partition: Vec<String>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 pub(super) async fn visit_matches(
@@ -796,14 +797,14 @@ pub(super) async fn visit_matches(
     }
     let geometry = (region.location.is_some() || matches!(projection, Projection::Documents))
         .then_some(definition.geometry.as_str());
-    let partition = definition.partition[..request.partition.len()].to_vec();
+    let partition = &definition.partition[..request.partition.len()];
     let iids = candidates.finish()?;
     let cursor = rtdb_query::open_owned_spatial_refinement(
         Arc::clone(&context),
         owner,
         relation,
         geometry,
-        &partition,
+        partition,
         request.valid_at,
         iids,
         projection,
@@ -812,7 +813,11 @@ pub(super) async fn visit_matches(
     .await?;
     let partition_start = 1 + usize::from(geometry.is_some());
     let refined_geometry = geometry.is_some();
-    let columns = DocumentColumns { geometry: definition.geometry, refined_geometry, partition };
+    let mut partition = definition.partition;
+    partition.truncate(request.partition.len());
+    let columns = DocumentColumns {
+        geometry: definition.geometry, refined_geometry, partition, _reservation: definition.reservation,
+    };
     let Some(rtdb_query::OwnedSpatialScan { mut cursor, document_columns }) = cursor else {
         return Ok((None, columns));
     };
