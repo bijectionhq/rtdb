@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, LargeListArray, StructArray, UInt32Array, cast::AsArray, types::{Float64Type, UInt32Type}};
+use arrow_array::{Array, Float64Array, Int64Array, LargeListArray, StructArray, UInt32Array, builder::BooleanBuilder, cast::AsArray, types::{Float64Type, UInt32Type}};
 use rtdb_text::{Query, RankScorer, Scorer, stored_length};
 use rtdb_types::{Iid, Result, TemporalBounds};
 
@@ -111,25 +111,40 @@ impl PostingPlan {
         let arrow_schema::DataType::Struct(block_fields) = block_item.data_type() else { unreachable!() };
         let impact_item = item_of(&block_fields[3]);
         let arrow_schema::DataType::Struct(impact_fields) = impact_item.data_type() else { unreachable!() };
-        let blocks: Vec<_> = self.terms.iter().flat_map(|term| term.blocks.iter().map(move |block| {
-            (block, &term.postings.windows[block.impacts.clone()])
-        })).collect();
-        let impact_values = || blocks.iter().flat_map(|&(_, impacts)| impacts);
+        let block_count = self.terms.iter().map(|term| term.blocks.len()).sum();
+        let impact_count = self.terms.iter().map(|term| term.postings.windows.len()).sum();
+        let mut pages = Vec::with_capacity(block_count);
+        let mut slots = Vec::with_capacity(block_count);
+        let mut counts = Vec::with_capacity(block_count);
+        let mut windows = Vec::with_capacity(impact_count);
+        let mut frequencies = Vec::with_capacity(impact_count);
+        let mut lengths = Vec::with_capacity(impact_count);
+        let mut same_frequency = BooleanBuilder::with_capacity(impact_count);
+        let mut same_length = BooleanBuilder::with_capacity(impact_count);
+        let mut scores = Vec::with_capacity(impact_count);
+        for term in &self.terms {
+            for block in &term.blocks {
+                pages.push(u32::try_from(block.page).map_err(fault)?);
+                slots.push(u32::try_from(block.slot).map_err(fault)?);
+                counts.push(u32::try_from(block.documents.len()).map_err(fault)?);
+                for impact in &term.postings.windows[block.impacts.clone()] {
+                    windows.push(impact.window);
+                    frequencies.push(impact.frequency);
+                    lengths.push(impact.length);
+                    same_frequency.append_value(impact.same_frequency);
+                    same_length.append_value(impact.same_length);
+                    scores.push(impact.max_unit_score);
+                }
+            }
+        }
         let impacts = StructArray::try_new(impact_fields.clone(), vec![
-            Arc::new(UInt32Array::from_iter_values(impact_values().map(|impact| impact.window))),
-            Arc::new(UInt32Array::from_iter_values(impact_values().map(|impact| impact.frequency))),
-            Arc::new(UInt32Array::from_iter_values(impact_values().map(|impact| impact.length))),
-            Arc::new(BooleanArray::from_iter(impact_values().map(|impact| Some(impact.same_frequency)))),
-            Arc::new(BooleanArray::from_iter(impact_values().map(|impact| Some(impact.same_length)))),
-            Arc::new(Float64Array::from_iter_values(impact_values().map(|impact| impact.max_unit_score))),
+            Arc::new(UInt32Array::from(windows)), Arc::new(UInt32Array::from(frequencies)),
+            Arc::new(UInt32Array::from(lengths)), Arc::new(same_frequency.finish()),
+            Arc::new(same_length.finish()), Arc::new(Float64Array::from(scores)),
         ], None).map_err(fault)?;
-        let column = |value: fn(&PlannedBlock) -> usize| {
-            blocks.iter().map(|(block, _)| u32::try_from(value(block)).map_err(fault)).collect::<Result<Vec<_>>>()
-                .map(|values| Arc::new(UInt32Array::from(values)) as arrow_array::ArrayRef)
-        };
         let blocks_table = StructArray::try_new(block_fields.clone(), vec![
-            column(|block| block.page)?, column(|block| block.slot)?, column(|block| block.documents.len())?,
-            list(Arc::new(impacts), blocks.iter().map(|(_, impacts)| impacts.len()), impact_item)?,
+            Arc::new(UInt32Array::from(pages)), Arc::new(UInt32Array::from(slots)), Arc::new(UInt32Array::from(counts)),
+            list(Arc::new(impacts), self.terms.iter().flat_map(|term| &term.blocks).map(|block| block.impacts.len()), impact_item)?,
         ], None).map_err(fault)?;
         Table::Blocks.array(vec![list(Arc::new(blocks_table), self.terms.iter().map(|term| term.blocks.len()), block_item)?])
     }

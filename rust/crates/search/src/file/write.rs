@@ -161,7 +161,9 @@ struct Builder {
     doc_columns: Vec<u32>,
     doc_revisions: FixedSizeBinaryBuilder,
     doc_tokens: arrow_array::builder::LargeListBuilder<StringBuilder>,
-    doc_positions: Vec<SearchPosition>,
+    doc_system_from: Vec<i64>,
+    doc_commit_positions: Vec<u32>,
+    doc_event_positions: FixedSizeBinaryBuilder,
     erases: BTreeMap<Iid, SearchPosition>,
 }
 
@@ -174,8 +176,10 @@ impl Builder {
             sections: BTreeMap::new(), window_ids: Vec::new(), format, mode,
             revisions: (0..if mode == BuildMode::History { columns } else { 0 }).map(|_| FixedSizeBinaryBuilder::new(33)).collect(),
             doc_columns: Vec::new(), doc_revisions: FixedSizeBinaryBuilder::new(32),
-            doc_tokens: arrow_array::builder::LargeListBuilder::new(StringBuilder::new()),
-            doc_positions: Vec::new(), erases: BTreeMap::new(),
+            doc_tokens: arrow_array::builder::LargeListBuilder::new(StringBuilder::new())
+                .with_field(item_of(&Table::TokenSequences.fields()[2])),
+            doc_system_from: Vec::new(), doc_commit_positions: Vec::new(),
+            doc_event_positions: FixedSizeBinaryBuilder::new(EventPosition::WIDTH), erases: BTreeMap::new(),
         }
     }
 
@@ -302,8 +306,14 @@ impl Builder {
                     let revision = revision.ok_or_else(|| fault("Search document has no logical text revision"))?;
                     self.doc_columns.push(column_index as u32);
                     self.doc_revisions.append_value(revision).map_err(fault)?;
-                    self.doc_positions.push(members.iter().map(|&index| search_position(entity.rows[index].1))
-                        .max().expect("a posting has at least one original event"));
+                    let (time, position, ordinal) = members.iter().map(|&index| search_position(entity.rows[index].1))
+                        .max().expect("a posting has at least one original event");
+                    self.doc_system_from.push(time.0);
+                    self.doc_commit_positions.push(ordinal);
+                    match position {
+                        Some(position) => self.doc_event_positions.append_value(position.to_bytes()).map_err(fault)?,
+                        None => self.doc_event_positions.append_null(),
+                    }
                     self.doc_tokens.values().append_array(&tokens).map_err(fault)?;
                     self.doc_tokens.append(true);
                 }
@@ -381,13 +391,9 @@ impl Builder {
                     Some(self.revisions.into_iter().map(|mut values| values.finish()).collect())
                 } else { None };
                 let documents = if self.mode == BuildMode::Postings {
-                    let tokens = self.doc_tokens.finish();
                     Some(Table::TokenSequences.array(vec![Arc::new(UInt32Array::from(self.doc_columns)), Arc::new(self.doc_revisions.finish()),
-                        list(tokens.values().clone(), (0..tokens.len()).map(|row| tokens.value_length(row) as usize),
-                            item_of(&Table::TokenSequences.fields()[2]))?,
-                        Arc::new(Int64Array::from_iter_values(self.doc_positions.iter().map(|(timestamp, _, _)| timestamp.0))),
-                        Arc::new(UInt32Array::from_iter_values(self.doc_positions.iter().map(|(_, _, ordinal)| *ordinal))),
-                        Arc::new(event_positions(self.doc_positions.iter().map(|(_, position, _)| *position))?)])?)
+                        Arc::new(self.doc_tokens.finish()), Arc::new(Int64Array::from(self.doc_system_from)),
+                        Arc::new(UInt32Array::from(self.doc_commit_positions)), Arc::new(self.doc_event_positions.finish())])?)
                 } else { None };
                 let erases = if !self.erases.is_empty() {
                     Some(Table::Erases.array(vec![

@@ -513,7 +513,7 @@ impl EventBatch {
             index.map(|index| self.batch.column(index).as_any().downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| invalid(message))).transpose()
         };
-        let origins = fixed(self.origins, "Event origin array type changed")?;
+        let origins = self.origins()?;
         let event_positions = fixed(self.event_positions, "Event position array type changed")?;
         Ok(move |row| {
             if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
@@ -579,10 +579,13 @@ impl EventBatch {
 
     pub fn origin(&self, row: usize) -> Result<Option<EventOrigin>> {
         if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
-        let Some(index) = self.origins else { return Ok(None); };
-        let origins = self.batch.column(index).as_any().downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| invalid("Event origin array type changed"))?;
-        Ok(origins.is_valid(row).then(|| EventOrigin(origins.value(row).try_into().expect("validated event origin width"))))
+        Ok(self.origins()?.and_then(|origins| origins.is_valid(row)
+            .then(|| EventOrigin(origins.value(row).try_into().expect("validated event origin width")))))
+    }
+
+    pub(crate) fn origins(&self) -> Result<Option<&FixedSizeBinaryArray>> {
+        self.origins.map(|index| self.batch.column(index).as_any().downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| invalid("Event origin array type changed"))).transpose()
     }
 
     fn event_position(&self, row: usize) -> Result<Option<EventPosition>> {
