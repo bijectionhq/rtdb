@@ -7,12 +7,16 @@ locals {
   custom_multi_configuration = local.multi && var.multi_configuration_secret != null
   classic_candidate          = local.multi ? var.classic_candidate_ingress : null
   classic_opening            = local.multi ? var.classic_opening_ingress : null
+  native_dependent_custody   = local.multi ? var.native_dependent_custody : null
+  native_dependent_ingress   = try(local.native_dependent_custody.ingress, null)
+  native_dependent_directory = "/run/rtdb/native-dependent-custody"
   peer_discovery_host        = "node.${aws_service_discovery_private_dns_namespace.cluster.name}"
   node_ports = concat(
     [{ containerPort = local.flight_port, protocol = "tcp" }],
     local.multi ? [{ containerPort = local.peer_port, protocol = "tcp" }] : [],
     local.classic_candidate == null ? [] : [{ containerPort = local.classic_candidate.port, protocol = "tcp" }],
-    local.classic_opening == null ? [] : [{ containerPort = local.classic_opening.port, protocol = "tcp" }]
+    local.classic_opening == null ? [] : [{ containerPort = local.classic_opening.port, protocol = "tcp" }],
+    local.native_dependent_ingress == null ? [] : [{ containerPort = local.native_dependent_ingress.port, protocol = "tcp" }]
   )
   secrets = merge(
     { RTDB_ROOT_PASSWORD = var.root_password_secret },
@@ -50,6 +54,9 @@ locals {
     RTDB_CLASSIC_CANDIDATE_INGRESS_PORT = tostring(local.classic_candidate.port)
     }, local.classic_opening == null ? {} : {
     RTDB_CLASSIC_OPENING_INGRESS_PORT = tostring(local.classic_opening.port)
+    }, local.native_dependent_custody == null ? {} : {
+    RTDB_NATIVE_DEPENDENT_CUSTODY_FILE = "${local.native_dependent_directory}/installation.json"
+    RTDB_NATIVE_DEPENDENT_CUSTODY_PORT = tostring(local.native_dependent_ingress == null ? 0 : local.native_dependent_ingress.port)
   })
 }
 
@@ -110,15 +117,32 @@ resource "aws_ecs_task_definition" "node" {
       }
     }
   }
+  dynamic "volume" {
+    for_each = local.native_dependent_custody == null ? [] : [local.native_dependent_custody]
+    content {
+      name = "native-dependent-custody"
+      efs_volume_configuration {
+        file_system_id     = split("/", volume.value.file_system_arn)[1]
+        transit_encryption = "ENABLED"
+        authorization_config {
+          access_point_id = split("/", volume.value.access_point_arn)[1]
+          iam             = "ENABLED"
+        }
+      }
+    }
+  }
   container_definitions = jsonencode([{
-    name            = "rtdb"
-    image           = var.image
-    essential       = true
-    user            = "20000:20000"
-    command         = local.multi ? local.multi_command : ["node", "--file", "/etc/rtdb/cluster-default.yaml"]
-    environment     = [for name, value in local.environment : { name = name, value = value } if value != null]
-    secrets         = [for name, value in local.secrets : { name = name, valueFrom = value }]
-    mountPoints     = local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : []
+    name        = "rtdb"
+    image       = var.image
+    essential   = true
+    user        = "20000:20000"
+    command     = local.multi ? local.multi_command : ["node", "--file", "/etc/rtdb/cluster-default.yaml"]
+    environment = [for name, value in local.environment : { name = name, value = value } if value != null]
+    secrets     = [for name, value in local.secrets : { name = name, valueFrom = value }]
+    mountPoints = concat(
+      local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : [],
+      local.native_dependent_custody == null ? [] : [{ sourceVolume = "native-dependent-custody", containerPath = local.native_dependent_directory, readOnly = true }],
+    )
     stopTimeout     = 90
     portMappings    = local.node_ports
     linuxParameters = { capabilities = { drop = ["ALL"] } }
@@ -152,6 +176,17 @@ resource "aws_ecs_task_definition" "node" {
     precondition {
       condition     = var.classic_opening_ingress == null || (local.multi && (local.classic_candidate == null || try(local.classic_candidate.port != local.classic_opening.port && local.classic_candidate.configuration_secret != local.classic_opening.configuration_secret, false)))
       error_message = "Classic opening ingress requires Multi mode and a listener and secret distinct from the Classic candidate ingress."
+    }
+    precondition {
+      condition     = local.multi || var.native_dependent_custody == null
+      error_message = "Native dependent custody requires Multi mode."
+    }
+    precondition {
+      condition = local.native_dependent_ingress == null || try(
+        local.native_dependent_ingress.port != try(local.classic_candidate.port, null) &&
+        local.native_dependent_ingress.port != try(local.classic_opening.port, null), false
+      )
+      error_message = "Native dependent custody ingress needs a private port distinct from the Classic recovery listeners."
     }
   }
   tags = var.tags
@@ -188,6 +223,8 @@ resource "aws_ecs_service" "node" {
     aws_vpc_security_group_ingress_rule.node,
     aws_vpc_security_group_ingress_rule.write_peers,
     aws_vpc_security_group_ingress_rule.classic_candidate,
+    aws_vpc_security_group_ingress_rule.native_dependent_custody,
+    aws_iam_role_policy.native_dependent_custody,
     aws_vpc_security_group_egress_rule.node,
     aws_iam_role_policy.objects,
     aws_iam_role_policy.secrets,

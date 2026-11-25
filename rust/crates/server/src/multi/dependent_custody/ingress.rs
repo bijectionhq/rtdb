@@ -135,6 +135,10 @@ impl Ingress {
         })
     }
 
+    pub(super) fn port(&self) -> u16 {
+        self.port
+    }
+
     pub(in crate::multi) async fn serve(
         self: &Arc<Self>,
         runtime: &MultiRuntime,

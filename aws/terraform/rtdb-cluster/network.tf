@@ -71,6 +71,15 @@ resource "aws_vpc_security_group_ingress_rule" "classic_opening" {
   to_port                      = local.classic_opening.port
 }
 
+resource "aws_vpc_security_group_ingress_rule" "native_dependent_custody" {
+  for_each                     = local.native_dependent_ingress == null ? toset([]) : local.native_dependent_ingress.source_security_group_ids
+  security_group_id            = aws_security_group.node.id
+  referenced_security_group_id = each.value
+  ip_protocol                  = "tcp"
+  from_port                    = local.native_dependent_ingress.port
+  to_port                      = local.native_dependent_ingress.port
+}
+
 resource "aws_vpc_security_group_egress_rule" "node" {
   security_group_id = aws_security_group.node.id
   ip_protocol       = "tcp"

@@ -35,12 +35,22 @@ struct Configuration {
 }
 
 pub(super) fn install(runtime: &mut MultiRuntime) -> Result<()> {
+    let mounted_port = std::env::var_os("RTDB_NATIVE_DEPENDENT_CUSTODY_PORT");
     let Some(path) = std::env::var_os("RTDB_NATIVE_DEPENDENT_CUSTODY_FILE") else {
-        return Ok(());
+        return if mounted_port.is_none() { Ok(()) } else { Err(invalid()) };
     };
     let config: Configuration = read_json(Path::new(&path))?;
     let observers = client::Observer::from_profiles(config.observers)?;
     let ingress = config.ingress.map(Ingress::from_profile).transpose()?;
+    if let Some(mounted_port) = mounted_port {
+        let port = mounted_port
+            .to_str()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(invalid)?;
+        if ingress.as_ref().map_or(0, Ingress::port) != port {
+            return Err(invalid());
+        }
+    }
     if observers.is_empty() && ingress.is_none() {
         return Err(invalid());
     }

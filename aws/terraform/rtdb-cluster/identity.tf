@@ -42,6 +42,23 @@ resource "aws_iam_role_policy" "objects" {
   })
 }
 
+resource "aws_iam_role_policy" "native_dependent_custody" {
+  count = local.native_dependent_custody == null ? 0 : 1
+  role  = aws_iam_role.node.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["elasticfilesystem:ClientMount"]
+      Resource = local.native_dependent_custody.file_system_arn
+      Condition = {
+        Bool         = { "aws:SecureTransport" = "true" }
+        StringEquals = { "elasticfilesystem:AccessPointArn" = local.native_dependent_custody.access_point_arn }
+      }
+    }]
+  })
+}
+
 resource "aws_iam_role" "execution" {
   name               = "${var.name}-execution"
   assume_role_policy = local.task_trust

@@ -147,6 +147,38 @@ variable "classic_opening_ingress" {
   }
 }
 
+variable "native_dependent_custody" {
+  description = "Optional Multi-only private EFS profile mount and ingress for the native dependent custody transport."
+  type = object({
+    file_system_arn  = string
+    access_point_arn = string
+    ingress = optional(object({
+      port                      = number
+      source_security_group_ids = set(string)
+    }))
+  })
+  default = null
+
+  validation {
+    condition = var.native_dependent_custody == null || try(
+      can(regex("^arn:[a-z0-9-]+:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:file-system/fs-[0-9a-f]+$", var.native_dependent_custody.file_system_arn)) &&
+      can(regex("^arn:[a-z0-9-]+:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:access-point/fsap-[0-9a-f]+$", var.native_dependent_custody.access_point_arn)) &&
+      slice(split(":", var.native_dependent_custody.file_system_arn), 0, 5) == slice(split(":", var.native_dependent_custody.access_point_arn), 0, 5) &&
+      (var.native_dependent_custody.ingress == null || try(
+        var.native_dependent_custody.ingress.port == floor(var.native_dependent_custody.ingress.port) &&
+        var.native_dependent_custody.ingress.port >= 1024 &&
+        var.native_dependent_custody.ingress.port <= 65535 &&
+        !contains([3000, 3001], var.native_dependent_custody.ingress.port) &&
+        length(var.native_dependent_custody.ingress.source_security_group_ids) > 0 &&
+        alltrue([for group in var.native_dependent_custody.ingress.source_security_group_ids :
+          can(regex("^sg-([a-f0-9]{8}|[a-f0-9]{17})$", group))
+        ]), false
+      )), false
+    )
+    error_message = "Native dependent custody needs a private EFS file system and access point, and any ingress needs a dedicated TCP port and source security groups."
+  }
+}
+
 variable "kafka_bootstrap" {
   description = "Comma-separated bootstrap endpoints for default mode."
   type        = string

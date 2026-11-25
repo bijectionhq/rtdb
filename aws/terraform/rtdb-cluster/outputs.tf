@@ -24,3 +24,12 @@ output "classic_opening_target" {
     security_group_id = aws_security_group.node.id
   }
 }
+
+output "native_dependent_custody_target" {
+  description = "Private DNS entry, TCP port and node security group for native dependent custody."
+  value = local.native_dependent_ingress == null ? null : {
+    entry             = local.peer_discovery_host
+    port              = local.native_dependent_ingress.port
+    security_group_id = aws_security_group.node.id
+  }
+}
