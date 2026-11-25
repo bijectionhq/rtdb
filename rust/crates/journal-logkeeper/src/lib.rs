@@ -5,6 +5,10 @@ use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Resul
 use stream_logkeeper::stream::{transport::TcpTransport, writer::Writer};
 
 pub use stream_logkeeper::stream::transport::Credentials;
+pub use stream_logkeeper::stream::{
+    timed::{TimedOriginal, TimedOriginalProof, TimedOriginalVerifier},
+    wire::KeeperId,
+};
 
 #[derive(Clone)]
 pub struct StreamJournal(Writer);
@@ -18,6 +22,33 @@ impl StreamJournal {
         let (transport, ensemble) = TcpTransport::discover(url, credentials, deadline).await?;
         let writer = Writer::new(Arc::new(transport), ensemble).map_err(io::Error::other)?;
         Ok(Self(writer))
+    }
+
+    pub async fn connect_with_timed_original(
+        url: &str,
+        credentials: &Credentials,
+        deadline: Duration,
+        verifier: Arc<dyn TimedOriginalVerifier>,
+        maximum_payload_bytes: Option<usize>,
+    ) -> io::Result<Self> {
+        let Self(writer) = Self::connect(url, credentials, deadline).await?;
+        Ok(Self(writer.with_timed_original(verifier, maximum_payload_bytes)))
+    }
+
+    pub fn maximum_timed_original_bytes(&self) -> Option<usize> {
+        self.0.maximum_timed_original_bytes()
+    }
+
+    pub async fn append_timed_original(
+        &self,
+        original: TimedOriginal,
+        payload: Bytes,
+    ) -> Result<TimedOriginalProof> {
+        self.0.append_timed_original(original, payload).await
+    }
+
+    pub async fn prove_timed_original(&self, original: TimedOriginal) -> Result<TimedOriginalProof> {
+        self.0.prove_timed_original(original).await
     }
 
     /// Submit a contiguous group to the writer's shared stream queue.

@@ -366,3 +366,23 @@ python3 rust/bench/v1_transact_commits.py "$output" --clients 32 \
 
 Record the selected keeper limits and storage layout with the comparison.
 The three local processes have separate durable journals and share the test host.
+
+## Certified timed original StreamJournal
+
+The native Multi journal connection can load an independent keeper verifier with
+`RTDB_TIMED_ORIGINAL_TRUST_FILE`. Set it to an absolute path to a bounded
+JSON object with `keepers` and optional `maximum_payload_bytes`. Each keeper
+entry contains `identity` (the installed keeper UUID) and `verification_key`
+(the exact 32-byte Ed25519 public key as a JSON array). Distinct keeper identities
+require distinct attestation keys. Retain the keys for original proofs while
+the corresponding journal records are retained. A trust profile with no
+payload limit can verify retained records and provides no timed append capacity.
+
+Use the matching keeper's commissioned original-clock authority and an
+RTDB `CertifiedDecisionClock` on the same native attachment before admitting
+funded transactions. The verified guard binds the receiver certificate to the
+exact original database and clock domain. Exercise an identical append after
+reply loss, a distinct successor after sealing the new epoch, and proof readback
+after keeper restart and checkpoint recovery. The RTDB adapter checks the
+original stream, epoch, LSN, sealed-payload digest, exclusive cutoff and
+certificate digest in the returned proof before the fold applies effects.

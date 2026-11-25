@@ -41,6 +41,7 @@ mod catalog;
 pub mod classic_ingress;
 mod classic_migration;
 mod classic_opening;
+mod timed_stream;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
 mod native_checkpoint;
@@ -1363,7 +1364,7 @@ fn retryable(error: &Anomaly) -> bool {
 }
 
 async fn connect_stream_journal(url: &str, credentials: &Credentials) -> Result<Arc<StreamJournal>> {
-    StreamJournal::connect(url, credentials, Duration::from_secs(5)).await
+    timed_stream::connect(url, credentials, Duration::from_secs(5)).await
         .map(Arc::new)
         .map_err(|error| Anomaly::new(AnomalyCategory::Unavailable, "rtdb/journal-connect", error.to_string()))
 }
@@ -1378,6 +1379,28 @@ impl JournalBatchAppender for StreamJournalBatch {
         records: Vec<(journal_contract::Lsn, bytes::Bytes)>,
     ) -> journal_contract::BoxFuture<'_, journal_contract::Result<journal_contract::Lsn>> {
         Box::pin(self.0.append_batch(stream, epoch, records))
+    }
+
+    fn maximum_timed_original_bytes(&self) -> Option<usize> {
+        self.0.maximum_timed_original_bytes()
+    }
+
+    fn append_timed_original(
+        &self, original: rtdb_db::TimedOriginal, payload: bytes::Bytes,
+    ) -> journal_contract::BoxFuture<'_, journal_contract::Result<rtdb_db::TimedOriginalProof>> {
+        Box::pin(async move {
+            let proof = self.0.append_timed_original(timed_stream::request(original), payload).await?;
+            timed_stream::proof(original, proof)
+        })
+    }
+
+    fn prove_timed_original(
+        &self, original: rtdb_db::TimedOriginal,
+    ) -> journal_contract::BoxFuture<'_, journal_contract::Result<rtdb_db::TimedOriginalProof>> {
+        Box::pin(async move {
+            let proof = self.0.prove_timed_original(timed_stream::request(original)).await?;
+            timed_stream::proof(original, proof)
+        })
     }
 }
 
