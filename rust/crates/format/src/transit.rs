@@ -160,6 +160,32 @@ pub fn decode_json(bytes: &[u8]) -> Result<TransitValue> {
     decode_json_with(bytes, &mut WireValues)
 }
 
+/// Admits one Transit JSON value and returns the charge for its decoded representation.
+pub fn decode_json_in(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<(TransitValue, Arc<MemoryReservation>)> {
+    // The visitor grows Packed vectors before unpacking. Punctuation inside strings only contributes text bytes.
+    let (mut quoted, mut escaped, mut entries) = (false, false, 0usize);
+    for &byte in bytes {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b'[' | b'{' | b',' if !quoted => entries += 1,
+            _ => {}
+        }
+    }
+    let packed_bound = entries.checked_mul(8 * size_of::<Packed>())
+        .and_then(|bound| bound.checked_add(bytes.len().checked_mul(8)?))
+        .and_then(|bound| bound.checked_add(512)).ok_or_else(read_overflow)?;
+    let _packed = memory.reserve(packed_bound)?;
+    let packed = packed_json(bytes)?;
+    let mut cache = ReadCache {
+        admission: ReadAdmission(Some(memory.reserve(0)?)),
+        ..ReadCache::new()
+    };
+    let value = unpack_value(packed, false, &mut cache, 0, &mut WireValues)?;
+    Ok((value, cache.admission.0.expect("tracked Transit decode has a reservation")))
+}
+
 pub fn decode_json_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Result<B::Value> {
     unpack_value(packed_json(bytes)?, false, &mut ReadCache::new(), 0, builder)
 }

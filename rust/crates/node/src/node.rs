@@ -2056,7 +2056,12 @@ impl OwnedReadSession {
             Arc::clone(&self.context), &self.owner, world.id, at.system_time,
         ).await?;
         self.check()?;
-        Ok(record.is_some_and(|(record, revision, _)| &record == world && revision == at.system_time))
+        let Some((record, revision, _)) = record else { return Ok(false); };
+        if revision < at.system_time { return Ok(false); }
+        if revision != at.system_time || &record != world {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        Ok(true)
     }
 
     /// Reads the exact local shadow, retaining its revision even when that shadow is a tombstone.

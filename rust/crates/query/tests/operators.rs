@@ -147,6 +147,109 @@ async fn analyze_reports_the_arrow_union_it_actually_runs() {
 }
 
 #[tokio::test]
+async fn prepared_projection_reuses_compatible_first_cells_and_funds_each_copy() -> Result<()> {
+    use arrow_array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, cast::AsArray};
+    use arrow_buffer::NullBuffer;
+    use rtdb_columnar::{OwnedBatch, to_field};
+
+    let context = query_context(Default::default());
+    let baseline = context.memory.used_bytes();
+    let wide = scalar(ScalarType::I64);
+    let types = [wide.clone(), scalar(ScalarType::Bool), scalar(ScalarType::I32), wide.clone().maybe()];
+    let fields = ["wide", "flag", "narrow", "nullable"].into_iter().zip(&types);
+    let schema = Schema::new(fields.clone().enumerate().map(|(id, (name, ty))| field(id as u32, name, ty.clone())).collect())?;
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+        rows: vec![types.iter().enumerate().map(|(index, ty)| Expr::Parameter { index, data_type: ty.clone() }).collect()],
+    })?);
+    let alias = |id, name, position: usize| NamedExpr {
+        field: field(id, name, types[position].clone()),
+        expr: schema.fields()[position].expression(),
+    };
+    let addition = NamedExpr {
+        field: field(5, "total", wide),
+        expr: Expr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(schema.fields()[0].expression()),
+            right: Box::new(Expr::Literal(Value::I64(2))),
+        },
+    };
+    let plan = input.project(vec![alias(4, "v", 2), addition, alias(6, "v", 2), alias(7, "flag", 1), alias(8, "nullable", 3)])?;
+    let prepared = PreparedQuery::new(Arc::new(plan))?;
+
+    let source_fields = fields.map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(source_fields)), vec![
+        Arc::new(Int64Array::from(vec![17, 20])),
+        Arc::new(BooleanArray::from(vec![true, true])),
+        Arc::new(Int32Array::from(vec![7, 33])),
+        Arc::new(Int64Array::try_new(vec![91, 42].into(), Some(NullBuffer::from(vec![false, true]))).unwrap()),
+    ]).unwrap();
+    let arguments = OwnedBatch::new(batch, &context.memory)?;
+    let argument_charge = Arc::downgrade(arguments.reservation());
+    let narrow_buffer = |array: &ArrayRef| array.as_any().downcast_ref::<Int32Array>().unwrap().values().as_ptr();
+    let source = narrow_buffer(arguments.batch().column(2));
+
+    let mut cursor = prepared.execute_parameter_projection(Arc::clone(&context), &arguments, &types, None).await?.unwrap();
+    let page = cursor.next_batch().await?.unwrap();
+    let row_charge = Arc::downgrade(page.reservation());
+    let batch = page.batch();
+    assert!(page.owns_schema());
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.schema_ref().fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(),
+        ["v", "total", "v", "flag", "nullable"]);
+    assert_eq!(narrow_buffer(batch.column(0)), source);
+    assert_eq!(narrow_buffer(batch.column(2)), source);
+    let values = batch.columns().iter().zip(batch.schema_ref().fields()).map(|(array, field)| {
+        read_value(field, array.as_ref(), 0)
+    }).collect::<Result<Vec<_>>>()?;
+    assert_eq!(values, [Value::I32(7), Value::I64(19), Value::I32(7), Value::Bool(true), Value::Null]);
+    assert_eq!(batch.column(3).as_boolean().values().values(), &[1]);
+    let nullable = Arc::clone(batch.column(4));
+    assert_eq!(nullable.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[0]);
+    let shared = Arc::clone(batch.column(0));
+    let computed = Arc::clone(batch.column(1));
+    assert!(cursor.next_batch().await?.is_none());
+    drop((arguments, page, cursor));
+    assert!(row_charge.upgrade().is_none());
+    assert!(argument_charge.upgrade().is_some());
+    drop(shared);
+    assert!(argument_charge.upgrade().is_none());
+    let with_computed = context.memory.used_bytes();
+    drop(computed);
+    assert!(context.memory.used_bytes() < with_computed);
+    assert!(context.memory.used_bytes() > baseline);
+    drop(nullable);
+    assert_eq!(context.memory.used_bytes(), baseline);
+    Ok(())
+}
+
+#[tokio::test]
+async fn prepared_projection_detaches_a_tiny_view_of_an_oversized_argument() -> Result<()> {
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    use rtdb_columnar::OwnedBatch;
+
+    let ty = scalar(ScalarType::Utf8);
+    let schema = Schema::new(vec![field(0, "v", ty.clone())])?;
+    let relation = Relation::new(schema, RelationNode::Values {
+        rows: vec![vec![Expr::Parameter { index: 0, data_type: ty.clone() }]],
+    })?;
+    let prepared = PreparedQuery::new(Arc::new(relation))?;
+    let context = query_context(Default::default());
+    let large = "x".repeat(64 * 1024);
+    let batch = RecordBatch::try_from_iter([("input", Arc::new(StringArray::from(vec!["first", large.as_str()])) as ArrayRef)]).unwrap();
+    let arguments = OwnedBatch::new(batch, &context.memory)?.slice(0, 1)?;
+    let source = Arc::downgrade(arguments.reservation());
+    let mut cursor = prepared.execute_parameter_projection(context, &arguments, &[ty], None).await?.unwrap();
+    let output = cursor.next_batch().await?.unwrap();
+    let array = Arc::clone(output.batch().column(0));
+    drop((arguments, output, cursor));
+    assert!(source.upgrade().is_none());
+    let text = array.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(text.value(0), "first");
+    assert_eq!(text.value_data(), b"first");
+    Ok(())
+}
+
+#[tokio::test]
 async fn directly_projected_arrow_parameters_emit_an_operator_peak() {
     use arrow_array::{Int64Array, RecordBatch};
     let context = query_context(Default::default());
@@ -161,7 +264,9 @@ async fn directly_projected_arrow_parameters_emit_an_operator_peak() {
     let arguments = rtdb_columnar::OwnedBatch::new(batch, &context.memory).unwrap();
     let prepared = PreparedQuery::new(plan).unwrap();
     let mut cursor = prepared.execute_parameter_projection(context, &arguments, &[ty], Some("SELECT ? AS v")).await.unwrap().unwrap();
-    assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(page.batch().num_rows(), 1);
+    assert!(Arc::ptr_eq(page.batch().column(0), arguments.batch().column(0)));
     assert!(cursor.next_batch().await.unwrap().is_none());
     drop(cursor);
     tracer.close();

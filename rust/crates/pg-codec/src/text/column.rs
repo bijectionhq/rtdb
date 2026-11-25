@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{mem::size_of, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, ListArray, NullArray, PrimitiveArray, UnionArray,
     builder::{ArrayBuilder, BinaryBuilder, TimestampMicrosecondBuilder, BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder},
@@ -8,10 +8,10 @@ use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, ListArray, N
 use arrow_buffer::{IntervalMonthDayNano, NullBuffer, NullBufferBuilder, OffsetBuffer, i256};
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_columnar::BatchBuilder;
-use rtdb_format::transit::{TransitValue, decode_json, encode_msgpack};
+use rtdb_format::transit::{TransitValue, decode_json, decode_json_in, encode_msgpack, msgpack_allocation_bound};
 use rtdb_types::{Anomaly, LogicalType, PgType, Result, ScalarType, TimeUnit};
 
-use super::{bytea, invalid, interval, interval_type, local_timestamp_micros, parse_boolean, parse_decimal, parse_uuid, range, float, float32, visit_array, zoned_timestamp_micros};
+use super::{bytea, invalid, interval, interval_type, local_timestamp_micros, parse_boolean, parse_decimal, parse_uuid, read_tstzrange, float, float32, visit_array, zoned_timestamp_micros};
 
 /// Decodes a PostgreSQL column using a fixed Arrow layout when supported.
 /// The caller admits input, output and scratch allocations.
@@ -186,14 +186,22 @@ fn list<'a, B: ArrayBuilder>(
 }
 
 /// Appends a source column with its native field metadata and writer reservation.
+/// The cell provider may be called more than once for a row.
 pub fn read_source_text_column<'a>(
-    name: &str, oid: u32, count: usize, cell: impl FnMut(usize) -> Result<Option<&'a str>>,
+    name: &str, oid: u32, count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
     output: &mut BatchBuilder,
 ) -> Result<Option<(Field, ArrayRef)>> {
     let result = match oid {
         3910 => {
-            let (field, array) = ranges(name, count, cell)?;
-            account_field(field, array, output)?
+            let (_, largest) = text_lengths(count, &mut cell)?;
+            let bound = column_scratch(count, 2 * size_of::<i64>() + 1, largest, 4)?;
+            let mut field = None;
+            let array = output.column(bound, || {
+                let (column_field, array) = ranges(name, count, cell)?;
+                field = Some(column_field);
+                Ok(array)
+            })?;
+            (field.expect("range column has a field"), array)
         }
         16384 => {
             let Some((field, array)) = transit_column(name, count, cell)? else { return Ok(None); };
@@ -247,45 +255,128 @@ pub fn read_source_text_column<'a>(
                 }
             })?,
         _ => {
-            let Some(array) = read_text_column(oid, count, cell)? else { return Ok(None); };
-            if matches!(oid, 1021 | 1022) { account_column(name, array, output)? }
-            else {
-                let array = if array.null_count() == count { Arc::new(NullArray::new(count)) } else { array };
-                account_column(name, array, output)?
-            }
+            let Some(bound) = plain_text_scratch(oid, count, &mut cell)? else { return Ok(None); };
+            let array = output.column(bound, || {
+                let array = read_text_column(oid, count, cell)?.expect("supported direct text layout");
+                Ok(if !matches!(oid, 1021 | 1022) && array.null_count() == count {
+                    Arc::new(NullArray::new(count))
+                } else { array })
+            })?;
+            (source_field(name, &array), array)
         }
     };
     Ok(Some(result))
 }
 
-fn account_column(name: &str, array: ArrayRef, output: &mut BatchBuilder) -> Result<(Field, ArrayRef)> {
-    let field = Field::new(name, array.data_type().clone(), !array.is_empty()
-        && (array.null_count() != 0 || array.data_type() == &DataType::Null));
-    account_field(field, array, output)
+fn source_field(name: &str, array: &ArrayRef) -> Field {
+    Field::new(name, array.data_type().clone(), !array.is_empty()
+        && (array.null_count() != 0 || array.data_type() == &DataType::Null))
+}
+
+fn text_lengths<'a>(count: usize, cell: &mut impl FnMut(usize) -> Result<Option<&'a str>>) -> Result<(usize, usize)> {
+    // Validate the full column before parsing its first value.
+    (0..count).try_fold((0usize, 0usize), |(total, largest), row| {
+        let len = cell(row)?.map_or(0, str::len);
+        Ok((total.checked_add(len).ok_or_else(text_allocation_overflow)?, largest.max(len)))
+    })
+}
+
+fn text_allocation_overflow() -> Anomaly {
+    Anomaly::fault("xtdb.postgres/protocol-error", "PostgreSQL Arrow batch allocation overflow")
+}
+
+fn column_scratch(count: usize, row_bytes: usize, payload: usize, payload_factor: usize) -> Result<usize> {
+    count.checked_mul(row_bytes)
+        .and_then(|bytes| bytes.checked_add(payload.checked_mul(payload_factor)?))
+        .and_then(|bytes| bytes.checked_add(4096))
+        .ok_or_else(text_allocation_overflow)
+}
+
+fn list_scratch<'a>(
+    oid: u32, count: usize, cell: &mut impl FnMut(usize) -> Result<Option<&'a str>>,
+) -> Result<usize> {
+    let mixed = matches!(oid, 1021 | 1022);
+    let child_width = if matches!(oid, 1016 | 1022) { 8 } else { 4 };
+    let mut payload = 0usize;
+    let mut largest_list = 0;
+    for row in 0..count {
+        let Some(text) = cell(row)? else { continue; };
+        let bytes = if mixed && float_array_text_layout(text) {
+            // An all-text column builds a second string array to restore its null rows.
+            text.len().checked_mul(8)
+        } else {
+            largest_list = largest_list.max(text.len());
+            let elements = component_limit(text)?;
+            let text_bytes = if oid == 1009 { text.len() } else { 0 };
+            elements.checked_mul(child_width + 1)
+                .and_then(|bytes| bytes.checked_add(text_bytes))
+                .and_then(|bytes| bytes.checked_mul(4))
+        }.ok_or_else(text_allocation_overflow)?;
+        payload = payload.checked_add(bytes).ok_or_else(text_allocation_overflow)?;
+    }
+    // Mixed float arrays also hold union buffers and borrowed row references.
+    let row_bytes = if mixed { 64 } else { 8 };
+    let payload = payload.checked_add(largest_list.checked_mul(4).ok_or_else(text_allocation_overflow)?)
+        .ok_or_else(text_allocation_overflow)?;
+    let bound = column_scratch(count, row_bytes, payload, 1)?;
+    // The integer and string builders start with Arrow's default capacity.
+    if mixed { Ok(bound) } else { bound.checked_add(12_288).ok_or_else(text_allocation_overflow) }
+}
+
+fn component_limit(text: &str) -> Result<usize> {
+    text.bytes().filter(|&byte| byte == b',').count().checked_add(1).ok_or_else(text_allocation_overflow)
+}
+
+fn plain_text_scratch<'a>(
+    oid: u32, count: usize, cell: &mut impl FnMut(usize) -> Result<Option<&'a str>>,
+) -> Result<Option<usize>> {
+    let (row_bytes, payload_factor) = match oid {
+        16 => (1, 0),
+        21 => (3, 0),
+        23 | 700 => (5, 0),
+        20 | 701 | 1083 | 11112 => (9, 0),
+        1007 | 1016 | 1009 | 1021 | 1022 => return list_scratch(oid, count, cell).map(Some),
+        oid if PgType::from_oid(oid as i32).is_none() || matches!(oid, 25 | 1042 | 1043) => (5, 4),
+        _ => return Ok(None),
+    };
+    let (total, largest) = text_lengths(count, cell)?;
+    let bound = if oid == 16 { column_scratch(count, row_bytes, largest, 1) }
+        else { column_scratch(count, row_bytes, total, payload_factor) }?;
+    Ok(Some(bound))
 }
 
 fn account_field(field: Field, array: ArrayRef, output: &mut BatchBuilder) -> Result<(Field, ArrayRef)> {
-    let bound = array.get_array_memory_size().checked_add(512)
-        .ok_or_else(|| Anomaly::fault("xtdb.postgres/protocol-error", "PostgreSQL Arrow batch allocation overflow"))?;
+    let bound = array.get_array_memory_size().checked_add(512).ok_or_else(text_allocation_overflow)?;
     Ok((field, output.column(bound, || Ok(array))?))
 }
 
 /// Decodes the text output shared by pgvector vector and halfvec.
+/// The cell provider may be called more than once for a row.
 pub fn read_vector_column<'a>(
     name: &str, typmod: i32, count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
     output: &mut BatchBuilder,
 ) -> Result<(Field, ArrayRef)> {
     if typmod == -1 {
-        let array = list(count, cell, true, PrimitiveBuilder::<Float32Type>::with_capacity(0), |builder, text| {
-            for component in vector_components(text, None)? { builder.append_value(component?); }
-            Ok(())
+        let components = (0..count).try_fold(0usize, |total, row| {
+            let elements = cell(row)?.map(component_limit).transpose()?.unwrap_or_default();
+            total.checked_add(elements).ok_or_else(text_allocation_overflow)
         })?;
-        return account_column(name, array, output);
+        let bound = column_scratch(count, 8, components, 4 * size_of::<f32>())?;
+        let array = output.column(bound, || {
+            list(count, cell, true, PrimitiveBuilder::<Float32Type>::with_capacity(0), |builder, text| {
+                for component in vector_components(text, None)? { builder.append_value(component?); }
+                Ok(())
+            })
+        })?;
+        return Ok((source_field(name, &array), array));
     }
 
+    text_lengths(count, &mut cell)?;
     let width = vector_width(typmod)?;
     let total = count.checked_mul(width).ok_or_else(|| invalid("pgvector column length overflow"))?;
-    let scratch = total.checked_mul(8).and_then(|size| size.checked_add(4096))
+    let scratch = total.checked_mul(8)
+        .and_then(|size| size.checked_add(count.checked_mul(2)?))
+        .and_then(|size| size.checked_add(4096))
         .ok_or_else(|| invalid("pgvector column allocation overflow"))?;
     let array = output.column(scratch, || {
         let mut builder = PrimitiveBuilder::<Float32Type>::with_capacity(total);
@@ -340,29 +431,48 @@ fn scalar_column<'a, P>(
     scalar: impl Fn(&P) -> ScalarType, heap: impl Fn(&P) -> usize,
     build: impl Fn(&Field, Vec<Option<P>>) -> Result<ArrayRef>,
 ) -> Result<(Field, ArrayRef)> {
+    let (payload, _) = text_lengths(count, &mut cell)?;
+    // A parsed decimal retains its coefficient at the selected physical width.
+    let row_bytes = size_of::<(usize, Option<P>)>() + 32;
+    let bytes = column_scratch(count, row_bytes, payload, 8)?
+        .checked_add(name.len()).ok_or_else(text_allocation_overflow)?;
+    let mut scratch = output.reserve_scratch(bytes)?;
     let mut types = rtdb_types::OrderedSet::new();
     let mut rows = Vec::with_capacity(count);
     for row in 0..count {
         let value = cell(row)?.map(&mut parse).transpose()?;
         let ty = value.as_ref().map_or(LogicalType::Null, |value| LogicalType::Scalar(scalar(value)));
         let leg = types.iter().position(|candidate| candidate == &ty).unwrap_or(types.len());
-        types.insert(ty);
+        if leg == types.len() {
+            let zone_bytes = match &ty {
+                LogicalType::Scalar(ScalarType::Timestamp { timezone: Some(zone), .. }) => zone.len(),
+                _ => 0,
+            };
+            let extra = zone_bytes.checked_mul(8)
+                .and_then(|bytes| bytes.checked_add(2048)).ok_or_else(text_allocation_overflow)?;
+            let scratch = Arc::get_mut(&mut scratch).expect("scalar decode owns its reservation");
+            scratch.grow_to(scratch.bytes().checked_add(extra).ok_or_else(text_allocation_overflow)?)?;
+            types.insert(ty);
+        }
         rows.push((leg, value));
     }
     let logical = if rows.is_empty() { LogicalType::Nothing } else { LogicalType::from_legs(types.iter().cloned()) };
     let field = rtdb_columnar::to_field(name, &logical)?;
-    let types = types.into_iter().collect::<Vec<_>>();
-    let bound = rtdb_columnar::estimate_scalar_builder_bytes(&logical, rows.iter().map(|(leg, value)| {
-        match (&types[*leg], value) {
-            (LogicalType::Scalar(ty), Some(value)) => Some((ty, heap(value))),
-            _ => None,
-        }
-    }))?;
+    output.retain_metadata(Arc::get_mut(&mut scratch).expect("scalar decode owns its reservation"), field.size())?;
+    let leg_count = types.len();
+    let payload = rows.iter().try_fold(0usize, |total, (_, value)| {
+        total.checked_add(value.as_ref().map_or(0, &heap)).ok_or_else(text_allocation_overflow)
+    })?;
+    // A dense union regroups the typed rows before building the child arrays.
+    let row_bytes = 4 * size_of::<Option<P>>() + 128;
+    let bound = column_scratch(count, row_bytes, payload, 4)?
+        .checked_add(leg_count.checked_mul(1024).ok_or_else(text_allocation_overflow)?)
+        .ok_or_else(text_allocation_overflow)?;
     let array = output.column(bound, || {
         match field.data_type() {
             DataType::Null => Ok(Arc::new(NullArray::new(count)) as ArrayRef),
             DataType::Union(fields, UnionMode::Dense) => {
-                let mut children = types.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+                let mut children = (0..leg_count).map(|_| Vec::new()).collect::<Vec<_>>();
                 let mut ids = Vec::with_capacity(count);
                 let mut offsets = Vec::with_capacity(count);
                 for (leg, value) in rows {
@@ -387,11 +497,12 @@ fn scalar_column<'a, P>(
 fn ranges<'a>(
     name: &str, count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
 ) -> Result<(Field, ArrayRef)> {
-    let mut values = TimestampMicrosecondBuilder::new().with_timezone("UTC");
+    let mut values = TimestampMicrosecondBuilder::with_capacity(count.checked_mul(2).ok_or_else(text_allocation_overflow)?)
+        .with_timezone("UTC");
     let mut valid = NullBufferBuilder::new(count);
     let mut present = 0;
     for row in 0..count {
-        let bounds = cell(row)?.map(range).transpose()?.flatten();
+        let bounds = cell(row)?.map(read_tstzrange).transpose()?.flatten();
         valid.append(bounds.is_some());
         if let Some((lower, upper)) = bounds {
             values.append_value(lower);
@@ -402,12 +513,63 @@ fn ranges<'a>(
         }
     }
     if present == 0 { return null_column(name, count); }
-    let logical = PgType::TsTzRange.logical_type().expect("range type");
-    let field = rtdb_columnar::to_field(name, &nullable(logical, present != count))?;
+    let field = tstzrange_field(name, present != count)?;
     let DataType::FixedSizeList(item, width) = field.data_type() else { unreachable!() };
     let array = FixedSizeListArray::try_new(Arc::clone(item), *width, Arc::new(values.finish()), valid.finish())
         .map_err(invalid)?;
     Ok((field, Arc::new(array)))
+}
+
+pub fn tstzrange_field(name: &str, has_null: bool) -> Result<Field> {
+    let logical = PgType::TsTzRange.logical_type().expect("range type");
+    rtdb_columnar::to_field(name, &nullable(logical, has_null))
+}
+
+/// Tries the opaque Transit layout before the snapshot admits generic values.
+pub fn read_snapshot_transit_column<'a>(
+    name: &str, count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
+    output: &mut BatchBuilder,
+) -> Result<Option<(Field, ArrayRef)>> {
+    text_lengths(count, &mut cell)?;
+    let slots = count.checked_mul(size_of::<Option<Vec<u8>>>()).ok_or_else(text_allocation_overflow)?;
+    let mut staged = output.reserve_scratch(slots)?;
+    let mut rows = Vec::with_capacity(count);
+    let mut payload = 0usize;
+    let mut present = 0;
+    for row in 0..count {
+        let bytes = if let Some(text) = cell(row)? {
+            let decoded = decode_json_in(text.as_bytes(), staged.budget())?;
+            match &decoded.0 {
+                TransitValue::Null => None,
+                wire @ TransitValue::Tagged { tag, .. } if super::is_opaque_transit(tag) => {
+                    let mut encoding = output.reserve_scratch(msgpack_allocation_bound(wire)?)?;
+                    let bytes = encode_msgpack(wire)?;
+                    payload = payload.checked_add(bytes.len()).ok_or_else(text_allocation_overflow)?;
+                    i32::try_from(payload).map_err(invalid)?;
+                    let encoding = Arc::get_mut(&mut encoding).expect("Transit encoding owns its reservation");
+                    encoding.shrink_to(bytes.capacity())?;
+                    Arc::get_mut(&mut staged).expect("Transit column owns its scratch").absorb(encoding)?;
+                    present += 1;
+                    Some(bytes)
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
+        rows.push(bytes);
+    }
+    let logical = if present == 0 { LogicalType::Null }
+        else { nullable(LogicalType::Scalar(ScalarType::Transit), present != count) };
+    let field = rtdb_columnar::to_field(name, &logical)?;
+    let bound = column_scratch(count, 5, payload, 1)?;
+    let array = output.column(bound, || {
+        if present == 0 { return Ok(Arc::new(NullArray::new(count))); }
+        let mut builder = BinaryBuilder::with_capacity(count, payload);
+        for bytes in rows { builder.append_option(bytes); }
+        Ok(Arc::new(builder.finish()))
+    })?;
+    Ok(Some((field, array)))
 }
 
 fn transit_column<'a>(

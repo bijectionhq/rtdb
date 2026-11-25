@@ -1,11 +1,14 @@
-use rtdb_types::StructFields;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::mem::size_of;
 use std::sync::Arc;
 
-use rtdb_columnar::MemoryBudget;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_schema::Schema;
+use rtdb_columnar::{EntityIdRef, MemoryBudget, OwnedBatch};
+use rtdb_format::catalog::{DECLARED_COLUMNS, schema_declarations};
 use rtdb_format::{data::{EncodedEvent, StoredOperation}, envelope::decode_replica_outcome_attempt, generated::xtdb::log::proto::ResolvedTx};
 use rtdb_index::{IndexBatch, StagedWrite, TableWrite};
-use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 use crate::{RetainedAnomaly, TransactionResult};
 
@@ -114,28 +117,14 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
             Some("1") if result.committed() && message.db_op.is_none() && (held || placed.is_some()) => true,
             Some(_) => return Err(invalid("An adopted history requires a committed placed decision")),
         };
-        let declarations = rtdb_format::catalog::schema_declarations(schema)?;
+        let declarations = schema_declarations(schema)?;
         if !declarations.is_empty() && message.committed != Some(true) {
             return Err(invalid("An uncommitted transaction cannot declare columns"));
         }
-        let mut clean_schema = rtdb_format::catalog::without_schema_declarations(schema);
-        if adopted {
-            if !declarations.is_empty() { return Err(invalid("An adopted history cannot declare columns")); }
-            let clean = clean_schema.unwrap_or_else(|| schema.as_ref().clone());
-            let mut metadata = clean.metadata().clone();
-            metadata.remove(ADOPTED_HISTORY_METADATA);
-            clean_schema = Some(clean.with_metadata(metadata));
+        if adopted && !declarations.is_empty() {
+            return Err(invalid("An adopted history cannot declare columns"));
         }
-        let page = match clean_schema {
-            Some(schema) => {
-                let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.batch().num_rows()));
-                let rows = arrow_array::RecordBatch::try_new_with_options(Arc::new(schema), page.batch().columns().to_vec(), &options)
-                    .map_err(|error| invalid(error.to_string()))?;
-                rtdb_columnar::OwnedBatch::with_reservation(rows, Arc::clone(page.reservation()))?
-            }
-            None => page,
-        };
-        let batch = IndexBatch::from_owned(page)?;
+        let batch = IndexBatch::from_owned(strip_replay_metadata(page)?)?;
         let owned_data = table.is_owned_event_data();
         if !batch.is_empty() && batch.view().has_entity_keys() != owned_data {
             return Err(invalid("Resolved transaction has the wrong entity-key layout"));
@@ -143,14 +132,15 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
         if owned_data {
             for index in 0..batch.len() {
                 let encoded = batch.view().entity_key(index)?.ok_or_else(|| invalid("Owned event has no complete key"))?;
-                let _key = memory.reserve(encoded.len().saturating_mul(2))?;
-                let id = rtdb_types::EntityId::from_handle_bytes(encoded)?;
-                if id.iid() != batch.header(index)?.iid || id.handle_bytes().as_slice() != encoded {
+                let id = EntityIdRef::from_handle_bytes(encoded)?;
+                let mut integer = [0; 8];
+                let (tag, payload) = id.handle_parts(&mut integer);
+                if id.iid() != batch.header(index)?.iid || encoded.split_first() != Some((&tag, payload)) {
                     return Err(invalid("Resolved owned event locality differs from its complete key"));
                 }
-                if matches!(&id, rtdb_types::EntityId::Binary(_)) {
+                if matches!(id, EntityIdRef::Binary(_)) {
                     let event = batch.view().borrow_event(index)?;
-                    if event.header().op == EventOp::Put && event.put_identity()? != Some(rtdb_columnar::EntityIdRef::from(&id)) {
+                    if event.header().op == EventOp::Put && event.put_identity()? != Some(id) {
                         return Err(invalid("Resolved owned put differs from its complete identity"));
                     }
                 }
@@ -249,6 +239,37 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
     Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: placed.map(|(attempt, _)| attempt) })
 }
 
+fn strip_replay_metadata(page: OwnedBatch) -> Result<OwnedBatch> {
+    let batch = page.batch();
+    let schema = batch.schema_ref();
+    let removed = schema.metadata().contains_key(DECLARED_COLUMNS) as usize
+        + schema.metadata().contains_key(ADOPTED_HISTORY_METADATA) as usize;
+    if removed == 0 { return Ok(page); }
+
+    let retained = schema.metadata().iter().filter(|(key, _)| {
+        !matches!(key.as_str(), DECLARED_COLUMNS | ADOPTED_HISTORY_METADATA)
+    });
+    let overflow = || invalid("Replica schema metadata exceeds addressable memory");
+    let descriptors = batch.num_columns().checked_mul(2 * size_of::<ArrayRef>())
+        .and_then(|bytes| bytes.checked_add(2 * size_of::<RecordBatch>() + size_of::<Schema>() + 128))
+        .ok_or_else(overflow)?;
+    let entry_bound = 4 * (size_of::<(String, String)>() + 1);
+    let bytes = retained.clone().try_fold(descriptors, |bytes, (key, value)| {
+        bytes.checked_add(entry_bound)
+            .and_then(|bytes| bytes.checked_add(key.len()))
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(overflow)
+    })?;
+    let reservation = page.reservation().budget().reserve(bytes)?;
+    let mut metadata = HashMap::with_capacity(schema.metadata().len() - removed);
+    metadata.extend(retained.map(|(key, value)| (key.clone(), value.clone())));
+    let schema = Arc::new(Schema::new_with_metadata(schema.fields().clone(), metadata));
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    let rows = RecordBatch::try_new_with_options(schema, batch.columns().to_vec(), &options)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(page.with_retained_buffers(rows).with_schema_reservation(reservation))
+}
+
 fn check_adoption_publication(tables: &BTreeMap<TableRef, TableWrite>, key: TransactionKey, memory: &Arc<MemoryBudget>) -> Result<()> {
     let Some((table, _)) = tables.iter().find(|(table, write)| write.is_adopted_history() && table.is_owned_event_data())
     else { return Ok(()); };
@@ -341,6 +362,10 @@ fn verify_archive_replay(
     {
         return Err(mismatch());
     }
+    let rank = binding(&replay.rank_locator())?.map(|body| {
+        crate::hosted_control::replay_rank::ReplayRank::decode(&body, &replay)
+    }).transpose()?;
+    crate::hosted_control::replay_rank::verify(rank.as_ref(), tables, key, memory)?;
     let mut positions: BTreeSet<_> = replay.commit_positions().iter().copied().collect();
     if let Some(omissions) = binding(&replay.world_omissions_locator())? {
         if omissions.is_empty() || omissions.len() / 20 > positions.len() {
@@ -538,7 +563,7 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.tx/inva
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtdb_format::data::StoredEvent;
+    use rtdb_format::data::{StoredEvent, owned_event_batch};
     use rtdb_index::{PartitionState, TransactionBuffer};
     use rtdb_types::{EntityId, Iid, OwnedRelation};
 
@@ -570,6 +595,8 @@ mod tests {
         };
         frame.table_data.insert(table.schema_and_table(), bytes.into_parts().0);
         let replayed = decode_replica(&frame, None, staged.block_index(), &memory)?;
+        let replayed_batch = replayed.writes.tables()[&table].batch().unwrap();
+        assert!(!replayed_batch.arrow().schema_ref().metadata().contains_key(DECLARED_COLUMNS));
         state.apply(&replayed.writes)?;
         let snapshot = state.snapshot();
         assert!(snapshot.column_types(&table).contains_key("row_only"));
@@ -578,6 +605,106 @@ mod tests {
         let blocks = prepared.table_blocks(&BTreeMap::new(), key.system_time)?;
         let reopened = rtdb_format::catalog::TableBlock::decode(&blocks[&table].encode())?;
         assert_eq!(&reopened.declared_columns()?, write.declared_columns());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_metadata_stripping_retains_decoded_arrays_and_their_charge() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let event = StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: None,
+            iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+            operation: StoredOperation::Delete, recency: None,
+        };
+        let page = owned_event_batch(&[event], None, false, &memory)?;
+        let retained_metadata = HashMap::from([("retained".to_owned(), "value".to_owned())]);
+        let mut metadata = retained_metadata.clone();
+        metadata.insert(DECLARED_COLUMNS.into(), "{}".into());
+        metadata.insert(ADOPTED_HISTORY_METADATA.into(), "1".into());
+        let source = page.batch();
+        let schema = Schema::new_with_metadata(source.schema_ref().fields().clone(), metadata);
+        let source = source.clone().with_schema(Arc::new(schema)).unwrap();
+        let bytes = crate::ipc::encode(source.schema_ref(), [&source], &memory)?.into_bytes();
+
+        let replay_memory = MemoryBudget::new(memory.limit_bytes());
+        let decoded = crate::ipc::decode(&bytes, &replay_memory)?.pop().unwrap();
+        let arrays = decoded.batch().columns().to_vec();
+        let fields = decoded.batch().schema_ref().fields().clone();
+        let decoded_bytes = replay_memory.used_bytes();
+        let batch = IndexBatch::from_owned(strip_replay_metadata(decoded)?)?;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.arrow().schema_ref().metadata(), &retained_metadata);
+        assert_eq!(batch.arrow().schema_ref().fields(), &fields);
+        assert!(batch.arrow().columns().iter().zip(&arrays).all(|(after, before)| Arc::ptr_eq(after, before)));
+        assert!(replay_memory.used_bytes() > decoded_bytes + IndexBatch::header_bytes(1)?);
+
+        drop(fields);
+        drop(batch);
+        assert_eq!(replay_memory.used_bytes(), decoded_bytes);
+        drop(arrays);
+        assert_eq!(replay_memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn full_and_held_replay_check_borrowed_owned_keys_in_order() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let table = OwnedRelation::new("locations")?.table("owner");
+        let identity = EntityId::Binary(vec![0, 255, 0]);
+        let other = EntityId::Binary(vec![0, 255, 1]);
+        let handle = identity.handle_bytes();
+        let iid = identity.iid();
+        let wrong_iid = other.iid();
+        let malformed = Some(("rtdb.owned/invalid-handle", "Invalid complete typed identity"));
+        let invalid_transaction = "rtdb.tx/invalid-replica-transaction";
+        let cases = [
+            (handle.as_slice(), iid, &identity, None),
+            (&[][..], wrong_iid, &other, malformed),
+            (&[5][..], wrong_iid, &other, malformed),
+            (&[0, 255][..], wrong_iid, &other, malformed),
+            (&[1, 255][..], wrong_iid, &other, malformed),
+            (&[2, 0][..], wrong_iid, &other, malformed),
+            (&[3, 0][..], wrong_iid, &other, malformed),
+            (handle.as_slice(), wrong_iid, &other, Some((invalid_transaction, "Resolved owned event locality differs from its complete key"))),
+            (handle.as_slice(), iid, &other, Some((invalid_transaction, "Resolved owned put differs from its complete identity"))),
+        ];
+        for (encoded, iid, document_id, expected) in cases {
+            let value = document_id.as_value();
+            let fields = StructFields::from([("_id".into(), value.logical_type())]);
+            let event = StoredEvent {
+                position: None, origin: None, commit_position: 1,
+                entity_key: Some(bytes::Bytes::copy_from_slice(encoded)),
+                iid, system_from: Timestamp(10), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), value)])),
+                recency: None,
+            };
+            let page = owned_event_batch(&[event], Some(fields), false, &memory)?;
+            let batch = page.batch();
+            let bytes = crate::ipc::encode(batch.schema_ref(), [batch], &memory)?.into_bytes();
+            let decoded_bytes = crate::ipc::decode(&bytes, &memory)?[0].reservation().bytes();
+            let mut frame = ResolvedTx {
+                tx_id: Some(1), src_msg_id: Some(1), system_time_micros: Some(10),
+                committed: Some(true), ..Default::default()
+            };
+            frame.table_data.insert(table.schema_and_table(), bytes);
+            for held in [false, true] {
+                let budget = MemoryBudget::new(decoded_bytes + IndexBatch::header_bytes(1)?);
+                let replayed = if held {
+                    decode_held_replica(&frame, None, BlockIndex(0), &budget)
+                } else {
+                    decode_replica(&frame, None, BlockIndex(0), &budget)
+                };
+                if let Some((code, message)) = expected {
+                    let error = replayed.err().expect("Expected replica validation failure");
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.message.as_deref(), Some(message));
+                } else {
+                    let replayed = replayed?;
+                    let batch = replayed.writes.tables()[&table].batch().unwrap();
+                    assert_eq!(batch.view().entity_key(0)?, Some(encoded));
+                }
+            }
+        }
         Ok(())
     }
 

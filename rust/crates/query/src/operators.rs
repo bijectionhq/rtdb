@@ -291,28 +291,30 @@ async fn build_batches_at(
         }
         RelationNode::Mark { arguments, condition, comparison, .. } => {
             let child = runtime.child(0)?;
-            let schema = child.schema().clone();
+            let schema = child.output();
             let dependent = runtime.child(1)?;
             let comparison = match condition {
                 Some(condition) => Expr::Case { branches: vec![(condition.clone(), comparison.clone())],
                     otherwise: Box::new(Expr::Literal(Value::Bool(false))) },
                 None => comparison.clone(),
             };
-            let comparison_schema = schema.concat(dependent.schema())?;
+            let comparison_schema = schema.schema().concat(dependent.schema())?;
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
-            let plan = BatchApplyPlan { schema, dependent, arguments: arguments.clone(), kind: ApplyKind::Mark,
+            let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
+            let plan = BatchApplyPlan { dependent, arguments, kind: ApplyKind::Mark,
                 document_field: None, comparison: Some((comparison, comparison_schema)), execution };
             let apply = BatchApply { input, plan };
             Ok(Some((Box::new(apply), projected)))
         }
         RelationNode::Apply { arguments, kind, .. } => {
             let child = runtime.child(0)?;
-            let schema = child.schema().clone();
+            let schema = child.output();
             let dependent = runtime.child(1)?;
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let document_field = matches!(kind, ApplyKind::Pull | ApplyKind::PullMany)
                 .then(|| runtime.schema().fields().last().cloned()).flatten();
-            let plan = BatchApplyPlan { schema, dependent, arguments: arguments.clone(), kind: *kind, document_field, comparison: None, execution };
+            let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
+            let plan = BatchApplyPlan { dependent, arguments, kind: *kind, document_field, comparison: None, execution };
             let apply = BatchApply { input, plan };
             Ok(Some((Box::new(apply), projected)))
         }
@@ -1032,9 +1034,8 @@ struct BatchApply {
 }
 
 struct BatchApplyPlan {
-    schema: Schema,
     dependent: Arc<EmittedRelation>,
-    arguments: Vec<(usize, Expr)>,
+    arguments: crate::context::ApplyArguments,
     kind: ApplyKind,
     document_field: Option<rtdb_plan::Field>,
     comparison: Option<(Expr, Schema)>,
@@ -1043,7 +1044,7 @@ struct BatchApplyPlan {
 
 impl BatchApplyPlan {
     async fn bind(&self, batch: &Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Execution> {
-        self.execution.bind_arrow_arguments(&self.arguments, &self.schema, Arc::clone(batch), row).await
+        self.arguments.bind(&self.execution, Arc::clone(batch), row).await
     }
 
     async fn dependent_batches(&self, batch: &Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<crate::columnar::BoxBatchCursor> {

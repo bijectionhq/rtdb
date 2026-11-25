@@ -23,6 +23,7 @@ use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catal
 use crate::logs::{APPEND_CAPACITY, DecodedReplica, PartitionReplay, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
+use crate::recovery_promotion::{WriterActivation, writer_activation};
 use crate::state::fail_pending;
 use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, SourceRequest};
 use crate::checkpoint_admin::{PinControl, ReleaseControl};
@@ -450,6 +451,7 @@ async fn pending_production(production: &mut Option<Production>) -> ProductionRe
 
 struct LeaderState {
     term: Term, resolver: Option<TxResolver>, resolution: Option<Resolution>, production: Option<Production>, confirmed: bool,
+    activation: WriterActivation,
     recovery_write: Option<Arc<PendingWrite>>,
     held: VecDeque<AdmittedReplica>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<PartitionReplay>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
@@ -498,7 +500,7 @@ impl LeaderState {
     fn resolver(&self) -> Result<&TxResolver> { self.resolver.as_ref().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn resolver_mut(&mut self) -> Result<&mut TxResolver> { self.resolver.as_mut().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn can_poll_source(&self) -> bool {
-        self.recovery_write.is_none() && self.cycle.accepting() && !self.pending_strict_write()
+        self.activation.is_active() && self.recovery_write.is_none() && self.cycle.accepting() && !self.pending_strict_write()
             && self.awaiting_placed.is_none() && !self.settling_placed
     }
     fn pending_strict_write(&self) -> bool {
@@ -1084,11 +1086,13 @@ impl ReplicationDriver {
         let confirmed = recovery_write.is_none() && !produce_inherited;
         let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
-            production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
+            production: None, confirmed, activation: writer_activation(self.logs.fences_writer_terms()),
+            recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
             pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
         if produce_inherited {
             self.produce_pending()?;
         }
+        self.activate_installed_writer();
         self.publish_status(self.role());
         Ok(())
     }
@@ -1112,7 +1116,17 @@ impl ReplicationDriver {
         }
         Ok(VecDeque::new())
     }
-    fn role(&self) -> Role { self.leader.as_ref().filter(|leader| leader.confirmed).map_or(Role::Following, |leader| Role::Leading(leader.term)) }
+    fn activate_installed_writer(&mut self) {
+        if let Some(leader) = &mut self.leader {
+            leader.activation = leader.activation.installed(leader.confirmed, self.recognized_prefix,
+                self.read_position.0, self.installed.map(|prefix| prefix.replica.0));
+        }
+    }
+
+    fn role(&self) -> Role {
+        self.leader.as_ref().filter(|leader| leader.confirmed && leader.activation.is_active())
+            .map_or(Role::Following, |leader| Role::Leading(leader.term))
+    }
     fn publish_status(&self, role: Role) {
         let value = self.partition.value();
         let (promotion_failure, last_block_upload_epoch_seconds) = { let status = self.status.borrow(); (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds) };
@@ -1134,6 +1148,10 @@ impl ReplicationDriver {
         ) {
             let through = ReplicaPosition(through);
             let checkpoint = self.partition.value();
+            let progress = self.progress.current();
+            if self.logs.fences_writer_terms() && checkpoint.live().latest_completed_tx() != progress.tx_key {
+                return Err(invalid("Installed replica state and transaction progress disagree"));
+            }
             if self.track_catalog_cut && checkpoint.table_catalog().block().is_none_or(|block| {
                 block.boundary_replica_position().is_some_and(|boundary| {
                     boundary.after_offset(self.logs.replica_epoch) >= 0 && boundary <= through
@@ -1150,7 +1168,7 @@ impl ReplicationDriver {
                     serving.publish_ranked_catalog(catalog);
                 }
             }
-            let source = self.progress.current().source_position;
+            let source = progress.source_position;
             self.logs.record_source_applied(source);
             self.installed = Some(InstalledPrefix { replica: through, source });
             if let Some(leader) = &mut self.leader
@@ -1160,6 +1178,7 @@ impl ReplicationDriver {
                 leader.compactor_reset.take().expect("matched reset block").complete();
             }
         }
+        self.activate_installed_writer();
         self.complete_trie_removals();
         Ok(())
     }
@@ -1221,6 +1240,9 @@ impl ReplicationDriver {
                 // The protobuf body can be omitted or too new for this reader to recognize.
                 if self.logs.is_copied_replica_position(position) {
                     return Err(invalid("The held transfer contains an unrecognized replica frame"));
+                }
+                if self.logs.fences_writer_terms() && self.leader.is_some() {
+                    return Err(invalid("The current writer cannot apply an unrecognized replica frame"));
                 }
                 self.recognized_prefix = false;
                 self.read_position = position;
@@ -2075,7 +2097,7 @@ impl ReplicationDriver {
     fn drive_placed_slot(&mut self) -> Result<()> {
         let Some(slot) = self.placed_slot else { return Ok(()); };
         let Some(leader) = &mut self.leader else { return Ok(()); };
-        if !leader.confirmed || leader.settling_placed || leader.resolution.is_some()
+        if !leader.confirmed || !leader.activation.is_active() || leader.settling_placed || leader.resolution.is_some()
             || !leader.drained_for_strict_source() || self.pending_block.is_some()
         {
             return Ok(());

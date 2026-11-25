@@ -618,6 +618,11 @@ contract SealedDerivedSearchSegments {
     -- A derived segment can be partially inverted back to its source text, so it carries its source's protection and is erased with it.
     -- Bijection writes the protected text of a labelled partition into its own derived search relation (`<partition>_search`), in the same commit as the sealed source row, and erases its rows with the source.
 
+    @invariant HeldOriginalRootRank
+        -- Held replay preserves the ordinary Root derivative address and typed rank fields under destination storage custody.
+        -- Each withdrawn derivative keeps only its certified Original residue and the complete erase floor and relation marker.
+        -- A family selector or World projection requires its own family-owner succession and current release fence.
+
     @invariant OneLabelSetPerSegment
         -- A caller that labels rows places each label set in its own relation, and a search path is declared per relation.
         -- A run, a term directory and a vector column cover the events of one relation only, so each derived segment holds entries of exactly one label set.

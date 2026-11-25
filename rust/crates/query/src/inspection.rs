@@ -108,7 +108,7 @@ impl BatchCursor for InspectionCursor {
         let input = self.input.as_mut().ok_or_else(|| invalid("inspection-state", "Inspection cursor has no input"))?;
         let limit = self.execution.context.options.batch_rows;
         if input.supports_arrow() {
-            let Some(batch) = input.next_arrow(limit).await? else { self.done = true; self.input = None; return Ok(None); };
+            let Some(batch) = input.next_arrow_projected(limit, &self.scan.columns).await? else { self.done = true; self.input = None; return Ok(None); };
             let record = batch.batch();
             let columns = self.scan.columns.iter().map(|field| {
                 match record.schema_ref().column_with_name(&field.name) {

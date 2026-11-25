@@ -561,7 +561,8 @@ variant TxMessage : SourceMessage {
     -- Coalescing those documents uses submitted field presence and type order to preserve the source layout.
     -- Compatible numeric list columns are coalesced from their submitted Arrow buffers in that layout.
     -- Embedded Transit delete and erase arguments retain their ID column in the row writer's source layout, with the request order and valid-time bounds.
-    -- Pgwire Transit COPY constructs Arrow document pages for compatible layouts and joins them in input order into one source operation.
+    -- Pgwire Transit COPY builds compatible Arrow page columns from ordered field entries and fills omitted cells with nulls.
+    -- Pgwire Transit COPY joins those pages in input order into one document struct for the source operation.
     -- The source operation preserves the submitted document layout and the original document data used in rejection diagnostics.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
@@ -1223,7 +1224,9 @@ rule LeaderProcessesTx {
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
+        -- A SQL put can retain a complete scalar Arrow column when it encodes the same document bytes as canonical staging.
         -- An ordered put run retains a common Arrow struct layout across the dense union legs that supply its documents.
+        -- Alternating put runs admit each Arrow source once and admit payload by the selected row positions.
         -- A batch can combine different put layouts while retaining the declarations of their original layouts.
         -- PATCH gap filling preserves the ordered valid-time pages and selects compatible document vectors.
         -- PATCH projects independently over distinct pairs of old and patch struct layouts.
@@ -2207,6 +2210,8 @@ surface QueryAccess {
 
     @guarantee ColumnarScanProjection
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.
+        -- A projection that shares input buffers retains their original charges through aliases, struct children, and assembled records.
+        -- The projection admits its own copied values, descriptors, and validity storage.
         -- System catalog and inspection scans batch their produced rows at the scan boundary.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
@@ -2268,6 +2273,7 @@ surface QueryAccess {
         -- A compatible cast to nullable or union list elements checks the types observed in the selected input.
         -- Text conversion of packed numeric lists renders the selected typed components into one text buffer.
         -- Compatible Boolean expressions select rows or produce a result vector directly from Arrow inputs, including selections across multiple source vectors.
+        -- Direct predicate comparisons keep their computed arithmetic operands in admitted Arrow buffers from construction through comparison.
         -- Checked numeric arithmetic can produce a result vector from selected Arrow positions with a compatible physical type.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.

@@ -1,13 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Int32Array, MapArray, NullArray, TimestampMicrosecondArray, UnionArray, cast::AsArray, make_array,
     types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
-use arrow_data::ArrayData;
+use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_columnar::{BatchBuilder, ColumnPresence, EXTENSION_NAME_KEY, copy_event_cells, estimate_event_copy_cell_bytes,
     estimate_event_null_cell_bytes, from_field, pack_runs};
-use rtdb_types::{Anomaly, ListKind, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit};
+use rtdb_types::{Anomaly, ListKind, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
 
 use super::{EncodedEvent, PutColumn, event_size};
 
@@ -18,13 +18,54 @@ enum Cell<'a> {
     Undefined,
 }
 
+fn read_size_ceiling(field: &Field) -> Option<usize> {
+    // SLOT dominates the fixed charges in estimate_read_cell_bytes, including each struct entry and sequence element.
+    const SLOT: usize = 1024 + 32 * (std::mem::size_of::<Value>() + std::mem::size_of::<String>());
+    const OFFSET_LIMIT: usize = i32::MAX as usize;
+    let sequence = |child, count: usize| {
+        read_size_ceiling(child)?.checked_add(SLOT)?.checked_mul(count)?.checked_add(SLOT)
+    };
+    let payload = match field.data_type() {
+        DataType::Null if !field.is_nullable() => return None,
+        DataType::Null | DataType::Boolean => 0,
+        DataType::Utf8 | DataType::Binary => OFFSET_LIMIT.checked_mul(2)?,
+        DataType::FixedSizeBinary(width) => usize::try_from(*width).ok()?.checked_mul(2)?,
+        DataType::Timestamp(_, zone) => zone.as_ref().map_or(0, |zone| zone.len()),
+        DataType::List(child) | DataType::Map(child, _) => sequence(child, OFFSET_LIMIT)?,
+        DataType::FixedSizeList(child, width) => sequence(child, usize::try_from(*width).ok()?)?,
+        DataType::RunEndEncoded(_, child) => read_size_ceiling(child)?,
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().try_fold(0usize, |max, (_, child)| {
+            Some(max.max(read_size_ceiling(child)?))
+        })?,
+        DataType::Struct(fields) => fields.iter().try_fold(0usize, |total, child| {
+            total.checked_add(SLOT)?.checked_add(child.name().len().checked_mul(2)?)?
+                .checked_add(read_size_ceiling(child)?)
+        })?,
+        ty if ty.primitive_width().is_some() => 64,
+        _ => return None,
+    };
+    SLOT.checked_add(payload)
+}
+
 pub(super) fn column<E: EncodedEvent>(
     events: &[&E], target: &Field, logical: &LogicalType, builder: Option<&mut BatchBuilder>,
+    preflight_scalar_read: impl FnOnce() -> Result<()>,
 ) -> Result<Option<ArrayRef>> {
-    if events.is_empty() || events.iter().any(|event| event.put_column(target.name()).is_none()) {
-        return Ok(None);
-    }
+    if events.is_empty() { return Ok(None); }
     let reserved = builder.is_some();
+    let mut defer_read_size = reserved;
+    let mut previous = None;
+    let limit = usize::MAX / events.len();
+    for event in events {
+        let Some(column) = event.put_column(target.name()) else { return Ok(None); };
+        if defer_read_size && let PutColumn::Stored(field, array, row) = column {
+            let key = std::ptr::from_ref(field);
+            defer_read_size = row < array.len() && field.data_type() == array.data_type()
+                && (previous == Some(key) || read_size_ceiling(field).is_some_and(|bytes| bytes <= limit));
+            previous = Some(key);
+        }
+    }
+    if reserved && !defer_read_size { preflight_scalar_read()?; }
     let mismatch = |row| {
         let message = if reserved {
             "Allocation estimate requires values belonging to the declared logical type".into()
@@ -146,8 +187,81 @@ fn has_packed_null_payload(item: &Field, values: &dyn Array, start: usize, end: 
     }
 }
 
-// The packed writer keeps the actual union tag and the bits of an invalid numeric slot.
-fn packed_children(item: &Field, cells: &[Cell<'_>], width: Option<usize>) -> Result<Option<ArrayRef>> {
+fn exact_packed_children(item: &Field, cells: &[Cell<'_>], width: Option<usize>, length: usize) -> Option<ArrayRef> {
+    let mut sources = Vec::new();
+    let mut slots = HashMap::new();
+    let mut spans: Vec<(Option<usize>, Range<usize>)> = Vec::new();
+    let mut masked = false;
+    for &cell in cells {
+        if let Cell::Stored(source, array, row) = cell {
+            let (source, values, start, end) = list_span(source, array, row);
+            if !rtdb_types::ListValue::supports_numeric_arrow(source) { return None; }
+            if start == end { continue; }
+            if source.data_type() != item.data_type() || source.metadata() != item.metadata() { return None; }
+            let slot = Some(*slots.entry(std::ptr::from_ref(values)).or_insert_with(|| {
+                let slot = sources.len();
+                sources.push(values);
+                slot
+            }));
+            if let Some((previous, range)) = spans.last_mut() && *previous == slot && range.end == start {
+                range.end = end;
+            } else {
+                spans.push((slot, start..end));
+            }
+        } else if let Some(width) = width.filter(|width| *width != 0) {
+            masked = true;
+            spans.push((None, 0..width));
+        }
+    }
+    if let [(Some(slot), range)] = spans.as_slice() {
+        let slice = sources[*slot].slice(range.start, range.len());
+        if reusable_packed_child(slice.as_ref()) { return Some(slice); }
+    }
+    if sources.is_empty() { return Some(arrow_array::new_null_array(item.data_type(), length)); }
+    let sources = sources.iter().map(|source| source.to_data()).collect::<Vec<_>>();
+    // MutableArrayData reserves the given capacity for every union leg.
+    let capacity = if matches!(item.data_type(), DataType::Union(..)) { 0 } else { length };
+    let mut child = MutableArrayData::new(sources.iter().collect(), masked, capacity);
+    for (source, range) in spans {
+        match source {
+            Some(slot) => child.extend(slot, range.start, range.end),
+            None => child.extend_nulls(range.len()),
+        }
+    }
+    Some(make_array(child.freeze()))
+}
+
+fn reusable_packed_child(array: &dyn Array) -> bool {
+    let fits = |buffer: &arrow_buffer::Buffer, bytes: usize| {
+        buffer.len() >= bytes && (bytes..=bytes.saturating_add(63)).contains(&buffer.capacity())
+    };
+    let data = array.to_data();
+    if let DataType::Union(fields, UnionMode::Dense) = data.data_type() {
+        if !fits(&data.buffers()[0], array.len()) || !fits(&data.buffers()[1], array.len() * 4) { return false; }
+        let union = array.as_union();
+        let mut lengths = [0; 128];
+        for (&tag, &offset) in union.type_ids().iter().zip(union.offsets().expect("Dense union offsets").iter()) {
+            let length = &mut lengths[tag as usize];
+            if offset != *length { return false; }
+            *length += 1;
+        }
+        return fields.iter().all(|(tag, _)| {
+            let child = union.child(tag);
+            child.len() == lengths[tag as usize] as usize && reusable_packed_child(child.as_ref())
+        });
+    }
+    if let Some(width) = data.data_type().primitive_width()
+        && !fits(&data.buffers()[0], array.len() * width) { return false; }
+    array.nulls().is_none_or(|nulls| {
+        let bytes = array.len().div_ceil(8);
+        let tail = array.len() % 8;
+        // A retained validity bitmap must serialize the same zero padding as a fresh gather.
+        nulls.offset() == 0 && fits(nulls.buffer(), bytes)
+            && (tail == 0 || nulls.buffer().as_slice()[bytes - 1] >> tail == 0)
+    })
+}
+
+fn relayout_packed_children(item: &Field, cells: &[Cell<'_>], width: Option<usize>) -> Result<Option<ArrayRef>> {
     let mut chunks = Vec::with_capacity(cells.len());
     for &cell in cells {
         match cell {
@@ -421,24 +535,6 @@ fn gather(target: &Field, cells: &[Cell<'_>]) -> Result<Option<ArrayRef>> {
         }
         DataType::List(item) | DataType::FixedSizeList(item, _) | DataType::Map(item, _) => {
             let width = match target.data_type() { DataType::FixedSizeList(_, width) => Some(*width as usize), _ => None };
-            let mut children = Vec::new();
-            let mut offsets = vec![0];
-            let mut valid = NullBufferBuilder::new(cells.len());
-            for &cell in cells {
-                match cell {
-                    Cell::Stored(field, array, index) => {
-                        let (field, array, start, end) = list_span(field, array, index);
-                        children.extend((start..end).map(|index| select(field, array, index)));
-                        valid.append_non_null();
-                    }
-                    Cell::Null | Cell::Undefined => {
-                        children.extend(std::iter::repeat_n(Cell::Undefined, width.unwrap_or(0)));
-                        valid.append_null();
-                    }
-                }
-                offsets.push(i32::try_from(children.len())
-                    .map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
-            }
             let packed = !target.metadata().contains_key(EXTENSION_NAME_KEY) && rtdb_types::ListValue::supports_numeric_arrow(item)
                 && cells.iter().any(|&cell| match cell {
                     Cell::Stored(field, array, row) => {
@@ -447,9 +543,37 @@ fn gather(target: &Field, cells: &[Cell<'_>]) -> Result<Option<ArrayRef>> {
                     }
                     _ => false,
                 });
+            let mut children = Vec::new();
+            let mut offsets = vec![0i32];
+            let mut length = 0i32;
+            let mut valid = NullBufferBuilder::new(cells.len());
+            for &cell in cells {
+                let added = match cell {
+                    Cell::Stored(field, array, index) => {
+                        let (field, array, start, end) = list_span(field, array, index);
+                        if !packed { children.extend((start..end).map(|index| select(field, array, index))); }
+                        valid.append_non_null();
+                        end - start
+                    }
+                    Cell::Null | Cell::Undefined => {
+                        if !packed { children.extend(std::iter::repeat_n(Cell::Undefined, width.unwrap_or(0))); }
+                        valid.append_null();
+                        width.unwrap_or(0)
+                    }
+                };
+                let overflow = || Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets");
+                let offset = i32::try_from(added).map_err(|_| overflow())?;
+                length = length.checked_add(offset).ok_or_else(overflow)?;
+                if width.is_none() { offsets.push(length); }
+            }
             let child = if packed {
-                let Some(child) = packed_children(item, cells, width)? else { return Ok(None); };
-                child
+                match exact_packed_children(item, cells, width, length as usize) {
+                    Some(child) => child,
+                    None => {
+                        let Some(child) = relayout_packed_children(item, cells, width)? else { return Ok(None); };
+                        child
+                    }
+                }
             } else {
                 let Some(child) = gather(item, &children)? else { return Ok(None); };
                 child
@@ -701,6 +825,86 @@ mod tests {
     }
 
     #[test]
+    fn packed_fixed_lists_compact_sliced_unions_and_pad_masked_children() {
+        use arrow_array::{Float32Array, Float64Array};
+        use arrow_buffer::NullBuffer;
+
+        let item = LogicalType::from_legs([LogicalType::Scalar(ScalarType::F32), LogicalType::Scalar(ScalarType::F64), LogicalType::Null]);
+        let ty = LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(item) }.maybe();
+        let field = to_field("v", &ty).unwrap();
+        let DataType::FixedSizeList(item, 2) = field.data_type() else { unreachable!() };
+        let DataType::Union(legs, _) = item.data_type() else { unreachable!() };
+        let payload = 0x7ff8_0000_0000_0042;
+        let numbers = UnionArray::try_new(legs.clone(), vec![0, 0, 1, 0, 2, 1, 0, 1].into(),
+            Some(vec![2, 0, 1, 1, 0, 0, 0, 1].into()), vec![
+                Arc::new(Float32Array::from(vec![-0.0, 7.0, 9.0])),
+                Arc::new(Float64Array::new(vec![3.0, f64::from_bits(payload)].into(), Some(NullBuffer::from(vec![true, false])))),
+                Arc::new(NullArray::new(1)),
+            ]).unwrap();
+        let values = make_array(ArrayData::builder(field.data_type().clone()).len(4)
+            .add_child_data(numbers.to_data()).nulls(Some(NullBuffer::from(vec![true, true, false, true])))
+            .build().unwrap()).slice(1, 3);
+        let events = [
+            ArrowOnly(PutColumn::Stored(&field, values.as_ref(), 2)),
+            ArrowOnly(PutColumn::Stored(&field, values.as_ref(), 1)),
+            ArrowOnly(PutColumn::Stored(&field, values.as_ref(), 0)),
+            ArrowOnly(PutColumn::Absent),
+        ];
+        let expected = [2, 1, 0].into_iter().map(|row| rtdb_columnar::read_value(&field, values.as_ref(), row).unwrap())
+            .chain([Value::Null]).collect();
+        assert_same_ipc(&events, expected, ty);
+    }
+
+    #[test]
+    fn adjacent_packed_lists_reuse_compact_numeric_buffers() {
+        use arrow_array::{Int64Array, ListArray};
+        use arrow_buffer::NullBuffer;
+
+        let ty = LogicalType::list(LogicalType::Scalar(ScalarType::I64).maybe());
+        let field = to_field("v", &ty).unwrap();
+        let DataType::List(item) = field.data_type() else { unreachable!() };
+        let numbers = Int64Array::new(vec![4, i64::MIN, 7].into(), Some(NullBuffer::from(vec![true, false, true])));
+        let lists = ListArray::try_new(Arc::clone(item), OffsetBuffer::new(vec![0i32, 2, 3].into()), Arc::new(numbers.clone()), None).unwrap();
+        let cells = [Cell::Stored(&field, &lists, 0), Cell::Stored(&field, &lists, 1)];
+        let gathered = gather(&field, &cells).unwrap().unwrap();
+        let child = gathered.as_list::<i32>().values().as_primitive::<Int64Type>();
+        assert_eq!(child.values().inner().data_ptr(), numbers.values().inner().data_ptr());
+        assert_eq!(child.values().as_ref(), &[4, i64::MIN, 7]);
+        assert!(child.is_null(1));
+    }
+
+    #[test]
+    fn packed_children_relayout_legacy_union_tags_to_the_declared_order() {
+        use arrow_array::{Float32Array, Float64Array};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::UnionFields;
+
+        let item_type = LogicalType::from_legs([LogicalType::Scalar(ScalarType::F32), LogicalType::Scalar(ScalarType::F64), LogicalType::Null]);
+        let ty = LogicalType::list(item_type);
+        let target = to_field("v", &ty).unwrap();
+        let DataType::List(item) = target.data_type() else { unreachable!() };
+        let DataType::Union(legs, _) = item.data_type() else { unreachable!() };
+        let legacy = UnionFields::try_new([8, 2, 7], [2, 1, 0].map(|index| Arc::clone(&legs.get(index).unwrap().1))).unwrap();
+        let payload = 0x7ff8_0000_0000_0042;
+        let values = UnionArray::try_new(legacy, vec![2, 7].into(), Some(vec![0, 0].into()), vec![
+            Arc::new(NullArray::new(0)),
+            Arc::new(Float64Array::new(vec![f64::from_bits(payload)].into(), Some(NullBuffer::new_null(1)))),
+            Arc::new(Float32Array::from(vec![-0.0])),
+        ]).unwrap();
+        let legacy_type = DataType::List(Arc::new(item.as_ref().clone().with_data_type(values.data_type().clone())));
+        let source = Field::new("v", legacy_type.clone(), false);
+        let values = make_array(ArrayData::builder(legacy_type).len(1)
+            .add_buffer(ScalarBuffer::from(vec![0i32, 2]).into_inner()).add_child_data(values.to_data()).build().unwrap());
+        let result = gather(&target, &[Cell::Stored(&source, values.as_ref(), 0)]).unwrap().unwrap();
+        let child = result.as_list::<i32>().values().as_union();
+        assert_eq!(child.type_ids().as_ref(), &[1, 0]);
+        assert_eq!(child.offsets().unwrap().as_ref(), &[0, 0]);
+        assert_eq!(child.child(1).as_primitive::<Float64Type>().value(0).to_bits(), payload);
+        assert!(child.child(1).is_null(0));
+        assert_eq!(child.child(0).as_primitive::<Float32Type>().value(0).to_bits(), (-0.0f32).to_bits());
+    }
+
+    #[test]
     fn timestamp_ranges_read_raw_endpoint_ticks_from_selected_legs() {
         use arrow_array::{FixedSizeListArray, TimestampNanosecondArray};
         use arrow_schema::{TimeUnit as ArrowUnit, UnionFields};
@@ -765,6 +969,18 @@ mod tests {
     }
 
     #[test]
+    fn native_selection_defers_scalar_sizing_for_a_bounded_layout() {
+        let ty = LogicalType::list(LogicalType::Scalar(ScalarType::I64));
+        let field = to_field("v", &ty).unwrap();
+        let values = copy_array(&ty, &[Value::list(vec![Value::I64(1)])]).unwrap();
+        let event = ArrowOnly(PutColumn::Stored(&field, values.as_ref(), 0));
+        let memory = MemoryBudget::new(1 << 20);
+        let mut builder = BatchBuilder::new(0, &memory).unwrap();
+        let output = column(&[&event], &field, &ty, Some(&mut builder), || panic!("Scalar sizing is for fallback"));
+        assert!(output.unwrap().is_some());
+    }
+
+    #[test]
     fn widening_structs_inside_runs_preserves_distinct_document_shapes() {
         let payload = Value::Map {
             entries: vec![(Value::I64(1), Value::list(vec![Value::F64(-0.0)]))],
@@ -805,5 +1021,23 @@ mod tests {
         let scalar = rtdb_columnar::read_value(&field, &array, 0).unwrap_err();
         let typed = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap_err();
         assert_eq!((typed.code, typed.message), (scalar.code, scalar.message));
+    }
+
+    #[test]
+    fn scalar_sizing_errors_precede_native_read_errors() {
+        let target = LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(LogicalType::Scalar(ScalarType::I64)) };
+        let fields = StructFields::from([("v".into(), target)]);
+        let uri = to_field("v", &LogicalType::Scalar(ScalarType::Uri)).unwrap();
+        let invalid_uri = arrow_array::StringArray::from(vec!["bad uri"]);
+        let bottom = to_field("v", &LogicalType::Nothing).unwrap();
+        let nulls = NullArray::new(1);
+        let events = [
+            ArrowOnly(PutColumn::Stored(&uri, &invalid_uri, 0)),
+            ArrowOnly(PutColumn::Stored(&bottom, &nulls, 0)),
+        ];
+        let memory = MemoryBudget::new(1 << 20);
+        let error = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap_err();
+        assert_eq!(error.code, "xtdb/zero-leg-read");
+        assert_eq!(error.message.as_deref(), Some("The bottom type has no values to read"));
     }
 }

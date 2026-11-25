@@ -1,20 +1,42 @@
 use std::sync::{Arc, OnceLock};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_types::{LogicalType, Result, Value};
+use rtdb_types::{AllocationScope, LogicalType, Result, Value};
 
 use crate::{cursor::OwnedRow, invalid};
 
 pub struct BoundParameters {
     input: Input,
+    types: Arc<ParameterTypes>,
+}
+
+pub(crate) struct ParameterTypes {
     types: Vec<LogicalType>,
     _reservation: Arc<MemoryReservation>,
+}
+
+impl ParameterTypes {
+    fn new(types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let reservation = memory.reserve(type_bytes(&types)?)?;
+        Ok(Arc::new(Self { types, _reservation: reservation }))
+    }
+
+    pub(crate) fn from_scope(types: Vec<LogicalType>, scope: AllocationScope) -> Result<Arc<Self>> {
+        let bytes = type_bytes(&types)?;
+        let mut reservation = scope.into_reservation()?.expect("Parameter type scope admitted the layout");
+        Arc::get_mut(&mut reservation).expect("Parameter type scope owns its reservation").shrink_to(bytes)?;
+        Ok(Arc::new(Self { types, _reservation: reservation }))
+    }
 }
 
 enum Input {
     Row(OwnedRow),
     Arrow(ArrowRow),
-    Overlay { outer: Arc<BoundParameters>, values: Vec<(usize, OverlayValue)> },
+    Overlay {
+        outer: Arc<BoundParameters>,
+        values: Vec<(usize, OverlayValue)>,
+        _reservation: Arc<MemoryReservation>,
+    },
 }
 
 pub(crate) enum OverlayValue {
@@ -79,6 +101,7 @@ struct ArrowRow {
     row: usize,
     values: Box<[LazyValue]>,
     memory: Arc<MemoryBudget>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 #[derive(Default)]
@@ -114,22 +137,22 @@ impl ArrowRow {
 }
 
 impl rtdb_expr::ParameterLookup for BoundParameters {
-    fn width(&self) -> usize { self.types.len() }
+    fn width(&self) -> usize { self.types().len() }
     fn value(&self, index: usize) -> Result<Option<&Value>> { self.get(index) }
     fn known_value(&self, index: usize) -> Option<&Value> {
-        if index >= self.types.len() { return None; }
+        if index >= self.types().len() { return None; }
         match &self.input {
             Input::Row(row) => row.values.get(index),
             Input::Arrow(row) => row.values[index].value.get().map(|value| &value.value),
-            Input::Overlay { outer, values } => match values.iter().rev().find(|(slot, _)| *slot == index) {
+            Input::Overlay { outer, values, .. } => match values.iter().rev().find(|(slot, _)| *slot == index) {
                 Some((_, value)) => value.known(),
-                None if index < outer.types.len() => outer.known_value(index),
+                None if index < outer.types().len() => outer.known_value(index),
                 None => Some(&Value::Null),
             },
         }
     }
     fn arrow_cell(&self, index: usize) -> Option<rtdb_expr::ArrowParameterCell<'_>> {
-        if let Input::Overlay { outer, values } = &self.input {
+        if let Input::Overlay { outer, values, .. } = &self.input {
             return match values.iter().rev().find(|(slot, _)| *slot == index) {
                 Some((_, OverlayValue::Arrow(binding))) => binding.cell(),
                 Some((_, OverlayValue::Scalar(_))) => None,
@@ -147,11 +170,11 @@ impl rtdb_expr::ParameterLookup for BoundParameters {
 
 impl BoundParameters {
     pub(crate) fn arrow_input(&self, index: usize) -> Option<(&OwnedBatch, usize)> {
-        if index >= self.types.len() { return None; }
+        if index >= self.types().len() { return None; }
         match &self.input {
             Input::Row(_) => None,
             Input::Arrow(row) => Some((&row.batch, row.row)),
-            Input::Overlay { outer, values } => {
+            Input::Overlay { outer, values, .. } => {
                 if values.iter().any(|(slot, _)| *slot == index) { return None; }
                 outer.arrow_input(index)
             }
@@ -165,17 +188,16 @@ impl BoundParameters {
             bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(size_error)?).ok_or_else(size_error)
         })?;
         let temporary = memory.reserve(bound)?;
-        let types = values.values.iter().map(Value::logical_type).collect::<Vec<_>>();
-        let reservation = memory.reserve(type_bytes(&types)?)?;
+        let types = ParameterTypes::new(values.values.iter().map(Value::logical_type).collect(), memory)?;
         drop(temporary);
-        Ok(Self { input: Input::Row(values), types, _reservation: reservation })
+        Ok(Self { input: Input::Row(values), types })
     }
 
     pub fn new(values: Vec<Value>, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if values.len() != types.len() { return Err(invalid("parameter-width", "Parameter values and declared types have different widths")); }
         let values = OwnedRow::new(values, memory)?;
-        let reservation = memory.reserve(type_bytes(&types)?)?;
-        Ok(Self { input: Input::Row(values), types, _reservation: reservation })
+        let types = ParameterTypes::new(types, memory)?;
+        Ok(Self { input: Input::Row(values), types })
     }
 
     pub fn from_arrow(batch: OwnedBatch, row: usize, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -183,31 +205,40 @@ impl BoundParameters {
             return Err(invalid("parameter-width", "The Arrow parameter position and declared types must match the batch"));
         }
         let slots = types.len().checked_mul(std::mem::size_of::<LazyValue>()).ok_or_else(size_error)?;
-        let reservation = memory.reserve(type_bytes(&types)?.checked_add(slots).ok_or_else(size_error)?)?;
+        let mut type_reservation = memory.reserve(type_bytes(&types)?.checked_add(slots).ok_or_else(size_error)?)?;
+        let reservation = Arc::get_mut(&mut type_reservation).expect("Arrow parameters own their reservation").split_off(slots)?;
         let values = (0..types.len()).map(|_| LazyValue::default()).collect();
-        let input = Input::Arrow(ArrowRow { batch, row, values, memory: Arc::clone(memory) });
-        Ok(Self { input, types, _reservation: reservation })
+        let types = Arc::new(ParameterTypes { types, _reservation: type_reservation });
+        let input = Input::Arrow(ArrowRow { batch, row, values, memory: Arc::clone(memory), _reservation: reservation });
+        Ok(Self { input, types })
     }
 
     pub fn overlay(self: &Arc<Self>, values: Vec<(usize, Value)>, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        self.overlay_sources(values.into_iter().map(|(slot, value)| (slot, OverlayValue::Scalar(value))).collect(), types, memory)
+        let values = values.into_iter().map(|(slot, value)| (slot, OverlayValue::Scalar(value))).collect();
+        let type_bytes = type_bytes(&types)?;
+        let bytes = overlay_bytes(&values, type_bytes)?;
+        let mut type_reservation = memory.reserve(bytes)?;
+        let reservation = Arc::get_mut(&mut type_reservation).expect("Overlay parameters own their reservation").split_off(bytes - type_bytes)?;
+        let types = Arc::new(ParameterTypes { types, _reservation: type_reservation });
+        Ok(self.with_overlay(values, types, reservation))
     }
 
-    pub(crate) fn overlay_sources(self: &Arc<Self>, values: Vec<(usize, OverlayValue)>, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let slots = values.capacity().checked_mul(std::mem::size_of::<(usize, OverlayValue)>()).ok_or_else(size_error)?;
-        let bytes = values.iter().try_fold(type_bytes(&types)?.checked_add(slots).ok_or_else(size_error)?, |bytes, (_, value)| {
-            bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)
-        })?;
-        let reservation = memory.reserve(bytes)?;
-        Ok(Self { input: Input::Overlay { outer: Arc::clone(self), values }, types, _reservation: reservation })
+    pub(crate) fn overlay_sources(self: &Arc<Self>, values: Vec<(usize, OverlayValue)>, types: Arc<ParameterTypes>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(overlay_bytes(&values, 256)?)?;
+        Ok(self.with_overlay(values, types, reservation))
+    }
+
+    fn with_overlay(self: &Arc<Self>, values: Vec<(usize, OverlayValue)>, types: Arc<ParameterTypes>, reservation: Arc<MemoryReservation>) -> Self {
+        let input = Input::Overlay { outer: Arc::clone(self), values, _reservation: reservation };
+        Self { input, types }
     }
 
     pub fn get(&self, index: usize) -> Result<Option<&Value>> {
-        if index >= self.types.len() { return Ok(None); }
+        if index >= self.types().len() { return Ok(None); }
         match &self.input {
             Input::Row(row) => Ok(row.values.get(index)),
             Input::Arrow(row) => row.value(index),
-            Input::Overlay { outer, values } => match values.iter().rev().find(|(slot, _)| *slot == index) {
+            Input::Overlay { outer, values, .. } => match values.iter().rev().find(|(slot, _)| *slot == index) {
                 Some((_, value)) => value.get().map(Some),
                 None => Ok(Some(outer.get(index)?.unwrap_or(&Value::Null))),
             },
@@ -223,12 +254,19 @@ impl BoundParameters {
     pub fn use_execution_budget(&mut self, memory: &Arc<MemoryBudget>) {
         if let Input::Arrow(row) = &mut self.input { row.memory = Arc::clone(memory); }
     }
-    pub fn types(&self) -> &[LogicalType] { &self.types }
+    pub fn types(&self) -> &[LogicalType] { &self.types.types }
 }
 
 fn type_bytes(types: &Vec<LogicalType>) -> Result<usize> {
     let spare = (types.capacity() - types.len()).checked_mul(std::mem::size_of::<LogicalType>()).ok_or_else(size_error)?;
     types.iter().try_fold(spare.checked_add(256).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))
+}
+
+fn overlay_bytes(values: &Vec<(usize, OverlayValue)>, fixed: usize) -> Result<usize> {
+    let slots = values.capacity().checked_mul(std::mem::size_of::<(usize, OverlayValue)>()).ok_or_else(size_error)?;
+    values.iter().try_fold(slots.checked_add(fixed).ok_or_else(size_error)?, |bytes, (_, value)| {
+        bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)
+    })
 }
 
 fn size_error() -> rtdb_types::Anomaly { invalid("parameter-size", "Parameter metadata exceeds addressable memory") }
@@ -254,7 +292,8 @@ mod tests {
         let source = Arc::new(crate::columnar::ColumnBatch::from_owned(OwnedBatch::new(record, &memory).unwrap()).unwrap());
         let base = Arc::new(BoundParameters::new(vec![], vec![], &memory).unwrap());
         let binding = ArrowBinding::new(source.clone(), 0, 1, memory.clone()).unwrap();
-        let bound = base.overlay_sources(vec![(0, OverlayValue::Arrow(binding))], vec![ty], &memory).unwrap();
+        let types = ParameterTypes::new(vec![ty], &memory).unwrap();
+        let bound = base.overlay_sources(vec![(0, OverlayValue::Arrow(binding))], types, &memory).unwrap();
 
         let cell = bound.arrow_cell(0).unwrap();
         assert_eq!(cell.row, 1);
@@ -271,7 +310,7 @@ mod tests {
         assert_eq!(retained.get(0).unwrap(), Some(&Value::I64(1)));
         assert_eq!(retained.types(), [LogicalType::Scalar(ScalarType::I64).maybe()]);
         let Input::Row(row) = &retained.input else { panic!("Expected row parameters"); };
-        assert_eq!(memory.used_bytes(), row.bytes() + retained._reservation.bytes());
+        assert_eq!(memory.used_bytes(), row.bytes() + retained.types._reservation.bytes());
         drop(retained);
         assert_eq!(memory.used_bytes(), 0);
     }

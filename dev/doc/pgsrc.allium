@@ -358,8 +358,10 @@ surface TargetIngestion {
         -- A complete WAL transaction carries Arrow batches grouped by relation, operation kind and compatible field layout.
         -- The mirror stages rows in upstream event order using Arrow document vectors and typed ID and valid-time columns.
         -- Snapshot fetch uses binary PostgreSQL fields wherever their binary readers preserve the source projection.
-        -- Direct binary snapshot readers reserve Arrow column capacity before allocating the column.
+        -- Direct snapshot readers admit typed decode scratch and Arrow column allocations before use.
+        -- Snapshot columns that require value decoding admit the generic scratch before materializing those values.
         -- Fixed-layout range and opaque Transit columns use Arrow timestamp and binary children.
+        -- A present WAL timestamp range contributes its two endpoints directly to the pending Arrow column.
         -- Array fields use typed Arrow children where the source projection has a list layout.
         -- Document-shaped values retain their observed field and type order.
 

@@ -4,7 +4,7 @@ use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, OrdinalityScope, Relation, Rela
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{LogicalType, Result, ScalarType, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::{Execution, OuterRows}, columnar::{BoxBatchCursor, ColumnBatch}, operators::build_column_pages, parameters::BoundParameters, runtime_schema::EmittedRelation};
+use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::{Execution, OuterRows}, columnar::{BatchCursor, BoxBatchCursor, ColumnBatch}, operators::build_column_pages, parameters::BoundParameters, runtime_schema::EmittedRelation};
 
 fn execution(batch_rows: usize) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
@@ -296,6 +296,50 @@ async fn emitted_definition_survives_its_caller_and_output_survives_the_cursor()
     assert_eq!(rows(&page), numbers(&[1,2,3]));
     drop(page);
     assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn generated_list_page_handoff_fits_one_payload_grant() {
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let count = 16_384usize;
+    let page_rows = std::num::NonZeroUsize::new(count);
+    let mut cursor = execution.open_list(series(0, count as i64, 1, false), page_rows).await.unwrap();
+    let headroom = count * std::mem::size_of::<i64>() + 8192;
+    let budget_hold = memory.reserve(memory.available_bytes() - headroom).unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(page.len, count);
+    assert_eq!(page.columns[0].value(count - 1).unwrap(), Value::I64(count as i64 - 1));
+    drop((page, cursor, budget_hold));
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn packed_list_slice_keeps_parent_backing_charged_after_reader_drop() {
+    use arrow_array::{Array, Float32Array};
+    use crate::columnar::Column;
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let parent = Float32Array::from(vec![-0.0; 16_384]);
+    let parent_capacity = parent.get_buffer_memory_size();
+    let parent_address = parent.values().inner().data_ptr().as_ptr() as usize;
+    let expression = Expr::Literal(Value::List(rtdb_types::ListValue::from_f32(parent)));
+    let mut reader = execution.open_list(expression, None).await.unwrap();
+    let page = reader.next_batch().await.unwrap().unwrap();
+    assert_eq!(page.len, 3);
+    drop(reader);
+
+    let page = page.slice(1, 1, memory).unwrap();
+    let Column::Arrow { array, .. } = &page.columns[0] else { panic!("expected packed float slice"); };
+    let values = array.as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(values.values().inner().data_ptr().as_ptr() as usize, parent_address);
+    assert_eq!(values.value(0).to_bits(), (-0.0_f32).to_bits());
+    assert!(memory.used_bytes() >= baseline + parent_capacity);
+    drop(page);
+    assert_eq!(memory.used_bytes(), baseline);
 }
 
 #[test]

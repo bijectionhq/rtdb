@@ -443,7 +443,7 @@ impl PageDecoder {
         let (header, body_start) = block_message(block, &bytes)?;
         let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
         if (message.version() == self.version || self.version == arrow_ipc::MetadataVersion::V1)
-            && let Some(batch) = projection.decode(&self.source_schema, message, &bytes.slice(body_start)) {
+            && let Some(batch) = projection.decode(&self.decoded_schema, message, &bytes.slice(body_start), Arc::ptr_eq(&self.schema, &self.decoded_schema)) {
             return Ok(batch);
         }
         // Reference-writer undefined unions need normalization by the full decoder.
@@ -451,6 +451,7 @@ impl PageDecoder {
     }
 
     /// Admits selected decode allocations while `wire` owns the already-funded IPC bytes.
+    /// Wide descriptor selections can use a temporary reservation during planning.
     /// `None` leaves full-page admission to the caller.
     pub fn decode_projected_page_reserved<G>(
         &self, page: usize, wire: impl AsRef<[u8]> + Send + 'static, selection: PageProjection<'_>,
@@ -463,22 +464,42 @@ impl PageDecoder {
         &self, page: usize, bytes: &Buffer, selection: PageProjection<'_>,
         mut reserve: impl FnMut(usize) -> Result<G>,
     ) -> Result<Option<(RecordBatch, G)>> {
-        if matches!(selection, PageProjection::Iid) {
-            self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
-        }
+        let indices = self.projection_indices(selection)?;
         let (batch, version, body) = self.projected_block(page, bytes)?;
-        let Some((bound, workspace)) = projection::allocation_bound(&bytes[body..], batch, &self.decoded_schema, version, selection)? else {
+        let body = bytes.slice(body);
+        let Some(plan) = projection::prepare(&body, batch, &self.decoded_schema, version,
+            |_, field| selection.field(field), projection::Preparation::Measure, &mut reserve)? else {
             return Ok(None);
         };
-        let charge = reserve(bound)?;
-        let _workspace = (workspace != 0).then(|| reserve(workspace)).transpose()?;
-        Ok(projection::decode(&bytes.slice(body), batch, &self.decoded_schema, version, selection)
+        let charge = reserve(plan.bound)?;
+        let _workspace = (plan.workspace != 0).then(|| reserve(plan.workspace)).transpose()?;
+        Ok(self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice()))
             .ok().map(|batch| (batch, charge)))
     }
 
     fn decode_projected_page(&self, page: usize, bytes: &Buffer, selection: PageProjection<'_>) -> Result<RecordBatch> {
+        let indices = self.projection_indices(selection)?;
         let (batch, version, body) = self.projected_block(page, bytes)?;
-        projection::decode(&bytes.slice(body), batch, &self.decoded_schema, version, selection)
+        let body = bytes.slice(body);
+        let plan = projection::prepare(&body, batch, &self.decoded_schema, version,
+            |_, field| selection.field(field), projection::Preparation::ReadPage, |_| Ok(()))?
+            .ok_or_else(|| invalid("Arrow schema and field-node inventory disagree"))?;
+        self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice()))
+    }
+
+    fn projection_indices(&self, selection: PageProjection<'_>) -> Result<Option<[usize; 1]>> {
+        if !matches!(selection, PageProjection::Iid) { return Ok(None); }
+        let iid = self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
+        Ok(Some([iid]))
+    }
+
+    fn decode_projection<G>(
+        &self, plan: &projection::Plan<'_, G>, version: arrow_ipc::MetadataVersion,
+        selection: PageProjection<'_>, indices: Option<&[usize]>,
+    ) -> Result<RecordBatch> {
+        let native = version == self.version || self.version == arrow_ipc::MetadataVersion::V1;
+        plan.decode(native, &self.decoded_schema, indices,
+            |nested| selection.output_schema(&self.decoded_schema, nested), None)
     }
 
     fn projected_block<'a>(&self, page: usize, bytes: &'a [u8]) -> Result<(arrow_ipc::RecordBatch<'a>, arrow_ipc::MetadataVersion, usize)> {
@@ -977,13 +998,23 @@ fn compressed_buffer_length(body: &[u8], start: usize) -> Result<i64> {
 }
 
 fn decoded_buffer_length(buffer: &arrow_ipc::Buffer, body_length: usize, compressed: bool, compressed_length: impl FnOnce(usize) -> Result<i64>) -> Result<(usize, bool)> {
+    let (_, decoded, decompresses) = decoded_buffer_span(buffer, body_length, compressed, compressed_length)?;
+    Ok((decoded, decompresses))
+}
+
+fn decoded_buffer_span(
+    buffer: &arrow_ipc::Buffer, body_length: usize, compressed: bool,
+    compressed_length: impl FnOnce(usize) -> Result<i64>,
+) -> Result<(Range<usize>, usize, bool)> {
     let start = usize::try_from(buffer.offset()).map_err(invalid)?;
     let length = usize::try_from(buffer.length()).map_err(invalid)?;
-    if allocation_add(start, length)? > body_length { return Err(invalid("Arrow buffer exceeds its message body")); }
-    if !compressed || length == 0 { return Ok((length, false)); }
+    let end = allocation_add(start, length)?;
+    if end > body_length { return Err(invalid("Arrow buffer exceeds its message body")); }
+    let span = start..end;
+    if !compressed || length == 0 { return Ok((span, length, false)); }
     if length < 8 { return Err(invalid("Compressed Arrow buffer has no length")); }
     let decoded = compressed_length(start)?;
-    if decoded == -1 { Ok((length - 8, false)) } else { Ok((usize::try_from(decoded).map_err(invalid)?, decoded > 0)) }
+    if decoded == -1 { Ok((span, length - 8, false)) } else { Ok((span, usize::try_from(decoded).map_err(invalid)?, decoded > 0)) }
 }
 
 fn decoded_buffer_bound(length: usize) -> Result<usize> { allocation_add(allocation_mul(length, 4)?, 512) }
@@ -1005,18 +1036,23 @@ fn validate_lz4_batch(batch: arrow_ipc::RecordBatch<'_>, body: &[u8]) -> Result<
             let expected = i64::from_le_bytes(prefix);
             if expected == -1 || expected == 0 { continue; }
             let expected = usize::try_from(expected).map_err(invalid)?;
-            let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[8..]);
-            let mut scratch = [0; 8192];
-            let mut decoded = 0;
-            loop {
-                let read = decoder.read(&mut scratch).map_err(invalid)?;
-                if read == 0 { break; }
-                decoded = allocation_add(decoded, read)?;
-                if decoded > expected { return Err(invalid("LZ4 data exceeds its declared Arrow buffer length")); }
-            }
-            if decoded != expected { return Err(invalid("LZ4 data differs from its declared Arrow buffer length")); }
+            validate_lz4_frame(&bytes[8..], expected)?;
         }
     }
+    Ok(())
+}
+
+fn validate_lz4_frame(bytes: &[u8], expected: usize) -> Result<()> {
+    let mut decoder = lz4_flex::frame::FrameDecoder::new(bytes);
+    let mut scratch = [0; 8192];
+    let mut decoded = 0;
+    loop {
+        let read = decoder.read(&mut scratch).map_err(invalid)?;
+        if read == 0 { break; }
+        decoded = allocation_add(decoded, read)?;
+        if decoded > expected { return Err(invalid("LZ4 data exceeds its declared Arrow buffer length")); }
+    }
+    if decoded != expected { return Err(invalid("LZ4 data differs from its declared Arrow buffer length")); }
     Ok(())
 }
 

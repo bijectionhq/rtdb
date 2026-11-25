@@ -6,21 +6,54 @@ use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, from_field, to_f
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{LogicalType, Result, Value};
 
-use super::{ArrowVector, Column, ColumnBatch, SelectedColumn, arrow_cell_is_null, pack_evaluated_column, size_error, stable_read_layout};
+use super::{ArrowVector, Column, ColumnBatch, SelectedColumn, SelectedRows, arrow_cell_is_null, pack_evaluated_column, size_error, stable_read_layout};
 
 #[derive(Clone, Copy)]
 struct Record<'a> {
     array: &'a StructArray,
     position: usize,
+    owner: &'a Arc<MemoryReservation>,
 }
 
-fn record(column: &Column, row: usize) -> Option<Option<Record<'_>>> {
-    let Some((array, field, logical, position)) = column.arrow_cell(row)? else { return Some(None); };
+impl<'a> Record<'a> {
+    fn child(self, index: usize) -> ChildCell<'a> {
+        ChildCell {
+            field: &self.array.fields()[index],
+            array: self.array.column(index),
+            position: self.position,
+            owner: self.owner,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ChildCell<'a> {
+    field: &'a ArrowField,
+    array: &'a ArrayRef,
+    position: usize,
+    owner: &'a Arc<MemoryReservation>,
+}
+
+impl ChildCell<'_> {
+    fn matches_layout(self, target: &ArrowField) -> bool {
+        self.field.data_type() == target.data_type() && self.field.metadata() == target.metadata()
+    }
+}
+
+fn record<'a>(column: &'a Column, owner: &'a Arc<MemoryReservation>, row: usize) -> Option<Option<Record<'a>>> {
+    let (array, field, logical, position, owner) = match column {
+        Column::Arrow { array, field, logical } => (array, field, logical, row, owner),
+        Column::Selected(selected) => {
+            let Some(((array, field, logical, custody), position)) = selected.source(row).ok()? else { return Some(None); };
+            (array, field, logical, position, custody.as_ref().unwrap_or(owner))
+        }
+        Column::Values(_) => return None,
+    };
     if array.is_null(position) || field.data_type() == &DataType::Null && field.is_nullable() {
         return Some(None);
     }
-    let logical = logical?;
-    let cell = (ArrowCell { field, array, row: position }).physical().ok()?;
+    let logical = logical.as_ref()?;
+    let cell = (ArrowCell { field, array: array.as_ref(), row: position }).physical().ok()?;
     if matches!(field.data_type(), DataType::Union(_, UnionMode::Dense)) {
         let active_type = from_field(cell.field).ok()?;
         // A named leg can supply the reader's logical type even when the physical field differs.
@@ -36,7 +69,7 @@ fn record(column: &Column, row: usize) -> Option<Option<Record<'_>>> {
     if cell.is_null().ok()? {
         return (!cell.is_undefined().ok()?).then_some(None);
     }
-    Some(Some(Record { array: cell.array.as_any().downcast_ref()?, position: cell.row }))
+    Some(Some(Record { array: cell.array.as_any().downcast_ref()?, position: cell.row, owner }))
 }
 
 pub(super) fn merge(
@@ -45,21 +78,24 @@ pub(super) fn merge(
     let [Expr::Column { id: old, .. }, Expr::Column { id: patch, .. }] = args else { return Ok(None); };
     let (Some(old), Some(patch)) = (schema.position(*old), schema.position(*patch)) else { return Ok(None); };
     let bytes = batch.len.checked_mul(256).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
-    let reservation = memory.reserve(bytes)?;
+    let mut reservation = memory.reserve(bytes)?;
     fn pack_operand(column: &Column, memory: &Arc<MemoryBudget>) -> Option<(Column, Arc<MemoryReservation>)> {
         let Column::Values(values) = column else { return None; };
         values.iter().all(|value| matches!(value, Value::Struct(_) | Value::Null | Value::Undefined))
             .then(|| pack_evaluated_column(values, memory).ok()).flatten()
     }
     let operands = [&batch.columns[old], &batch.columns[patch]];
+    let owners = [batch.column_reservation(old), batch.column_reservation(patch)];
     let packed = operands.map(|column| pack_operand(column, memory));
-    let [old, patch] = std::array::from_fn(|index| packed[index].as_ref().map_or(operands[index], |(column, _)| column));
+    let [(old, old_owner), (patch, patch_owner)] = std::array::from_fn(|index| {
+        packed[index].as_ref().map_or((operands[index], owners[index]), |(column, owner)| (column, owner))
+    });
     let mut rows = Vec::with_capacity(batch.len);
     let mut layouts = HashMap::new();
     let mut groups = Vec::new();
     let mut positions = Vec::with_capacity(batch.len);
     for row in 0..batch.len {
-        let (Some(old), Some(Some(patch))) = (record(old, row), record(patch, row)) else { return Ok(None); };
+        let (Some(old), Some(Some(patch))) = (record(old, old_owner, row), record(patch, patch_owner, row)) else { return Ok(None); };
         let fields = (old.map(|old| old.array.fields()), patch.array.fields());
         let group = *layouts.entry(fields).or_insert_with(|| {
             let group = groups.len();
@@ -81,23 +117,42 @@ pub(super) fn merge(
     });
     let mut sources = Vec::with_capacity(groups.len());
     for ((old, patch), indices) in groups {
-        let Some(((array, field, logical), charge)) = merged_group(&rows, &indices, old, patch, memory)? else {
+        let Some(MergedGroup { vector: (array, field, logical), charge, shared_children }) =
+            merged_group(&rows, &indices, old, patch, memory)? else {
             return Ok(None);
         };
         if heterogeneous || union_records || packed.iter().any(Option::is_some) {
             rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
         }
-        if indices.len() == batch.len {
+        if indices.len() == batch.len && !shared_children {
             return Ok(Some((Column::Arrow { array, field, logical }, charge)));
         }
         sources.push(Some((array, field, logical, Some(charge))));
     }
-    Ok(Some((Column::Selected(SelectedColumn::new(sources, Arc::new(positions))), reservation)))
+    let cells = if sources.len() == 1 {
+        drop(positions);
+        SelectedRows::Span(0..batch.len)
+    } else {
+        SelectedRows::Picks(Arc::new(positions))
+    };
+    let column = Column::Selected(SelectedColumn { sources: Arc::new(sources), cells });
+    drop((rows, layouts));
+    drop(packed);
+    let retained = column.retained_bytes()?;
+    let lease = Arc::get_mut(&mut reservation).expect("The patch merge owns its selection reservation");
+    if retained <= lease.bytes() { lease.shrink_to(retained)?; } else { lease.grow_to(retained)?; }
+    Ok(Some((column, reservation)))
+}
+
+struct MergedGroup {
+    vector: ArrowVector,
+    charge: Arc<MemoryReservation>,
+    shared_children: bool,
 }
 
 fn merged_group<'a>(
     rows: &[(Option<Record<'a>>, Record<'a>)], indices: &[usize], old: Option<&Fields>, patch: &Fields, memory: &Arc<MemoryBudget>,
-) -> Result<Option<(ArrowVector, Arc<MemoryReservation>)>> {
+) -> Result<Option<MergedGroup>> {
     let previous = old.into_iter().flatten().enumerate().map(|(index, field)| {
         (field, Some(index), patch.iter().position(|candidate| candidate.name() == field.name()))
     });
@@ -108,8 +163,10 @@ fn merged_group<'a>(
         bytes.checked_add(field.size().checked_mul(8).ok_or_else(size_error)?).ok_or_else(size_error)
     })?;
     let mut charge = memory.reserve(metadata)?;
+    let lease = Arc::get_mut(&mut charge).expect("The patch record owns its reservation");
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
+    let mut shared_children = false;
     for (field, old_index, patch_index) in previous.chain(added) {
         let ty = match (old_index, patch_index) {
             (Some(old_index), Some(patch_index)) => {
@@ -126,29 +183,64 @@ fn merged_group<'a>(
         let preferred = |row: usize| {
             let (old, patch) = rows[row];
             if let Some(index) = patch_index {
-                let field = &patch.array.fields()[index];
-                let array = patch.array.column(index);
-                if old_index.is_none() || !arrow_cell_is_null(field, array.as_ref(), patch.position)? {
-                    return Some((field, array, patch.position));
+                let child = patch.child(index);
+                if old_index.is_none() || !arrow_cell_is_null(child.field, child.array.as_ref(), child.position)? {
+                    return Some(child);
                 }
             }
-            let (old, index) = (old?, old_index?);
-            Some((&old.array.fields()[index], old.array.column(index), old.position))
+            Some(old?.child(old_index?))
         };
-        let Some((array, _scratch)) = gather_child(indices, preferred, &target, memory)? else { return Ok(None); };
-        let owner = Arc::get_mut(&mut charge).expect("The patch record owns its reservation");
-        owner.grow_to(owner.bytes().checked_add(array.get_array_memory_size()).ok_or_else(size_error)?)?;
+        let array = if let Some(array) = retain_child_range(indices, preferred, &target, lease)? {
+            shared_children = true;
+            array
+        } else {
+            let Some((array, mut scratch)) = gather_child(indices, preferred, &target, memory)? else { return Ok(None); };
+            let retained = array.get_array_memory_size();
+            let scratch = Arc::get_mut(&mut scratch).expect("The patch child owns its construction reservation");
+            if retained <= scratch.bytes() { scratch.shrink_to(retained)?; } else { scratch.grow_to(retained)?; }
+            lease.absorb(scratch)?;
+            array
+        };
         fields.push(target);
         arrays.push(array);
     }
     let Ok(array) = StructArray::try_new_with_length(fields.into(), arrays, None, indices.len()) else { return Ok(None); };
     let field = Arc::new(ArrowField::new("value", array.data_type().clone(), false));
     let logical = from_field(&field)?;
-    Ok(Some(((Arc::new(array), field, Some(logical)), charge)))
+    Ok(Some(MergedGroup { vector: (Arc::new(array), field, Some(logical)), charge, shared_children }))
+}
+
+fn retain_child_range<'a>(
+    rows: &[usize], cell: impl Fn(usize) -> Option<ChildCell<'a>>, target: &ArrowField,
+    lease: &mut MemoryReservation,
+) -> Result<Option<ArrayRef>> {
+    let Some(first) = rows.first().and_then(|&row| cell(row)) else { return Ok(None); };
+    let Some(end) = first.position.checked_add(rows.len()) else { return Ok(None); };
+    if end > first.array.len() || !first.matches_layout(target) || first.array.data_type() != target.data_type()
+        || !rows[1..].iter().enumerate().all(|(offset, &row)| {
+            cell(row).is_some_and(|next| Arc::ptr_eq(first.array, next.array)
+                && next.position == first.position + offset + 1
+                && (std::ptr::eq(first.field, next.field) || next.matches_layout(target)))
+        }) {
+        return Ok(None);
+    }
+
+    let descriptors = first.array.get_array_memory_size().checked_sub(first.array.get_buffer_memory_size()).ok_or_else(size_error)?;
+    let retained = lease.bytes();
+    let bound = descriptors.checked_mul(4).and_then(|bytes| bytes.checked_add(512))
+        .and_then(|bytes| retained.checked_add(bytes)).ok_or_else(size_error)?;
+    lease.grow_to(bound)?;
+    let view = if rows.len() == first.array.len() { Arc::clone(first.array) } else { first.array.slice(first.position, rows.len()) };
+    // A query page can own the source reservation outside its Arrow buffers.
+    if let Ok(view) = rtdb_columnar::retain_array(view, first.owner) {
+        return Ok(Some(view));
+    }
+    lease.shrink_to(retained)?;
+    Ok(None)
 }
 
 fn gather_child<'a>(
-    rows: &[usize], cell: impl Fn(usize) -> Option<(&'a Arc<ArrowField>, &'a ArrayRef, usize)>,
+    rows: &[usize], cell: impl Fn(usize) -> Option<ChildCell<'a>>,
     target: &ArrowField, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
     let bound = rows.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
@@ -158,12 +250,13 @@ fn gather_child<'a>(
     let mut arrays = Vec::new();
     let mut selected = Vec::with_capacity(rows.len());
     for &row in rows {
-        let Some((field, source, offset)) = cell(row) else { return Ok(None); };
+        let Some(child) = cell(row) else { return Ok(None); };
+        let ChildCell { field, array: source, position: offset, .. } = child;
         let key = Arc::as_ptr(source).cast::<()>();
         let index = if let Some(&index) = slots.get(&key) {
             index
         } else {
-            let array = if field.data_type() == target.data_type() && field.metadata() == target.metadata() {
+            let array = if child.matches_layout(target) {
                 Arc::clone(source)
             } else {
                 let bytes = rtdb_columnar::arrow_relayout_bound(source.as_ref(), field, target)?;
@@ -270,27 +363,47 @@ mod tests {
 
     #[test]
     fn patch_keeps_arrow_vectors_when_the_other_operand_is_a_row_record() {
+        use arrow_array::StringArray;
+
         let memory = MemoryBudget::new(1 << 20);
         let vector = Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into());
-        let record = Value::Struct(StructFields::from([("vector".into(), vector.clone())]));
+        let record = |name: &str| Value::Struct(StructFields::from([
+            ("vector".into(), vector.clone()), ("name".into(), Value::Utf8(name.into())),
+        ]));
         let patch = Value::Struct(StructFields::from([("vector".into(), Value::Null), ("label".into(), Value::I64(5))]));
-        let logical = record.logical_type();
+        let logical = record("first").logical_type();
         let field = Arc::new(to_field("lhs", &logical).unwrap());
-        let array = rtdb_columnar::copy_array(&logical, &[record]).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, &[record("first"), record("second"), record("third")]).unwrap();
+        let text = array.as_any().downcast_ref::<StructArray>().unwrap().column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let source_bytes = text.value(1).as_ptr();
         let schema = Schema::new([logical.clone(), patch.logical_type()].into_iter().enumerate().map(|(index, data_type)| {
             Field { id: ColumnId(index as u32), name: format!("c{index}"), qualifier: None, qualified_only: false, unnamed: false, data_type }
         }).collect()).unwrap();
-        let batch = ColumnBatch::settled(vec![
-            Column::Arrow { array, field, logical: Some(logical) },
-            Column::Values(vec![patch]),
-        ], 1, memory.reserve(4096).unwrap()).unwrap();
+        let old = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical) }],
+            3, memory.reserve(4096).unwrap()).unwrap();
+        let owner = Arc::downgrade(old.column_reservation(0));
+        let (old_rows, selection) = old.lend_window_span(0, 1..3, &memory).unwrap().unwrap();
+        let batch = ColumnBatch::settled(vec![old_rows, Column::Values(vec![patch.clone(), patch])],
+            2, memory.reserve(4096).unwrap()).unwrap();
+        drop((old, selection));
         let args = schema.fields().iter().map(Field::expression).collect::<Vec<_>>();
-        let (column, _charge) = merge(&args, &schema, &batch, &memory).unwrap().unwrap();
+        let (column, charge) = merge(&args, &schema, &batch, &memory).unwrap().unwrap();
+        drop(batch);
+        assert!(owner.upgrade().is_some());
         let Some(Some((array, field, _, row))) = column.arrow_cell(0) else { panic!("Expected an Arrow record"); };
+        let text = array.as_any().downcast_ref::<StructArray>().unwrap().column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(text.value(row).as_ptr(), source_bytes);
         let cell = (ArrowCell { array, field, row }).structure().unwrap().next().unwrap();
         let (components, range) = cell.float_list_span().unwrap();
         assert_eq!(components.float_component(range.start).unwrap().to_bits(), (-0.0_f64).to_bits());
         assert_eq!(components.float_component(range.start + 1), None);
-        assert_eq!(column.value(0).unwrap(), Value::Struct(StructFields::from([("vector".into(), vector), ("label".into(), Value::I64(5))])));
+        for (row, name) in ["second", "third"].into_iter().enumerate() {
+            assert_eq!(column.value(row).unwrap(), Value::Struct(StructFields::from([
+                ("vector".into(), vector.clone()), ("name".into(), Value::Utf8(name.into())), ("label".into(), Value::I64(5)),
+            ])));
+        }
+        drop((column, charge));
+        assert!(owner.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

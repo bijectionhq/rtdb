@@ -118,6 +118,22 @@ impl<'a> Rows<'a> {
 
 struct AggregateInput { batches: crate::columnar::BoxBatchCursor, projected: bool }
 
+#[derive(Clone, Copy)]
+enum GroupMapping<'a> {
+    Global(usize),
+    Grouped(&'a [usize]),
+}
+
+impl<'a> GroupMapping<'a> {
+    fn iter(self) -> impl Iterator<Item = usize> + Clone + 'a {
+        let (len, ordinals) = match self {
+            Self::Global(len) => (len, None),
+            Self::Grouped(ordinals) => (ordinals.len(), Some(ordinals)),
+        };
+        (0..len).map(move |row| ordinals.map_or(0, |groups| groups[row]))
+    }
+}
+
 pub(crate) struct AggregateTypes { input: LogicalType, declared_output: LogicalType, output: LogicalType }
 
 impl AggregateTypes {
@@ -238,21 +254,16 @@ impl AggregateCursor {
         let (mut columns, reservation) = self.accumulators()?;
         let positions = Self::positions(&self.schema, &self.groups, &self.aggregates);
         while let Some(batch) = batches.next_batch().await? {
+            let mapping = GroupMapping::Global(batch.len);
             if positions.is_some() && self.accepts_typed_aggregates(&batch)? {
-                let memory = &self.execution.context.memory;
-                let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>())
-                    .ok_or_else(|| invalid("aggregate-size", "Group mapping overflow"))?)?;
-                self.reduce_typed(&batch, &vec![0; batch.len], 1, &mut columns)?;
+                self.reduce_typed(&batch, mapping, 1, &mut columns)?;
                 continue;
             }
             let positions = positions.as_ref().ok_or_else(|| invalid("aggregate-input", "A batch input reached an aggregate that reads whole rows"))?;
             let rows = Rows::columns(&batch, positions, projected, &self.execution.context)?;
             self.execution.context.check_cancelled()?;
-            let scope = self.execution.scope()?;
-            scope.reserve(rows.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(|| invalid("aggregate-size", "Group mapping overflow"))?)?;
-            let mapping = vec![0; rows.len()];
             for ((column, aggregate), types) in columns.iter_mut().zip(&self.aggregates).zip(self.runtime.aggregates()?) {
-                column.aggregate(rows, &mapping, 1, aggregate, types, &self.schema, &self.execution).await?;
+                column.aggregate(rows, mapping, 1, aggregate, types, &self.schema, &self.execution).await?;
             }
         }
         Ok((columns, reservation))
@@ -291,13 +302,14 @@ impl AggregateCursor {
                 mapping.push(ordinal);
                 Ok(())
             })?;
+            let mapping = GroupMapping::Grouped(&mapping);
             if self.accepts_typed_aggregates(&batch)? {
-                self.reduce_typed(&batch, &mapping, index.len(), &mut columns)?;
+                self.reduce_typed(&batch, mapping, index.len(), &mut columns)?;
                 continue;
             }
             let rows = Rows::columns(&batch, arguments, projected, context)?;
             for ((column, aggregate), types) in columns.iter_mut().zip(&self.aggregates).zip(self.runtime.aggregates()?) {
-                column.aggregate(rows, &mapping, index.len(), aggregate, types, &self.schema, &self.execution).await?;
+                column.aggregate(rows, mapping, index.len(), aggregate, types, &self.schema, &self.execution).await?;
             }
         }
         Ok(index.group_keys(group_width, context)?.map(|keys| ReducedGroups { keys, columns, _reservation: reservation }))
@@ -332,7 +344,11 @@ impl BatchCursor for AggregateCursor {
                 Accumulation::Vectors(vectors) => {
                     validate_collection_order(aggregate, types, &self.schema, &self.execution)?;
                     let (column, charge) = vectors.finish(batch.len, aggregate, field, &self.execution).await?;
-                    batch.append_column(column, charge, &context.memory)?;
+                    if charge.backing().is_empty() {
+                        batch.append_column(column, charge, &context.memory)?;
+                    } else {
+                        batch.append_funded_column(column, charge, &context.memory)?;
+                    }
                     continue;
                 }
             };
@@ -456,7 +472,7 @@ impl AggregateCursor {
         Ok(true)
     }
 
-    fn reduce_typed(&self, batch: &ColumnBatch, mapping: &[usize], group_count: usize, columns: &mut [AggregateColumn]) -> Result<()> {
+    fn reduce_typed(&self, batch: &ColumnBatch, mapping: GroupMapping<'_>, group_count: usize, columns: &mut [AggregateColumn]) -> Result<()> {
         use AggregateFunction as A;
         let types = self.runtime.aggregates()?;
         let memory = &self.execution.context.memory;
@@ -468,13 +484,13 @@ impl AggregateCursor {
             match (&aggregate.function,argument) {
                 (A::CountStar,_) => for (row, group) in mapping.iter().enumerate() {
                     self.execution.context.check_cancelled_at(row)?;
-                    states.values[*group].count = states.values[*group].count.wrapping_add(1);
+                    states.values[group].count = states.values[group].count.wrapping_add(1);
                 },
                 (A::Count,Some(position)) => {
                     let array = marked_nulls(&batch.columns[position]).ok_or_else(||invalid("aggregate-input","A typed count lost its column"))?;
                     for (row, group) in mapping.iter().enumerate() {
                         self.execution.context.check_cancelled_at(row)?;
-                        if !array.is_null(row) { states.values[*group].count = states.values[*group].count.wrapping_add(1); }
+                        if !array.is_null(row) { states.values[group].count = states.values[group].count.wrapping_add(1); }
                     }
                 }
                 (A::Sum | A::Average,Some(position)) => {
@@ -483,7 +499,7 @@ impl AggregateCursor {
                         self.execution.context.check_cancelled_at(row)?;
                         if array.is_null(row) { continue; }
                         let value = array.value(row);
-                        let state = &mut states.values[*group];
+                        let state = &mut states.values[group];
                         if let Some(accumulator) = &mut state.accumulator {
                             let Value::F64(sum) = &mut accumulator.values[0] else { return Err(sum_state()); };
                             *sum += value;
@@ -510,7 +526,7 @@ enum DistinctSeen {
 
 impl DistinctSeen {
     fn select(
-        &mut self, input: Rows<'_>, mapping: &[usize], mask: &mut [bool], argument: Option<usize>,
+        &mut self, input: Rows<'_>, mapping: GroupMapping<'_>, mask: &mut [bool], argument: Option<usize>,
         types: &AggregateTypes, execution: &Execution,
     ) -> Result<()> {
         if matches!(self, Self::FirstBatch) {
@@ -521,7 +537,7 @@ impl DistinctSeen {
         }
         let mut retained_source = None;
         let mut admitted = false;
-        for (row, (group, selected)) in mapping.iter().copied().zip(mask).enumerate() {
+        for (row, (group, selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled()?;
             if !*selected { continue; }
             if !admitted {
@@ -571,7 +587,7 @@ impl AggregateColumn {
         let distinct = if aggregate.distinct && !matches!(aggregate.function,AggregateFunction::Min | AggregateFunction::Max) { Some(DistinctSeen::FirstBatch) } else { None };
         Ok(Self { accumulation,distinct })
     }
-    async fn aggregate(&mut self,input: Rows<'_>,mapping: &[usize],group_count: usize,aggregate: &AggregateExpr,types: &AggregateTypes,schema: &Schema,execution: &Execution) -> Result<()> {
+    async fn aggregate(&mut self,input: Rows<'_>,mapping: GroupMapping<'_>,group_count: usize,aggregate: &AggregateExpr,types: &AggregateTypes,schema: &Schema,execution: &Execution) -> Result<()> {
         let scope = execution.scope()?;
         scope.reserve(input.len())?;
         let mut mask = vec![true;input.len()];
@@ -643,7 +659,7 @@ impl CollectionVectors {
         Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false })
     }
 
-    fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: &[usize], mask: &[bool], groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
+    fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: GroupMapping<'_>, mask: &[bool], groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
         self.present |= batch.len != 0;
         self.projected |= projected;
         if let Some(order) = &self.order {
@@ -653,22 +669,32 @@ impl CollectionVectors {
             self.batches.push(batch);
             return Ok(());
         }
-        self.collect(batch, position, mapping.iter().copied().zip(mask).enumerate()
+        self.collect(batch, position, mapping.iter().zip(mask).enumerate()
             .filter_map(|(row, (group, &selected))| selected.then_some((row, group))), groups, context)
     }
 
     fn collect(&mut self, batch: &ColumnBatch, position: usize, picks: impl Iterator<Item = (usize, usize)> + Clone, groups: usize, context: &crate::QueryContext) -> Result<()> {
         let count = picks.clone().count();
         if count == 0 { return Ok(()); }
+        self.admit_positions(count, groups)?;
+        let page = self.batches.len();
+        self.batches.push(batch.key_projection(&[position], &context.memory)?);
+        for (row, group) in picks {
+            self.push_position(group, page, row)?;
+        }
+        Ok(())
+    }
+
+    fn admit_positions(&mut self, count: usize, groups: usize) -> Result<()> {
         self.selected = self.selected.checked_add(count).filter(|count| *count <= i32::MAX as usize)
             .ok_or_else(|| invalid("aggregate-size", "List aggregate result exceeds signed Arrow offsets"))?;
         self.account_pages(self.selected, groups)?;
         self.groups.resize_with(groups, Vec::new);
-        let page = self.batches.len();
-        self.batches.push(batch.key_projection(&[position], &context.memory)?);
-        for (row, group) in picks {
-            self.groups.get_mut(group).ok_or_else(|| invalid("aggregate-group", "List aggregate group is absent"))?.push((page, row));
-        }
+        Ok(())
+    }
+
+    fn push_position(&mut self, group: usize, page: usize, row: usize) -> Result<()> {
+        self.groups.get_mut(group).ok_or_else(|| invalid("aggregate-group", "List aggregate group is absent"))?.push((page, row));
         Ok(())
     }
 
@@ -691,26 +717,22 @@ impl CollectionVectors {
         }
         let context = &execution.context;
         let memory = &context.memory;
-        let base = groups.checked_mul(64).and_then(|bytes| self.selected.checked_mul(64).and_then(|rows| bytes.checked_add(rows)))
-            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("aggregate-size", "List aggregate allocation overflow"))?;
+        let base = groups.checked_mul(64).and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| invalid("aggregate-size", "List aggregate allocation overflow"))?;
         let _scratch = memory.reserve(base)?;
-        let mut picks = Vec::with_capacity(self.selected);
         let mut offsets = Vec::with_capacity(groups + 1);
         let mut valid = Vec::with_capacity(groups);
+        let mut end = 0i32;
         offsets.push(0);
         for group in 0..groups {
             context.check_cancelled_at(group)?;
             let rows = self.groups.get(group).map_or(&[][..], Vec::as_slice);
-            picks.extend_from_slice(rows);
-            offsets.push(picks.len() as i32);
+            end += rows.len() as i32;
+            offsets.push(end);
             valid.push(!rows.is_empty() || (aggregate.function == AggregateFunction::VecAgg && !self.present));
         }
-        let selected = if picks.is_empty() {
-            ColumnBatch::settled(vec![Column::Values(Vec::new())], 0, memory.reserve(256)?)?
-        } else {
-            ColumnBatch::take_rows(&self.batches, &picks, &[0], memory)?
-        };
-        selected.collect_lists(offsets, valid, output, memory)
+        let picks = self.groups.iter().flatten().copied();
+        ColumnBatch::collect_lists_from_rows(&self.batches, picks, self.selected, offsets, valid, output, memory)
     }
 
     async fn percentiles(self, groups: usize, kind: PercentileKind, fraction: f64, descending: bool, input_type: LogicalType,
@@ -725,10 +747,12 @@ impl CollectionVectors {
         let mut values = Vec::with_capacity(if kind == PercentileKind::Discrete && !gather { groups } else { 0 });
         let mut picks = Vec::with_capacity(if gather { groups } else { 0 });
         let mut interpolated = Vec::with_capacity(if kind == PercentileKind::Continuous { groups } else { 0 });
-        let read = |(batch, row): (usize, usize)| Rows { batch: &self.batches[batch], projected: self.projected, memory }.value(row, Some(0));
+        let batches = Arc::new(self.batches);
+        let mut positions = self.groups.into_iter();
+        let read = |(batch, row): (usize, usize)| Rows { batch: &batches[batch], projected: self.projected, memory }.value(row, Some(0));
         let read_number = |position: (usize, usize)| -> Result<f64> {
             let (batch, row) = position;
-            let column = &self.batches[batch].columns[0];
+            let column = &batches[batch].columns[0];
             match ScalarKey::read(column, row) {
                 Some(ScalarKey::Signed(value)) => return Ok(value as f64),
                 Some(ScalarKey::Float(value)) => return Ok(value),
@@ -739,7 +763,7 @@ impl CollectionVectors {
         };
         for group in 0..groups {
             context.check_cancelled_at(group)?;
-            let rows = self.groups.get(group).map_or(&[][..], Vec::as_slice);
+            let rows = positions.next().unwrap_or_default();
             if rows.is_empty() {
                 if gather {
                     picks.push(None);
@@ -752,9 +776,16 @@ impl CollectionVectors {
             }
             let (low, high, weight) = percentile_ranks(kind, fraction, rows.len() as i32)?;
             let (lower, upper) = if rows.len().saturating_mul(std::mem::size_of::<usize>()) > context.options.sort_memory_bytes {
-                self.spilled_ranks(rows, low as u64, high as u64, descending, &input_type, execution).await?
+                let input = PercentileInput {
+                    batches: Arc::clone(&batches),
+                    rows: Arc::new(rows),
+                    context: Arc::clone(context),
+                    start: 0,
+                    _reservation: Arc::clone(&self.reservation),
+                };
+                Self::spilled_ranks(input, low as u64, high as u64, descending, &input_type, self.projected, execution).await?
             } else {
-                let key = |(batch, row): (usize, usize)| ScalarKey::read(&self.batches[batch].columns[0], row);
+                let key = |(batch, row): (usize, usize)| ScalarKey::read(&batches[batch].columns[0], row);
                 let indices = crate::sort::sort_ordinals(rows.len(), context, |left, right| {
                     let (left, right) = if descending { (rows[right], rows[left]) } else { (rows[left], rows[right]) };
                     if let (Some(left), Some(right)) = (key(left), key(right))
@@ -788,7 +819,7 @@ impl CollectionVectors {
             values.push(value);
         }
         if gather {
-            return crate::columnar::gather_nullable_column(|batch| &self.batches[batch], &picks, 0, memory);
+            return crate::columnar::gather_nullable_column(|batch| &batches[batch], &picks, 0, memory);
         }
         if kind == PercentileKind::Continuous {
             return double_results(interpolated, reservation);
@@ -796,22 +827,18 @@ impl CollectionVectors {
         crate::columnar::pack_evaluated_column(&values, memory)
     }
 
-    async fn spilled_ranks(&self, rows: &[(usize, usize)], low: u64, high: u64, descending: bool, ty: &LogicalType,
-        execution: &Execution) -> Result<((usize, usize), (usize, usize))> {
+    async fn spilled_ranks(input: PercentileInput, low: u64, high: u64,
+        descending: bool, ty: &LogicalType, projected: bool, execution: &Execution) -> Result<((usize, usize), (usize, usize))> {
         use crate::sort::batches::BatchSort;
         use rtdb_plan::SortExpr;
 
-        let context = &execution.context;
         let mut binder = Binder::default();
         let key = binder.field("value", None, ty.clone())?;
         let ordinal = binder.field("position", None, LogicalType::Scalar(ScalarType::I64))?;
         let schema = Schema::new(vec![key.clone(), ordinal])?;
-        let mut batch = ColumnBatch::take_rows_with_custody(&self.batches, rows, &[0], true, &context.memory)?;
-        let (column, charge) = crate::columnar::ordinal_column(batch.len, 0, "position", context)?;
-        batch.append_column(column, charge, &context.memory)?;
-        let input = crate::columnar::single_batch(Some(batch), Arc::clone(context));
+        let rows = Arc::clone(&input.rows);
         let order = vec![SortExpr { expr: key.expression(), descending, nulls_first: false }];
-        let mut sorted = BatchSort::new(input, schema, order, execution.clone(), self.projected, low, high + 1)?;
+        let mut sorted = BatchSort::new(Box::new(input), schema, order, execution.clone(), projected, low, high + 1)?;
         let mut first = None;
         let mut last = None;
         while let Some(batch) = sorted.next_batch().await? {
@@ -827,7 +854,35 @@ impl CollectionVectors {
         }
         first.zip(last).ok_or_else(|| invalid("percentile-state", "Sorted percentile has no ranks"))
     }
+}
 
+struct PercentileInput {
+    batches: Arc<Vec<ColumnBatch>>,
+    rows: Arc<Vec<(usize, usize)>>,
+    context: Arc<crate::QueryContext>,
+    start: usize,
+    _reservation: Arc<MemoryReservation>,
+}
+
+#[async_trait]
+impl BatchCursor for PercentileInput {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        self.context.check_cancelled()?;
+        if self.start == self.rows.len() {
+            return Ok(None);
+        }
+        let bytes_per_row = size_of::<(usize, usize)>() + size_of::<i64>();
+        let run_rows = (self.context.options.sort_memory_bytes / bytes_per_row).clamp(1, 4096);
+        let end = (self.start + run_rows).min(self.rows.len());
+        let memory = &self.context.memory;
+        let rows = self.rows[self.start..end].iter().copied().map(Some);
+        let (column, charge) = crate::columnar::gather_nullable_column_iter(|page| &self.batches[page], rows, 0, memory)?;
+        let mut batch = ColumnBatch::settled(vec![column], end - self.start, charge)?;
+        let (column, charge) = crate::columnar::ordinal_column(batch.len, self.start as i64, "position", &self.context)?;
+        batch.append_column(column, charge, memory)?;
+        self.start = end;
+        Ok(Some(batch))
+    }
 }
 
 struct CollectionOrder {
@@ -852,14 +907,14 @@ impl CollectionOrder {
         Ok(Some(Self { positions, schema, group }))
     }
 
-    fn page(&self, batch: &ColumnBatch, mapping: &[usize], mask: &[bool], context: &crate::QueryContext) -> Result<ColumnBatch> {
+    fn page(&self, batch: &ColumnBatch, mapping: GroupMapping<'_>, mask: &[bool], context: &crate::QueryContext) -> Result<ColumnBatch> {
         let memory = &context.memory;
         let mut output = batch.key_projection(&self.positions, memory)?;
         let bytes = batch.len.checked_mul(16).and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(|| invalid("aggregate-size", "Ordered list aggregate group vector overflow"))?;
         let reservation = memory.reserve(bytes)?;
         let mut groups = arrow_array::builder::Int64Builder::with_capacity(batch.len);
-        for (&group, &selected) in mapping.iter().zip(mask) {
+        for (group, &selected) in mapping.iter().zip(mask) {
             if selected { groups.append_value(group as i64); } else { groups.append_null(); }
         }
         let logical = self.group.data_type.clone();
@@ -878,27 +933,60 @@ impl CollectionOrder {
         let source = Box::new(CollectionInput { batches: input.batches.into_iter(), _reservation: input.reservation });
         let mut sorted = BatchSort::new(source, self.schema, order.to_vec(), execution.clone(), input.projected, 0, i64::MAX as u64)?;
         while let Some(batch) = sorted.next_batch().await? {
-            let _positions = memory.reserve(batch.len.checked_mul(2 * std::mem::size_of::<(usize, usize)>())
-                .ok_or_else(|| invalid("aggregate-size", "Ordered list positions overflow"))?)?;
-            let mut picks = Vec::with_capacity(batch.len);
-            for row in 0..batch.len {
-                context.check_cancelled_at(row)?;
-                let value = match ScalarKey::read(&batch.columns[group], row) {
-                    Some(ScalarKey::Signed(value)) => Some(value),
+            let group_at = |row| -> Result<Option<usize>> {
+                Ok(match ScalarKey::read(&batch.columns[group], row) {
+                    Some(ScalarKey::Signed(value)) => Some(value as usize),
                     Some(ScalarKey::Null) => None,
                     _ => match batch.columns[group].value(row)? {
-                        Value::I64(value) => Some(value),
+                        Value::I64(value) => Some(value as usize),
                         Value::Null | Value::Undefined => None,
                         _ => return Err(invalid("aggregate-group", "Expected a group index for an ordered aggregate")),
                     },
-                };
-                if let Some(value) = value { picks.push((row, value as usize)); }
+                })
+            };
+            let (span, count) = if let Column::Arrow { array, .. } = &batch.columns[group]
+                && array.data_type() == &DataType::Int64 && array.null_count() == 0
+            {
+                context.check_cancelled()?;
+                (0..batch.len, batch.len)
+            } else {
+                let mut span = 0..0;
+                let mut count = 0;
+                for row in 0..batch.len {
+                    context.check_cancelled_at(row)?;
+                    if group_at(row)?.is_some() {
+                        if count == 0 { span.start = row; }
+                        span.end = row + 1;
+                        count += 1;
+                    }
+                }
+                (span, count)
+            };
+            if count == 0 { continue; }
+            output.admit_positions(count, groups)?;
+            let page = output.batches.len();
+            let retained = if span.len() == count { batch.retain_ordered_list_span(span.clone(), memory)? } else { None };
+            let _positions = if retained.is_none() {
+                Some(memory.reserve(count.checked_mul(size_of::<(usize, usize)>())
+                    .ok_or_else(|| invalid("aggregate-size", "Ordered list positions overflow"))?)?)
+            } else {
+                None
+            };
+            let mut rows = if retained.is_none() { Vec::with_capacity(count) } else { Vec::new() };
+            let mut offset = 0;
+            for row in span {
+                context.check_cancelled_at(row)?;
+                if let Some(group) = group_at(row)? {
+                    output.push_position(group, page, offset)?;
+                    if retained.is_none() { rows.push((0, row)); }
+                    offset += 1;
+                }
             }
-            if !picks.is_empty() {
-                let rows = picks.iter().map(|&(row, _)| (0, row)).collect::<Vec<_>>();
-                let arguments = batch.key_projection(&[0], memory)?.compact_group_keys(&rows, memory)?;
-                output.collect(&arguments, 0, picks.iter().enumerate().map(|(row, &(_, group))| (row, group)), groups, context)?;
-            }
+            let arguments = match retained {
+                Some(arguments) => arguments,
+                None => batch.compact_group_key_columns(&rows, Some(&[0]), memory)?,
+            };
+            output.batches.push(arguments);
         }
         Ok(output)
     }
@@ -1041,7 +1129,7 @@ impl ScalarGroups {
         self.reservation = reservation;
         Ok(())
     }
-    fn aggregate(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
+    fn aggregate(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],group_count: usize,argument: Option<usize>,aggregate: &AggregateExpr,types: &AggregateTypes,scope: &rtdb_expr::EvaluationScope,execution: &Execution) -> Result<()> {
         use AggregateFunction as A;
         match aggregate.function {
             A::Sum | A::Average => {
@@ -1056,10 +1144,10 @@ impl ScalarGroups {
                 let summer = SumFactory::new(&types.input,&sum_type)?;
                 self.ensure(group_count,execution)?;
                 self.sum_page(page,mapping,mask,argument,&summer,execution)?;
-                for ((value,group),selected) in squares.into_iter().zip(mapping).zip(mask) {
+                for ((value,group),selected) in squares.into_iter().zip(mapping.iter()).zip(mask) {
                     execution.context.check_cancelled()?;
                     if *selected { if let Some(value) = value {
-                        let state = &mut self.values[*group];
+                        let state = &mut self.values[group];
                         state.squares = Some(state.squares.map_or(value,|previous|previous + value));
                     } }
                 }
@@ -1077,7 +1165,7 @@ impl ScalarGroups {
                 for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
                     execution.context.check_cancelled_at(row)?;
                     if *selected {
-                        let state = &mut self.values[*group];
+                        let state = &mut self.values[group];
                         if let Some(column) = &extrema {
                             if let Some(value) = column.get(row) {
                                 state.numeric_extremum(value, types.output_type(), aggregate.function == A::Min, execution)?;
@@ -1092,14 +1180,14 @@ impl ScalarGroups {
         }
         Ok(())
     }
-    fn sum_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
+    fn sum_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
         let _scratch = execution.context.memory.reserve(4096)?;
         let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
             .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
         for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(index)?;
             if !*selected { continue; }
-            let state = &mut self.values[*group];
+            let state = &mut self.values[group];
             if let Some(column) = &numeric {
                 if let Some(value) = column.get(index) {
                     state.add_numeric(value, summer.output, execution)?;
@@ -1117,11 +1205,11 @@ impl ScalarGroups {
         }
         Ok(())
     }
-    fn count_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,all: bool,execution: &Execution) -> Result<()> {
+    fn count_page(&mut self,page: Rows<'_>,mapping: GroupMapping<'_>,mask: &[bool],argument: Option<usize>,all: bool,execution: &Execution) -> Result<()> {
         for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(row)?;
             if *selected && (all || !page.is_null(row,argument)?) {
-                let state = &mut self.values[*group];
+                let state = &mut self.values[group];
                 state.count = state.count.wrapping_add(1);
             }
         }

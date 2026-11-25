@@ -115,9 +115,20 @@ enum ListEvent {
 }
 
 /// A completed list slice retaining all cell evaluation charges until it is dropped.
-pub struct ListBatch { values: rtdb_types::ListValue, _scope: crate::EvaluationScope }
+pub struct ListBatch { values: rtdb_types::ListValue, scope: crate::EvaluationScope }
 impl ListBatch {
     pub fn values(&self) -> &rtdb_types::ListValue { &self.values }
+
+    /// Transfers the Arrow column together with the page grant that covers its backing.
+    pub fn into_packed_column(self) -> Result<(Arc<arrow_schema::Field>, arrow_array::ArrayRef, Arc<rtdb_types::MemoryReservation>)> {
+        let Self { values, scope } = self;
+        let (field, array) = values.packed_column()
+            .ok_or_else(|| Anomaly::fault("rtdb.expr/list-state", "A packed list page requires an Arrow column"))?;
+        drop(values);
+        let reservation = scope.into_reservation()?
+            .ok_or_else(|| Anomaly::fault("rtdb.expr/allocation-scope", "A list page has no reservation"))?;
+        Ok((field, array, reservation))
+    }
 }
 
 /// Caller-polled list evaluation, with its descriptor selected once at opening.
@@ -180,7 +191,7 @@ impl IndexedListBatches {
         let field = Arc::new(arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false));
         let values = rtdb_types::ListValue::from_numeric_arrow(field, Arc::new(array)).expect("i64 series is numeric");
         self.position = end;
-        Ok(Some(ListBatch { values, _scope: scope }))
+        Ok(Some(ListBatch { values, scope }))
     }
 }
 

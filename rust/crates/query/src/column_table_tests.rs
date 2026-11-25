@@ -375,3 +375,80 @@ async fn a_computed_column_table_keeps_one_batch_across_list_pages() {
     }
     assert!(batches.next_batch().await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn computed_column_table_moves_one_span_and_assembles_multiple_float_spans() {
+    use arrow_array::{Array, Float32Array};
+    use crate::columnar::Column;
+
+    for count in [3, 6] {
+        let execution = execution(1, vec![]);
+        let nan = f32::from_bits(0x7fc0_1234);
+        let cells = [Some(-0.0_f32), None, Some(nan), None, Some(0.0), Some(nan)];
+        let expected = cells[..count].iter().map(|cell| cell.map(f32::to_bits)).collect::<Vec<_>>();
+        let array = Float32Array::from(cells[..count].to_vec());
+        let source = array.values().inner().data_ptr().as_ptr() as usize;
+        let expression = Expr::Literal(Value::List(rtdb_types::ListValue::from_f32(array)));
+        let mut cursor = crate::column_table::open_columns(&execution, expression).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.len, count);
+        let Column::Arrow { array, .. } = &page.columns[0] else { panic!("expected a single float vector"); };
+        let array = array.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(array.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>(), expected);
+        if count == 3 {
+            assert_eq!(array.values().inner().data_ptr().as_ptr() as usize, source);
+        }
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn computed_column_table_keeps_mixed_float_widths_and_null_legs_in_order() {
+    let f32_bits = 0x7fc0_1234;
+    let f64_bits = 0x7ff8_0000_0000_1234;
+    let cells = vec![
+        Value::F32(f32::from_bits(f32_bits)),
+        Value::Null,
+        Value::F64(-0.0),
+        Value::F64(f64::from_bits(f64_bits)),
+        Value::F32(-0.0),
+        Value::Null,
+    ];
+    for expression in [
+        Expr::Literal(Value::list(cells.clone())),
+        Expr::List(cells.into_iter().map(Expr::Literal).collect()),
+    ] {
+        let execution = execution(1, vec![]);
+        let memory = &execution.context.memory;
+        let baseline = memory.used_bytes();
+        let mut cursor = crate::column_table::open_columns(&execution, expression).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.len, 6);
+        assert!(matches!(page.columns[0].value(0).unwrap(), Value::F32(value) if value.to_bits() == f32_bits));
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        drop(cursor);
+
+        let page = page.slice(1, 5, memory).unwrap();
+        let cell = |row| page.columns[0].value(row).unwrap();
+        assert_eq!(cell(0), Value::Null);
+        assert!(matches!(cell(1), Value::F64(value) if value.to_bits() == (-0.0_f64).to_bits()));
+        assert!(matches!(cell(2), Value::F64(value) if value.to_bits() == f64_bits));
+        assert!(matches!(cell(3), Value::F32(value) if value.to_bits() == (-0.0_f32).to_bits()));
+        assert_eq!(cell(4), Value::Null);
+        drop(page);
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
+async fn computed_column_table_cancellation_during_assembly_releases_all_pages() {
+    let execution = execution(1, vec![]);
+    let baseline = execution.context.memory.used_bytes();
+    let mut opening = Box::pin(crate::column_table::open_columns(&execution, series(8)));
+    for _ in 0..4 {
+        assert!(matches!(futures::poll!(&mut opening), std::task::Poll::Pending));
+    }
+    execution.context.cancellation.cancel();
+    assert_eq!(opening.await.err().unwrap().code, "xtdb/query-cancelled");
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}

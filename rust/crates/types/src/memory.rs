@@ -78,7 +78,18 @@ impl MemoryBudget {
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.acquire_chain(bytes)?;
-        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes }))
+        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: Box::default() }))
+    }
+
+    /// Admits new storage that also depends on already funded allocations.
+    pub fn reserve_with_backing(self: &Arc<Self>, bytes: usize,
+        backing: impl ExactSizeIterator<Item = Arc<MemoryReservation>>,
+    ) -> Result<Arc<MemoryReservation>> {
+        let bytes = backing.len().checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())
+            .and_then(|slots| bytes.checked_add(slots))
+            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;
+        self.acquire_chain(bytes)?;
+        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: backing.collect() }))
     }
 
     /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
@@ -184,11 +195,14 @@ impl Drop for MemoryBudget {
 pub struct MemoryReservation {
     budget: Arc<MemoryBudget>,
     bytes: usize,
+    backing: Box<[Arc<MemoryReservation>]>,
 }
 
 impl MemoryReservation {
+    /// The local charge excludes the already funded allocations in `backing`.
     pub fn bytes(&self) -> usize { self.bytes }
     pub fn budget(&self) -> &Arc<MemoryBudget> { &self.budget }
+    pub fn backing(&self) -> &[Arc<Self>] { &self.backing }
 
     /// - Admits additional bytes through this lease and every ancestor before the caller allocates them.
     /// - Requires a total at least as large as the held bytes; allocations are not resized.
@@ -212,17 +226,20 @@ impl MemoryReservation {
         Ok(())
     }
 
-    /// Transfers part of this grant to an independently released reservation.
+    /// Transfers part of this grant to an independently released reservation for storage with independent backing.
     pub fn split_off(&mut self, bytes: usize) -> Result<Arc<Self>> {
         self.bytes = self.bytes.checked_sub(bytes)
             .ok_or_else(|| Anomaly::incorrect("rtdb/undersized-reservation", "Allocation exceeds its reservation"))?;
-        Ok(Arc::new(Self { budget: Arc::clone(&self.budget), bytes }))
+        Ok(Arc::new(Self { budget: Arc::clone(&self.budget), bytes, backing: Box::default() }))
     }
 
-    /// Moves an existing charge between reservations on the same budget without acquiring it again.
+    /// Moves an independent charge between reservations on the same budget without acquiring it again.
     pub fn absorb(&mut self, other: &mut Self) -> Result<()> {
         if !Arc::ptr_eq(&self.budget, &other.budget) {
             return Err(Anomaly::incorrect("rtdb/reservation-budget", "Reservations belong to different budgets"));
+        }
+        if !other.backing.is_empty() {
+            return Err(Anomaly::incorrect("rtdb/reservation-backing", "Reservation depends on other allocations"));
         }
         let bytes = self.bytes.checked_add(other.bytes)
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;

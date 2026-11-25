@@ -65,10 +65,44 @@ theorem snapshot_reply_is_at_the_requested_basis
   unfold snapshotAt at reply
   split at reply <;> simp_all
 
+structure InstalledImage (State : Type) where
+  through : Nat
+  value : State
+
+/-- Initial activation reads the image at the installed cut. Appending a
+checkpoint confirmation alone supplies no installed image for that cut. -/
+def activateFromImage (confirmed recognized : Bool) (received : Nat)
+    (installed : Option (InstalledImage State)) : Option State :=
+  match installed with
+  | some image =>
+    if confirmed && recognized && (image.through == received) then some image.value else none
+  | none => none
+
+theorem activated_writer_uses_replayed_image
+    (applyEvent : State → Event → State) (initial : State)
+    (replay : CursorReplay history checkpoint received delivered)
+    (installed : InstalledImage State)
+    (installedCut : installed.through = received)
+    (installedValue : installed.value =
+      delivered.foldl applyEvent ((history.take checkpoint).foldl applyEvent initial))
+    (confirmed recognized : Bool)
+    (activated : activateFromImage confirmed recognized received (some installed) = some value) :
+    confirmed = true ∧ recognized = true ∧
+      value = (history.take received).foldl applyEvent initial := by
+  have result := certified_checkpoint_with_retried_delivery applyEvent initial replay
+  simp [activateFromImage, installedCut, Bool.and_eq_true] at activated
+  obtain ⟨flags, exactValue⟩ := activated
+  exact ⟨flags.1, flags.2, exactValue.symm.trans (installedValue.trans result)⟩
+
+#guard activateFromImage true true 42 (some ⟨41, "original receipt"⟩) == none
+#guard activateFromImage true false 42 (some ⟨42, "original receipt"⟩) == none
+#guard activateFromImage true true 42 (some ⟨42, "original receipt"⟩) == some "original receipt"
+
 #print axioms replay_suffix_from_checkpoint
 #print axioms cursor_replay_covers_exact_segment
 #print axioms certified_checkpoint_with_retried_delivery
 #print axioms snapshot_reply_is_at_the_requested_basis
+#print axioms activated_writer_uses_replayed_image
 
 end RTDB.Recovery
 

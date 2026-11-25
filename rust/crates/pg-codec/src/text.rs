@@ -4,7 +4,7 @@ use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, PgType, Result, ScalarType
 use crate::interval::parse as interval;
 
 mod column;
-pub use column::{read_source_text_column, read_text_column, read_vector_column};
+pub use column::{read_snapshot_transit_column, read_source_text_column, read_text_column, read_vector_column, tstzrange_field};
 mod wal_array;
 pub use wal_array::{WalArrayRow, WalListColumn, WalListRow, read_wal_array};
 mod transit_input;
@@ -38,7 +38,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
         1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; let mut list = rtdb_types::ListBuilder::with_capacity(0); visit_array(text, |value| { list.push(value.map_or(Ok(Value::Null), |text| read_text(element, &text))?); Ok(()) })?; Value::List(list.finish()) },
         114 | 3802 => read_json(text)?,
-        3910 => match range(text)? {
+        3910 => match read_tstzrange(text)? {
             Some((lower, upper)) => Value::TimestampTzRange { lower, upper },
             None => Value::Null,
         },
@@ -184,11 +184,12 @@ pub(crate) fn visit_array_elements<'a>(text: &'a str, strict_quotes: bool, mut v
     if quoted || escaped { return Err(invalid("Unterminated PostgreSQL array element")); }
     visit(finish(start, inner.len(), copied, decoded))
 }
-fn range(text: &str) -> Result<Option<(i64, i64)>> {
+/// Parses the timestamp endpoints of a source range. Absent bounds use the native infinity sentinels.
+pub fn read_tstzrange(text: &str) -> Result<Option<(i64, i64)>> {
     let Some(inner) = text.strip_prefix('[').and_then(|text| text.strip_suffix(')')) else { return Ok(None); };
     let Some((lower, upper)) = inner.split_once(',') else { return Ok(None); };
     let bound = |text: &str, absent| -> Result<i64> {
-        if text.is_empty() { Ok(absent) } else { Ok(rtdb_expr::timestamp_micros(&timestamp(text)?, "UTC")?.0) }
+        if text.is_empty() { Ok(absent) } else { zoned_timestamp_micros(text).map(|(micros, _)| micros) }
     };
     Ok(Some((bound(lower, i64::MIN)?, bound(upper, i64::MAX)?)))
 }

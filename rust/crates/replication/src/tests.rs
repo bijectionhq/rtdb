@@ -3698,6 +3698,35 @@ async fn fenced_term_fixture(holds_grant: bool) -> (Fixture, Arc<FencedTermLog>)
     (fixture, fenced)
 }
 
+#[tokio::test]
+async fn a_fenced_replacement_starts_serving_after_its_inherited_checkpoint_is_installed() {
+    let (fixture, fenced) = fenced_term_fixture(true).await;
+    let config = ReplicationConfig { idle_heartbeat: false, ..leading_config() };
+    let (handle, mut driver) = reopen_memory_checkpoint_with_config(&fixture, config).await;
+    driver.update_installed_prefix().unwrap();
+    let boundary = raw(0, 1, 0, boundary(0, -1));
+    fenced.log.enqueue(boundary.payload.clone(), boundary.metadata.timestamp).await.unwrap().durable().await.unwrap();
+    driver.consume(boundary).await.unwrap();
+
+    driver.lead_after_empty_read(0).await.unwrap();
+    assert_eq!(handle.status().role, Role::Following);
+    for _ in 0..2 {
+        let production = &mut driver.leader.as_mut().unwrap().production;
+        let result = tokio::time::timeout(Duration::from_secs(5), super::pending_production(production)).await.unwrap();
+        driver.production_finished(result).await.unwrap();
+    }
+    assert_eq!(handle.status().role, Role::Following);
+    assert_eq!(fenced.log.latest().unwrap(), LogOffset(1));
+
+    let upload = fenced.log.read_range(LogOffset(1), LogOffset(2)).await.unwrap().pop().unwrap();
+    driver.consume(upload).await.unwrap();
+    let status = handle.status();
+    assert_eq!(status.role, Role::Leading(Term(2)));
+    assert_eq!(status.installed.unwrap().replica, status.replica_position);
+    assert_eq!(status.adopted_block.unwrap().block_index(), BlockIndex(0));
+    driver.demote().await.unwrap();
+}
+
 fn leading_config() -> ReplicationConfig {
     ReplicationConfig { assertion_interval: Duration::from_millis(1), claim_wait: Some(Duration::from_millis(1)), ..Default::default() }
 }

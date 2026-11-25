@@ -1403,7 +1403,14 @@ fn iid_vector(lists: &[Cow<'_, [Iid]>], field: &Field, arrays: &mut BatchBuilder
     })
 }
 
-fn document_leg(mut lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
+    let length = *offsets.last().expect("document origin") as usize;
+    let structs = document_struct(lists, length, arrays, memory)?;
+    document_list(structs, offsets)
+}
+
+fn document_struct(mut lists: Vec<SourceDocuments<'_>>, length: usize, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
     let all_submitted = lists.len() > 1 && lists.iter().all(|list| {
         matches!(list, SourceDocuments::Arrow(documents) if documents.submitted_rows().is_some())
     });
@@ -1435,7 +1442,7 @@ fn document_leg(mut lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, 
                 let mixed = lists.iter().zip(&pages).map(|(list, page)| {
                     page.as_ref().map_or(*list, SourceDocuments::Arrow)
                 }).collect::<Vec<_>>();
-                if let Some(leg) = mixed_document_leg(&mixed, arrays)? { return Ok(leg); }
+                if let Some(structs) = mixed_document_struct(&mixed, length, arrays)? { return Ok(structs); }
             }
             let legacy = lists.iter().map(|list| match list {
                 SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some() => {
@@ -1446,25 +1453,23 @@ fn document_leg(mut lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, 
             let mixed = lists.into_iter().zip(&legacy).map(|(list, rows)| {
                 rows.as_ref().map_or(list, SourceDocuments::Rows)
             }).collect();
-            return document_leg(mixed, arrays, memory);
+            return document_struct(mixed, length, arrays, memory);
         }
         let arrow = lists.iter().map(|list| match list {
             SourceDocuments::Arrow(documents) => Some(documents.array()),
             SourceDocuments::Rows(_) | SourceDocuments::Canonical { .. } => None,
         }).collect::<Option<Vec<_>>>();
         if let Some(pages) = arrow
-            && let Some(leg) = arrow_document_leg(&pages, arrays)? {
-            return Ok(leg);
+            && let Some(structs) = arrow_document_struct(&pages, length, arrays)? {
+            return Ok(structs);
         }
         if lists.iter().all(|list| !matches!(list, SourceDocuments::Canonical { .. }))
             && lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
-            && let Some(leg) = mixed_document_leg(&lists, arrays)? {
-            return Ok(leg);
+            && let Some(structs) = mixed_document_struct(&lists, length, arrays)? {
+            return Ok(structs);
         }
     }
-    let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
-    let structs = canonical_document_struct(&lists, *offsets.last().expect("document origin") as usize, arrays, memory)?;
-    document_list(structs, offsets)
+    canonical_document_struct(&lists, length, arrays, memory)
 }
 
 fn document_observed_type_bytes(cell: ArrowCell<'_>) -> Result<usize> {
@@ -1488,9 +1493,7 @@ fn legacy_page_has_stable_layout(documents: &ArrowDocuments, arrays: &BatchBuild
     Ok(true)
 }
 
-fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
-    let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
-    let length = *offsets.last().unwrap() as usize;
+fn mixed_document_struct(lists: &[SourceDocuments<'_>], length: usize, arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
     let names = lists.iter().flat_map(SourceDocuments::columns).collect::<OrderedSet<_>>();
     let mut layout = Vec::with_capacity(names.len());
     for name in names {
@@ -1563,8 +1566,7 @@ fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) 
         })?);
         fields.push(Arc::new(field));
     }
-    let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, length, None)?;
-    document_list(structs, offsets).map(Some)
+    rtdb_columnar::build_struct_array(fields.into(), &columns, length, None).map(Some)
 }
 
 fn canonical_union_layouts(field: &Field) -> bool {
@@ -1583,13 +1585,11 @@ fn canonical_union_layouts(field: &Field) -> bool {
     }
 }
 
-fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
+fn arrow_document_struct(pages: &[&StructArray], length: usize, arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
     let Some(first) = pages.first() else { return Ok(None); };
-    let offsets = document_offsets(pages.iter().map(|page| page.len()))?;
     if pages.len() == 1 {
         let bound = first.get_array_memory_size().checked_add(4096).ok_or_else(overflow)?;
-        let structs = arrays.column(bound, || Ok(Arc::new((*first).clone())))?;
-        return document_list(structs, offsets).map(Some);
+        return arrays.column(bound, || Ok(Arc::new((*first).clone()))).map(Some);
     }
 
     let mut layout = StructFields::<Field>::new();
@@ -1641,8 +1641,7 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
         })?);
         fields.push(Arc::new(field));
     }
-    let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?;
-    document_list(structs, offsets).map(Some)
+    rtdb_columnar::build_struct_array(fields.into(), &columns, length, None).map(Some)
 }
 
 fn document_column<'a>(page: &'a StructArray, name: &str) -> Option<(&'a Field, &'a ArrayRef)> {
@@ -1754,13 +1753,13 @@ pub(crate) fn owned_row_documents(documents: &Documents, memory: &Arc<MemoryBudg
 pub(crate) fn coalesce_arrow_documents(mut pages: Vec<ArrowDocuments>, memory: &Arc<MemoryBudget>) -> Result<ArrowDocuments> {
     if pages.len() == 1 { return Ok(pages.pop().expect("The document group has one page")); }
     let mut builder = BatchBuilder::new(4096, memory)?;
+    let length = pages.iter().map(ArrowDocuments::row_count).try_fold(0, next_document_offset)? as usize;
     let documents = pages.iter().map(ArrowDocuments::array).collect::<Vec<_>>();
-    let list = if let Some(array) = arrow_document_leg(&documents, &mut builder)? {
+    let array = if let Some(array) = arrow_document_struct(&documents, length, &mut builder)? {
         array
     } else {
-        document_leg(pages.iter().map(SourceDocuments::Arrow).collect(), &mut builder, memory)?
+        document_struct(pages.iter().map(SourceDocuments::Arrow).collect(), length, &mut builder, memory)?
     };
-    let array = Arc::clone(list.as_list::<i32>().values());
     own_documents(array, builder, memory)
 }
 
@@ -2344,10 +2343,14 @@ fn coalesce_submitted_numeric_lists(
 fn document_offsets(lengths: impl IntoIterator<Item = usize>) -> Result<Vec<i32>> {
     let mut offsets = vec![0i32];
     for length in lengths {
-        let length = i32::try_from(length).map_err(|_| overflow())?;
-        offsets.push(offsets.last().unwrap().checked_add(length).ok_or_else(overflow)?);
+        offsets.push(next_document_offset(*offsets.last().unwrap(), length)?);
     }
     Ok(offsets)
+}
+
+fn next_document_offset(offset: i32, length: usize) -> Result<i32> {
+    let length = i32::try_from(length).map_err(|_| overflow())?;
+    offset.checked_add(length).ok_or_else(overflow)
 }
 
 fn document_list(structs: ArrayRef, offsets: Vec<i32>) -> Result<ArrayRef> {
@@ -4096,15 +4099,19 @@ mod tests {
         ).unwrap();
         let second = StructArray::try_new(
             vec![Field::new("_id", DataType::Int64, false), Field::new("b", DataType::Boolean, false)].into(),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![2])), Arc::new(arrow_array::BooleanArray::from(vec![true]))],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![2, 3])), Arc::new(arrow_array::BooleanArray::from(vec![true, false]))],
             None,
         ).unwrap();
+        let pages = [&first, &second].map(|page| {
+            let layout = DecodedDocumentLayout::new(page.fields(), &memory).unwrap();
+            ArrowDocuments::from_source(page, layout, page.get_array_memory_size(), &memory).unwrap().unwrap()
+        });
         let mut arrays = BatchBuilder::new(4096, &memory).unwrap();
 
-        let result = arrow_document_leg(&[&first, &second], &mut arrays).unwrap().unwrap();
+        let result = document_leg(pages.iter().map(SourceDocuments::Arrow).collect(), &mut arrays, &memory).unwrap();
 
         let lists = result.as_any().downcast_ref::<ListArray>().unwrap();
-        assert_eq!(lists.value_offsets(), &[0, 1, 2]);
+        assert_eq!(lists.value_offsets(), &[0, 1, 3]);
         let values = lists.values().as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(values.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["a", "_id", "b"]);
         assert_eq!(read_value(&values.fields()[0], values.column(0).as_ref(), 0).unwrap(), Value::Utf8("left".into()));
@@ -4449,7 +4456,7 @@ mod tests {
         let first_docs = put(1, &first);
         let second_docs = put(2, &second);
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
-        assert!(arrow_document_leg(&[first_docs.array(), second_docs.array()], &mut builder).unwrap().is_some());
+        assert!(arrow_document_struct(&[first_docs.array(), second_docs.array()], 2, &mut builder).unwrap().is_some());
         let operations = [first_docs, second_docs].into_iter().map(|documents| TxOp::PutArrowDocs {
             table: TableRef::new("public", "docs"), documents,
         }).collect();
@@ -4479,9 +4486,9 @@ mod tests {
         let memory = MemoryBudget::new(1 << 18);
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
 
-        let result = arrow_document_leg(&[&first, &second], &mut builder).unwrap().unwrap();
+        let result = arrow_document_struct(&[&first, &second], 2, &mut builder).unwrap().unwrap();
 
-        let docs = result.as_list::<i32>().values().as_struct();
+        let docs = result.as_struct();
         let (field, array) = document_column(docs, "items").unwrap();
         assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), Value::FixedSizeList(vec![Value::I64(5)].into()));
         assert_eq!(read_value(field, array.as_ref(), 1).unwrap(), Value::FixedSizeList(vec![Value::I64(7)].into()));
@@ -4512,9 +4519,9 @@ mod tests {
         let memory = MemoryBudget::new(2 << 20);
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
 
-        let list = arrow_document_leg(&[&first, &second], &mut builder).unwrap().unwrap();
+        let result = arrow_document_struct(&[&first, &second], first.len() + second.len(), &mut builder).unwrap().unwrap();
 
-        let docs = list.as_list::<i32>().values().as_struct();
+        let docs = result.as_struct();
         let (field, array) = document_column(docs, "items").unwrap();
         let expected = Value::FixedSizeList(vec![Value::list(vec![Value::Struct(StructFields::from([
             ("n".into(), Value::I64(0)), ("payload".into(), Value::Null),
@@ -5392,7 +5399,7 @@ mod tests {
         let legacy = documents.to_rows(false, &memory).unwrap();
         let row = SourceDocuments::Rows(&legacy);
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
-        assert!(mixed_document_leg(&[SourceDocuments::Arrow(&documents), SourceDocuments::Rows(&legacy)], &mut builder).unwrap().is_none());
+        assert!(mixed_document_struct(&[SourceDocuments::Arrow(&documents), SourceDocuments::Rows(&legacy)], 2, &mut builder).unwrap().is_none());
         let actual = document_leg(vec![SourceDocuments::Arrow(&documents), row], &mut builder, &memory).unwrap();
         let expected = document_leg(vec![SourceDocuments::Rows(&legacy), SourceDocuments::Rows(&legacy)], &mut builder, &memory).unwrap();
         let ipc = |array: ArrayRef| {

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 mod direct_plan;
+pub(crate) mod replay_rank;
 mod retired_family;
 pub use retired_family::bind_retired_family_authority;
 pub(crate) use retired_family::RetiredFamilyFence;
@@ -92,6 +93,8 @@ pub struct HostedReplay {
     worlds: Vec<u8>,
     #[serde(skip)]
     direct_effects: VecDeque<u32>,
+    #[serde(skip)]
+    rank: Option<replay_rank::ReplayRank>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -180,6 +183,7 @@ pub fn hosted_replay_controls<'a>(
     let expiries = selected(RESTORE, &expiry_id);
     let effects_id = format!("native-effects/{}", source.tx_id.0);
     let effects = selected(RESTORE, &effects_id).ok_or_else(replay_invalid)?;
+    let rank = selected(RESTORE, &replay.rank_locator());
     let prefix = format!("native-worlds/{}/", source.tx_id.0);
     let mut chunks = std::collections::BTreeMap::new();
     let mut bytes = 0usize;
@@ -197,7 +201,7 @@ pub fn hosted_replay_controls<'a>(
         }
     }
     if controls.clone().filter(|control| control.name() == RESTORE).count()
-        != 6 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + chunks.len()
+        != 6 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + usize::from(rank.is_some()) + chunks.len()
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -221,6 +225,11 @@ pub fn hosted_replay_controls<'a>(
         replay.require_assertion_line(position, [0; 16])?;
     }
     replay.direct_effects = positions;
+    if let Some(rank) = rank {
+        let body = control_body(rank, 68)
+            .filter(|_| rank.expected().is_none()).ok_or_else(replay_invalid)?;
+        replay.rank = Some(replay_rank::ReplayRank::decode(body, &replay)?);
+    }
     if let Some(lifetimes) = lifetimes {
         let encoded = control_body(lifetimes, MAX_REPLAY_LIFETIME_BYTES)
             .filter(|_| lifetimes.expected().is_none()).ok_or_else(replay_invalid)?;
@@ -430,6 +439,24 @@ impl HostedReplay {
 
     pub(crate) fn destination_locator(destination: rtdb_types::TxId) -> String {
         format!("native-destination/{}", destination.0)
+    }
+
+    pub(crate) fn rank_locator(&self) -> String {
+        format!("native-rank/{}", self.source.tx_id.0)
+    }
+
+    pub(crate) fn rank(&self) -> Option<&replay_rank::ReplayRank> { self.rank.as_ref() }
+
+    pub(crate) fn rank_scope(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut scope = Sha256::new();
+        scope.update(b"rtdb.archive-rank-scope/v1\0");
+        scope.update(self.binding);
+        scope.update(self.archive);
+        scope.update(self.fingerprint);
+        scope.update(self.source.tx_id.0.to_be_bytes());
+        scope.update(self.source.system_time.0.to_be_bytes());
+        scope.finalize().into()
     }
 
     pub(crate) fn world_omissions_locator(&self) -> String {

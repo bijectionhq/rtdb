@@ -4,7 +4,7 @@ use rtdb_plan::{ColumnId, Expr, PatchEndpoint, Schema};
 use rtdb_format::transit::{TransitValue, to_json_value};
 use rtdb_types::{Anomaly, Iid, Result, Timestamp, Value};
 
-use crate::{columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, times},
+use crate::{columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column_iter, times},
     context::Execution, invalid};
 
 pub(crate) struct BatchPatchGaps {
@@ -123,7 +123,8 @@ impl BatchCursor for BatchPatchGaps {
         let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
         let [iid, valid_from, valid_to, document] = layout.columns;
         let capacity = batch.len.checked_mul(3).ok_or_else(size_error)?;
-        let _scratch = context.memory.reserve(capacity.checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?)?;
+        let span_bytes = capacity.checked_mul(size_of::<PatchSpan>()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let _spans = context.memory.reserve(span_bytes)?;
         let mut spans = Vec::with_capacity(capacity);
         let mut timeline = layout.timeline();
         let read_time = |position, row, upper| -> Result<Timestamp> {
@@ -151,24 +152,33 @@ impl BatchCursor for BatchPatchGaps {
             spans.extend(timeline.advance(row, id, from, to).into_iter().flatten());
         }
         spans.extend(timeline.finish());
-        let ids = spans.iter().map(|span| Some((0, span.source))).collect::<Vec<_>>();
-        let docs = spans.iter().map(|span| span.copy_document.then_some((0, span.source))).collect::<Vec<_>>();
-        let mut reservation = context.memory.reserve(256)?;
+        let timestamp_bytes = spans.len().checked_mul(4 * size_of::<i64>()).ok_or_else(size_error)?;
+        let output_bound = layout.width.checked_mul(size_of::<Column>() + 512)
+            .and_then(|bytes| bytes.checked_add(timestamp_bytes))
+            .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?;
+        let mut reservation = context.memory.reserve(output_bound)?;
         let mut output = Vec::with_capacity(layout.width);
         for position in 0..layout.width {
-            let (column, _charge) = match position {
-                index if index == iid => gather_nullable_column(|_| &batch, &ids, position, &context.memory)?,
-                index if index == document => gather_nullable_column(|_| &batch, &docs, position, &context.memory)?,
-                index if index == valid_from => (times("_valid_from", spans.iter().map(|span| span.from), false), Arc::clone(&_scratch)),
-                index if index == valid_to => (times("_valid_to", spans.iter().map(|span| span.to), true), Arc::clone(&_scratch)),
-                _ => (Column::Arrow { array: Arc::new(arrow_array::NullArray::new(spans.len())),
+            context.check_cancelled()?;
+            let column = match position {
+                index if index == iid || index == document => {
+                    let rows = spans.iter().map(|span| {
+                        (index == iid || span.copy_document).then_some((0, span.source))
+                    });
+                    let (column, mut charge) = gather_nullable_column_iter(|_| &batch, rows, position, &context.memory)?;
+                    let lease = Arc::get_mut(&mut reservation).expect("Patch output owns its reservation");
+                    lease.absorb(Arc::get_mut(&mut charge).expect("A gap gather owns its reservation"))?;
+                    column
+                }
+                index if index == valid_from => times("_valid_from", spans.iter().map(|span| span.from), false),
+                index if index == valid_to => times("_valid_to", spans.iter().map(|span| span.to), true),
+                _ => Column::Arrow { array: Arc::new(arrow_array::NullArray::new(spans.len())),
                     field: Arc::new(arrow_schema::Field::new("null", arrow_schema::DataType::Null, true)),
-                    logical: Some(LogicalType::Null) }, Arc::clone(&_scratch)),
+                    logical: Some(LogicalType::Null) },
             };
-            let lease = Arc::get_mut(&mut reservation).expect("Patch output owns its reservation");
-            lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
             output.push(column);
         }
+        context.check_cancelled()?;
         ColumnBatch::settled(output, spans.len(), reservation).map(Some)
     }
 }

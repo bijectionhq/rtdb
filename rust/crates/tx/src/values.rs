@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
-use arrow_schema::{DataType, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{ArrowCell, ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
@@ -349,6 +349,17 @@ impl ArrowDocuments {
             }
             result => result,
         }
+    }
+
+    pub(crate) fn from_scalar_mutation_page(content: &StructArray, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let batch = RecordBatch::from(content.clone());
+        let columns = batch.columns().iter().enumerate().map(|(index, column)| {
+            if canonical_mutation_scalar(column.as_ref()) { return Ok(Arc::clone(column)); }
+            copy_argument_column(&[&batch], index, memory)
+        }).collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
+        Self::from_record_batch(&batch, memory)
     }
 
     fn prepare_columns(batch: &RecordBatch, schema: &Schema, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<Self>> {
@@ -873,6 +884,47 @@ fn canonical_nullable_uuid(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Resu
     rtdb_columnar::retain_array(column, &reservation)
 }
 
+fn canonical_mutation_scalar(array: &dyn Array) -> bool {
+    if array.data_type() == &DataType::Null { return true; }
+    let nulls = array.nulls();
+    if nulls.is_some_and(|nulls| nulls.null_count() == 0 || !canonical_bitmap(nulls.inner())) {
+        return false;
+    }
+    let null_rows = || nulls.into_iter().flat_map(|nulls| nulls.iter().enumerate())
+        .filter_map(|(row, valid)| (!valid).then_some(row));
+    let data = array.to_data();
+    if data.offset() != 0 { return false; }
+    let len = array.len();
+    match (array.data_type(), data.buffers()) {
+        (DataType::Boolean, [_]) => {
+            let values = array.as_boolean().values();
+            canonical_bitmap(values) && null_rows().all(|row| !values.value(row))
+        }
+        (DataType::Utf8 | DataType::Binary, [offsets, values]) => {
+            let offsets = offsets.typed_data::<i32>();
+            offsets.len().checked_sub(1) == Some(len) && offsets.first() == Some(&0)
+                && offsets.last().and_then(|&end| usize::try_from(end).ok()) == Some(values.len())
+                && null_rows().all(|row| offsets[row] == offsets[row + 1])
+        }
+        (ty, [values]) => {
+            let width = match ty {
+                DataType::FixedSizeBinary(width) => usize::try_from(*width).ok(),
+                ty => ty.primitive_width(),
+            };
+            width.is_some_and(|width| len.checked_mul(width) == Some(values.len())
+                && null_rows().all(|row| values[row * width..(row + 1) * width].iter().all(|&byte| byte == 0)))
+        }
+        _ => false,
+    }
+}
+
+fn canonical_bitmap(bitmap: &arrow_buffer::BooleanBuffer) -> bool {
+    let values = bitmap.inner();
+    let bits = bitmap.len() % 8;
+    bitmap.offset() == 0 && values.len() == bitmap.len().div_ceil(8)
+        && (bits == 0 || values.last().is_some_and(|byte| *byte >> bits == 0))
+}
+
 pub(crate) fn canonical_argument_column(pages: &[&RecordBatch], index: usize, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
     if let [page] = pages {
         let array = page.column(index);
@@ -1328,6 +1380,42 @@ impl Deref for ArgumentRow<'_> {
     fn deref(&self) -> &[Value] { &self.values }
 }
 
+/// Funded logical types in the field order of one immutable Arrow argument schema.
+pub struct ArrowArgumentTypes {
+    schema: SchemaRef,
+    types: Vec<LogicalType>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl ArrowArgumentTypes {
+    /// Validates readable values in structurally admitted columns before the caller copies or retains them.
+    pub fn for_readable_columns(
+        schema: SchemaRef, columns: &[ArrayRef], memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let invalid_layout = || Anomaly::incorrect("rtdb.tx/argument-schema", "Arrow argument columns must match their schema");
+        if schema.fields().len() != columns.len() { return Err(invalid_layout()); }
+        Self::translate(schema, memory, |index, field, logical| {
+            let column = columns[index].as_ref();
+            if field.data_type() != column.data_type() { return Err(invalid_layout()); }
+            rtdb_columnar::validate_readable_column(field, column, logical, memory)
+        })
+    }
+
+    fn translate(
+        schema: SchemaRef, memory: &Arc<MemoryBudget>,
+        mut validate: impl FnMut(usize, &Field, &LogicalType) -> Result<()>,
+    ) -> Result<Self> {
+        let reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let mut types = Vec::with_capacity(schema.fields().len());
+        for (index, field) in schema.fields().iter().enumerate() {
+            let logical = from_field(field)?;
+            validate(index, field, &logical)?;
+            types.push(logical);
+        }
+        Ok(Self { schema, types, reservation })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SqlArguments {
     types: Arc<Vec<LogicalType>>,
@@ -1359,6 +1447,12 @@ impl SqlArguments {
     pub fn from_arrow_with_canonical_source(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
         Self::arrow(batch, SourceArgumentLayout::Canonical, memory)
     }
+
+    /// Reuses the admitted types when the resulting batch keeps the very same schema.
+    pub fn from_admitted_arrow_with_canonical_source(batch: OwnedBatch, admitted: ArrowArgumentTypes) -> Result<Self> {
+        Self::arrow_with_types(batch, SourceArgumentLayout::Canonical, admitted)
+    }
+
     /// Retains a single argument row built with the source row writer's canonical fields and buffers.
     pub fn from_canonical_arrow_row(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if batch.batch().num_rows() != 1 {
@@ -1373,12 +1467,20 @@ impl SqlArguments {
     }
 
     fn arrow(batch: OwnedBatch, source_layout: SourceArgumentLayout, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let schema = batch.batch().schema();
-        let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
-        let types = Arc::new(schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?);
+        let admitted = ArrowArgumentTypes::translate(batch.batch().schema(), memory, |_, _, _| Ok(()))?;
+        Self::arrow_with_types(batch, source_layout, admitted)
+    }
+
+    fn arrow_with_types(batch: OwnedBatch, source_layout: SourceArgumentLayout, admitted: ArrowArgumentTypes) -> Result<Self> {
+        if !Arc::ptr_eq(batch.batch().schema_ref(), &admitted.schema) {
+            return Err(Anomaly::incorrect("rtdb.tx/argument-schema", "Arrow argument batch does not use the admitted schema"));
+        }
+        let ArrowArgumentTypes { types, reservation: schema_reservation, .. } = admitted;
+        let memory = Arc::clone(schema_reservation.budget());
+        let types = Arc::new(types);
         let row_count = batch.batch().num_rows();
         let chunk = Arc::new(ArgumentChunk::Arrow { batch, types: Arc::clone(&types), source_layout, _reservation: Arc::clone(&schema_reservation) });
-        Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
+        Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory, schema_reservation, row_count })
     }
     pub fn from_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = rows.first().map_or(0, Vec::len);

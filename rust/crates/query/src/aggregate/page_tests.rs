@@ -188,6 +188,39 @@ async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
 }
 
 #[tokio::test]
+async fn global_counts_fit_without_a_group_ordinal_for_each_row() {
+    for filtered in [false, true] {
+        let execution = execution(1024);
+        let memory = &execution.context.memory;
+        let baseline = memory.used_bytes();
+        let len = 32_768;
+        let logical = LogicalType::Scalar(ScalarType::Bool);
+        let schema = Schema::new(vec![field(0, logical.clone())]).unwrap();
+        let filter = filtered.then(|| Expr::binary(
+            BinaryOp::Eq, schema.fields()[0].expression(), Expr::Literal(Value::Bool(true)),
+        ));
+        let aggregate = count(1, filter);
+        let output = Schema::new(vec![aggregate.field.clone()]).unwrap();
+        let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+            input: Arc::new(Relation::empty(schema.clone())), groups: vec![], aggregates: vec![aggregate.clone()],
+        }).unwrap());
+        let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+        let array = Arc::new(arrow_array::BooleanArray::from((0..len).map(|row| row % 2 == 0).collect::<Vec<_>>()));
+        let field = Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap());
+        let input = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical) }],
+            len, memory.reserve(0).unwrap()).unwrap();
+        let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(input))), false,
+            schema, vec![], vec![aggregate], runtime, execution.clone()).unwrap();
+        let pressure = memory.reserve(memory.available_bytes() - 128 * 1024).unwrap();
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        let expected = if filtered { len / 2 } else { len };
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::I64(expected as i64));
+        drop((result, cursor, pressure));
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
 async fn grouped_count_excludes_null_runs() {
     use arrow_array::{Float64Array, Int16Array, Int64Array, RecordBatch, RunArray, types::Int16Type};
     use arrow_schema::Schema as ArrowSchema;
@@ -388,6 +421,41 @@ async fn percentile_collects_arrow_positions_before_sorting_the_group() {
 }
 
 #[tokio::test]
+async fn spilled_percentiles_use_original_positions_across_mixed_runs() {
+    for object_sort in [rtdb_types::ObjectSort::TimSort, rtdb_types::ObjectSort::LegacyMergeSort] {
+        let execution = execution_with_options(QueryOptions { object_sort, batch_rows: 64, sort_memory_bytes: 2048, ..Default::default() });
+        let baseline = execution.context.memory.used_bytes();
+        let ty = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::F64)).maybe();
+        let schema = Schema::new(vec![field(0, ty.clone())]).unwrap();
+        let argument = schema.fields()[0].expression();
+        let percentile = |id, kind, descending, fraction, ty| AggregateExpr {
+            field: field(id, ty),
+            function: AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(fraction), descending },
+            argument: Some(argument.clone()), distinct: false, filter: None, order_by: vec![],
+        };
+        let aggregates = vec![
+            percentile(1, PercentileKind::Continuous, false, 0.5, LogicalType::Scalar(ScalarType::F64).maybe()),
+            percentile(2, PercentileKind::Discrete, true, 0.75, ty),
+        ];
+        let pages = (0..10).map(|page| {
+            (0..30).flat_map(|row| {
+                let lower = if row % 2 == 0 { Value::I64(10) } else { Value::F64(10.0) };
+                let upper = if page % 2 == 0 { Value::F64(30.0) } else { Value::I64(30) };
+                [vec![lower], vec![upper], vec![Value::Null]]
+            }).collect()
+        }).collect();
+        let (mut cursor, _) = cursor(&execution, schema, pages, vec![], aggregates, None);
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::F64(20.0));
+        assert!(matches!(result.columns[1].value(0).unwrap(), Value::F64(value) if value == 10.0));
+        assert!(execution.context.spill_peak_bytes() > 0);
+        drop((cursor, result));
+        assert_eq!(execution.context.spill_bytes(), 0);
+        assert_eq!(execution.context.memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
 async fn aggregate_columns_complete_their_page_masks_before_the_next_column() {
     for batch_rows in [1,1024] {
         let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();
@@ -463,6 +531,85 @@ async fn aggregate_output_is_complete_and_retains_distinct_state_across_pages() 
         assert_eq!(batch_row(&page, 1),[Value::I64(2),Value::list(vec![Value::I64(5)]),Value::I64(5)]);
         drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);
     }
+}
+
+#[tokio::test]
+async fn ordered_array_agg_lends_small_backing_and_detaches_wide_sort_keys() {
+    for key_width in [0, 16 * 1024] {
+        let execution = execution(1024);
+        let memory = &execution.context.memory;
+        let baseline = memory.used_bytes();
+        let ty = LogicalType::Scalar(ScalarType::I64);
+        let key_ty = LogicalType::Scalar(ScalarType::Utf8);
+        let schema = Schema::new(vec![field(0, ty.clone()), field(1, key_ty.clone())]).unwrap();
+        let aggregate = AggregateExpr {
+            field: field(2, LogicalType::list(ty.clone()).maybe()),
+            function: AggregateFunction::ArrayAgg,
+            argument: Some(schema.fields()[0].expression()),
+            distinct: false,
+            filter: None,
+            order_by: vec![SortExpr { expr: schema.fields()[1].expression(), descending: false, nulls_first: false }],
+        };
+        let output = Schema::new(vec![aggregate.field.clone()]).unwrap();
+        let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+            input: Arc::new(Relation::empty(schema.clone())), groups: vec![], aggregates: vec![aggregate.clone()],
+        }).unwrap());
+        let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+        let values: arrow_array::ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![30, 10, 20]));
+        let tail = "x".repeat(key_width);
+        let key = Arc::new(arrow_array::StringArray::from(vec![format!("a{tail}"), format!("b{tail}"), format!("c{tail}")]));
+        let input = ColumnBatch::settled(vec![
+            Column::Arrow { array: Arc::clone(&values), field: Arc::new(rtdb_columnar::to_field("c0", &ty).unwrap()), logical: Some(ty) },
+            Column::Arrow { array: key, field: Arc::new(rtdb_columnar::to_field("c1", &key_ty).unwrap()), logical: Some(key_ty) },
+        ], 3, memory.reserve(0).unwrap()).unwrap();
+        let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(input))), false, schema,
+            vec![], vec![aggregate], runtime, execution.clone()).unwrap();
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        drop(cursor);
+        let Column::Arrow { array, .. } = &result.columns[0] else { panic!("Expected an Arrow list"); };
+        let lists = array.as_list::<i32>();
+        assert_eq!(lists.value_offsets(), &[0, 3]);
+        assert_eq!(Arc::ptr_eq(lists.values(), &values), key_width == 0);
+        assert!(memory.used_bytes() - baseline < 16 * 1024);
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::list(vec![Value::I64(30), Value::I64(10), Value::I64(20)]));
+        drop((result, values));
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
+async fn spilled_ordered_array_agg_keeps_mixed_children_and_empty_group_offsets() {
+    let execution = execution_with_options(QueryOptions { batch_rows: 4, sort_memory_bytes: 1024, ..Default::default() });
+    let baseline = execution.context.memory.used_bytes();
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let arg = int.join(&LogicalType::Scalar(ScalarType::Utf8)).maybe();
+    let schema = Schema::new(vec![field(0, int.clone()), field(1, arg.clone()), field(2, int.clone())]).unwrap();
+    let groups = vec![NamedExpr { field: field(3, int), expr: schema.fields()[0].expression() }];
+    let key = schema.fields()[2].expression();
+    let aggregate = AggregateExpr {
+        field: field(4, LogicalType::list(arg).maybe()),
+        function: AggregateFunction::ArrayAgg,
+        argument: Some(schema.fields()[1].expression()),
+        distinct: false,
+        filter: Some(Expr::binary(BinaryOp::NotEq, key.clone(), Expr::Literal(Value::I64(2)))),
+        order_by: vec![SortExpr { expr: key, descending: false, nulls_first: false }],
+    };
+    let row = |group, argument, key| vec![Value::I64(group), argument, Value::I64(key)];
+    let pages = vec![
+        vec![row(1, Value::I64(30), 3), row(2, Value::I64(20), 2), row(1, Value::Null, 1)],
+        vec![row(1, Value::Utf8("skip".into()), 2), row(1, Value::Utf8("later tie".into()), 3)],
+    ];
+    let (mut cursor, _) = cursor(&execution, schema, pages, groups, vec![aggregate], None);
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    drop(cursor);
+    assert_eq!(batch_row(&result, 0), [Value::I64(1), Value::list(vec![Value::Null, Value::I64(30), Value::Utf8("later tie".into())])]);
+    assert_eq!(batch_row(&result, 1), [Value::I64(2), Value::Null]);
+    let Column::Arrow { array, .. } = &result.columns[1] else { panic!("Expected an Arrow list"); };
+    assert_eq!(array.as_list::<i32>().value_offsets(), &[0, 3, 3]);
+    assert!(execution.context.spill_peak_bytes() > 0);
+    assert_eq!(execution.context.spill_bytes(), 0);
+    drop(result);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
 
 #[tokio::test]
@@ -593,7 +740,7 @@ fn failing_duration_average_sum_does_not_start_the_count_pass() {
     for value in [Value::Duration { value: 10,unit: TimeUnit::Millisecond },Value::Null] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
     let page = ColumnBatch::from_page(&page.finish(), &execution.context.memory).unwrap();let scope = execution.scope().unwrap();
     let mut states = ScalarGroups::new(&execution).unwrap();
-    assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },&[0,0],&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
+    assert_eq!(states.aggregate(Rows { batch: &page, projected: false, memory: &execution.context.memory },GroupMapping::Global(2),&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
     assert_eq!(states.values[0].count,0);
     assert_eq!(states.values[0].accumulator.as_ref().unwrap().values,[Value::Duration { value: 10,unit: TimeUnit::Millisecond }]);
     drop(states);drop(scope);drop(page);

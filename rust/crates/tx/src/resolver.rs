@@ -41,6 +41,7 @@ mod fixed_range;
 pub(crate) mod ordered_micros;
 mod replay_constraints;
 mod replay_worlds;
+mod replay_rank;
 mod owned_capacity;
 use crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS;
 use owned_capacity::OwnedCapacityChanges;
@@ -776,6 +777,7 @@ pub struct OpenTransaction<'a> {
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
     search_erasure_admitted: bool,
+    replay_rank_erases: Option<replay_rank::ReplayRankErases>,
     placed_attempt: Option<PlacedAttempt>,
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
@@ -783,7 +785,7 @@ pub struct OpenTransaction<'a> {
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, search_erasure_admitted: false, replay_rank_erases: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -815,6 +817,11 @@ impl<'a> OpenTransaction<'a> {
         if let Some(prepared) = prepared {
             writes.install_prepared_generation(prepared, &self.context.memory)?;
         }
+        if let Some(replay) = self.hosted_replay.as_ref().filter(|_| result.committed()) {
+            crate::hosted_control::replay_rank::verify(
+                replay.rank(), writes.tables(), result.tx_key(), &self.context.memory,
+            )?;
+        }
         ResolvedTx::new(writes, result, input, None, None, self.context)
     }
 
@@ -824,6 +831,7 @@ impl<'a> OpenTransaction<'a> {
         if let Some(replay) = &self.hosted_replay {
             replay.require_constraints_matched()?;
             replay.require_expiries_matched()?;
+            if self.replay_rank_erases.as_ref().is_some_and(|erases| !erases.is_empty()) { return Err(purge_path_uncovered()); }
         }
         self.check_final_constraints(operations).await?;
         self.check_spatial_readiness(operations).await
@@ -1099,26 +1107,27 @@ impl<'a> OpenTransaction<'a> {
         let mut cursor = execute(input, context, arguments, syntax).await?;
         let system_time = self.tx_key().system_time;
         while let Some(batch) = cursor.next_batch().await? {
-            let batch = batch.batch();
             match kind {
-                MutationKind::Put => self.stage_mutation_puts(&table.table, batch, system_time)?,
+                MutationKind::Put => self.stage_mutation_puts(&table.table, &batch, system_time)?,
                 MutationKind::Erase => {
+                    let batch = batch.batch();
                     mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?;
                     let iids = mutation_column(batch, "_iid")?;
                     for row in 0..batch.num_rows() {
                         self.retire_unit_metadata(&table.table, iids.iid(row)?, None).await?;
                     }
                 }
-                MutationKind::Delete => mutation_events(batch, kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
+                MutationKind::Delete => mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event).map(drop))?,
             }
         }
         Ok(())
     }
 
-    fn stage_mutation_puts(&mut self, table: &TableRef, batch: &RecordBatch, system_time: Timestamp) -> Result<()> {
+    fn stage_mutation_puts(&mut self, table: &TableRef, page: &OwnedBatch, system_time: Timestamp) -> Result<()> {
+        let batch = page.batch();
         if batch.num_rows() == 0 { return Ok(()); }
         let memory = &self.context.memory;
-        match mutation_put_batch(batch, system_time, memory) {
+        match mutation_put_batch(page, system_time, memory) {
             Ok(Some(put)) => return self.buffer.append_batch(table, put),
             Ok(None) => (),
             Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
@@ -1168,7 +1177,7 @@ impl<'a> OpenTransaction<'a> {
                 let header = read_header(row)?;
                 let (document, index) = mutation_document(documents.as_ref(), row).expect("A document run has a struct at every position");
                 let content = document.slice(index, 1);
-                let batch = rtdb_format::data::owned_put_batch(Arc::new(content), &[header], None, memory)?;
+                let batch = rtdb_format::data::funded_put_batch(Arc::new(content), &[header], memory)?;
                 self.buffer.append_batch(table, batch)?;
             }
             start = end;
@@ -2871,7 +2880,18 @@ impl<'a> OpenTransaction<'a> {
         } else { kind };
         // The admitted erasure names every selector and writes the held
         // search revocation marker and the relation's purge frontier.
-        if !(self.search_erasure_admitted && crate::hosted_control::family_root_erase(relation)) {
+        let archived_rank_erase = self.hosted_replay.is_some()
+            && crate::hosted_control::replay_rank::rank_base(relation.name()).is_some();
+        let admitted = if archived_rank_erase {
+            let EntityId::Binary(address) = id else { return Err(purge_path_uncovered()); };
+            if !self.replay_rank_erases.as_mut().is_some_and(|erases| erases.take(relation.name(), address)) {
+                return Err(purge_path_uncovered());
+            }
+            true
+        } else {
+            self.search_erasure_admitted && crate::hosted_control::family_root_erase(relation)
+        };
+        if !admitted {
             let search = OwnedRelation::search_catalog(owner);
             if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
                 while let Some(batch) = rows.next_batch().await? {
@@ -4247,8 +4267,8 @@ enum DocumentWrite<'a> { Insert, Put, Owned { relation: &'a rtdb_types::OwnedRel
 #[derive(Clone, Copy)]
 enum MutationKind { Put, Delete, Erase }
 
-fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
-    mutation_put_batches(batch, &[], system_time, memory)
+fn mutation_put_batch(page: &OwnedBatch, system_time: Timestamp, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
+    assemble_mutation_put_batch(page.batch(), &[], true, system_time, memory)
 }
 
 fn scalar_mutation_put_field(field: &arrow_schema::Field) -> bool {
@@ -4270,6 +4290,12 @@ fn mutation_put_headers(batch: &RecordBatch, system_time: Timestamp) -> Result<i
 
 fn mutation_put_batches(
     batch: &RecordBatch, rest: &[OwnedBatch], system_time: Timestamp, memory: &Arc<MemoryBudget>,
+) -> Result<Option<OwnedBatch>> {
+    assemble_mutation_put_batch(batch, rest, false, system_time, memory)
+}
+
+fn assemble_mutation_put_batch(
+    batch: &RecordBatch, rest: &[OwnedBatch], funded_page: bool, system_time: Timestamp, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<OwnedBatch>> {
     let Some((index, _)) = batch.schema_ref().column_with_name("doc") else { return Ok(None); };
     let Some(content) = batch.column(index).as_struct_opt() else { return Ok(None); };
@@ -4305,6 +4331,10 @@ fn mutation_put_batches(
         let content = RecordBatch::from(content.clone());
         let Some(documents) = ArrowDocuments::from_canonical_ingest(&content, IngestMode::Mutation, memory)? else { return Ok(None); };
         return rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, None, memory).map(Some);
+    }
+    if funded_page {
+        let Some(documents) = ArrowDocuments::from_scalar_mutation_page(content, memory)? else { return Ok(None); };
+        return rtdb_format::data::funded_put_batch(Arc::new(documents.array().clone()), &headers, memory).map(Some);
     }
     let documents = || {
         std::iter::once(content).chain(rest.iter().map(move |page| page.batch().column(index).as_struct()))
@@ -4422,6 +4452,110 @@ fn mutation_layout_batch(
     Ok(Some((batch, declared)))
 }
 
+fn interleave_slot_bytes(ty: &DataType) -> Result<usize> {
+    let children = match ty {
+        DataType::Struct(fields) => fields.iter().try_fold(0usize, |bytes, field| {
+            bytes.checked_add(interleave_slot_bytes(field.data_type())?).ok_or_else(overflow)
+        })?,
+        DataType::Union(fields, _) => fields.iter().try_fold(0usize, |bytes, (_, field)| {
+            bytes.checked_add(interleave_slot_bytes(field.data_type())?).ok_or_else(overflow)
+        })?,
+        DataType::List(field) | DataType::LargeList(field) | DataType::ListView(field)
+        | DataType::LargeListView(field) | DataType::Map(field, _) => interleave_slot_bytes(field.data_type())?,
+        DataType::FixedSizeList(field, width) => interleave_slot_bytes(field.data_type())?
+            .checked_mul(usize::try_from(*width).map_err(|_| overflow())?).ok_or_else(overflow)?,
+        DataType::RunEndEncoded(ends, values) => interleave_slot_bytes(ends.data_type())?
+            .checked_add(interleave_slot_bytes(values.data_type())?).ok_or_else(overflow)?,
+        DataType::FixedSizeBinary(width) => usize::try_from(*width).map_err(|_| overflow())?,
+        ty => ty.primitive_width().unwrap_or_default(),
+    };
+    children.checked_add(32).ok_or_else(overflow)
+}
+
+fn interleave_offsets<O: arrow_buffer::ArrowNativeType>(offsets: &[O], row: usize) -> std::ops::Range<usize> {
+    offsets[row].as_usize()..offsets[row + 1].as_usize()
+}
+
+fn interleave_cell_payload(array: &dyn Array, row: usize) -> Result<usize> {
+    use arrow_array::types::{Int16Type, Int32Type, Int64Type};
+    use arrow_schema::UnionMode;
+
+    let payload = |array: &dyn Array, mut rows: std::ops::Range<usize>, initial| {
+        if array.data_type().primitive_width().is_some() || matches!(array.data_type(),
+            DataType::Null | DataType::Boolean | DataType::FixedSizeBinary(_) | DataType::Dictionary(..)
+            | DataType::Utf8View | DataType::BinaryView) {
+            return Ok(initial);
+        }
+        rows.try_fold(initial, |bytes: usize, row| {
+            bytes.checked_add(interleave_cell_payload(array, row)?).ok_or_else(overflow)
+        })
+    };
+    let list = |values: &dyn Array, rows: std::ops::Range<usize>| {
+        let bytes = interleave_slot_bytes(values.data_type())?.checked_mul(rows.len()).ok_or_else(overflow)?;
+        payload(values, rows, bytes)
+    };
+    // Arrow interleave can copy variable-width payload under a null mask.
+    match array.data_type() {
+        DataType::Utf8 => Ok(interleave_offsets(array.as_string::<i32>().value_offsets(), row).len()),
+        DataType::LargeUtf8 => Ok(interleave_offsets(array.as_string::<i64>().value_offsets(), row).len()),
+        DataType::Binary => Ok(interleave_offsets(array.as_binary::<i32>().value_offsets(), row).len()),
+        DataType::LargeBinary => Ok(interleave_offsets(array.as_binary::<i64>().value_offsets(), row).len()),
+        DataType::Struct(_) => array.as_struct().columns().iter().try_fold(0usize, |bytes, column| {
+            bytes.checked_add(interleave_cell_payload(column.as_ref(), row)?).ok_or_else(overflow)
+        }),
+        DataType::List(_) => {
+            let array = array.as_list::<i32>();
+            list(array.values().as_ref(), interleave_offsets(array.value_offsets(), row))
+        }
+        DataType::LargeList(_) => {
+            let array = array.as_list::<i64>();
+            list(array.values().as_ref(), interleave_offsets(array.value_offsets(), row))
+        }
+        DataType::ListView(_) => {
+            let array = array.as_list_view::<i32>();
+            let start = array.value_offset(row) as usize;
+            let end = start.checked_add(array.value_size(row) as usize).ok_or_else(overflow)?;
+            list(array.values().as_ref(), start..end)
+        }
+        DataType::LargeListView(_) => {
+            let array = array.as_list_view::<i64>();
+            let start = array.value_offset(row) as usize;
+            let end = start.checked_add(array.value_size(row) as usize).ok_or_else(overflow)?;
+            list(array.values().as_ref(), start..end)
+        }
+        DataType::FixedSizeList(_, width) => {
+            let array = array.as_fixed_size_list();
+            let start = array.value_offset(row) as usize;
+            let end = start.checked_add(*width as usize).ok_or_else(overflow)?;
+            payload(array.values().as_ref(), start..end, 0)
+        }
+        DataType::Map(..) => {
+            let array = array.as_map();
+            list(array.entries(), interleave_offsets(array.value_offsets(), row))
+        }
+        DataType::Union(_, UnionMode::Dense) => {
+            let array = array.as_union();
+            interleave_cell_payload(array.child(array.type_id(row)).as_ref(), array.value_offset(row))
+        }
+        DataType::Union(fields, UnionMode::Sparse) => {
+            let array = array.as_union();
+            fields.iter().try_fold(0usize, |bytes, (id, _)| {
+                bytes.checked_add(interleave_cell_payload(array.child(id).as_ref(), array.value_offset(row))?).ok_or_else(overflow)
+            })
+        }
+        DataType::RunEndEncoded(ends, _) => {
+            let (values, index) = match ends.data_type() {
+                DataType::Int16 => { let array = array.as_run::<Int16Type>(); (array.values(), array.get_physical_index(row)) }
+                DataType::Int32 => { let array = array.as_run::<Int32Type>(); (array.values(), array.get_physical_index(row)) }
+                DataType::Int64 => { let array = array.as_run::<Int64Type>(); (array.values(), array.get_physical_index(row)) }
+                _ => unreachable!("Arrow run ends are signed integers"),
+            };
+            interleave_cell_payload(values.as_ref(), index)
+        }
+        _ => Ok(0),
+    }
+}
+
 fn mutation_run_batch(
     input: &dyn Array, document: &arrow_array::StructArray, rows: std::ops::Range<usize>,
     read_header: impl Fn(usize) -> Result<EventHeader>, memory: &Arc<MemoryBudget>,
@@ -4436,12 +4570,15 @@ fn mutation_run_batch(
     let locate = |row| mutation_document(input, row).expect("A document run has a struct at every position");
     let (_, first) = locate(rows.start);
     let same_source = rows.clone().all(|row| std::ptr::eq(locate(row).0, document));
-    let (content, _copy): (ArrayRef, _) = if rows.clone().enumerate().all(|(position, row)| {
+    if rows.clone().enumerate().all(|(position, row)| {
         let (source, offset) = locate(row);
         std::ptr::eq(source, document) && offset == first + position
     }) {
-        (Arc::new(document.slice(first, rows.len())), None)
-    } else if same_source {
+        return rtdb_format::data::funded_put_batch(
+            Arc::new(document.slice(first, rows.len())), &headers, memory,
+        ).map(Some);
+    }
+    let (content, _copy) = if same_source {
         let field = arrow_schema::Field::new("doc", document.data_type().clone(), false);
         let bound = rows.clone().try_fold(4096usize, |bytes, row| {
             rtdb_columnar::estimate_event_copy_cell_bytes(&field, document, locate(row).1)?
@@ -4449,29 +4586,39 @@ fn mutation_run_batch(
         })?;
         let copy = memory.reserve(bound)?;
         let picks = rows.map(|row| Some((0, locate(row).1))).collect::<Vec<_>>();
-        (rtdb_columnar::copy_event_cells(&[document], &picks)?, Some(copy))
+        (rtdb_columnar::copy_event_cells(&[document], &picks)?, copy)
     } else {
         let inventory = rows.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
-        let mut copy = memory.reserve(inventory)?;
+        let mut inventory = memory.reserve(inventory)?;
         let mut sources = Vec::<&dyn Array>::new();
         let mut slots = std::collections::HashMap::new();
         let mut picks = Vec::with_capacity(rows.len());
         for row in rows {
             let (source, offset) = locate(row);
-            let source_bytes = source.get_array_memory_size();
-            // A single put of a larger retained array can compact its masked payload cells.
-            if source_bytes > 4096 { return Ok(None); }
-            let lease = Arc::get_mut(&mut copy).expect("The mutation gather owns its scratch");
-            lease.grow_to(source_bytes.checked_mul(4).and_then(|bytes| lease.bytes().checked_add(bytes)).ok_or_else(overflow)?)?;
-            let slot = *slots.entry(std::ptr::from_ref(source)).or_insert_with(|| {
-                let slot = sources.len();
-                sources.push(source);
-                slot
-            });
+            let entry = slots.entry(std::ptr::from_ref(source));
+            let slot = match entry {
+                std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let source_bytes = source.get_array_memory_size();
+                    // A single put of a larger retained array can compact its masked payload cells.
+                    if source_bytes > 4096 { return Ok(None); }
+                    // Arrow interleave can rebuild the full source dictionaries.
+                    let lease = Arc::get_mut(&mut inventory).expect("The mutation gather owns its source inventory");
+                    lease.grow_to(source_bytes.checked_mul(4).and_then(|bytes| lease.bytes().checked_add(bytes)).ok_or_else(overflow)?)?;
+                    let index = sources.len();
+                    sources.push(source);
+                    *slot.insert(index)
+                }
+            };
             picks.push((slot, offset));
         }
+        let slots_bytes = interleave_slot_bytes(document.data_type())?.checked_mul(picks.len()).ok_or_else(overflow)?;
+        let payload = picks.iter().try_fold(slots_bytes, |bytes, &(source, offset)| {
+            bytes.checked_add(interleave_cell_payload(sources[source], offset)?).ok_or_else(overflow)
+        })?;
+        let copy = memory.reserve(payload.checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let Ok(array) = arrow_select::interleave::interleave(&sources, &picks) else { return Ok(None); };
-        (array, Some(copy))
+        (array, copy)
     };
     rtdb_format::data::owned_put_batch(content, &headers, None, memory).map(Some)
 }
@@ -5476,17 +5623,30 @@ mod tests {
     }
 
     #[test]
-    fn scalar_mutation_put_stages_the_same_events_without_retaining_the_query_batch() {
-        use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int64Array, StructArray, TimestampMicrosecondArray, types::Int64Type};
+    fn scalar_mutation_put_reuses_canonical_buffers_and_preserves_encoded_events() {
+        use arrow_array::{BooleanArray, FixedSizeBinaryArray, Int64Array, StringArray, StructArray, TimestampMicrosecondArray, types::Int64Type};
+        use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
         use arrow_schema::{Field, TimeUnit as ArrowTimeUnit};
 
         let memory = MemoryBudget::new(1 << 24);
+        let query_memory = MemoryBudget::new(1 << 24);
         let ids = Arc::new(Int64Array::from(vec![1, 2]));
-        let make_documents = |cells| StructArray::try_new(vec![
+        let clean_null = Arc::new(Int64Array::new(ScalarBuffer::from(vec![8, 0]), Some(NullBuffer::from(vec![true, false]))));
+        let strings = Arc::new(StringArray::from(vec!["first", "second"]));
+        let sliced = Arc::new(StringArray::from(vec!["prefix", "a", "b", "suffix"]).slice(1, 2));
+        let flags = Arc::new(BooleanArray::new(BooleanBuffer::new(vec![0b1111_1101].into(), 0, 2), None));
+        let make_documents = |cells: Vec<bool>| StructArray::try_new(vec![
             Arc::new(Field::new("_id", DataType::Int64, false)),
             Arc::new(Field::new("n", DataType::Int64, true)),
             Arc::new(Field::new("nulls", DataType::Int64, true)),
-        ].into(), vec![ids.clone(), Arc::new(Int64Array::from(cells)), Arc::new(Int64Array::from(vec![None::<i64>; 2]))], None).unwrap();
+            Arc::new(Field::new("s", DataType::Utf8, false)),
+            Arc::new(Field::new("slice", DataType::Utf8, false)),
+            Arc::new(Field::new("flags", DataType::Boolean, false)),
+            Arc::new(Field::new("clean_null", DataType::Int64, true)),
+        ].into(), vec![ids.clone(),
+            Arc::new(Int64Array::new(ScalarBuffer::from(vec![7, 99]), Some(NullBuffer::from(cells)))),
+            Arc::new(Int64Array::from(vec![None::<i64>; 2])), strings.clone(), sliced.clone(), flags.clone(), clean_null.clone(),
+        ], None).unwrap();
         let iids = FixedSizeBinaryArray::try_from_iter([[1_u8; 16], [2; 16]].into_iter()).unwrap();
         let times = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
         let make_columns = |cells| -> Vec<ArrayRef> { vec![Arc::new(iids.clone()),
@@ -5494,31 +5654,48 @@ mod tests {
             Arc::new(TimestampMicrosecondArray::from(vec![Some(12), None]).with_timezone("UTC")),
             Arc::new(make_documents(cells)),
         ] };
-        let columns = make_columns(vec![Some(7), None]);
+        let columns = make_columns(vec![true, false]);
         let schema = Arc::new(Schema::new(vec![Field::new("_iid", DataType::FixedSizeBinary(16), false),
             Field::new("_valid_from", times.clone(), true), Field::new("_valid_to", times, true),
             Field::new("doc", columns[3].data_type().clone(), false),
         ]));
-        let output = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let output = OwnedBatch::new(RecordBatch::try_new(Arc::clone(&schema), columns).unwrap(), &query_memory).unwrap();
         let system_time = Timestamp(10);
         let mut events = Vec::new();
-        mutation_events(&output, MutationKind::Put, system_time, |event| { events.push(event); Ok(()) }).unwrap();
+        mutation_events(output.batch(), MutationKind::Put, system_time, |event| { events.push(event); Ok(()) }).unwrap();
         let expected = rtdb_index::IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
+        let copied = mutation_put_batches(output.batch(), &[], system_time, &memory).unwrap().unwrap();
 
         let put = mutation_put_batch(&output, system_time, &memory).unwrap().unwrap();
 
         assert_eq!(put.batch(), expected.arrow());
+        let encode = |batch: &RecordBatch| crate::ipc::encode(batch.schema_ref(), [batch], &memory).unwrap();
+        assert_eq!(encode(put.batch()).as_slice(), encode(copied.batch()).as_slice());
         let content = put.batch().column_by_name("op").unwrap().as_union().child(2).as_struct();
-        assert_ne!(content.column(0).as_primitive::<Int64Type>().values().as_ptr(), ids.values().as_ptr());
+        assert_eq!(content.column(0).as_primitive::<Int64Type>().values().as_ptr(), ids.values().as_ptr());
+        assert_eq!(content.column(1).as_primitive::<Int64Type>().value(1), 0);
+        assert_eq!(content.column(3).as_string::<i32>().value_data().as_ptr(), strings.value_data().as_ptr());
+        assert_eq!(content.column(4).as_string::<i32>().value_offsets(), &[0, 1, 2]);
+        assert_eq!(content.column(4).as_string::<i32>().value_data(), b"ab");
+        assert_eq!(content.column(5).as_boolean().values().inner().as_slice(), &[1]);
+        assert_eq!(content.column(6).as_primitive::<Int64Type>().values().as_ptr(), clean_null.values().as_ptr());
+        let escaped = content.column(0).clone();
+        drop(output);
+        assert!(query_memory.used_bytes() > 0);
+        drop(put);
+        assert!(query_memory.used_bytes() > 0);
+        drop(escaped);
+        assert_eq!(query_memory.used_bytes(), 0);
 
-        let null_first = RecordBatch::try_new(Arc::clone(&schema), make_columns(vec![None, Some(7)])).unwrap();
+        let null_first = RecordBatch::try_new(Arc::clone(&schema), make_columns(vec![false, true])).unwrap();
+        let null_first = OwnedBatch::new(null_first, &query_memory).unwrap();
         assert!(mutation_put_batch(&null_first, system_time, &memory).unwrap().is_none());
 
-        let mut invalid_times = make_columns(vec![Some(7), None]);
+        let mut invalid_times = make_columns(vec![true, false]);
         invalid_times[2] = Arc::new(TimestampMicrosecondArray::from(vec![Some(12), Some(0)]).with_timezone("UTC"));
-        let invalid_times = RecordBatch::try_new(schema, invalid_times).unwrap();
+        let invalid_times = OwnedBatch::new(RecordBatch::try_new(schema, invalid_times).unwrap(), &query_memory).unwrap();
         assert!(mutation_put_batch(&invalid_times, system_time, &memory).unwrap().is_none());
-        let error = mutation_events(&invalid_times, MutationKind::Put, system_time, |_| {
+        let error = mutation_events(invalid_times.batch(), MutationKind::Put, system_time, |_| {
             memory.reserve(memory.limit_bytes())?;
             Ok(())
         }).unwrap_err();
@@ -5599,6 +5776,62 @@ mod tests {
             Some(7.0_f64.to_bits()), None, Some((-0.0_f64).to_bits()), None,
             Some(7.0_f64.to_bits()), None, Some((-0.0_f64).to_bits()), None,
         ]);
+    }
+
+    #[test]
+    fn alternating_mutation_run_admits_distinct_sources_and_selected_payload() {
+        use arrow_array::{StringArray, StructArray, UnionArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::{Field, UnionFields};
+
+        let rows = 64;
+        let make_input = |masked_bytes: usize, pick| {
+            let document = |first| {
+                let mut values = vec![b'x'; 1 + masked_bytes];
+                values[0] = first;
+                let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, (1 + masked_bytes) as i32]));
+                let column = StringArray::new(offsets, values.into(), Some(NullBuffer::from(vec![true, false])));
+                StructArray::new(vec![Field::new("payload", DataType::Utf8, true)].into(), vec![Arc::new(column)], None)
+            };
+            let a = document(b'a');
+            let b = document(b'b');
+            let fields = UnionFields::try_new([3, 5], [
+                Field::new("a", a.data_type().clone(), false), Field::new("b", b.data_type().clone(), false),
+            ]).unwrap();
+            let types = (0..rows).map(|row| if row % 2 == 0 { 5_i8 } else { 3 }).collect::<Vec<_>>();
+            UnionArray::try_new(fields, types.into(), Some(vec![pick; rows].into()), vec![Arc::new(a), Arc::new(b)]).unwrap()
+        };
+        let read_header = |row| Ok(EventHeader {
+            position: None,
+            commit_position: 0, iid: Iid([row as u8; 16]), system_from: Timestamp(10),
+            valid_time: Interval::ALL, op: EventOp::Put,
+        });
+        let memory = MemoryBudget::new(100_000);
+        let input = make_input(2400, 0);
+        let (source, _) = mutation_document(&input, 0).unwrap();
+        assert!(source.get_array_memory_size() <= 4096);
+        let gathered = mutation_run_batch(&input, source, 0..rows, read_header, &memory).unwrap().unwrap();
+        let put = gathered.batch().column_by_name("op").unwrap().as_union().child(2).as_struct();
+        let strings = put.column(0).as_string::<i32>();
+        let events = rtdb_format::data::EventBatch::new(gathered.batch().clone()).unwrap();
+        for row in 0..rows {
+            assert_eq!(strings.value(row), if row % 2 == 0 { "b" } else { "a" });
+            assert_eq!(events.header(row).unwrap().iid, read_header(row).unwrap().iid);
+        }
+        drop(events);
+        drop(gathered);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let masked = make_input(2400, 1);
+        let (source, _) = mutation_document(&masked, 0).unwrap();
+        let error = mutation_run_batch(&masked, source, 0..rows, read_header, &memory).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(memory.used_bytes(), 0);
+
+        let large = make_input(5000, 0);
+        let (source, _) = mutation_document(&large, 0).unwrap();
+        assert!(mutation_run_batch(&large, source, 0..rows, read_header, &memory).unwrap().is_none());
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
@@ -5697,7 +5930,7 @@ mod tests {
         let mut events = Vec::new();
         mutation_events(batch.batch(), MutationKind::Put, system_time, |event| { events.push(event); Ok(()) }).unwrap();
         let expected = rtdb_index::IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
-        let output = mutation_put_batch(batch.batch(), system_time, &memory).unwrap().expect("Expected Arrow mutation payload");
+        let output = mutation_put_batch(&batch, system_time, &memory).unwrap().expect("Expected Arrow mutation payload");
         drop(batch);
         assert_eq!(query_memory.used_bytes(), 0);
         assert_eq!(output.batch(), expected.arrow());

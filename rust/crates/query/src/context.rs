@@ -1,6 +1,6 @@
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::Snapshot;
@@ -9,7 +9,12 @@ use rtdb_storage::{cache::{BufferPool, HeldCatalogRead}, sealing::{PlaintextDeli
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::{invalid, spill::SpillRegion};
+use crate::{
+    invalid,
+    parameters::{ArrowBinding, OverlayValue, ParameterTypes},
+    runtime_schema::RuntimeSchema,
+    spill::SpillRegion,
+};
 
 #[derive(Clone)]
 pub struct DatabaseSnapshot { pub partitions: Vec<Snapshot>, pub storage: Arc<BufferPool> }
@@ -212,20 +217,34 @@ impl CatalogSnapshot {
     /// Funds the logical field tree and join scratch for just this table.
     pub fn table_binding_reserved(&self, name: &QualifiedTable, memory: &Arc<MemoryBudget>) -> Result<Option<(TableBinding, Arc<MemoryReservation>)>> {
         if !self.permits_table(name) { return Ok(None); }
-        let snapshot = self.database(&name.database)?;
+        self.binding_reserved(&name.database, &name.table, memory)
+    }
+
+    pub(crate) fn binding_reserved(&self, database: &str, table: &TableRef, memory: &Arc<MemoryBudget>) -> Result<Option<(TableBinding, Arc<MemoryReservation>)>> {
+        let snapshot = self.database(database)?;
         let overflow = || invalid("catalog-size", "Table metadata allocation exceeds addressable memory");
-        let base = [name.database.len(), name.table.schema.len(), name.table.table.len()]
+        let base = [database.len(), table.schema.len(), table.table.len()]
             .into_iter().try_fold(4096usize, |bytes, len| bytes.checked_add(len).ok_or_else(overflow))?;
-        let bytes = if let Some(definition) = crate::system_schema::definition(&name.table) {
-            base.checked_add(definition.allocation_bound(&name.database)?).ok_or_else(overflow)?
+        let bytes = if let Some(definition) = crate::system_schema::definition(table) {
+            base.checked_add(definition.allocation_bound(database)?).ok_or_else(overflow)?
         } else {
-            snapshot.partitions.iter().filter(|part| part.contains_table(&name.table))
+            snapshot.partitions.iter().filter(|part| part.contains_table(table))
                 .try_fold(base, |bytes, part| {
-                    bytes.checked_add(part.table_schema_allocation_bound(&name.database, &name.table)?).ok_or_else(overflow)
+                    bytes.checked_add(part.table_schema_allocation_bound(database, table)?).ok_or_else(overflow)
                 })?
         };
         let reservation = memory.reserve(bytes)?;
-        Ok(self.table(name)?.map(|binding| (binding, reservation)))
+        Ok(self.binding(database, table)?.map(|binding| (binding, reservation)))
+    }
+
+    pub(crate) fn catalog_table_oid(&self, database: &str, table: &TableRef) -> Result<Option<i32>> {
+        let mut oid = None;
+        if crate::system_schema::definition(table).is_none() {
+            for snapshot in &self.database(database)?.partitions {
+                if snapshot.contains_table(table) { include_table_oid(&mut oid, snapshot, table)?; }
+            }
+        }
+        Ok(oid)
     }
 
     /// Reserves schema enumeration and joins before creating the returned table bindings.
@@ -673,7 +692,6 @@ pub(crate) struct Execution {
     pub analysis: Option<Arc<crate::analysis::AnalysisNode>>,
 }
 
-#[derive(Clone)]
 struct OuterInput { batch: Arc<crate::columnar::ColumnBatch>, row: usize }
 
 impl rtdb_expr::RowInput for OuterInput {
@@ -686,24 +704,43 @@ impl rtdb_expr::RowInput for OuterInput {
     }
 }
 
-pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, OuterInput)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
+struct OuterFrame {
+    schema: Arc<RuntimeSchema>,
+    input: OuterInput,
+    parent: Arc<OuterRows>,
+}
+
+pub(crate) struct OuterRows {
+    frame: Option<OuterFrame>,
+    len: usize,
+    _reservation: Arc<MemoryReservation>,
+}
+
 impl OuterRows {
-    fn expression_rows(&self) -> Vec<rtdb_expr::OuterRow<'_>> {
-        self.rows.iter().map(|(schema, _)| rtdb_expr::OuterRow { schema, values: &[] }).collect()
+    fn frames(&self) -> impl Iterator<Item = &OuterFrame> {
+        std::iter::successors(self.frame.as_ref(), |&frame| frame.parent.frame.as_ref())
     }
 
-    pub fn schemas(&self) -> impl Iterator<Item = &rtdb_plan::Schema> { self.rows.iter().map(|(schema, _)| schema) }
+    fn expression_rows(&self) -> Vec<rtdb_expr::OuterRow<'_>> {
+        let mut rows = Vec::with_capacity(self.len);
+        rows.extend(self.schemas().map(|schema| rtdb_expr::OuterRow { schema, values: &[] }));
+        rows
+    }
+
+    pub fn schemas(&self) -> impl Iterator<Item = &rtdb_plan::Schema> {
+        self.frames().map(|frame| frame.schema.schema())
+    }
+
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(256)?;
-        Ok(Arc::new(Self { rows: Vec::new(), _reservation: reservation }))
+        Ok(Arc::new(Self { frame: None, len: 0, _reservation: reservation }))
     }
-    fn prepend(&self, schema: &rtdb_plan::Schema, row: OuterInput, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let bound = self.rows.iter().try_fold(crate::runtime_schema::schema_bound(schema)?, |bytes, (schema, _)| {
-            bytes.checked_add(crate::runtime_schema::schema_bound(schema)?).ok_or_else(|| crate::invalid("outer-size", "Outer schema allocation exceeds addressable memory"))
-        })?;
-        let reservation = memory.reserve(bound)?;
-        let mut rows = Vec::with_capacity(self.rows.len() + 1); rows.push((schema.clone(), row)); rows.extend(self.rows.iter().cloned());
-        Ok(Arc::new(Self { rows, _reservation: reservation }))
+
+    fn prepend(self: &Arc<Self>, schema: &Arc<RuntimeSchema>, input: OuterInput, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let len = self.len.checked_add(1).ok_or_else(|| invalid("outer-size", "Outer row bindings exceed addressable memory"))?;
+        let reservation = memory.reserve(256)?;
+        let frame = OuterFrame { schema: Arc::clone(schema), input, parent: Arc::clone(self) };
+        Ok(Arc::new(Self { frame: Some(frame), len, _reservation: reservation }))
     }
 }
 
@@ -716,44 +753,91 @@ impl rtdb_expr::ParameterLookup for ExpressionInputs<'_> {
     fn arrow_cell(&self, position: usize) -> Option<rtdb_columnar::ArrowCell<'_>> { rtdb_expr::ParameterLookup::arrow_cell(self.parameters, position) }
 
     fn correlated_value(&self, depth: usize, position: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
-        self.outer.rows.get(depth).map_or(Ok(None), |(_, row)| rtdb_expr::RowInput::value(row, position, scope))
+        self.outer.frames().nth(depth).map_or(Ok(None), |frame| rtdb_expr::RowInput::value(&frame.input, position, scope))
     }
 }
 
-impl Execution {
-    pub async fn bind_arrow_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema,
-        batch: Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Self> {
+pub(crate) struct ApplyArguments {
+    schema: Arc<RuntimeSchema>,
+    arguments: Vec<(usize, rtdb_plan::Expr)>,
+    types: OnceLock<Arc<ParameterTypes>>,
+}
+
+impl ApplyArguments {
+    pub(crate) fn new(schema: Arc<RuntimeSchema>, arguments: Vec<(usize, rtdb_plan::Expr)>) -> Self {
+        Self { schema, arguments, types: OnceLock::new() }
+    }
+
+    pub(crate) async fn bind(&self, execution: &Execution, batch: Arc<crate::columnar::ColumnBatch>, row: usize) -> Result<Execution> {
         let outer_input = OuterInput { batch, row };
-        use crate::parameters::{ArrowBinding, OverlayValue};
-        let scope = self.scope()?;
-        let parameter_count = arguments.iter().try_fold(self.parameters.types().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;
-        let slots = parameter_count.checked_mul(std::mem::size_of::<rtdb_types::LogicalType>())
-            .and_then(|bytes| bytes.checked_add(arguments.len().checked_mul(std::mem::size_of::<(usize, OverlayValue)>())?))
-            .ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))?;
-        let existing = self.parameters.types().iter().try_fold(slots, |bytes, ty| {
-            bytes.checked_add(ty.retained_bytes()?).ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))
-        })?;
-        scope.reserve(existing)?;
-        let mut parameters = Vec::with_capacity(arguments.len());
-        let mut types = Vec::with_capacity(parameter_count);
-        types.extend_from_slice(self.parameters.types());
-        types.resize(parameter_count, rtdb_types::LogicalType::Null);
-        for (index, expression) in arguments {
-            types[*index] = self.expression_type(&scope, expression, schema)?;
+        let schema = self.schema.schema();
+        let memory = &execution.context.memory;
+        let scope = execution.scope()?;
+        let size_error = || invalid("parameter-count", "Apply parameters exceed addressable memory");
+        let parent_types = execution.parameters.types();
+        let width = if self.types.get().is_none() {
+            Some(self.arguments.iter().try_fold(parent_types.len(), |count, (index, _)| {
+                index.checked_add(1).map(|next| count.max(next))
+                    .ok_or_else(|| invalid("parameter-count", "Apply parameter index overflow"))
+            })?)
+        } else {
+            None
+        };
+        let slots = self.arguments.len().checked_mul(std::mem::size_of::<(usize, OverlayValue)>()).ok_or_else(size_error)?;
+        let draft = if let Some(width) = width {
+            let inline = width.checked_mul(std::mem::size_of::<LogicalType>())
+                .and_then(|bytes| bytes.checked_add(slots)).ok_or_else(size_error)?;
+            let bound = parent_types.iter().try_fold(inline, |bytes, ty| {
+                bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error)
+            })?;
+            let types_scope = scope.scratch();
+            types_scope.reserve(bound - slots)?;
+            Some((width, types_scope))
+        } else {
+            None
+        };
+        scope.reserve(slots)?;
+        let mut draft = draft.map(|(width, types_scope)| {
+            let mut types = Vec::with_capacity(width);
+            types.extend_from_slice(parent_types);
+            types.resize(width, LogicalType::Null);
+            (types, types_scope)
+        });
+        let mut parameters = Vec::with_capacity(self.arguments.len());
+        for (index, expression) in &self.arguments {
+            // A later type error must wait until the first reached row has evaluated its earlier arguments.
+            if let Some((types, types_scope)) = &mut draft {
+                types[*index] = execution.expression_type(types_scope, expression, schema)?;
+            }
             if let rtdb_plan::Expr::Column { id, .. } = expression
                 && let Some(position) = schema.position(*id)
-                && let Some(binding) = ArrowBinding::new(Arc::clone(&outer_input.batch), position, outer_input.row, Arc::clone(&self.context.memory))
+                && let Some(binding) = ArrowBinding::new(Arc::clone(&outer_input.batch), position, row, Arc::clone(memory))
             {
                 parameters.push((*index, OverlayValue::Arrow(binding)));
                 continue;
             }
-            let invocation = self.prepare_expression(expression, schema, &scope)?;
-            let value = self.evaluate_invocation_row(&scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&outer_input)).await?;
+            let invocation = execution.prepare_expression(expression, schema, &scope)?;
+            let value = execution.evaluate_invocation_row(&scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&outer_input)).await?;
             parameters.push((*index, OverlayValue::Scalar(value)));
         }
-        let outer = self.outer.prepend(schema, outer_input, &self.context.memory)?;
-        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay_sources(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
+        let outer = execution.outer.prepend(&self.schema, outer_input, memory)?;
+        let prepared = draft.map(|(types, scope)| ParameterTypes::from_scope(types, scope)).transpose()?;
+        let types = self.types.get().or(prepared.as_ref()).expect("Apply parameter layout was prepared");
+        let parameters = Arc::new(execution.parameters.overlay_sources(parameters, Arc::clone(types), memory)?);
+        if let Some(types) = prepared {
+            self.types.get_or_init(|| types);
+        }
+        Ok(Execution {
+            context: Arc::clone(&execution.context),
+            parameters,
+            outer,
+            bindings: execution.bindings.clone(),
+            analysis: execution.analysis.clone(),
+        })
     }
+}
+
+impl Execution {
     pub fn in_operator(mut self) -> Self {
         if self.context.operator_root.is_none() && (self.analysis.is_some() || self.context.trace_parent.is_some()) {
             self.context = self.context.operator_scope();
@@ -769,7 +853,7 @@ impl Execution {
     }
     pub fn scope(&self) -> Result<rtdb_expr::EvaluationScope> { rtdb_expr::EvaluationScope::new(&self.context.memory) }
     pub fn expression_type(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema) -> Result<rtdb_types::LogicalType> {
-        scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
+        scope.reserve(self.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
         let outer_rows = self.outer.expression_rows();
         let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
         let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
@@ -781,7 +865,7 @@ impl Execution {
     }
     pub fn prepare_expression<'a>(&self, expression: &'a rtdb_plan::Expr, schema: &'a rtdb_plan::Schema, scope: &rtdb_expr::EvaluationScope) -> Result<rtdb_expr::ExpressionInvocation<'a>> {
         self.context.check_cancelled()?;
-        scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
+        scope.reserve(self.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
         let outer_rows = self.outer.expression_rows();
         let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
         let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs),parameter_types: Some(self.parameters.types()),current_time: self.context.current_time,timezone: &self.context.timezone,outer_rows: &outer_rows,snapshot_token: self.context.snapshot_token(),allocation: Some(scope),catalog: Some(&self.context.catalog) };
@@ -796,7 +880,7 @@ impl Execution {
     ) -> Result<Value> {
         self.context.check_cancelled()?;
         scope.reserve(4096)?;
-        scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
+        scope.reserve(self.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
         let outer_rows = self.outer.expression_rows();
         let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
         let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
@@ -809,7 +893,7 @@ impl Execution {
         let stream = async_stream::try_stream! {
             let scope = execution.scope()?;
             let schema = rtdb_plan::Schema::default();
-            scope.reserve(execution.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| crate::invalid("outer-size", "Outer row bindings exceed addressable memory"))?)?;
+            scope.reserve(execution.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| crate::invalid("outer-size", "Outer row bindings exceed addressable memory"))?)?;
             let outer_rows = execution.outer.expression_rows();
             let inputs = ExpressionInputs { parameters: &execution.parameters, outer: &execution.outer };
             let eval = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
@@ -832,12 +916,141 @@ impl Execution {
     pub async fn evaluate_list_invocation(&self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: rtdb_expr::ExpressionRow<'_>) -> Result<rtdb_expr::EvaluatedList> {
         self.context.check_cancelled()?;
         scope.reserve(4096)?;
-        scope.reserve(self.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
+        scope.reserve(self.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| Anomaly::incorrect("rtdb.query/expression-size", "Outer row bindings exceed addressable memory"))?)?;
         let outer_rows = self.outer.expression_rows();
         let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
         let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
             invocation.evaluate_list_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+    }
+}
+
+#[cfg(test)]
+mod apply_argument_tests {
+    use super::*;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use rtdb_expr::ParameterLookup;
+    use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, Schema};
+    use rtdb_types::ScalarType;
+
+    fn execution() -> Execution {
+        let database = DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let parameters = crate::parameters::BoundParameters::infer(vec![Value::I64(7), Value::I64(8)], &memory).unwrap();
+        Execution {
+            context,
+            parameters: Arc::new(parameters),
+            outer: OuterRows::empty(&memory).unwrap(),
+            bindings: None,
+            analysis: None,
+        }
+    }
+
+    fn input(id: u32, values: Vec<i64>, memory: &Arc<MemoryBudget>) -> (Arc<RuntimeSchema>, Arc<crate::columnar::ColumnBatch>) {
+        let name = format!("c{id}");
+        let field = Field {
+            id: ColumnId(id), name: name.clone(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        let schema = Schema::new(vec![field]).unwrap();
+        let record = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(name, DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(values))],
+        ).unwrap();
+        let batch = rtdb_columnar::OwnedBatch::new(record, memory).unwrap();
+        (
+            RuntimeSchema::fixed(&schema, memory).unwrap(),
+            Arc::new(crate::columnar::ColumnBatch::from_owned(batch).unwrap()),
+        )
+    }
+
+    #[tokio::test]
+    async fn apply_rows_share_types_across_pages_and_keep_sparse_overlays_lazy() {
+        let execution = execution();
+        let memory = &execution.context.memory;
+        let baseline = memory.used_bytes();
+        let (schema, first_page) = input(0, vec![11], memory);
+        let (_, second_page) = input(0, vec![20, 22], memory);
+        let first_page_owner = Arc::downgrade(&first_page);
+        let column = schema.schema().fields()[0].expression();
+        let i64_type = LogicalType::Scalar(ScalarType::I64);
+        let arguments = ApplyArguments::new(schema, vec![
+            (0, Expr::Literal(Value::I64(9))),
+            (3, Expr::Literal(Value::Bool(false))),
+            (3, column),
+            (4, Expr::Parameter { index: 0, data_type: i64_type.clone() }),
+        ]);
+
+        let first = arguments.bind(&execution, first_page, 0).await.unwrap();
+        let second = arguments.bind(&execution, second_page, 1).await.unwrap();
+        assert!(std::ptr::eq(first.parameters.types(), second.parameters.types()));
+        assert_eq!(second.parameters.types(), [i64_type.clone(), i64_type.clone(), LogicalType::Null, i64_type.clone(), i64_type]);
+        assert_eq!(second.parameters.get(0).unwrap(), Some(&Value::I64(9)));
+        assert_eq!(second.parameters.get(1).unwrap(), Some(&Value::I64(8)));
+        assert_eq!(second.parameters.known_value(2), Some(&Value::Null));
+        assert_eq!(second.parameters.get(4).unwrap(), Some(&Value::I64(7)));
+        assert_eq!(second.parameters.get(5).unwrap(), None);
+        assert_eq!(first.parameters.arrow_cell(3).unwrap().row, 0);
+        assert_eq!(second.parameters.arrow_cell(3).unwrap().row, 1);
+        assert!(first.parameters.known_value(3).is_none());
+        assert!(second.parameters.known_value(3).is_none());
+        assert_eq!(first.parameters.get(3).unwrap(), Some(&Value::I64(11)));
+        drop(first);
+        assert!(first_page_owner.upgrade().is_none());
+        assert_eq!(second.parameters.get(3).unwrap(), Some(&Value::I64(22)));
+        drop((arguments, second));
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+
+    #[tokio::test]
+    async fn apply_reports_earlier_row_error_before_later_argument_type_error() {
+        let execution = execution();
+        let (schema, page) = input(0, vec![0, 2], &execution.context.memory);
+        let column = schema.schema().fields()[0].expression();
+        let missing = Expr::column(ColumnId(99), LogicalType::Scalar(ScalarType::I64));
+        let divide = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(8)), column);
+        let arguments = ApplyArguments::new(schema, vec![(0, divide), (1, missing)]);
+
+        let error = arguments.bind(&execution, Arc::clone(&page), 0).await.err().unwrap();
+        assert_eq!(error.code, "xtdb.expression/division-by-zero");
+        assert!(arguments.types.get().is_none());
+        let error = arguments.bind(&execution, page, 1).await.err().unwrap();
+        assert_eq!(error.code, "rtdb.expr/missing-column");
+        assert!(arguments.types.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn nested_apply_retains_outer_schema_and_source_in_depth_order() {
+        let execution = execution();
+        let memory = &execution.context.memory;
+        let (parent_schema, parent_page) = input(10, vec![1, 2], memory);
+        let (child_schema, child_page) = input(20, vec![3], memory);
+        let parent_page_owner = Arc::downgrade(&parent_page);
+        let parent_schema_owner = Arc::downgrade(&parent_schema);
+        let parent_arguments = ApplyArguments::new(parent_schema, vec![]);
+        let child_arguments = ApplyArguments::new(child_schema, vec![]);
+        let parent = parent_arguments.bind(&execution, parent_page, 1).await.unwrap();
+        let child = child_arguments.bind(&parent, child_page, 0).await.unwrap();
+
+        drop((parent_arguments, parent));
+        let schema = parent_schema_owner.upgrade().unwrap();
+        assert!(std::ptr::eq(child.outer.schemas().nth(1).unwrap(), schema.schema()));
+        assert_eq!(child.outer.schemas().next().unwrap().fields()[0].id, ColumnId(20));
+        assert!(parent_page_owner.upgrade().is_some());
+        let scope = child.scope().unwrap();
+        let inputs = ExpressionInputs { parameters: &child.parameters, outer: &child.outer };
+        assert_eq!(inputs.correlated_value(0, 0, Some(&scope)).unwrap(), Some(Value::I64(3)));
+        assert_eq!(inputs.correlated_value(1, 0, Some(&scope)).unwrap(), Some(Value::I64(2)));
+        assert_eq!(inputs.correlated_value(2, 0, Some(&scope)).unwrap(), None);
+        drop((child, schema));
+        assert!(parent_page_owner.upgrade().is_none());
+        assert!(parent_schema_owner.upgrade().is_none());
     }
 }
 

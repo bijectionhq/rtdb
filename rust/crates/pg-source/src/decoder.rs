@@ -5,7 +5,10 @@ use arrow_schema::Schema;
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
 use crate::{Lsn, read_text, vector_types::{VectorType, VectorTypes}, wire::{Column, Input, protocol}};
-use rtdb_pg_codec::{Format, WalArrayRow, read_source_binary, read_source_binary_column, read_source_text_column, read_wal_array};
+use rtdb_pg_codec::{
+    Format, WalArrayRow, read_snapshot_transit_column, read_source_binary, read_source_binary_column,
+    read_source_text_column, read_tstzrange, read_wal_array, tstzrange_field,
+};
 
 mod pending;
 use pending::{DecodedCell, PendingTransaction, Run};
@@ -210,16 +213,23 @@ impl Decoder {
                     }
                     let bound = text.map(|text| text_bound(oid, text)).transpose()?.unwrap_or_default();
                     let mut charge = self.memory.reserve(bound.checked_add(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-                    let mut column = BatchBuilder::new(0, &self.memory)?;
-                    let typed = if matches!(oid, 3910 | 16384) {
-                        read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
-                    } else { None };
-                    let (field, cell) = match typed {
-                        Some((field, _)) if field.data_type() == &arrow_schema::DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
-                        Some((field, array)) => (field, DecodedCell::Nested(array)),
-                        None => {
-                            let value = text.map_or(Ok(Value::Null), |text| read_text(oid, text))?;
-                            DecodedCell::from_value(name, value, &self.memory)?
+                    let (field, cell) = if oid == 3910 {
+                        match text.map(read_tstzrange).transpose()?.flatten() {
+                            Some((lower, upper)) => (tstzrange_field(name, false)?, DecodedCell::Range([lower, upper])),
+                            None => (rtdb_columnar::to_field(name, &LogicalType::Null)?, DecodedCell::Scalar(Value::Null)),
+                        }
+                    } else {
+                        let mut column = BatchBuilder::new(0, &self.memory)?;
+                        let typed = if oid == 16384 {
+                            read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
+                        } else { None };
+                        match typed {
+                            Some((field, _)) if field.data_type() == &arrow_schema::DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
+                            Some((field, array)) => (field, DecodedCell::Nested(array)),
+                            None => {
+                                let value = text.map_or(Ok(Value::Null), |text| read_text(oid, text))?;
+                                DecodedCell::from_value(name, value, &self.memory)?
+                            }
                         }
                     };
                     let retained = cell.retained()?;
@@ -286,30 +296,30 @@ fn decode_columns<'a>(
             fields.push(field);
             continue;
         }
-        let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
         let text = |row| cell(row, index)?.map(|bytes| std::str::from_utf8(bytes).map_err(protocol)).transpose();
+        let direct = match (vector, format) {
+            (Some(VectorType::Pgvector(domain_typmod)), _) => {
+                Some(rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), count, text, &mut output)?)
+            }
+            (_, Format::Text) if oid == 16384 => read_snapshot_transit_column(name, count, text, &mut output)?,
+            (_, Format::Text) => read_source_text_column(name, oid, count, text, &mut output)?,
+            _ => None,
+        };
+        if let Some((field, array)) = direct {
+            arrays.push(array);
+            fields.push(field);
+            continue;
+        }
+
         let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
         let temporary = (0..count).try_fold(base, |bytes, row| {
             let size = match format {
-                Format::Text => text(row)?.map(|text| text_bound(bound_oid, text)).transpose()?,
+                Format::Text => text(row)?.map(|text| text_bound(oid, text)).transpose()?,
                 Format::Binary => cell(row, index)?.map(|bytes| wire_value_bound(oid, bytes)).transpose()?,
             }.unwrap_or_default();
             bytes.checked_add(size).ok_or_else(overflow)
         })?;
         let _values = memory.reserve(temporary)?;
-        if let Some(VectorType::Pgvector(domain_typmod)) = vector {
-            let (field, array) = rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), count, text, &mut output)?;
-            arrays.push(array);
-            fields.push(field);
-            continue;
-        }
-        if *format == Format::Text
-            && let Some((field, array)) = read_source_text_column(name, oid, count, text, &mut output)?
-        {
-            arrays.push(array);
-            fields.push(field);
-            continue;
-        }
         let values = (0..count).map(|row| {
             match format {
                 Format::Text => text(row)?.map_or(Ok(Value::Null), |text| read_text(oid, text)),
@@ -533,6 +543,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn wal_ranges_keep_null_groups_endpoint_order_and_recovered_toast() {
+        use arrow_array::{Array, FixedSizeListArray, TimestampMicrosecondArray};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(&memory));
+        decoder.receive_decoded(&relation(1, "docs", &[("period", 3910)])).unwrap();
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+
+        let lower = "[2000-01-01 00:00:00+02:00,)";
+        let upper = "[,2000-01-01 00:00:00+00)";
+        for (tag, text) in [(b'I', Some(lower)), (b'I', None), (b'I', Some(upper)), (b'I', Some("empty")), (b'D', Some(lower))] {
+            decoder.receive_decoded(&row(tag, 1, &[text])).unwrap();
+        }
+        let held = memory.used_bytes();
+        let invalid = "[invalid,)";
+        assert_eq!(decoder.receive_decoded(&row(b'I', 1, &[Some(invalid)])).unwrap_err(), read_text(3910, invalid).unwrap_err());
+        assert_eq!(memory.used_bytes(), held);
+
+        let mut update = row(b'U', 1, &[Some("[,)")]);
+        update[5] = b'O';
+        update.extend_from_slice(b"N\0\x01u");
+        decoder.receive_decoded(&update).unwrap();
+
+        let transaction = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        assert_eq!(transaction.batches.iter().map(|change| change.rows.batch().num_rows()).collect::<Vec<_>>(), [3, 2, 1]);
+        let batch = transaction.batches[0].rows.batch();
+        assert_eq!(batch.schema_ref().field(0), &tstzrange_field("period", false).unwrap());
+        let ranges = batch.column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let endpoints = ranges.values().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert_eq!(ranges.null_count(), 0);
+        assert_eq!(endpoints.null_count(), 0);
+        assert_eq!(endpoints.timezone(), Some("UTC"));
+        assert_eq!(endpoints.values().as_ref(), &[PG_EPOCH_MICROS - 7_200_000_000, i64::MAX, i64::MIN, PG_EPOCH_MICROS, i64::MIN, i64::MAX]);
+
+        let rows = transaction.to_rows(&memory).unwrap();
+        let ordered = rows.operations.iter().map(|op| (op.kind, op.row["period"].clone())).collect::<Vec<_>>();
+        assert_eq!(ordered, [
+            (RowKind::Put, read_text(3910, lower).unwrap()),
+            (RowKind::Put, Value::Null),
+            (RowKind::Put, read_text(3910, upper).unwrap()),
+            (RowKind::Put, Value::Null),
+            (RowKind::Delete, read_text(3910, lower).unwrap()),
+            (RowKind::Put, Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }),
+        ]);
+        let detached = Arc::clone(ranges.values());
+        drop((decoder, transaction, rows));
+        assert!(memory.used_bytes() > 0);
+        drop(detached);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn pg_source_arrow_snapshot_binary_and_text_layouts_are_identical() {
         let memory = MemoryBudget::new(1 << 22);
         let text = [Column { name: "_id".into(), oid: 20, typmod: -1, format: Format::Text },
@@ -576,6 +638,72 @@ pub(crate) mod tests {
         assert!(memory.used_bytes() > text.len() * 999);
         drop(values);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn snapshot_typed_text_and_vectors_fit_without_generic_value_scratch() {
+        let memory = MemoryBudget::new(128 << 10);
+        let types = VectorTypes::fixture();
+        for (oid, typmod, text) in [
+            (20, -1, "12345"),
+            (17, -1, r"\x00ff"),
+            (1043, -1, "a label"),
+            (1007, -1, "{1,2,NULL}"),
+            (3910, -1, "[,2000-01-01 00:00:00+00)"),
+            (20345, -1, "[1,2]"),
+            (20345, 2, "[1,2]"),
+            (16384, -1, r#"["~#xtdb/clj-form","a"]"#),
+        ] {
+            let column = Column { typmod, ..column("value", oid) };
+            let batch = decode_columns(&[column], 256, &memory, |oid| types.get(oid, None), |row, _| {
+                Ok((row != 12).then_some(text.as_bytes()))
+            }).unwrap();
+            let field = batch.batch().schema_ref().field(0);
+            let array = Arc::clone(batch.batch().column(0));
+            let expected = match (oid, typmod) {
+                (20345, -1) => Value::list(vec![Value::F32(1.0), Value::F32(2.0)]),
+                (20345, _) => Value::FixedSizeList(vec![Value::F32(1.0), Value::F32(2.0)].into()),
+                _ => read_text(oid, text).unwrap(),
+            };
+            assert_eq!(rtdb_columnar::read_value(field, array.as_ref(), 0).unwrap(), expected, "OID {oid}");
+            assert_eq!(rtdb_columnar::read_value(field, array.as_ref(), 12).unwrap(), Value::Null);
+            drop(batch);
+            assert!(memory.used_bytes() > 0);
+            drop(array);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_transit_fallback_keeps_validation_and_row_parse_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let columns = [column("value", 16384)];
+        let malformed = br#"["~#unknown"]"#.as_slice();
+        let dynamic = br#"["~#unknown",0]"#.as_slice();
+        let decode = |rows: &[&[u8]]| {
+            decode_columns(&columns, rows.len(), &memory, |_| None, |row, _| Ok(Some(rows[row])))
+        };
+        let error = decode(&[malformed, dynamic, &[u8::MAX]]).unwrap_err();
+        assert_eq!(error.code, "xtdb.postgres/protocol-error");
+        assert!(error.message.as_deref().unwrap_or_default().contains("invalid utf-8 sequence"));
+        assert_eq!(decode(&[malformed, dynamic]).unwrap_err(), rtdb_format::transit::decode_json(malformed).unwrap_err());
+        assert_eq!(decode(&[dynamic, malformed]).unwrap_err(), read_text(16384, std::str::from_utf8(dynamic).unwrap()).unwrap_err());
+
+        let opaque = br#"["~#xtdb/clj-form","a"]"#.as_slice();
+        let doc = br#"["^ ","a",1]"#.as_slice();
+        let batch = decode(&[opaque, doc]).unwrap();
+        let field = batch.batch().schema_ref().field(0);
+        for (row, bytes) in [opaque, doc].into_iter().enumerate() {
+            let expected = read_text(16384, std::str::from_utf8(bytes).unwrap()).unwrap();
+            assert_eq!(rtdb_columnar::read_value(field, batch.batch().column(0).as_ref(), row).unwrap(), expected);
+        }
+        drop(batch);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let tight = MemoryBudget::new(32 << 10);
+        let error = decode_columns(&columns, 16, &tight, |_| None, |_, _| Ok(Some(b"1"))).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(tight.used_bytes(), 0);
     }
 
     #[test]

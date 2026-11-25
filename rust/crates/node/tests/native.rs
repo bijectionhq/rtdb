@@ -1525,6 +1525,8 @@ async fn log_tables_test_source_log_msgs_basic_and_tx_ops_decoded() {
         assert_eq!(messages[0][0], Value::I64(0)); assert_eq!(messages[0][1], Value::I64(0));
         assert!(matches!(&messages[0][2], Value::Utf8(value) if value.contains(":type :tx")));
         assert!(matches!(&messages[0][3], Value::Utf8(value) if value.contains("#xt/tagged [:put-docs") && value.contains(":xt/id 1")));
+        let offsets = rows(session.query_sql("SELECT log_offset FROM xt.source_log_msgs WHERE msg_id BETWEEN 0 AND 100 AND msg LIKE '%:type :tx%' ORDER BY log_offset", vec![]).await.unwrap()).await;
+        assert_eq!(offsets, [vec![Value::I64(0)], vec![Value::I64(1)]]);
         assert!(rows(session.query_sql("SELECT * FROM xt.source_log_msgs WHERE msg_id BETWEEN 99999 AND 99999", vec![]).await.unwrap()).await.is_empty());
         let error = match session.query_sql("SELECT msg_id FROM xt.source_log_msgs", vec![]).await { Ok(_) => panic!("unbounded inspection succeeded"), Err(error) => error };
         assert_eq!(error.code, "xtdb/missing-log-bounds");

@@ -1,5 +1,5 @@
 {
-  "summary": "The shipped ordered writer open checks the certified checkpoint and head coordinates. The installed cursor binds the exact requested interval, delivers the selected successor, and advances only after successful delivery. An unrecognized prefix prevents promotion.",
+  "summary": "The shipped ordered writer open checks the certified checkpoint and head coordinates. The installed cursor binds the exact requested interval, delivers the selected successor, and advances only after successful delivery. A fenced writer activates only at its recognized and installed prefix after checkpoint confirmation.",
   "flags": ["--no-external-by-default"],
   "min_verified_functions": 22,
   "controls": {
@@ -49,6 +49,12 @@
       "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
       "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && may_lead && !already_leading && holds_grant", "replace": "    may_lead && !already_leading && holds_grant" }],
       "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "activate_after_append_before_apply": {
+      "defect": "A confirmed append can activate a replacement writer while its installed state is behind.",
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "        if self.is_active() || (confirmed && recognized && installed == Some(received)) {", "replace": "        if self.is_active() || (confirmed && recognized) {" }],
+      "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "installed", "category": "postcondition not satisfied" }],
       "min_verified_functions": 8
     }
   }

@@ -4,7 +4,8 @@ use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType};
 use crate::{context::Execution, invalid};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_nullable_column, ordinal_column_by, poll_nested_batch};
-use crate::{scalar_key::ScalarKey, set_keys::BatchKeyIndex};
+use crate::columnar::window::{WindowSpan, lend_window_spans};
+use crate::{scalar_key::ScalarKey, set_keys::{BatchKeyIndex, KeyColumns}};
 
 pub(crate) struct BatchWindow {
     input: Option<BoxBatchCursor>,
@@ -75,7 +76,7 @@ impl BatchWindow {
         if let Some(position) = self.partition_column {
             let mut previous = None;
             for (batch, &start) in batches.iter_mut().zip(&offsets) {
-                let column = batch.columns.remove(position);
+                let (column, _owner) = batch.remove_window_partition(position);
                 for row in 0..batch.len {
                     context.check_cancelled_at(row)?;
                     let Some(ScalarKey::Signed(group)) = ScalarKey::read(&column, row) else {
@@ -108,17 +109,25 @@ impl BatchWindow {
                     })?,
                     WindowFunction::Lead { column, offset } | WindowFunction::Lag { column, offset } => {
                         let position = self.schema.position(column).ok_or_else(|| invalid("window-column", "Window value column is absent"))?;
-                        if let Some(span) = shifted_span(expression.function, start, batch.len, offset, group) {
+                        let single_source = shifted_span(expression.function, start, batch.len, offset, group).and_then(|span| {
                             let source = offsets.partition_point(|&start| start <= span.start) - 1;
                             let base = offsets[source];
-                            if span.end - base <= batches[source].len {
-                                for row in 0..batch.len {
-                                    context.check_cancelled_at(row)?;
-                                }
-                                if let Some(suffix) = batches[source].lend_window_span(position, span.start - base..span.end - base, memory)? {
-                                    suffixes.push(suffix);
-                                    continue;
-                                }
+                            (span.end - base <= batches[source].len)
+                                .then(|| (&batches[source], span.start - base..span.end - base))
+                        });
+                        if let Some((source, rows)) = single_source {
+                            for row in 0..batch.len {
+                                context.check_cancelled_at(row)?;
+                            }
+                            if let Some(suffix) = source.lend_window_span(position, rows, memory)? {
+                                suffixes.push(suffix);
+                                continue;
+                            }
+                        } else if shifted_index(expression.function, (start + batch.len - 1) as u64, offset).is_ok() {
+                            let spans = shifted_runs(expression.function, start..start + batch.len, offset, group, &batches, &offsets);
+                            if let Some(suffix) = lend_window_spans(spans, position, batch.len, context)? {
+                                suffixes.push(suffix);
+                                continue;
                             }
                         }
                         let _picks = memory.reserve(batch.len.checked_mul(size_of::<Option<(usize, usize)>>()).ok_or_else(window_size)?)?;
@@ -167,9 +176,9 @@ impl BatchCursor for PartitionBatches {
             if batch.len == 0 { continue; }
             let bytes = batch.len.checked_mul(std::mem::size_of::<i64>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(window_size)?;
             let reservation = memory.reserve(bytes)?;
-            let keys = batch.key_projection(&self.positions, memory)?;
+            let keys = KeyColumns::projection(&batch, &self.positions);
             let mut groups = Vec::with_capacity(batch.len);
-            self.index.identify(&keys, self.projected, &self.context, &self.keys, |_, group, _| {
+            self.index.identify(keys, self.projected, &self.context, &self.keys, |_, group, _| {
                 groups.push(i64::try_from(group).map_err(|_| invalid("window-count", "Window partition count overflow"))?);
                 Ok(())
             })?;
@@ -206,6 +215,44 @@ fn shifted_span(function: WindowFunction, start: usize, len: usize, offset: u64,
     let first_target = usize::try_from(shifted_index(function, start as u64, offset).ok().flatten()?).ok()?;
     let last_target = usize::try_from(shifted_index(function, last as u64, offset).ok().flatten()?).ok()?;
     (lower <= first_target && last_target < upper).then(|| first_target..last_target + 1)
+}
+
+fn shifted_runs<'a>(
+    function: WindowFunction,
+    output: Range<usize>,
+    offset: u64,
+    group: impl Fn(usize) -> (usize, usize) + Clone + 'a,
+    batches: &'a [ColumnBatch],
+    offsets: &'a [usize],
+) -> impl Iterator<Item = WindowSpan<'a>> + Clone + 'a {
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    let output_end = output.end;
+    let groups = std::iter::successors(Some((output.start, group(output.start))), move |&(_, (_, upper))| {
+        (upper < output_end).then(|| (upper, group(upper)))
+    });
+    groups.flat_map(move |(start, (lower, upper))| {
+        let end = upper.min(output_end);
+        let (targets, prefix, suffix) = if matches!(function, WindowFunction::Lead { .. }) {
+            let present_end = end.min(upper.saturating_sub(offset)).max(start);
+            let targets = if start < present_end { start + offset..present_end + offset } else { 0..0 };
+            (targets, 0, end - present_end)
+        } else {
+            let present_start = start.max(lower.saturating_add(offset)).min(end);
+            let targets = if present_start < end { present_start - offset..end - offset } else { 0..0 };
+            (targets, present_start - start, 0)
+        };
+        let first = (!targets.is_empty()).then(|| offsets.partition_point(|&base| base <= targets.start) - 1);
+        let sources = std::iter::successors(first, move |&page| {
+            offsets.get(page + 1).filter(|&&next| next < targets.end).map(|_| page + 1)
+        }).map(move |page| {
+            let base = offsets[page];
+            let batch = &batches[page];
+            WindowSpan::Source(batch, targets.start.saturating_sub(base)..(targets.end - base).min(batch.len))
+        });
+        (prefix > 0).then_some(WindowSpan::Null(prefix)).into_iter()
+            .chain(sources)
+            .chain((suffix > 0).then_some(WindowSpan::Null(suffix)))
+    })
 }
 
 fn shifted_index(function: WindowFunction, index: u64, offset: u64) -> Result<Option<u64>> {

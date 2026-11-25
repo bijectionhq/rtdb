@@ -20,6 +20,16 @@ impl BatchBuilder {
         self.reservation.budget().reserve(bytes)
     }
 
+    /// Moves the charge for metadata discovered during column decoding to the batch.
+    pub fn retain_metadata(&mut self, scratch: &mut MemoryReservation, bytes: usize) -> Result<()> {
+        if !Arc::ptr_eq(self.reservation.budget(), scratch.budget()) {
+            return Err(Anomaly::incorrect("rtdb/reservation-budget", "Reservations belong to different budgets"));
+        }
+        let mut metadata = scratch.split_off(bytes)?;
+        Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation")
+            .absorb(Arc::get_mut(&mut metadata).expect("metadata charge has a single owner"))
+    }
+
     pub fn column(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
         self.try_column(temporary, || build().map(Some)).map(|array| array.expect("Column construction returned an array"))
     }
