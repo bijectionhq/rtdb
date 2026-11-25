@@ -422,15 +422,22 @@ async fn retained_ticket_pins_arrow_parameters_after_rebind() {
     let command = CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle };
     client.upload(command.clone(), vec![arguments(vec![41, 99])]).await;
     let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
-    let request = client.request(descriptor);
+    let request = client.request(descriptor.clone());
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
     let ticket = Any::decode(info.endpoint[0].ticket.as_ref().unwrap().ticket.as_ref()).unwrap();
     let handle = TicketStatementQuery::decode(ticket.value).unwrap().statement_handle;
     assert!(handle.starts_with(b"RTDBFT\x02"));
     assert_eq!(handle.len(), 7 + 16);
 
-    client.upload(command, vec![arguments(vec![42])]).await;
+    let text = RecordBatch::try_from_iter([("label", Arc::new(StringArray::from(vec!["new"])) as arrow_array::ArrayRef)]).unwrap();
+    client.upload(command, vec![text]).await;
+    let request = client.request(descriptor);
+    let current = client.client.get_flight_info(request).await.unwrap().into_inner();
+    assert_eq!(info.clone().try_decode_schema().unwrap().field(0).data_type(), &DataType::Int64);
+    assert_eq!(current.clone().try_decode_schema().unwrap().field(0).data_type(), &DataType::Utf8);
     assert_eq!(integer(&client.redeem(&info).await[0], 0, 0), 41);
+    let rows = client.redeem(&current).await;
+    assert_eq!(rows[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "new");
     let mut other = Client::connect(&running.server, None).await;
     let request = other.request(info.endpoint[0].ticket.clone().unwrap());
     assert_eq!(other.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);

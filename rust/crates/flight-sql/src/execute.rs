@@ -2,10 +2,12 @@ use std::{sync::{Arc, Mutex}, time::Duration};
 use arrow_flight::FlightData;
 use arrow_schema::Schema;
 use bytes::Bytes;
+use rtdb_columnar::MemoryBudget;
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
 use rtdb_query::{BoundParameters, QueryContext, QueryCursor};
 use rtdb_tx::SqlArguments;
+use rtdb_types::LogicalType;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
@@ -51,27 +53,23 @@ impl QueryTicket {
         ).await.map_err(status)
     }
 
-    async fn open(&self, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<QueryCursor, Status> {
+    async fn open(&self, memory: &Arc<MemoryBudget>) -> Result<QueryCursor, Status> {
         let (prepared, params) = match &self.input {
             QueryInput::Statement { prepared, params } => (prepared, params),
             QueryInput::Inspection(cursor) => return cursor.lock().expect("query ticket lock").take()
                 .ok_or_else(|| Status::not_found("query inspection was already retrieved")),
         };
-        let arguments = params.as_ref().map(|params| params.arguments(memory)).transpose()?;
-        let types = arguments.as_ref().map(SqlArguments::types).unwrap_or_default();
         let context = Arc::clone(&self.context);
-        if let Some(params) = params
-            && let Some(cursor) = prepared.try_open_query_arrow(Arc::clone(&context), params.owned_batch(), types).await.map_err(status)?
-        {
-            return Ok(cursor);
+        if let Some(params) = params {
+            let types = params.validated_query_types(memory).await?;
+            if let Some(cursor) = prepared.try_open_query_arrow(Arc::clone(&context), params.owned_batch(), types).await.map_err(status)? {
+                return Ok(cursor);
+            }
+            let (row, _values) = params.first_query_row(types, memory)?;
+            return prepared.open_query_columns_typed(context, row, types).await.map_err(status);
         }
-        let row = arguments.as_ref().map(|arguments| {
-            arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))?.map_err(status)
-        }).transpose()?;
-        let row = row.as_deref().unwrap_or_default();
-        let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;
-        let _values = memory.reserve(bound).map_err(status)?;
-        prepared.open_query_columns_typed(context, row.to_vec(), types).await.map_err(status)
+        let _values = memory.reserve(1024).map_err(status)?;
+        prepared.open_query_columns_typed(context, Vec::new(), &[]).await.map_err(status)
     }
 }
 
@@ -88,19 +86,14 @@ impl Service {
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
             .map_err(status)?;
         let schema = if prepared.is_dml() { None } else {
-            Some(self.parameterized_schema(&prepared, &context, None)?)
+            Some(self.parameterized_schema(&prepared, &context, prepared.parameter_types())?)
         };
         Ok(Shape { schema, parameters: prepared.parameter_count(), plan: Some(prepared) })
     }
     fn parameterized_schema(
-        &self, prepared: &PreparedSql, context: &Arc<QueryContext>, params: Option<&wire::BoundParameters>,
+        &self, prepared: &PreparedSql, context: &Arc<QueryContext>, types: &[LogicalType],
     ) -> Result<wire::OwnedSchema, Status> {
-        let schema = if let Some(params) = params {
-            let types = wire::ParameterTypes::from_batch(params.batch(), self.memory())?;
-            prepared.result_schema(context, types.as_slice()).map_err(status)?
-        } else {
-            prepared.result_schema(context, prepared.parameter_types()).map_err(status)?
-        };
+        let schema = prepared.result_schema(context, types).map_err(status)?;
         wire::plan_schema(schema.schema(), self.memory())
     }
 
@@ -163,7 +156,11 @@ impl Service {
                 return self.empty_update_info();
             }
             let context = native.query_context_with(&token, true).await.map_err(status)?;
-            let schema = self.parameterized_schema(&prepared, &context, params.as_deref())?;
+            let types = match &params {
+                Some(params) => params.query_types(self.memory()).await?,
+                None => prepared.parameter_types(),
+            };
+            let schema = self.parameterized_schema(&prepared, &context, types)?;
             let params = params.filter(|params| params.batch().num_columns() != 0);
             (context, schema, QueryInput::Statement { prepared, params })
         };

@@ -101,7 +101,8 @@ SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; tra
 Prepared handles are re-prepared against the current execution context on each use.
 Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
 Prepared query binding retains the first Arrow batch.
-Flight SQL derives the result schema from the bound Arrow fields and encodes the batch when issuing a query ticket.
+Flight SQL derives the result schema from the admitted parameter types and retains the batch and types with the query ticket.
+Rebinding the prepared statement leaves previously issued tickets associated with their original batch and types.
 Ticket redemption validates the argument batch and reads the first parameter row when opening the query.
 A pure projection of compatible bound parameters stays in Arrow.
 Compatible nested lists, fixed-size lists, and structs are projected as Arrow columns.
@@ -144,7 +145,10 @@ Metadata enumeration reserves borrowed schema bounds before cloning table bindin
 The schema and codec estimates are conservative allowances, not a demonstrated bound for every possible nested Arrow representation.
 During classification of the complete SQL input, Flight SQL charges token array capacity and an estimate for lexer scratch to the node's memory budget.
 A classified control command retains an estimated parsing and binding allowance through schema preparation or execution.
-Flight SQL reserves a schema allowance before converting Arrow parameter fields to logical types and holds it through result-schema binding or construction of retained SQL arguments.
+Flight SQL charges each upload frame while it awaits and undergoes Arrow decoding, and charges command decoding from the descriptor's command bytes.
+Decoded command fields that survive command parsing keep their share of the charge until consumed.
+Flight SQL reserves a schema allowance before converting Arrow parameter fields to logical types.
+Prepared query descriptions and ticket redemptions share the retained parameter types from that conversion.
 Typed batches with zero rows still carry their parameter field types.
 Without a bound parameter batch, result-schema binding borrows the prepared parameter types.
 HTTP/2, prost, TLS-free tonic buffers, ordinary SQL parser scratch, and scalar-expression peak allocations still require end-to-end accounting qualification.

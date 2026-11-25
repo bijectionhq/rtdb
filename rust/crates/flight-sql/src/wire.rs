@@ -9,7 +9,8 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{BufferIdentity, MemoryBudget, MemoryReservation, OwnedBatch, RetainedArray, from_field};
 use rtdb_tx::SqlArguments;
-use rtdb_types::LogicalType;
+use rtdb_types::{LogicalType, Value};
+use tokio::sync::OnceCell;
 use tonic::Status;
 use crate::error::{arrow, invalid, status};
 
@@ -394,6 +395,7 @@ fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBat
 pub(crate) struct BoundParameters {
     batch: OwnedBatch,
     _schema: Option<Arc<MemoryReservation>>,
+    query_types: OnceCell<ParameterTypes>,
 }
 
 impl BoundParameters {
@@ -404,7 +406,7 @@ impl BoundParameters {
             None if batch.owns_schema() => (batch, None),
             None => (batch, Some(schema)),
         };
-        Ok(Arc::new(Self { batch, _schema: schema }))
+        Ok(Arc::new(Self { batch, _schema: schema, query_types: OnceCell::new() }))
     }
 
     #[cfg(test)]
@@ -421,6 +423,46 @@ impl BoundParameters {
     pub fn batch(&self) -> &RecordBatch { self.batch.batch() }
 
     pub fn owned_batch(&self) -> &OwnedBatch { &self.batch }
+
+    pub async fn query_types(&self, memory: &Arc<MemoryBudget>) -> Result<&[LogicalType], Status> {
+        let types = self.query_types.get_or_try_init(|| async {
+            let mut types = ParameterTypes::from_batch(self.batch(), memory)?;
+            let spare = types.types.capacity() - types.types.len();
+            let retained = types.types.iter().try_fold(add(256, mul(spare, std::mem::size_of::<LogicalType>())?)?, |bytes, ty| {
+                add(bytes, ty.retained_bytes().map_err(status)?)
+            })?;
+            let grant = Arc::get_mut(&mut types.reservation).expect("parameter types own their grant");
+            if retained <= grant.bytes() {
+                grant.shrink_to(retained).map_err(status)?;
+            } else {
+                grant.grow_to(retained).map_err(status)?;
+            }
+            Ok::<_, Status>(types)
+        }).await?;
+        Ok(types.as_slice())
+    }
+
+    pub async fn validated_query_types(&self, memory: &Arc<MemoryBudget>) -> Result<&[LogicalType], Status> {
+        let types = self.query_types(memory).await?;
+        validate_argument_columns(self.batch(), types, memory)?;
+        Ok(types)
+    }
+
+    pub fn first_query_row(&self, types: &[LogicalType], memory: &Arc<MemoryBudget>) -> Result<(Vec<Value>, Arc<MemoryReservation>), Status> {
+        let batch = self.batch();
+        if batch.num_rows() == 0 { return Err(invalid("Query parameter batch has no rows")); }
+        let columns = || batch.schema_ref().fields().iter().zip(batch.columns());
+        let bound = columns().try_fold(mul(types.len(), std::mem::size_of::<Value>())?, |bytes, (field, array)| {
+            add(bytes, rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0).map_err(status)?)
+        })?;
+        let charge = memory.reserve(bound).map_err(status)?;
+        let mut row = Vec::with_capacity(types.len());
+        for ((field, array), ty) in columns().zip(types) {
+            row.push(rtdb_columnar::read_value_as(ty, field, array.as_ref(), 0).map_err(status)?);
+        }
+        row.iter_mut().try_for_each(Value::admit_object_dates).map_err(status)?;
+        Ok((row, charge))
+    }
 
     pub fn arguments(&self, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
         arguments(&self.batch, memory)
@@ -452,13 +494,13 @@ fn logical_parameter_types(schema: &Schema) -> Result<Vec<LogicalType>, Status> 
 
 pub(crate) struct ParameterTypes {
     types: Vec<LogicalType>,
-    _reservation: Arc<MemoryReservation>,
+    reservation: Arc<MemoryReservation>,
 }
 impl ParameterTypes {
     pub fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
         let schema = batch.schema_ref();
         let reservation = memory.reserve(schema_bound(schema)?).map_err(status)?;
-        Ok(Self { types: logical_parameter_types(schema)?, _reservation: reservation })
+        Ok(Self { types: logical_parameter_types(schema)?, reservation })
     }
 
     pub fn as_slice(&self) -> &[LogicalType] { &self.types }
@@ -468,10 +510,15 @@ pub(crate) fn arguments(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Resul
     let record = batch.batch();
     let _check = memory.reserve(schema_bound(record.schema_ref())?).map_err(status)?;
     let arguments = SqlArguments::from_arrow(batch.clone(), memory).map_err(status)?;
-    for ((field, array), logical) in record.schema_ref().fields().iter().zip(record.columns()).zip(arguments.types()) {
+    validate_argument_columns(record, arguments.types(), memory)?;
+    Ok(arguments)
+}
+
+fn validate_argument_columns(record: &RecordBatch, types: &[LogicalType], memory: &Arc<MemoryBudget>) -> Result<(), Status> {
+    for ((field, array), logical) in record.schema_ref().fields().iter().zip(record.columns()).zip(types) {
         rtdb_columnar::validate_readable_column(field, array.as_ref(), logical, memory).map_err(status)?;
     }
-    Ok(arguments)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -668,8 +715,8 @@ mod tests {
         assert_eq!(memory.used_bytes(), 0);
     }
 
-    #[test]
-    fn ticket_arguments_reject_an_unreadable_value_after_the_first_row() {
+    #[tokio::test]
+    async fn ticket_arguments_reject_an_unreadable_value_after_the_first_row() {
         let memory = MemoryBudget::new(1 << 20);
         let field = rtdb_columnar::to_field("arg", &LogicalType::Scalar(rtdb_types::ScalarType::Uri)).unwrap();
         let batch = RecordBatch::try_new(
@@ -677,13 +724,39 @@ mod tests {
             vec![Arc::new(arrow_array::StringArray::from(vec!["https://xtdb.com", "bad uri"]))],
         ).unwrap();
         let bytes = parameter_ipc(&batch, &memory).unwrap().unwrap();
-        let decoded = parameter_batch(&bytes, &memory).unwrap();
+        let bound = BoundParameters::new(parameter_batch(&bytes, &memory).unwrap(), &memory).unwrap();
 
-        let error = arguments(&decoded, &memory).err().unwrap();
+        assert!(bound.query_types(&memory).await.is_ok());
+        let error = bound.validated_query_types(&memory).await.unwrap_err();
 
         let bytes = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
         let anomaly: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(anomaly["code"], "xtdb/invalid-uri");
+    }
+
+    #[tokio::test]
+    async fn query_types_retry_after_memory_pressure_and_stay_with_the_bound_rows() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Arc::new(Schema::new(vec![Field::new("arg", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![None, Some(17)]))]).unwrap();
+        let bound = BoundParameters::new(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+
+        let obstruction = memory.reserve(memory.available_bytes()).unwrap();
+        assert!(bound.query_types(&memory).await.is_err());
+        drop(obstruction);
+
+        let types = bound.query_types(&memory).await.unwrap();
+        assert_eq!(types, &[LogicalType::Scalar(rtdb_types::ScalarType::I64).maybe()]);
+        let obstruction = memory.reserve(memory.available_bytes()).unwrap();
+        assert_eq!(bound.validated_query_types(&memory).await.unwrap(), types);
+        drop(obstruction);
+
+        let (row, row_charge) = bound.first_query_row(types, &memory).unwrap();
+        assert_eq!(row, [Value::Null]);
+        drop(row);
+        drop(row_charge);
+        drop(bound);
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
