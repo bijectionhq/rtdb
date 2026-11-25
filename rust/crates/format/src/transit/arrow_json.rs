@@ -95,10 +95,17 @@ fn bytes(output: &mut impl Write, data: &[u8]) -> Result<()> {
 
 fn text(output: &mut impl Write, value: &str) -> Result<()> {
     if value.starts_with(['~', '^', '`']) {
-        serde_json::to_writer(output, &format!("~{value}")).map_err(invalid)
+        prefixed_text(output, "~", value)
     } else {
         serde_json::to_writer(output, value).map_err(invalid)
     }
+}
+
+fn prefixed_text(output: &mut impl Write, prefix: &str, value: &str) -> Result<()> {
+    serde::Serializer::collect_str(
+        &mut serde_json::Serializer::new(output),
+        &format_args!("{prefix}{value}"),
+    ).map_err(invalid)
 }
 
 fn write_struct<'a>(output: &mut impl Write, cells: impl Iterator<Item = ArrowCell<'a>>, typed_structs: bool, depth: usize) -> Result<()> {
@@ -397,7 +404,7 @@ fn write_typed_leaf(output: &mut impl Write, cell: ArrowCell<'_>, key: bool, dep
         (DataType::Utf8, Some("xt/clj-keyword" | "uri")) => {
             let value = array.as_string::<i32>().value(row);
             let prefix = if extension == Some("uri") { rtdb_types::UriParts::parse(value)?; "~r" } else { "~:" };
-            quoted(output, top, |output| json(output, &format!("{prefix}{value}")))?;
+            quoted(output, top, |output| prefixed_text(output, prefix, value))?;
             return Ok(true);
         }
         (DataType::Int32, Some(tag @ ("xt/oid" | "xt/regclass" | "xt/regproc"))) => {
