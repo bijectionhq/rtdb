@@ -695,6 +695,27 @@ fn catalog_bindings_reserve_before_enumeration_and_clones_retain_the_charge() {
     let exhausted = MemoryBudget::new(1); assert!(context.catalog.tables_reserved("xtdb", &exhausted).is_err()); assert_eq!(exhausted.used_bytes(), 0);
 }
 
+#[test]
+fn table_names_and_one_selected_binding_fit_without_funding_the_whole_catalog() {
+    use rtdb_plan::QualifiedTable;
+    use rtdb_types::TableRef;
+
+    let context = query_context(Default::default());
+    let memory = MemoryBudget::new(1 << 16);
+    assert!(context.catalog.tables_reserved("xtdb", &memory).is_err());
+    let names = context.catalog.table_names_reserved("xtdb", &memory).unwrap();
+    let table = TableRef::new("pg_catalog", "pg_views");
+    assert!(names.rows().binary_search(&table).is_ok());
+    let name = QualifiedTable { database: "xtdb".into(), table };
+    let (binding, charge) = context.catalog.table_binding_reserved(&name, &memory).unwrap().unwrap();
+    assert_eq!(binding.name, name);
+    assert!(binding.columns.contains_key("viewname"));
+    drop(binding);
+    drop(charge);
+    drop(names);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 #[tokio::test]
 async fn extension_retains_input_fields_and_resolves_appended_fields_in_input_scope() {
     let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });

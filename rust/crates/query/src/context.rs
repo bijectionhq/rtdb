@@ -159,6 +159,56 @@ impl CatalogSnapshot {
         Ok(())
     }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
+
+    /// Lists visible table identities in schema and table order under a name-only reservation.
+    pub fn table_names_reserved(&self, database: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_plan::CatalogRows<TableRef>> {
+        let overflow = || invalid("catalog-size", "Table identities exceed addressable memory");
+        let bytes = self.table_name_sources(database)?.try_fold(4096usize, |bytes, (schema, table)| {
+            bytes.checked_add(schema.len()).and_then(|n| n.checked_add(table.len()))
+                .and_then(|n| n.checked_add(512)).ok_or_else(overflow)
+        })?;
+        let reservation = memory.reserve(bytes)?;
+        let names = self.table_name_sources(database)?.collect::<BTreeSet<_>>();
+        let rows = names.into_iter().map(|(schema, table)| TableRef::new(schema, table)).collect();
+        Ok(rtdb_plan::CatalogRows::new(rows, reservation))
+    }
+
+    fn table_name_sources<'a>(&'a self, database: &'a str) -> Result<impl Iterator<Item = (&'a str, &'a str)>> {
+        let snapshot = self.database(database)?;
+        let ordinary = self.owned_relation.is_none();
+        let stored = snapshot.partitions.iter().filter(move |_| ordinary).flat_map(Snapshot::table_names)
+            .filter(|name| !TableRef::owned_schema(&name.schema))
+            .map(|name| (name.schema.as_str(), name.table.as_str()));
+        let system = crate::system_schema::DEFINITIONS.iter().filter(move |_| ordinary)
+            .map(|definition| -> (&'a str, &'a str) { (definition.schema, definition.name) });
+        let owned = self.owned_relation.iter()
+            .filter(move |(admitted, _)| {
+                admitted.database == database && (crate::system_schema::definition(&admitted.table).is_some()
+                    || snapshot.partitions.iter().any(|part| part.contains_table(&admitted.table)))
+            })
+            .map(|(admitted, _)| (admitted.table.schema.as_str(), admitted.table.table.as_str()));
+        Ok(stored.chain(system).chain(owned))
+    }
+
+    /// Funds the logical field tree and join scratch for just this table.
+    pub fn table_binding_reserved(&self, name: &QualifiedTable, memory: &Arc<MemoryBudget>) -> Result<Option<(TableBinding, Arc<MemoryReservation>)>> {
+        if !self.permits_table(name) { return Ok(None); }
+        let snapshot = self.database(&name.database)?;
+        let overflow = || invalid("catalog-size", "Table metadata allocation exceeds addressable memory");
+        let base = [name.database.len(), name.table.schema.len(), name.table.table.len()]
+            .into_iter().try_fold(4096usize, |bytes, len| bytes.checked_add(len).ok_or_else(overflow))?;
+        let bytes = if let Some(definition) = crate::system_schema::definition(&name.table) {
+            base.checked_add(definition.allocation_bound(&name.database)?).ok_or_else(overflow)?
+        } else {
+            snapshot.partitions.iter().filter(|part| part.contains_table(&name.table))
+                .try_fold(base, |bytes, part| {
+                    bytes.checked_add(part.table_schema_allocation_bound(&name.database, &name.table)?).ok_or_else(overflow)
+                })?
+        };
+        let reservation = memory.reserve(bytes)?;
+        Ok(self.table(name)?.map(|binding| (binding, reservation)))
+    }
+
     /// Reserves schema enumeration and joins before creating the returned table bindings.
     /// Clones of the result share its retained allocation charge.
     pub fn tables_reserved(&self, database: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_plan::CatalogRows<TableBinding>> {
@@ -235,9 +285,10 @@ impl Catalog for CatalogSnapshot {
                 Ok(Vec::new())
             };
         }
-        let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).filter(|table| !TableRef::owned_schema(&table.schema)).collect();
-        let names: BTreeSet<_> = names.into_iter().chain(crate::system_schema::DEFINITIONS.iter().map(|definition| TableRef::new(definition.schema, definition.name))).collect();
-        names.iter().map(|table| self.binding(database, table)?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))).collect()
+        let names = self.table_name_sources(database)?.collect::<BTreeSet<_>>();
+        names.into_iter().map(|(schema, table)| {
+            self.binding(database, &TableRef::new(schema, table))?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))
+        }).collect()
     }
     fn transaction_scoped(&self) -> bool { self.transaction_scoped }
 }

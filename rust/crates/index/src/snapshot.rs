@@ -188,17 +188,20 @@ impl Snapshot {
     /// Conservative allocation allowance for enumerating and merging this snapshot's table schemas.
     /// It borrows the schema sources and allocates nothing; event buffers and HLLs are excluded.
     pub fn schema_allocation_bound(&self, database: &str) -> Result<usize> {
-        let overflow = || Anomaly::incorrect("rtdb.index/schema-size", "Schema allocation bound exceeds addressable memory");
-        let mut bytes = 4096usize;
-        let mut include = |table: &TableRef, types: &StructFields<LogicalType>| -> Result<()> {
-            bytes = bytes.checked_add(database.len()).and_then(|n| n.checked_add(table.schema.len())).and_then(|n| n.checked_add(table.table.len())).and_then(|n| n.checked_add(1024)).ok_or_else(overflow)?;
-            for (name, ty) in types { let retained = ty.retained_bytes()?; bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(512)).and_then(|n| n.checked_add(retained)).ok_or_else(overflow)?; }
-            Ok(())
-        };
-        for (table, metadata) in self.table_catalog.tables() { include(table, &metadata.column_types)?; }
-        for (table, live) in self.durable.tables() { include(table, live.column_types())?; }
-        for (table, segments) in &self.layered { for segment in segments { include(table, segment.column_types())?; } }
-        bytes.checked_mul(16).ok_or_else(overflow)
+        let catalog = self.table_catalog.tables().iter().map(|(table, metadata)| (table, &metadata.column_types));
+        let applied = self.durable.tables().iter().map(|(table, live)| (table, live.column_types()));
+        let overlays = self.layered.iter().flat_map(|(table, segments)| {
+            segments.iter().map(move |segment| (table, segment.column_types()))
+        });
+        schema_sources_bound(database, catalog.chain(applied).chain(overlays))
+    }
+    /// Bounds the schema merge for just one table in this snapshot.
+    pub fn table_schema_allocation_bound(&self, database: &str, table: &TableRef) -> Result<usize> {
+        let catalog = self.table_catalog.metadata(table).map(|metadata| &metadata.column_types);
+        let live = self.durable.tables().get(table).into_iter()
+            .chain(self.layered.get(table).into_iter().flatten())
+            .map(|segment| segment.column_types());
+        schema_sources_bound(database, catalog.into_iter().chain(live).map(|types| (table, types)))
     }
     pub fn column_names(&self, table: &TableRef) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
@@ -315,6 +318,24 @@ impl Snapshot {
         }
         Ok(next)
     }
+}
+
+fn schema_sources_bound<'a>(
+    database: &str,
+    sources: impl Iterator<Item = (&'a TableRef, &'a StructFields<LogicalType>)>,
+) -> Result<usize> {
+    let overflow = || Anomaly::incorrect("rtdb.index/schema-size", "Schema allocation bound exceeds addressable memory");
+    let mut bytes = 4096usize;
+    for (table, types) in sources {
+        bytes = bytes.checked_add(database.len()).and_then(|n| n.checked_add(table.schema.len()))
+            .and_then(|n| n.checked_add(table.table.len())).and_then(|n| n.checked_add(1024)).ok_or_else(overflow)?;
+        for (name, ty) in types {
+            let retained = ty.retained_bytes()?;
+            bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(512))
+                .and_then(|n| n.checked_add(retained)).ok_or_else(overflow)?;
+        }
+    }
+    bytes.checked_mul(16).ok_or_else(overflow)
 }
 
 #[cfg(test)]

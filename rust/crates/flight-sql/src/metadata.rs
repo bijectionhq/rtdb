@@ -1,8 +1,18 @@
-use std::{collections::BTreeSet, sync::Arc};
-use arrow_flight::{FlightData, sql::{Command, SqlInfo, metadata::{SqlInfoData, SqlInfoDataBuilder}}};
-use arrow_schema::Schema;
-use rtdb_columnar::OwnedBatch;
+use std::sync::Arc;
+
+use arrow_array::{RecordBatch, builder::BinaryBuilder, cast::AsArray};
+use arrow_flight::{
+    FlightData, IpcMessage, SchemaAsIpc,
+    sql::{Command, CommandGetTables, SqlInfo, metadata::{SqlInfoData, SqlInfoDataBuilder}},
+};
+use arrow_ipc::writer::IpcWriteOptions;
+use arrow_schema::{Schema, SchemaRef};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_plan::QualifiedTable;
+use rtdb_query::CatalogSnapshot;
+use rtdb_types::TableRef;
 use tonic::{Response, Status};
+
 use crate::{error::{arrow, cancelled, status, unsupported}, service::{Call, Output, Service}, wire};
 
 impl Service {
@@ -51,27 +61,50 @@ impl Service {
                     let mut native = connection.borrow().await?;
                     let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
                     let context = native.query_context_with(&token, false).await.map_err(status)?;
-                    let mut tables = Vec::new();
-                    for database in context.catalog.database_names() {
-                        let next = context.catalog.tables_reserved(database, self.memory()).map_err(status)?;
-                        let mut bound = 8192;
-                        for table in next.rows() { bound = wire::add(bound, wire::mul(wire::add(database.len(), wire::add(table.name.table.schema.len(), table.name.table.table.len())?)?, 16)?)?; for (name, ty) in &table.columns { bound = wire::add(bound, wire::mul(wire::add(name.len(), wire::add(ty.retained_bytes().map_err(status)?, 512)?)?, 32)?)?; } }
-                        charges.push(self.memory().reserve(bound).map_err(status)?); tables.push(next);
-                    }
+                    let catalog = &context.catalog;
+                    let memory = self.memory();
                     match command {
                         Command::CommandGetDbSchemas(command) => {
                             let mut builder = command.into_builder();
-                            let mut schemas = BTreeSet::new();
-                            for table in tables.iter().flat_map(|tables| tables.rows()) { schemas.insert((table.name.database.as_str(), table.name.table.schema.as_str())); }
-                            for (database, schema) in schemas { builder.append(database, schema); } builder.build().map_err(arrow)?
-                        }
-                        Command::CommandGetTables(command) => {
-                            let mut builder = command.into_builder();
-                            for table in tables.iter().flat_map(|tables| tables.rows()) {
-                                let schema = Schema::new(table.columns.iter().map(|(name, ty)| rtdb_columnar::to_field(name, ty).map_err(status)).collect::<Result<Vec<_>, _>>()?);
-                                builder.append(&table.name.database, &table.name.table.schema, &table.name.table.table, "TABLE", &schema).map_err(arrow)?;
+                            for database in catalog.database_names() {
+                                let names = catalog.table_names_reserved(database, memory).map_err(status)?;
+                                let mut previous = None;
+                                for table in names.rows() {
+                                    let schema = table.schema.as_str();
+                                    if previous == Some(schema) {
+                                        continue;
+                                    }
+                                    let bytes = wire::add(512, wire::mul(wire::add(database.len(), schema.len())?, 16)?)?;
+                                    charges.push(memory.reserve(bytes).map_err(status)?);
+                                    builder.append(database, schema);
+                                    previous = Some(schema);
+                                }
                             }
                             builder.build().map_err(arrow)?
+                        }
+                        Command::CommandGetTables(command) => {
+                            let output_schema = command.include_schema.then(|| {
+                                CommandGetTables { include_schema: true, ..Default::default() }.into_builder().schema()
+                            });
+                            let mut names = CommandGetTables { include_schema: false, ..command }.into_builder();
+                            let empty = Schema::empty();
+                            for database in catalog.database_names() {
+                                let tables = catalog.table_names_reserved(database, memory).map_err(status)?;
+                                let bytes = tables.rows().iter().try_fold(8192, |bytes, table| {
+                                    let name = wire::add(database.len(), wire::add(table.schema.len(), table.table.len())?)?;
+                                    wire::add(bytes, wire::add(512, wire::mul(name, 16)?)?)
+                                })?;
+                                charges.push(memory.reserve(bytes).map_err(status)?);
+                                for table in tables.rows() {
+                                    names.append(database, &table.schema, &table.table, "TABLE", &empty).map_err(arrow)?;
+                                }
+                            }
+                            let selected = names.build().map_err(arrow)?;
+                            if let Some(output_schema) = output_schema {
+                                with_table_schemas(selected, output_schema, catalog, memory, &mut charges)?
+                            } else {
+                                selected
+                            }
                         }
                         _ => return Err(unsupported()),
                     }
@@ -91,4 +124,39 @@ impl Service {
         });
         let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
     }
+}
+
+fn with_table_schemas(
+    selected: RecordBatch,
+    schema: SchemaRef,
+    catalog: &CatalogSnapshot,
+    memory: &Arc<MemoryBudget>,
+    charges: &mut Vec<Arc<MemoryReservation>>,
+) -> Result<RecordBatch, Status> {
+    let databases = selected.column(0).as_string::<i32>();
+    let schemas = selected.column(1).as_string::<i32>();
+    let tables = selected.column(2).as_string::<i32>();
+    let options = IpcWriteOptions::default();
+    let mut ipc = BinaryBuilder::new();
+    for row in 0..selected.num_rows() {
+        let name = QualifiedTable {
+            database: databases.value(row).into(),
+            table: TableRef::new(schemas.value(row), tables.value(row)),
+        };
+        let (table, _binding) = catalog.table_binding_reserved(&name, memory).map_err(status)?
+            .ok_or_else(|| Status::internal("Selected table is missing from its captured catalog"))?;
+        let bytes = table.columns.iter().try_fold(512, |bytes, (name, ty)| {
+            let field = wire::add(name.len(), wire::add(ty.retained_bytes().map_err(status)?, 512)?)?;
+            wire::add(bytes, wire::mul(field, 32)?)
+        })?;
+        charges.push(memory.reserve(bytes).map_err(status)?);
+        let fields = table.columns.iter().map(|(name, ty)| rtdb_columnar::to_field(name, ty).map_err(status))
+            .collect::<Result<Vec<_>, _>>()?;
+        let table_schema = Schema::new(fields);
+        let IpcMessage(message) = SchemaAsIpc::new(&table_schema, &options).try_into().map_err(arrow)?;
+        ipc.append_value(message);
+    }
+    let mut columns = selected.columns().to_vec();
+    columns.push(Arc::new(ipc.finish()));
+    RecordBatch::try_new(schema, columns).map_err(arrow)
 }

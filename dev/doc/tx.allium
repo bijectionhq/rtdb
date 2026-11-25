@@ -108,6 +108,7 @@
 -- Computed VALUES and replayed literal pages admit their results column by column.
 -- Compatible XTQL literal pages build their Arrow columns during binding and retain the order and size of every page.
 -- System catalog scans build the requested columns in Arrow and apply filters to their batches.
+-- Flight SQL catalog metadata resolves visible names before building fields for selected tables requested with schemas.
 -- Relation name casts resolve against an identity map for the captured catalog.
 -- Column tables preserve one semantic page across the input list's batches.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
@@ -449,6 +450,9 @@
 -- An interrupted response leaves the transaction outcome to the attempt marker and durable source observation.
 -- An ordinary authenticated Flight session may read a bound catalog projection through ScanCatalog.v1 under the SQL snapshot issued to the same principal and database.
 -- The held snapshot supplies the original read cut and clock, and each streamed Arrow result frame requires its delivery grant.
+-- Each result carries one complete IPC frame.
+-- The catalog scan sends the declared schema first and the stream terminator last.
+-- Catalog scan pages in the declared layout share its funded schema.
 -- The packed hosted decision accepts related Arrow runs in a shared stream and restores their scheduled order before the existing decision, control, and source admission.
 --
 -- == Boundaries ==

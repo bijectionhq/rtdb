@@ -27,14 +27,17 @@ pub(crate) fn schema_bound(schema: &Schema) -> Result<usize, Status> {
         add(size, add(mul(field.size(), 8)?, 2048)?)
     })
 }
-pub(crate) struct OwnedSchema { schema: Schema, _reservation: Arc<MemoryReservation> }
+pub(crate) struct OwnedSchema { schema: Schema, reservation: Arc<MemoryReservation> }
 impl std::ops::Deref for OwnedSchema { type Target = Schema; fn deref(&self) -> &Schema { &self.schema } }
 impl OwnedSchema {
     pub fn build(bound: usize, memory: &Arc<MemoryBudget>, build: impl FnOnce() -> Result<Schema, Status>) -> Result<Self, Status> {
         let reservation = memory.reserve(bound).map_err(status)?;
-        Ok(Self { schema: build()?, _reservation: reservation })
+        Ok(Self { schema: build()?, reservation })
     }
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Self, Status> { Self::build(8192, memory, || Ok(Schema::empty())) }
+    pub(crate) fn into_declared(self) -> rtdb_columnar::DeclaredSchema {
+        rtdb_columnar::DeclaredSchema::with_reservation(self.schema, self.reservation)
+    }
 }
 pub(crate) fn plan_schema(schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<OwnedSchema, Status> {
     let bound = schema.fields().iter().try_fold(8192, |bytes, field| add(bytes, add(mul(add(field.name.len(), field.data_type.retained_bytes().map_err(status)?)?, 64)?, 4096)?))?;
