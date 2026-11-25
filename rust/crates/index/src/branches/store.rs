@@ -56,8 +56,31 @@ pub struct StoreRead {
     /// Resume strictly after this key.
     pub after: Option<Vec<u8>>,
     pub limit: usize,
-    /// Return keys and versions only.
-    pub keys_only: bool,
+    pub projection: Projection,
+}
+
+/// What a read returns of each value. Each equals projecting the whole value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Projection {
+    #[default]
+    Values,
+    Keys,
+    /// The bytes `[start, start + len)` of each value, clipped to its length.
+    Slice { start: u32, len: u32 },
+}
+
+impl Projection {
+    pub fn apply(self, value: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Self::Values => Some(value.to_vec()),
+            Self::Keys => None,
+            Self::Slice { start, len } => {
+                let start = (start as usize).min(value.len());
+                let end = start.saturating_add(len as usize).min(value.len());
+                Some(value[start..end].to_vec())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,7 +129,10 @@ impl BranchView<'_> {
                 break;
             }
             let written = event.written_basis().ok_or_else(invalid_store_value)?;
-            let value = if read.keys_only { None } else { Some(value_of(event)?) };
+            let value = match read.projection {
+                Projection::Keys => None,
+                projection => projection.apply(&value_of(event)?),
+            };
             entries.push(StoreEntry { key: key.clone(), value, written });
         }
         Ok(StorePage { cut: self.cut, entries, resume })
@@ -172,13 +198,17 @@ mod tests {
         put(&mut index, cut(2), b"a2", b"z")?;
 
         let all = KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) };
-        let read = StoreRead { range: all.clone(), after: None, limit: 10, keys_only: false };
+        let read = StoreRead { range: all.clone(), after: None, limit: 10, projection: Projection::Values };
         let early = index.view(MAIN_BRANCH, At::Exactly(cut(1).basis), Layer::Merged, cut(2).system_time)?.store_page(&read)?;
         assert_eq!(early.entries.iter().map(|entry| entry.key.as_slice()).collect::<Vec<_>>(), [b"a1".as_slice()]);
         let late = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, cut(2).system_time)?;
         let page = late.store_page(&StoreRead { limit: 1, ..read })?;
         assert_eq!(page.entries[0].value.as_deref(), Some(b"x".as_slice()));
         assert_eq!(page.resume.as_deref(), Some(b"a1".as_slice()));
+        let sliced = late.store_page(&StoreRead {
+            range: all.clone(), after: None, limit: 10, projection: Projection::Slice { start: 0, len: 0 },
+        })?;
+        assert!(sliced.entries.iter().all(|entry| entry.value.as_deref() == Some(b"".as_slice())));
 
         assert_eq!(late.store_written_since(&all, cut(1).basis)?.as_deref(), Some(b"a2".as_slice()));
         assert_eq!(late.store_written_since(&all, cut(2).basis)?, None);

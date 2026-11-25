@@ -12,7 +12,9 @@ The wire is `rust/proto/rtdb.store.v1.proto`, served as Flight `DoAction` calls 
 `rtdb.store.v1.Read`:: Returns the live entries of each requested range, ascending by key, at one version.
 All ranges of one request read the same version.
 A page stops at its limit and names the key to resume after.
-`keys_only` omits values, so key scans cost no value bytes.
+A projection selects what each entry returns of its value: the whole value, nothing, or one byte slice at a fixed offset.
+Every projection equals reading the whole value and projecting it afterwards.
+With `arrow`, each page is one Arrow IPC stream with columns `key`, `written` and `value`.
 
 `rtdb.store.v1.Append`:: Commits its writes at a new version, unless a write committed after `since` intersects one of its read ranges.
 A refused append names the first such range and writes nothing.
@@ -40,4 +42,5 @@ An entry's id is its key bytes and its `v` cell holds the value.
 `Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.
 
 Scan pushdown, columnar projection and batching are mechanism under this contract.
+The host's contract suite (`fact_store::persistence::contract` in Bijection) runs one case list against this store and against its reference store.
 Each must return what an unpushed read followed by host-side filtering returns.

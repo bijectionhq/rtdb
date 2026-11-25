@@ -5,11 +5,14 @@
 //! after `since` intersects its read ranges; a watch reports the next version
 //! that wrote into its ranges.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+use arrow_array::{ArrayRef, BinaryArray, RecordBatch, UInt64Array};
+use arrow_ipc::writer::StreamWriter;
 
 use bytes::Bytes;
 use prost::Message;
-use rtdb_index::branches::store::{KeyRange, MAX_PAGE_ENTRIES, StoreRead, VALUE_COLUMN, store_table};
+use rtdb_index::branches::store::{KeyRange, MAX_PAGE_ENTRIES, Projection, StoreEntry, StoreRead, VALUE_COLUMN, store_table};
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Row, Transact, Window};
 use rtdb_types::{EntityId, StructFields, Value, rtdb_v1::{At, Basis, MAIN_BRANCH}};
@@ -39,6 +42,22 @@ fn ranges(ranges: Vec<proto::KeyRange>) -> Result<Vec<KeyRange>, Status> {
 
 fn incarnation(bytes: &[u8]) -> Result<[u8; 16], Status> {
     bytes.try_into().map_err(|_| error::incorrect("A store incarnation has 16 bytes"))
+}
+
+/// One page as an Arrow IPC stream: `key` Binary, `written` UInt64 and
+/// nullable `value` Binary.
+fn arrow_page(entries: Vec<StoreEntry>) -> Result<Vec<u8>, Status> {
+    let keys = BinaryArray::from_iter_values(entries.iter().map(|entry| entry.key.as_slice()));
+    let written = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.written.position()));
+    let values = BinaryArray::from_iter(entries.iter().map(|entry| entry.value.as_deref()));
+    let batch = RecordBatch::try_from_iter([
+        ("key", Arc::new(keys) as ArrayRef),
+        ("written", Arc::new(written) as ArrayRef),
+        ("value", Arc::new(values) as ArrayRef),
+    ]).map_err(crate::error::arrow)?;
+    let mut writer = StreamWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(crate::error::arrow)?;
+    writer.write(&batch).map_err(crate::error::arrow)?;
+    writer.into_inner().map_err(crate::error::arrow)
 }
 
 impl Service {
@@ -80,20 +99,32 @@ impl Service {
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let mut at = request.at.map_or(At::Latest, |at| At::Exactly(Basis::new(incarnation, at)));
         let limit = (request.limit as usize).clamp(1, MAX_PAGE_ENTRIES);
+        let projection = match proto::Projection::try_from(request.projection)
+            .map_err(|_| error::incorrect("Invalid store projection"))?
+        {
+            proto::Projection::Values => Projection::Values,
+            proto::Projection::Keys => Projection::Keys,
+            proto::Projection::Slice => Projection::Slice { start: request.slice_start, len: request.slice_len },
+        };
         let mut pages = Vec::with_capacity(request.ranges.len());
         let mut read_at = None;
         for key_range in ranges(request.ranges)? {
             let after = request.after.clone().filter(|after| key_range.contains(after));
-            let read = StoreRead { range: key_range, after, limit, keys_only: request.keys_only };
+            let read = StoreRead { range: key_range, after, limit, projection };
             let page = driver.read_store(read, at, self.0.node.now(), &call.cancellation).await.map_err(error::anomaly)?;
             // Every later range reads the cut the first one selected.
             at = At::Exactly(page.cut.basis);
             read_at = Some(page.cut.basis.position());
-            pages.push(proto::RangePage {
-                entries: page.entries.into_iter().map(|entry| proto::Entry {
-                    key: entry.key, value: entry.value, written: entry.written.position(),
-                }).collect(),
-                resume: page.resume,
+            pages.push(if request.arrow {
+                proto::RangePage { entries: Vec::new(), resume: page.resume, arrow_ipc: arrow_page(page.entries)? }
+            } else {
+                proto::RangePage {
+                    entries: page.entries.into_iter().map(|entry| proto::Entry {
+                        key: entry.key, value: entry.value, written: entry.written.position(),
+                    }).collect(),
+                    resume: page.resume,
+                    arrow_ipc: Default::default(),
+                }
             });
         }
         self.check_attachment(call, &database)?;
