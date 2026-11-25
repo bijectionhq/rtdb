@@ -751,6 +751,9 @@ impl rtdb_expr::ParameterLookup for ExpressionInputs<'_> {
     fn value(&self, position: usize) -> Result<Option<&Value>> { self.parameters.get(position) }
     fn known_value(&self, position: usize) -> Option<&Value> { rtdb_expr::ParameterLookup::known_value(self.parameters, position) }
     fn arrow_cell(&self, position: usize) -> Option<rtdb_columnar::ArrowCell<'_>> { rtdb_expr::ParameterLookup::arrow_cell(self.parameters, position) }
+    fn arrow_backing(&self, position: usize) -> Option<&Arc<MemoryReservation>> {
+        rtdb_expr::ParameterLookup::arrow_backing(self.parameters, position)
+    }
 
     fn correlated_value(&self, depth: usize, position: usize, scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<Value>> {
         self.outer.frames().nth(depth).map_or(Ok(None), |frame| rtdb_expr::RowInput::value(&frame.input, position, scope))

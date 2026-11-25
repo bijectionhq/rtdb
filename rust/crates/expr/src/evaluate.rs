@@ -30,6 +30,8 @@ pub trait ParameterLookup: Sync {
     fn value(&self, index: usize) -> Result<Option<&Value>>;
     fn known_value(&self, index: usize) -> Option<&Value>;
     fn arrow_cell(&self, index: usize) -> Option<ArrowParameterCell<'_>>;
+    /// The full backing charge, when the corresponding Arrow cell carries it in its buffers.
+    fn arrow_backing(&self, _index: usize) -> Option<&Arc<rtdb_types::MemoryReservation>> { None }
     fn correlated_value(&self, _depth: usize, _position: usize, _scope: Option<&crate::EvaluationScope>) -> Result<Option<Value>> {
         Ok(None)
     }
@@ -55,6 +57,10 @@ impl<'a> Parameters<'a> {
     }
     pub fn arrow_cell(self, index: usize) -> Option<ArrowParameterCell<'a>> {
         match self { Self::Values(_) => None, Self::Lookup(lookup) => lookup.arrow_cell(index) }
+    }
+
+    fn arrow_backing(self, index: usize) -> Option<&'a Arc<rtdb_types::MemoryReservation>> {
+        match self { Self::Values(_) => None, Self::Lookup(lookup) => lookup.arrow_backing(index) }
     }
 }
 
@@ -115,13 +121,18 @@ enum ListEvent {
 }
 
 /// A completed list slice retaining all cell evaluation charges until it is dropped.
-pub struct ListBatch { values: rtdb_types::ListValue, scope: crate::EvaluationScope }
+pub struct ListBatch {
+    values: rtdb_types::ListValue,
+    scope: crate::EvaluationScope,
+    backing: Option<Arc<rtdb_types::MemoryReservation>>,
+}
 impl ListBatch {
     pub fn values(&self) -> &rtdb_types::ListValue { &self.values }
+    pub fn backing(&self) -> Option<&Arc<rtdb_types::MemoryReservation>> { self.backing.as_ref() }
 
-    /// Transfers the Arrow column together with the page grant that covers its backing.
+    /// Transfers the Arrow column and page grant. Shared buffers carry their source grant.
     pub fn into_packed_column(self) -> Result<(Arc<arrow_schema::Field>, arrow_array::ArrayRef, Arc<rtdb_types::MemoryReservation>)> {
-        let Self { values, scope } = self;
+        let Self { values, scope, .. } = self;
         let (field, array) = values.packed_column()
             .ok_or_else(|| Anomaly::fault("rtdb.expr/list-state", "A packed list page requires an Arrow column"))?;
         drop(values);
@@ -191,7 +202,7 @@ impl IndexedListBatches {
         let field = Arc::new(arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false));
         let values = rtdb_types::ListValue::from_numeric_arrow(field, Arc::new(array)).expect("i64 series is numeric");
         self.position = end;
-        Ok(Some(ListBatch { values, scope }))
+        Ok(Some(ListBatch { values, scope, backing: None }))
     }
 }
 

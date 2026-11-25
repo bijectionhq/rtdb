@@ -6,7 +6,7 @@ fn typed_numbers<'a>(value: &'a EvalValue<'a>) -> Option<NumericListInput<'a>> {
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
     match reader.as_ref() {
         ListReader::Stored(list) => NumericListInput::stored(list.view()),
-        ListReader::Arrow(cell) => cell.numeric_list_span().map(NumericListInput::Opened),
+        ListReader::Arrow { cell, .. } => cell.numeric_list_span().map(NumericListInput::Opened),
         _ => None,
     }
 }

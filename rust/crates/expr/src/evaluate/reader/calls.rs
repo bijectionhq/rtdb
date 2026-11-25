@@ -269,7 +269,7 @@ async fn id_eq_any<'a>(id_expr: &'a Expr, array_expr: &'a Expr, frame: &'a Evalu
         evaluated_array = Some(array);
         if let Some(EvalValue::List(_, reader)) = &evaluated_array {
             match reader.as_ref() {
-                ListReader::Arrow(cell) => arrow_array = cell.sequence_range(),
+                ListReader::Arrow { cell, .. } => arrow_array = cell.sequence_range(),
                 ListReader::Stored(values) => stored_array = Some(values.view()),
                 _ => (),
             }
@@ -290,7 +290,7 @@ async fn id_eq_any<'a>(id_expr: &'a Expr, array_expr: &'a Expr, frame: &'a Evalu
             if left == IdCell::Null || right == IdCell::Null { None } else { Some(left == right) }
         } else {
             let value = if let Some(child) = child {
-                box_cell(from_arrow(child, frame)?)?
+                box_cell(from_arrow(child, None, frame)?)?
             } else if let Some(value) = &stored {
                 box_cell(from_value(super::super::retained_clone(value.as_ref(), frame.context)?, frame)?)?
             } else {
@@ -348,7 +348,7 @@ impl<'a> CosineOperand<'a> {
             ListReader::Expressions(_) | ListReader::Cast { .. } | ListReader::Trim { .. }
             | ListReader::IntegerSeries(_) => Some(Self::Deferred(value)),
             ListReader::Stored(list) if list.array().is_some() => Some(Self::Borrowed(VectorInput::Stored(list.view()))),
-            ListReader::Arrow(cell) => VectorInput::from_numeric_arrow(*cell).map(Self::Borrowed),
+            ListReader::Arrow { cell, .. } => VectorInput::from_numeric_arrow(*cell).map(Self::Borrowed),
             _ => None,
         }
     }
@@ -414,7 +414,7 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
             let allows_packed = |input: &EvalValue<'_>, other: &EvalValue<'_>| {
                 !matches!((input, other), (EvalValue::List(_, input), EvalValue::List(_, other))
                     if matches!(input.as_ref(), ListReader::Prepared(_))
-                        && matches!(other.as_ref(), ListReader::Arrow(cell) if !packed_numeric_cell(*cell)))
+                        && matches!(other.as_ref(), ListReader::Arrow { cell, .. } if !packed_numeric_cell(*cell)))
             };
             if allows_packed(left, right) && allows_packed(right, left)
                 && let (Some(left), Some(right)) = (borrowed_vector(left), borrowed_vector(right))

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, UnionArray,
+    Array, ArrayRef, ArrowPrimitiveType, Float32Array, Float64Array, PrimitiveArray, UnionArray,
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type},
 };
@@ -11,31 +11,67 @@ use rtdb_types::{ListValue, ListView, LogicalType, Result, ScalarType};
 
 use crate::numeric::overflow;
 
-/// Casts the packed components of a list to a floating-point element type in one pass over its Arrow child.
-/// Each component takes the scalar cast's route, through binary64 and then to the target width, so the bits agree.
-/// Returns `None` where the components or the target need the element-at-a-time cast,
-/// and for a list without a present component, whose storage the element-at-a-time builder decides.
 pub(crate) fn cast(
     field: &Field, values: &dyn Array, target: &CastTarget, reserve: impl FnOnce(usize) -> Result<()>,
 ) -> Result<Option<ListValue>> {
+    cast_with_backing(field, values, target, None, reserve).map(|output| output.map(|(list, _)| list))
+}
+
+pub(crate) fn cast_with_backing(
+    field: &Field, values: &dyn Array, target: &CastTarget, backing: Option<usize>,
+    reserve: impl FnOnce(usize) -> Result<()>,
+) -> Result<Option<(ListValue, bool)>> {
+    Ok(cast_child(field, values, target, backing, reserve)?.map(|(child, shared)| {
+        let list = match child {
+            FloatChild::F32(values) => ListValue::from_f32(values),
+            FloatChild::F64(values) => ListValue::from_f64(values),
+        };
+        (list, shared)
+    }))
+}
+
+enum FloatChild { F32(Float32Array), F64(Float64Array) }
+
+fn cast_child(
+    field: &Field, values: &dyn Array, target: &CastTarget, backing: Option<usize>,
+    reserve: impl FnOnce(usize) -> Result<()>,
+) -> Result<Option<(FloatChild, bool)>> {
     let Some((target, validate)) = float_target(target) else { return Ok(None); };
     let Some(source) = source_scalar(field, values) else { return Ok(None); };
     if source.is_empty() { return Ok(None); }
     if let Some(validate) = validate {
         for source in source { validate.validate_source(&LogicalType::Scalar(source))?; }
     }
-    let width = if target == ScalarType::F32 { 4 } else { 8 };
-    reserve(values.len().checked_mul(width).and_then(|bytes| bytes.checked_add(values.len().div_ceil(8) + 256)).ok_or_else(overflow)?)?;
-    Ok(Some(match target {
-        ScalarType::F32 => ListValue::from_f32(convert::<Float32Type>(values, |number| number as f32)),
-        _ => ListValue::from_f64(convert::<Float64Type>(values, |number| number)),
-    }))
+    let (data_type, width) = if target == ScalarType::F32 { (DataType::Float32, 4) } else { (DataType::Float64, 8) };
+    let payload = values.len().checked_mul(width).ok_or_else(overflow)?;
+    let validity = values.len().div_ceil(8);
+    let visible = if values.null_count() == 0 { payload } else { payload.checked_add(validity).ok_or_else(overflow)? };
+    let shared = values.data_type() == &data_type && backing.is_some_and(|bytes| {
+        bytes.max(values.get_buffer_memory_size()) <= visible.saturating_mul(2).saturating_add(4096)
+    });
+    let child = if shared {
+        reserve(256)?;
+        match target {
+            ScalarType::F32 => FloatChild::F32(primitive_view::<Float32Type>(values)),
+            _ => FloatChild::F64(primitive_view::<Float64Type>(values)),
+        }
+    } else {
+        reserve(payload.checked_add(validity + 256).ok_or_else(overflow)?)?;
+        match target {
+            ScalarType::F32 => FloatChild::F32(convert::<Float32Type>(values, |number| number as f32)),
+            _ => FloatChild::F64(convert::<Float64Type>(values, |number| number)),
+        }
+    };
+    Ok(Some((child, shared)))
 }
 
-/// Casts a bound Arrow list through the same floating-point component kernel used by expressions.
+/// Returns the converted child and its observed element type for a one-row Arrow list binding.
+/// When `backing` is supplied, the source buffers must already carry that complete backing charge.
+/// The returned flag identifies a child that shares source buffers.
 pub fn cast_bound_float_list(
     cell: rtdb_columnar::ArrowCell<'_>, target: &LogicalType, allocation: &crate::EvaluationScope,
-) -> Result<Option<rtdb_types::Value>> {
+    backing: Option<&Arc<rtdb_columnar::MemoryReservation>>,
+) -> Result<Option<(LogicalType, ArrayRef, bool)>> {
     use rtdb_types::ListKind;
 
     let target = match target { LogicalType::Maybe(target) => target.as_ref(), target => target };
@@ -45,8 +81,17 @@ pub fn cast_bound_float_list(
     }
     let Some((field, values, range)) = cell.sequence_range() else { return Ok(None); };
     let values = values.slice(range.start, range.len());
-    cast(field, values.as_ref(), &CastTarget::fixed(element.as_ref().clone()), |bytes| allocation.reserve(bytes))
-        .map(|value| value.map(rtdb_types::Value::List))
+    let target = CastTarget::fixed(element.as_ref().clone());
+    let backing = backing.map(|lease| lease.bytes());
+    Ok(cast_child(field, values.as_ref(), &target, backing, |bytes| allocation.reserve(bytes))?.map(|(child, shared)| {
+        let (scalar, values): (_, ArrayRef) = match child {
+            FloatChild::F32(values) => (ScalarType::F32, Arc::new(values)),
+            FloatChild::F64(values) => (ScalarType::F64, Arc::new(values)),
+        };
+        let element = LogicalType::Scalar(scalar);
+        let element = if values.null_count() == 0 { element } else { element.maybe() };
+        (element, values, shared)
+    }))
 }
 
 pub(crate) fn packed(list: &ListValue) -> Option<(Arc<Field>, ArrayRef)> {
@@ -101,6 +146,12 @@ fn source_scalar(field: &Field, values: &dyn Array) -> Option<Vec<ScalarType>> {
             Some(if values.null_count() == values.len() { Vec::new() } else { vec![scalar] })
         }
     }
+}
+
+fn primitive_view<T: ArrowPrimitiveType>(values: &dyn Array) -> PrimitiveArray<T> {
+    let values = values.as_primitive::<T>();
+    let nulls = (values.null_count() != 0).then(|| values.nulls().expect("nullable primitive").clone());
+    PrimitiveArray::new(values.values().clone(), nulls)
 }
 
 /// Maps each component through binary64, as `crate::numeric::number` reads it.

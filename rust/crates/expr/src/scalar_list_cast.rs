@@ -1,8 +1,8 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, PrimitiveArray, StringArray,
-    builder::StringBuilder,
+    Array, ArrayRef, ArrowPrimitiveType, StringArray,
+    builder::{PrimitiveBuilder, StringBuilder},
     types::{
         Date32Type, Date64Type, DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
         DurationSecondType, Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
@@ -81,19 +81,17 @@ pub(crate) fn cast_list(
     if !is_temporal(&ty) || !cells.all(|cell| supports_temporal(cell, &ty, temporal, current_time)) {
         return Ok(None);
     }
-    let logical = LogicalType::Scalar(ty.clone());
-    if rtdb_columnar::to_field("value", &logical).is_err() {
+    let Ok(field) = rtdb_columnar::to_field("value", &LogicalType::Scalar(ty.clone())) else {
         return Ok(None);
-    }
-    reserve(count.checked_mul(32).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)?)?;
-    let mut raw = Vec::with_capacity(count);
-    for i in 0..count {
-        let source = cells.get(i);
+    };
+    let width = field.data_type().primitive_width().expect("temporal primitive");
+    reserve(count.checked_mul(width)
+        .and_then(|bytes| bytes.checked_add(count.div_ceil(8)))
+        .and_then(|bytes| bytes.checked_add(field.size()))
+        .and_then(|bytes| bytes.checked_add(4096))
+        .ok_or_else(overflow)?)?;
+    let array = temporal_array(&field, &cells, |source| {
         let (source_type, value) = match source {
-            Cell::Null => {
-                raw.push(None);
-                continue;
-            }
             Cell::Text(text) => {
                 reserve(text.len().checked_mul(64).ok_or_else(overflow)?)?;
                 (ScalarType::Utf8, TemporalValue::Text(text))
@@ -105,23 +103,12 @@ pub(crate) fn cast_list(
         let source = LogicalType::Scalar(source_type.clone());
         target.validate_source(&source)?;
         let temporal = temporal_options(target, &source)?;
-        let Some(value) = cast_temporal(value, &source_type, &ty, temporal.as_deref(), timezone, current_time)? else {
-            return Ok(None);
-        };
-        if matches!(ty, ScalarType::Time { bit_width: 32, .. }) && i32::try_from(value).is_err() {
-            return Ok(None);
-        }
-        raw.push(Some(value));
-    }
-    if raw.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    let array = temporal_array(&ty, raw)?;
+        cast_temporal(value, &source_type, &ty, temporal.as_deref(), timezone, current_time)
+    })?;
     let Some(array) = array else {
         return Ok(None);
     };
-    let field =
-        rtdb_columnar::to_field("value", &if array.null_count() == 0 { logical } else { logical.maybe() })?;
+    let field = field.with_nullable(array.null_count() != 0);
     Ok(ListValue::from_scalar_arrow(Arc::new(field), array))
 }
 
@@ -452,49 +439,95 @@ fn cast_temporal(
     Ok(Some(raw))
 }
 
-fn temporal_array(target: &ScalarType, raw: Vec<Option<i64>>) -> Result<Option<ArrayRef>> {
-    use ScalarType as S;
-    use TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+fn temporal_array<'a>(
+    field: &arrow_schema::Field, cells: &'a Cells<'_>, cast: impl FnMut(Cell<'a>) -> Result<Option<i64>>,
+) -> Result<Option<ArrayRef>> {
+    use arrow_schema::{DataType as D, TimeUnit::{Microsecond, Millisecond, Nanosecond, Second}};
     macro_rules! primitive {
         ($ty:ty) => {
-            Arc::new(raw.into_iter().collect::<PrimitiveArray<$ty>>())
+            build_temporal::<$ty>(field.data_type(), cells, cast)
         };
     }
-    macro_rules! narrow {
-        ($ty:ty) => {{
-            let Some(raw) = raw
-                .into_iter()
-                .map(|value| match value {
-                    Some(value) => i32::try_from(value).ok().map(Some),
-                    None => Some(None),
-                })
-                .collect::<Option<PrimitiveArray<$ty>>>()
-            else {
-                return Ok(None);
-            };
-            Arc::new(raw)
-        }};
+    match field.data_type() {
+        D::Date32 => primitive!(Date32Type),
+        D::Date64 => primitive!(Date64Type),
+        D::Time32(Second) => primitive!(Time32SecondType),
+        D::Time32(Millisecond) => primitive!(Time32MillisecondType),
+        D::Time64(Microsecond) => primitive!(Time64MicrosecondType),
+        D::Time64(Nanosecond) => primitive!(Time64NanosecondType),
+        D::Timestamp(Second, _) => primitive!(TimestampSecondType),
+        D::Timestamp(Millisecond, _) => primitive!(TimestampMillisecondType),
+        D::Timestamp(Microsecond, _) => primitive!(TimestampMicrosecondType),
+        D::Timestamp(Nanosecond, _) => primitive!(TimestampNanosecondType),
+        D::Duration(Second) => primitive!(DurationSecondType),
+        D::Duration(Millisecond) => primitive!(DurationMillisecondType),
+        D::Duration(Microsecond) => primitive!(DurationMicrosecondType),
+        D::Duration(Nanosecond) => primitive!(DurationNanosecondType),
+        _ => Ok(None),
     }
-    macro_rules! timestamp {
-        ($ty:ty, $zone:expr) => {
-            Arc::new(raw.into_iter().collect::<PrimitiveArray<$ty>>().with_timezone_opt($zone.as_deref()))
+}
+
+fn build_temporal<'a, T: ArrowPrimitiveType>(
+    data_type: &arrow_schema::DataType, cells: &'a Cells<'_>, mut cast: impl FnMut(Cell<'a>) -> Result<Option<i64>>,
+) -> Result<Option<ArrayRef>>
+where
+    T::Native: TryFrom<i64>,
+{
+    let mut builder = PrimitiveBuilder::<T>::with_capacity(cells.len()).with_data_type(data_type.clone());
+    let mut present = false;
+    let mut narrow_overflow = false;
+    for row in 0..cells.len() {
+        let cell = cells.get(row);
+        if matches!(cell, Cell::Null) {
+            builder.append_null();
+            continue;
+        }
+        let Some(value) = cast(cell)? else { return Ok(None); };
+        match T::Native::try_from(value) {
+            Ok(value) => {
+                builder.append_value(value);
+                present = true;
+            }
+            Err(_) if matches!(data_type, arrow_schema::DataType::Time32(_)) => return Ok(None),
+            // A later conversion error takes precedence over Date32 storage overflow.
+            Err(_) => narrow_overflow = true,
+        }
+    }
+    Ok((present && !narrow_overflow).then(|| Arc::new(builder.finish()) as ArrayRef))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, TimeUnit as ArrowUnit};
+    use rtdb_types::Anomaly;
+
+    #[test]
+    fn temporal_narrowing_preserves_the_time32_and_date32_error_order() {
+        let inputs = [Value::I64(i64::MAX), Value::I64(0)];
+        let cells = Cells::Values(&inputs);
+        let convert = |cell| {
+            match cell {
+                Cell::Number(NumericCell::I64(i64::MAX)) => Ok(Some(i64::MAX)),
+                _ => Err(Anomaly::incorrect("example/bad-component", "Invalid temporal component")),
+            }
         };
+        let result = build_temporal::<Time32SecondType>(&DataType::Time32(ArrowUnit::Second), &cells, convert).unwrap();
+        assert!(result.is_none());
+        let error = build_temporal::<Date32Type>(&DataType::Date32, &cells, convert).unwrap_err();
+        assert_eq!(error.code, "example/bad-component");
     }
-    Ok(Some(match target {
-        S::DateDay => narrow!(Date32Type),
-        S::DateMilli => primitive!(Date64Type),
-        S::Time { unit: Second, bit_width: 32 } => narrow!(Time32SecondType),
-        S::Time { unit: Millisecond, bit_width: 32 } => narrow!(Time32MillisecondType),
-        S::Time { unit: Microsecond, bit_width: 64 } => primitive!(Time64MicrosecondType),
-        S::Time { unit: Nanosecond, bit_width: 64 } => primitive!(Time64NanosecondType),
-        S::Timestamp { unit: Second, timezone } => timestamp!(TimestampSecondType, timezone),
-        S::Timestamp { unit: Millisecond, timezone } => timestamp!(TimestampMillisecondType, timezone),
-        S::Timestamp { unit: Microsecond, timezone } => timestamp!(TimestampMicrosecondType, timezone),
-        S::Timestamp { unit: Nanosecond, timezone } => timestamp!(TimestampNanosecondType, timezone),
-        S::Duration(Second) => primitive!(DurationSecondType),
-        S::Duration(Millisecond) => primitive!(DurationMillisecondType),
-        S::Duration(Microsecond) => primitive!(DurationMicrosecondType),
-        S::Duration(Nanosecond) => primitive!(DurationNanosecondType),
-        _ => return Ok(None),
-    }))
+
+    #[test]
+    fn temporal_child_has_the_target_zone_and_observed_validity() {
+        let inputs = [Value::I64(i64::MIN), Value::Null, Value::I64(0)];
+        let field = Field::new("value", DataType::Timestamp(ArrowUnit::Microsecond, Some("America/New_York".into())), false);
+        let result = temporal_array(&field, &Cells::Values(&inputs), |cell| {
+            let Cell::Number(NumericCell::I64(value)) = cell else { panic!("present integer"); };
+            Ok(Some(value))
+        }).unwrap().unwrap();
+        let values = result.as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+        assert_eq!(values.data_type(), field.data_type());
+        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(i64::MIN), None, Some(0)]);
+    }
 }

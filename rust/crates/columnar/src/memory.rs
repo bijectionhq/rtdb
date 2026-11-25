@@ -60,6 +60,7 @@ pub struct OwnedBatch {
     batch: RecordBatch,
     reservation: Arc<MemoryReservation>,
     schema_reservation: Option<Arc<MemoryReservation>>,
+    covers_buffer_backing: bool,
 }
 
 impl OwnedBatch {
@@ -67,7 +68,10 @@ impl OwnedBatch {
     /// Callers allocating large batches should reserve before allocation and use `with_reservation`.
     pub fn new(batch: RecordBatch, budget: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = budget.reserve(batch.get_array_memory_size())?;
-        Self::with_reservation(batch, reservation)
+        let mut owned = Self::with_reservation(batch, reservation)?;
+        // A foreign or previously wrapped array can report only its visible buffer size.
+        owned.covers_buffer_backing = false;
+        Ok(owned)
     }
 
     /// The reservation must cover all buffers retained by this batch.
@@ -76,7 +80,7 @@ impl OwnedBatch {
             return Err(Anomaly::incorrect("rtdb/undersized-reservation", "Batch allocation exceeds its reservation"));
         }
         let batch = attach_batch(batch, |buffer| retain_buffer(buffer, &reservation))?;
-        Ok(Self { batch, reservation, schema_reservation: None })
+        Ok(Self { batch, reservation, schema_reservation: None, covers_buffer_backing: true })
     }
 
     /// Adopts a batch under its decode grant, leaving already funded backing with its existing owners.
@@ -97,7 +101,7 @@ impl OwnedBatch {
             if is_funded(BufferIdentity::of(buffer)) { buffer.clone() }
             else { retain_buffer(buffer, &reservation) }
         })?;
-        Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation) })
+        Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation), covers_buffer_backing: false })
     }
 
     /// Adopts a decoded page, charging its slot and descriptors separately from each new backing allocation.
@@ -125,18 +129,18 @@ impl OwnedBatch {
             };
             retain_buffer_with_owner(buffer, owner)
         })?;
-        Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation) })
+        Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation), covers_buffer_backing: false })
     }
 
     /// Carries the owners through a layout change with already funded backing buffers.
     pub fn with_retained_buffers(&self, batch: RecordBatch) -> Self {
-        Self { batch, reservation: Arc::clone(&self.reservation), schema_reservation: self.schema_reservation.clone() }
+        Self { batch, reservation: Arc::clone(&self.reservation), schema_reservation: self.schema_reservation.clone(), covers_buffer_backing: false }
     }
 
     /// The reservation covers the batch's descriptors, including arrays without backing buffers.
     /// Each column with backing buffers already carries its allocation owners.
     pub fn with_funded_columns(batch: RecordBatch, reservation: Arc<MemoryReservation>) -> Self {
-        Self { batch, reservation, schema_reservation: None }
+        Self { batch, reservation, schema_reservation: None, covers_buffer_backing: false }
     }
 
     /// The reservation covers the allocation of this batch's immutable schema.
@@ -149,6 +153,12 @@ impl OwnedBatch {
     pub fn batch(&self) -> &RecordBatch { &self.batch }
     /// The batch's own charge. Shared buffers and the schema can carry separate charges.
     pub fn reservation(&self) -> &Arc<MemoryReservation> { &self.reservation }
+
+    /// Bounds backing held by a cloned Arrow buffer, including bytes hidden by wrapped slices.
+    pub fn buffer_backing(&self) -> Option<&Arc<MemoryReservation>> {
+        (self.covers_buffer_backing && self.reservation.backing().is_empty()).then_some(&self.reservation)
+    }
+
     pub fn owns_schema(&self) -> bool { self.schema_reservation.is_some() }
 
     pub fn with_appended_column(&self, field: arrow_schema::Field, column: arrow_array::ArrayRef,
@@ -218,7 +228,7 @@ impl OwnedBatch {
 
     pub fn slice(&self, offset: usize, length: usize) -> Result<Self> {
         check_slice(offset, length, self.batch.num_rows())?;
-        Ok(self.with_retained_buffers(self.batch.slice(offset, length)))
+        Ok(Self { batch: self.batch.slice(offset, length), ..self.clone() })
     }
 
     pub fn select(&self, selection: &Selection) -> Result<Self> {

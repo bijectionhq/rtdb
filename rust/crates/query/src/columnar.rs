@@ -1139,8 +1139,11 @@ impl ColumnBatch {
 
     pub(crate) fn from_packed_list(
         array: ArrayRef, field: Arc<ArrowField>, mut reservation: Arc<MemoryReservation>,
+        backing: Option<Arc<MemoryReservation>>,
     ) -> Result<Self> {
-        let base = array.get_array_memory_size().checked_add(size_of::<Column>() + 256).ok_or_else(size_error)?;
+        let shared_bytes = if backing.is_some() { array.get_buffer_memory_size() } else { 0 };
+        let base = array.get_array_memory_size().checked_sub(shared_bytes)
+            .and_then(|bytes| bytes.checked_add(size_of::<Column>() + 256)).ok_or_else(size_error)?;
         let occupied = |field: &ArrowField| base.checked_add(field.size()).ok_or_else(size_error);
         let lease = Arc::get_mut(&mut reservation).expect("A packed list page owns its reservation");
         let field = if field.name() == "value" {
@@ -1153,6 +1156,10 @@ impl ColumnBatch {
         };
         let retained = occupied(&field)?;
         if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
+        let reservation = match backing {
+            Some(backing) => reservation.budget().reserve_with_backing(0, [Arc::clone(&reservation), backing].into_iter())?,
+            None => reservation,
+        };
         let len = array.len();
         Ok(Self::sharing(vec![Column::Arrow { array, field, logical: None }], len, reservation))
     }

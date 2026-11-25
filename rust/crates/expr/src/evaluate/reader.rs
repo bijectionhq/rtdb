@@ -1,8 +1,8 @@
 use rtdb_types::StructFields;
 use std::{future::Future, pin::Pin, sync::Arc, task::{Context, Poll, Waker}};
-use rtdb_columnar::ArrowCell;
+use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
-use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
+use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, Value};
 use super::invocation::{PreparedList, Replacements};
 use super::{EvalContext, ExpressionRow, boolean, integer, nullish, overflow};
 
@@ -29,7 +29,7 @@ enum ListReader<'a> {
     Values(Vec<Value>),
     Stored(rtdb_types::ListValue),
     Prepared(&'a PreparedList),
-    Arrow(ArrowCell<'a>),
+    Arrow { cell: ArrowCell<'a>, backing: Option<&'a Arc<MemoryReservation>> },
     Cast { input: EvalValue<'a>, element: Target<'a>, union_admitted: bool },
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
@@ -46,6 +46,15 @@ impl ListReader<'_> {
     }
 }
 
+struct PackedList {
+    values: ListValue,
+    backing: Option<Arc<MemoryReservation>>,
+}
+
+impl From<ListValue> for PackedList {
+    fn from(values: ListValue) -> Self { Self { values, backing: None } }
+}
+
 struct EvaluationFrame<'a> { schema: &'a Schema, row: ExpressionRow<'a>, context: &'a EvalContext<'a>, asynchronous: bool, replacements: Option<&'a super::invocation::Replacements<'a>> }
 
 impl<'a> EvaluationFrame<'a> {
@@ -58,6 +67,12 @@ impl<'a> EvaluationFrame<'a> {
                 .filter(|cell| matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_)))),
             _ => None,
         }
+    }
+
+    fn arrow_backing(&self, mut expr: &Expr) -> Option<&'a Arc<MemoryReservation>> {
+        while let Expr::Field { expr: parent, .. } = expr { expr = parent; }
+        let Expr::Parameter { index, .. } = expr else { return None; };
+        self.context.parameters.arrow_backing(*index)
     }
 
     fn prepared_list(&self, expr: &Expr) -> Option<&'a PreparedList> {
@@ -180,7 +195,7 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
                     }
                     items.element_type()
                 }
-                ListReader::Arrow(cell) => {
+                ListReader::Arrow { cell, .. } => {
                     frame.context.reserve(cell.observed_type_bytes()?)?;
                     if let Some(element) = cell.sequence_range().and_then(|(field, array, range)| rtdb_types::ListValue::observed_numeric_type(field, array, range)) {
                         rtdb_columnar::execution_type(&element)
@@ -290,7 +305,7 @@ pub(super) async fn execute_with_arrow_list<T>(
     let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
     let value = evaluate(expr, &frame)?.await?;
     if let EvalValue::List(Kind::List | Kind::Fixed, reader) = &value
-        && let ListReader::Arrow(cell) = reader.as_ref()
+        && let ListReader::Arrow { cell, .. } = reader.as_ref()
         && let Some(output) = retain(*cell)?
     {
         return Ok(ControlFlow::Break(output));
@@ -323,12 +338,12 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 let scope = crate::EvaluationScope::new(allocation.memory_budget())?;
                 scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
                 let page_context = context.with_allocation(&scope);
-                if let Some(values) = packed_slice(&value, position, count, true, &page_context)? {
+                if let Some(PackedList { values, backing }) = packed_slice(&value, position, count, true, &page_context)? {
                     if let Some((field, array)) = values.packed_column() {
                         rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
                     }
                     position += count;
-                    yield super::ListEvent::Batch(super::ListBatch { values, scope });
+                    yield super::ListEvent::Batch(super::ListBatch { values, scope, backing });
                     continue;
                 }
                 let mut values = rtdb_types::ListBuilder::with_capacity(count);
@@ -340,7 +355,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                     }
                 }
                 position += count;
-                yield super::ListEvent::Batch(super::ListBatch { values: values.finish(), scope });
+                yield super::ListEvent::Batch(super::ListBatch { values: values.finish(), scope, backing: None });
             }
         }
     })
@@ -399,7 +414,9 @@ fn from_value<'a>(value: Value,frame: &EvaluationFrame<'_>) -> Result<EvalValue<
         value => Ok(EvalValue::Scalar(value)),
     }
 }
-fn from_arrow<'a>(cell: ArrowCell<'a>, frame: &EvaluationFrame<'_>) -> Result<EvalValue<'a>> {
+fn from_arrow<'a>(
+    cell: ArrowCell<'a>, backing: Option<&'a Arc<MemoryReservation>>, frame: &EvaluationFrame<'_>,
+) -> Result<EvalValue<'a>> {
     let cell = cell.physical()?;
     if cell.is_undefined()? { return Ok(scalar(Value::Undefined)); }
     if cell.is_null()? { return Ok(scalar(Value::Null)); }
@@ -411,7 +428,7 @@ fn from_arrow<'a>(cell: ArrowCell<'a>, frame: &EvaluationFrame<'_>) -> Result<Ev
             _ => None,
         };
         if let Some(kind) = kind {
-            return make_list(kind, ListReader::Arrow(cell), frame);
+            return make_list(kind, ListReader::Arrow { cell, backing }, frame);
         }
     }
     frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
@@ -434,7 +451,7 @@ fn len(value: &EvalValue<'_>) -> Result<usize> {
         ListReader::Expressions(items) => Ok(items.len()), ListReader::Values(items) => Ok(items.len()),
         ListReader::Stored(items) => Ok(items.len()),
         ListReader::Prepared(list) => Ok(list.values.len()),
-        ListReader::Arrow(cell) => Ok(cell.sequence().ok_or_else(|| invalid("list length"))?.len()),
+        ListReader::Arrow { cell, .. } => Ok(cell.sequence().ok_or_else(|| invalid("list length"))?.len()),
         ListReader::Cast { input, .. } => len(input),
         ListReader::Trim { size,.. } => crate::collection::view_size(*size),
         ListReader::IntegerSeries(series) => Ok(series.len()),
@@ -451,11 +468,11 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
                 let value = list.stored().expect("stored list").get(index).ok_or_else(|| invalid("nth"))?;
                 from_value(super::retained_clone(value.as_ref(), frame.context)?, frame)?
             },
-            ListReader::Arrow(cell) => {
+            ListReader::Arrow { cell, backing } => {
                 let (field, array, range) = cell.sequence_range().ok_or_else(|| invalid("nth"))?;
                 if index >= range.len() { return Err(invalid("nth")); }
                 let item = ArrowCell { field, array, row: range.start + index };
-                from_arrow(item, frame)?
+                from_arrow(item, *backing, frame)?
             }
             ListReader::Cast { input,element,union_admitted } => {
                 let value = nth(clone_value(input,frame)?,index,frame)?.await?;
@@ -479,7 +496,7 @@ fn borrowed_vector<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::Vector
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
     match reader.as_ref() {
         ListReader::Stored(_) | ListReader::Prepared(_) => Some(VectorInput::Stored(reader.stored()?.view())),
-        ListReader::Arrow(cell) => VectorInput::from_arrow(*cell),
+        ListReader::Arrow { cell, .. } => VectorInput::from_arrow(*cell),
         ListReader::Trim { input, size } => {
             let size = crate::collection::view_size(*size).ok()?;
             let vector = borrowed_vector(input)?;
@@ -490,7 +507,7 @@ fn borrowed_vector<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::Vector
     }
 }
 
-fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: bool, context: &EvalContext<'_>) -> Result<Option<rtdb_types::ListValue>> {
+fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: bool, context: &EvalContext<'_>) -> Result<Option<PackedList>> {
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return Ok(None); };
     let end = offset.checked_add(count).ok_or_else(overflow)?;
     match reader.as_ref() {
@@ -507,14 +524,14 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
                             .and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
                     })?;
                     context.reserve(bound)
-                });
+                }).map(|list| list.map(PackedList::from));
             }
             let Some(slice) = items.slice_packed(offset, count) else { return Ok(None); };
             // A yielded page can outlive the source reader, even when its Arrow slice retains the whole parent buffer.
             context.reserve(slice.retained_payload_bytes()?)?;
-            Ok(Some(slice))
+            Ok(Some(slice.into()))
         }
-        ListReader::Arrow(cell) => {
+        ListReader::Arrow { cell, .. } => {
             let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
             if end > range.len() { return Ok(None); }
             let rows = (range.start + offset)..(range.start + end);
@@ -530,15 +547,15 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
             if !rtdb_types::ListValue::supports_numeric_arrow(field) {
                 if let Some(span) = cell.numeric_list_span_range(offset..end) {
                     reserve()?;
-                    return Ok(rtdb_columnar::repack_numeric_list(&span, true));
+                    return Ok(rtdb_columnar::repack_numeric_list(&span, true).map(PackedList::from));
                 }
-                return rtdb_columnar::repack_scalar_list(field, array, rows.clone(), true, reserve);
+                return rtdb_columnar::repack_scalar_list(field, array, rows.clone(), true, reserve).map(|list| list.map(PackedList::from));
             }
             reserve()?;
             let selection = rows.map(|row| (0, row)).collect::<Vec<_>>();
             let array = rtdb_columnar::copy_selected_cells(&[array], &selection)?;
             let values = rtdb_types::ListValue::from_numeric_arrow(Arc::new(field.clone()), array);
-            Ok(values)
+            Ok(values.map(PackedList::from))
         }
         ListReader::Cast { input, element, .. } => packed::cast(input, *element, offset..end, projection, context),
         ListReader::Trim { input, size } if end <= crate::collection::view_size(*size)? => {
@@ -601,7 +618,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                     });
                 }
                 if let EvalValue::List(_, reader) = &value
-                    && let ListReader::Arrow(cell) = reader.as_ref()
+                    && let ListReader::Arrow { cell, .. } = reader.as_ref()
                     && !matches!(kind, Kind::Set)
                 {
                     if cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field)) {
@@ -624,14 +641,14 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 }
                 if let EvalValue::List(Kind::List, reader) = &value
                     && let ListReader::Cast { input, element, .. } = reader.as_ref()
-                    && let Some(values) = packed::cast(input, *element, 0..len(input)?, false, frame.context)?
+                    && let Some(PackedList { values, .. }) = packed::cast(input, *element, 0..len(input)?, false, frame.context)?
                 {
                     return Ok(Value::List(values));
                 }
                 let size = len(&value)?;
                 if let EvalValue::List(Kind::List, reader) = &value
                     && matches!(reader.as_ref(), ListReader::Trim { .. })
-                    && let Some(values) = packed_slice(&value, 0, size, false, frame.context)?
+                    && let Some(PackedList { values, .. }) = packed_slice(&value, 0, size, false, frame.context)?
                 {
                     return Ok(Value::List(values));
                 }
@@ -700,7 +717,7 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
             let packed = match &value {
                 EvalValue::List(_, reader) => match reader.as_ref() {
                     ListReader::Stored(list) => list.array().is_some(),
-                    ListReader::Arrow(cell) => cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field)),
+                    ListReader::Arrow { cell, .. } => cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field)),
                     _ => false,
                 },
                 _ => false,
@@ -728,7 +745,7 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
 fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
     boxed(async move {
         if let Some(cell) = frame.arrow_input(expr) {
-            let value = from_arrow(cell, frame)?;
+            let value = from_arrow(cell, frame.arrow_backing(expr), frame)?;
             return if matches!(expr, Expr::Field { .. }) { box_cell(value) } else { Ok(value) };
         }
         if !required(expr) { return evaluate_scalar(expr, frame).await; }

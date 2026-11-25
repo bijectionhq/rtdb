@@ -166,6 +166,10 @@ impl rtdb_expr::ParameterLookup for BoundParameters {
             row,
         })
     }
+
+    fn arrow_backing(&self, index: usize) -> Option<&Arc<MemoryReservation>> {
+        self.arrow_input(index)?.0.buffer_backing()
+    }
 }
 
 impl BoundParameters {
