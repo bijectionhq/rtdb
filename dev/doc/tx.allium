@@ -153,6 +153,9 @@
 -- A single equijoin fails when more than one build row matches a probe row.
 -- A columnar cross join retains its Arrow inputs and maps output positions in left-major order within each batch pair.
 -- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
+-- Apply and correlated Mark share one admitted parameter type layout across reached rows of an execution with the same input and parent schemas.
+-- The first reached row admits each argument type in evaluation order.
+-- Each outer row frame retains its source position, the emitted schema owner, and its parent frame in nesting order.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
 -- Joined Apply retains dependent pages in order and uses the same outer position across each page.
 -- Apply documents retain compatible dependent fields and arrays in field-name order.

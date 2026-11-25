@@ -51,6 +51,32 @@ async fn correlated_mark_adds_a_nullable_boolean_to_the_original_arrow_input() {
 }
 
 #[tokio::test]
+async fn correlated_mark_admits_argument_layout_only_when_an_outer_row_is_reached() {
+    let execution = execution(2);
+    let relation = |rows: &[i64]| {
+        let input = table(0, rows);
+        let output = field(2, LogicalType::Scalar(ScalarType::Bool).maybe());
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        Arc::new(Relation::new(schema, RelationNode::Mark {
+            input,
+            dependent: table(1, &[1]),
+            arguments: vec![(usize::MAX, column(0))],
+            condition: None,
+            comparison: Expr::binary(BinaryOp::Eq, column(0), column(1)),
+            output,
+        }).unwrap())
+    };
+    let mut empty = open(relation(&[]), &execution).await;
+    while let Some(page) = empty.next_batch().await.unwrap() {
+        assert_eq!(page.len, 0);
+    }
+
+    let mut reached = open(relation(&[1]), &execution).await;
+    let error = reached.next_batch().await.err().unwrap();
+    assert_eq!(error.code, "rtdb.query/parameter-count");
+}
+
+#[tokio::test]
 async fn uncorrelated_arrow_membership_handles_null_and_empty_builds() {
     let execution = execution(2);
     let schema = |id| Schema::new(vec![field(id, LogicalType::Scalar(ScalarType::I64).maybe())]).unwrap();
