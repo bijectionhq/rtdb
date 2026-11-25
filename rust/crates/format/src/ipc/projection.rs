@@ -1,253 +1,568 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_ipc::{FieldNode, MetadataVersion};
-use arrow_schema::{DataType, FieldRef, Schema, UnionFields, UnionMode};
+use arrow_schema::{DataType, FieldRef, Schema, SchemaRef, UnionFields, UnionMode};
 use flatbuffers::FlatBufferBuilder;
-use rtdb_types::Result;
+use rtdb_types::{Anomaly, Result};
 
-use super::{PageProjection, allocation_add, allocation_mul, arrow_descriptors, codec_workspace,
-    compressed_buffer_length, decoded_buffer_bound, decoded_buffer_length, field_metadata_bound,
-    invalid, schema_metadata_bound, validate_lz4_batch};
-
-pub(super) fn allocation_bound(
-    body: &[u8],
-    batch: arrow_ipc::RecordBatch<'_>,
-    schema: &Schema,
-    version: MetadataVersion,
-    selection: PageProjection<'_>,
-) -> Result<Option<(usize, usize)>> {
-    let workspace = codec_workspace(batch)?;
-    let compressed = batch.compression().is_some();
-    for node in batch.nodes().into_iter().flatten() {
-        usize::try_from(node.length()).map_err(invalid)?;
-    }
-    for buffer in batch.buffers().into_iter().flatten() {
-        decoded_buffer_length(buffer, body.len(), compressed, |start| compressed_buffer_length(body, start))?;
-    }
-
-    let mut bound = Bound {
-        body, compressed, decompresses: false,
-        bytes: allocation_add(8192, schema_metadata_bound(schema.metadata())?)?,
-    };
-    let mut layout = Layout::new(batch, version, Output::Measure(&mut bound));
-    if layout.select(schema, selection).is_err() { return Ok(None); }
-    Ok(Some((bound.bytes, if bound.decompresses { workspace } else { 0 })))
-}
-
-pub(super) fn decode(
-    body: &Buffer,
-    batch: arrow_ipc::RecordBatch<'_>,
-    schema: &Schema,
-    version: MetadataVersion,
-    selection: PageProjection<'_>,
-) -> Result<RecordBatch> {
-    let mut descriptors = Descriptors::default();
-    let mut layout = Layout::new(batch, version, Output::Decode(&mut descriptors));
-    let fields = layout.select(schema, selection)?;
-
-    // The projected descriptors still address the original body.
-    let mut builder = FlatBufferBuilder::new();
-    let nodes = builder.create_vector(&descriptors.nodes);
-    let buffers = builder.create_vector(&descriptors.buffers);
-    let counts = (!descriptors.counts.is_empty()).then(|| builder.create_vector(&descriptors.counts));
-    let compression = batch.compression().map(|compression| arrow_ipc::BodyCompression::create(
-        &mut builder,
-        &arrow_ipc::BodyCompressionArgs { codec: compression.codec(), method: compression.method() },
-    ));
-    let batch = arrow_ipc::RecordBatch::create(&mut builder, &arrow_ipc::RecordBatchArgs {
-        length: batch.length(), nodes: Some(nodes), buffers: Some(buffers), compression,
-        variadicBufferCounts: counts,
-    });
-    builder.finish(batch, None);
-    let batch = flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(builder.finished_data()).map_err(invalid)?;
-    validate_lz4_batch(batch, body)?;
-    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-    arrow_ipc::reader::read_record_batch(body, batch, schema, &HashMap::new(), None, &version).map_err(invalid)
-}
-
-struct Bound<'a> {
-    body: &'a [u8],
-    compressed: bool,
-    decompresses: bool,
-    bytes: usize,
-}
-
-impl Bound<'_> {
-    fn field(&mut self, field: &FieldRef, node: &FieldNode, buffers: impl Iterator<Item = arrow_ipc::Buffer>) -> Result<()> {
-        let mut descriptor = field_metadata_bound(field)?;
-        if let DataType::Timestamp(_, Some(zone)) = field.data_type() {
-            descriptor = allocation_add(descriptor, allocation_mul(zone.len(), 16)?)?;
-        }
-        let rows = usize::try_from(node.length()).map_err(invalid)?;
-        self.bytes = allocation_add(self.bytes, allocation_add(arrow_descriptors(rows)?, descriptor)?)?;
-        for buffer in buffers {
-            let (decoded, decompresses) = decoded_buffer_length(&buffer, self.body.len(), self.compressed,
-                |start| compressed_buffer_length(self.body, start))?;
-            self.decompresses |= decompresses;
-            self.bytes = allocation_add(self.bytes, decoded_buffer_bound(decoded)?)?;
-        }
-        Ok(())
-    }
-}
+use super::{
+    PageProjection, allocation_add, allocation_mul, arrow_descriptors, codec_workspace, compressed_buffer_length,
+    decoded_buffer_bound, decoded_buffer_span, field_metadata_bound, invalid, schema_metadata_bound,
+    validate_lz4_frame,
+};
 
 #[derive(Clone, Copy)]
-enum FieldSelection<'a> {
-    All,
+pub(super) enum Selection<'a> {
+    Keep,
     Skip,
     Operations(&'a [String]),
     PutFields(&'a [String]),
+    Children(&'a [ConfiguredField]),
+}
+
+pub(super) enum ConfiguredField {
+    Keep,
+    Skip,
+    Children(Vec<ConfiguredField>),
+}
+
+impl ConfiguredField {
+    pub(super) fn selection(&self) -> Selection<'_> {
+        match self {
+            Self::Keep => Selection::Keep,
+            Self::Skip => Selection::Skip,
+            Self::Children(fields) => Selection::Children(fields),
+        }
+    }
+}
+
+impl<'a> Selection<'a> {
+    fn keeps(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+
+    fn child(self, index: usize, field: &FieldRef) -> Result<Self> {
+        Ok(match self {
+            Self::Operations(names) if is_put_struct(field) => Self::PutFields(names),
+            Self::PutFields(names) if !names.contains(field.name()) => Self::Skip,
+            Self::Children(fields) => fields
+                .get(index)
+                .ok_or_else(|| invalid("Arrow projection exceeds its configured field inventory"))?
+                .selection(),
+            Self::Skip => Self::Skip,
+            _ => Self::Keep,
+        })
+    }
+}
+
+impl<'a> PageProjection<'a> {
+    pub(super) fn field(self, field: &FieldRef) -> Selection<'a> {
+        match self {
+            Self::Iid if field.name() != "_iid" => Selection::Skip,
+            Self::PutColumns(names) if field.name() == "op" && matches!(field.data_type(), DataType::Union(..)) => {
+                Selection::Operations(names)
+            }
+            _ => Selection::Keep,
+        }
+    }
+
+    pub(super) fn output_schema(self, schema: &SchemaRef, nested: bool) -> Result<SchemaRef> {
+        let Self::PutColumns(names) = self else {
+            let fields: Vec<_> = schema.fields().iter().filter(|field| field.name() == "_iid").cloned().collect();
+            return Ok(Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())));
+        };
+        if !nested {
+            return Ok(Arc::clone(schema));
+        }
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let DataType::Union(legs, mode) = field.data_type() else {
+                    return Ok(Arc::clone(field));
+                };
+                if field.name() != "op" {
+                    return Ok(Arc::clone(field));
+                }
+                let children = legs.iter().map(|(_, leg)| {
+                    if !is_put_struct(leg) {
+                        return Arc::clone(leg);
+                    }
+                    let DataType::Struct(fields) = leg.data_type() else { unreachable!("put struct") };
+                    if fields.iter().all(|field| names.contains(field.name())) {
+                        return Arc::clone(leg);
+                    }
+                    let fields = fields.iter().filter(|field| names.contains(field.name())).cloned().collect();
+                    Arc::new(leg.as_ref().clone().with_data_type(DataType::Struct(fields)))
+                });
+                let legs = UnionFields::try_new(legs.iter().map(|(id, _)| id), children).map_err(invalid)?;
+                Ok(Arc::new(field.as_ref().clone().with_data_type(DataType::Union(legs, *mode))))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
+    }
+}
+
+fn is_put_struct(field: &FieldRef) -> bool {
+    field.name() == "put" && matches!(field.data_type(), DataType::Struct(_))
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Preparation {
+    Measure,
+    ReadPage,
+    ReadPreparedFile,
+}
+
+pub(super) fn prepare<'a, 'selection, G>(
+    body: &'a Buffer,
+    batch: arrow_ipc::RecordBatch<'a>,
+    schema: &Schema,
+    version: MetadataVersion,
+    mut select: impl FnMut(usize, &FieldRef) -> Selection<'selection>,
+    preparation: Preparation,
+    reserve_scratch: impl FnOnce(usize) -> Result<G>,
+) -> Result<Option<Plan<'a, G>>> {
+    let measure = matches!(preparation, Preparation::Measure);
+    let workspace = codec_workspace(batch)?;
+    for node in batch.nodes().into_iter().flatten() {
+        usize::try_from(node.length()).map_err(invalid)?;
+    }
+
+    let lz4 = !matches!(preparation, Preparation::ReadPreparedFile)
+        && batch.compression().is_some_and(|compression| compression.codec() == arrow_ipc::CompressionType::LZ4_FRAME);
+    let mut reserve_scratch = Some(reserve_scratch);
+    let mut scratch = None;
+    let mut allow_growth = || {
+        if let Some(reserve) = reserve_scratch.take() {
+            let nodes = batch.nodes().map_or(0, |nodes| nodes.len());
+            let frames = if lz4 { batch.buffers().map_or(0, |buffers| buffers.len()) } else { 0 };
+            // A growing Vec can briefly own both allocations during reallocation.
+            scratch = Some(
+                allocation_mul(nodes, 3 * size_of::<DescriptorSpan>())
+                    .and_then(|nodes| allocation_add(nodes, allocation_mul(frames, 3 * size_of::<Lz4Frame<'_>>())?))
+                    .and_then(reserve),
+            );
+        }
+        scratch.as_ref().is_some_and(|grant| grant.is_ok())
+    };
+    let mut layout = Layout::new(body, batch, version, measure, lz4, &mut allow_growth);
+    let base = if measure {
+        schema_metadata_bound(schema.metadata()).and_then(|bytes| allocation_add(8192, bytes))
+    } else {
+        Ok(0)
+    };
+    let selection = schema.fields().iter().enumerate().try_for_each(|(index, field)| {
+        let selection = select(index, field);
+        layout.retained.top_level += usize::from(selection.keeps());
+        layout.field(field, selection)
+    });
+    let inventory = layout.inventory();
+    // Descriptor errors precede layout fallback, including buffers beyond a failed layout walk.
+    layout.check_buffers(inventory.buffer, false)?;
+    if let Some(error) = layout.wire_error {
+        return Err(error);
+    }
+    let base = base?;
+    if selection.is_err() || layout.position != inventory {
+        return Ok(None);
+    }
+    let inventory = layout.retained;
+    let Ok(bound) = allocation_add(base, inventory.bound) else {
+        return Ok(None);
+    };
+    let workspace = if layout.decompresses { workspace } else { 0 };
+    Ok(Some(Plan { body, batch, version, inventory, bound, workspace, _scratch: scratch.transpose()? }))
+}
+
+const INLINE_SPANS: usize = 8;
+const INLINE_FRAMES: usize = 16;
+
+struct Entries<T, const N: usize> {
+    inline: [T; N],
+    len: usize,
+    overflow: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Default for Entries<T, N> {
+    fn default() -> Self {
+        Self { inline: [T::default(); N], len: 0, overflow: Vec::new() }
+    }
+}
+
+impl<T, const N: usize> Entries<T, N> {
+    fn push(&mut self, value: T, allow_growth: &mut dyn FnMut() -> bool) {
+        if self.len < N {
+            self.inline[self.len] = value;
+            self.len += 1;
+        } else if allow_growth() {
+            self.overflow.push(value);
+        }
+    }
+
+    fn last_mut(&mut self) -> Option<&mut T> {
+        if self.overflow.is_empty() { self.inline[..self.len].last_mut() } else { self.overflow.last_mut() }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.inline[..self.len].iter().chain(&self.overflow)
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Position {
+    node: usize,
+    buffer: usize,
+    variadic: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DescriptorSpan {
+    start: Position,
+    end: Position,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Lz4Frame<'a> {
+    bytes: &'a [u8],
+    expected: usize,
+}
+
+pub(super) struct Plan<'a, G> {
+    body: &'a Buffer,
+    batch: arrow_ipc::RecordBatch<'a>,
+    version: MetadataVersion,
+    inventory: Inventory<'a>,
+    pub(super) bound: usize,
+    pub(super) workspace: usize,
+    _scratch: Option<G>,
 }
 
 #[derive(Default)]
-struct Descriptors {
+struct Inventory<'a> {
+    spans: Entries<DescriptorSpan, INLINE_SPANS>,
+    frames: Entries<Lz4Frame<'a>, INLINE_FRAMES>,
+    selected: Position,
+    top_level: usize,
+    nested: bool,
+    native_incompatible: bool,
+    bound: usize,
+}
+
+impl<G> Plan<'_, G> {
+    pub(super) fn decode(
+        &self,
+        native_version: bool,
+        source: &SchemaRef,
+        indices: Option<&[usize]>,
+        output_schema: impl FnOnce(bool) -> Result<SchemaRef>,
+        scratch: Option<&Mutex<Descriptors>>,
+    ) -> Result<RecordBatch> {
+        for frame in self.inventory.frames.iter() {
+            validate_lz4_frame(frame.bytes, frame.expected)?;
+        }
+        let batch = self.batch;
+        let columns = indices.map_or(source.fields().len(), <[usize]>::len);
+        if native_version
+            && columns == self.inventory.top_level
+            && matches!(self.version, MetadataVersion::V4 | MetadataVersion::V5)
+            && !self.inventory.nested
+            && !self.inventory.native_incompatible
+            && batch.nodes().is_some()
+            && batch.buffers().is_some()
+            && usize::try_from(batch.length()).is_ok()
+        {
+            return arrow_ipc::reader::read_record_batch(
+                self.body,
+                batch,
+                Arc::clone(source),
+                &HashMap::new(),
+                indices,
+                &self.version,
+            )
+            .map_err(invalid);
+        }
+
+        let schema = output_schema(self.inventory.nested)?;
+        if let Some(mut scratch) = scratch.and_then(|scratch| scratch.try_lock().ok())
+            && scratch.fits(self.inventory.selected)
+        {
+            return self.decode_rewritten(schema, &mut scratch);
+        }
+        let mut descriptors = Descriptors::with_capacity(self.inventory.selected);
+        self.decode_rewritten(schema, &mut descriptors)
+    }
+
+    fn decode_rewritten(&self, schema: SchemaRef, descriptors: &mut Descriptors) -> Result<RecordBatch> {
+        let batch = self.batch;
+        descriptors.nodes.clear();
+        descriptors.buffers.clear();
+        descriptors.counts.clear();
+        let nodes = batch.nodes();
+        let buffers = batch.buffers();
+        let counts = batch.variadicBufferCounts();
+        for span in self.inventory.spans.iter() {
+            let DescriptorSpan { start, end } = *span;
+            descriptors.nodes.extend((start.node..end.node).map(|index| *nodes.unwrap().get(index)));
+            descriptors.buffers.extend((start.buffer..end.buffer).map(|index| *buffers.unwrap().get(index)));
+            descriptors.counts.extend((start.variadic..end.variadic).map(|index| counts.unwrap().get(index)));
+        }
+
+        let mut builder = FlatBufferBuilder::new();
+        let nodes = builder.create_vector(&descriptors.nodes);
+        let buffers = builder.create_vector(&descriptors.buffers);
+        let counts = (!descriptors.counts.is_empty()).then(|| builder.create_vector(&descriptors.counts));
+        let compression = batch.compression().map(|compression| {
+            arrow_ipc::BodyCompression::create(
+                &mut builder,
+                &arrow_ipc::BodyCompressionArgs { codec: compression.codec(), method: compression.method() },
+            )
+        });
+        let batch = arrow_ipc::RecordBatch::create(
+            &mut builder,
+            &arrow_ipc::RecordBatchArgs {
+                length: batch.length(),
+                nodes: Some(nodes),
+                buffers: Some(buffers),
+                compression,
+                variadicBufferCounts: counts,
+            },
+        );
+        builder.finish(batch, None);
+        let batch = flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(builder.finished_data()).map_err(invalid)?;
+        arrow_ipc::reader::read_record_batch(self.body, batch, schema, &HashMap::new(), None, &self.version)
+            .map_err(invalid)
+    }
+}
+
+pub(super) struct Descriptors {
     nodes: Vec<FieldNode>,
     buffers: Vec<arrow_ipc::Buffer>,
     counts: Vec<i64>,
 }
 
-enum Output<'a, 'b> {
-    Measure(&'a mut Bound<'b>),
-    Decode(&'a mut Descriptors),
+impl Descriptors {
+    pub(super) fn reusable() -> Self {
+        Self::with_capacity(Position { node: 32, buffer: 64, variadic: 8 })
+    }
+
+    fn with_capacity(size: Position) -> Self {
+        Self {
+            nodes: Vec::with_capacity(size.node),
+            buffers: Vec::with_capacity(size.buffer),
+            counts: Vec::with_capacity(size.variadic),
+        }
+    }
+
+    fn fits(&self, size: Position) -> bool {
+        size.node <= self.nodes.capacity()
+            && size.buffer <= self.buffers.capacity()
+            && size.variadic <= self.counts.capacity()
+    }
 }
 
-struct Layout<'a, 'b, 'c> {
+struct Layout<'a, 'b> {
+    body: &'a [u8],
     batch: arrow_ipc::RecordBatch<'a>,
     version: MetadataVersion,
-    node: usize,
-    buffer: usize,
-    variadic: usize,
-    output: Output<'b, 'c>,
+    measure: bool,
+    compressed: bool,
+    lz4: bool,
+    allow_growth: &'b mut dyn FnMut() -> bool,
+    position: Position,
+    checked_buffers: usize,
+    wire_error: Option<Anomaly>,
+    decompresses: bool,
+    retained: Inventory<'a>,
 }
 
-impl<'a, 'b, 'c> Layout<'a, 'b, 'c> {
-    fn new(batch: arrow_ipc::RecordBatch<'a>, version: MetadataVersion, output: Output<'b, 'c>) -> Self {
-        Self { batch, version, node: 0, buffer: 0, variadic: 0, output }
+impl<'a, 'b> Layout<'a, 'b> {
+    fn new(
+        body: &'a [u8],
+        batch: arrow_ipc::RecordBatch<'a>,
+        version: MetadataVersion,
+        measure: bool,
+        lz4: bool,
+        allow_growth: &'b mut dyn FnMut() -> bool,
+    ) -> Self {
+        Self {
+            body,
+            batch,
+            version,
+            measure,
+            compressed: batch.compression().is_some(),
+            lz4,
+            allow_growth,
+            position: Position::default(),
+            checked_buffers: 0,
+            wire_error: None,
+            decompresses: false,
+            retained: Inventory::default(),
+        }
     }
 
-    fn select(&mut self, schema: &Schema, selection: PageProjection<'_>) -> Result<Vec<FieldRef>> {
-        let mut fields = Vec::new();
-        for field in schema.fields() {
-            let selected = match selection {
-                PageProjection::Iid if field.name() == "_iid" => FieldSelection::All,
-                PageProjection::Iid => FieldSelection::Skip,
-                PageProjection::PutColumns(names) if field.name() == "op" => FieldSelection::Operations(names),
-                PageProjection::PutColumns(_) => FieldSelection::All,
+    fn inventory(&self) -> Position {
+        Position {
+            node: self.batch.nodes().map_or(0, |nodes| nodes.len()),
+            buffer: self.batch.buffers().map_or(0, |buffers| buffers.len()),
+            variadic: self.batch.variadicBufferCounts().map_or(0, |counts| counts.len()),
+        }
+    }
+
+    fn check_buffers(&mut self, end: usize, keep: bool) -> Result<()> {
+        if self.wire_error.is_some() {
+            return Ok(());
+        }
+        let Some(buffers) = self.batch.buffers() else {
+            return Ok(());
+        };
+        for index in self.checked_buffers..end {
+            self.checked_buffers = index + 1;
+            let checked = decoded_buffer_span(buffers.get(index), self.body.len(), self.compressed, |start| {
+                compressed_buffer_length(self.body, start)
+            });
+            let (span, decoded, decompresses) = match checked {
+                Ok(checked) => checked,
+                Err(error) => {
+                    self.wire_error = Some(error);
+                    break;
+                }
             };
-            if let Some(field) = self.field(field, selected)? { fields.push(field); }
+            if keep {
+                self.decompresses |= decompresses;
+                if self.measure {
+                    self.retained.bound = allocation_add(self.retained.bound, decoded_buffer_bound(decoded)?)?;
+                }
+                if self.lz4 && decompresses {
+                    self.retained.frames.push(
+                        Lz4Frame { bytes: &self.body[span.start + 8..span.end], expected: decoded },
+                        self.allow_growth,
+                    );
+                }
+            }
         }
-        if self.node != self.batch.nodes().map_or(0, |nodes| nodes.len())
-            || self.buffer != self.batch.buffers().map_or(0, |buffers| buffers.len())
-            || self.variadic != self.batch.variadicBufferCounts().map_or(0, |counts| counts.len())
-        {
-            return Err(invalid("Arrow schema and field-node inventory disagree"));
-        }
-        Ok(fields)
+        Ok(())
     }
 
-    fn field(&mut self, field: &FieldRef, selection: FieldSelection<'_>) -> Result<Option<FieldRef>> {
-        let keep = !matches!(selection, FieldSelection::Skip);
-        let materialize = keep && matches!(&self.output, Output::Decode(_));
-        let nodes = self.batch.nodes().filter(|nodes| self.node < nodes.len())
+    fn field(&mut self, field: &FieldRef, selection: Selection<'_>) -> Result<()> {
+        if self.wire_error.is_some() {
+            return Ok(());
+        }
+        let keep = selection.keeps();
+        let start = self.position;
+        let nodes = self
+            .batch
+            .nodes()
+            .filter(|nodes| start.node < nodes.len())
             .ok_or_else(|| invalid("Arrow schema exceeds its field-node inventory"))?;
-        let node = nodes.get(self.node);
+        let node = nodes.get(start.node);
         if keep && node.null_count() < 0 {
             return Err(invalid("Projected Arrow fields require known null counts"));
         }
-        self.node += 1;
+        self.position.node += 1;
 
         let physical = match field.data_type() {
-            DataType::Dictionary(key, _) => key.as_ref(),
+            DataType::Dictionary(key, _) => {
+                self.retained.native_incompatible |= !key.is_integer();
+                key.as_ref()
+            }
             data_type => data_type,
         };
-        let mut variadic = None;
         let buffers = match physical {
             DataType::Null | DataType::RunEndEncoded(_, _) => 0,
-            DataType::Union(_, mode) =>
-                usize::from(self.version < MetadataVersion::V5) + if *mode == UnionMode::Dense { 2 } else { 1 },
+            DataType::Union(_, mode) => {
+                usize::from(self.version < MetadataVersion::V5) + if *mode == UnionMode::Dense { 2 } else { 1 }
+            }
             DataType::Struct(_) | DataType::FixedSizeList(_, _) => 1,
             DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => 2,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-            | DataType::ListView(_) | DataType::LargeListView(_) => 3,
+            DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::ListView(_)
+            | DataType::LargeListView(_) => 3,
             DataType::Utf8View | DataType::BinaryView => {
-                let counts = self.batch.variadicBufferCounts().filter(|counts| self.variadic < counts.len())
+                let counts = self
+                    .batch
+                    .variadicBufferCounts()
+                    .filter(|counts| start.variadic < counts.len())
                     .ok_or_else(|| invalid("Arrow view exceeds its variadic inventory"))?;
-                let count = counts.get(self.variadic);
-                self.variadic += 1;
-                variadic = Some(count);
-                usize::try_from(count).ok().and_then(|count| count.checked_add(2))
+                self.position.variadic += 1;
+                // Arrow queues the original counts even for a top-level field it skips.
+                self.retained.native_incompatible |= !keep;
+                usize::try_from(counts.get(start.variadic))
+                    .ok()
+                    .and_then(|count| count.checked_add(2))
                     .ok_or_else(|| invalid("Arrow view buffer-count overflow"))?
             }
             _ => 2,
         };
-        let end = self.buffer.checked_add(buffers).ok_or_else(|| invalid("Arrow buffer-count overflow"))?;
-        let inventory = self.batch.buffers().filter(|buffers| end <= buffers.len())
-            .ok_or_else(|| invalid("Arrow schema exceeds its buffer inventory"))?;
-        if keep {
-            let buffers = (self.buffer..end).map(|index| *inventory.get(index));
-            match &mut self.output {
-                Output::Measure(bound) => bound.field(field, node, buffers)?,
-                Output::Decode(descriptors) => {
-                    descriptors.nodes.push(*node);
-                    descriptors.buffers.extend(buffers);
-                    descriptors.counts.extend(variadic);
-                }
-            }
+        let end = start.buffer.checked_add(buffers).ok_or_else(|| invalid("Arrow buffer-count overflow"))?;
+        if self.batch.buffers().is_none_or(|buffers| end > buffers.len()) {
+            return Err(invalid("Arrow schema exceeds its buffer inventory"));
         }
-        self.buffer = end;
+        self.position.buffer = end;
+        self.check_buffers(end, keep)?;
+        if self.wire_error.is_some() {
+            return Ok(());
+        }
+        if keep {
+            if self.measure {
+                let mut descriptor = field_metadata_bound(field)?;
+                if let DataType::Timestamp(_, Some(zone)) = field.data_type() {
+                    descriptor = allocation_add(descriptor, allocation_mul(zone.len(), 16)?)?;
+                }
+                let rows = node.length() as usize;
+                self.retained.bound =
+                    allocation_add(self.retained.bound, allocation_add(arrow_descriptors(rows)?, descriptor)?)?;
+            }
+            let end = self.position;
+            if let Some(last) = self.retained.spans.last_mut().filter(|last| last.end == start) {
+                last.end = end;
+            } else {
+                self.retained.spans.push(DescriptorSpan { start, end }, self.allow_growth);
+            }
+            self.retained.selected.node += 1;
+            self.retained.selected.buffer += buffers;
+            self.retained.selected.variadic += end.variadic - start.variadic;
+        }
 
-        let next = if keep { FieldSelection::All } else { FieldSelection::Skip };
-        let replacement = match physical {
-            DataType::Struct(fields) => {
-                let mut selected = Vec::new();
-                for child in fields {
-                    let selected_child = match selection {
-                        FieldSelection::PutFields(names) if !names.iter().any(|name| name == child.name()) =>
-                            FieldSelection::Skip,
-                        _ => next,
-                    };
-                    if let Some(child) = self.field(child, selected_child)? { selected.push(child); }
-                }
-                (materialize && matches!(selection, FieldSelection::PutFields(_)))
-                    .then(|| DataType::Struct(selected.into()))
-            }
-            DataType::Union(legs, mode) => {
-                let mut selected = Vec::new();
-                for (id, leg) in legs.iter() {
-                    let selection = match selection {
-                        FieldSelection::Operations(names) if leg.name() == "put" && matches!(leg.data_type(), DataType::Struct(_)) =>
-                            FieldSelection::PutFields(names),
-                        _ => next,
-                    };
-                    if let Some(leg) = self.field(leg, selection)? { selected.push((id, leg)); }
-                }
-                if materialize && matches!(selection, FieldSelection::Operations(_)) {
-                    let (ids, fields): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
-                    Some(DataType::Union(UnionFields::try_new(ids, fields).map_err(invalid)?, *mode))
-                } else {
-                    None
-                }
-            }
-            DataType::List(child) | DataType::LargeList(child) | DataType::Map(child, _)
-            | DataType::FixedSizeList(child, _) | DataType::ListView(child) | DataType::LargeListView(child) => {
-                self.field(child, next)?;
-                None
-            }
-            DataType::RunEndEncoded(ends, child) => {
-                self.field(ends, next)?;
-                self.field(child, next)?;
-                None
-            }
-            _ => None,
+        let mut child = |index, field: &FieldRef| {
+            let child = selection.child(index, field)?;
+            self.retained.nested |= keep && !child.keeps();
+            self.field(field, child)
         };
-        Ok(materialize.then(|| match replacement {
-            Some(data_type) => Arc::new(field.as_ref().clone().with_data_type(data_type)),
-            None => Arc::clone(field),
-        }))
+        match physical {
+            DataType::Struct(fields) => {
+                for (index, field) in fields.iter().enumerate() {
+                    child(index, field)?;
+                }
+            }
+            DataType::Union(fields, _) => {
+                for (index, (_, field)) in fields.iter().enumerate() {
+                    child(index, field)?;
+                }
+            }
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::Map(field, _)
+            | DataType::FixedSizeList(field, _)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field) => child(0, field)?,
+            DataType::RunEndEncoded(ends, values) => {
+                child(0, ends)?;
+                child(1, values)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
-
 
 #[cfg(test)]
 #[test]
@@ -286,4 +601,170 @@ fn fts_arrow_projection_keeps_event_headers_and_only_selected_put_fields() {
     assert!(matches!(row.put_text("body").unwrap(), PutText::Utf8("search text")));
     assert!(matches!(row.put_text("payload").unwrap(), PutText::Missing));
     assert!(matches!(headers.borrow_event(0).unwrap().put_text("body").unwrap(), PutText::Missing));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use arrow_array::Int64Array;
+    use arrow_schema::Field;
+
+    use super::*;
+
+    fn metadata(nodes: &[FieldNode], buffers: &[arrow_ipc::Buffer], compressed: bool) -> Vec<u8> {
+        let mut builder = FlatBufferBuilder::new();
+        let nodes = builder.create_vector(nodes);
+        let buffers = builder.create_vector(buffers);
+        let compression = compressed.then(|| {
+            arrow_ipc::BodyCompression::create(
+                &mut builder,
+                &arrow_ipc::BodyCompressionArgs {
+                    codec: arrow_ipc::CompressionType::LZ4_FRAME,
+                    method: arrow_ipc::BodyCompressionMethod::BUFFER,
+                },
+            )
+        });
+        let batch = arrow_ipc::RecordBatch::create(
+            &mut builder,
+            &arrow_ipc::RecordBatchArgs {
+                length: 1,
+                nodes: Some(nodes),
+                buffers: Some(buffers),
+                compression,
+                variadicBufferCounts: None,
+            },
+        );
+        builder.finish(batch, None);
+        builder.finished_data().to_vec()
+    }
+
+    #[test]
+    fn native_iid_projection_skips_a_nested_column_and_keeps_the_body_allocation() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("omitted", DataType::Struct(vec![Field::new("value", DataType::Int64, false)].into()), false),
+            Field::new("_iid", DataType::Int64, false),
+        ]));
+        let descriptors = metadata(
+            &[FieldNode::new(1, 0); 3],
+            &[
+                arrow_ipc::Buffer::new(0, 0),
+                arrow_ipc::Buffer::new(0, 0),
+                arrow_ipc::Buffer::new(0, 0),
+                arrow_ipc::Buffer::new(0, 0),
+                arrow_ipc::Buffer::new(0, 8),
+            ],
+            false,
+        );
+        let batch = flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(&descriptors).unwrap();
+        let body = Buffer::from_vec(vec![19_i64]);
+        let source = body.as_ptr();
+        let plan = prepare(
+            &body,
+            batch,
+            &schema,
+            MetadataVersion::V5,
+            |_, field| PageProjection::Iid.field(field),
+            Preparation::Measure,
+            |_| Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+        let page = plan.decode(true, &schema, Some(&[1]), |_| panic!("native projection"), None).unwrap();
+        drop(plan);
+        drop(body);
+        assert_eq!(page.schema(), Arc::new(schema.project(&[1]).unwrap()));
+        let selected = page.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(selected.value(0), 19);
+        assert_eq!(selected.values().as_ptr().cast::<u8>(), source);
+    }
+
+    #[test]
+    fn invalid_skipped_descriptors_precede_projected_layout_fallback() {
+        let schema = Schema::new(vec![
+            Field::new("_iid", DataType::Int64, false),
+            Field::new("omitted", DataType::Int64, false),
+        ]);
+        let body = Buffer::from(Vec::from((-2_i64).to_le_bytes()));
+        let cases = [
+            (-1, 8, 8, false, invalid(usize::try_from(-1_i64).unwrap_err())),
+            (1, -1, 1, false, invalid(usize::try_from(-1_i64).unwrap_err())),
+            (1, 8, 1, false, invalid("Arrow buffer exceeds its message body")),
+            (1, 0, 7, true, invalid("Compressed Arrow buffer has no length")),
+            (1, 0, 8, true, invalid(usize::try_from(-2_i64).unwrap_err())),
+        ];
+        for (skipped_rows, offset, length, compressed, expected) in cases {
+            let descriptors = metadata(
+                &[FieldNode::new(1, -1), FieldNode::new(skipped_rows, 0)],
+                &[
+                    arrow_ipc::Buffer::new(0, 0),
+                    arrow_ipc::Buffer::new(0, 0),
+                    arrow_ipc::Buffer::new(0, 0),
+                    arrow_ipc::Buffer::new(offset, length),
+                ],
+                compressed,
+            );
+            let batch = flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(&descriptors).unwrap();
+            let result = prepare::<()>(
+                &body,
+                batch,
+                &schema,
+                MetadataVersion::V5,
+                |_, field| PageProjection::Iid.field(field),
+                Preparation::Measure,
+                |_| panic!("invalid descriptors must fail before admission"),
+            );
+            assert_eq!(result.err(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn only_selected_compressed_frames_use_lz4_workspace_and_length_validation() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("omitted", DataType::Int64, false),
+            Field::new("_iid", DataType::Int64, false),
+        ]));
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        encoder.write_all(&19_i64.to_le_bytes()).unwrap();
+        let frame = encoder.finish().unwrap();
+        for declared in [-1_i64, 8, 7] {
+            let mut bytes = Vec::from(1_i64.to_le_bytes());
+            bytes.extend(declared.to_le_bytes());
+            if declared == -1 {
+                bytes.extend(19_i64.to_le_bytes());
+            } else {
+                bytes.extend(&frame);
+            }
+            let body = Buffer::from(bytes);
+            let descriptors = metadata(
+                &[FieldNode::new(1, 0); 2],
+                &[
+                    arrow_ipc::Buffer::new(0, 0),
+                    arrow_ipc::Buffer::new(0, 8),
+                    arrow_ipc::Buffer::new(8, 0),
+                    arrow_ipc::Buffer::new(8, (body.len() - 8) as i64),
+                ],
+                true,
+            );
+            let batch = flatbuffers::root::<arrow_ipc::RecordBatch<'_>>(&descriptors).unwrap();
+            let plan = prepare(
+                &body,
+                batch,
+                &schema,
+                MetadataVersion::V5,
+                |_, field| PageProjection::Iid.field(field),
+                Preparation::Measure,
+                |_| Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.workspace, if declared == -1 { 0 } else { 64 << 20 });
+            let page = plan.decode(true, &schema, Some(&[1]), |_| panic!("native projection"), None);
+            if declared == 7 {
+                assert_eq!(page.unwrap_err(), invalid("LZ4 data exceeds its declared Arrow buffer length"));
+            } else {
+                assert_eq!(page.unwrap().column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 19);
+            }
+        }
+    }
 }
