@@ -112,9 +112,12 @@ Receiver clock and protected release evidence require their owning routes.
 
 Use `rtdb.v1.OpenExactRead` with the exact Basis, tracking mode and a TTL of at most 2,000 milliseconds.
 The open captures the selected native view on the verified assignment and retains its storage before returning the opaque scope.
+The open and scoped pages use the locally retained cut and require neither a writer-head sample nor an available writer.
 Send `QueryRequest.exact_read_scope` (tag 16) on every plain SQL page in the same Flight session.
 Each request must use the same exact Basis and tracking mode, and a continuation belongs to that scope and query.
 Delivery rechecks the attached follower and the captured key generation.
+For scoped pages with `observe_applied_position`, the trailer reports the exact applied position and the assignment fields of `follower_progress`.
+Use the unscoped readiness query below to obtain the writer head and retained floor.
 Call `rtdb.v1.CloseExactRead` to release the scope early.
 An expired scope fails with `rtdb/exact-scope-expired`.
 

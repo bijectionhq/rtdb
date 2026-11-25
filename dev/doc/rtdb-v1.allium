@@ -158,7 +158,9 @@ surface StatelessDatabase {
 
     @guarantee AssignedFollowerExactScope
         -- An open on the assigned follower retains the selected exact view under the authenticated Flight session for at most two seconds.
+        -- A scoped read uses local apply evidence and is independent of writer progress.
         -- All scoped pages use the original view, basis and tracking mode.
+        -- A scoped page with observation enabled attests the assignment and the selected applied position.
         -- Delivery requires the attached assignment and its captured key generation.
         -- A continuation identifies its exact scope and the request that issued it.
         -- Closing or expiring the scope ends admission and cancels its active pages.
