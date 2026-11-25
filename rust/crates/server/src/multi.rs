@@ -1935,7 +1935,7 @@ mod tests {
 
         let data = tempfile::tempdir().unwrap();
         let mut expected = None;
-        let mut interrupted_restore = None;
+        let mut interrupted_restore: Option<(_, rtdb_types::rtdb_v1::Basis)> = None;
         let key = vec![37; 16];
         for reopen in [false, true] {
             let limit = 256 << 20;

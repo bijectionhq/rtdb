@@ -2340,19 +2340,19 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
         ops: vec![put(2, 30)], otherwise: vec![put(3, 40)], ..Default::default()
     };
     let refused = transact_wire(&mut client, stale.clone()).await.unwrap();
-    let Some(Outcome::Refused(error)) = &refused.outcome else { panic!("expected refusal"); };
-    assert_eq!(error.category(), v1::AnomalyCategory::Conflict);
-    assert_eq!(error.code, "rtdb/requirement-failed");
-    assert_eq!(error.message, "Requirement 0 failed");
+    let Some(Outcome::Refused(refusal)) = &refused.outcome else { panic!("expected refusal"); };
+    assert_eq!(refusal.category(), v1::AnomalyCategory::Conflict);
+    assert_eq!(refusal.code, "rtdb/requirement-failed");
+    assert_eq!(refusal.message, "Requirement 0 failed");
     assert!(!refused.replayed);
     let read = input("SELECT n FROM wire_owner ORDER BY n");
     assert_eq!(ints(&query(&mut client, read.clone()).await.0), [20]);
     let replayed = v1::Receipt { replayed: true, ..refused };
     assert_eq!(transact_wire(&mut client, stale.clone()).await.unwrap(), replayed);
-    let status = client.action(
+    let tx_status = client.action(
         "rtdb.v1.TxStatus", v1::TxStatusRequest { key: stale.key.clone() }.encode_to_vec().into(),
     ).await.unwrap();
-    assert_eq!(v1::Receipt::decode(status[0].body.clone()).unwrap(), replayed);
+    assert_eq!(v1::Receipt::decode(tx_status[0].body.clone()).unwrap(), replayed);
 
     let selected = transact_wire(&mut client, v1::TransactRequest {
         key: vec![4; 16], requires: vec![version(1, Expect::Written(written))], ..stale.clone()
@@ -2367,8 +2367,8 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
     let (running, _) = start().await;
     let mut client = Client::connect(&running.server, None).await;
     let status_request = v1::TxStatusRequest { key: stale.key.clone() }.encode_to_vec();
-    let status = client.action("rtdb.v1.TxStatus", status_request.clone().into()).await.unwrap();
-    assert_eq!(v1::Receipt::decode(status[0].body.clone()).unwrap(), replayed);
+    let tx_status = client.action("rtdb.v1.TxStatus", status_request.clone().into()).await.unwrap();
+    assert_eq!(v1::Receipt::decode(tx_status[0].body.clone()).unwrap(), replayed);
     assert_eq!(transact_wire(&mut client, stale).await.unwrap(), replayed);
     let mut read = read;
     read.source.as_mut().unwrap().at = Some(v1::At { selection: selected.basis.clone().map(Selection::Exactly) });
@@ -2380,8 +2380,8 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
     assert_eq!(ints(&client.query("SELECT n FROM classic_only FOR ALL VALID_TIME").await), [50]);
     let caps = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
     assert!(v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap().features.is_empty());
-    let status = client.action("rtdb.v1.TxStatus", status_request.into()).await.unwrap_err();
-    error(status, v1::AnomalyCategory::Unsupported, "rtdb/default-serving-classic-history");
+    let refused_status = client.action("rtdb.v1.TxStatus", status_request.into()).await.unwrap_err();
+    error(refused_status, v1::AnomalyCategory::Unsupported, "rtdb/default-serving-classic-history");
     running.stop().await;
 }
 
