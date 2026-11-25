@@ -1,22 +1,68 @@
 use rtdb_types::StructFields;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int32Array, Int64Array, ListArray,
-    RecordBatch, RunArray, StringArray, StructArray, UnionArray, builder::BinaryBuilder,
-    types::{Int16Type, Int32Type, Int64Type},
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float64Array, Int32Array, Int64Array,
+    ListArray, RecordBatch, RunArray, StringArray, StructArray, UnionArray,
+    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, NullBufferBuilder,
+    OffsetBuffer, ScalarBuffer,
+};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
 
 use crate::bloom::BloomFilter;
 
-#[derive(Clone)]
-enum Mask { All, Selected(Vec<bool>) }
+enum Mask {
+    All,
+    Span(Range<usize>),
+    Selected { offset: usize, rows: BooleanBuffer },
+}
 
 impl Mask {
-    fn includes(&self, row: usize) -> bool { match self { Self::All => true, Self::Selected(rows) => rows[row] } }
+    fn span(&self, len: usize) -> Range<usize> {
+        match self {
+            Self::All => 0..len,
+            Self::Span(span) => span.clone(),
+            Self::Selected { offset, rows } => *offset..*offset + rows.len(),
+        }
+    }
+
+    fn rows(&self, len: usize) -> impl Iterator<Item = usize> + '_ {
+        let (span, selected) = match self {
+            Self::Selected { offset, rows } => {
+                (0..0, Some(rows.set_indices().map(move |row| *offset + row)))
+            }
+            _ => (self.span(len), None),
+        };
+        span.chain(selected.into_iter().flatten())
+    }
+
+    fn count_in(&self, span: Range<usize>) -> usize {
+        match self {
+            Self::Selected { offset, rows } => {
+                let start = span.start - *offset;
+                rows.inner().count_set_bits_offset(rows.offset() + start, span.len())
+            }
+            _ => span.len(),
+        }
+    }
+
+    fn with_parent_validity(&self, array: &dyn Array) -> Option<Self> {
+        let Some(validity) = array.nulls().filter(|validity| validity.null_count() != 0) else {
+            // An explicit selection keeps unreferenced dense union child slots out of the fold.
+            return matches!(self, Self::All).then(|| Self::Span(0..array.len()));
+        };
+        let span = self.span(array.len());
+        let valid = validity.inner().slice(span.start, span.len());
+        let rows = match self {
+            Self::Selected { rows, .. } => rows & &valid,
+            _ => valid,
+        };
+        Some(Self::Selected { offset: span.start, rows })
+    }
 }
 
 #[derive(Default)]
@@ -32,7 +78,7 @@ enum Flavour {
     Child(i32),
     Children(Vec<i32>),
     Bounds(Option<f64>, Option<f64>),
-    Bytes(Option<Vec<u8>>),
+    Bytes(Option<BloomFilter>),
 }
 
 struct ColumnSummary {
@@ -48,7 +94,7 @@ pub(crate) fn page_statistics(batch: &RecordBatch, calculate_blooms: bool, base:
 }
 
 pub fn columns_for_event_page(batch: &RecordBatch, calculate_blooms: bool) -> Result<Vec<Value>> {
-    Ok(event_statistics(batch, calculate_blooms, 0)?.into_iter().map(column_value).collect())
+    event_statistics(batch, calculate_blooms, 0)?.into_iter().map(column_value).collect()
 }
 
 fn event_statistics(batch: &RecordBatch, calculate_blooms: bool, base: i32) -> Result<Vec<ColumnSummary>> {
@@ -83,7 +129,7 @@ pub fn column_metadata(field: &Field, array: &dyn Array, root: bool, calculate_b
     let base = i32::try_from(output.len()).map_err(invalid)?;
     let mut columns = Vec::new();
     let index = write_column(field, array, root, calculate_blooms, &Mask::All, &mut columns, base, 0)?;
-    output.extend(columns.into_iter().map(column_value));
+    output.extend(columns.into_iter().map(column_value).collect::<Result<Vec<_>>>()?);
     Ok(index as usize)
 }
 
@@ -100,10 +146,19 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
             let reader = rtdb_columnar::ColumnPresence::new(field)?;
             if field.data_type() == array.data_type() && reader.uses_parent_validity() {
                 i64::try_from(validity_count(array, mask)).map_err(invalid)?
+            } else if let DataType::RunEndEncoded(ends, _) = field.data_type()
+                && field.data_type() == array.data_type()
+            {
+                match ends.data_type() {
+                    DataType::Int16 => run_presence_count(downcast::<RunArray<Int16Type>>(array)?, mask, &reader)?,
+                    DataType::Int32 => run_presence_count(downcast::<RunArray<Int32Type>>(array)?, mask, &reader)?,
+                    DataType::Int64 => run_presence_count(downcast::<RunArray<Int64Type>>(array)?, mask, &reader)?,
+                    _ => return Err(invalid("Invalid run-end index width")),
+                }
             } else {
                 let mut count = 0i64;
-                for row in 0..array.len() {
-                    if mask.includes(row) && reader.is_present(array, row)? { count += 1; }
+                for row in mask.rows(array.len()) {
+                    if reader.is_present(array, row)? { count += 1; }
                 }
                 count
             }
@@ -115,8 +170,7 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
         ));
     }
     if statistics.bytes_seen {
-        let bloom = statistics.bloom.map(|bloom| bloom.to_bytes()).transpose()?;
-        statistics.flavours.insert("bytes".into(), Flavour::Bytes(bloom));
+        statistics.flavours.insert("bytes".into(), Flavour::Bytes(statistics.bloom));
     }
     let index = i32::try_from(output.len()).map_err(invalid)?;
     let index = index.checked_add(base).ok_or_else(|| Anomaly::incorrect(
@@ -126,7 +180,7 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     Ok(index)
 }
 
-fn column_value(column: ColumnSummary) -> Value {
+fn column_value(column: ColumnSummary) -> Result<Value> {
     let mut fields = StructFields::from([
         ("col-name".into(), Value::Utf8(column.name)),
         ("root-col?".into(), Value::Bool(column.root)),
@@ -141,13 +195,16 @@ fn column_value(column: ColumnSummary) -> Value {
                 ("min".into(), min.map_or(Value::Null, Value::F64)),
                 ("max".into(), max.map_or(Value::Null, Value::F64)),
             ])),
-            Flavour::Bytes(bloom) => Value::Struct(StructFields::from([
-                ("bloom".into(), bloom.map_or(Value::Null, Value::Binary)),
-            ])),
+            Flavour::Bytes(bloom) => {
+                let bloom = bloom.map(|bloom| bloom.to_bytes()).transpose()?;
+                Value::Struct(StructFields::from([
+                    ("bloom".into(), bloom.map_or(Value::Null, Value::Binary)),
+                ]))
+            }
         };
         fields.insert(name, value);
     }
-    Value::Struct(fields)
+    Ok(Value::Struct(fields))
 }
 
 fn build_statistics(columns: &[ColumnSummary]) -> Result<StructArray> {
@@ -196,22 +253,91 @@ fn build_statistics(columns: &[ColumnSummary]) -> Result<StructArray> {
                 (true, Arc::new(StructArray::try_new(fields.into(), children, nulls()).map_err(invalid)?))
             }
             Flavour::Bytes(_) => {
-                let bytes = cells().flatten().try_fold(0usize, |bytes, cell| {
-                    let length = match cell { Flavour::Bytes(Some(bloom)) => bloom.len(), _ => 0 };
-                    bytes.checked_add(length).ok_or_else(|| invalid("Bloom metadata allocation overflow"))
-                })?;
-                let mut builder = BinaryBuilder::with_capacity(columns.len(), bytes);
-                for cell in cells() {
-                    builder.append_option(match cell { Some(Flavour::Bytes(bloom)) => bloom.as_deref(), _ => None });
-                }
+                let blooms = cells().map(|cell| match cell {
+                    Some(Flavour::Bytes(bloom)) => bloom.as_ref(),
+                    _ => None,
+                });
                 let fields = vec![Field::new("bloom", DataType::Binary, true)].into();
-                (true, Arc::new(StructArray::try_new(fields, vec![Arc::new(builder.finish())], nulls()).map_err(invalid)?))
+                let bloom = Arc::new(build_blooms(blooms)?);
+                let bytes = StructArray::try_new(fields, vec![bloom], nulls()).map_err(invalid)?;
+                (true, Arc::new(bytes))
             }
         };
         fields.push(Field::new(name, array.data_type().clone(), nullable));
         arrays.push(array);
     }
     StructArray::try_new(fields.into(), arrays, None).map_err(invalid)
+}
+
+fn build_blooms<'a>(
+    blooms: impl ExactSizeIterator<Item = Option<&'a BloomFilter>> + Clone,
+) -> Result<BinaryArray> {
+    let mut offsets = Vec::with_capacity(blooms.len() + 1);
+    let mut validity = NullBufferBuilder::new(blooms.len());
+    let mut end = 0i32;
+    offsets.push(end);
+    for bloom in blooms.clone() {
+        validity.append(bloom.is_some());
+        if let Some(bloom) = bloom {
+            let size = i32::try_from(bloom.serialized_size()).map_err(|_| bloom_allocation_overflow())?;
+            end = end.checked_add(size).ok_or_else(bloom_allocation_overflow)?;
+        }
+        offsets.push(end);
+    }
+
+    let mut values = vec![0u8; end as usize];
+    for (bloom, span) in blooms.zip(offsets.windows(2)) {
+        if let Some(bloom) = bloom {
+            let mut target = &mut values[span[0] as usize..span[1] as usize];
+            bloom.write_bytes(&mut target)?;
+            if !target.is_empty() {
+                return Err(invalid("Bloom metadata serialized size disagrees with its offset"));
+            }
+        }
+    }
+    BinaryArray::try_new(OffsetBuffer::new(offsets.into()), Buffer::from_vec(values), validity.finish())
+        .map_err(invalid)
+}
+
+fn bloom_allocation_overflow() -> Anomaly {
+    invalid("Bloom metadata allocation overflow")
+}
+
+fn visible_run_spans<R: RunEndIndexType>(
+    runs: &RunArray<R>,
+    rows: Range<usize>,
+) -> (Range<usize>, impl Iterator<Item = Range<usize>> + '_) {
+    let physical = if rows.is_empty() {
+        0..0
+    } else {
+        runs.get_physical_index(rows.start)..runs.get_physical_index(rows.end - 1) + 1
+    };
+    let offset = runs.offset();
+    let mut start = rows.start;
+    let spans = runs.run_ends().values()[physical.clone()].iter().map(move |end| {
+        let end = (end.as_usize() - offset).min(rows.end);
+        let span = start..end;
+        start = end;
+        span
+    });
+    (physical, spans)
+}
+
+fn run_presence_count<R: RunEndIndexType>(
+    runs: &RunArray<R>,
+    mask: &Mask,
+    reader: &rtdb_columnar::ColumnPresence<'_>,
+) -> Result<i64> {
+    let (_, spans) = visible_run_spans(runs, mask.span(runs.len()));
+    let mut count = 0;
+    for span in spans {
+        let row = span.start;
+        let selected = mask.count_in(span);
+        if selected != 0 && reader.is_present(runs, row)? {
+            count += selected;
+        }
+    }
+    i64::try_from(count).map_err(invalid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,10 +350,15 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
                 let child = union.child(id);
                 let child_mask = match mask {
                     Mask::All => Mask::All,
-                    Mask::Selected(_) => {
-                        let mut selected = vec![false; child.len()];
-                        for row in 0..array.len() { if mask.includes(row) && union.type_id(row) == id { selected[union.value_offset(row)] = true; } }
-                        Mask::Selected(selected)
+                    _ => {
+                        let mut selected = BooleanBufferBuilder::new(child.len());
+                        selected.append_n(child.len(), false);
+                        for row in mask.rows(array.len()) {
+                            if union.type_id(row) == id {
+                                selected.set_bit(union.value_offset(row), true);
+                            }
+                        }
+                        Mask::Selected { offset: 0, rows: selected.finish() }
                     }
                 };
                 fold(field, child.as_ref(), &child_mask, with_bloom, calculate_blooms, output, statistics, base, depth + 1)?;
@@ -238,18 +369,25 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
             macro_rules! runs {
                 ($ty:ty) => {{
                     let runs = downcast::<RunArray<$ty>>(array)?;
-                    let mut selected = vec![false; runs.values().len()];
-                    for row in 0..array.len() { if mask.includes(row) { selected[runs.get_physical_index(row)] = true; } }
-                    fold(value, runs.values().as_ref(), &Mask::Selected(selected), with_bloom, calculate_blooms, output, statistics, base, depth + 1)
+                    let (physical, spans) = visible_run_spans(runs, mask.span(runs.len()));
+                    let child_mask = match mask {
+                        Mask::Selected { .. } => Mask::Selected {
+                            offset: physical.start,
+                            rows: spans.map(|span| mask.count_in(span) != 0).collect(),
+                        },
+                        _ => Mask::Span(physical),
+                    };
+                    fold(value, runs.values().as_ref(), &child_mask, with_bloom, calculate_blooms, output, statistics, base, depth + 1)
                 }};
             }
             return match ends.data_type() { DataType::Int16 => runs!(Int16Type), DataType::Int32 => runs!(Int32Type), DataType::Int64 => runs!(Int64Type), _ => Err(invalid("Invalid run-end index width")) };
         }
         DataType::Struct(fields) => {
             let values = downcast::<StructArray>(array)?;
-            let child_mask = if field.is_nullable() { Mask::Selected((0..array.len()).map(|row| mask.includes(row) && !array.is_null(row)).collect()) } else { mask.clone() };
+            let selection = field.is_nullable().then(|| mask.with_parent_validity(array)).flatten();
+            let child_mask = selection.as_ref().unwrap_or(mask);
             let children = fields.iter().enumerate().map(|(index, field)| {
-                write_column(field, values.column(index).as_ref(), false, calculate_blooms, &child_mask, output, base, depth + 1)
+                write_column(field, values.column(index).as_ref(), false, calculate_blooms, child_mask, output, base, depth + 1)
             }).collect::<Result<Vec<_>>>()?;
             statistics.flavours.insert("struct".into(), Flavour::Children(children));
             return Ok(());
@@ -281,8 +419,8 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         statistics.bytes_seen = true;
         if with_bloom {
             let bloom = statistics.bloom.get_or_insert_with(BloomFilter::default);
-            if !bloom.insert_byte_cells(array, (0..array.len()).filter(|row| mask.includes(*row))) {
-                for row in 0..array.len() { if mask.includes(row) { bloom.insert_cell(field, array, row)?; } }
+            if !bloom.insert_byte_cells(array, mask.rows(array.len())) {
+                for row in mask.rows(array.len()) { bloom.insert_cell(field, array, row)?; }
             }
         }
         return Ok(());
@@ -296,8 +434,8 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
     };
     let bounds = statistics.numeric.entry(group).or_insert((f64::INFINITY, f64::NEG_INFINITY));
     let cells = numeric_cells(array);
-    for row in 0..array.len() {
-        if !mask.includes(row) || array.is_null(row) { continue; }
+    for row in mask.rows(array.len()) {
+        if array.is_null(row) { continue; }
         let value = match &cells {
             Some(cells) => cells(row),
             None => rtdb_columnar::decimal_cell_as_f64(field, array, row)?,
@@ -320,7 +458,8 @@ fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize>
 fn validity_count(array: &dyn Array, mask: &Mask) -> usize {
     match mask {
         Mask::All => array.len() - array.null_count(),
-        Mask::Selected(rows) => (0..array.len()).filter(|row| rows[*row] && array.is_valid(*row)).count(),
+        _ if array.null_count() == 0 => mask.count_in(mask.span(array.len())),
+        _ => mask.rows(array.len()).filter(|row| array.is_valid(*row)).count(),
     }
 }
 
@@ -378,6 +517,139 @@ fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Int16Array, cast::AsArray};
+    use arrow_schema::UnionFields;
+
+    #[test]
+    fn sliced_runs_keep_logical_counts_and_exact_float_bounds_at_every_width() {
+        let values = Float64Array::from(vec![
+            Some(-100.0), Some(-0.0), None, Some(f64::NAN), Some(0.0), Some(100.0),
+        ]);
+        macro_rules! check_width {
+            ($width:ty, $ends:ty) => {{
+                let ends = <$ends>::from(vec![4, 9, 14, 18, 22, 26]);
+                let runs = RunArray::<$width>::try_new(&ends, &values).unwrap();
+                let field = Field::new("encoded", runs.data_type().clone(), false);
+                for (start, len, count, bound) in [
+                    (7, 5, 2, Some(-0.0f64)),
+                    (13, 8, 7, Some(f64::NAN)),
+                    (26, 0, 0, None),
+                ] {
+                    let mut columns = Vec::new();
+                    column_metadata(&field, &runs.slice(start, len), true, false, &mut columns).unwrap();
+                    assert_eq!(columns[0].field("count"), Some(&Value::I64(count)));
+                    let numbers = columns[0].field("numbers").unwrap();
+                    for name in ["min", "max"] {
+                        let actual = match numbers.field(name).unwrap() {
+                            Value::F64(number) => Some(number.to_bits()),
+                            Value::Null => None,
+                            value => panic!("Unexpected numeric bound {value:?}"),
+                        };
+                        assert_eq!(actual, bound.map(f64::to_bits));
+                    }
+                }
+            }};
+        }
+        check_width!(Int16Type, Int16Array);
+        check_width!(Int32Type, Int32Array);
+        check_width!(Int64Type, Int64Array);
+    }
+
+    #[test]
+    fn nested_masks_select_run_values_and_active_union_slots() {
+        let fields = UnionFields::try_new([3, 7], [
+            Field::new("utf8", DataType::Utf8, false),
+            Field::new("i64", DataType::Int64, false),
+        ]).unwrap();
+        let union = UnionArray::try_new(
+            fields, vec![3, 3, 7, 3, 3].into(), Some(vec![0, 1, 0, 2, 3].into()),
+            vec![
+                Arc::new(StringArray::from(vec!["left", "first", "second", "right", "unreferenced"])),
+                Arc::new(Int64Array::from(vec![999])),
+            ],
+        ).unwrap();
+        let runs = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![3, 6, 9, 12, 15]), &union)
+            .unwrap().slice(2, 11);
+        let wrap = |name: &str, child: ArrayRef, nullable, nulls| {
+            let fields = vec![Field::new(name, child.data_type().clone(), nullable)].into();
+            StructArray::try_new(fields, vec![child], nulls).unwrap()
+        };
+        let inner = wrap("encoded", Arc::new(runs), false, Some(
+            vec![true, true, false, true, true, true, true, true, false, true, true].into(),
+        ));
+        let required = wrap("inner", Arc::new(inner), true, None);
+        let outer = wrap("required", Arc::new(required), false, Some(
+            vec![false, true, true, true, false, false, false, true, true, false, false].into(),
+        ));
+        let field = Field::new("outer", outer.data_type().clone(), true);
+        let mut columns = Vec::new();
+        column_metadata(&field, &outer, true, true, &mut columns).unwrap();
+
+        let encoded = &columns[0];
+        assert_eq!(encoded.field("col-name"), Some(&Value::Utf8("encoded".into())));
+        assert_eq!(encoded.field("count"), Some(&Value::I64(3)));
+        assert_eq!(encoded.field("numbers").unwrap().field("max"), Some(&Value::Null));
+        let mut bloom = BloomFilter::default();
+        for value in ["first", "second"] {
+            bloom.insert_value(&Value::Utf8(value.into())).unwrap();
+        }
+        assert_eq!(encoded.field("bytes").unwrap().field("bloom"), Some(&Value::Binary(bloom.to_bytes().unwrap())));
+    }
+
+    #[test]
+    fn null_free_nullable_structs_still_exclude_unreferenced_union_values() {
+        let fields = UnionFields::try_new([3], [Field::new("i64", DataType::Int64, false)]).unwrap();
+        let union = UnionArray::try_new(
+            fields, vec![3].into(), Some(vec![1].into()), vec![Arc::new(Int64Array::from(vec![999, 7]))],
+        ).unwrap();
+        let child = Field::new("selected", union.data_type().clone(), false);
+        let array = StructArray::try_new(vec![child].into(), vec![Arc::new(union)], None).unwrap();
+        let mut columns = Vec::new();
+        for (nullable, max) in [(true, 7.0), (false, 999.0)] {
+            let field = Field::new("root", array.data_type().clone(), nullable);
+            columns.clear();
+            column_metadata(&field, &array, true, false, &mut columns).unwrap();
+            assert_eq!(columns[0].field("numbers").unwrap().field("max"), Some(&Value::F64(max)));
+        }
+    }
+
+    #[test]
+    fn typed_bloom_values_preserve_portable_bytes_and_distinct_absences() {
+        let mut bloom = BloomFilter::default();
+        bloom.insert_hashes(1, 1);
+        let columns: Vec<_> = [
+            None, Some(None), Some(Some(BloomFilter::default())), Some(Some(bloom)), None,
+        ].into_iter().enumerate().map(|(index, bloom)| ColumnSummary {
+            name: index.to_string(),
+            root: true,
+            count: 0,
+            flavours: bloom.into_iter().map(|bloom| ("bytes".into(), Flavour::Bytes(bloom))).collect(),
+        }).collect();
+        let page = build_statistics(&columns).unwrap();
+        let bytes = page.column_by_name("bytes").unwrap().as_struct();
+        let binary = bytes.column(0).as_binary::<i32>();
+        let empty = [58, 48, 0, 0, 0, 0, 0, 0];
+        let populated = [58, 48, 0, 0, 1, 0, 0, 0, 0, 0, 4, 0, 16, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0];
+
+        assert!(bytes.is_null(0));
+        assert!(bytes.is_valid(1));
+        assert!(binary.is_null(0));
+        assert!(binary.is_null(1));
+        assert!(binary.is_valid(2));
+        assert!(binary.is_valid(3));
+        assert!(bytes.is_null(4));
+        assert!(binary.is_null(4));
+        assert_eq!(binary.value_offsets(), &[0, 0, 0, 8, 34, 34]);
+        assert_eq!(binary.value(2), &empty);
+        assert_eq!(binary.value(3), &populated);
+
+        let values = columns.into_iter().map(column_value).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(values[0].field("bytes"), None);
+        assert_eq!(values[1].field("bytes").unwrap().field("bloom"), Some(&Value::Null));
+        assert_eq!(values[2].field("bytes").unwrap().field("bloom"), Some(&Value::Binary(empty.to_vec())));
+        assert_eq!(values[3].field("bytes").unwrap().field("bloom"), Some(&Value::Binary(populated.to_vec())));
+    }
+
     #[test]
     fn decimal_statistics_handle_full_scale_without_exponent_sized_allocation() {
         for (scale, expected) in [(i32::MIN, f64::NEG_INFINITY), (i32::MAX, -0.0)] {
@@ -456,7 +728,8 @@ mod float_list_tests {
         let list = FixedSizeListArray::try_new(item, 2, values, Some(vec![true, false].into())).unwrap();
         let field = Field::new("embedding", list.data_type().clone(), true);
         assert_eq!(present_cells(&field, &list, &Mask::All), Some(1));
-        assert_eq!(present_cells(&field, &list, &Mask::Selected(vec![false, true])), Some(0));
+        let selected = Mask::Selected { offset: 0, rows: vec![false, true].into() };
+        assert_eq!(present_cells(&field, &list, &selected), Some(0));
 
         let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
         builder.values().append_null();

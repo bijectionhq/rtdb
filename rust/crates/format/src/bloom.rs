@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 use arrow_array::{Array, cast::AsArray};
 use arrow_schema::Field;
@@ -23,9 +23,17 @@ impl BloomFilter {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(self.bitmap.serialized_size());
-        self.bitmap.serialize_into(&mut output).map_err(invalid)?;
+        let mut output = Vec::with_capacity(self.serialized_size());
+        self.write_bytes(&mut output)?;
         Ok(output)
+    }
+
+    pub(crate) fn serialized_size(&self) -> usize {
+        self.bitmap.serialized_size()
+    }
+
+    pub(crate) fn write_bytes(&self, output: impl Write) -> Result<()> {
+        self.bitmap.serialize_into(output).map_err(invalid)
     }
 
     /// Adds bit positions in bulk; sorted and de-duplicated first, they enter the bitmap as one union.
