@@ -464,6 +464,8 @@ pub struct ResolvedTransact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workload: Option<WorkloadFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload_digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<Box<RawValue>>,
 }
 
@@ -499,6 +501,9 @@ impl ResolvedTransact {
             before: Option<Timestamp>,
         }
 
+        if self.workload_digest.is_some() && (self.workload.is_none() || self.request.is_none()) {
+            return Err(invalid_record());
+        }
         if let Some(funding) = self.receipt.decision_clock {
             let request = self.request.as_ref().ok_or_else(invalid_record)?;
             let request = Transact::decode_canonical_request(request.get().as_bytes()).map_err(|_| invalid_record())?;
@@ -548,6 +553,15 @@ pub(crate) struct StoredReceipt {
     installed: Option<InstalledReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workload: Option<WorkloadFamily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload_digest: Option<[u8; 32]>,
+}
+
+impl StoredReceipt {
+    fn matches_workload_digest(&self, digest: [u8; 32]) -> bool {
+        // Older workload receipts used the signed action digest as their fingerprint.
+        self.workload_digest.unwrap_or(self.fingerprint) == digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,7 +674,7 @@ impl TransactState {
             for (key, expected) in receipts {
                 let actual = actual.get(key).ok_or_else(invalid_record)?;
                 if actual.fingerprint != expected.fingerprint || actual.receipt != expected.receipt
-                    || actual.workload != expected.workload
+                    || actual.workload != expected.workload || actual.workload_digest != expected.workload_digest
                     || expected.installed.is_some_and(|position| actual.installed != Some(position))
                 {
                     return Err(invalid_record());
@@ -792,7 +806,9 @@ impl TransactState {
         for stored in receipts {
             let receipt = &stored.receipt;
             validate_key(&receipt.key).map_err(|_| invalid())?;
-            if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time {
+            if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time
+                || stored.workload_digest.is_some() && stored.workload.is_none()
+            {
                 return Err(invalid());
             }
             if receipt.erasure == Some(Erasure::Pending) && state.pending_erasure.is_some() {
@@ -927,16 +943,18 @@ impl TransactState {
             workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
         );
         let family = workload.map(workload::Admission::family);
-        let (fingerprint, canonical_request) = match workload.map(workload::Admission::digest).or(request.custody_request_digest) {
-            Some(digest) => (digest, None),
-            None => {
-                let request = request.canonical_request()?;
-                (Sha256::digest(request.get().as_bytes()).into(), Some(request))
-            }
-        };
+        let workload_digest = workload.map(workload::Admission::authorization_digest);
+        let canonical_request = request.canonical_request()?;
+        let fingerprint = request.custody_request_digest
+            .unwrap_or_else(|| Sha256::digest(canonical_request.get().as_bytes()).into());
         let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
         if let Some(stored) = stored {
-            if stored.fingerprint != fingerprint || stored.workload != family {
+            let same_request = match workload_digest {
+                Some(digest) => stored.matches_workload_digest(digest)
+                    && (stored.workload_digest.is_none() || stored.fingerprint == fingerprint),
+                None => stored.fingerprint == fingerprint,
+            };
+            if !same_request || stored.workload != family {
                 return Err(conflicting_key());
             }
             if funding.is_none() {
@@ -1050,9 +1068,9 @@ impl TransactState {
             Ok((Resolution::Answer(receipt), None))
         } else {
             // For a timed write, `after` is the index once it settles at `position + 1`.
-            let canonical_request = canonical_request.map_or_else(|| request.canonical_request(), Ok)?;
             let record = TransactionRecord::Tx(ResolvedTransact {
                 fingerprint, receipt, effects, before, receipt_namespace, admitted_at: now, workload: family,
+                workload_digest,
                 request: Some(canonical_request),
             });
             Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
@@ -1236,7 +1254,7 @@ impl TransactState {
                     self.pending = Some(Pending { position, tx });
                     Ok(None)
                 } else {
-                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.workload, tx.effects).map(Some)
+                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.workload, tx.workload_digest, tx.effects).map(Some)
                 }
             }
             TransactionRecord::Settle { tx_lsn } => {
@@ -1248,7 +1266,8 @@ impl TransactState {
                     return Err(invalid_record());
                 }
                 let receipt = self.publish(
-                    pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload, pending.tx.effects.clone(),
+                    pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload,
+                    pending.tx.workload_digest, pending.tx.effects.clone(),
                 )?;
                 self.pending = None;
                 Ok(Some(receipt))
@@ -1265,7 +1284,8 @@ impl TransactState {
                             "The original transaction lacks timely durable acknowledgement"),
                     };
                 }
-                let receipt = self.publish(receipt, pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload, Vec::new())?;
+                let receipt = self.publish(receipt, pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload,
+                    pending.tx.workload_digest, Vec::new())?;
                 self.pending = None;
                 Ok(Some(receipt))
             }
@@ -1273,7 +1293,7 @@ impl TransactState {
     }
 
     fn publish(&mut self, receipt: Receipt, fingerprint: [u8; 32], receipt_namespace: Option<[u8; 32]>,
-               workload: Option<WorkloadFamily>, effects: Vec<BranchEffect>) -> Result<Receipt> {
+               workload: Option<WorkloadFamily>, workload_digest: Option<[u8; 32]>, effects: Vec<BranchEffect>) -> Result<Receipt> {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
@@ -1293,7 +1313,7 @@ impl TransactState {
             candidate.apply(effect)?;
         }
         self.index = candidate;
-        self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload });
+        self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload, workload_digest });
         Ok(receipt)
     }
 }

@@ -56,7 +56,7 @@ pub struct Terminal {
 
 enum Entry {
     /// An ordinary decision; `after` is the index once it applies.
-    Untimed { after: BranchIndex, receipt: Receipt, fingerprint: [u8; 32], workload: Option<WorkloadFamily> },
+    Untimed { after: BranchIndex, receipt: StoredReceipt },
     Funded { record: TransactionRecord },
     /// A timed write's original record. It publishes at its terminal record.
     TimedTx { record: TransactionRecord },
@@ -235,7 +235,10 @@ impl TransactPipeline {
             entry
         } else {
             let TransactionRecord::Tx(tx) = prepared.record else { unreachable!("checked above") };
-            Entry::Untimed { after: after.clone(), receipt: tx.receipt, fingerprint: tx.fingerprint, workload: tx.workload }
+            Entry::Untimed { after: after.clone(), receipt: StoredReceipt {
+                receipt: tx.receipt, fingerprint: tx.fingerprint, receipt_namespace: tx.receipt_namespace,
+                installed: None, workload: tx.workload, workload_digest: tx.workload_digest,
+            } }
         };
         // A timed write's overlay assumes it settles at `position + 1`.
         self.speculative = after;
@@ -307,18 +310,17 @@ impl TransactPipeline {
         while self.in_flight.front().is_some_and(|entry| entry.position <= through) {
             let InFlight { position, key, entry } = self.in_flight.pop_front().expect("checked front");
             match entry {
-                Entry::Untimed { after, receipt, fingerprint, workload } => {
+                Entry::Untimed { after, receipt } => {
                     if self.durable.pending.is_some() {
                         return Err(order_error("A timed write's terminal record must be durable before later records"));
                     }
                     // Adopt the decided index: identical to applying the record, without re-applying it.
                     self.durable.index = after;
-                    let previous = self.durable.store_receipt(StoredReceipt {
-                        receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace, installed: None, workload,
-                    });
+                    let released_receipt = receipt.receipt.clone();
+                    let previous = self.durable.store_receipt(receipt);
                     debug_assert!(previous.is_none());
                     self.deciding.remove(&key);
-                    released.push(receipt);
+                    released.push(released_receipt);
                 }
                 Entry::TimedTx { record } => {
                     if self.durable.apply(position, record)?.is_some() {

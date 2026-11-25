@@ -1245,7 +1245,7 @@ impl TransactState {
         match self.workload_receipt(namespace, key) {
             Ok(stored)
                 if stored.workload == Some(commitment.family)
-                    && stored.fingerprint == commitment.digest =>
+                    && stored.matches_workload_digest(commitment.digest) =>
             {
                 Ok(Some(replay(&stored.receipt)))
             }
@@ -1278,7 +1278,7 @@ impl Admission {
         self.commitment.family
     }
 
-    pub(super) fn digest(&self) -> [u8; 32] {
+    pub(super) fn authorization_digest(&self) -> [u8; 32] {
         self.commitment.digest
     }
 

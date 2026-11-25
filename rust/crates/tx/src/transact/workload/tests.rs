@@ -420,9 +420,16 @@ fn original_acknowledgement_at_the_grant_cutoff_refuses_the_timed_effect() {
             &admission,
         )
         .unwrap();
-    let Decision::Append { position, .. } = decision else {
+    let Decision::Append { position, record } = decision else {
         panic!("expected append")
     };
+    let TransactionRecord::Tx(record) = TransactionRecord::decode(&record).unwrap() else {
+        panic!("expected transaction record")
+    };
+    let fingerprint = transaction.logical_sha256().unwrap();
+    assert_eq!(record.admission(), (transaction.key.as_slice(), journal.now, fingerprint));
+    assert_eq!(record.workload_digest, Some([20; 32]));
+    assert_eq!(record.canonical_request().unwrap().get(), transaction.canonical_request().unwrap().get());
     assert!(journal.pipeline.acknowledge(position).unwrap().is_empty());
     assert!(
         request
@@ -446,6 +453,13 @@ fn original_acknowledgement_at_the_grant_cutoff_refuses_the_timed_effect() {
         )
         .is_none()
     );
+    journal.restart();
+    let stored = journal.pipeline.durable().workload_receipt(WRITE, &transaction.key).unwrap();
+    assert_eq!(stored.fingerprint, fingerprint);
+    assert!(stored.matches_workload_digest([20; 32]));
+    assert!(!stored.matches_workload_digest([21; 32]));
+    assert!(matches!(request.prepare(journal.pipeline.durable(), journal.now).unwrap(),
+        Prepared::Answer(Reply::Receipt(receipt)) if receipt.replayed && matches!(receipt.outcome, Outcome::Refused { .. })));
 }
 
 #[test]
