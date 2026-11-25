@@ -1598,7 +1598,15 @@ pub(crate) fn gather_list_pages(
 pub(crate) fn gather_nullable_column<'a>(
     source: impl Fn(usize) -> &'a ColumnBatch, rows: &[Option<(usize, usize)>], position: usize, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
-    let (column, mut reservation) = gather_column_cells(source, rows.iter().copied(), rows.len(), position, true, memory)?;
+    gather_nullable_column_iter(source, rows.iter().copied(), position, memory)
+}
+
+pub(crate) fn gather_nullable_column_iter<'a>(
+    source: impl Fn(usize) -> &'a ColumnBatch, rows: impl ExactSizeIterator<Item = Option<(usize, usize)>> + Clone,
+    position: usize, memory: &Arc<MemoryBudget>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let count = rows.len();
+    let (column, mut reservation) = gather_column_cells(source, rows, count, position, true, memory)?;
     let bytes = column.retained_bytes()?;
     let lease = Arc::get_mut(&mut reservation).expect("A nullable gather owns its reservation");
     if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
@@ -4686,9 +4694,10 @@ impl BatchCursor for BatchExpressions {
             }
             if let rtdb_plan::Expr::Call { name, args, .. } = kernel
                 && name == "_patch"
-                && let Some((column, _scratch)) = patch::merge(args, &self.schema, &batch, &self.execution.context.memory)? {
+                && let Some((column, mut charge)) = patch::merge(args, &self.schema, &batch, &self.execution.context.memory)? {
+                self.execution.context.check_cancelled()?;
                 let lease = Arc::get_mut(&mut reservation).expect("The patch projection owns its reservation");
-                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                lease.absorb(Arc::get_mut(&mut charge).expect("The patch projection owns the merge reservation"))?;
                 columns.push(column);
                 continue;
             }

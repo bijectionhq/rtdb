@@ -53,11 +53,16 @@ async fn cursor_with_extra(context: &Arc<QueryContext>, pages: Vec<Vec<InputRow>
 #[tokio::test]
 async fn only_the_four_selected_columns_are_written_on_copied_rows() {
     let context = context();
-    let (mut cursor,_,_) = cursor_with_extra(&context,vec![vec![(1,10,20)]],0,30,true).await;
+    let (mut cursor,_,_) = cursor_with_extra(&context,vec![vec![(1,10,20),(2,12,23)]],0,30,true).await;
     let page = cursor.next_batch().await.unwrap().unwrap();
     let mut documents = Vec::new();
-    for row in 0..page.len { assert_eq!(page.columns[4].value(row).unwrap(),Value::Null);documents.push(page.columns[3].value(row).unwrap()); }
-    assert_eq!(documents,[Value::Null,Value::I64(7),Value::Null]);
+    assert_eq!(page.len, 6);
+    for (row, iid) in [1, 1, 1, 2, 2, 2].into_iter().enumerate() {
+        assert_eq!(page.columns[0].value(row).unwrap(), Value::FixedSizeBinary(vec![iid; 16]));
+        assert_eq!(page.columns[4].value(row).unwrap(), Value::Null);
+        documents.push(page.columns[3].value(row).unwrap());
+    }
+    assert_eq!(documents, [Value::Null, Value::I64(7), Value::Null, Value::Null, Value::I64(7), Value::Null]);
     drop(page);drop(cursor);assert_eq!(context.memory.used_bytes(),0);
 }
 fn intervals(page: ColumnBatch) -> Vec<(i64,i64,bool)> {
