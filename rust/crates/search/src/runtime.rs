@@ -157,10 +157,10 @@ impl LivePostingPage {
             else { return Ok(None); };
         let retained = page.bytes();
         if retained > reservation.bytes() { return Ok(None); }
-        Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").shrink_to(retained)?;
-        let tokens = rtdb_columnar::retain_array(Arc::new(page.tokens), &reservation)?;
+        let retained = Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").split_off(retained)?;
+        let tokens = rtdb_columnar::retain_array(Arc::new(page.tokens), &retained)?;
         page.tokens = tokens.as_list::<i64>().clone();
-        page._reservation = Some(reservation);
+        page._reservation = Some(retained);
         Ok(Some(page))
     }
 
