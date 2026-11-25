@@ -24,7 +24,7 @@ impl<'a> Frame<'a> {
         Ok(payload)
     }
 
-    fn counted(&mut self) -> Result<&'a [u8]> {
+    pub(super) fn counted(&mut self) -> Result<&'a [u8]> {
         let n = u16::from_be_bytes(self.take()?) as usize;
         let (field, tail) = self.0.split_at_checked(n).ok_or_else(conflict)?;
         self.0 = tail;
@@ -46,11 +46,11 @@ impl<'a> Frame<'a> {
         })
     }
 
-    fn position(&mut self) -> Result<Position> {
+    pub(super) fn position(&mut self) -> Result<Position> {
         Position::from_bytes(self.take()?).map_err(|_| conflict())
     }
 
-    fn stage(&mut self) -> Result<AssertionStage> {
+    pub(super) fn stage(&mut self) -> Result<AssertionStage> {
         AssertionStage::new(self.uuid()?, self.incarnation()?, self.uuid()?)
     }
 
@@ -79,10 +79,59 @@ pub(super) fn put_transaction(out: &mut Vec<u8>, key: TransactionKey) {
     out.extend_from_slice(&key.system_time.0.to_be_bytes());
 }
 
-fn put_stage(out: &mut Vec<u8>, stage: AssertionStage) {
+pub(super) fn put_stage(out: &mut Vec<u8>, stage: AssertionStage) {
     out.extend_from_slice(stage.deployment().as_bytes());
     out.extend_from_slice(&stage.incarnation().get().to_be_bytes());
     out.extend_from_slice(stage.identity().as_bytes());
+}
+
+pub(super) fn read_header(frame: &mut Frame<'_>) -> Result<(WorldRankTransferSource, WorldRankTransferDestination)> {
+    let source = WorldRankTransferSource {
+        original: RetiredOriginalFamilySource {
+            deployment: frame.uuid()?,
+            history: frame.take()?,
+            installation: frame.uuid()?,
+            target_installation: frame.uuid()?,
+            audience_tablet: frame.take()?,
+            row_custody: frame.take()?,
+            handoff: frame.take()?,
+            carrier: frame.transaction()?,
+            fence: frame.transaction()?,
+            through: frame.transaction()?,
+            captured: frame.transaction()?,
+        },
+        custody_incarnation: frame.incarnation()?,
+        archive: frame.take()?,
+    };
+    let destination = WorldRankTransferDestination {
+        deployment: frame.uuid()?,
+        installation: frame.uuid()?,
+        custody_incarnation: frame.incarnation()?,
+        hold: frame.take()?,
+        preparation: frame.take()?,
+    };
+    Ok((source, destination))
+}
+
+pub(super) fn put_header(out: &mut Vec<u8>, source: WorldRankTransferSource, target: WorldRankTransferDestination) {
+    let original = source.original;
+    out.extend_from_slice(original.deployment.as_bytes());
+    out.extend_from_slice(&original.history);
+    out.extend_from_slice(original.installation.as_bytes());
+    out.extend_from_slice(original.target_installation.as_bytes());
+    out.extend_from_slice(&original.audience_tablet);
+    out.extend_from_slice(&original.row_custody);
+    out.extend_from_slice(&original.handoff);
+    for key in [original.carrier, original.fence, original.through, original.captured] {
+        put_transaction(out, key);
+    }
+    out.extend_from_slice(&source.custody_incarnation.get().to_be_bytes());
+    out.extend_from_slice(&source.archive);
+    out.extend_from_slice(target.deployment.as_bytes());
+    out.extend_from_slice(target.installation.as_bytes());
+    out.extend_from_slice(&target.custody_incarnation.get().to_be_bytes());
+    out.extend_from_slice(&target.hold);
+    out.extend_from_slice(&target.preparation);
 }
 
 impl WorldRankTransfer {
@@ -90,30 +139,7 @@ impl WorldRankTransfer {
         if bytes.len() > MAX_RECORD_BYTES { return Err(too_large()); }
         let mut frame = Frame(bytes);
         if &frame.take::<4>()? != AGREEMENT { return Err(conflict()); }
-        let source = WorldRankTransferSource {
-            original: RetiredOriginalFamilySource {
-                deployment: frame.uuid()?,
-                history: frame.take()?,
-                installation: frame.uuid()?,
-                target_installation: frame.uuid()?,
-                audience_tablet: frame.take()?,
-                row_custody: frame.take()?,
-                handoff: frame.take()?,
-                carrier: frame.transaction()?,
-                fence: frame.transaction()?,
-                through: frame.transaction()?,
-                captured: frame.transaction()?,
-            },
-            custody_incarnation: frame.incarnation()?,
-            archive: frame.take()?,
-        };
-        let destination = WorldRankTransferDestination {
-            deployment: frame.uuid()?,
-            installation: frame.uuid()?,
-            custody_incarnation: frame.incarnation()?,
-            hold: frame.take()?,
-            preparation: frame.take()?,
-        };
+        let (source, destination) = read_header(&mut frame)?;
         let count = u16::from_be_bytes(frame.take()?) as usize;
         if !(1..=MAX_CONTRIBUTORS).contains(&count) { return Err(conflict()); }
         let mut contributors = Vec::with_capacity(count);
@@ -129,7 +155,7 @@ impl WorldRankTransfer {
             let rank_stage = frame.stage()?;
             let relation = frame.counted()?;
             let key = frame.counted()?;
-            if relation.len() > 255 || key.len() > 256 { return Err(conflict()); }
+            if relation.len() > 255 || key.len() > MAX_RANK_KEY_BYTES { return Err(conflict()); }
             let relation = std::str::from_utf8(relation).map_err(|_| conflict())?.to_owned();
             contributors.push(WorldRankTransferContributor {
                 family, occurrence, transaction, rank_position,
@@ -155,25 +181,7 @@ impl WorldRankTransfer {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut out = AGREEMENT.to_vec();
-        let original = self.source.original;
-        out.extend_from_slice(original.deployment.as_bytes());
-        out.extend_from_slice(&original.history);
-        out.extend_from_slice(original.installation.as_bytes());
-        out.extend_from_slice(original.target_installation.as_bytes());
-        out.extend_from_slice(&original.audience_tablet);
-        out.extend_from_slice(&original.row_custody);
-        out.extend_from_slice(&original.handoff);
-        for key in [original.carrier, original.fence, original.through, original.captured] {
-            put_transaction(&mut out, key);
-        }
-        out.extend_from_slice(&self.source.custody_incarnation.get().to_be_bytes());
-        out.extend_from_slice(&self.source.archive);
-        let target = self.destination;
-        out.extend_from_slice(target.deployment.as_bytes());
-        out.extend_from_slice(target.installation.as_bytes());
-        out.extend_from_slice(&target.custody_incarnation.get().to_be_bytes());
-        out.extend_from_slice(&target.hold);
-        out.extend_from_slice(&target.preparation);
+        put_header(&mut out, self.source, self.destination);
         self.put_inventory(&mut out)?;
         Ok(out)
     }
@@ -222,7 +230,7 @@ impl TransferRecord {
             }
             _ => return Err(malformed()),
         };
-        Ok(Self { agreement: WorldRankTransfer::from_bytes(frame.0)?, phase, delivery_revoked })
+        Ok(Self { agreement: RankTransferAgreement::from_bytes(frame.0)?, phase, delivery_revoked })
     }
 
     pub(super) fn to_bytes(&self) -> Result<Vec<u8>> {

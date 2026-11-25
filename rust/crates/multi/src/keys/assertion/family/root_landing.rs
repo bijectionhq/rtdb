@@ -2,7 +2,7 @@ use rtdb_types::{RootLandingBinding, RootLandingTarget};
 
 use super::*;
 
-const ROOT_PAYLOAD_CODEC: u32 = u32::from_be_bytes(*b"RLP1");
+pub(super) const ROOT_PAYLOAD_CODEC: u32 = u32::from_be_bytes(*b"RLP1");
 const ROOT_LINK_CODEC: u32 = u32::from_be_bytes(*b"RLL1");
 
 impl AssertionFamilies<'_> {
@@ -196,7 +196,7 @@ fn root_binding_digest(binding: RootLandingBinding) -> [u8; 32] {
     commitment
 }
 
-fn root_authoring(
+pub(super) fn root_authoring(
     family: Uuid, assertion_id: AssertionId, target: RootLandingTarget, codec: u32,
 ) -> AssertionAuthoring {
     let mut hash = Context::new(&SHA256);
