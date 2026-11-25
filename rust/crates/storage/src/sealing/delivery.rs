@@ -84,6 +84,7 @@ impl DeliveryDeadline {
 tokio::task_local! {
     static PLAINTEXT_VIEWS: Arc<[Arc<PlaintextView>]>;
     static ANSWER_HANDOFF: Handoff;
+    static INHERITED_ROOT_RANK: InheritedRootRankCut;
 }
 
 struct Unit {
@@ -112,6 +113,28 @@ pub struct RootRankSelection<'a> {
     pub ordinal: NonZeroU64,
     pub relation: &'a str,
     pub selector: &'a [u8],
+    pub inherited: Option<InheritedRootRankProof>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InheritedRootRankCut {
+    pub world: rtdb_types::Iid,
+    pub pin: rtdb_types::Iid,
+    pub basis: rtdb_types::TransactionKey,
+    pub registration: rtdb_types::OwnedPointVersion,
+    pub writer: rtdb_types::PlacedAttemptScope,
+    pub incarnation: u64,
+    pub storage_generation: Option<uuid::Uuid>,
+    pub until: rtdb_types::Timestamp,
+}
+
+pub struct InheritedRootRankProof {
+    pub cut: InheritedRootRankCut,
+    pub valid: rtdb_types::Timestamp,
+    pub carrier: rtdb_types::OwnedPointVersion,
+    pub journal: rtdb_types::OwnedPointVersion,
+    pub rank: rtdb_types::OwnedPointVersion,
+    pub allocation: Arc<MemoryReservation>,
 }
 
 #[async_trait::async_trait]
@@ -209,7 +232,21 @@ impl PlaintextView {
         Self::root_rank_authority().is_some()
     }
 
+    pub async fn reading_inherited_root_rank<F: Future>(cut: Option<InheritedRootRankCut>, work: F) -> F::Output {
+        match cut {
+            Some(cut) => INHERITED_ROOT_RANK.scope(cut, work).await,
+            None => work.await,
+        }
+    }
+
+    pub fn inherited_root_rank_cut() -> Option<InheritedRootRankCut> {
+        INHERITED_ROOT_RANK.try_with(|cut| *cut).ok()
+    }
+
     pub async fn require_root_rank_derivative(selected: RootRankSelection<'_>) -> rtdb_types::Result<()> {
+        if selected.inherited.as_ref().map(|proof| proof.cut) != Self::inherited_root_rank_cut() {
+            return Err(rank_unavailable());
+        }
         Self::root_rank_authority().ok_or_else(rank_unavailable)?.require_derivative(selected).await
     }
 
@@ -261,13 +298,19 @@ impl PlaintextView {
 
     /// Preserve the first cutoff for this subject through response handoff.
     pub fn track_release_check(key: [u8; 32], owner: Arc<dyn PlaintextReleaseCheck>) -> rtdb_types::Result<()> {
+        Self::track_release_check_until(key, owner, DeliveryDeadline::answer_window())
+    }
+
+    pub fn track_release_check_until(
+        key: [u8; 32], owner: Arc<dyn PlaintextReleaseCheck>, cutoff: DeliveryDeadline,
+    ) -> rtdb_types::Result<()> {
         PLAINTEXT_VIEWS.try_with(|views| {
             for view in views.iter() {
                 let mut checks = view.release_checks.lock();
                 if let std::collections::btree_map::Entry::Vacant(entry) = checks.entry(key) {
                     let allocation = view.memory.reserve(512)?;
                     entry.insert(Arc::new(CheckedRelease {
-                        owner: Arc::clone(&owner), cutoff: DeliveryDeadline::answer_window(), _allocation: allocation,
+                        owner: Arc::clone(&owner), cutoff, _allocation: allocation,
                     }));
                 }
             }

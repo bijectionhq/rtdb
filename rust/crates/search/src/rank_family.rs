@@ -2,8 +2,8 @@ use std::{num::NonZeroU64, sync::Arc};
 
 use rtdb_columnar::{ArrowCell, EntityIdRef, OwnedBatch};
 use rtdb_query::{QueryContext, owned_row_revision, owned_row_revision_for, read_owned_point_revision};
-use rtdb_storage::sealing::{PlaintextView, RootRankSelection};
-use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, EntityId, Interval, OwnedRelation, Result, ROOT_ROW_CARRIERS, RootFamilyDerivativeId, RootLandingTarget, RootRowCarrier, Timestamp};
+use rtdb_storage::sealing::{InheritedRootRankProof, PlaintextView, RootRankSelection};
+use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, EntityId, Interval, OwnedPointVersion, OwnedRelation, Result, ROOT_ROW_CARRIERS, RootFamilyDerivativeId, RootLandingTarget, RootRowCarrier, Timestamp};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -78,7 +78,7 @@ impl<'a> RootProjectionId<'a> {
 
         let journal = OwnedRelation::new(relation.name().strip_suffix("_search").ok_or_else(unavailable)?)?;
         let position = point(context, owner, &journal, &journal_id, valid).await?;
-        ArrowCell::named(position.batch(), "membership_until", 0).and_then(ArrowCell::binary)
+        let membership_until = ArrowCell::named(position.batch(), "membership_until", 0).and_then(ArrowCell::binary)
             .filter(|bytes| bytes.len() == size_of::<i64>()).ok_or_else(unavailable)?;
         let publication = owned_row_revision(position.batch(), 0, &journal_id, &context.memory)?;
         let carrier_revision = owned_row_revision(page.batch(), 0, &carrier, &context.memory)?;
@@ -86,13 +86,33 @@ impl<'a> RootProjectionId<'a> {
         if publication != carrier_revision || derivative_revision < publication || publication.0 <= 0 {
             return Err(unavailable());
         }
+        let inherited = if let Some(cut) = PlaintextView::inherited_root_rank_cut() {
+            if membership_until != i64::MAX.to_be_bytes().as_slice() || derivative_revision != publication
+                || context.current_time.as_micros()? != cut.basis.system_time
+            {
+                return Err(unavailable());
+            }
+            Some(InheritedRootRankProof {
+                cut, valid,
+                carrier: OwnedPointVersion {
+                    history: carrier_revision, position: rtdb_query::owned_row_event_position(page.batch(), 0)?,
+                },
+                journal: OwnedPointVersion {
+                    history: publication, position: rtdb_query::owned_row_event_position(position.batch(), 0)?,
+                },
+                rank: OwnedPointVersion {
+                    history: derivative_revision, position: rtdb_query::owned_row_event_position(projection, row)?,
+                },
+                allocation: context.memory.reserve(3 * self.physical.len() + relation.name().len() + 1024)?,
+            })
+        } else { None };
         let publication = publication.0 as u64;
         let ordinal = NonZeroU64::from(rtdb_query::owned_row_assertion_ordinal(position.batch(), 0)?.ok_or_else(unavailable)?);
         let target = RootLandingTarget::from_bytes(*target).map_err(|_| unavailable())?;
         PlaintextView::require_root_rank_derivative(RootRankSelection {
             family: Uuid::from_bytes(*family), assertion: AssertionId::from_bytes(*member), stage: *stage,
             target, link_digest: *link_digest, payload_digest: Sha256::digest(envelope).into(),
-            publication, ordinal, relation: relation.name(), selector: self.physical,
+            publication, ordinal, relation: relation.name(), selector: self.physical, inherited,
         }).await?;
 
         let mut entry = Vec::with_capacity(109 + relation.name().len() + self.physical.len());

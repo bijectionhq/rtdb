@@ -588,6 +588,9 @@ contract LogService {
         -- The Original adds the transfer to every contributing family before the destination can become readable.
         -- A readable transfer has an accepted destination replay receipt and positive copy drains on both sides.
         -- Dependent ranks stay under the Original stages and recheck the installed destination generation and all contributing Original fences at delivery.
+        -- An inherited Held Root rank binds its current destination generation and ordered world registration to the exact retained Root publication.
+        -- Each admitted Root rank matches the live Original landing and co-ordered carrier, journal and derivative occurrences at the selected valid instant.
+        -- Delivery rechecks the same registration, the applied receipts and the current erasure projection.
         -- Family custody settlement waits for each enrolled copy to report an installed or discarded terminal and positive drains.
         -- The private Root landing link binds the enrolled member and the reviewed source winner.
         -- The release owner authenticates the prepared switch receipt and recovers an interrupted activation from the original ordered position.
