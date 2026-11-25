@@ -122,18 +122,18 @@ impl ReservedRow {
 enum Image {
     Binary(Vec<u8>),
     Shared {
-        stream: Arc<RowStreamEncoder>,
+        stream: Arc<ImageStream>,
         row: PreparedStreamRow,
     },
     Deferred(Box<DeferredImage>),
 }
 
 impl Image {
-    fn encode(batch: &RecordBatch, stream: Option<&Arc<RowStreamEncoder>>) -> Result<Self, Status> {
+    fn encode(batch: &RecordBatch, stream: Option<&Arc<ImageStream>>) -> Result<Self, Status> {
         match stream {
             Some(stream) => Ok(Self::Shared {
                 stream: Arc::clone(stream),
-                row: stream.prepare(batch).map_err(error::anomaly)?,
+                row: stream.encoder.prepare(batch).map_err(error::anomaly)?,
             }),
             None => rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(batch))
                 .map(Self::Binary)
@@ -145,7 +145,7 @@ impl Image {
         match self {
             Self::Binary(bytes) => bytes.len(),
             Self::Shared { stream, row } => {
-                stream.schema_frame().len() + row.framed_len() + IMAGE_END.len()
+                stream.encoder.schema_frame().len() + row.framed_len() + IMAGE_END.len()
             }
             Self::Deferred(image) => image.legacy_len,
         }
@@ -156,8 +156,9 @@ impl Image {
         else {
             return false;
         };
-        !left.has_dictionaries() && !right.has_dictionaries()
-            && (Arc::ptr_eq(left, right) || left.schema_frame() == right.schema_frame())
+        !left.encoder.has_dictionaries() && !right.encoder.has_dictionaries()
+            && (Arc::ptr_eq(left, right)
+                || left.encoder.schema_frame() == right.encoder.schema_frame())
     }
 }
 
@@ -447,7 +448,7 @@ fn image_offsets<O: OffsetSizeTrait>(offsets: &ImageOffsets, len: usize) -> Offs
 struct DeferredImage {
     schema: SchemaRef,
     cells: [ImageCell<Buffer>; MAX_DEFERRED_IMAGE_NODES],
-    stream: Option<Arc<RowStreamEncoder>>,
+    stream: Option<Arc<ImageStream>>,
     legacy_len: usize,
 }
 
@@ -576,15 +577,21 @@ impl DeferredImage {
     }
 }
 
+struct ImageStream {
+    encoder: RowStreamEncoder,
+    _charge: Arc<MemoryReservation>,
+}
+
 enum ImageEncoding {
     Binary,
-    Stream(Option<Arc<RowStreamEncoder>>),
+    Stream(Option<Arc<ImageStream>>),
 }
 
 #[derive(Default)]
 struct ImageLayout {
     schema: Option<SchemaRef>,
     base_wire_lengths: [Option<usize>; 2],
+    shared_stream: Option<Arc<ImageStream>>,
 }
 
 impl ImageLayout {
@@ -594,6 +601,36 @@ impl ImageLayout {
             self.base_wire_lengths = [None; 2];
         }
         &mut self.base_wire_lengths[usize::from(has_body)]
+    }
+
+    fn stream(
+        &mut self,
+        schema: &SchemaRef,
+        scratch: &mut Arc<MemoryReservation>,
+    ) -> Result<Arc<ImageStream>, Status> {
+        if let Some(stream) = &self.shared_stream
+            && stream.encoder.schema_ref() == schema
+        {
+            return Ok(Arc::clone(stream));
+        }
+
+        let encoder = RowStreamEncoder::new(schema).map_err(error::anomaly)?;
+        let retained = wire::add(
+            encoder.retained_bytes().map_err(error::anomaly)?,
+            2 * size_of::<usize>() + size_of::<Arc<MemoryReservation>>(),
+        )
+        .map_err(error::map_status)?;
+        let charge = Arc::get_mut(scratch)
+            .expect("image preparation owns its scratch reservation")
+            .split_off(retained)
+            .map_err(error::anomaly)?;
+        let stream = Arc::new(ImageStream {
+            encoder,
+            _charge: charge,
+        });
+        // Arrow schema equality omits the dictionary ordering flag.
+        self.shared_stream = (!stream.encoder.has_dictionaries()).then(|| Arc::clone(&stream));
+        Ok(stream)
     }
 }
 
@@ -663,15 +700,13 @@ impl<'a> ImageProjection<'a> {
         };
         let arrays = wire::mul(array_bytes, 4).map_err(error::map_status)?;
         let size = wire::add(arrays, schema_bound).map_err(error::map_status)?;
-        let charge = memory.reserve(size).map_err(error::anomaly)?;
+        let mut charge = memory.reserve(size).map_err(error::anomaly)?;
         let stream = match &mut self.encoding {
             ImageEncoding::Binary => None,
             ImageEncoding::Stream(encoder) => {
                 let encoder = match encoder {
                     Some(encoder) => encoder,
-                    None => encoder.insert(Arc::new(
-                        RowStreamEncoder::new(schema).map_err(error::anomaly)?,
-                    )),
+                    None => encoder.insert(self.layout.stream(schema, &mut charge)?),
                 };
                 Some(&*encoder)
             }
@@ -1301,12 +1336,12 @@ fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, Arrow
         Image::Shared { row, .. } => row,
         _ => unreachable!("packed rows use the same encoded image carrier"),
     });
-    let len = stream.schema_frame().len()
+    let len = stream.encoder.schema_frame().len()
         + messages.clone().map(PreparedStreamRow::framed_len).sum::<usize>()
         + IMAGE_END.len();
     let end = i32::try_from(len).map_err(|_| ArrowError::OffsetOverflowError(len))?;
     let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(stream.schema_frame());
+    bytes.extend_from_slice(stream.encoder.schema_frame());
     for message in messages {
         message.append_to(&mut bytes);
     }
@@ -1328,6 +1363,21 @@ mod tests {
         Decimal128Array, Float32Array, Int64Array, builder::StringDictionaryBuilder,
         types::Int32Type,
     };
+
+    fn image_stream(image: &Image) -> Option<&Arc<ImageStream>> {
+        match image {
+            Image::Shared { stream, .. } => Some(stream),
+            Image::Deferred(deferred) => deferred.stream.as_ref(),
+            Image::Binary(_) => None,
+        }
+    }
+
+    fn admission_bytes(image: &Image, scratch: &MemoryReservation, first: bool) -> usize {
+        let retained = image_stream(image)
+            .filter(|_| first)
+            .map_or(0, |stream| stream._charge.bytes());
+        scratch.bytes() + retained
+    }
 
     #[test]
     fn fixed_images_preserve_scratch_admission_and_singleton_bytes_when_deferred() {
@@ -1455,7 +1505,7 @@ mod tests {
                 )
                 .unwrap();
                 let (image, scratch) = projection.prepare(index, &memory).unwrap();
-                assert_eq!(scratch.bytes(), bound);
+                assert_eq!(admission_bytes(&image, &scratch, index == 0), bound);
                 assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
                 assert_eq!(image.legacy_len(), expected.len());
                 let charge = memory
@@ -1473,6 +1523,7 @@ mod tests {
                 let singleton = image_array(std::slice::from_ref(&row), 2).unwrap();
                 assert_eq!(singleton.value(0), expected.as_slice());
             }
+            drop(layout);
             assert_eq!(memory.used_bytes(), 0);
         }
     }
@@ -1540,7 +1591,10 @@ mod tests {
                 let mut rows = Vec::new();
                 for (position, (index, slice)) in indices.into_iter().zip(&slices).enumerate() {
                     let (image, scratch) = projection.prepare(index, &memory).unwrap();
-                    assert_eq!(scratch.bytes(), wire::batch_bound(slice).unwrap());
+                    assert_eq!(
+                        admission_bytes(&image, &scratch, position == 0),
+                        wire::batch_bound(slice).unwrap(),
+                    );
                     assert_eq!(matches!(&image, Image::Deferred(_)), position != 0);
                     let expected = rtdb_format::ipc::write_stream(
                         slice.schema_ref(),
@@ -1689,7 +1743,7 @@ mod tests {
                     let (image, charge) = projection.prepare(0, &memory).unwrap();
                     let deferred = row != 0 && (last_deferred || row + 1 != slices.len());
                     assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
-                    assert_eq!(charge.bytes(), bound);
+                    assert_eq!(admission_bytes(&image, &charge, row == 0), bound);
                     let expected = rtdb_format::ipc::write_stream(
                         slice.schema_ref(),
                         std::slice::from_ref(slice),
@@ -1830,7 +1884,10 @@ mod tests {
                         std::slice::from_ref(&slice),
                     ).unwrap();
                     let (image, charge) = projection.prepare(index, &memory).unwrap();
-                    assert_eq!(charge.bytes(), wire::batch_bound(&slice).unwrap());
+                    assert_eq!(
+                        admission_bytes(&image, &charge, index == 0),
+                        wire::batch_bound(&slice).unwrap(),
+                    );
                     assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
                     assert_eq!(image.legacy_len(), expected.len());
                     let mut row = ReservedRow {
@@ -1845,6 +1902,7 @@ mod tests {
                     assert_eq!(encoded.value(0), expected.as_slice());
                 }
             }
+            drop(layout);
             assert_eq!(memory.used_bytes(), 0);
         }
     }
@@ -1874,7 +1932,7 @@ mod tests {
         let base = singleton_base(&outer_schema, &table).unwrap();
         let released = RowStreamEncoder::new(batch.schema_ref()).unwrap();
         let mut expected = released.schema_frame().to_vec();
-        let mut rows = Vec::new();
+        let mut rows: Vec<ReservedRow> = Vec::new();
         let mut shared_layout = ImageLayout::default();
         let mut ordinary_layout = ImageLayout::default();
         for input in &inputs {
@@ -1893,8 +1951,17 @@ mod tests {
                 assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
                 assert_eq!(matches!(&binary, Image::Deferred(_)), deferred);
                 let image_bound = wire::batch_bound(&candidate).unwrap();
-                assert_eq!(scratch.bytes(), image_bound);
+                assert_eq!(
+                    admission_bytes(&image, &scratch, rows.is_empty()),
+                    image_bound,
+                );
                 assert_eq!(binary_scratch.bytes(), image_bound);
+                if let Some(first) = rows.first() {
+                    assert!(Arc::ptr_eq(
+                        image_stream(first.images[0].as_ref().unwrap()).unwrap(),
+                        image_stream(&image).unwrap(),
+                    ));
+                }
                 let binary = match binary {
                     Image::Deferred(deferred) => deferred.encode().unwrap(),
                     binary => binary,
@@ -1927,7 +1994,65 @@ mod tests {
         assert_eq!(packed.value(0), expected.as_slice());
         assert!(packed.is_null(1));
         assert!(packed.is_null(2));
-        drop(rows);
+        drop((rows, shared_layout));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_changed_schema_replaces_the_encoder_while_old_images_keep_its_charge() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let batch = RecordBatch::try_from_iter([("_id", values)]).unwrap();
+        let mut changed = batch.clone();
+        changed
+            .schema_metadata_mut()
+            .insert("layout".into(), "new".into());
+        let memory = MemoryBudget::new(1 << 20);
+        let mut layout = ImageLayout::default();
+        let (first, deferred) = {
+            let mut projection = ImageProjection::new(&batch, &[0], true, &mut layout);
+            (
+                projection.prepare(0, &memory).unwrap().0,
+                projection.prepare(1, &memory).unwrap().0,
+            )
+        };
+        let first_stream = image_stream(&first).unwrap();
+        assert!(Arc::ptr_eq(first_stream, image_stream(&deferred).unwrap()));
+        let old_charge = first_stream._charge.bytes();
+        assert_eq!(memory.used_bytes(), old_charge);
+
+        let changed = ImageProjection::new(&changed, &[0], true, &mut layout)
+            .prepare(0, &memory)
+            .unwrap()
+            .0;
+        assert!(!first.shares_schema_with(&changed));
+        let new_charge = image_stream(&changed).unwrap()._charge.bytes();
+        assert_eq!(memory.used_bytes(), old_charge + new_charge);
+        drop(first);
+
+        let Image::Deferred(deferred) = deferred else {
+            panic!("expected a deferred image");
+        };
+        let materialized = deferred.encode().unwrap();
+        drop(deferred);
+        assert_eq!(memory.used_bytes(), old_charge + new_charge);
+        let candidate = batch.slice(1, 1);
+        let expected = rtdb_format::ipc::write_stream(
+            candidate.schema_ref(),
+            std::slice::from_ref(&candidate),
+        )
+        .unwrap();
+        let row = ReservedRow {
+            table: Arc::from("public.rows"),
+            time: Timestamp(1),
+            opened: true,
+            images: [Some(materialized), None, None],
+            charge: memory.reserve(0).unwrap(),
+        };
+        let array = image_array(std::slice::from_ref(&row), 0).unwrap();
+        assert_eq!(array.value(0), expected.as_slice());
+        drop(row);
+        assert_eq!(memory.used_bytes(), new_charge);
+        drop((changed, layout));
         assert_eq!(memory.used_bytes(), 0);
     }
 
@@ -2063,11 +2188,11 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let mut shared_layout = ImageLayout::default();
         let mut legacy_layout = ImageLayout::default();
-        let mut shared = ImageProjection::new(&batch, &[0], true, &mut shared_layout);
-        let mut legacy = ImageProjection::new(&batch, &[0], false, &mut legacy_layout);
-        let mut make_row = |row| {
-            let (image, charge) = shared.prepare(row, &memory).unwrap();
-            let (legacy, _) = legacy.prepare(row, &memory).unwrap();
+        let mut make_row = |batch: &RecordBatch| {
+            let mut shared = ImageProjection::new(batch, &[0], true, &mut shared_layout);
+            let mut legacy = ImageProjection::new(batch, &[0], false, &mut legacy_layout);
+            let (image, charge) = shared.prepare(0, &memory).unwrap();
+            let (legacy, _) = legacy.prepare(0, &memory).unwrap();
             let Image::Binary(legacy) = legacy else {
                 panic!("expected an ordinary image");
             };
@@ -2083,8 +2208,12 @@ mod tests {
             assert_eq!(encoded.value(0), legacy.as_slice());
             row
         };
-        let first = make_row(0);
-        let second = make_row(1);
+        let first = make_row(&batch.slice(0, 1));
+        let second = make_row(&batch.slice(1, 1));
+        assert!(!Arc::ptr_eq(
+            image_stream(first.images[0].as_ref().unwrap()).unwrap(),
+            image_stream(second.images[0].as_ref().unwrap()).unwrap(),
+        ));
         assert!(!first.shares_streams_with(&second));
     }
 }

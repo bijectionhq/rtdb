@@ -1830,6 +1830,18 @@ impl RowStreamEncoder {
         &self.schema_frame
     }
 
+    /// Borrows the input schema supplied to `new`.
+    pub fn schema_ref(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Bounds the retained schema and its wire frame, including the encoder's inline storage.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let schema = retained_stream_schema_bound(&self.schema)?;
+        let frame = allocation_add(schema, self.schema_frame.capacity())?;
+        allocation_add(std::mem::size_of::<Self>(), frame)
+    }
+
     pub fn has_dictionaries(&self) -> bool {
         self.dictionaries != 0
     }
