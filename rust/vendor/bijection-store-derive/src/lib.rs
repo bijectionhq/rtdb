@@ -63,9 +63,13 @@ pub const DERIVE_ORDINAL_BASE: u64 = 1u64 << 48;
 /// then version big-endian).
 pub const STAMP_BYTES: usize = 16;
 
-/// Encoded width of a world identifier immediately following the partition
-/// prefix.
-pub const WORLD_BYTES: usize = 16;
+/// A stored key's place is its partition prefix (a big-endian `u16` length,
+/// then that many bytes), a family byte, then its world as one escaped
+/// segment (`store_read::layout::stored`): `partition ‖ family ‖
+/// segment(world) ‖ …`. Two keys share a place when their partition prefixes
+/// and world segments are equal, whatever their families: a row's manifest
+/// (family `Row`), its markers (`Index`) and its statistics, aggregates and
+/// expiry entries (`Persistence`) all lie at the row's place.
 
 /// Encoded width of a precedence (`stamp || ordinal`).
 pub const PRECEDENCE_BYTES: usize = 24;
@@ -309,11 +313,6 @@ pub open spec fn prefix_eq(a: Seq<u8>, b: Seq<u8>, len: int) -> bool {
     len <= a.len() && len <= b.len() && forall|i: int| 0 <= i < len ==> #[trigger] a[i] == b[i]
 }
 
-/// `key` with its 16-byte world at `[p_len, p_len + 16)` replaced by `world`.
-pub open spec fn rerooted_spec(key: Seq<u8>, p_len: int, world: Seq<u8>) -> Seq<u8> {
-    Seq::new(key.len(), |i: int| if p_len <= i && i < p_len + 16 { world[i - p_len] } else { key[i] })
-}
-
 /// The order-preserving `u64` image of an `i64` (sign bit flipped).
 pub open spec fn ordered_spec(value: i64) -> u64 {
     (value as u64) ^ 0x8000_0000_0000_0000u64
@@ -359,20 +358,6 @@ pub proof fn lemma_edged_retraction_exact(o_from: i64, o_to: i64, t: i64)
         t < i64::MAX,
     ensures
         edged_retraction_sum(o_from, o_to, t) == -edged_coverage(o_from, o_to, t),
-{
-}
-
-/// P10 core: re-rooting a key's world preserves its partition prefix and
-/// places the target world immediately after it.
-pub proof fn lemma_reroot_confined(key: Seq<u8>, p_len: int, world: Seq<u8>)
-    requires
-        0 <= p_len,
-        p_len + 16 <= key.len(),
-        world.len() == 16,
-    ensures
-        rerooted_spec(key, p_len, world).len() == key.len(),
-        prefix_eq(rerooted_spec(key, p_len, world), key, p_len),
-        forall|i: int| 0 <= i < 16 ==> #[trigger] rerooted_spec(key, p_len, world)[p_len + i] == world[i],
 {
 }
 
@@ -497,12 +482,66 @@ pub fn partition_prefix_len(key: &[u8]) -> Option<usize> {
     Some(2 + len)
 }
 
-/// The length of `prefix`'s place (`partition ‖ world`), when it has one.
+/// The end of the escaped segment that starts at `start` in `key` (past its
+/// `0x00 0x01` terminator), when it is well formed.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
-pub fn place_prefix_len(prefix: &[u8]) -> Option<usize> {
-    let p_len = partition_prefix_len(prefix)?;
-    let place_len = p_len.checked_add(WORLD_BYTES)?;
-    (prefix.len() >= place_len).then_some(place_len)
+pub fn segment_end(key: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < key.len() {
+        if key[i] == 0 {
+            match key.get(i + 1) {
+                Some(1) => return Some(i + 2),
+                Some(0xff) => i += 2,
+                _ => return None,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// A stored key's place bounds: its partition prefix's length and the end
+/// of its world segment, which follows the family byte.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn place_bounds(key: &[u8]) -> Option<(usize, usize)> {
+    let p_len = partition_prefix_len(key)?;
+    if key.len() <= p_len {
+        return None;
+    }
+    Some((p_len, segment_end(key, p_len + 1)?))
+}
+
+/// Whether `a` lies in `b`'s partition.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn same_partition(a: &[u8], b: &[u8]) -> bool {
+    match (partition_prefix_len(a), partition_prefix_len(b)) {
+        (Some(pa), Some(pb)) => pa == pb && a[..pa] == b[..pb],
+        _ => false,
+    }
+}
+
+/// Whether `a` lies at `b`'s place: the same partition and the same world,
+/// whatever its family (P10).
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn same_place(a: &[u8], b: &[u8]) -> bool {
+    match (place_bounds(a), place_bounds(b)) {
+        (Some((pa, ea)), Some((pb, eb))) => pa == pb && a[..pa] == b[..pb] && a[pa + 1..ea] == b[pb + 1..eb],
+        _ => false,
+    }
+}
+
+/// `key` re-rooted into the world whose escaped segment is `world`: its
+/// partition, family and everything after its world are kept (P10). `None`
+/// for a key with no well-formed place.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn reroot(key: &[u8], world: &[u8]) -> Option<Vec<u8>> {
+    let (p_len, end) = place_bounds(key)?;
+    let mut out = Vec::with_capacity(p_len + 1 + world.len() + key.len() - end);
+    out.extend_from_slice(&key[..p_len + 1]);
+    out.extend_from_slice(world);
+    out.extend_from_slice(&key[end..]);
+    Some(out)
 }
 
 /// Whether `a` and `b` share their first `len` bytes.
@@ -526,44 +565,6 @@ pub fn same_prefix(a: &[u8], b: &[u8], len: usize) -> bool {
         i += 1;
     }
     true
-}
-
-/// Re-root `key` into `world` (the 16 bytes immediately following the
-/// partition prefix of length `p_len`), keeping the partition prefix and
-/// every byte past the world unchanged.
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    requires
-        p_len + 16 <= key@.len(),
-        world@.len() == 16,
-    ensures
-        out@ == rerooted_spec(key@, p_len as int, world@),
-        out@.len() == key@.len(),
-        prefix_eq(out@, key@, p_len as int),
-        forall|j: int| 0 <= j < 16 ==> #[trigger] out@[p_len as int + j] == world@[j],
-))]
-pub fn reroot_world(key: &[u8], p_len: usize, world: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(key.len());
-    let mut i = 0usize;
-    #[cfg_attr(verus_keep_ghost, verus_spec(invariant
-        i <= key@.len(),
-        p_len + 16 <= key@.len(),
-        world@.len() == 16,
-        out@.len() == i,
-        forall|j: int| 0 <= j < i ==> #[trigger] out@[j] == (
-            if p_len as int <= j && j < p_len as int + 16 { world@[j - p_len as int] } else { key@[j] }
-        ),
-        decreases key@.len() - i,
-    ))]
-    while i < key.len() {
-        let byte = if p_len <= i && i - p_len < 16 { world[i - p_len] } else { key[i] };
-        out.push(byte);
-        i += 1;
-    }
-    #[cfg(verus_keep_ghost)]
-    proof! {
-        assert(out@ =~= rerooted_spec(key@, p_len as int, world@));
-    };
-    out
 }
 
 /// Build a stamped derived key `identity ‖ stamp ‖ ordinal.to_be_bytes()`,
@@ -702,16 +703,12 @@ fn fill_key_stamp(identity: &[u8], key_stamp: Option<KeyStamp>, stamp: &[u8; STA
 /// request alone.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 pub fn check(derive: &Derive) -> Result<(), DeriveError> {
-    let p_len = partition_prefix_len(&derive.manifest_prefix)
-        .ok_or_else(|| DeriveError::new("A derive manifest prefix starts with a whole partition prefix"))?;
-    let place_len = place_prefix_len(&derive.manifest_prefix)
-        .ok_or_else(|| DeriveError::new("A derive manifest prefix carries its partition and world"))?;
+    if place_bounds(&derive.manifest_prefix).is_none() {
+        return Err(DeriveError::new("A derive manifest prefix carries its partition, family and world"));
+    }
     for level in &derive.levels {
-        if !same_prefix(&level.prefix, &derive.manifest_prefix, p_len) {
+        if place_bounds(&level.prefix).is_none() || !same_partition(&level.prefix, &derive.manifest_prefix) {
             return Err(DeriveError::new("A derive lookup level must stay in the manifest's partition"));
-        }
-        if level.prefix.len() < place_len {
-            return Err(DeriveError::new("A derive lookup level carries its partition and world"));
         }
     }
     if let DeriveMode::Replace { interval, entries } = &derive.mode {
@@ -725,9 +722,10 @@ pub fn check(derive: &Derive) -> Result<(), DeriveError> {
             _ => {},
         }
         for entry in entries {
-            if !same_prefix(&entry.identity, &derive.manifest_prefix, place_len) {
+            if !same_place(&entry.identity, &derive.manifest_prefix) {
                 return Err(DeriveError::new("A derived entry must stay in the manifest's partition and world"));
             }
+            let place_len = place_bounds(&entry.identity).map_or(0, |(_, end)| end);
             if let Some(KeyStamp::Raw(offset) | KeyStamp::EscapedSegment(offset) | KeyStamp::DoubleEscapedSegment(offset)) = entry.key_stamp {
                 let start = offset as usize;
                 let end = start.checked_add(STAMP_BYTES)
@@ -809,12 +807,11 @@ pub fn apply(
         manifest: Manifest { segments: previous.segments.clone(), horizon: previous.horizon, written_keys: Vec::new() },
         next_ordinal: ordinal,
     };
-    let Some(place_len) = place_prefix_len(manifest_prefix) else { return unchanged() };
+    let Some((m_partition, m_world_end)) = place_bounds(manifest_prefix) else { return unchanged() };
     if interval.from >= interval.to {
         return unchanged();
     }
-    let p_len = place_len - WORLD_BYTES;
-    let target_world = &manifest_prefix[p_len..place_len];
+    let target_world = &manifest_prefix[m_partition + 1..m_world_end];
     let mut ordinal = ordinal;
 
     // 1. The previous line, re-rooted into the target world when inherited
@@ -822,14 +819,12 @@ pub fn apply(
     let prev: Vec<Segment> = previous
         .segments
         .iter()
-        .filter(|segment| segment.identity.len() >= place_len && same_prefix(&segment.identity, manifest_prefix, p_len))
-        .map(|segment| {
-            let own = same_prefix(&segment.identity, manifest_prefix, place_len);
-            Segment {
-                identity: if own { segment.identity.clone() } else { reroot_world(&segment.identity, p_len, target_world) },
-                live_key: if own && same_prefix(&segment.live_key, manifest_prefix, place_len) { segment.live_key.clone() } else { Vec::new() },
-                ..segment.clone()
-            }
+        .filter(|segment| same_partition(&segment.identity, manifest_prefix))
+        .filter_map(|segment| {
+            let own = same_place(&segment.identity, manifest_prefix);
+            let identity = if own { segment.identity.clone() } else { reroot(&segment.identity, target_world)? };
+            let live_key = if own && same_place(&segment.live_key, manifest_prefix) { segment.live_key.clone() } else { Vec::new() };
+            Some(Segment { identity, live_key, ..segment.clone() })
         })
         .collect();
     let horizon = previous.horizon.max(interval.to);
@@ -837,7 +832,7 @@ pub fn apply(
     // 2. The new entries over the interval, stamp placeholders filled.
     let new: Vec<Segment> = entries
         .iter()
-        .filter(|entry| same_prefix(&entry.identity, manifest_prefix, place_len))
+        .filter(|entry| same_place(&entry.identity, manifest_prefix))
         .map(|entry| Segment {
             from: interval.from,
             to: interval.to,
@@ -1012,12 +1007,14 @@ pub fn purge(
     ordinal: u64,
 ) -> (Vec<EmittedWrite>, u64) {
     let mut ordinal = ordinal;
-    let Some(place_len) = place_prefix_len(manifest_prefix) else { return (Vec::new(), ordinal) };
+    if place_bounds(manifest_prefix).is_none() {
+        return (Vec::new(), ordinal);
+    }
     let mut writes = Vec::new();
     // 1. Retract the latest line's live statistics and edged contributions.
     if let Some((_, latest)) = stored_manifests.last() {
         for segment in &latest.segments {
-            if !same_prefix(&segment.identity, manifest_prefix, place_len) {
+            if !same_place(&segment.identity, manifest_prefix) {
                 continue;
             }
             match segment.kind {
@@ -1042,11 +1039,11 @@ pub fn purge(
     let mut deleted = std::collections::BTreeSet::<Vec<u8>>::new();
     for (manifest_key, manifest) in stored_manifests {
         for key in &manifest.written_keys {
-            if same_prefix(key, manifest_prefix, place_len) && deleted.insert(key.clone()) {
+            if same_place(key, manifest_prefix) && deleted.insert(key.clone()) {
                 writes.push(EmittedWrite { key: key.clone(), value: None });
             }
         }
-        if same_prefix(manifest_key, manifest_prefix, place_len) && deleted.insert(manifest_key.clone()) {
+        if same_place(manifest_key, manifest_prefix) && deleted.insert(manifest_key.clone()) {
             writes.push(EmittedWrite { key: manifest_key.clone(), value: None });
         }
     }
@@ -1301,11 +1298,25 @@ impl Derive {
 mod tests {
     use super::*;
 
-    fn place_prefix(part: &[u8], world: [u8; 16]) -> Vec<u8> {
+    const ROW: u8 = 16;
+    const INDEX: u8 = 17;
+    const PERSISTENCE: u8 = 32;
+
+    /// A stored key `partition ‖ family ‖ segment(world) ‖ rest`, as
+    /// `store_read::layout::stored` builds it.
+    fn key(part: &[u8], family: u8, world: [u8; 16], rest: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(part.len() as u16).to_be_bytes());
         out.extend_from_slice(part);
-        out.extend_from_slice(&world);
+        out.push(family);
+        for byte in world {
+            out.push(byte);
+            if byte == 0 {
+                out.push(0xff);
+            }
+        }
+        out.extend_from_slice(&[0, 1]);
+        out.extend_from_slice(rest);
         out
     }
 
@@ -1313,18 +1324,28 @@ mod tests {
         [0x80, 0, 0, 0, 0, 0, 0, micros, 0, 0, 0, 0, 0, 0, 0, version]
     }
 
-    fn entry(kind: EntryKind, name: &[u8], enter: &[u8], leave: &[u8]) -> DeriveEntry {
-        DeriveEntry { kind, identity: [place_prefix(b"p", [0; 16]), name.to_vec()].concat(), key_stamp: None, enter_value: enter.to_vec(), leave_value: leave.to_vec() }
+    fn entry(kind: EntryKind, family: u8, name: &[u8], enter: &[u8], leave: &[u8]) -> DeriveEntry {
+        DeriveEntry { kind, identity: key(b"p", family, [0; 16], name), key_stamp: None, enter_value: enter.to_vec(), leave_value: leave.to_vec() }
     }
 
     fn prefix() -> Vec<u8> {
-        [place_prefix(b"p", [0; 16]), b"row\x04".to_vec()].concat()
+        key(b"p", ROW, [0; 16], b"row\x04")
+    }
+
+    #[test]
+    fn entries_of_every_family_share_the_rows_place() {
+        assert!(same_place(&key(b"p", INDEX, [0; 16], b"x"), &prefix()));
+        assert!(same_place(&key(b"p", PERSISTENCE, [0; 16], b"y"), &prefix()));
+        assert!(!same_place(&key(b"p", INDEX, [1; 16], b"x"), &prefix()), "another world");
+        assert!(!same_place(&key(b"q", INDEX, [0; 16], b"x"), &prefix()), "another partition");
+        let rerooted = reroot(&key(b"p", INDEX, [1; 16], b"x"), &prefix()[4..4 + 34]).unwrap();
+        assert_eq!(rerooted, key(b"p", INDEX, [0; 16], b"x"), "re-rooting swaps only the world segment");
     }
 
     #[test]
     fn identical_reput_emits_nothing() {
-        let marker = entry(EntryKind::Marker, b"idx_a", &[1], &[]);
-        let stats = entry(EntryKind::Boundary, b"stats", &[1], &[0xff]);
+        let marker = entry(EntryKind::Marker, INDEX, b"idx_a", &[1], &[]);
+        let stats = entry(EntryKind::Boundary, PERSISTENCE, b"stats", &[1], &[0xff]);
         let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: OPEN_END }, &[marker.clone(), stats.clone()], stamp(10, 1), DERIVE_ORDINAL_BASE);
         assert_eq!(first.writes.len(), 2, "one marker enter, one statistics enter");
         let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: OPEN_END }, &[marker, stats], stamp(20, 2), DERIVE_ORDINAL_BASE);
@@ -1333,8 +1354,8 @@ mod tests {
 
     #[test]
     fn a_move_leaves_and_enters_and_purge_deletes_both() {
-        let a = entry(EntryKind::Marker, b"idx_a", &[1], &[]);
-        let b = entry(EntryKind::Marker, b"idx_b", &[1], &[]);
+        let a = entry(EntryKind::Marker, INDEX, b"idx_a", &[1], &[]);
+        let b = entry(EntryKind::Marker, INDEX, b"idx_b", &[1], &[]);
         let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: OPEN_END }, &[a], stamp(10, 1), DERIVE_ORDINAL_BASE);
         let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: OPEN_END }, &[b], stamp(20, 2), DERIVE_ORDINAL_BASE);
         assert_eq!(second.writes.len(), 2);
@@ -1350,7 +1371,7 @@ mod tests {
 
     #[test]
     fn statistics_count_the_row_once_across_puts_and_a_delete() {
-        let doc = |n: u8| entry(EntryKind::Boundary, b"stats", &[n], &[0x80 | n]);
+        let doc = |n: u8| entry(EntryKind::Boundary, PERSISTENCE, b"stats", &[n], &[0x80 | n]);
         let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: OPEN_END }, &[doc(1)], stamp(10, 1), DERIVE_ORDINAL_BASE);
         assert_eq!(first.writes.iter().map(|w| w.value.clone()).collect::<Vec<_>>(), vec![Some(vec![1])]);
         let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: OPEN_END }, &[doc(2)], stamp(20, 2), DERIVE_ORDINAL_BASE);
@@ -1361,7 +1382,7 @@ mod tests {
 
     #[test]
     fn an_edged_assertion_counts_out_the_overlap_and_back_in_after_it() {
-        let edged = |v: u8| entry(EntryKind::Edged { retain: false }, b"agg", &[v], &[0x80 | v]);
+        let edged = |v: u8| entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg", &[v], &[0x80 | v]);
         let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 20 }, &[edged(1)], stamp(1, 1), DERIVE_ORDINAL_BASE);
         assert_eq!(first.writes.len(), 2, "+v at 10, -v at 20");
         let second = apply(&prefix(), &first.manifest, ValidInterval { from: 15, to: 18 }, &[edged(2)], stamp(2, 2), DERIVE_ORDINAL_BASE);
@@ -1372,8 +1393,8 @@ mod tests {
 
     #[test]
     fn an_empty_interval_or_a_foreign_entry_changes_nothing() {
-        let foreign = DeriveEntry { identity: [place_prefix(b"q", [0; 16]), b"x".to_vec()].concat(), ..entry(EntryKind::Marker, b"x", &[1], &[]) };
-        let empty = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 5, to: 5 }, &[entry(EntryKind::Marker, b"x", &[1], &[])], stamp(1, 1), DERIVE_ORDINAL_BASE);
+        let foreign = DeriveEntry { identity: key(b"q", INDEX, [0; 16], b"x"), ..entry(EntryKind::Marker, INDEX, b"x", &[1], &[]) };
+        let empty = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 5, to: 5 }, &[entry(EntryKind::Marker, INDEX, b"x", &[1], &[])], stamp(1, 1), DERIVE_ORDINAL_BASE);
         assert!(empty.writes.is_empty());
         let confined = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 5, to: 6 }, &[foreign], stamp(1, 1), DERIVE_ORDINAL_BASE);
         assert!(confined.writes.is_empty(), "an entry outside the manifest's place is never emitted");
@@ -1381,7 +1402,7 @@ mod tests {
 
     #[test]
     fn wire_and_manifest_round_trip() {
-        let prefix = [place_prefix(b"p", [1; 16]), b"r\x04".to_vec()].concat();
+        let prefix = key(b"p", ROW, [1; 16], b"r\x04");
         let derive = Derive {
             manifest_prefix: prefix.clone(),
             levels: vec![DeriveLevel { prefix: prefix.clone(), through: None }],
@@ -1389,7 +1410,7 @@ mod tests {
                 interval: DeriveInterval::FromStamp { to: OPEN_END },
                 entries: vec![DeriveEntry {
                     kind: EntryKind::Edged { retain: true },
-                    identity: [place_prefix(b"p", [1; 16]), b"agg".to_vec()].concat(),
+                    identity: key(b"p", PERSISTENCE, [1; 16], b"agg"),
                     key_stamp: None,
                     enter_value: vec![0, 1],
                     leave_value: vec![0xff, 0xff],

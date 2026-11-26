@@ -138,10 +138,15 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
         store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind},
     };
     let mut state = TransactState::new(INCARNATION);
-    let place = |inner: &[u8]| [vec![0u8, 1, b'p'], vec![0u8; 16], inner.to_vec()].concat();
-    let manifest_prefix = place(b"row1\x04");
-    let idx_a = place(b"idx/a");
-    let idx_b = place(b"idx/b");
+    // Bijection's stored key: `partition ‖ family ‖ segment(world) ‖ …`, the
+    // manifest in the Row family (16), its markers in the Index family (17).
+    let place = |family: u8, inner: &[u8]| {
+        let world: Vec<u8> = [0u8; 16].iter().flat_map(|_| [0u8, 0xff]).chain([0u8, 1]).collect();
+        [vec![0u8, 1, b'p', family], world, inner.to_vec()].concat()
+    };
+    let manifest_prefix = place(16, b"row1\x04");
+    let idx_a = place(17, b"idx/a");
+    let idx_b = place(17, b"idx/b");
     let level = vec![DeriveLevel { prefix: manifest_prefix.clone(), through: None }];
     let marker = |id: &Vec<u8>| DeriveEntry {
         kind: EntryKind::Marker,
