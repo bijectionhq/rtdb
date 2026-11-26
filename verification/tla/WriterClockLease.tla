@@ -7,6 +7,15 @@
  * only once its clock passes `Until` plus the drift bound. It waits once, at
  * takeover, and never per append.
  *
+ * The same lease bounds the replication leader's handover on the Kafka path
+ * (T7-2). Each term's appender issues `NoOp.clock_lease_micros` on the
+ * clock's schedule and the term decides only while its clock plus the drift
+ * bound is before the latest lease it issued; every decision follows that
+ * lease in the term's log, so a durable stamp always lies under a durable
+ * lease. A promoted term's fence is the latest lease applied before it, and
+ * the record right after each block boundary carries the current lease, so
+ * a node resuming from a block knows it. `Until` is that latest lease.
+ *
  * Paired histories over one real-time tape and one pair of clock skews:
  * history A carries hidden predecessor commits that history B lacks; both
  * carry the same public ones. The successor's start must not tell them apart.
@@ -22,6 +31,12 @@
  * its clock passes its history's last stamp. Monotonicity still holds, but a
  * hidden tail commit delays the start in A only, violating StartIndependent.
  *
+ * Failing control (Mutation = "lost_lease",
+ * WriterClockLease_control_lost_lease.cfg): the successor knows no lease, as
+ * a node resuming after a boundary would if the carried lease record were
+ * dropped, and starts at once. A successor sample can then fall at or below
+ * a predecessor sample, violating SamplesMonotone.
+ *
  * Witness (WriterClockLease_witness.cfg): NotWitnessReached is violated, so a
  * takeover after a hidden predecessor commit is reachable.
  *)
@@ -31,7 +46,7 @@ CONSTANTS
     MaxTime,     \* real-time bound, e.g. 6
     Drift,       \* clock drift bound, e.g. 1
     Until,       \* the predecessor's durable lease end, e.g. 3
-    Mutation     \* "none" | "fence_last_stamp"
+    Mutation     \* "none" | "fence_last_stamp" | "lost_lease"
 
 Writers == {"pred", "succ"}
 Skews == -Drift..Drift
@@ -85,9 +100,9 @@ LastStamp(P) == IF P = {} THEN -(MaxTime + Drift + 1) ELSE Max(P)
 \* Whether the successor's fence lets it start, given its history's
 \* predecessor samples.
 MayStart(P) ==
-    IF Mutation = "fence_last_stamp"
-    THEN Local("succ") > LastStamp(P)
-    ELSE Local("succ") > Until + Drift
+    CASE Mutation = "fence_last_stamp" -> Local("succ") > LastStamp(P)
+      [] Mutation = "lost_lease" -> TRUE
+      [] OTHER -> Local("succ") > Until + Drift
 
 StartAEnabled == startA = NoStart /\ MayStart(predA)
 StartBEnabled == startB = NoStart /\ MayStart(predB)

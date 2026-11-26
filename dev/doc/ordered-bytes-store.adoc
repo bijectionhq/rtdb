@@ -76,6 +76,10 @@ It always reports how far it inspected, so a caller resumes from there.
   The store decides regression, the window and the stamp through Bijection's `fact_store::persistence::judge::admit`, which RTDB vendors byte for byte as `rust/vendor/bijection-store-judge` (pinned by SHA-256 in both repositories).
 * The writer's clock never issues a sample below one it has issued, and the clock's own contract ensures it, not the appends.
   A Multi writer holds a durable clock lease (`Record::Lease { until }`), renewed on the clock's schedule and never per append: it samples only while its clock plus the drift bound is before `until`, and a successor writer starts only once its clock passes the predecessor's `until` plus the drift bound.
+  A replication leader on the Kafka path holds the same lease in its replica log (`driver.rs`, `appender.rs`).
+  Each term's appender issues `NoOp.clock_lease_micros` on the clock's schedule, and the term decides a store append only while its clock plus the drift bound is before the latest lease it issued; every decision follows that lease in the term's log, so a durable stamp always lies under a durable lease.
+  A promoted term issues its first lease, and so decides, only once its clock passes the latest applied lease plus the drift bound.
+  The record right after each block boundary carries the current lease, so a node resuming from a block knows it.
   The successor waits once, at takeover, and that wait depends on the lease alone, never on whether the last commits were hidden.
   A sample below the head's time is the writer clock's fault (`rtdb.store/clock-regressed`), never a wait and never raised.
 * *Positions name transactions.*
@@ -139,5 +143,5 @@ Remaining: a historical (as-of time) world fork with no positioned basis still m
 * V9′: `TransactState::resolve_store`'s clock decision equals `judge::admit(head, last, sample, not_before, before, write_free)` with no comparison of the sample against the last stamp beyond `admit`'s own regression check.
   Control: re-adding `stamped && now == floor` must break it.
 * `PositionNamedRecovery.tla`: recovery groups events by position and keeps transactions atomic (`TxAtomic`); grouping by system time with ties merges two transactions (control config).
-* `WriterClockLease.tla`: samples stay monotone across takeover and restore, and the takeover wait is independent of hidden appends; fencing on the last stamp keeps monotonicity but breaks the paired-history invariant (control config).
+* `WriterClockLease.tla`, for the Multi writer and the replication leader alike: samples stay monotone across takeover and restore, and the takeover wait is independent of hidden appends; fencing on the last stamp keeps monotonicity but breaks the paired-history invariant (control `fence_last_stamp`), and a successor that knows no lease, as a node resuming after a boundary without the carried lease record would, breaks monotonicity (control `lost_lease`).
 

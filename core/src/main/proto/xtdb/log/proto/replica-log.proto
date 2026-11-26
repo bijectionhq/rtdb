@@ -95,6 +95,14 @@ message NoOp {
     // An applied-branch decision or reply. A timed original stores its source position here.
     // Only its terminal record sets src_msg_id.
     bytes serving_record = 3;
+
+    // A leader clock lease end, in UTC microseconds, and nothing else (T7). A leader decides
+    // only while its clock plus the drift bound is before the latest lease it issued, and
+    // renews it on the clock's schedule, never per record. A successor issues its first
+    // lease, and so decides, only once its clock passes the latest applied lease plus the
+    // drift bound. The record right after a block boundary carries the current lease, so a
+    // node resuming after that boundary knows it.
+    int64 clock_lease_micros = 4;
 }
 
 // Stands in for a message the log declined for its size: the encoded message is in the

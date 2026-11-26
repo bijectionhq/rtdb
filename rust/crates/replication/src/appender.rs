@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, atomic::{AtomicI64, Ordering}};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -95,6 +95,47 @@ pub(crate) struct ReplicaAppender {
     queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock,
     heartbeat: bool,
     durable_commit_observer: Option<DurableCommitObserver>,
+    clock_lease: Option<ClockLease>,
+}
+
+/// How long one leader clock lease lasts past the sample that issues it.
+/// It exceeds twice the drift bound, as Multi's writer lease does.
+pub(crate) const LEADER_CLOCK_LEASE_MICROS: i64 = 2_000_000;
+
+/// The leader's clock lease (T7). A term decides only while its clock plus
+/// the drift bound is before the latest lease it issued, so every stamp it
+/// takes lies below that lease. It issues its first lease only once its
+/// clock passes the latest lease applied before the term plus the drift
+/// bound, and renews on the clock's schedule, never per record. The
+/// takeover therefore waits once, on the lease alone: never on the last
+/// stamp, which would make the wait depend on hidden commits.
+pub(crate) struct ClockLease {
+    /// The latest lease applied before this term began.
+    fence: i64,
+    drift: i64,
+    /// The latest lease this term has enqueued, read by the driver's decision gate.
+    issued: Arc<AtomicI64>,
+}
+
+impl ClockLease {
+    /// The lease to issue at `now`: once the takeover fence has passed, and
+    /// when the issued lease ends within half a period.
+    fn due(&self, now: i64) -> Option<i64> {
+        (now > self.fence.saturating_add(self.drift)
+            && now.saturating_add(LEADER_CLOCK_LEASE_MICROS / 2) >= self.issued.load(Ordering::Acquire))
+            .then(|| now.saturating_add(LEADER_CLOCK_LEASE_MICROS))
+    }
+
+    /// The lease a record right after a block boundary carries, so a node
+    /// resuming after that boundary learns it without replaying earlier records.
+    fn carried(&self) -> Option<i64> {
+        Some(self.fence.max(self.issued.load(Ordering::Acquire))).filter(|until| *until > i64::MIN)
+    }
+}
+
+/// A lease record: a no-op carrying only the lease end.
+fn clock_lease_record(until: i64) -> ReplicaBody {
+    ReplicaBody::NoOp(proto::NoOp { clock_lease_micros: Some(until), ..Default::default() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,9 +172,15 @@ impl DurableCommitObservation {
 impl ReplicaAppender {
     pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken, clock: ReplicationClock) -> (AppenderHandle, Self) {
         let (sender, queue) = mpsc::unbounded_channel();
-        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None })
+        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None, clock_lease: None })
     }
     pub fn with_heartbeat(mut self, heartbeat: bool) -> Self { self.heartbeat = heartbeat; self }
+    /// Holds a clock lease past `fence`, the latest lease applied before this term,
+    /// publishing each enqueued lease end in `issued`.
+    pub fn with_clock_lease(mut self, fence: i64, drift: i64, issued: Arc<AtomicI64>) -> Self {
+        self.clock_lease = Some(ClockLease { fence, drift, issued });
+        self
+    }
     pub fn starting_at(mut self, sequence: TermSequence) -> Self { self.sequence = sequence; self }
     pub fn with_durable_commit_observer(mut self, observer: impl Fn(CommitLagBasis, Option<Duration>) + Send + Sync + 'static) -> Self {
         self.durable_commit_observer = Some(Arc::new(observer));
@@ -153,6 +200,9 @@ impl ReplicaAppender {
         let mut timer = tokio::time::interval(self.assertion_interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         timer.tick().await;
+        // The lease renews on the clock's own schedule, whatever the traffic.
+        let mut lease_timer = tokio::time::interval(Duration::from_micros((LEADER_CLOCK_LEASE_MICROS / 8) as u64));
+        lease_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut receipts: futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, Result<()>>> = futures::stream::FuturesUnordered::new();
         use futures::StreamExt;
         let outcome = loop {
@@ -163,6 +213,22 @@ impl ReplicaAppender {
                 receipt = receipts.next(), if !receipts.is_empty() => {
                     if let Some(Err(error)) = receipt { break Err(error); }
                 },
+                _ = lease_timer.tick(), if self.clock_lease.is_some() && !start_with_confirmation && !self.logs.data_suspended() => {
+                    let Some(until) = self.clock_lease.as_ref().and_then(|lease| lease.due((self.clock)().0)) else { continue; };
+                    let sequence = self.sequence;
+                    self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
+                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: clock_lease_record(until) };
+                    match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
+                        Ok(Some(receipt)) => {
+                            // Every later record of this term follows the lease in the log,
+                            // so a decision stamped under it is durable only after it.
+                            if let Some(lease) = &self.clock_lease { lease.issued.fetch_max(until, Ordering::AcqRel); }
+                            receipts.push(track_receipt(receipt, None, None, None));
+                        }
+                        Ok(None) => break Ok(()),
+                        Err(error) => break Err(error),
+                    }
+                }
                 _ = timer.tick(), if self.heartbeat && !start_with_confirmation && !self.logs.data_suspended() => {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
@@ -214,6 +280,7 @@ impl ReplicaAppender {
                         }
                         _ => body,
                     };
+                    let boundary = matches!(body, ReplicaBody::BlockBoundary(_));
                     let guarded = match body {
                         ReplicaBody::ResolvedTx(tx) => tx.acceptance_stage.is_some(),
                         ReplicaBody::NoOp(message) => crate::serving::is_funded_original(message),
@@ -245,6 +312,18 @@ impl ReplicaAppender {
                                 receipts.push(receipt);
                             }
                             timer.reset();
+                            // A node resuming after this boundary replays only what follows
+                            // it, so the lease is carried in the very next record.
+                            if let Some(until) = self.clock_lease.as_ref().filter(|_| boundary).and_then(ClockLease::carried) {
+                                let sequence = self.sequence;
+                                self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
+                                let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: clock_lease_record(until) };
+                                match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
+                                    Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None, None)),
+                                    Ok(None) => break Ok(()),
+                                    Err(error) => break Err(error),
+                                }
+                            }
                         }
                         Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
                         Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
