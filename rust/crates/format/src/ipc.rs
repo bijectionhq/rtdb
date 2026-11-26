@@ -2371,7 +2371,9 @@ fn seekable_event_projection_funds_only_selected_decode_and_wire_with_unknown_nu
             ("ignored".into(), Value::Utf8("x".repeat(256 << 10))),
         ])),
     };
-    let batch = build_event_batch(std::slice::from_ref(&event), None, None).unwrap();
+    let StoredOperation::Put(document) = &event.operation else { unreachable!() };
+    let types = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
+    let batch = build_event_batch(std::slice::from_ref(&event), Some(types), None).unwrap();
     let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
     writer.write(&batch).unwrap();
     let mut bytes = writer.into_inner().unwrap();
