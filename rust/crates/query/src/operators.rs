@@ -110,13 +110,15 @@ async fn build_batches_at(
             let mut input = runtime.child(0)?;
             let mut input_execution = execution.child(0);
             let mut state = execution.context.memory.reserve(0)?;
+            // Each stage below the first is measured as the filter it was fused from.
+            let mut stage_analysis = vec![None];
             let derived;
             let predicates = match stacked {
-                _ if execution.analysis.is_some() || execution.context.trace_parent.is_some() => single,
                 Some(stacked) => {
                     for bound in stacked.bounds.iter() {
                         let lease = Arc::get_mut(&mut state).expect("Stacked filters own their reservation");
                         lease.grow_to(lease.bytes().checked_add(*bound).ok_or_else(|| invalid("operator-size", "Filter stages exceed addressable memory"))?)?;
+                        stage_analysis.push(input_execution.analysis.clone());
                         input = input.child(0)?;
                         input_execution = input_execution.child(0);
                     }
@@ -129,6 +131,7 @@ async fn build_batches_at(
                         let lease = Arc::get_mut(&mut state).expect("Stacked filters own their reservation");
                         lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(|| invalid("operator-size", "Filter stages exceed addressable memory"))?)?;
                         stages.push(predicate.clone());
+                        stage_analysis.push(input_execution.analysis.clone());
                         input = input.child(0)?;
                         input_execution = input_execution.child(0);
                     }
@@ -137,9 +140,10 @@ async fn build_batches_at(
                     &derived
                 }
             };
+            stage_analysis.reverse();
             let Some((batches, projected)) = build_batch_input(input, input_execution, pushdowns, output).await? else { return Ok(None); };
             let context = Arc::clone(&execution.context);
-            let filter = Box::new(crate::columnar::BatchFilter::admitted(batches, predicates, execution));
+            let filter = Box::new(crate::columnar::BatchFilter::admitted(batches, predicates, execution).observing_stages(stage_analysis));
             let filter = crate::columnar::retain_batch_state(filter, state);
             let filter = if output.semantic_pages() { crate::columnar::coalesce_pages(filter, context) } else { filter };
             Ok(Some((filter, projected)))

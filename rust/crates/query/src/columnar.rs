@@ -3501,30 +3501,53 @@ impl PredicateSelection {
 pub(crate) struct BatchFilter {
     input: BoxBatchCursor, schema: Arc<rtdb_plan::Schema>, stages: Arc<[rtdb_plan::Expr]>,
     admissions: Option<Arc<[crate::compiled::Admission]>>, execution: crate::context::Execution,
+    stage_analysis: Vec<Option<Arc<crate::analysis::AnalysisNode>>>,
 }
 impl BatchFilter {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution) -> Self {
-        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), admissions: None, execution }
+        Self { input, schema: Arc::new(schema), stages: vec![predicate].into(), admissions: None, execution, stage_analysis: Vec::new() }
     }
     /// Applies a compiled plan's predicates, sharing their admissions with every execution of that plan.
     pub(crate) fn admitted(input: BoxBatchCursor, predicates: &crate::compiled::Predicates, execution: crate::context::Execution) -> Self {
         Self { input, schema: Arc::clone(&predicates.schema), stages: Arc::clone(&predicates.stages),
-            admissions: Some(Arc::clone(&predicates.admissions)), execution }
+            admissions: Some(Arc::clone(&predicates.admissions)), execution, stage_analysis: Vec::new() }
+    }
+    /// Measures each stage, innermost first, as the filter it was fused from; `None` leaves a stage to its operator's wrapper.
+    pub fn observing_stages(mut self, stage_analysis: Vec<Option<Arc<crate::analysis::AnalysisNode>>>) -> Self {
+        debug_assert_eq!(stage_analysis.len(), self.stages.len());
+        self.stage_analysis = stage_analysis;
+        self
+    }
+    /// A fused stage's time covers its input and the stages below it, as its own operator's would.
+    fn observe_stages(&self, from: usize, to: usize, started: std::time::Instant, rows: Option<usize>) -> Result<()> {
+        let Some(nodes) = self.stage_analysis.get(from..to.min(self.stage_analysis.len())) else { return Ok(()) };
+        let peak = self.execution.context.memory.peak_bytes();
+        for node in nodes.iter().flatten() { node.observe_stage(started.elapsed(), rows, peak)?; }
+        Ok(())
     }
 }
 #[async_trait::async_trait]
 impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        'batches: while let Some(mut batch) = poll_nested_batch(self.input.as_mut()).await? {
+        let stages = self.stages.len();
+        'batches: loop {
+            let started = std::time::Instant::now();
+            let Some(mut batch) = poll_nested_batch(self.input.as_mut()).await? else {
+                self.observe_stages(0, stages, started, None)?;
+                return Ok(None);
+            };
             for (index, predicate) in self.stages.iter().enumerate() {
                 let admission = self.admissions.as_ref().map(|admissions| &admissions[index]);
                 let selection = admitted_predicate_selection(&batch, predicate, &self.schema, &self.execution, admission).await?;
-                if selection.count == 0 { continue 'batches; }
+                if selection.count == 0 {
+                    self.observe_stages(index, stages, started, None)?;
+                    continue 'batches;
+                }
                 batch = batch.select_predicate(&selection, &self.execution.context.memory)?;
+                self.observe_stages(index, index + 1, started, Some(batch.len))?;
             }
             return Ok(Some(batch));
         }
-        Ok(None)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }

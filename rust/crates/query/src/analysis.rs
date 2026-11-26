@@ -41,6 +41,11 @@ impl AnalysisNode {
         Ok(())
     }
 
+    /// Records one call of a filter fused into the operator above it.
+    pub fn observe_stage(&self, elapsed: Duration, rows: Option<usize>, peak_memory: usize) -> Result<()> {
+        self.observe(elapsed, rows, None, peak_memory)
+    }
+
     pub fn new(relation: &Relation, context: &Arc<QueryContext>) -> Result<Arc<Self>> {
         let reservation = context.memory.reserve(bound(relation)?)?;
         Self::build(relation, &reservation)

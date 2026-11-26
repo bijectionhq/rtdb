@@ -232,7 +232,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
   - `rtdb_expr::evaluate_batch` exists but has no production caller.
 - Fallbacks: `BatchFilter` and `BatchExpressions` call `batch.rows()`, which materialises **every** column for every row, even when the expression reads one.
   - Columns that always fall back: union columns with string legs, temporal system columns (`Column::Values`), nested types, extension types (keyword, uuid, uri, transit, decimal), and float or non-ASCII ordering cases.
-  - The column path is disabled entirely when tracing or EXPLAIN ANALYZE is on (`operators.rs`), so profiled runs follow a different plan from production.
+  - Tracing and EXPLAIN ANALYZE run the production column plan; stacked filters stay fused, EXPLAIN ANALYZE measures each fused stage as its own `select`, and a trace shows the fused stack as one span.
 
 ### Divergence and impact
 
@@ -507,7 +507,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 ## 12. Other divergences found
 
 - **Cancellation checks.** Most row operators check cancellation per row (`check_cancelled`, which takes the token's lock per its comment). Only the scan heap uses `check_cancelled_at` (every N rows). XTDB checks by thread interrupt. Low-medium.
-- **Profiling changes the plan.** Column paths are disabled under tracing or EXPLAIN ANALYZE (`R/query/src/operators.rs`), so profiles of RTDB measure the slower row plan. This matters for performance work itself.
+- **Fused filters under profiling.** Tracing and EXPLAIN ANALYZE run the production plan, including fused stacked filters (`R/query/src/operators.rs`); EXPLAIN ANALYZE reports each fused `select`, while a trace has one span for the stack where XTDB has one per `select`.
 - **Different block-size defaults.** `rows_per_block` is 100,000 in `ReplicationConfig::default` (`R/replication/src/driver.rs:51`) and 102,400 in server config. This is harmless, but embedded and server nodes cut blocks at different points.
 - **Data files are validated on first decode** (`scan.rs` `load`, IID-order check per row). XTDB trusts its own files. This is a one-off cost per page thanks to the page cache.
 - **Better than XTDB in RTDB:**

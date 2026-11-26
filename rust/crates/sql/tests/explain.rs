@@ -202,6 +202,27 @@ async fn api_test_explain_analyze_counts_production_pages_and_subtracts_direct_c
 }
 
 #[tokio::test]
+async fn explain_analyze_measures_each_stacked_filter_of_the_fused_production_plan() {
+    let context = context(2);
+    let sql = "SELECT n FROM (VALUES (1), (2), (3), (4)) AS t(n) WHERE n > 1 AND n < 4";
+    let plan = query(&context, &format!("EXPLAIN {sql}")).await.unwrap();
+    let measured = query(&context, &format!("EXPLAIN ANALYZE {sql}")).await.unwrap();
+    assert_eq!(plan.iter().map(|row| (&row["depth"], &row["op"])).collect::<Vec<_>>(), measured.iter().map(|row| (&row["depth"], &row["op"])).collect::<Vec<_>>());
+    let selects = measured.iter().filter(|row| row["op"] == op("select")).collect::<Vec<_>>();
+    assert_eq!(selects.len(), 2, "{measured:?}");
+    assert!(depth(selects[0]) < depth(selects[1]));
+    assert_eq!(selects.iter().map(|row| &row["row_count"]).collect::<Vec<_>>(), [&Value::I64(2), &Value::I64(3)]);
+    for (index, row) in measured.iter().enumerate() {
+        assert!(matches!(row["page_count"], Value::I64(pages) if pages >= 1), "{row:?}");
+        assert!(matches!(row["time_to_first_page"], Value::Duration { .. }), "{row:?}");
+        let children = measured[index + 1..].iter().take_while(|child| depth(child) > depth(row)).filter(|child| depth(child) == depth(row) + 2);
+        assert_eq!(duration(&row["self_time"]), duration(&row["total_time"]) - children.map(|child| duration(&child["total_time"])).sum::<i64>());
+    }
+    assert_eq!(query(&context, sql).await.unwrap().iter().map(|row| row["n"].clone()).collect::<Vec<_>>(), [Value::I64(2), Value::I64(3)]);
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn emitted_sort_combines_order_and_fetch_at_the_production_cursor_boundary() {
     let context = context(2);
     let sql = "SELECT n FROM (VALUES (3), (1), (2)) AS t(n) ORDER BY n LIMIT 2";
