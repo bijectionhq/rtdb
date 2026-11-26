@@ -118,6 +118,42 @@ mod tests {
     }
 
     #[test]
+    fn a_trie_carrying_a_malformed_directory_record_fails_instead_of_losing_the_directory() {
+        let table = TableRef::new("public", "docs");
+        let key = TrieKey::l0(BlockIndex(0)).unwrap();
+        let root = EntityDirectoryRoot {
+            root: Some(RootRef { digest: PageDigest([1; 32]), length: 512, height: 0, summary: Vec::new() }.encode()),
+            through_block: Some(0), source_rows: Some(10), has_erases: Some(false), allocation: Some(vec![0; 16]),
+            writer_fence: Some(3), erase_frontier_digest: Some(vec![0; 32]),
+        };
+        let valid = EntityDirectoryChange { root: Some(root.clone()), replaces_root: None }.to_artefact().unwrap();
+        let carrying = |record| {
+            let mut trie = CatalogTrie::notification(key.clone(), 10, None).unwrap();
+            trie.artefacts = vec![record];
+            trie
+        };
+        let catalog = TrieCatalog::new(4).unwrap();
+
+        let installed = catalog.with_tries(table.clone(), [carrying(valid.clone())], Timestamp(0)).unwrap();
+        assert_eq!(installed.entity_directory(&table), Some(&root));
+
+        let corrupt = rtdb_format::log::proto::ArtefactRecord { stats: Some(vec![0xff; 7]), ..valid.clone() };
+        assert!(catalog.with_tries(table.clone(), [carrying(corrupt)], Timestamp(0)).is_err());
+        let newer = rtdb_format::log::proto::ArtefactRecord { definition_version: Some(valid.definition_version() + 1), ..valid };
+        assert!(catalog.with_tries(table.clone(), [carrying(newer)], Timestamp(0)).is_err());
+    }
+
+    #[test]
+    fn a_malformed_search_record_on_a_trie_fails_the_catalog_update() {
+        let table = TableRef::new("public", "docs");
+        let mut trie = CatalogTrie::notification(TrieKey::l0(BlockIndex(0)).unwrap(), 10, None).unwrap();
+        trie.artefacts = vec![rtdb_format::log::proto::ArtefactRecord {
+            kind: Some(rtdb_format::search_manifest::RECORD_KIND.into()), stats: Some(vec![0xff; 7]), ..Default::default()
+        }];
+        assert!(TrieCatalog::new(4).unwrap().with_tries(table, [trie], Timestamp(0)).is_err());
+    }
+
+    #[test]
     fn a_stale_directory_replacement_does_not_change_either_catalog_generation() {
         let table = TableRef::new("public", "docs");
         let trie = |block| TrieKey::l0(BlockIndex(block)).unwrap();

@@ -358,21 +358,27 @@ impl TrieCatalog {
         let expiring_metadata = table.stores_expiring_transaction_metadata();
         let state = next.tables.entry(table).or_default();
         for mut trie in tries {
-            trie.artefacts.retain(|record| {
+            let (mut directory, mut search) = (Vec::new(), Vec::new());
+            let mut held = Vec::with_capacity(trie.artefacts.len());
+            for record in std::mem::take(&mut trie.artefacts) {
                 if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
-                    if let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(record) {
-                        std::sync::Arc::make_mut(&mut state.directory).install(&trie.key, change);
-                    }
-                    return false;
+                    directory.push(log_pb::EntityDirectoryChange::from_artefact(&record)?);
+                } else if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
+                    search.push(log_pb::SearchRunChange::from_artefact(&record)?);
+                } else {
+                    held.push(record);
                 }
-                if record.kind() != rtdb_format::search_manifest::RECORD_KIND { return true; }
-                if trie.key.level() == 0 && let Ok(change) = log_pb::SearchRunChange::from_artefact(record)
-                    && !change.retire_only() && change.replaces.is_empty()
+            }
+            trie.artefacts = held;
+            for change in directory {
+                std::sync::Arc::make_mut(&mut state.directory).install(&trie.key, change);
+            }
+            for change in search {
+                if trie.key.level() == 0 && !change.retire_only() && change.replaces.is_empty()
                     && change.run.as_ref().is_some_and(|run| run.blocks == [trie.key.block_index().0]) {
                     std::sync::Arc::make_mut(&mut state.search).apply_uploaded(change, as_of);
                 }
-                false
-            });
+            }
             state.apply(trie, self.file_size_target, as_of, expiring_metadata)?;
         }
         Ok(next)
