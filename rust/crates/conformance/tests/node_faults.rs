@@ -366,10 +366,19 @@ async fn recover_during_block_collection(pause: RecoveryPause) {
         Arc::clone(store), recovered.partition, Arc::new(Observer),
         GarbageConfig { blocks_to_keep: 1, ..GarbageConfig::default() },
     ).unwrap();
-    collector.collect(writer.cancellation()).await.unwrap();
-    for key in [block_key(old).unwrap(), old_table] {
-        assert!(matches!(store.head_fresh(&ObjectKey::new(key).unwrap()).await, Err(Error::MissingObject(_))));
-    }
+    // A pass leaves files in place while any recovery read holds the deletion gate, which the writer's post-adoption reads take briefly.
+    let garbage = [ObjectKey::new(block_key(old).unwrap()).unwrap(), ObjectKey::new(old_table).unwrap()];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            collector.collect(writer.cancellation()).await.unwrap();
+            let mut collected = true;
+            for key in &garbage {
+                collected &= matches!(store.head_fresh(key).await, Err(Error::MissingObject(_)));
+            }
+            if collected { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("block collection never won against the paused recovery");
     store.head_fresh(&ObjectKey::new(block_key(latest).unwrap()).unwrap()).await.unwrap();
     storage.io.close_and_wait().await;
     reader_schedule.release("checkpoint-open").unwrap();
