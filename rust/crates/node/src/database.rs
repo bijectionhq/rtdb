@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering}};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -56,6 +56,8 @@ pub struct Database {
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     submitted_bytes: AtomicU64,
     replica_read_sessions: AtomicUsize,
+    /// The highest block this database has seen in the store, or -1; `block_lag` probes forward from it.
+    latest_stored_block: AtomicI64,
     query_cpu: Option<Arc<rtdb_query::QueryCpu>>,
     fragment_residence: Option<rtdb_query::FragmentResidence>,
     compaction: Option<CompactionHandle>,
@@ -317,11 +319,17 @@ impl Database {
         Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.monotonic_micros()))))
     }
 
+    /// Blocks in the store beyond the one this database has adopted.
+    /// The leader is the only block writer, so it has adopted every block there is; a follower probes forward from the highest block it has adopted or seen,
+    /// listing `blocks/` only when it knows of no block that is still stored.
     pub async fn block_lag(&self) -> Result<i64> {
-        let current = self.status().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
-        let prefix = rtdb_storage::ObjectKey::new("blocks")?;
-        let latest = self.storage.object_store().list(Some(&prefix)).await?.iter()
-            .filter_map(|entry| rtdb_format::keys::block_index_from_key(entry.key.as_str()).ok()).map(|index| index.0).max().unwrap_or(-1);
+        let status = self.status();
+        if matches!(status.role, Role::Leading(_)) { return Ok(0); }
+        let current = status.adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
+        let known = self.latest_stored_block.load(Ordering::Relaxed).max(current);
+        let known = (known >= 0).then_some(rtdb_types::BlockIndex(known));
+        let latest = rtdb_replication::latest_stored_block(self.storage.object_store().as_ref(), known).await?.map_or(-1, |index| index.0);
+        self.latest_stored_block.fetch_max(latest, Ordering::Relaxed);
         Ok(latest.saturating_sub(current).max(0))
     }
     pub fn external_source(&self) -> bool { self.configuration.external_source.is_some() }
@@ -713,7 +721,7 @@ impl DatabaseFactory {
                 audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
-                transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
+                transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0), latest_stored_block: AtomicI64::new(-1),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor,
                 artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };

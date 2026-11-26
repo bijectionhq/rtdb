@@ -121,6 +121,7 @@ Frontends revalidate before their protocol commands.
 `NodeCatalogRuntime` forwards configured users and metric snapshots and reads role membership from a fresh primary snapshot independently of the outer query basis.
 `HealthChecks` is passive and retains the replica targets captured at startup.
 Its current observations distinguish critical from noncritical database failures, check a five-block lag threshold, and submit explicit block-flush requests.
+Block lag is zero on a database's leader, which writes every block; a follower probes forward from the highest block it has adopted or seen, one fresh HEAD per block, and lists `blocks/` only when it knows of no block still stored.
 HTTP serving and metrics export are separate operational adapters still requiring composition.
 `PreparedSql` retains charged source and prepared metadata, rebinds at execution, and exposes separate PostgreSQL signature checks and dynamic Arrow schemas.
 `PreparedSql::prepare` and query rebinding reserve an estimate for temporary lexer, grammar and binding work before parsing.

@@ -338,7 +338,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 - The local store (`R/storage/src/object_store.rs` `put`/`publish_file`) copies into a tempfile and fsyncs the file and every parent directory.
   - Block production (`R/replication/src/blocks.rs:237-240`) writes and fsyncs a tempfile *before* `put_file` copies and fsyncs it again.
   - XTDB `LocalStorage` writes a tmp file and does an `ATOMIC_MOVE`, with no copy and no fsync.
-- RTDB's `block_lag` lists `blocks/` on every call (`R/node/src/database.rs:40-46`). XTDB caches the listing for 10 s (`BufferPool.kt` `latestAvailableBlockIndex`).
+- RTDB's `block_lag` (`R/node/src/database.rs`) lists nothing on the leader, the database's only block writer, and on a follower probes forward from the highest block it has adopted or seen with one fresh HEAD per block, listing `blocks/` only when it knows of no stored block. XTDB lists after the current block and caches the result for 10 s (`BufferPool.kt` `latestAvailableBlockIndex`), so its lag can be up to 10 s stale.
 - Impact: medium-high on block flush and compaction output latency, and extra round trips on S3/GCS/Azure.
 - Recommendation: rename into the local store root; upload parts in parallel to the final key, keeping the create-only check as a conditional PUT on the last step.
 

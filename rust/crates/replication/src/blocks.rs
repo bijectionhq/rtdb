@@ -258,6 +258,31 @@ pub enum BlockDiscovery {
     AtErasure(PublishedCheckpoint),
 }
 
+/// The latest block catalog in `store`, probing forward from a stored `known` block with one fresh head per block.
+/// Lists the block catalogs instead when there is no `known` block or it is no longer stored.
+pub async fn latest_stored_block(store: &dyn ObjectStore, known: Option<BlockIndex>) -> Result<Option<BlockIndex>> {
+    let mut latest = match known {
+        Some(known) if known.0 >= 0 && block_stored(store, known).await? => known,
+        _ => {
+            let directory = ObjectKey::new("blocks")?;
+            return Ok(store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
+        }
+    };
+    while let Some(next) = latest.0.checked_add(1).map(BlockIndex) {
+        if !block_stored(store, next).await? { break; }
+        latest = next;
+    }
+    Ok(Some(latest))
+}
+
+async fn block_stored(store: &dyn ObjectStore, index: BlockIndex) -> Result<bool> {
+    match store.head_fresh(&ObjectKey::new(block_key(index)?)?).await {
+        Ok(_) => Ok(true),
+        Err(rtdb_storage::Error::MissingObject(_)) => Ok(false),
+        Err(error) => Err(rtdb_types::Anomaly::from(error)),
+    }
+}
+
 pub struct BlockStore {
     store: Arc<dyn ObjectStore>,
     cache: Arc<BufferPool>,
@@ -418,13 +443,7 @@ impl BlockStore {
     }
 
     async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
-        let exists = |index: BlockIndex| async move {
-            match self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await {
-                Ok(_) => Ok(true),
-                Err(rtdb_storage::Error::MissingObject(_)) => Ok(false),
-                Err(error) => Err(rtdb_types::Anomaly::from(error)),
-            }
-        };
+        let exists = move |index: BlockIndex| block_stored(self.store.as_ref(), index);
         let discovery = match discovery {
             BlockDiscovery::AtPublished(published) | BlockDiscovery::AtErasure(published) => BlockDiscovery::At(published.block),
             BlockDiscovery::FromPublished(published) if published.root_sha256.is_some() => BlockDiscovery::At(published.block),
@@ -435,7 +454,7 @@ impl BlockStore {
         let mut latest = match discovery {
             BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
             BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
-            BlockDiscovery::From(hint) if exists(hint).await? => hint,
+            BlockDiscovery::From(hint) => return latest_stored_block(self.store.as_ref(), Some(hint)).await,
             BlockDiscovery::FromPublished(checkpoint) => {
                 if !exists(checkpoint.block).await? {
                     return self.latest_listed_block().await?.filter(|index| *index >= checkpoint.block)
@@ -460,10 +479,7 @@ impl BlockStore {
         Ok(Some(latest))
     }
 
-    pub(crate) async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> {
-        let directory = ObjectKey::new("blocks")?;
-        Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max())
-    }
+    pub(crate) async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> { latest_stored_block(self.store.as_ref(), None).await }
 
     pub(crate) async fn collect_serving_checkpoints(&self, database: uuid::Uuid, epoch: u64, cancellation: &CancellationToken) -> Result<()> {
         let Some(local) = self.store.local_maintenance_store().filter(|store| store.defers_trie_releases()) else { return Ok(()); };
@@ -910,5 +926,51 @@ mod naming_epoch_tests {
             let upload = ReplicaBody::BlockUploaded(proto::BlockUploaded { block_index: Some(1), naming_epoch: recorded, ..Default::default() });
             assert_eq!(rtdb_format::envelope::replica_uses_extension(&upload), recorded.is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod latest_stored_block_tests {
+    use std::{ops::Range, path::Path, sync::atomic::{AtomicUsize, Ordering}};
+    use async_trait::async_trait;
+    use rtdb_storage::{MemoryStore, StoredObject};
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingStore { inner: MemoryStore, lists: AtomicUsize, heads: AtomicUsize }
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.heads.fetch_add(1, Ordering::SeqCst); self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.lists.fetch_add(1, Ordering::SeqCst); self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    async fn upload(store: &CountingStore, index: i64) {
+        store.put(&ObjectKey::new(block_key(BlockIndex(index)).unwrap()).unwrap(), Bytes::from_static(b"block")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_known_block_is_probed_forward_without_listing_the_store() {
+        let store = CountingStore::default();
+        assert_eq!(latest_stored_block(&store, None).await.unwrap(), None);
+        assert_eq!(store.lists.load(Ordering::SeqCst), 1, "no knowledge lists");
+        for index in 0..4 { upload(&store, index).await; }
+        assert_eq!(latest_stored_block(&store, Some(BlockIndex(1))).await.unwrap(), Some(BlockIndex(3)));
+        assert_eq!(latest_stored_block(&store, Some(BlockIndex(3))).await.unwrap(), Some(BlockIndex(3)));
+        assert_eq!(store.lists.load(Ordering::SeqCst), 1, "a stored known block needs no listing");
+        assert_eq!(store.heads.load(Ordering::SeqCst), 4 + 2, "one head for the known block and one per block after it");
+    }
+
+    #[tokio::test]
+    async fn a_known_block_no_longer_stored_falls_back_to_listing() {
+        let store = CountingStore::default();
+        for index in 5..8 { upload(&store, index).await; }
+        assert_eq!(latest_stored_block(&store, Some(BlockIndex(1))).await.unwrap(), Some(BlockIndex(7)));
+        assert_eq!(latest_stored_block(&store, Some(BlockIndex(-1))).await.unwrap(), Some(BlockIndex(7)));
+        assert_eq!(store.lists.load(Ordering::SeqCst), 2);
     }
 }

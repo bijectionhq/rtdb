@@ -2840,6 +2840,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
         follower.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
         assert_eq!(follower.catalog().database("xtdb").unwrap().status().role, rtdb_replication::Role::Following);
         assert!(matches!(writer.catalog().database("xtdb").unwrap().status().role, rtdb_replication::Role::Leading(_)));
+        for node in [&writer, &follower] { assert_eq!(node.catalog().database("xtdb").unwrap().block_lag().await.unwrap(), 0, "a caught-up node has no block lag"); }
         assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
         let mut follower_session = follower.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(follower_session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
