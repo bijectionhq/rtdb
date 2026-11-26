@@ -70,6 +70,7 @@ pub struct MultiFollower {
 
 pub struct MultiFollowerProgress {
     pub applied_position: u64,
+    pub retained_from: Basis,
     pub writer_head: Basis,
     pub writer_head_position: u64,
 }
@@ -107,17 +108,33 @@ impl MultiFollower {
             let mut database = self.serving.database.lock().await;
             let (index, _) = database.follower_view(&self.owner)?;
             let applied_position = index.applied_position(cut)?;
+            let retained_from = index.oldest_retained_cut().basis;
             let (writer_head, writer_head_position) = database.follower_writer_head(&self.owner).await?;
             if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
             }
-            Ok(Some(MultiFollowerProgress { applied_position, writer_head, writer_head_position }))
+            Ok(Some(MultiFollowerProgress { applied_position, retained_from, writer_head, writer_head_position }))
         }).await.ok_or_else(interrupted)?
     }
 
     pub async fn query(
         &self, at: At, now: Timestamp, observe_progress: bool, cancellation: &CancellationToken,
     ) -> Result<(QueryView, Option<MultiFollowerProgress>)> {
+        let view = self.query_view(at, now, cancellation).await?;
+        let progress = self.progress(view.cut, observe_progress, cancellation).await?;
+        Ok((view, progress))
+    }
+
+    /// Select a locally retained snapshot for an assigned exact scope.
+    pub async fn retained_view(
+        &self, basis: Basis, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        self.query_view(At::Exactly(basis), now, cancellation).await
+    }
+
+    async fn query_view(
+        &self, at: At, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
         cancellation.run_until_cancelled(async {
             let (index, generation) = self.serving.database.lock().await.follower_view(&self.owner)?;
             require_plain_follower(&index)?;
@@ -132,12 +149,11 @@ impl MultiFollower {
                 } else { error }
             })?;
             let cut = view.cut();
-            let progress = self.progress(cut, observe_progress, cancellation).await?;
             let snapshot = rtdb_query::branch_snapshot(&view, &self.serving.memory)?;
-            Ok((QueryView {
+            Ok(QueryView {
                 snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
                 custody_contributors: Some(BTreeSet::new()), scoped_source_basis: None, key_generation: Some(generation),
-            }, progress))
+            })
         }).await.ok_or_else(interrupted)?
     }
 
@@ -147,6 +163,15 @@ impl MultiFollower {
             let (index, _) = database.follower_view(&self.owner)?;
             require_plain_follower(&index)?;
             index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, At::Exactly(basis), Layer::Merged, now)?;
+            database.check_generation(generation).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    pub async fn check_retained_delivery(&self, generation: u64, cancellation: &CancellationToken) -> Result<()> {
+        cancellation.run_until_cancelled(async {
+            let database = self.serving.database.lock().await;
+            let (index, _) = database.follower_view(&self.owner)?;
+            require_plain_follower(&index)?;
             database.check_generation(generation).await
         }).await.ok_or_else(interrupted)?
     }
@@ -1157,6 +1182,8 @@ fn interrupted() -> Anomaly {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
     use journal_contract::{Identity, reference::MemoryJournal};
     use rtdb_tx::transact::TRANSACT_REQUIRES;
     use rtdb_crypt::LocalKms;
@@ -1210,21 +1237,52 @@ mod tests {
 
     #[tokio::test]
     async fn assigned_query_uses_the_local_cut_and_reports_a_separate_writer_head() {
+        async fn titles(context: &Arc<QueryContext>, sql: &str) -> Vec<Value> {
+            let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &Default::default(), &context.memory).unwrap();
+            let mut rows = PreparedQuery::from_prepared(prepared, &context.memory).unwrap()
+                .execute(Arc::clone(context), Vec::new()).await.unwrap();
+            let mut values = Vec::new();
+            while let Some(result) = rows.next_batch().await.unwrap() {
+                let batch = result.batch();
+                for index in 0..batch.num_rows() {
+                    values.push(rtdb_columnar::read_value(batch.schema().field(0), batch.column(0).as_ref(), index).unwrap());
+                }
+            }
+            values
+        }
+
         let journal = MemoryJournal::default();
         let id = Uuid::from_u128(1);
         let store = Arc::new(MemoryStore::default());
         let kms = Arc::new(LocalKms::new(|| 10));
+        let clock = Arc::new(AtomicI64::new(10));
+        let node_clock = {
+            let clock = Arc::clone(&clock);
+            Arc::new(move || Timestamp(clock.load(Ordering::Relaxed)))
+        };
+        let memory = MemoryBudget::new(64 << 20);
         let open = |node, identity| MultiDatabase::new(
             MultiOptions { database: id, node, lease_micros: 100, drift_micros: 1 },
-            Arc::new(journal.handle(identity)), store.clone(), kms.clone(), Arc::new(|| Timestamp(10)),
+            Arc::new(journal.handle(identity)), store.clone(), kms.clone(), node_clock.clone(),
         ).unwrap();
         let writer_node = IpAddr::from([127, 0, 0, 1]);
         let mut writer = open(writer_node, Identity::from_static("urn:rtdb:test:1"));
         writer.create().await.unwrap();
         writer.tick(&BTreeSet::from([writer_node])).await.unwrap();
-        let first = writer.transact(&write(1, "one", None)).await.unwrap();
+        let mut initial = write(1, "one", None);
+        let Op::Put { rows, .. } = &mut initial.ops[0] else { panic!() };
+        rows.push(Row {
+            id: EntityId::Integer(2),
+            cells: StructFields::from([("title".into(), Cell::Value(Value::Utf8("other".into())))]),
+            ..rows[0].clone()
+        });
+        let first = writer.transact(&initial).await.unwrap();
+        let original_index = writer.fresh_index().await.unwrap();
+        let original = original_index
+            .view(MAIN_BRANCH, At::Exactly(first.basis), Layer::Merged, first.system_time).unwrap();
+        let original = rtdb_query::branch_snapshot(&original, &memory).unwrap();
         let follower_node = IpAddr::from([127, 0, 0, 2]);
-        let follower = Arc::new(MultiServing::new(open(follower_node, Identity::from_static("urn:rtdb:test:2")), MemoryBudget::new(64 << 20)));
+        let follower = Arc::new(MultiServing::new(open(follower_node, Identity::from_static("urn:rtdb:test:2")), Arc::clone(&memory)));
         let reader = follower.assign_follower().await.unwrap();
         let second = writer.transact(&write(2, "two", Some(Timestamp(20)))).await.unwrap();
         let cancellation = CancellationToken::new();
@@ -1243,6 +1301,37 @@ mod tests {
         let unretained = Basis::new(*id.as_bytes(), evidence.applied_position + 1);
         assert_eq!(select(At::Exactly(unretained), false).await.err().unwrap().code, "rtdb/cursor-expired");
         assert_eq!(select(At::Exactly(Basis::new([5; 16], 0)), false).await.err().unwrap().code, "rtdb/foreign-basis");
+
+        clock.store(200, Ordering::Relaxed);
+        assert_eq!(
+            select(At::Latest, true).await.err().unwrap().code,
+            "rtdb/follower-progress-unavailable",
+        );
+        let view = reader.retained_view(first.basis, Timestamp(200), &cancellation).await.unwrap();
+        assert_eq!(view.cut.basis, first.basis);
+        reader.check_retained_delivery(view.key_generation.unwrap(), &cancellation).await.unwrap();
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let context = |snapshot| {
+            let catalog = CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
+                partitions: vec![snapshot], storage: Arc::clone(&storage),
+            })]), false).unwrap();
+            QueryContext::new(catalog, Arc::clone(&memory), first.system_time, "UTC", QueryOptions::default(), &cancellation)
+                .unwrap().with_wire_cut(first.system_time, first.system_time.into()).unwrap()
+        };
+        let original = context(original);
+        let snapshot = rtdb_query::retain_catalog_snapshot(view.snapshot, &storage).await.unwrap();
+        let retained = context(snapshot);
+        retained.retain_wire_scope((Instant::now() + Duration::from_secs(2)).into_std()).await.unwrap();
+        for (sql, expected) in [
+            ("SELECT title FROM notes WHERE _id = 1", vec![Value::Utf8("one".into())]),
+            ("SELECT title FROM notes WHERE _id = 3", vec![]),
+            ("SELECT title FROM notes ORDER BY _id LIMIT 1", vec![Value::Utf8("one".into())]),
+            ("SELECT title FROM notes ORDER BY _id LIMIT 1 OFFSET 1", vec![Value::Utf8("other".into())]),
+        ] {
+            let page = retained.for_wire_scope_page(&cancellation);
+            assert_eq!(titles(&original, sql).await, expected);
+            assert_eq!(titles(&page, sql).await, expected);
+        }
 
         drop(reader);
         let live = BTreeSet::from([follower_node]);

@@ -246,6 +246,12 @@ async fn assigned_follower_observes_settled_writer_progress_without_admitting_wr
     cluster.at(200);
     assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Follower);
     assert_eq!(follower.follower_writer_head(&owner).await.unwrap_err().code, "rtdb/follower-progress-unavailable");
+    let (local, generation) = follower.follower_view(&owner).unwrap();
+    assert_eq!(local.head().basis, second.basis);
+    let retained = local.cut(At::Exactly(first.basis)).unwrap();
+    assert_eq!(retained.basis, first.basis);
+    assert_eq!(local.applied_position(retained).unwrap(), first.basis.position());
+    follower.check_generation(generation).await.unwrap();
     drop(owner);
     assert!(matches!(follower.tick(&live(2)).await.unwrap(), Role::Writer(_)));
 }

@@ -20,6 +20,7 @@ pub(crate) mod custody;
 pub(crate) mod original_family_landing;
 pub(crate) mod original_family_readback;
 pub(crate) mod error;
+pub(crate) mod exact_read;
 mod query;
 mod scoped_hold;
 mod store;
@@ -44,8 +45,10 @@ pub(crate) const MANAGED_WORKLOAD: &str = "rtdb.v1.ManagedWorkload";
 pub(crate) const TX_STATUS: &str = "rtdb.v1.TxStatus";
 pub(crate) const OFFER_DECISION_CLOCK: &str = "rtdb.v1.OfferDecisionClock";
 pub(crate) use store::ACTIONS as STORE_ACTIONS;
-pub(crate) const ACTIONS: [&str; 7] = [
+pub(crate) const ACTIONS: [&str; 9] = [
     CAPABILITIES,
+    exact_read::OPEN,
+    exact_read::CLOSE,
     "rtdb.v1.Transact",
     TX_STATUS,
     OFFER_DECISION_CLOCK,
@@ -184,6 +187,7 @@ impl Service {
                 }
                 if self.follower_only() {
                     features.extend(["query", "query.track", "query.page", APPLIED_POSITION, FOLLOWER_PROGRESS].map(str::to_owned));
+                    features.push(exact_read::FEATURE.into());
                     features.extend([CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS].map(str::to_owned));
                     #[cfg(feature = "multi")]
                     if self.follower().is_some_and(|route| route.reader.supports_ranked_ivf()) {
@@ -303,6 +307,12 @@ impl Service {
                 }
                 .encode_to_vec())
             }.await,
+            exact_read::OPEN => match decode(action.body) {
+                Ok(request) => self.open_exact_read(&call, request).await.map(|reply| reply.encode_to_vec()),
+                Err(status) => Err(status),
+            },
+            exact_read::CLOSE => decode::<proto::CloseExactReadRequest>(action.body)
+                .and_then(|request| self.close_exact_read(&call, &request.scope)),
             scoped_hold::ACTION => self.scoped_hold_action(&call, &action.body).await,
             custody::RELEASE => self.custody_release_action(&call, &action.body).await,
             original_family_landing::ACTION => self.original_family_landing(&call, &action.body).await,
