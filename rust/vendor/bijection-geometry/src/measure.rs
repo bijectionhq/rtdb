@@ -341,19 +341,27 @@ pub fn measure(
             Measurement::Area => {
                 // Outer rings run counterclockwise and holes clockwise, so the
                 // signed areas add up to the region's, modulo the ellipsoid.
+                let geographic = geometry.space.frame == CoordinateFrame::Wgs84;
                 for polygon in geometry.polygons() {
                     let mut area = 0.0;
                     for ring in polygon {
-                        area += ring_area(ring, geometry, work)?;
+                        area += ring_area(&crate::arcs::without_seam_cuts(geographic, ring), geometry, work)?;
                     }
                     sum += area.rem_euclid(ellipsoid_area());
                 }
             },
             Measurement::Length | Measurement::Perimeter => {
-                let lines = if measurement == Measurement::Length {
-                    geometry.lines()
+                // A ring's cut along the antimeridian is interior, no perimeter.
+                let geographic = geometry.space.frame == CoordinateFrame::Wgs84;
+                let lines: Vec<std::borrow::Cow<'_, [Pos]>> = if measurement == Measurement::Length {
+                    geometry.lines().into_iter().map(|line| std::borrow::Cow::Borrowed(&line[..])).collect()
                 } else {
-                    geometry.polygons().into_iter().flatten().collect()
+                    geometry
+                        .polygons()
+                        .into_iter()
+                        .flatten()
+                        .map(|ring| crate::arcs::without_seam_cuts(geographic, ring))
+                        .collect()
                 };
                 for line in lines {
                     for edge in line.windows(2) {

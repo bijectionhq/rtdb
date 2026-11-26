@@ -1095,8 +1095,8 @@
     }
   },
   {
-    "name": "parts sharing an edge along the antimeridian are one region",
-    "valid": false,
+    "name": "parts split at the antimeridian (+180 and -180) are one region",
+    "valid": true,
     "value": {
       "type": "MultiPolygon",
       "coordinates": [

@@ -28,6 +28,7 @@ mod construction;
 pub mod encounters;
 mod exact;
 pub mod envelope;
+pub mod generator;
 pub mod geodesy;
 pub mod measure;
 pub mod mgrs;
@@ -1506,7 +1507,8 @@ fn admit_coordinates_nested<'a>(
                 .unzip();
             let geographic = space.frame == CoordinateFrame::Wgs84;
             // Parts may touch at isolated points, never overlap or share an
-            // edge.
+            // edge, except the two sides of a cut at the antimeridian (+180
+            // in one part, -180 in the other).
             let parts: Vec<&[arcs::Ring]> = rings.iter().map(Vec::as_slice).collect();
             if parts.len() > 1 && topology::parts_overlap(geographic, &parts, admission.work)? {
                 return Err(invalid("multipart polygons must be disjoint"));

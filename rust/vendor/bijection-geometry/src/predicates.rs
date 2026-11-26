@@ -224,7 +224,7 @@ fn vertices(geometry: &Geometry) -> Vec<Pos> {
     geometry.for_each(|point| points.push(*point));
     points
 }
-fn segments(geometry: &Geometry) -> Vec<(Pos, Pos)> {
+pub(crate) fn segments(geometry: &Geometry) -> Vec<(Pos, Pos)> {
     if let Coords::Collection(members) = &geometry.coords {
         return members.iter().flat_map(segments).collect();
     }

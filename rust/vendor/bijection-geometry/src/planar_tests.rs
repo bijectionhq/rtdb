@@ -145,10 +145,19 @@ fn import_joins_parts_cut_at_the_antimeridian() -> anyhow::Result<()> {
         assert!(covers(&geometry, p)?, "{p:?}");
     }
     assert!(!covers(&geometry, [0.0, 0.0])?);
-    // Natively two parts may not share their seam edge.
-    assert!(native(json!({"type":"MultiPolygon","coordinates":[
+    // Natively two parts split at the antimeridian (+180 in one, -180 in
+    // the other) are admitted as they are, and their seam is interior.
+    let split = native(json!({"type":"MultiPolygon","coordinates":[
         [[[170,-10],[180,-10],[180,10],[170,10],[170,-10]]],
         [[[-180,-10],[-170,-10],[-170,10],[-180,10],[-180,-10]]]
+    ]}))?;
+    for p in [[180.0, 0.0], [175.0, 5.0], [-175.0, -5.0]] {
+        assert!(covers(&split, p)?, "{p:?}");
+    }
+    // Two parts on one side of the seam still may not share it.
+    assert!(native(json!({"type":"MultiPolygon","coordinates":[
+        [[[170,-10],[180,-10],[180,10],[170,10],[170,-10]]],
+        [[[175,-10],[180,-10],[180,10],[175,10],[175,-10]]]
     ]}))
     .is_err());
     Ok(())
@@ -277,5 +286,41 @@ fn export_cuts_lines_and_densifies_arcs() -> anyhow::Result<()> {
     let first = parts[0].as_array().expect("first part");
     assert_eq!(first[first.len() - 1][0].as_f64(), Some(180.0));
     assert_eq!(parts[1][0][0].as_f64(), Some(-180.0));
+    Ok(())
+}
+
+#[test]
+fn a_polar_ring_cut_along_the_antimeridian_is_one_region() -> anyhow::Result<()> {
+    // RFC 7946's one-ring cap: east along 70°N from -180 to +180, up the
+    // +180 side of the cut to the pole, back down the -180 side.
+    let cut = native(json!({"type":"Polygon","coordinates":[[
+        [-180,70],[-90,70],[0,70],[90,70],[180,70],[180,90],[0,90],[-180,90],[-180,70]
+    ]]}))?;
+    // The same region held around its pole.
+    let held = native(json!({"type":"Polygon","coordinates":[[
+        [-90,70],[0,70],[90,70],[180,70],[-90,70]
+    ]]}))?;
+    for p in [[0.0, 89.0], [180.0, 80.0], [-180.0, 75.0], [45.0, 80.0]] {
+        assert!(covers(&cut, p)?, "{p:?}");
+    }
+    assert!(!covers(&cut, [0.0, 60.0])?);
+    let measured = |g: &Geometry, m| measure(g, m, &mut GeometryWork::default()).expect("measure");
+    for m in [Measurement::Area, Measurement::Perimeter] {
+        let (a, b) = (measured(&cut, m), measured(&held, m));
+        assert!((a - b).abs() <= 1e-6 * b, "{a} {b}");
+    }
+    // The cut is interior: the two hold the same point set.
+    let relation = crate::topology::relation::matrix(&cut, &held, &mut GeometryWork::default())?;
+    assert_eq!(relation, "2FFF1FFF2");
+    // A spur up and back down one side of the meridian is no cut.
+    assert!(native(json!({"type":"Polygon","coordinates":[[
+        [-180,70],[-90,70],[0,70],[90,70],[180,70],[180,90],[180,70],[-180,70]
+    ]]}))
+    .is_err());
+    // Nor is a cut whose legs return to another latitude.
+    assert!(native(json!({"type":"Polygon","coordinates":[[
+        [-180,60],[-90,70],[0,70],[90,70],[180,70],[180,90],[-180,90],[-180,60]
+    ]]}))
+    .is_err());
     Ok(())
 }

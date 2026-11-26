@@ -1111,6 +1111,90 @@ impl ArcIndex {
     }
 }
 
+/// Whether a position lies on the antimeridian or at a pole.
+fn on_seam(p: Pos) -> bool {
+    p[0].abs() == 180.0 || p[1].abs() == 90.0
+}
+
+/// Whether a run of seam positions is a cut along the antimeridian, as RFC
+/// 7946 writes a ring that winds around a pole or crosses the antimeridian
+/// as one ring: out along one side of the meridian (written at +180, or
+/// -180), through a pole or a turn on the meridian, and back along the other
+/// side to the direction it left. Each leg runs monotonically toward the
+/// turn, so the two legs cover the same arc once each, in opposite
+/// directions, and the cut is interior to the region.
+fn seam_cut(run: &[Pos]) -> bool {
+    let pole = |p: &Pos| p[1].abs() == 90.0;
+    let (Some(first), Some(last)) = (run.first(), run.last()) else {
+        return false;
+    };
+    if run.len() < 2 || pole(first) || pole(last) || first[1] != last[1] || first[0] != -last[0] {
+        return false;
+    }
+    let side = first[0];
+    let Some(turn) = run.iter().position(|p| !pole(p) && p[0] == -side) else {
+        return false;
+    };
+    let (out, back) = run.split_at(turn);
+    if out.iter().any(|p| !pole(p) && p[0] != side) || back.iter().any(|p| !pole(p) && p[0] != -side) {
+        return false;
+    }
+    // The out leg moves away from the start's latitude, the back leg toward
+    // it, and they meet at one direction: a pole, or one latitude.
+    let (out_end, back_start) = (out[out.len() - 1], back[0]);
+    let rising = out_end[1] > first[1];
+    let monotone = |leg: &[Pos], up: bool| leg.windows(2).all(|w| if up { w[1][1] >= w[0][1] } else { w[1][1] <= w[0][1] });
+    // The legs meet at a pole, or cross the meridian at one latitude.
+    let returning: Vec<Pos> = std::iter::once(out_end).chain(back.iter().copied()).collect();
+    out.len() >= 2
+        && out_end[1] != first[1]
+        && (pole(&out_end) || out_end[1] == back_start[1])
+        && monotone(out, rising)
+        && monotone(&returning, !rising)
+}
+
+/// A ring as the sphere reads it: each cut along the antimeridian
+/// ([`seam_cut`]) is interior, so its positions after the first are dropped
+/// and the ring joins straight on from the direction the cut left (the same
+/// direction it returns to). Rings without one are returned as they are.
+pub(crate) fn without_seam_cuts(geographic: bool, ring: &[Pos]) -> Cow<'_, [Pos]> {
+    let Some((_, open)) = ring.split_last() else {
+        return Cow::Borrowed(ring);
+    };
+    let n = open.len();
+    let Some(start) = (geographic && n >= 3).then(|| (0..n).find(|&i| !on_seam(open[i]))).flatten() else {
+        return Cow::Borrowed(ring);
+    };
+    let at = |i: usize| open[(start + i) % n];
+    let mut kept = Vec::with_capacity(n + 1);
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        if !on_seam(at(i)) {
+            kept.push(at(i));
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < n && on_seam(at(j)) {
+            j += 1;
+        }
+        let run: Vec<Pos> = (i..j).map(at).collect();
+        if seam_cut(&run) {
+            kept.push(run[0]);
+            changed = true;
+        } else {
+            kept.extend(run);
+        }
+        i = j;
+    }
+    if !changed {
+        return Cow::Borrowed(ring);
+    }
+    kept.push(kept[0]);
+    Cow::Owned(kept)
+}
+
 /// A simple closed chain of arcs. Its left side is the region it bounds when
 /// it is a shell, as GeoJSON's counterclockwise outer rings put it; rings may
 /// contain a pole or more than a hemisphere, since orientation fixes the
@@ -1148,6 +1232,8 @@ impl Ring {
             return Err(crate::invalid("A ring must end at its first position"));
         }
         let geographic = *frame == CoordinateFrame::Wgs84;
+        let positions = without_seam_cuts(geographic, positions);
+        let open = &positions[..positions.len() - 1];
         work.charge(open.len())?;
         work.allocate(open.len().saturating_mul(2 * std::mem::size_of::<Vector>()))?;
         let mut vertices: Vec<Vector> = Vec::with_capacity(open.len());

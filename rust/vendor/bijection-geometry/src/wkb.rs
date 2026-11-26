@@ -49,8 +49,14 @@ impl Geometry {
 
     /// Little-endian ISO WKB (ISO WKB Z with heights).
     pub fn wkb(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.wkb_len());
+        self.append_wkb(&mut out);
+        out
+    }
+
+    pub fn append_wkb(&self, out: &mut Vec<u8>) {
         struct W<'a> {
-            out: Vec<u8>,
+            out: &'a mut Vec<u8>,
             heights: Option<&'a [f64]>,
             next: usize,
         }
@@ -142,12 +148,11 @@ impl Geometry {
             }
         }
         let mut w = W {
-            out: Vec::with_capacity(self.wkb_len()),
+            out,
             heights: self.heights.as_deref(),
             next: 0,
         };
         w.geometry(self);
-        w.out
     }
 }
 

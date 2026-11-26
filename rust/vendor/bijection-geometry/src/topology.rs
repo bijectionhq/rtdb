@@ -440,6 +440,8 @@ fn collect(
             let first = rings.len();
             let id = polygons.len();
             for (index, ring) in polygon.iter().enumerate() {
+                // A cut along the antimeridian is interior: no edge.
+                let ring = arcs::without_seam_cuts(geographic, ring);
                 let mut vertices: Vec<Vector> = Vec::with_capacity(ring.len());
                 let ring_id = rings.len();
                 for pair in ring.windows(2) {
@@ -648,8 +650,19 @@ pub(crate) fn polygon_defect(
     Ok(None)
 }
 
+/// Whether two edges are the two sides of a cut at the antimeridian: both
+/// run along the ±180 meridian, one written at +180 (the eastern part's)
+/// and the other at -180 (the western part's), as RFC 7946 splits a value
+/// that crosses it. The shared meridian is then interior to their union.
+fn antimeridian_cut(a: &Edge, b: &Edge) -> bool {
+    let on = |edge: &Edge, longitude: f64| edge.raw.0[0] == longitude && edge.raw.1[0] == longitude;
+    on(a, 180.0) && on(b, -180.0) || on(a, -180.0) && on(b, 180.0)
+}
+
 /// Whether any two of a multipart value's admitted polygons share an edge
-/// or interior points. Isolated contacts are allowed. All parts share one
+/// or interior points. Isolated contacts are allowed, and so is a shared
+/// edge along the antimeridian written at +180 in one part and -180 in the
+/// other: a value that crosses it, split there. All parts share one
 /// packed index: edges of different parts are compared once, each ring is
 /// located in the others by one vertex, and only edges near another part are
 /// refined.
@@ -669,6 +682,10 @@ pub(crate) fn parts_overlap(
                 }
                 let met = meet(&shape.edges[i], &shape.edges[j], work)?;
                 if met.len() >= 2 {
+                    if geographic && antimeridian_cut(&shape.edges[i], &shape.edges[j]) {
+                        contact = true;
+                        return Ok(false);
+                    }
                     overlap = true;
                     return Ok(true);
                 }

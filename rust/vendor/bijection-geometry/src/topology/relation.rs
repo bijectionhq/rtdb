@@ -665,6 +665,179 @@ fn empty_pair(a: &Geometry, b: &Geometry, predicate: Predicate) -> bool {
         || matches!(predicate, Predicate::Equals) && a.is_empty() && b.is_empty()
 }
 
+/// The DE-9IM matrix of two values, exact: nine symbols `F`, `0`, `1`, `2`
+/// in the order II IB IE BI BB BE EI EB EE. Every region is computed (the
+/// named predicates read only the ones they need). EE is not always 2 on
+/// the sphere: it is read from the samples beside every edge piece.
+pub(crate) fn matrix(
+    a: &Geometry,
+    b: &Geometry,
+    work: &mut GeometryWork,
+) -> Result<String, GeometryRefusal> {
+    validate_pair(a, b)?;
+    let cells = work.scoped(|work| {
+        let mut cells = [[-1_i8; 3]; 3];
+        if a.is_empty() || b.is_empty() {
+            // The exterior of an empty value is everything.
+            cells[2][2] = 2;
+            if !a.is_empty() {
+                let topology = PreparedTopology::new(a, work)?;
+                cells[0][2] = topology.dimension;
+                cells[1][2] = topology.boundary_dimension(a, None, work)?;
+            }
+            if !b.is_empty() {
+                let topology = PreparedTopology::new(b, work)?;
+                cells[2][0] = topology.dimension;
+                cells[2][1] = topology.boundary_dimension(b, None, work)?;
+            }
+            return Ok(cells);
+        }
+        let left = PreparedTopology::new(a, work)?;
+        let right = PreparedTopology::new(b, work)?;
+        full_cells(a, b, &left, &right, work)
+    })?;
+    Ok(cells
+        .iter()
+        .flatten()
+        .map(|cell| match cell {
+            -1 => 'F',
+            0 => '0',
+            1 => '1',
+            _ => '2',
+        })
+        .collect())
+}
+
+/// Every cell of the matrix of two non-empty values.
+fn full_cells(
+    a: &Geometry,
+    b: &Geometry,
+    left: &PreparedTopology,
+    right: &PreparedTopology,
+    work: &mut GeometryWork,
+) -> Result<[[i8; 3]; 3], GeometryRefusal> {
+    let geographic = left.geographic();
+    let mut cells = [[-1_i8; 3]; 3];
+    if !reaches(&left.bounds, &right.bounds, geographic) {
+        // Disjoint closed sets: each lies in the other's exterior, and two
+        // disjoint closed sets never cover the plane or the sphere.
+        cells[0][2] = left.dimension;
+        cells[1][2] = left.boundary_dimension(a, None, work)?;
+        cells[2][0] = right.dimension;
+        cells[2][1] = right.boundary_dimension(b, None, work)?;
+        cells[2][2] = 2;
+        return Ok(cells);
+    }
+    if left.dimension == 0 && right.dimension == 0 {
+        let a_points = point_set(a, left.points.as_ref(), work)?;
+        let b_points = point_set(b, right.points.as_ref(), work)?;
+        if a_points.iter().any(|p| b_points.contains(p)) {
+            cells[0][0] = 0;
+        }
+        if a_points.iter().any(|p| !b_points.contains(p)) {
+            cells[0][2] = 0;
+        }
+        if b_points.iter().any(|p| !a_points.contains(p)) {
+            cells[2][0] = 0;
+        }
+        cells[2][2] = 2;
+        return Ok(cells);
+    }
+    if left.dimension == 0 || right.dimension == 0 {
+        let transposed = left.dimension != 0;
+        let (points, cached, topology, other) = if transposed {
+            (b, right.points.as_ref(), left, a)
+        } else {
+            (a, left.points.as_ref(), right, b)
+        };
+        // Rows: the points (interior only); columns: the other value.
+        let mut own = [[-1_i8; 3]; 3];
+        let set = point_set(points, cached, work)?;
+        for p in set.iter() {
+            let location = topology.locate(&Point::vertex(p.map(f64::from_bits)), work)?;
+            own[0][location] = 0;
+        }
+        // A finite point set covers no positive-dimensional interior, and
+        // leaves the other's boundary uncovered unless that boundary is
+        // finitely many points, all of them in the set.
+        own[2][0] = topology.dimension;
+        own[2][1] = topology.boundary_dimension(other, Some(&*set), work)?;
+        own[2][2] = 2;
+        if transposed {
+            for (i, row) in own.iter().enumerate() {
+                for (j, cell) in row.iter().enumerate() {
+                    cells[j][i] = *cell;
+                }
+            }
+        } else {
+            cells = own;
+        }
+        return Ok(cells);
+    }
+    // Every edge piece of both values, its cuts and the samples beside it,
+    // located in both: the regions they meet are the matrix.
+    for own in [left, right] {
+        for index in 0..own.shape.edges.len() {
+            work.charge(1)?;
+            if own.shape.edges[index].role == Role::Collapsed {
+                continue;
+            }
+            work.scoped(|work| refine(own, index, left, right, &mut cells, work))?;
+        }
+    }
+    if !geographic {
+        // The plane's exterior to two bounded values is unbounded.
+        cells[2][2] = 2;
+    }
+    Ok(cells)
+}
+
+impl PreparedTopology {
+    /// The dimension of a value's boundary outside `covered` (a point set,
+    /// by frame vertex): 1 for areas, 0 when some endpoint of odd degree of
+    /// its lines is uncovered, else none (-1).
+    fn boundary_dimension(
+        &self,
+        geometry: &Geometry,
+        covered: Option<&std::collections::BTreeSet<[u64; 3]>>,
+        work: &mut GeometryWork,
+    ) -> Result<i8, GeometryRefusal> {
+        if self.shape.has_areas() {
+            return Ok(1);
+        }
+        if self.dimension < 1 {
+            return Ok(-1);
+        }
+        let mut ends = Vec::new();
+        line_ends(geometry, &mut ends);
+        work.charge(ends.len())?;
+        for end in ends {
+            let vertex = arcs::embed(&self.frame, end).map(f64::to_bits);
+            if covered.is_some_and(|set| set.contains(&vertex)) {
+                continue;
+            }
+            if self.locate(&self.vertex(end), work)? == 1 {
+                return Ok(0);
+            }
+        }
+        Ok(-1)
+    }
+}
+
+/// The first and last positions of every line of a value.
+fn line_ends(geometry: &Geometry, ends: &mut Vec<Pos>) {
+    match (&geometry.coords, geometry.kind) {
+        (Coords::Collection(members), _) => members.iter().for_each(|member| line_ends(member, ends)),
+        (Coords::Points(line), Kind::LineString) => ends.extend(line.first().into_iter().chain(line.last())),
+        (Coords::Lines(lines), Kind::MultiLineString) => {
+            for line in lines {
+                ends.extend(line.first().into_iter().chain(line.last()));
+            }
+        },
+        _ => {},
+    }
+}
+
 pub(crate) fn evaluate(
     a: &Geometry,
     b: &Geometry,

@@ -167,7 +167,7 @@ fn face_of(v: Vector) -> u8 {
 }
 
 /// A direction's (u, v) on a face; S2's `ValidFaceXYZtoUV`.
-fn face_uv(face: u8, p: Vector) -> (f64, f64) {
+pub(crate) fn face_uv(face: u8, p: Vector) -> (f64, f64) {
     match face {
         0 => (p[1] / p[0], p[2] / p[0]),
         1 => (-p[0] / p[1], p[2] / p[1]),
@@ -180,7 +180,7 @@ fn face_uv(face: u8, p: Vector) -> (f64, f64) {
 
 /// The direction of (u, v) on a face; S2's `FaceUVtoXYZ`. Each face's (u, v)
 /// frame turns counterclockwise about its outward normal.
-fn face_xyz(face: u8, u: f64, v: f64) -> Vector {
+pub(crate) fn face_xyz(face: u8, u: f64, v: f64) -> Vector {
     match face {
         0 => [1.0, u, v],
         1 => [-u, 1.0, v],
@@ -446,29 +446,38 @@ pub fn cover(
     for face in CellId::faces() {
         classify(face, &mut kept, &mut meets, work)?;
     }
-    while !meets.is_empty() {
-        work.charge(meets.len())?;
-        let position = (0..meets.len())
-            .min_by_key(|position| (meets[*position].level(), meets[*position]))
-            .expect("nonempty frontier");
-        let id = meets.swap_remove(position);
+    // The frontier is a min-heap on (level, id): the same unique next cell
+    // as a linear scan, at a logarithmic cost charged per selection.
+    let mut frontier = std::collections::BinaryHeap::from_iter(
+        meets.into_iter().map(|id| std::cmp::Reverse((id.level(), id))),
+    );
+    while let Some(std::cmp::Reverse((_, id))) = frontier.pop() {
+        work.charge(1 + (usize::BITS - frontier.len().leading_zeros()) as usize)?;
         let Some(children) = id.children() else {
             kept.push(id);
             continue;
         };
+        // A split fits only while its kept children stay within the room
+        // left; once they cannot, the parent stays and the remaining
+        // children need no classification. The decision is unchanged.
+        let room = max_cells - kept.len() - frontier.len();
         let (mut inside, mut boundary) = (Vec::with_capacity(4), Vec::with_capacity(4));
+        let mut fits = true;
         for child in children {
             classify(child, &mut inside, &mut boundary, work)?;
+            if inside.len() + boundary.len() > room {
+                fits = false;
+                break;
+            }
         }
-        if kept.len() + meets.len() + inside.len() + boundary.len() <= max_cells {
+        if fits {
             kept.extend(inside);
-            meets.extend(boundary);
+            frontier.extend(boundary.into_iter().map(|id| std::cmp::Reverse((id.level(), id))));
         } else {
             // Keeping the unsplit parent preserves complete coverage.
             kept.push(id);
         }
     }
-    kept.extend(meets);
     kept.sort_unstable();
     Ok(kept)
 }
