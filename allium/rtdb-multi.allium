@@ -1123,6 +1123,8 @@ entity MemberRecord {
     state: MemberState
     -- Logkeepers only: present once a draining journal is certified free of custody, and kept once it is decommissioned.
     decommission: LogkeeperDecommission?
+    -- Moves on with every change to state or decommission, and never with a lease renewal.
+    eligibility_epoch: Integer
 
     transitions state {
         joining -> eligible      -- prewarmed and admitted by the controller
@@ -1141,6 +1143,8 @@ entity MemberRecord {
     -- Derived: what it may hold or serve.
     may_hold: role = node and (state = eligible or state = draining)
     may_receive_placements: role = node and state = eligible
+    -- Derived: whether a deployment record may newly name it.
+    accepts_journal_references: role != log_server or decommission = null
 }
 
 value PlacementMove {
@@ -2655,7 +2659,8 @@ rule CertifyLogkeeperDecommission {
     -- Each controller pass reads the deployment records once while any logkeeper is draining.
     -- A record retains custody of a journal while any of its fields names the journal's identity or address, until its disposal receipt is recorded.
     -- That covers its ensemble, a pending journal placement, copy custody, replica journals and staged transfer sources.
-    -- The certificate is written conditionally on the member record, and kept across lease renewals while the journal stays draining at the same address.
+    -- The certificate is written conditionally on the member record, and kept across lease renewals while the journal stays draining at the same address and eligibility epoch.
+    -- A pass that finds a certified journal still unreferenced keeps its certificate, since no record can have gained it since.
     -- A later pass that finds a reference withdraws the certificate.
     when: ControllerPass(cell)
 
@@ -2667,10 +2672,28 @@ rule CertifyLogkeeperDecommission {
                 member.decommission = null
 }
 
+rule JournalReferenceRequiresCurrentEligibility {
+    -- The directory has no transaction spanning a member record and a deployment record, so a writer's view of a logkeeper may be stale when its deployment write lands.
+    -- A logkeeper is newly named by a write when the written record names its identity or address and the stored record it replaces does not, by the same matching as RetainsCustody.
+    -- Every deployment write is fenced this way: creation, replacement, fork staging and publication, retirement settlement and checkpoint transfer steps.
+    -- That covers initial placement, journal placement, ensemble repair, copy reservation, claims, forks and restores, whichever path wrote the field.
+    -- The directory observes each newly named logkeeper's eligibility epoch and commits the write only while the epoch is unchanged, in the same conditional write.
+    -- A member write that changes state or decommission without moving the epoch on is refused.
+    when: DeploymentWritten(stored, written)
+
+    requires: for member in Directory.members where member.role = log_server and NamesJournal(written, member) and not NamesJournal(stored, member):
+        member.accepts_journal_references
+        and member.eligibility_epoch = ObservedEligibilityEpoch(written, member)
+
+    ensures:
+        Directory.cas(written.id, stored.version, change: written)
+}
+
 rule LogkeeperDecommissionRequiresNoCustody {
     -- `rtdb-multi decommission-logkeeper` retires a logkeeper only under a certificate for its own identity and address, issued while it was draining.
     -- It reads the deployment records again and refuses while any retains custody of the journal, so every journal a record references, including one a journal placement moved it off, stays a member until the record finishes disposal.
-    -- The retirement is conditional on the member still draining under the same certificate.
+    -- The retirement is conditional on the member still draining under the same certificate, at the eligibility epoch the certificate was written at.
+    -- JournalReferenceRequiresCurrentEligibility keeps any record from gaining the journal once it is certified, so this check sees every reference a record can hold when the retirement lands.
     -- The process serving the journal loses its lease, after which the journal's storage may be destroyed.
     -- No placement, ensemble repair or claim chooses a logkeeper that is not eligible.
     when: LogkeeperDecommissionRequested(member)

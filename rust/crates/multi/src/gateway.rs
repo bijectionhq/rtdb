@@ -798,7 +798,7 @@ mod tests {
             drain_target_engine: None,
             pool: MemberPool::General,
             storage_namespaces: None,
-            decommission: None,
+            decommission: None, eligibility_epoch: 0,
             version: 0,
         };
         let source = directory.register_member(member("source", &source_control)).await.unwrap();

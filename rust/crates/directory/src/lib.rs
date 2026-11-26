@@ -27,6 +27,11 @@ pub mod network;
 pub mod dynamo;
 
 pub use feed::ChangeFeed;
+mod journal_admission;
+pub use journal_admission::{JournalObservation, epoch_follows, fenced_journals};
+mod journal_fence;
+pub use journal_fence::{journal_fence, may_add_journal_references};
+use journal_fence::require_epoch_follows;
 mod writer_handoff;
 pub use writer_handoff::{RetainedWriterHandoff, WriterHandoff, WriterHandoffPlan, WriterHandoffState, WRITER_HANDOFF_BYTES};
 use writer_handoff::require_writer_handoff_update;
@@ -95,6 +100,9 @@ pub struct MemberRecord {
     pub storage_namespaces: Option<StorageNamespaces>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decommission: Option<LogkeeperDecommission>,
+    /// Moves on with every change to `state` or `decommission`, so a deployment write can be fenced on the eligibility it observed.
+    #[serde(default)]
+    pub eligibility_epoch: u64,
     pub version: Version,
 }
 
@@ -144,6 +152,17 @@ impl MemberRecord {
     }
     pub fn may_receive_placements(&self, now_ms: i64) -> bool {
         self.role == MemberRole::Node && self.state == MemberState::Eligible && self.lease_expires_at_ms > now_ms
+    }
+    /// Whether a deployment record may newly name this member: a logkeeper stops once it is certified for decommission.
+    pub fn accepts_journal_references(&self) -> bool {
+        self.role != MemberRole::Logkeeper || self.decommission.is_none()
+    }
+    pub fn same_eligibility(&self, other: &MemberRecord) -> bool {
+        self.state == other.state && self.decommission == other.decommission
+    }
+    /// Numbers this record as the successor of `previous`, moving the eligibility epoch on if its state or decommission differs.
+    pub fn follow(&mut self, previous: &MemberRecord) {
+        self.eligibility_epoch = previous.eligibility_epoch + u64::from(!self.same_eligibility(previous));
     }
 }
 
@@ -2079,6 +2098,13 @@ struct MemoryState {
     failed: bool,
 }
 
+impl MemoryState {
+    /// The fence is checked under the same lock as the write, so the eligibility it observes is the one the write commits under.
+    fn fence_journals(&self, next: &DeploymentRecord) -> Result<()> {
+        journal_fence(self.deployments.get(&next.id).map(Box::as_ref), next, self.members.values()).map(|_| ())
+    }
+}
+
 impl MemoryDirectory {
     pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
 
@@ -2118,13 +2144,14 @@ impl MemoryDirectory {
     }
     fn replace_record(&self, mut record: DeploymentRecord, expected: Version, disposal: Option<&ReferenceDisposal>) -> Result<Cas<DeploymentRecord>> {
         let mut state = self.state()?;
-        let MemoryState { deployments, held, reference_revisions, .. } = &mut *state;
+        let MemoryState { deployments, held, reference_revisions, members, .. } = &mut *state;
         let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
         require_fork_stage_update(current, &record)?;
         require_transfer_update(current, &record)?;
         require_writer_handoff_update(current, &record)?;
+        journal_fence(Some(current), &record, members.values())?;
         if let Some(permit) = disposal {
             let references = reference_revisions.get(&permit.lineage).map(StoredLineage::state).unwrap_or_default();
             let next = references.finish_disposal(permit, current, &record)?;
@@ -2158,6 +2185,7 @@ impl MemoryDirectory {
             return Err(exists("Deployment", &record.id));
         }
         if record.fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
+        state.fence_journals(&record)?;
         if let Some((lineage, next)) = lineage {
             let stored = next.legacy_revision().map_or_else(|| StoredLineage::Current(next), StoredLineage::Legacy);
             state.reference_revisions.insert(lineage, stored);
@@ -2258,6 +2286,7 @@ impl Directory for MemoryDirectory {
         let current = state.reference_revisions.get(&lineage).map(StoredLineage::state).unwrap_or_default();
         let (next, next_lineage) = current.settle_exact_owned(owner, &retirement)?;
         require_transfer_update(owner, &next)?;
+        state.fence_journals(&next)?;
         state.deployments.insert(id.to_owned(), Box::new(next.clone()));
         state.reference_revisions.insert(lineage, StoredLineage::Current(next_lineage));
         self.persist(&mut state)?;
@@ -2300,6 +2329,7 @@ impl Directory for MemoryDirectory {
         if state.installed_journals.contains(&scratch_id) { return Err(classic_flight::conflict()); }
         let scratch = state.deployments.get(&scratch_id).map(Box::as_ref);
         let rebound = classic_flight::prepare_rebind(source, excluded, scratch, previous, replacement)?;
+        state.fence_journals(&rebound)?;
         state.deployments.insert(id, Box::new(rebound.clone()));
         self.persist(&mut state)?;
         self.changes.publish(rebound);
@@ -2313,6 +2343,8 @@ impl Directory for MemoryDirectory {
         let destination = state.deployments.get(&destination_id).ok_or_else(transfer_changed)?;
         let (fenced, held, fence) = prepare_checkpoint_transfer(source, destination, selection)?;
         if fenced.version == source.version { return Ok(fence); }
+        state.fence_journals(&fenced)?;
+        state.fence_journals(&held)?;
         if let Some(previous) = source.holder.clone()
             && let Some(installations) = state.held.get_mut(&previous)
         {
@@ -2333,6 +2365,7 @@ impl Directory for MemoryDirectory {
         let source = state.deployments.get(&id).ok_or_else(transfer_changed)?;
         let next = prepare_checkpoint_transfer_terminal(source, terminal)?;
         if next.version != source.version {
+            state.fence_journals(&next)?;
             state.deployments.insert(id, Box::new(next.clone()));
             self.persist(&mut state)?;
             self.changes.publish(next);
@@ -2348,6 +2381,7 @@ impl Directory for MemoryDirectory {
         let destination = state.deployments.get(&id).ok_or_else(transfer_changed)?;
         let next = prepare_checkpoint_transfer_bootstrap(source, destination, bootstrap)?;
         if next.version != destination.version {
+            state.fence_journals(&next)?;
             state.deployments.insert(id, Box::new(next.clone()));
             self.persist(&mut state)?;
             self.changes.publish(next);
@@ -2364,6 +2398,7 @@ impl Directory for MemoryDirectory {
         let next = prepare_checkpoint_transfer_replica(source, destination, replica)?;
         let reserved = next.checkpoint_transfer_replica.as_deref().ok_or_else(transfer_changed)?.clone();
         if next.version != destination.version {
+            state.fence_journals(&next)?;
             state.deployments.insert(id, Box::new(next.clone()));
             self.persist(&mut state)?;
             self.changes.publish(next);
@@ -2379,6 +2414,7 @@ impl Directory for MemoryDirectory {
         let destination = state.deployments.get(&id).ok_or_else(transfer_changed)?;
         let next = prepare_checkpoint_transfer_activation(source, destination, activation)?;
         if next.version != destination.version {
+            state.fence_journals(&next)?;
             state.deployments.insert(id, Box::new(next.clone()));
             self.persist(&mut state)?;
             self.changes.publish(next);
@@ -2403,6 +2439,7 @@ impl Directory for MemoryDirectory {
         let mut state = self.state()?;
         let Some(current) = state.members.get(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
+        require_epoch_follows(current, &record)?;
         record.version = expected + 1;
         state.members.insert(record.id.clone(), record.clone());
         self.persist(&mut state)?;

@@ -587,6 +587,8 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    It reads every deployment record on each pass; an indexed or paged scan remains open.
    Each controller pass certifies a draining logkeeper once no deployment record names its journal identity or address, until the record's disposal receipt is recorded, and withdraws the certificate if a later pass finds a reference.
    `rtdb-multi decommission-logkeeper` checks the records again and retires a certified logkeeper for good: its process loses its lease, its journal identity can never register again, and its storage may then be destroyed.
+   Each member carries an eligibility epoch that moves on with every change to its state or decommission, and every deployment write that newly names a logkeeper commits only while that logkeeper is uncertified at the epoch the directory observed: atomically under the local directory's lock, and as a DynamoDB condition check in the same transaction.
+   A placement, repair or fork planned before a certificate therefore cannot land after it, and the decommission's last check sees every reference.
    A logkeeper still referenced, or never certified, is refused.
    A journal placement leaves the evacuated journal in the deployment's copy custody, so the journal becomes eligible only once each deployment it ever served has finished disposal; releasing a live deployment's retained copy remains open.
 

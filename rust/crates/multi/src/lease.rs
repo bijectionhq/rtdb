@@ -39,7 +39,7 @@ impl Registration {
         MemberRecord {
             id, role: self.role, address: self.address, control_address: self.control_address,
             availability_zone: self.availability_zone, engine_version: self.engine_version,
-            lease_expires_at_ms: 0, state: MemberState::Eligible, drain_target_engine: None, pool: self.pool, storage_namespaces: self.storage_namespaces, decommission: None, version: 0,
+            lease_expires_at_ms: 0, state: MemberState::Eligible, drain_target_engine: None, pool: self.pool, storage_namespaces: self.storage_namespaces, decommission: None, eligibility_epoch: 0, version: 0,
         }
     }
 }
@@ -87,6 +87,7 @@ impl MemberLease {
                 }
                 if !previous.is_live(now) {
                     draining = previous.state == MemberState::Draining;
+                    candidate.follow(&previous);
                     if let Cas::Applied(record) = directory.replace_member(candidate.clone(), previous.version).await? {
                         return Ok(record);
                     }
@@ -99,8 +100,10 @@ impl MemberLease {
             return Err(conflict());
         }
         let version = record.version;
+        let reclaimed = record.clone();
         // An operator's drain of the journal outlives the process that serves it.
         record.state = if draining { MemberState::Draining } else { MemberState::Eligible };
+        record.follow(&reclaimed);
         record.lease_expires_at_ms = now_ms() + options.lease.as_millis() as i64;
         let Cas::Applied(record) = directory.replace_member(record, version).await? else {
             return Err(conflict());
@@ -180,6 +183,7 @@ impl MemberLease {
             } else {
                 next.state = MemberState::Retired;
             }
+            next.follow(&current);
             match self.directory.replace_member(next, current.version).await? {
                 Cas::Applied(stored) => { *self.record.lock() = stored; return Ok(()); }
                 // A drain moved a node's record after this lease last read it.

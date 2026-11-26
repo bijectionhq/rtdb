@@ -2462,6 +2462,7 @@ async fn mark_draining(directory: &dyn Directory, member: &MemberId, target_engi
         let mut draining = current.clone();
         draining.state = MemberState::Draining;
         draining.drain_target_engine = target_engine.map(str::to_owned);
+        draining.follow(&current);
         if let Cas::Applied(_) = directory.replace_member(draining, current.version).await? { return Ok(true); }
     }
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/drain-contended", "The member kept changing while being drained"))
@@ -2516,6 +2517,7 @@ pub async fn reap_members(directory: &dyn Directory, grace: Duration) -> Result<
         }
         let mut dead = member.clone();
         dead.state = MemberState::Dead;
+        dead.follow(&member);
         if let Cas::Applied(_) = directory.replace_member(dead, member.version).await? { reaped += 1; }
     }
     Ok(reaped)
@@ -2594,6 +2596,7 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
                 if matches!(current.state, MemberState::Dead | MemberState::Retired) || !failure.matches(&current) { break; }
                 let mut dead = current.clone();
                 dead.state = MemberState::Dead;
+                dead.follow(&current);
                 match directory.replace_member(dead, current.version).await? {
                     Cas::Applied(_) => { confirmed += 1; break; }
                     Cas::Conflict(Some(stored)) => current = stored,
@@ -2787,7 +2790,7 @@ mod tests {
             id: MemberId::fresh(), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
             availability_zone: "local".into(), engine_version: String::new(), lease_expires_at_ms: i64::MAX,
             state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::default(),
-            storage_namespaces: None, decommission: None, version: 1,
+            storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 1,
         };
         let members = BTreeMap::from([(replacement.id.clone(), replacement)]);
         let directory = MemoryDirectory::new();

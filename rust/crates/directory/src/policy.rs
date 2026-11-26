@@ -59,7 +59,7 @@ mod tests {
 
     fn node(id: &str, state: MemberState, lease: i64) -> MemberRecord {
         MemberRecord { id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None, availability_zone: "a".into(),
-            engine_version: "0".into(), lease_expires_at_ms: lease, state, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 1 }
+            engine_version: "0".into(), lease_expires_at_ms: lease, state, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 1 }
     }
 
     fn members(list: &[MemberRecord]) -> BTreeMap<MemberId, MemberRecord> { list.iter().map(|member| (member.id.clone(), member.clone())).collect() }

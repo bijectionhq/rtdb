@@ -4,24 +4,11 @@
 
 use rtdb_directory::{Cas, DecommissionCertificate, DeploymentRecord, Directory, Lifecycle, LogkeeperDecommission, MemberId, MemberRecord, MemberRole, MemberState, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use serde_json::Value;
 
 /// Whether `record` retains custody of `journal`'s stream: any mention of its identity or address, unless the record has finished disposal.
-/// Matching the whole record keeps every custody field in scope, including ones added after this check.
+/// The directory's journal fence matches the same mentions, so once a certificate is written no record gains one.
 pub(super) fn retains_custody(record: &DeploymentRecord, journal: &MemberRecord) -> bool {
-    if record.lifecycle == Lifecycle::Deleted && record.disposal.is_some() { return false; }
-    let value = serde_json::to_value(record).expect("a deployment record serializes");
-    mentions(&value, journal.id.as_str(), &journal.address)
-}
-
-fn mentions(value: &Value, id: &str, address: &str) -> bool {
-    let matches = |text: &str| text == id || !address.is_empty() && text == address;
-    match value {
-        Value::String(text) => matches(text),
-        Value::Array(items) => items.iter().any(|item| mentions(item, id, address)),
-        Value::Object(fields) => fields.iter().any(|(key, field)| matches(key) || mentions(field, id, address)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
+    !(record.lifecycle == Lifecycle::Deleted && record.disposal.is_some()) && record.names_journal(journal)
 }
 
 fn checked(deployments: &[DeploymentRecord]) -> ([u8; 32], u64) {
@@ -55,24 +42,25 @@ pub async fn certify_logkeeper_decommissions(directory: &dyn Directory) -> Resul
     Ok(certified)
 }
 
-/// Sets or clears the certificate on `member` while it stays the same draining journal; lease renewals in between are kept.
+/// Sets or clears the certificate on `member` while it keeps the eligibility it was checked at; lease renewals in between are kept.
 async fn record_certificate(directory: &dyn Directory, mut member: MemberRecord, certificate: Option<DecommissionCertificate>) -> Result<bool> {
-    let journal = (member.id.clone(), member.address.clone());
+    let journal = (member.id.clone(), member.address.clone(), member.eligibility_epoch);
     for _ in 0..8 {
-        if member.state != MemberState::Draining || (member.id.clone(), member.address.clone()) != journal
+        if member.state != MemberState::Draining || (member.id.clone(), member.address.clone(), member.eligibility_epoch) != journal
             || matches!(member.decommission, Some(LogkeeperDecommission::Decommissioned { .. }))
         {
             return Ok(false);
         }
         let unchanged = match (&member.decommission, &certificate) {
             (None, None) => true,
-            (Some(LogkeeperDecommission::Certified(held)), Some(fresh)) => held.deployments_sha256 == fresh.deployments_sha256
-                && held.deployments_checked == fresh.deployments_checked && held.journal == fresh.journal && held.address == fresh.address,
+            // The journal fence keeps any record from naming a certified journal, so a held certificate stays true until withdrawn.
+            (Some(LogkeeperDecommission::Certified(held)), Some(fresh)) => held.journal == fresh.journal && held.address == fresh.address,
             _ => false,
         };
         if unchanged { return Ok(certificate.is_some()); }
         let mut next = member.clone();
         next.decommission = certificate.clone().map(LogkeeperDecommission::Certified);
+        next.follow(&member);
         match directory.replace_member(next, member.version).await? {
             Cas::Applied(_) => return Ok(certificate.is_some()),
             Cas::Conflict(Some(stored)) => member = stored,
@@ -89,12 +77,13 @@ pub async fn decommission_logkeeper(directory: &dyn Directory, id: &MemberId) ->
     let mut member = directory.member(id).await?.ok_or_else(unknown)?;
     let certificate = certified(&member)?;
     let Some(certificate) = certificate else { return Ok(member) };
+    let certified_epoch = member.eligibility_epoch;
     if let Some(record) = directory.deployments().await?.iter().find(|record| retains_custody(record, &member)) {
         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/journal-custody",
             format!("Deployment {} retains custody of logkeeper {id}; its certificate is stale", record.id)));
     }
     for _ in 0..8 {
-        if certified(&member)?.as_ref() != Some(&certificate) {
+        if member.eligibility_epoch != certified_epoch || certified(&member)?.as_ref() != Some(&certificate) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/decommission-changed",
                 format!("Logkeeper {id} changed its state or certificate during decommission")));
         }
@@ -103,6 +92,7 @@ pub async fn decommission_logkeeper(directory: &dyn Directory, id: &MemberId) ->
         next.state = MemberState::Retired;
         next.lease_expires_at_ms = next.lease_expires_at_ms.min(decommissioned_at_ms);
         next.decommission = Some(LogkeeperDecommission::Decommissioned { certificate: certificate.clone(), decommissioned_at_ms });
+        next.follow(&member);
         match directory.replace_member(next, member.version).await? {
             Cas::Applied(stored) => return Ok(stored),
             Cas::Conflict(Some(stored)) => member = stored,
@@ -136,7 +126,7 @@ mod tests {
         MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Logkeeper, address: format!("{id}:7000"), control_address: None,
             availability_zone: "z1".into(), engine_version: "test".into(), lease_expires_at_ms: i64::MAX, state,
-            drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, version: 0,
+            drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0,
         }
     }
 
@@ -187,17 +177,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reference_after_certification_withdraws_the_certificate_and_refuses_the_decommission() {
+    async fn a_reference_landing_before_certification_withdraws_it_and_refuses_the_decommission() {
         let directory = cell(vec![deployment("shop", &["a"])]).await;
-        assert_eq!(certify_logkeeper_decommissions(&*directory).await.unwrap(), 1);
+        let certifying_scan = directory.deployments().await.unwrap();
         let mut current = directory.deployment_by_name("shop").await.unwrap().unwrap();
         let version = current.version;
         current.log_copy_servers.push(JournalEndpoint::Member { address: "d:7000".into(), journal: "d".into() });
-        directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
+        directory.replace_deployment(current, version).await.unwrap().applied().expect("an uncertified draining journal accepts references");
+        let member = directory.member(&MemberId("d".into())).await.unwrap().unwrap();
+        assert!(!certifying_scan.iter().any(|record| retains_custody(record, &member)), "the scan predates the reference");
+        let (deployments_sha256, deployments_checked) = checked(&certifying_scan);
+        let stale = DecommissionCertificate { journal: member.id.clone(), address: member.address.clone(), deployments_sha256, deployments_checked, certified_at_ms: now_ms() };
+        assert!(record_certificate(&*directory, member, Some(stale)).await.unwrap());
         let refused = decommission_logkeeper(&*directory, &MemberId("d".into())).await.unwrap_err();
         assert_eq!(refused.code, "rtdb.multi/journal-custody");
         assert_eq!(certify_logkeeper_decommissions(&*directory).await.unwrap(), 0);
         assert_eq!(directory.member(&MemberId("d".into())).await.unwrap().unwrap().decommission, None);
+    }
+
+    /// A placement planned while the logkeeper was eligible, written after it was drained and certified.
+    fn stale_placement(observed: &DeploymentRecord) -> DeploymentRecord {
+        let mut planned = observed.clone();
+        planned.journal_placement = Some(JournalPlacement { operation: uuid::Uuid::new_v4(), destination: vec![MemberId("d".into())] });
+        planned
+    }
+
+    #[tokio::test]
+    async fn a_placement_planned_on_an_eligible_logkeeper_cannot_land_after_its_certification() {
+        let directory = MemoryDirectory::new();
+        for member in [logkeeper("a", MemberState::Eligible), logkeeper("d", MemberState::Eligible)] {
+            directory.register_member(member).await.unwrap();
+        }
+        let observed = directory.create_deployment(deployment("shop", &["a"])).await.unwrap();
+        let eligible = directory.member(&MemberId("d".into())).await.unwrap().unwrap();
+        crate::admin::drain(&*directory, &eligible.id).await.unwrap();
+        assert_eq!(certify_logkeeper_decommissions(&*directory).await.unwrap(), 1);
+        let certified = directory.member(&eligible.id).await.unwrap().unwrap();
+        assert_eq!(certified.eligibility_epoch, eligible.eligibility_epoch + 2, "the drain and the certificate each move the epoch on");
+
+        let refused = directory.replace_deployment(stale_placement(&observed), observed.version).await.unwrap_err();
+        assert_eq!(refused.code, "rtdb.directory/journal-retiring");
+        let refused = directory.create_deployment(deployment("late", &["a", "d"])).await.unwrap_err();
+        assert_eq!(refused.code, "rtdb.directory/journal-retiring", "an initial placement is fenced the same way");
+
+        let retired = decommission_logkeeper(&*directory, &eligible.id).await.unwrap();
+        assert!(!directory.deployments().await.unwrap().iter().any(|record| record.names_journal(&retired)));
+    }
+
+    /// Lands a stale placement between the decommission's last read of the deployments and its retirement write.
+    struct RaceDecommission {
+        inner: std::sync::Arc<MemoryDirectory>,
+        placement: parking_lot::Mutex<Option<DeploymentRecord>>,
+        placed: parking_lot::Mutex<Option<Result<rtdb_directory::Cas<DeploymentRecord>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Directory for RaceDecommission {
+        async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> { self.inner.reserve_installed_journal(id).await }
+        async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
+        async fn stage_fork(&self, child: DeploymentRecord, preparation: rtdb_directory::ForkPreparation) -> Result<DeploymentRecord> { self.inner.stage_fork(child, preparation).await }
+        async fn publish_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version, preparation: Option<rtdb_directory::ForkPublication>) -> Result<DeploymentRecord> {
+            self.inner.publish_fork(child, expected, preparation).await
+        }
+        async fn lineage_state(&self, lineage: &str) -> Result<rtdb_directory::LineageState> { self.inner.lineage_state(lineage).await }
+        async fn change_lineage(&self, lineage: &str, change: rtdb_directory::LineageChange) -> Result<rtdb_directory::LineageState> { self.inner.change_lineage(lineage, change).await }
+        async fn authorize_owned_retirement(&self, id: &str, expected: rtdb_directory::Version, retirement: rtdb_directory::LineageRetirement) -> Result<rtdb_directory::LineageState> {
+            self.inner.authorize_owned_retirement(id, expected, retirement).await
+        }
+        async fn settle_owned_version(&self, id: &str, expected: rtdb_directory::Version, retirement: rtdb_directory::LineageRetirement) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+            self.inner.settle_owned_version(id, expected, retirement).await
+        }
+        async fn begin_reference_disposal(&self, id: &str, expected: rtdb_directory::Version) -> Result<rtdb_directory::ReferenceDisposal> { self.inner.begin_reference_disposal(id, expected).await }
+        async fn settle_reference_disposal(&self, permit: &rtdb_directory::ReferenceDisposal, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+            self.inner.settle_reference_disposal(permit, record, expected).await
+        }
+        async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment(id).await }
+        async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment_by_name(name).await }
+        async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { self.inner.deployments().await }
+        async fn deployments_held_by(&self, id: &MemberId) -> Result<Vec<DeploymentRecord>> { self.inner.deployments_held_by(id).await }
+        async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+            self.inner.replace_deployment(record, expected).await
+        }
+        async fn register_member(&self, member: MemberRecord) -> Result<MemberRecord> { self.inner.register_member(member).await }
+        async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>> { self.inner.member(id).await }
+        async fn members(&self) -> Result<Vec<MemberRecord>> { self.inner.members().await }
+        async fn replace_member(&self, member: MemberRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<MemberRecord>> {
+            let planned = matches!(member.decommission, Some(LogkeeperDecommission::Decommissioned { .. }))
+                .then(|| self.placement.lock().take()).flatten();
+            if let Some(planned) = planned {
+                let version = planned.version;
+                *self.placed.lock() = Some(self.inner.replace_deployment(planned, version).await);
+            }
+            self.inner.replace_member(member, expected).await
+        }
+        fn change_feed(&self) -> Option<&rtdb_directory::ChangeFeed> { self.inner.change_feed() }
+    }
+
+    #[tokio::test]
+    async fn a_placement_racing_the_decommission_after_its_last_check_cannot_land() {
+        let inner = MemoryDirectory::new();
+        for member in [logkeeper("a", MemberState::Eligible), logkeeper("d", MemberState::Eligible)] {
+            inner.register_member(member).await.unwrap();
+        }
+        let observed = inner.create_deployment(deployment("shop", &["a"])).await.unwrap();
+        let race = RaceDecommission { inner, placement: parking_lot::Mutex::new(Some(stale_placement(&observed))), placed: Default::default() };
+        let id = MemberId("d".into());
+        crate::admin::drain(&race, &id).await.unwrap();
+        assert_eq!(certify_logkeeper_decommissions(&race).await.unwrap(), 1);
+
+        let retired = decommission_logkeeper(&race, &id).await.unwrap();
+        let placed = race.placed.lock().take().expect("the placement raced the decommission");
+        assert_eq!(placed.unwrap_err().code, "rtdb.directory/journal-retiring");
+        assert!(matches!(retired.decommission, Some(LogkeeperDecommission::Decommissioned { .. })));
+        assert!(!race.deployments().await.unwrap().iter().any(|record| record.names_journal(&retired)),
+            "no deployment names a decommissioned logkeeper");
     }
 
     #[tokio::test]

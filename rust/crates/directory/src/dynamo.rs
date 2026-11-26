@@ -49,6 +49,8 @@ const CHECKPOINT_TRANSFER_FENCE: &str = "checkpoint_transfer_fence";
 const CLASSIC_FLIGHT: &str = "classic_flight";
 const FORK_STAGE: &str = "fork_stage";
 const WRITER_HANDOFF: &str = "writer_handoff";
+const ELIGIBILITY_EPOCH: &str = "eligibility_epoch";
+const ELIGIBILITY: &str = "eligibility";
 /// The index on the deployments table answering `deployments_held_by`; it projects only keys, since every hit is re-read strongly.
 pub const HOLDER_INDEX: &str = "holder";
 
@@ -315,6 +317,11 @@ impl AudienceSeatClaim for DynamoAudienceSeat {
     }
 }
 
+fn journal_eligibility_changed(deployment: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/journal-eligibility-changed",
+        format!("A logkeeper that deployment {deployment} newly names changed its eligibility during the write"))
+}
+
 async fn write_conditional_transaction(client: &Client, items: Vec<TransactWriteItem>) -> Result<bool> {
     use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
     match client.transact_write_items().set_transact_items(Some(items)).send().await {
@@ -440,8 +447,16 @@ fn member_item(record: &MemberRecord) -> Result<Item> {
     Ok(Item::from([
         (ID.to_owned(), AttributeValue::S(record.id.0.clone())),
         (VERSION.to_owned(), number(record.version)),
+        (ELIGIBILITY_EPOCH.to_owned(), number(record.eligibility_epoch)),
+        (ELIGIBILITY.to_owned(), eligibility(record)?),
         (RECORD.to_owned(), blob(record)?),
     ]))
+}
+
+/// The member's state and decommission, compared when a write keeps its eligibility epoch.
+fn eligibility(record: &MemberRecord) -> Result<AttributeValue> {
+    serde_json::to_string(&(record.state, &record.decommission)).map(AttributeValue::S)
+        .map_err(|error| Anomaly::fault("rtdb.directory/encode", error.to_string()))
 }
 
 impl DynamoDirectory {
@@ -493,8 +508,12 @@ impl DynamoDirectory {
         let name = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(name_item))
             .condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME).build().map_err(build_fault)?;
         let publishing_fork = !fork.is_empty();
+        let staged = match stage_version { Some(_) => self.deployment(&record.id).await?, None => None };
+        let fence = self.journal_fence(staged.as_ref(), &record).await?;
         let mut items = vec![TransactWriteItem::builder().put(deployment).build(), TransactWriteItem::builder().put(name).build()];
         items.extend(fork);
+        let fenced_from = items.len();
+        items.extend(fence);
         let transaction = self.client.transact_write_items().set_transact_items(Some(items));
         match transaction.send().await {
             Ok(_) => Ok(record),
@@ -506,6 +525,7 @@ impl DynamoDirectory {
                         return Err(if stage_version.is_some() { fork_stage_changed() } else { exists("Deployment", &record.id) });
                     }
                     if refused(1, reasons) { return Err(exists("Deployment name", &record.name)); }
+                    if (fenced_from..reasons.len()).any(|index| refused(index, reasons)) { return Err(journal_eligibility_changed(&record.id)); }
                     if refused(2, reasons) || refused(3, reasons)
                         || (publishing_fork && reasons.iter().any(|reason| reason.code() == Some("TransactionConflict")))
                     {
@@ -527,6 +547,43 @@ impl DynamoDirectory {
         Ok(TransactWriteItem::builder().condition_check(condition).build())
     }
 
+    /// Condition checks holding each logkeeper `next` newly names at the eligibility epoch it was observed accepting references at (`JournalReferenceRequiresCurrentEligibility`).
+    async fn journal_fence(&self, current: Option<&DeploymentRecord>, next: &DeploymentRecord) -> Result<Vec<TransactWriteItem>> {
+        if !crate::may_add_journal_references(current, next) { return Ok(Vec::new()); }
+        let members = self.members().await?;
+        crate::journal_fence(current, next, &members)?.into_iter().map(|(id, epoch)| {
+            let condition = if epoch == 0 { "attribute_not_exists(#epoch) OR #epoch = :epoch" } else { "#epoch = :epoch" };
+            let check = ConditionCheck::builder().table_name(&self.tables.members).key(ID, AttributeValue::S(id.0))
+                .condition_expression(condition).expression_attribute_names("#epoch", ELIGIBILITY_EPOCH)
+                .expression_attribute_values(":epoch", number(epoch)).build().map_err(build_fault)?;
+            Ok(TransactWriteItem::builder().condition_check(check).build())
+        }).collect()
+    }
+
+    /// Replaces a deployment that may newly name a logkeeper in one transaction with the fence on its eligibility, or None when the write needs no fence.
+    /// The record it diffs against is the one at `expected`, which the conditional put then requires, so the fence covers exactly what the write adds.
+    async fn replace_fenced_deployment(&self, record: &DeploymentRecord, expected: Version) -> Result<Option<Cas<DeploymentRecord>>> {
+        for _ in 0..8 {
+            let Some(current) = self.deployment(&record.id).await? else { return Ok(Some(Cas::Conflict(None))) };
+            if current.version != expected { return Ok(Some(Cas::Conflict(Some(current)))); }
+            let fence = self.journal_fence(Some(&current), record).await?;
+            if fence.is_empty() { return Ok(None); }
+            if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
+            require_fork_stage_update(&current, record)?;
+            require_transfer_update(&current, record)?;
+            crate::require_writer_handoff_update(&current, record)?;
+            let mut next = record.clone();
+            next.version = expected + 1;
+            let put = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&next, self.pack_parked_records)?))
+                .condition_expression(EXACT_VERSION).expression_attribute_names("#v", VERSION)
+                .expression_attribute_values(":expected", number(expected)).build().map_err(build_fault)?;
+            let mut items = vec![TransactWriteItem::builder().put(put).build()];
+            items.extend(fence);
+            if self.write_retirement(items).await? { return Ok(Some(Cas::Applied(next))); }
+        }
+        Err(journal_eligibility_changed(&record.id))
+    }
+
     async fn write_retirement(&self, items: Vec<TransactWriteItem>) -> Result<bool> {
         write_conditional_transaction(&self.client, items).await
     }
@@ -536,10 +593,13 @@ impl DynamoDirectory {
         let put = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?))
             .condition_expression(EXACT_VERSION).expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected)).build().map_err(build_fault)?;
-        let items = vec![
+        let stored = self.deployment(&record.id).await?;
+        let fence = self.journal_fence(stored.as_ref(), &record).await?;
+        let mut items = vec![
             TransactWriteItem::builder().put(put).build(),
             self.write_lineage(&record.lineage, next, current.version(), legacy)?,
         ];
+        items.extend(fence);
         if self.write_retirement(items).await? {
             Ok(Cas::Applied(record))
         } else {
@@ -675,8 +735,9 @@ impl Directory for DynamoDirectory {
             stage.version = 1;
             let insert = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&stage, self.pack_parked_records)?))
                 .condition_expression(NEW_ITEM).expression_attribute_names("#id", ID).build().map_err(build_fault)?;
-            let items = vec![TransactWriteItem::builder().put(insert).build(),
+            let mut items = vec![TransactWriteItem::builder().put(insert).build(),
                 self.write_lineage(&parent.lineage, &lineage, lineage.version(), legacy)?];
+            items.extend(self.journal_fence(None, &stage).await?);
             if self.write_retirement(items).await? { return Ok(stage); }
             if self.deployment(&child.id).await?.is_some() { return Err(exists("Deployment", &child.id)); }
         }
@@ -907,11 +968,13 @@ impl Directory for DynamoDirectory {
                 .build().map_err(build_fault)?;
             TransactWriteItem::builder().condition_check(missing).build()
         };
-        if self.write_retirement(vec![
+        let mut items = vec![
             self.require_deployment_version(&excluded_id, excluded.version)?,
             replacement_check,
             TransactWriteItem::builder().put(put).build(),
-        ]).await? || self.deployment(&id).await?.as_ref().and_then(classic_flight::commission) == Some(replacement) {
+        ];
+        items.extend(self.journal_fence(Some(&source), &rebound).await?);
+        if self.write_retirement(items).await? || self.deployment(&id).await?.as_ref().and_then(classic_flight::commission) == Some(replacement) {
             return Ok(());
         }
         Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.directory/classic-flight-rebind",
@@ -935,6 +998,8 @@ impl Directory for DynamoDirectory {
                 .build().map_err(build_fault)?;
             items.push(TransactWriteItem::builder().put(put).build());
         }
+        items.extend(self.journal_fence(Some(&source), &fenced).await?);
+        items.extend(self.journal_fence(Some(&destination), &held).await?);
         if !self.write_retirement(items).await? { return Err(transfer_changed()); }
         Ok(fence)
     }
@@ -950,7 +1015,9 @@ impl Directory for DynamoDirectory {
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(source.version))
             .build().map_err(build_fault)?;
-        if !self.write_retirement(vec![TransactWriteItem::builder().put(put).build()]).await? {
+        let mut items = vec![TransactWriteItem::builder().put(put).build()];
+        items.extend(self.journal_fence(Some(&source), &next).await?);
+        if !self.write_retirement(items).await? {
             return Err(transfer_changed());
         }
         Ok(terminal.clone())
@@ -969,7 +1036,9 @@ impl Directory for DynamoDirectory {
             .expression_attribute_values(":expected", number(destination.version))
             .build().map_err(build_fault)?;
         let source_check = self.require_deployment_version(&source.id, source.version)?;
-        if !self.write_retirement(vec![source_check, TransactWriteItem::builder().put(put).build()]).await? {
+        let mut items = vec![source_check, TransactWriteItem::builder().put(put).build()];
+        items.extend(self.journal_fence(Some(&destination), &next).await?);
+        if !self.write_retirement(items).await? {
             return Err(transfer_changed());
         }
         Ok(bootstrap.clone())
@@ -989,7 +1058,9 @@ impl Directory for DynamoDirectory {
             .expression_attribute_values(":expected", number(destination.version))
             .build().map_err(build_fault)?;
         let source_check = self.require_deployment_version(&source.id, source.version)?;
-        if !self.write_retirement(vec![source_check, TransactWriteItem::builder().put(put).build()]).await? {
+        let mut items = vec![source_check, TransactWriteItem::builder().put(put).build()];
+        items.extend(self.journal_fence(Some(&destination), &next).await?);
+        if !self.write_retirement(items).await? {
             return Err(transfer_changed());
         }
         Ok(reserved)
@@ -1008,7 +1079,9 @@ impl Directory for DynamoDirectory {
             .expression_attribute_values(":expected", number(destination.version))
             .build().map_err(build_fault)?;
         let source_check = self.require_deployment_version(&source.id, source.version)?;
-        if !self.write_retirement(vec![source_check, TransactWriteItem::builder().put(put).build()]).await? {
+        let mut items = vec![source_check, TransactWriteItem::builder().put(put).build()];
+        items.extend(self.journal_fence(Some(&destination), &next).await?);
+        if !self.write_retirement(items).await? {
             return Err(transfer_changed());
         }
         Ok(activation.clone())
@@ -1022,6 +1095,7 @@ impl Directory for DynamoDirectory {
             require_transfer_update(&current, &record)?;
             crate::require_writer_handoff_update(&current, &record)?;
         }
+        if let Some(fenced) = self.replace_fenced_deployment(&record, expected).await? { return Ok(fenced); }
         record.version = expected + 1;
         let name = record.name.clone();
         match self.put_conditional(&self.tables.deployments, deployment_item(&record, self.pack_parked_records)?, expected, Some(&name)).await? {
@@ -1055,9 +1129,27 @@ impl Directory for DynamoDirectory {
 
     async fn replace_member(&self, mut record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>> {
         record.version = expected + 1;
-        match self.put_conditional(&self.tables.members, member_item(&record)?, expected, None).await? {
-            Ok(()) => Ok(Cas::Applied(record)),
-            Err(current) => Ok(Cas::Conflict(current.as_ref().map(decode_member).transpose()?)),
+        let request = self.client.put_item().table_name(&self.tables.members).set_item(Some(member_item(&record)?))
+            .condition_expression("#v = :expected AND (attribute_not_exists(#epoch) OR #epoch < :epoch OR (#epoch = :epoch AND #eligibility = :eligibility))")
+            .expression_attribute_names("#v", VERSION).expression_attribute_names("#epoch", ELIGIBILITY_EPOCH)
+            .expression_attribute_names("#eligibility", ELIGIBILITY)
+            .expression_attribute_values(":expected", number(expected)).expression_attribute_values(":epoch", number(record.eligibility_epoch))
+            .expression_attribute_values(":eligibility", eligibility(&record)?)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+        match request.send().await {
+            Ok(_) => Ok(Cas::Applied(record)),
+            Err(error) => match error.as_service_error() {
+                Some(aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(failed)) => {
+                    let current = match failed.item.clone() {
+                        Some(item) => Some(item),
+                        None => self.get(&self.tables.members, ID, record.id.as_str()).await?,
+                    };
+                    let Some(current) = current.as_ref().map(decode_member).transpose()? else { return Ok(Cas::Conflict(None)) };
+                    if current.version == expected { crate::require_epoch_follows(&current, &record)?; }
+                    Ok(Cas::Conflict(Some(current)))
+                }
+                _ => Err(sdk_anomaly("PutItem", error)),
+            },
         }
     }
 

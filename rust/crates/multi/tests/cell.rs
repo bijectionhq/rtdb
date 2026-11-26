@@ -822,6 +822,7 @@ async fn an_engine_pin_can_advance_after_its_old_holder_dies() {
     cell.nodes[0].take().unwrap().kill().await.unwrap();
     let mut dead = directory.member(&old.id).await.unwrap().unwrap();
     dead.state = rtdb_directory::MemberState::Dead;
+    dead.eligibility_epoch += 1;
     let version = dead.version;
     assert!(directory.replace_member(dead, version).await.unwrap().applied().is_some());
     admin::pin_engine(directory.as_ref(), "shop", Some("next-image")).await.unwrap();
@@ -2605,7 +2606,7 @@ async fn controller_probes_can_progress_before_another_member_replies() {
         directory.register_member(MemberRecord {
             id: MemberId(id.into()), role: MemberRole::Node, address: pgwire_address.clone(), control_address: Some(address.clone()),
             availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
+            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0,
         }).await.unwrap();
     }
     let answer = async {
@@ -2668,7 +2669,7 @@ async fn a_missed_serving_probe_counts_only_without_inspection_overflow() {
         id: MemberId("writer".into()), role: MemberRole::Node, address: address.to_string(),
         control_address: Some(control_address.to_string()), availability_zone: "local".into(),
         engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0,
     }).await.unwrap();
     let options = admin::ControllerOptions { control: common::control(), ..Default::default() };
     let mut failures = BTreeMap::new();
@@ -2700,7 +2701,7 @@ async fn the_controller_cannot_confirm_an_endpoint_changed_while_its_probe_is_pe
         id: MemberId("node".into()), role: MemberRole::Node, address: unreachable,
         control_address: Some(control.local_addr().unwrap().to_string()), availability_zone: "local".into(),
         engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0,
     }).await.unwrap();
     let id = member.id.clone();
     let replace_during_probe = async {
@@ -2733,7 +2734,7 @@ async fn the_controller_counts_failures_at_each_endpoint_independently() {
     let mut member = directory.register_member(MemberRecord {
         id: MemberId("node".into()), role: MemberRole::Node, address: address.clone(), control_address: Some(address),
         availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
-        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, version: 0,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0,
     }).await.unwrap();
     let options = admin::ControllerOptions { suspicion_probes: 2, probe_timeout: Duration::from_millis(20), ..Default::default() };
     let mut failures = std::collections::BTreeMap::new();
@@ -3097,6 +3098,7 @@ async fn journal_replacement_keeps_acknowledged_history_after_interrupted_trim()
         let mut writer = directory.member(member).await.unwrap().unwrap();
         let version = writer.version;
         writer.state = rtdb_directory::MemberState::Dead;
+        writer.eligibility_epoch += 1;
         if directory.replace_member(writer, version).await.unwrap().applied().is_some() { break; }
     }
     lost_reply.resume.notify_one();

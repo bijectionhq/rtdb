@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, DisposalReceipt, ForkPreparation, ForkPublication, Lifecycle, ServingInventory, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
+use rtdb_types::JournalEndpoint;
+
+use crate::{claim, now_ms, park, Cas, DecommissionCertificate, LogkeeperDecommission, DeploymentRecord, Directory, DisposalReceipt, ForkPreparation, ForkPublication, Lifecycle, ServingInventory, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
 
 /// Panics on the first violation.
 /// Uses fresh ids and names, so it can run against a shared, non-empty directory.
@@ -143,13 +145,17 @@ pub async fn run(directory: &dyn Directory) {
     directory.publish_fork(later_fork, child.version, Some(next_cut)).await.unwrap();
 
     let member = MemberRecord { id: MemberId(format!("member-{suffix}")), role: MemberRole::Node, address: "127.0.0.1:1".into(), control_address: Some("127.0.0.1:2".into()),
-        availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: 10, state: MemberState::Joining, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, version: 0 };
+        availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: 10, state: MemberState::Joining, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0 };
     let registered = directory.register_member(member.clone()).await.unwrap();
     assert_eq!(registered.version, 1);
     assert!(directory.register_member(member).await.is_err(), "member ids are unique");
     let mut renewed = registered.clone();
     renewed.lease_expires_at_ms = 20;
     renewed.state = MemberState::Eligible;
+    let unnumbered = directory.replace_member(renewed.clone(), registered.version).await.unwrap_err();
+    assert_eq!(unnumbered.code, "rtdb.directory/eligibility-epoch", "a state change moves the eligibility epoch on");
+    renewed.follow(&registered);
+    assert_eq!(renewed.eligibility_epoch, registered.eligibility_epoch + 1);
     let renewed = directory.replace_member(renewed, registered.version).await.unwrap().applied().expect("lease renewal applies");
     assert!(matches!(directory.replace_member(renewed.clone(), registered.version).await.unwrap(), Cas::Conflict(Some(_))));
     assert_eq!(directory.member(&renewed.id).await.unwrap().as_ref(), Some(&renewed));
@@ -157,6 +163,42 @@ pub async fn run(directory: &dyn Directory) {
 
     let missing = DeploymentRecord::new(format!("missing-{suffix}"), "acme", vec![], 0);
     assert!(matches!(directory.replace_deployment(missing, 1).await.unwrap(), Cas::Conflict(None)), "replacing an absent record conflicts");
+
+    journal_references_are_fenced(directory, &suffix).await;
+}
+
+/// `JournalReferenceRequiresCurrentEligibility`: once a logkeeper is certified for decommission, no deployment write newly names it.
+async fn journal_references_are_fenced(directory: &dyn Directory, suffix: &str) {
+    let journal = MemberRecord { id: MemberId::fresh(), role: MemberRole::Logkeeper, address: format!("journal-{suffix}:7000"), control_address: None,
+        availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: i64::MAX, state: MemberState::Draining, drain_target_engine: None,
+        pool: Default::default(), storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0 };
+    let journal = directory.register_member(journal).await.unwrap();
+    let endpoint = JournalEndpoint::Member { address: journal.address.clone(), journal: journal.id.0.clone() };
+    let named = directory.create_deployment(DeploymentRecord::new(format!("fenced-{suffix}"), "acme", vec![journal.id.clone()], 0)).await
+        .expect("a draining journal that is not certified still accepts references");
+    let unnamed = directory.create_deployment(DeploymentRecord::new(format!("unfenced-{suffix}"), "acme", vec![], 0)).await.unwrap();
+
+    let mut certified = journal.clone();
+    certified.decommission = Some(LogkeeperDecommission::Certified(DecommissionCertificate {
+        journal: journal.id.clone(), address: journal.address.clone(), deployments_sha256: [0; 32], deployments_checked: 0, certified_at_ms: 1,
+    }));
+    certified.follow(&journal);
+    directory.replace_member(certified, journal.version).await.unwrap().applied().expect("certification applies");
+
+    let refused = directory.create_deployment(DeploymentRecord::new(format!("late-{suffix}"), "acme", vec![journal.id.clone()], 0)).await.unwrap_err();
+    assert_eq!(refused.code, "rtdb.directory/journal-retiring", "a new record cannot name a certified journal");
+    let mut gaining = unnamed.clone();
+    gaining.replica_journals.insert(JournalEndpoint::Address(journal.address.clone()));
+    let refused = directory.replace_deployment(gaining, unnamed.version).await.unwrap_err();
+    assert_eq!(refused.code, "rtdb.directory/journal-retiring", "a record cannot gain a certified journal's address");
+    let mut gaining = unnamed.clone();
+    gaining.log_copy_servers.push(endpoint.clone());
+    assert_eq!(directory.replace_deployment(gaining, unnamed.version).await.unwrap_err().code, "rtdb.directory/journal-retiring");
+
+    let mut kept = named.clone();
+    kept.read_width += 1;
+    kept.replica_journals.insert(endpoint);
+    directory.replace_deployment(kept, named.version).await.unwrap().applied().expect("a record that already names the journal may still change");
 }
 
 async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecord, name: &str) {
@@ -352,7 +394,7 @@ pub async fn concurrent_claims(directories: &[Arc<dyn Directory>], claimants: us
     let mut members = BTreeMap::new();
     for index in 0..claimants {
         let member = MemberRecord { id: MemberId(format!("claimant-{index}-{suffix}")), role: MemberRole::Node, address: String::new(), control_address: None,
-            availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: lease, state: MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, version: 0 };
+            availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: lease, state: MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, decommission: None, eligibility_epoch: 0, version: 0 };
         let registered = admin.register_member(member).await.expect("register claimant");
         members.insert(registered.id.clone(), registered);
     }
