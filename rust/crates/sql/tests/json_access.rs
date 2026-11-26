@@ -79,10 +79,12 @@ fn json_path_admission_is_shared_by_normal_and_ignored_setting_expressions() {
 }
 
 #[tokio::test]
-async fn ignored_setting_json_access_validates_literals_without_evaluating_the_object() {
-    assert_eq!(query("SETTING SNAPSHOT_TIME=(1/0)->'x' SELECT 1",vec![]).await.unwrap(),[vec![V::I64(1)]]);
-    assert_eq!(query("SETTING SNAPSHOT_TIME=LOWER(1) #> ARRAY['x',0] SELECT 1",vec![]).await.unwrap(),[vec![V::I64(1)]]);
-    assert!(query("SETTING SNAPSHOT_TIME=DATE '2020-02-30'->'x' SELECT 1",vec![]).await.is_err());
+async fn setting_json_access_validates_literals_without_evaluating_the_object() {
+    for source in ["SETTING SNAPSHOT_TIME=(1/0)->'x' SELECT 1","SETTING SNAPSHOT_TIME=LOWER(1) #> ARRAY['x',0] SELECT 1"] {
+        assert_eq!(query(source,vec![]).await.unwrap_err().code,"rtdb.query/invalid-setting-value","{source}");
+    }
+    let invalid_literal = query("SETTING SNAPSHOT_TIME=DATE '2020-02-30'->'x' SELECT 1",vec![]).await.unwrap_err();
+    assert_ne!(invalid_literal.code,"rtdb.query/invalid-setting-value");
 }
 
 #[tokio::test]

@@ -39,7 +39,7 @@ async fn pg2_sleep_functions_cast_seconds_and_periods_to_milliseconds() {
 async fn sql_sleep_short_circuit_and_unevaluated_settings_do_not_wait() {
     let start = tokio::time::Instant::now();
     assert_eq!(query("SELECT CASE WHEN TRUE THEN 7 ELSE PG_SLEEP(60.0) END, COALESCE(9, PG_SLEEP(60.0)), PG_SLEEP(NULL)").await.unwrap(), [vec![Value::I64(7), Value::I64(9), Value::Null]]);
-    assert_eq!(query("SETTING SNAPSHOT_TIME=PG_SLEEP(60.0) SELECT 1").await.unwrap(), [vec![Value::I64(1)]]);
+    assert_eq!(query("SETTING SNAPSHOT_TIME=PG_SLEEP(60.0) SELECT 1").await.unwrap_err().code, "rtdb.query/invalid-setting-value");
     assert_eq!(tokio::time::Instant::now(), start);
     assert_eq!(query("SELECT PG_SLEEP(-0.1)").await.unwrap_err().message.as_deref(), Some("timeout value is negative"));
     assert!(query("SELECT PG_SLEEP(1)").await.is_err());
