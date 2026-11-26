@@ -76,7 +76,7 @@ pub(super) fn host_timezone(now: i64) -> Result<String> {
         if cfg!(target_os = "linux") && value.starts_with("posix/") { value.drain(..6); }
     }
     let Some(zone) = zone else { return Ok("GMT".into()); };
-    let parsed = LegacyTimeZone::parse(&zone);
+    let parsed = LegacyTimeZone::parse(&zone)?;
     if parsed.to_string() != "GMT" || zone == "GMT" { return Ok(zone); }
     host_offset(now)
 }

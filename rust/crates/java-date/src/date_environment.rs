@@ -72,8 +72,8 @@ impl DateEnvironment {
         let locale = LocaleData::new(LocaleId::from_parts(&input.language,&input.script,&input.region,&input.variant,input.unicode)?)?;
         let number = DateNumber::new(&locale)?;
         let names = [NameField::Era,NameField::Year,NameField::Month,NameField::Weekday,NameField::AmPm].map(|field|FieldNames::new(&locale,field));
-        let default_zone = LegacyTimeZone::parse(&input.timezone);
-        let calendar_zone = locale.locale.extensions.get("tz").and_then(|key|super::locale_data::canonical_zone(key)).map_or(default_zone,LegacyTimeZone::parse);
+        let default_zone = LegacyTimeZone::parse(&input.timezone)?;
+        let calendar_zone = locale.locale.extensions.get("tz").and_then(|key|super::locale_data::canonical_zone(key)).map_or(Ok(default_zone),LegacyTimeZone::parse)?;
         Ok(Arc::new(Self { locale,number,names,default_zone,calendar_zone,clocks,charge: locale_charge }))
     }
     pub(super) fn names(&self,field: NameField) -> &FieldNames {

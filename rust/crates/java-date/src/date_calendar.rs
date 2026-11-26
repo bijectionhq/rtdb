@@ -383,7 +383,7 @@ mod tests {
     fn full_date_endpoints_roundtrip_calendar_fields_without_local_millisecond_overflow() {
         for kind in [CalendarKind::Gregorian,CalendarKind::Buddhist,CalendarKind::Japanese] {
             let calendar = system(kind);
-            for zone in [LegacyTimeZone::gmt(),LegacyTimeZone::parse("GMT+23:59:59"),LegacyTimeZone::parse("GMT-23:59:59")] {
+            for zone in [LegacyTimeZone::gmt(),LegacyTimeZone::parse("GMT+23:59:59").unwrap(),LegacyTimeZone::parse("GMT-23:59:59").unwrap()] {
                 for millis in [i64::MIN,i64::MIN+MILLIS_PER_DAY,-1,0,1,i64::MAX-MILLIS_PER_DAY,i64::MAX] {
                     let view = calendar.view(millis,zone).unwrap();
                     let mut fields = clock_fields(&view);
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn explicit_standard_and_dst_fields_override_wall_components_independently() {
         let calendar = system(CalendarKind::Gregorian);
-        let zone = LegacyTimeZone::parse("Europe/Berlin");
+        let zone = LegacyTimeZone::parse("Europe/Berlin").unwrap();
         let mut values = fields(&[(Year,2024),(Month,2),(DayOfMonth,31),(HourOfDay,2),(Minute,30)]);
         let midnight = date(2024,3,31);
         assert_eq!(calendar.resolve(&values,zone).unwrap(),midnight+90*60_000);

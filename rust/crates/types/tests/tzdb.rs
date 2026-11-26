@@ -1,4 +1,5 @@
-#[path = "../build_support/tzdb.rs"]
+#[allow(dead_code)]
+#[path = "../src/tzdb.rs"]
 mod tzdb;
 
 #[test]
@@ -6,10 +7,10 @@ fn packaged_tzdb_decodes_without_jvm_and_rejects_truncated_records() {
     let bytes = include_bytes!("../data/tzdb/2026e.dat");
     let database = tzdb::decode(bytes).unwrap();
     assert_eq!(database.version, "2026e");
-    let source = database.rust_source("fixture-digest");
-    assert!(source.contains("Europe/Paris"));
-    assert!(source.contains("TransitionRule {"));
-    assert!(source.contains("fixture-digest"));
+    let paris = database.zones.iter().find(|zone| zone.name == "Europe/Paris").unwrap();
+    assert!(!database.rules[paris.rules].recurring.is_empty());
+    assert_eq!(database.legacy.len(), database.rules.len());
+    assert!(database.zones.windows(2).all(|pair| pair[0].name < pair[1].name));
     for length in [0, 1, 7, 16, bytes.len() / 2, bytes.len() - 1] { assert!(tzdb::decode(&bytes[..length]).is_err(), "{length}"); }
     assert!(tzdb::decode(&vec![0; tzdb::MAX_BYTES + 1]).is_err());
 }

@@ -19,7 +19,7 @@ impl DateDisplay {
     pub fn capture_process(observed_at: i64, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let _scratch = memory.reserve(4 << 20)?;
         let default_zone = date_platform::host_timezone(observed_at)?;
-        Self::from_zone(LegacyTimeZone::parse(&default_zone), observed_at, memory)
+        Self::from_zone(LegacyTimeZone::parse(&default_zone)?, observed_at, memory)
     }
 
     /// Prepares short US-English display names for the selected legacy timezone.
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn default_zone_names_follow_each_dates_daylight_state() {
         let memory = MemoryBudget::new(16 << 20);
-        let printer = DateDisplay::from_zone(LegacyTimeZone::parse("America/New_York"), 1_600_000_000_000, &memory).unwrap();
+        let printer = DateDisplay::from_zone(LegacyTimeZone::parse("America/New_York").unwrap(), 1_600_000_000_000, &memory).unwrap();
         assert_eq!(printer.format(0).unwrap(), "Wed Dec 31 19:00:00 EST 1969");
         let summer = printer.format(1_593_561_600_000).unwrap();
         assert_eq!(summer, "Tue Jun 30 20:00:00 EDT 2020");

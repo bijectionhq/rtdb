@@ -1,5 +1,13 @@
-use std::fmt::Write;
+//! `TimeZone`'s form of each zone's rules: OpenJDK `ZoneInfoFile`'s 1900–2100 transition table and its SimpleTimeZone tail.
+
 use super::{Rule,Rules};
+
+#[derive(Debug)]
+pub struct LegacyRules { pub raw: i32,pub last_standard_transition: Option<i64>,pub transitions: Vec<(i64,i32,i32)>,pub future: Option<LegacyRecurring> }
+#[derive(Debug)]
+pub struct LegacyRecurring { pub start: LegacyTransition,pub end: LegacyTransition,pub saving: i32 }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct LegacyTransition { pub month: u8,pub day: i32,pub weekday: u8,pub last: bool,pub second: u32,pub definition: u8 }
 
 const UTC_1900: i64 = -2_208_988_800;
 const UTC_2100_END: i64 = 4_133_980_799;
@@ -74,8 +82,7 @@ impl RuleTable {
     }
 }
 
-struct FutureRule { month: u8,day: i32,weekday: u8,last: bool,second: u32,definition: u8 }
-impl FutureRule {
+impl LegacyTransition {
     fn of(rule: &Rule) -> Self {
         Self { month: rule.month,day: i32::from(rule.day),weekday: rule.weekday,last: rule.weekday != 0 && (rule.day < 0 || rule.day >= 24),second: if rule.end_of_day { 86_400 } else { rule.second },definition: rule.definition }
     }
@@ -83,12 +90,9 @@ impl FutureRule {
         let (_,month,day,second) = date(second,offset);
         Self { month,day: i32::from(day),weekday: 0,last: false,second,definition: 1 }
     }
-    fn write(&self,out: &mut String) {
-        write!(out,"LegacyTransition {{ month: {}, day: {}, weekday: {}, last: {}, second: {}, definition: {} }}",self.month,self.day,self.weekday,self.last,self.second,self.definition).unwrap();
-    }
 }
 
-pub(super) fn write(out: &mut String,rules: &Rules) {
+pub(super) fn build(rules: &Rules) -> LegacyRules {
     let raw = rules.standards.last().map_or(rules.standard_initial,|(_,offset)|*offset);
     let mut table = RuleTable::new();
     let mut future = None;
@@ -126,7 +130,7 @@ pub(super) fn write(out: &mut String,rules: &Rules) {
             let mut start = &rules.recurring[rules.recurring.len() - 2];
             let mut end = &rules.recurring[rules.recurring.len() - 1];
             if start.after < start.before && end.after > end.before { std::mem::swap(&mut start,&mut end); }
-            future = Some((FutureRule::of(start),FutureRule::of(end),(start.after - start.before) * 1000));
+            future = Some(LegacyRecurring { start: LegacyTransition::of(start),end: LegacyTransition::of(end),saving: (start.after - start.before) * 1000 });
         } else if !table.packed.is_empty() {
             if last_year < 2100 { table.append(LOCAL_2100_START - i64::from(raw),raw,raw); }
             else if rules.transitions.len() > 2 {
@@ -135,21 +139,14 @@ pub(super) fn write(out: &mut String,rules: &Rules) {
                 let start_standard = standard(rules,start_time);let end_standard = standard(rules,end_time);
                 if start_offset > start_standard && end_offset == end_standard {
                     let start_before = before(rules,a);let end_before = before(rules,b);
-                    let start = FutureRule::exact(start_time,start_before.min(start_offset));
-                    let end = FutureRule::exact(end_time,end_before.max(end_offset));
-                    future = Some((start,end,(start_offset - start_standard) * 1000));
+                    let start = LegacyTransition::exact(start_time,start_before.min(start_offset));
+                    let end = LegacyTransition::exact(end_time,end_before.max(end_offset));
+                    future = Some(LegacyRecurring { start,end,saving: (start_offset - start_standard) * 1000 });
                 }
             }
         }
     }
-    write!(out,"LegacyRules {{ raw: {}, last_standard_transition: {:?}, transitions: &[",raw * 1000,rules.standards.last().map(|(second,_)|*second)).unwrap();
-    for row in table.rows() { write!(out,"{row:?},").unwrap(); }
-    out.push_str("], future: ");
-    if let Some((start,end,saving)) = future {
-        out.push_str("Some(LegacyRecurring { start: ");start.write(out);out.push_str(", end: ");end.write(out);
-        write!(out,", saving: {saving} }})").unwrap();
-    } else { out.push_str("None"); }
-    out.push_str(" }");
+    LegacyRules { raw: raw * 1000,last_standard_transition: rules.standards.last().map(|(second,_)|*second),transitions: table.rows().collect(),future }
 }
 
 #[cfg(test)]
@@ -168,11 +165,12 @@ mod tests {
     #[test]
     fn legacy_tail_uses_last_weekday_conversion_and_preserves_final_standard_offset() {
         let rules = Rules { initial: 561,fixed: false,standard_initial: 561,standards: vec![(0,3600)],transitions: vec![(0,3600)],recurring: recurring() };
-        let mut source = String::new();write(&mut source,&rules);
-        assert!(source.contains("raw: 3600000"));
-        assert!(source.contains("day: 25, weekday: 7, last: true"));
-        assert!(source.contains("saving: 3600000"));
-        assert!(source.contains("(-2208988800000, 561000, 0)"));
+        let legacy = build(&rules);
+        assert_eq!(legacy.raw,3_600_000);
+        let future = legacy.future.unwrap();
+        assert_eq!((future.start.day,future.start.weekday,future.start.last),(25,7,true));
+        assert_eq!(future.saving,3_600_000);
+        assert_eq!(legacy.transitions[0],(-2_208_988_800_000,561_000,0));
     }
     #[test]
     fn packed_legacy_transition_offsets_use_the_reference_four_bit_indexes() {
@@ -189,10 +187,9 @@ mod tests {
         let mut rules = recurring();
         rules[0].second = 0;
         rules[0].end_of_day = true;
-        assert_eq!(FutureRule::of(&rules[0]).second, 86_400);
+        assert_eq!(LegacyTransition::of(&rules[0]).second, 86_400);
         let rules = Rules { initial: 3600, fixed: false, standard_initial: 3600, standards: vec![], transitions: vec![(0, 3600)], recurring: rules };
-        let mut source = String::new();
-        write(&mut source, &rules);
-        assert!(source.contains("day: 25, weekday: 7, last: true, second: 86400"));
+        let start = build(&rules).future.unwrap().start;
+        assert_eq!(start, LegacyTransition { month: 3, day: 25, weekday: 7, last: true, second: 86_400, definition: 0 });
     }
 }

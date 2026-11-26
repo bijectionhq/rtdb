@@ -1,23 +1,32 @@
-use std::{collections::BTreeMap, fmt::Write};
+//! OpenJDK's `tzdb.dat` format, decoded by the build script to validate the bundled file and by the zone database at runtime.
+//! Self-contained so that the build script can include it by path.
 
-#[path = "legacy_tzdb.rs"]
-mod legacy;
+use std::collections::BTreeMap;
+
+#[path = "tzdb/legacy.rs"]
+pub mod legacy;
 
 pub const MAX_BYTES: usize = 1_048_576;
 
+/// The last version of a `tzdb.dat`: its regions in lexical order and the rules they share.
 #[derive(Debug)]
 pub struct Database {
     pub version: String,
-    zones: BTreeMap<String, usize>,
-    aliases: BTreeMap<String,String>,
-    rules: Vec<Rules>,
+    pub zones: Vec<Zone>,
+    pub rules: Vec<Rules>,
+    /// `TimeZone`'s form of each of `rules`, at the same index.
+    pub legacy: Vec<legacy::LegacyRules>,
 }
 
+/// A region identifier, the identifier `TimeZone` resolves it to, and the index of its rules.
 #[derive(Debug)]
-struct Rules { initial: i32, fixed: bool, standard_initial: i32, standards: Vec<(i64,i32)>, transitions: Vec<(i64, i32)>, recurring: Vec<Rule> }
+pub struct Zone { pub name: String, pub legacy_name: String, pub rules: usize }
 
 #[derive(Debug)]
-struct Rule { month: u8, day: i8, weekday: u8, second: u32, end_of_day: bool, definition: u8, standard: i32, before: i32, after: i32 }
+pub struct Rules { pub initial: i32, pub fixed: bool, pub standard_initial: i32, pub standards: Vec<(i64,i32)>, pub transitions: Vec<(i64, i32)>, pub recurring: Vec<Rule> }
+
+#[derive(Debug)]
+pub struct Rule { pub month: u8, pub day: i8, pub weekday: u8, pub second: u32, pub end_of_day: bool, pub definition: u8, pub standard: i32, pub before: i32, pub after: i32 }
 
 struct Reader<'a> { bytes: &'a [u8], position: usize }
 
@@ -160,27 +169,7 @@ pub fn decode(bytes: &[u8]) -> Result<Database, String> {
     }
     let legacy_entries = rules.iter().try_fold(0usize,|count,rules|count.checked_add(legacy::allocation_entries(rules)?).ok_or_else(||"Legacy TZDB table bound overflow".to_owned()))?;
     if legacy_entries > 1_048_576 { return Err("Derived legacy TZDB transitions exceed the one-million-entry resource limit".into()); }
-    Ok(Database { version, zones, aliases, rules })
-}
-
-impl Database {
-    pub fn rust_source(&self, sha256: &str) -> String {
-        let mut out = format!("pub const TZDB_VERSION: &str = {:?};\npub const TZDB_SHA256: &str = {sha256:?};\n", self.version);
-        for (index, rules) in self.rules.iter().enumerate() {
-            writeln!(out, "static RULE_{index}: RuleData = RuleData {{ initial: {}, fixed: {}, standard_initial: {}, standards: &{:?}, transitions: &{:?}, recurring: &[", rules.initial, rules.fixed, rules.standard_initial, rules.standards, rules.transitions).unwrap();
-            for rule in &rules.recurring {
-                writeln!(out, "TransitionRule {{ month: {}, day: {}, weekday: {}, second: {}, end_of_day: {}, definition: {}, standard: {}, before: {}, after: {} }},", rule.month, rule.day, rule.weekday, rule.second, rule.end_of_day, rule.definition, rule.standard, rule.before, rule.after).unwrap();
-            }
-            out.push_str("], legacy: ");
-            legacy::write(&mut out,rules);
-            out.push_str(" };\n");
-        }
-        out.push_str("static ZONES: &[ZoneRecord] = &[\n");
-        for (name, index) in &self.zones {
-            let canonical = self.aliases.get(name).unwrap_or(name);
-            writeln!(out, "ZoneRecord {{ name: {name:?}, legacy_name: {canonical:?}, rules: &RULE_{index} }},").unwrap();
-        }
-        out.push_str("];\n");
-        out
-    }
+    let legacy = rules.iter().map(legacy::build).collect();
+    let zones = zones.into_iter().map(|(name, rules)| Zone { legacy_name: aliases.get(&name).unwrap_or(&name).clone(), name, rules }).collect();
+    Ok(Database { version, zones, rules, legacy })
 }

@@ -58,7 +58,7 @@ impl DatePattern {
             let length = match part { Part::Literal(value) => value.len(),Part::Field(_,width) => environment.number.bound(*width).max(zone_bound).max(environment.names.iter().map(super::date_names::FieldNames::maximum_name_bytes).max().unwrap_or(0)).max(16) };
             size.checked_add(length).ok_or_else(||error("allocation-overflow","Date pattern output exceeds range"))
         })?;
-        let zone = if utc { LegacyTimeZone::parse("UTC") } else { environment.calendar_zone };
+        let zone = if utc { LegacyTimeZone::parse("UTC")? } else { environment.calendar_zone };
         Ok(Self { parts,environment,calendar,zone,zone_names: None,zone_display: None,pivot,pivot_year,standalone_month,maximum_output,_charge: charge })
     }
     /// Returns the UTF-8 result bound to admit before formatting.

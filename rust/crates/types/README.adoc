@@ -42,11 +42,13 @@ Expression output checks signed 32-bit day narrowing, while object input truncat
 Admission recursively visits nested values without allocating.
 Durable Arrow schemas retain their existing physical date types.
 
-`ZoneId` uses immutable tables compiled from the selected OpenJDK TZDB input, including historical offsets and recurring future rules.
+`ZoneId` uses the process's zone database, decoded from an OpenJDK `tzdb.dat` on the first region lookup, including historical offsets and recurring future rules.
+As the JVM reads its `lib/tzdb.dat` at runtime, a non-empty `RTDB_TZDB_FILE` names a replacement file, so the rules can be updated without a rebuild; otherwise the build's bundled file is used.
+A replacement that cannot be read or decoded fails every region lookup with `xtdb/tzdb-unavailable`; fixed offsets still resolve.
 Overlaps prefer the earlier offset unless a valid preferred offset is supplied; gaps move forward, and start-of-day uses the first valid instant of the date.
 `ZoneId::offset_at` accepts every signed 64-bit second for fixed offsets and fixed-rule regions; regions with transitions retain Java Instant and calendar bounds.
 The default bundle, source archive checksum, license files and override contract are in link:data/tzdb/README.adoc[timezone data provenance].
-The selected version and SHA-256 are embedded as constants; qualification must compare them with the actual reference JVM's installed data.
+The bundled file's version and SHA-256 are embedded as constants; qualification must compare them with the actual reference JVM's installed data, and with `RTDB_TZDB_FILE` unset.
 Calendar, parser and zone regression sources remain unexecuted.
 
 `LegacyTimeZone` supplies the separate OpenJDK25 `java.util.TimeZone` interpretation of the same selected database.
@@ -55,7 +57,7 @@ Local readings choose the standard side of overlaps and the preceding offset of 
 The legacy parser supports Java25 short IDs, custom GMT offsets through ±23:59:59 and GMT fallback for unrecognized IDs.
 It accepts raw signed 64-bit Date milliseconds and preserves Java wrapping at that storage boundary.
 Building the legacy view retains standard-offset transitions and aliases from the bounded TZDB decoder.
-The derived tables are limited to one million entries before generation; an oversized custom input fails decoding explicitly.
+The derived tables are limited to one million entries; an oversized custom input fails decoding explicitly.
 Existing `ZoneId` lookup and local resolution remain independent of the legacy view.
 `tests/legacy_zone.rs` exercises historical, recurring, overlap, custom-ID and signed64-boundary cases as unexecuted source.
 

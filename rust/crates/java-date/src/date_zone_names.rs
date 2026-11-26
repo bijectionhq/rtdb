@@ -2,7 +2,7 @@ use std::{collections::BTreeSet,sync::Arc};
 use rtdb_types::{LegacyTimeZone,MemoryBudget,MemoryReservation,Result,timezone_names};
 use super::{date_locale::LocaleData,date_names::insensitive_prefix,locale_data::{self,Family,LocaleValue},error};
 
-pub(super) struct ZoneName { pub id: &'static str,pub names: [String;6] }
+pub(super) struct ZoneName { pub id: &'static str,pub zone: LegacyTimeZone,pub names: [String;6] }
 pub(super) struct ZoneDisplay { id: String,names: [String;6],_charge: Arc<MemoryReservation> }
 pub(super) struct ZoneNames { entries: Vec<ZoneName>,_charge: Arc<MemoryReservation> }
 pub(super) struct MatchedZone { pub zone: LegacyTimeZone,pub saving: Option<i32>,pub consumed: usize }
@@ -26,7 +26,7 @@ impl ZoneDisplay {
 }
 impl ZoneNames {
     pub fn allocation_bound(locale: &LocaleData) -> Result<usize> {
-        let entries = locale.zone_sources().iter().try_fold(timezone_names().len() + SHORT_IDS.len(),|total,entries|total.checked_add(entries.len()).ok_or_else(overflow))?;
+        let entries = locale.zone_sources().iter().try_fold(timezone_names()?.len() + SHORT_IDS.len(),|total,entries|total.checked_add(entries.len()).ok_or_else(overflow))?;
         let per_entry = ZoneDisplay::allocation_bound(locale)?;
         entries.checked_add(32).and_then(|entries|entries.checked_mul(per_entry)).ok_or_else(overflow)
     }
@@ -39,12 +39,12 @@ impl ZoneNames {
                 if matches!(value,LocaleValue::Array(_)) && seen.insert(*id) { ids.push(*id); }
             }
         }
-        let mut remaining = timezone_names().chain(SHORT_IDS.iter().copied()).filter(|id| !seen.contains(id)
+        let mut remaining = timezone_names()?.chain(SHORT_IDS.iter().copied()).filter(|id| !seen.contains(id)
             && !id.starts_with("Etc/GMT") && !id.starts_with("GMT") && !id.starts_with("SystemV")).collect::<Vec<_>>();
-        let capacity = ((timezone_names().len() + SHORT_IDS.len()) * 4 / 3 + 1).next_power_of_two();
+        let capacity = ((timezone_names()?.len() + SHORT_IDS.len()) * 4 / 3 + 1).next_power_of_two();
         remaining.sort_by_key(|id|java_hash(id) as usize & (capacity - 1));
         ids.extend(remaining);
-        let entries = ids.into_iter().map(|id|Ok(ZoneName { id,names: derive(locale,id,observe,0)? })).collect::<Result<Vec<_>>>()?;
+        let entries = ids.into_iter().map(|id|Ok(ZoneName { id,zone: LegacyTimeZone::parse(id)?,names: derive(locale,id,observe,0)? })).collect::<Result<Vec<_>>>()?;
         Ok(Self { entries,_charge: charge })
     }
     pub fn match_prefix(&self,text: &str,current: LegacyTimeZone,default: LegacyTimeZone) -> Option<MatchedZone> {
@@ -54,7 +54,7 @@ impl ZoneNames {
             for (index,name) in entry.names[..4].iter().enumerate() {
                 if name.is_empty() { continue; }
                 let Some(consumed) = insensitive_prefix(text,name) else { continue; };
-                let zone = LegacyTimeZone::parse(entry.id);
+                let zone = entry.zone;
                 let saving = if index >= 2 { zone.daylight_savings_millis() } else { 0 };
                 let same = index < 2 && insensitive_prefix(&entry.names[index + 2],name) == Some(entry.names[index + 2].len());
                 return Some(MatchedZone { zone,saving: (!(same || index >= 2 && saving == 0)).then_some(saving),consumed });
@@ -69,7 +69,7 @@ fn derive(locale: &LocaleData,id: &str,observe: &dyn Fn() -> i64,depth: usize) -
     let canonical = locale_data::canonical_zone(id).filter(|canonical|*canonical != id);
     let initial = array(locale.zone(id)).or_else(||canonical.and_then(|canonical|array(locale.zone(canonical))));
     let mut names: [String;6] = std::array::from_fn(|index|initial.and_then(|names|names.get(index)).unwrap_or(&"").to_string());
-    let modern = LegacyTimeZone::parse(id).to_zone_id()?;
+    let modern = LegacyTimeZone::parse(id)?.to_zone_id()?;
     let fixed = modern.fixed_offset().is_some();
     for index in 0..6 {
         if !names[index].is_empty() {
@@ -108,7 +108,7 @@ fn derive(locale: &LocaleData,id: &str,observe: &dyn Fn() -> i64,depth: usize) -
 }
 fn array(value: Option<LocaleValue>) -> Option<&'static [&'static str]> { match value { Some(LocaleValue::Array(values)) => Some(values),_ => None } }
 fn gmt(locale: &LocaleData,id: &str,daylight: bool,observe: &dyn Fn() -> i64) -> Result<String> {
-    let zone = LegacyTimeZone::parse(id).to_zone_id()?;
+    let zone = LegacyTimeZone::parse(id)?.to_zone_id()?;
     let second = observe().div_euclid(1000);
     let offset = (zone.standard_offset_at(second)?.seconds() + if daylight { zone.historical_daylight_savings_before(second)? } else { 0 }) / 60;
     if offset == 0 { return Ok(locale.text("timezone.gmtZeroFormat").ok_or_else(missing)?.into()); }
@@ -151,13 +151,13 @@ mod tests {
     fn localized_zone_names_preserve_dst_and_default_zone_parse_precedence() {
         let locale = LocaleData::new(LocaleId::from_parts("en","","US","",BTreeMap::new()).unwrap()).unwrap();
         let names = ZoneNames::new(&locale,&||1_600_000_000_000,&MemoryBudget::new(256 << 20)).unwrap();
-        let chicago = LegacyTimeZone::parse("America/Chicago");
+        let chicago = LegacyTimeZone::parse("America/Chicago").unwrap();
         assert_eq!(ZoneDisplay::new(&locale,chicago,&||1_600_000_000_000,&MemoryBudget::new(256 << 20)).unwrap().display(false,false),"CST");
         let matched = names.match_prefix("CST remaining",chicago,LegacyTimeZone::gmt()).unwrap();
         assert_eq!(matched.zone.to_string(),"America/Chicago");assert_eq!(matched.saving,Some(0));assert_eq!(matched.consumed,3);
         let matched = names.match_prefix("CDT",chicago,LegacyTimeZone::gmt()).unwrap();
         assert_eq!(matched.saving,Some(3_600_000));
-        assert_eq!(ZoneDisplay::new(&locale,LegacyTimeZone::parse("GMT-00:00"),&||0,&MemoryBudget::new(256 << 20)).unwrap().display(false,true),"GMT-00:00");
+        assert_eq!(ZoneDisplay::new(&locale,LegacyTimeZone::parse("GMT-00:00").unwrap(),&||0,&MemoryBudget::new(256 << 20)).unwrap().display(false,true),"GMT-00:00");
     }
     #[test]
     fn message_substitution_keeps_quoted_literals_and_doubled_apostrophes() {

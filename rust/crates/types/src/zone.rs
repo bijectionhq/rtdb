@@ -1,6 +1,6 @@
-use std::fmt;
+use std::{fmt, io::Read, path::Path, sync::OnceLock};
 use crate::{Anomaly, CivilDate, CivilDateTime, Instant, Result};
-use crate::legacy_zone::{LegacyRules,LegacyRecurring,LegacyTransition};
+use crate::tzdb::{self, Database, Rule, Rules, legacy::LegacyRules};
 
 const MIN_INSTANT_SECOND: i64 = -31_557_014_167_219_200;
 const MAX_INSTANT_SECOND: i64 = 31_556_889_864_403_199;
@@ -82,16 +82,24 @@ enum Prefix { None, Utc, Gmt, Ut }
 impl Prefix { fn text(self) -> &'static str { match self { Self::None => "", Self::Utc => "UTC", Self::Gmt => "GMT", Self::Ut => "UT" } } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum ZoneKind { Fixed { offset: FixedOffset, prefix: Prefix }, Region(usize) }
+enum ZoneKind { Fixed { offset: FixedOffset, prefix: Prefix }, Region(Region) }
 
-/// A validated timezone backed by immutable bundled rules or a fixed UTC offset.
-/// Successful lookups allocate no memory and perform no I/O; names and rules remain valid for the process lifetime.
+/// A region of the process's zone database, identified by its name, which is unique within that one database.
+#[derive(Clone, Copy)]
+struct Region { name: &'static str, rules: &'static Rules }
+impl PartialEq for Region { fn eq(&self, other: &Self) -> bool { self.name == other.name } }
+impl Eq for Region {}
+impl std::hash::Hash for Region { fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.name.hash(state); } }
+impl fmt::Debug for Region { fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result { out.debug_tuple("Region").field(&self.name).finish() } }
+
+/// A validated timezone backed by the process's zone database or a fixed UTC offset.
+/// After the first region lookup loads the database, lookups allocate no memory and perform no I/O; names and rules remain valid for the process lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ZoneId { kind: ZoneKind }
 
 impl ZoneId {
     /// Parses Java `ZoneId.of` names without the optional short-ID alias map.
-    /// Unknown names and invalid offset spellings return `xtdb/invalid-timezone`.
+    /// Unknown names and invalid offset spellings return `xtdb/invalid-timezone`; a region name, when the zone database cannot be loaded, `xtdb/tzdb-unavailable`.
     pub fn parse(name: &str) -> Result<Self> {
         for (text, prefix) in [("UTC", Prefix::Utc), ("GMT", Prefix::Gmt), ("UT", Prefix::Ut)] {
             if let Some(suffix) = name.strip_prefix(text) {
@@ -105,7 +113,8 @@ impl ZoneId {
         if name.encode_utf16().nth(1).is_none() || name.starts_with(['+', '-']) {
             return Ok(Self { kind: ZoneKind::Fixed { offset: FixedOffset::parse(name)?, prefix: Prefix::None } });
         }
-        let index = ZONES.binary_search_by_key(&name, |zone| zone.name).map_err(|_| {
+        let database = database()?;
+        let index = database.zones.binary_search_by(|zone| zone.name.as_str().cmp(name)).map_err(|_| {
             let mut bytes = name.bytes();
             if bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
                 && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"/~._+-".contains(&byte)) {
@@ -114,7 +123,8 @@ impl ZoneId {
                 invalid(format!("Invalid ID for region-based ZoneId, invalid format: {name}"))
             }
         })?;
-        Ok(Self { kind: ZoneKind::Region(index) })
+        let zone = &database.zones[index];
+        Ok(Self { kind: ZoneKind::Region(Region { name: zone.name.as_str(), rules: &database.rules[zone.rules] }) })
     }
 
     pub fn utc() -> Self { Self { kind: ZoneKind::Fixed { offset: FixedOffset::UTC, prefix: Prefix::Utc } } }
@@ -123,7 +133,7 @@ impl ZoneId {
     pub fn fixed_offset(self) -> Option<FixedOffset> {
         match self.kind {
             ZoneKind::Fixed { offset, .. } => Some(offset),
-            ZoneKind::Region(index) => { let rules = ZONES[index].rules; rules.fixed.then_some(FixedOffset(rules.initial)) },
+            ZoneKind::Region(Region { rules, .. }) => rules.fixed.then_some(FixedOffset(rules.initial)),
         }
     }
 
@@ -132,8 +142,7 @@ impl ZoneId {
     pub fn offset_at(self, epoch_second: i64) -> Result<FixedOffset> {
         match self.kind {
             ZoneKind::Fixed { offset, .. } => Ok(offset),
-            ZoneKind::Region(index) => {
-                let rules = ZONES[index].rules;
+            ZoneKind::Region(Region { rules, .. }) => {
                 if self.fixed_offset().is_some() { return Ok(FixedOffset(rules.initial)); }
                 if !(MIN_INSTANT_SECOND..=MAX_INSTANT_SECOND).contains(&epoch_second) { return Err(overflow()); }
                 rules.offset_at(epoch_second).map(FixedOffset)
@@ -146,9 +155,9 @@ impl ZoneId {
     pub fn standard_offset_at(self, epoch_second: i64) -> Result<FixedOffset> {
         match self.kind {
             ZoneKind::Fixed { offset,.. } => Ok(offset),
-            ZoneKind::Region(index) => {
+            ZoneKind::Region(Region { rules, .. }) => {
                 if !(MIN_INSTANT_SECOND..=MAX_INSTANT_SECOND).contains(&epoch_second) { return Err(overflow()); }
-                Ok(FixedOffset(ZONES[index].rules.standard_at(epoch_second)))
+                Ok(FixedOffset(rules.standard_at(epoch_second)))
             }
         }
     }
@@ -157,9 +166,8 @@ impl ZoneId {
     /// Recurring future rules are excluded, matching traversal of Java `ZoneRules.getTransitions`.
     /// Returns zero when no such transition exists and uses the same input-range checks as `standard_offset_at`.
     pub fn historical_daylight_savings_before(self, epoch_second: i64) -> Result<i32> {
-        let ZoneKind::Region(index) = self.kind else { return Ok(0); };
+        let ZoneKind::Region(Region { rules, .. }) = self.kind else { return Ok(0); };
         if !(MIN_INSTANT_SECOND..=MAX_INSTANT_SECOND).contains(&epoch_second) { return Err(overflow()); }
-        let rules = ZONES[index].rules;
         Ok(rules.transitions.iter().rev().filter(|(second,_)|*second <= epoch_second).find_map(|(second,offset)| {
             let saving = offset - rules.standard_at(*second);
             (saving != 0).then_some(saving)
@@ -198,15 +206,15 @@ impl ZoneId {
         let offset = self.offset_for_local(midnight, None)?;
         let resolved = midnight - i64::from(offset.0);
         if self.offset_at(resolved)? == offset { return Ok(resolved); }
-        let ZoneKind::Region(index) = self.kind else { return Ok(resolved); };
-        ZONES[index].rules.gap_transition(midnight, date.year())?.ok_or_else(overflow)
+        let ZoneKind::Region(Region { rules, .. }) = self.kind else { return Ok(resolved); };
+        rules.gap_transition(midnight, date.year())?.ok_or_else(overflow)
     }
 }
 
 impl fmt::Display for ZoneId {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ZoneKind::Region(index) => out.write_str(ZONES[index].name),
+            ZoneKind::Region(Region { name, .. }) => out.write_str(name),
             ZoneKind::Fixed { offset, prefix } => {
                 out.write_str(prefix.text())?;
                 if offset != FixedOffset::UTC || prefix == Prefix::None { write!(out, "{offset}")?; }
@@ -216,18 +224,45 @@ impl fmt::Display for ZoneId {
     }
 }
 
-/// Iterates the selected TZDB version's region identifiers, including its retained aliases, in lexical order.
-pub fn timezone_names() -> impl ExactSizeIterator<Item = &'static str> { ZONES.iter().map(|zone| zone.name) }
+/// Iterates the zone database's region identifiers, including its retained aliases, in lexical order.
+/// - Errors: `xtdb/tzdb-unavailable` when the zone database cannot be loaded.
+pub fn timezone_names() -> Result<impl ExactSizeIterator<Item = &'static str>> { Ok(database()?.zones.iter().map(|zone| zone.name.as_str())) }
 
-pub(crate) fn legacy_rules(name: &str) -> Option<(&'static str,&'static str,&'static LegacyRules)> {
-    let zone = &ZONES[ZONES.binary_search_by_key(&name,|zone|zone.name).ok()?];
-    Some((zone.name,zone.legacy_name,&zone.rules.legacy))
+/// The version of the zone database this process uses: `TZDB_VERSION` unless `RTDB_TZDB_FILE` names a replacement.
+/// - Errors: `xtdb/tzdb-unavailable` when the zone database cannot be loaded.
+pub fn tzdb_version() -> Result<&'static str> { Ok(database()?.version.as_str()) }
+
+/// A region's name, the name `TimeZone` resolves it to, and its `TimeZone` rules; `None` when the database has no such region.
+pub(crate) fn legacy_rules(name: &str) -> Result<Option<(&'static str,&'static str,&'static LegacyRules)>> {
+    let database = database()?;
+    let Ok(index) = database.zones.binary_search_by(|zone| zone.name.as_str().cmp(name)) else { return Ok(None); };
+    let zone = &database.zones[index];
+    Ok(Some((zone.name.as_str(),zone.legacy_name.as_str(),&database.legacy[zone.rules])))
 }
 
-struct ZoneRecord { name: &'static str, legacy_name: &'static str, rules: &'static RuleData }
-struct RuleData { initial: i32, fixed: bool, standard_initial: i32, standards: &'static [(i64,i32)], transitions: &'static [(i64, i32)], recurring: &'static [TransitionRule], legacy: LegacyRules }
+/// The OpenJDK `tzdb.dat` the build selected and validated, which the zone database uses unless `RTDB_TZDB_FILE` replaces it.
+static BUNDLED_TZDB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tzdb.dat"));
 
-impl RuleData {
+/// The process's zone database, loaded on first use as the JVM loads its `lib/tzdb.dat`, so that, as there, the rules
+/// can be updated without a new build: from the OpenJDK `tzdb.dat` file a non-empty `RTDB_TZDB_FILE` names, otherwise
+/// from the bundled one. A failed load fails every later region lookup the same way.
+fn database() -> Result<&'static Database> {
+    static DATABASE: OnceLock<Result<Database>> = OnceLock::new();
+    DATABASE.get_or_init(|| load(std::env::var_os("RTDB_TZDB_FILE").filter(|path| !path.is_empty()).as_deref().map(Path::new)))
+        .as_ref().map_err(Clone::clone)
+}
+
+/// Decodes the `tzdb.dat` at `path`, or the bundled one, reading at most the format's one-MiB bound.
+fn load(path: Option<&Path>) -> Result<Database> {
+    let unavailable = |source: &dyn fmt::Display, message: &dyn fmt::Display| Anomaly::fault("xtdb/tzdb-unavailable", format!("Unable to load TZDB time-zone rules from {source}: {message}"));
+    let Some(path) = path else { return tzdb::decode(BUNDLED_TZDB).map_err(|message| unavailable(&"the bundled tzdb.dat", &message)); };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|file| file.take(tzdb::MAX_BYTES as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|error| unavailable(&path.display(), &error))?;
+    tzdb::decode(&bytes).map_err(|message| unavailable(&path.display(), &message))
+}
+
+impl Rules {
     fn standard_at(&self, second: i64) -> i32 {
         let index = self.standards.partition_point(|(transition,_)|*transition <= second);
         if index == 0 { self.standard_initial } else { self.standards[index - 1].1 }
@@ -237,7 +272,7 @@ impl RuleData {
         if second > last && !self.recurring.is_empty() {
             let year = CivilDate::from_epoch_day((second + i64::from(last_offset)).div_euclid(86_400))?.year();
             let mut offset = last_offset;
-            for rule in self.recurring {
+            for rule in &self.recurring {
                 if second < rule.epoch_second(year)? { return Ok(rule.before); }
                 offset = rule.after;
             }
@@ -248,11 +283,11 @@ impl RuleData {
     }
     fn gap_transition(&self, local: i64, year: i32) -> Result<Option<i64>> {
         let mut before = self.initial;
-        for &(second, after) in self.transitions {
+        for &(second, after) in &self.transitions {
             if after > before && (second + i64::from(before)..second + i64::from(after)).contains(&local) { return Ok(Some(second)); }
             before = after;
         }
-        for rule in self.recurring {
+        for rule in &self.recurring {
             let second = rule.epoch_second(year)?;
             if rule.after > rule.before && (second + i64::from(rule.before)..second + i64::from(rule.after)).contains(&local) { return Ok(Some(second)); }
         }
@@ -260,8 +295,7 @@ impl RuleData {
     }
 }
 
-struct TransitionRule { month: u8, day: i8, weekday: u8, second: u32, end_of_day: bool, definition: u8, standard: i32, before: i32, after: i32 }
-impl TransitionRule {
+impl Rule {
     fn epoch_second(&self, year: i32) -> Result<i64> {
         let day = if self.day < 0 { CivilDate::month_length(year, u32::from(self.month)) as i32 + 1 + i32::from(self.day) } else { i32::from(self.day) };
         let mut date = CivilDate::from_ymd(year, u32::from(self.month), day as u32)?;
@@ -276,3 +310,30 @@ impl TransitionRule {
 }
 
 include!(concat!(env!("OUT_DIR"), "/tzdb.rs"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replacement_tzdb_file_is_decoded_in_place_of_the_bundled_one() {
+        let directory = std::env::temp_dir().join(format!("rtdb-tzdb-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("tzdb.dat");
+        std::fs::write(&path, BUNDLED_TZDB).unwrap();
+        let database = load(Some(path.as_path())).unwrap();
+        assert_eq!(database.version, TZDB_VERSION);
+        assert!(database.zones.iter().any(|zone| zone.name == "Europe/Paris"));
+        std::fs::write(&path, &BUNDLED_TZDB[..BUNDLED_TZDB.len() / 2]).unwrap();
+        let truncated = load(Some(path.as_path())).unwrap_err();
+        assert!(truncated.to_string().contains("Unable to load TZDB time-zone rules"), "{truncated}");
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(load(Some(path.as_path())).is_err());
+    }
+
+    #[test]
+    fn the_bundled_tzdb_is_the_one_the_build_selected() {
+        assert_eq!(load(None).unwrap().version, TZDB_VERSION);
+        if std::env::var_os("RTDB_TZDB_FILE").is_none() { assert_eq!(tzdb_version().unwrap(), TZDB_VERSION); }
+    }
+}

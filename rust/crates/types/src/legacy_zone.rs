@@ -1,12 +1,6 @@
 use std::fmt;
 use crate::{Anomaly,CivilDate,Result};
-
-#[derive(Debug)]
-pub(crate) struct LegacyRules { pub raw: i32,pub last_standard_transition: Option<i64>,pub transitions: &'static [(i64,i32,i32)],pub future: Option<LegacyRecurring> }
-#[derive(Debug)]
-pub(crate) struct LegacyRecurring { pub start: LegacyTransition,pub end: LegacyTransition,pub saving: i32 }
-#[derive(Clone,Copy,Debug)]
-pub(crate) struct LegacyTransition { pub month: u8,pub day: i32,pub weekday: u8,pub last: bool,pub second: u32,pub definition: u8 }
+use crate::tzdb::legacy::{LegacyRecurring,LegacyRules,LegacyTransition};
 
 #[derive(Clone,Copy,Debug)]
 enum Kind {
@@ -15,22 +9,23 @@ enum Kind {
 }
 
 /// Immutable OpenJDK `TimeZone` rules for signed64 java.util.Date milliseconds.
-/// Uses the selected TZDB's legacy 1900–2100 table and its SimpleTimeZone tail; it is distinct from `ZoneId`.
-/// Lookups allocate no memory and perform no I/O; all retained rule data is process-static.
+/// Uses the zone database's legacy 1900–2100 table and its SimpleTimeZone tail; it is distinct from `ZoneId`.
+/// After the zone database is loaded, lookups allocate no memory and perform no I/O; all retained rule data is process-static.
 #[derive(Clone,Copy,Debug)]
 pub struct LegacyTimeZone { kind: Kind }
 
 impl LegacyTimeZone {
     /// Resolves region names, Java25 short aliases and GMT custom offsets, including seconds up to ±23:59:59.
     /// Unrecognized or malformed names select GMT, matching `TimeZone.getTimeZone` fallback.
-    pub fn parse(name: &str) -> Self {
+    /// - Errors: `xtdb/tzdb-unavailable` when the zone database cannot be loaded.
+    pub fn parse(name: &str) -> Result<Self> {
         let alias = SHORT_IDS.iter().find(|(short,_)|*short == name);
         let lookup = alias.map_or(name,|(_,target)|*target);
-        if let Some((original,canonical,rules)) = crate::zone::legacy_rules(lookup) {
-            return Self { kind: Kind::Region { name: alias.map_or(original,|(short,_)|*short),canonical,rules } };
+        if let Some((original,canonical,rules)) = crate::zone::legacy_rules(lookup)? {
+            return Ok(Self { kind: Kind::Region { name: alias.map_or(original,|(short,_)|*short),canonical,rules } });
         }
-        if let Some((millis,negative)) = custom(name) { return Self { kind: Kind::Fixed { millis,negative,custom: true } }; }
-        Self::gmt()
+        if let Some((millis,negative)) = custom(name) { return Ok(Self { kind: Kind::Fixed { millis,negative,custom: true } }); }
+        Ok(Self::gmt())
     }
     /// Returns the GMT fallback with zero offset and the GMT identifier.
     pub fn gmt() -> Self { Self { kind: Kind::Fixed { millis: 0,negative: false,custom: false } } }
@@ -89,7 +84,7 @@ impl LegacyTimeZone {
     fn offsets(self,date: i64,wall: bool) -> Result<(i32,i32)> {
         let Kind::Region { rules,canonical,.. } = self.kind else { return Ok((self.final_raw_offset_millis(),0)); };
         if rules.transitions.is_empty() { return Ok((rules.raw,0)); }
-        let index = transition_index(rules.transitions,date,wall);
+        let index = transition_index(&rules.transitions,date,wall);
         if index < 0 { return Ok((rules.raw,0)); }
         if let Some((_,total,saving)) = rules.transitions.get(index as usize) { return Ok((total - saving,*saving)); }
         let Some(future) = &rules.future else { return Ok(rules.transitions.last().map_or((rules.raw,0),|(_,total,saving)|(total - saving,*saving))); };
