@@ -110,6 +110,7 @@ pub(crate) const OWNED_RELATION_LAYOUT_V1: &str = "rtdb.owned.RelationLayout.v1"
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const OFFER_FUNDED_MUTATION_CLOCK_V1: &str = "rtdb.owned.OfferFundedMutationClock.v1";
+pub(crate) const FOOTPRINT_GRANT_V1: &str = "rtdb.owned.FootprintGrant.v1";
 pub(crate) const OFFER_CLOCK_SLOT_V2: &str = "rtdb.owned.OfferClockSlot.v2";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
@@ -1491,6 +1492,25 @@ impl Service {
         body.extend_from_slice(&slot.reading.0.to_be_bytes());
         body.extend_from_slice(&slot.issued.encode());
         Ok(ActionResult { body: wire::retain(body, call.reserve(48)?) })
+    }
+
+    pub(crate) async fn footprint_grant_action(
+        &self,
+        call: &Call,
+        body: &[u8],
+        ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
+        self.hosted_control_policy(call)?;
+        let op: rtdb_tx::OwnedFootprintGrantOp = serde_json::from_slice(body)
+            .map_err(|_| invalid("Invalid SS8 footprint grant action payload"))?;
+        self.owned_write_reply_with_reads(
+            call,
+            vec![TxOp::OwnedFootprintGrant(op)],
+            Vec::new(),
+            Vec::new(),
+            ipc_stream,
+        )
+        .await
     }
 
     pub(crate) async fn offer_funded_mutation_clock_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

@@ -1,0 +1,109 @@
+{
+  "summary": "Checks RTDB's shipped SS8 durable footprint grant, lease-loss transfer without lapse, strict work-key age rotation, durable work-keyed OCC debit, monotone footprint union, and all-writer (Flight and SQL) fence.",
+  "flags": [
+    "--no-external-by-default"
+  ],
+  "min_verified_functions": 10,
+  "controls": {
+    "lapsing_grant": {
+      "defect": "Lease loss lapses the grant (sets active = false) instead of transferring it with progress to the replacement attempt.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "find": "        active: true,\n    })",
+          "replace": "        active: false,\n    })"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "transfer_on_lease_loss",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "non_age_rotation": {
+      "defect": "Waiter selection picks arrival order instead of strict work-key age.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "find": "    if first.work_age < second.work_age\n        || (first.work_age == second.work_age && first.work_key_id <= second.work_key_id)",
+          "replace": "    let _ = second;\n    if true"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "select_older_waiter",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "select_older_waiter",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "unfenced_sql_writer": {
+      "defect": "Allow SQL writers to bypass an overlapping active durable footprint grant.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "find": "        WriterKind::Sql => !overlapping || !grant_active || matches_active_holder,",
+          "replace": "        WriterKind::Sql => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "writer_may_apply",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "debit_refills_on_conflict": {
+      "defect": "Refill credits on definite OCC conflict instead of sticky saturating decrement.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "find": "    if remaining == 0 {\n        0\n    } else {\n        remaining - 1\n    }",
+          "replace": "    let _ = remaining;\n    DEFAULT_OPTIMISTIC_CONFLICT_LIMIT"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "debit_occ_conflict",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "debit_occ_conflict",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "grant_expansion_discards_old_footprint": {
+      "defect": "Replace footprint length with newly observed count instead of taking the durable union.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "find": "    Some(held_len + added_new)",
+          "replace": "    Some(added_new)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "union_footprint_len",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    }
+  }
+}

@@ -254,6 +254,8 @@ impl Service {
                 crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 =>
                     return Box::pin(self.read_held_root_catalog_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.offer_funded_mutation_clock_action(&call, &action.body)).await?)]),
+                crate::owned_actions::FOOTPRINT_GRANT_V1 =>
+                    return rtdb_types::boxed(|| self.footprint_grant_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.offer_clock_slot_action(&call, &action.body)).await?)]),
                 COMMIT_OWNED_V1 =>
                     return rtdb_types::boxed(|| self.commit_owned_action(&call, &action.body, CommitFormat::Single, ipc_stream)).await.map(ActionReplies::Owned),

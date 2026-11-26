@@ -1729,6 +1729,57 @@ pub struct OwnedClockSlot {
 #[derive(Clone, Copy, Debug)]
 pub enum ArrowDocumentWrite { Put, Patch }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum OwnedFootprintGrantOp {
+    DebitOnConflict {
+        work_key: String,
+        work_age: u64,
+        limit: u8,
+    },
+    AcquireOrWait {
+        work_key: String,
+        work_age: u64,
+        attempt: u64,
+        footprint: Vec<String>,
+    },
+    TransferOnLeaseLoss {
+        work_key: String,
+        replacement_attempt: u64,
+        progress_step: u64,
+        additional_footprint: Vec<String>,
+    },
+    CarryGrant {
+        work_key: String,
+        work_age: u64,
+        holder_attempt: u64,
+    },
+    Release {
+        work_key: String,
+        holder_attempt: u64,
+    },
+}
+
+impl OwnedFootprintGrantOp {
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::DebitOnConflict { work_key, .. }
+            | Self::CarryGrant { work_key, .. }
+            | Self::Release { work_key, .. } => work_key.len().saturating_add(64),
+            Self::AcquireOrWait { work_key, footprint, .. } => footprint
+                .iter()
+                .fold(work_key.len().saturating_add(64), |acc, t| {
+                    acc.saturating_add(t.len()).saturating_add(32)
+                }),
+            Self::TransferOnLeaseLoss { work_key, additional_footprint, .. } => additional_footprint
+                .iter()
+                .fold(work_key.len().saturating_add(64), |acc, t| {
+                    acc.saturating_add(t.len()).saturating_add(32)
+                }),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
@@ -1760,6 +1811,7 @@ pub enum TxOp {
     HostedConstraintRefusal,
     OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<rtdb_types::TimedJournalCutoff> },
     OwnedClockSlot { slot: OwnedClockSlot },
+    OwnedFootprintGrant(OwnedFootprintGrantOp),
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,
@@ -1829,7 +1881,7 @@ impl TxOp {
     }
 
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedRetireRelation { .. } | Self::OwnedAdoptRelation { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeclareVectorPath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedReplayResidue { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
+        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedRetireRelation { .. } | Self::OwnedAdoptRelation { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeclareVectorPath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedFootprintGrant(_) | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedReplayResidue { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
     }
 }
 

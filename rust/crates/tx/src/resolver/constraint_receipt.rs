@@ -610,6 +610,7 @@ fn primary_op(op: &Operation) -> bool {
     match op {
         _ if crate::hosted_control::source_public_root_version_marker(op) => true,
         Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. }
+            | TxOp::OwnedFootprintGrant(_)
             | TxOp::OwnedForkWorld { .. } | TxOp::HostedControl(_)) => true,
         Operation::Public(
             TxOp::OwnedCheck { relation, .. }
@@ -633,6 +634,7 @@ pub(super) fn shared_check(op: &Operation) -> Option<&Operation> {
     match op {
         Operation::Public(
             TxOp::OwnedDeadline { .. }
+            | TxOp::OwnedFootprintGrant(_)
             | TxOp::OwnedCheck { .. }
             | TxOp::OwnedCheckRange { .. }
             | TxOp::OwnedCheckWorldScope { .. }

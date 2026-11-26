@@ -185,6 +185,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => (attempt.len(), None, 128),
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => (0, None, 0),
+                Operation::Public(TxOp::OwnedFootprintGrant(op)) => (op.retained_bytes(), None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
                 Operation::Public(TxOp::OwnedCheckRange { relation, region, .. }) =>
@@ -546,6 +547,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => attempt.len() + 128,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.name().len(),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => 0,
+                Operation::Public(TxOp::OwnedFootprintGrant(op)) => op.retained_bytes(),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
                 Operation::Public(TxOp::OwnedCheckRange { relation, region, .. }) => range_evidence_bytes(relation, region),
@@ -1013,6 +1015,11 @@ fn operation_value<'a>(
             body.insert("issued".into(), Value::Binary(slot.issued.encode().to_vec()));
             body.insert("funded".into(), Value::Bool(slot.funded));
             "rtdb-owned-clock-slot-v4"
+        }
+        Operation::Public(TxOp::OwnedFootprintGrant(op)) => {
+            let encoded = serde_json::to_vec(op).map_err(|error| invalid(format!("Invalid SS8 footprint grant op: {error}")))?;
+            body.insert("payload".into(), Value::Binary(encoded));
+            "rtdb-owned-footprint-grant-v1"
         }
         Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging, journal_before }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -2839,6 +2846,14 @@ impl SourceOperationReader<'_> {
                         issued: crate::DecisionObservation::decode(&issued)?, funded,
                     },
                 }
+            }
+            "rtdb-owned-footprint-grant-v1" => {
+                let Value::Binary(payload) = value("payload")? else {
+                    return Err(invalid("Invalid SS8 footprint grant payload"));
+                };
+                let op: crate::OwnedFootprintGrantOp = serde_json::from_slice(&payload)
+                    .map_err(|_| invalid("Malformed SS8 footprint grant payload"))?;
+                TxOp::OwnedFootprintGrant(op)
             }
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" | "rtdb-owned-physical-deadline-v2" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
