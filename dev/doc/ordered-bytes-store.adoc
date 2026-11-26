@@ -30,8 +30,9 @@ A committing append receives its stamp: the clock sample in microseconds and the
 The store overwrites every stamp placeholder of the writes (16 zero bytes at a named offset of a key or value) with the stamp's encoding, micros big-endian with the sign bit flipped and then the version big-endian, so stamped keys sort in commit order.
 A key placeholder lies at or past the key's partition prefix (a big-endian `u16` length, then that many bytes).
 A placeholder out of bounds, over non-zero bytes or inside the prefix, a value placeholder on a delete, and a stamped key that could land on another write's key (equal length and equal bytes outside both placeholders) are request errors, decided before anything is ordered.
-An append with no writes only validates, and answers the version it validated through.
-Its idempotency key makes a retry return the first outcome, a committed one with its first stamp.
+An append with no writes only validates: it is recorded at a new version with no effects, the version it answers it validated through.
+Every outcome but `outside` is a receipt under the append's idempotency key, so a retry returns the first outcome: a commit with its first stamp, a conflict, or a validation with its version, even after a later write that a fresh judgement would conflict with.
+The key belongs to its first request; another request under it is refused.
 
 `rtdb.store.v1.Watch`:: Reports the first version after `after` that wrote into one of its ranges, waiting up to a bounded time.
 It always reports how far it inspected, so a caller resumes from there.
@@ -49,6 +50,9 @@ It always reports how far it inspected, so a caller resumes from there.
 * Stamp micros never decrease along versions and are never raised to a predecessor's.
   A sample at or behind the last commit's time (two commits in one microsecond, or a failover writer's clock) is waited out before the append is judged again.
   So a stamp is seekable by time and by version alike, and whether an append is `outside` depends on the clock alone.
+* RTDB's stamps' micros in fact strictly increase, which the host's non-decreasing contract admits.
+  System time strictly increases along positions because Default's shared physical partition names a transaction by its system time: its stage carries no event position, and its recovery groups events into transactions by time.
+  So the writer samples its clock for each append at that append's ordering point, a batched group included, and a commit waits only when two samples fall in one microsecond.
 
 == Mechanism
 
@@ -58,6 +62,8 @@ An entry's id is its key bytes and its `v` cell holds the value.
 The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time.
 It fills the placeholders and applies the stamped writes as puts and deletes of `store.entries`.
 A sample at or behind the head's time refuses as `rtdb.store/clock-behind`, and the Flight action waits it out and retries.
+A conflict and a validation carry no stamp: their records take the next time past the head when the sample does not pass it, as a native transaction's does.
+A write-free append is therefore not a v1 validation (`Transact::validates_only`), which answers at the acquired basis without a record: it is ordered and appended like a commit, so every append needs write access.
 `Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.
 
 Scan pushdown, columnar projection and batching are mechanism under this contract.

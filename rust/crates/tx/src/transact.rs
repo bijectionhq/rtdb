@@ -70,11 +70,12 @@ impl Transact {
         }
     }
 
-    /// Whether the request writes nothing and only validates: no operations, or
-    /// a store append without writes.
+    /// Whether the request only validates: no operations in either arm. It answers at
+    /// the acquired basis and publishes no record. A store append is never one, even
+    /// without writes: every outcome but `outside` is a receipt under its key
+    /// ([`TransactState::resolve_store`]).
     pub fn validates_only(&self) -> bool {
-        self.otherwise.is_empty()
-            && (self.ops.is_empty() || self.store_append().is_some_and(|append| append.writes.is_empty()))
+        self.otherwise.is_empty() && self.ops.is_empty()
     }
 
     pub fn claims(&self) -> impl Iterator<Item = &Claim> {
@@ -1295,9 +1296,17 @@ impl TransactState {
     /// first. The writer's clock sample `now` is then judged against the window and,
     /// for writes, is the commit's system time and its stamp's micros, with the
     /// commit's position as the stamp's version. The sample is never raised to a
-    /// predecessor's: one at or behind the head refuses as
-    /// [`STORE_CLOCK_BEHIND`], and the caller waits it out. Outside the window
-    /// nothing is decided or recorded. A write-free append answers at the view's head.
+    /// predecessor's: one at or behind the head refuses as [`STORE_CLOCK_BEHIND`],
+    /// and the caller waits it out. A commit's sample must pass the head's because
+    /// system time strictly increases along positions: Default's shared physical
+    /// partition names a transaction by its system time (its stage carries no event
+    /// position, and its recovery groups events into transactions by time). Outside
+    /// the window nothing is decided or recorded, so a retry is judged again.
+    ///
+    /// Every other outcome is a receipt under the request's key, so a retry returns
+    /// the first one: a commit with its stamp, a conflict, or a write-free append's
+    /// validation. A validation is recorded at its own position with no effects; that
+    /// position is the version it validated its reads through.
     #[allow(clippy::too_many_arguments)]
     fn resolve_store(
         view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
@@ -1316,7 +1325,7 @@ impl TransactState {
         check_placeholders(&append.writes)?;
         if view.pending { return Err(pending_error()); }
         let head = view.index.head();
-        let validation = append.writes.is_empty();
+        let stamped = !append.writes.is_empty();
         let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
             key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
         };
@@ -1326,14 +1335,12 @@ impl TransactState {
         for (i, guard) in request.guards.iter().enumerate() {
             if !guard.evaluate(view.index, guard_time, claims, None)? { failed.push(i); }
         }
-        if !failed.is_empty() && validation {
-            return Ok((Resolution::Answer(receipt(head.basis, head.system_time, Outcome::Otherwise { failed })), None));
-        }
 
         if failed.is_empty() {
-            // A commit's time is its own sample, past the head's; a validation's is at least the head's.
+            // A commit's time is its own sample, past the head's; a validation's sample
+            // is at least the head's, since the store's clock never regresses.
             let floor = head.system_time.max(view.time_floor.unwrap_or(Timestamp::MIN));
-            if now < floor || (!validation && now == floor) {
+            if now < floor || (stamped && now == floor) {
                 return Err(Anomaly::new(AnomalyCategory::Busy, STORE_CLOCK_BEHIND, "The writer clock is behind the store's last commit")
                     .with_context("retry_after_micros", floor.0.saturating_sub(now.0).saturating_add(1).into()));
             }
@@ -1344,21 +1351,25 @@ impl TransactState {
             if before.is_some_and(|end| now >= end) {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, STORE_OUTSIDE_LATE, "The store append's window has closed"));
             }
-            if validation {
-                return Ok((Resolution::Answer(receipt(head.basis, head.system_time, Outcome::Then)), None));
-            }
         }
 
         if position <= head.basis.position() {
             return Err(Anomaly::fault("rtdb/transaction-order", "The append must follow the applied prefix"));
         }
-        // A refused append records its conflict, so a retry under its key replays it;
-        // it carries no stamp, so its system time is only the index's.
-        let system_time = if failed.is_empty() { now } else { now.max(head.system_time.next()?) };
+        // Only a commit's time is its sample. A conflict and a validation carry no
+        // stamp: their records take the next time past the head when the sample does
+        // not pass it, as a native transaction's does.
+        let system_time = if stamped && failed.is_empty() {
+            now
+        } else {
+            now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN))
+        };
         let cut = BranchCut { basis: Basis::new(head.basis.incarnation(), position), system_time };
         let mut index = view.index.clone();
         index.advance(cut)?;
-        let (outcome, effects, after) = if failed.is_empty() {
+        let (outcome, effects, after) = if !failed.is_empty() {
+            (Outcome::Otherwise { failed }, Vec::new(), index)
+        } else if stamped {
             let stamp = StoreStamp { micros: now.0, version: position };
             let mut ops: Vec<Op> = Vec::new();
             for (key, value) in stamp_writes(&append.writes, stamp)? {
@@ -1378,7 +1389,8 @@ impl TransactState {
             then.check_constraints()?;
             (Outcome::Then, then.effects, then.index)
         } else {
-            (Outcome::Otherwise { failed }, Vec::new(), index)
+            // A validation: its receipt, and nothing else, at its own position.
+            (Outcome::Then, Vec::new(), index)
         };
         let record = TransactionRecord::Tx(ResolvedTransact {
             fingerprint, receipt: receipt(cut.basis, cut.system_time, outcome), effects, before: None,

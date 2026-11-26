@@ -256,10 +256,16 @@ impl TransactPipeline {
 
     /// Decide queued requests in order, as one group the driver may append in one journal
     /// request. Each result is independent; a full pipeline refuses the rest.
+    ///
+    /// The writer's `clock` is sampled for each request at its own ordering point, never
+    /// once for the group. System time strictly increases along positions, and a store
+    /// commit's time is its own sample, never raised: one sample shared by the group
+    /// would leave every store commit after the first behind the head it set, waiting
+    /// out `rtdb.store/clock-behind` and retrying.
     pub fn decide_batch(
-        &mut self, requests: &[Transact], now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
+        &mut self, requests: &[Transact], clock: &dyn Fn() -> Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Vec<Result<Decision>> {
-        requests.iter().map(|request| self.decide(request, now, features, claims)).collect()
+        requests.iter().map(|request| self.decide(request, clock(), features, claims)).collect()
     }
 
     /// For the timed write at `tx_position`, once its original record is durable under
@@ -708,6 +714,47 @@ mod tests {
         };
         assert_eq!(receipt.basis.position(), position);
         assert!(receipt.replayed);
+    }
+
+    fn store(n: u8, writes: Vec<rtdb_index::branches::store::StoreWrite>) -> Transact {
+        Transact {
+            custody_request_digest: None,
+            request_memory: None,
+            key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
+            ops: vec![Op::Store(StoreAppend { writes, window: Window::default() })],
+            otherwise: Vec::new(),
+            requires: Vec::new(),
+        }
+    }
+
+    /// Each request of a group samples the clock at its own ordering point, so every
+    /// store commit of the group commits at its own time, and a write-free store append
+    /// is appended as a receipt rather than answered.
+    #[test]
+    fn a_group_of_store_appends_commits_each_at_its_own_sample() {
+        use std::cell::Cell as Tick;
+        use rtdb_index::branches::store::StoreWrite;
+        let mut pipeline = pipeline();
+        let write = |n: u8| StoreWrite { key: vec![0, 1, b'p', n], value: Some(vec![n]), key_stamp: None, value_stamp: None };
+        let requests = [store(1, vec![write(1)]), store(2, vec![write(2)]), store(3, Vec::new()), store(4, vec![write(4)])];
+        let now = Tick::new(100);
+        let clock = || { let at = now.get(); now.set(at + 1); Timestamp(at) };
+        let decisions = pipeline.decide_batch(&requests, &clock, FEATURES, &claims());
+        let positions = decisions.into_iter().map(|decision| match decision.unwrap() {
+            Decision::Append { position, .. } => position,
+            Decision::Answer(_) => panic!("every store append is appended"),
+        }).collect::<Vec<_>>();
+        assert_eq!(positions, vec![1, 2, 3, 4]);
+        let released = pipeline.acknowledge(4).unwrap();
+        let times = released.iter().map(|receipt| receipt.system_time).collect::<Vec<_>>();
+        assert_eq!(times, vec![Timestamp(100), Timestamp(101), Timestamp(102), Timestamp(103)]);
+        assert!(released.iter().all(|receipt| receipt.outcome == Outcome::Then));
+
+        // One sample for the whole group leaves the second commit behind the first.
+        let mut shared = TransactPipeline::new(TransactState::new(INCARNATION), 1, 8).unwrap();
+        let decisions = shared.decide_batch(&requests[..2], &|| Timestamp(100), FEATURES, &claims());
+        assert!(matches!(decisions[0], Ok(Decision::Append { .. })));
+        assert!(matches!(&decisions[1], Err(error) if error.code == STORE_CLOCK_BEHIND));
     }
 
     #[test]

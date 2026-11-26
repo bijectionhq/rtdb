@@ -5,7 +5,9 @@
 //! only when no write committed after `since` intersects its read ranges and
 //! the writer's clock at the ordering point lies in its window, and the
 //! resolver stamps it there (`rtdb_tx::transact::Op::Store`); a watch reports
-//! the next version that wrote into its ranges.
+//! the next version that wrote into its ranges. Every append outcome but
+//! `outside` is a receipt under its key, a write-free validation included, so a
+//! retry returns the first one.
 
 use std::time::Duration;
 
@@ -145,9 +147,9 @@ impl Service {
         if window.not_before.zip(window.before).is_some_and(|(start, end)| start >= end) {
             return Err(error::incorrect("The append's window is empty"));
         }
+        // Every append records its outcome under its key, a write-free one included.
         let validation = writes.is_empty();
-        let access = if validation { DatabaseAccess::Read } else { DatabaseAccess::Write };
-        let (database, incarnation) = self.store_database(call, access, Some(&request.incarnation)).await?;
+        let (database, incarnation) = self.store_database(call, DatabaseAccess::Write, Some(&request.incarnation)).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let since = Basis::new(incarnation, request.since);
         let guards = ranges(request.reads)?.into_iter()

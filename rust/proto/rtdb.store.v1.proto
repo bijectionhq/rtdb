@@ -146,7 +146,9 @@ message AppendReply {
     Stamp committed = 2;
     // The index of the first read range a later write intersected.
     uint32 conflict = 3;
-    // An append with no writes validated its reads through this version.
+    // An append with no writes validated its reads through this version: its
+    // own record, which writes nothing. Like a commit and a conflict, it is a
+    // receipt, so a retry under the same key returns it.
     uint64 validated = 4;
     // The clock sample fell outside the window. Nothing was written and no
     // receipt was kept: a retry under the same key is judged again.

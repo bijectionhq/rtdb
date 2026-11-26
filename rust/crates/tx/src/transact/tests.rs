@@ -100,11 +100,63 @@ fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
     let conflicting = plan(&state, &store_append(6, 0, vec![everything.clone()], vec![other.clone()], closed), 2, 200, DEFAULT);
     let receipt = apply(&mut state, 2, conflicting.record()).unwrap();
     assert_eq!(receipt.outcome, Outcome::Otherwise { failed: vec![0] });
-    // A write-free append validates at the head and appends nothing.
-    let Resolution::Answer(validated) = state.resolve(&store_append(7, 2, vec![everything], Vec::new(), Window::default()), 3, Timestamp(300), DEFAULT, &claims()).unwrap() else {
-        panic!("a validation answers");
+    // A write-free append validates through its own record, which writes nothing.
+    let validated = plan(&state, &store_append(7, 2, vec![everything], Vec::new(), Window::default()), 3, 300, DEFAULT);
+    let receipt = apply(&mut state, 3, validated.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.outcome), (basis(3), Outcome::Then));
+}
+
+#[test]
+fn a_store_append_records_its_validation_and_conflict_as_receipts() {
+    use rtdb_index::branches::store::{Projection, StoreRead};
+    let mut state = TransactState::new(INCARNATION);
+    let partition = vec![0u8, 1, b'p'];
+    let everything = KeyRange { start: partition.clone(), end: None };
+    let write = StoreWrite { key: [partition.as_slice(), b"k"].concat(), value: Some(b"v".to_vec()), key_stamp: None, value_stamp: None };
+    let entries = |state: &TransactState, at: i64| {
+        let read = StoreRead { range: everything.clone(), after: None, limit: 10, projection: Projection::Keys, filter: None, reverse: false };
+        state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(at)).unwrap().store_page(&read).unwrap().entries.len()
     };
-    assert_eq!((validated.basis, validated.outcome), (basis(2), Outcome::Then));
+
+    // A write-free append is recorded at its own position with no effects: that
+    // position is the version it validated through.
+    let validation = store_append(1, 0, vec![everything.clone()], Vec::new(), Window::default());
+    let validated = plan(&state, &validation, 1, 100, DEFAULT);
+    let receipt = apply(&mut state, 1, validated.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.system_time, receipt.outcome), (basis(1), Timestamp(100), Outcome::Then));
+    assert_eq!(entries(&state, 100), 0, "a validation writes nothing");
+
+    // A later write into its reads would conflict the same request judged afresh;
+    // the retry replays the first outcome instead.
+    let committed = plan(&state, &store_append(2, 1, Vec::new(), vec![write], Window::default()), 2, 200, DEFAULT);
+    apply(&mut state, 2, committed.record()).unwrap();
+    let Resolution::Answer(replayed) = state.resolve(&validation, 3, Timestamp(300), DEFAULT, &claims()).unwrap() else {
+        panic!("a retried validation replays its receipt");
+    };
+    assert!(replayed.replayed);
+    assert_eq!((replayed.basis, replayed.outcome), (basis(1), Outcome::Then));
+    // The key belongs to its first request.
+    let reused = store_append(1, 0, Vec::new(), Vec::new(), Window::default());
+    assert_eq!(refused(&state, &reused, 3, 300), "rtdb/idempotency-key");
+
+    // A write-free append that conflicts is recorded too, and its retry replays the
+    // conflict.
+    let stale = store_append(3, 1, vec![everything.clone()], Vec::new(), Window::default());
+    let conflicted = plan(&state, &stale, 3, 300, DEFAULT);
+    let receipt = apply(&mut state, 3, conflicted.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.outcome), (basis(3), Outcome::Otherwise { failed: vec![0] }));
+    let Resolution::Answer(replayed) = state.resolve(&stale, 4, Timestamp(400), DEFAULT, &claims()).unwrap() else {
+        panic!("a retried conflict replays its receipt");
+    };
+    assert_eq!((replayed.basis, replayed.outcome), (basis(3), Outcome::Otherwise { failed: vec![0] }));
+
+    // Outside its window a validation is no receipt: its retry is judged again.
+    let closing = Window { not_before: None, before: Some(Timestamp(450)) };
+    let late = store_append(4, 3, vec![everything], Vec::new(), closing);
+    assert_eq!(refused(&state, &late, 4, 450), STORE_OUTSIDE_LATE);
+    let validated = plan(&state, &late, 4, 400, DEFAULT);
+    let receipt = apply(&mut state, 4, validated.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.outcome), (basis(4), Outcome::Then));
 }
 
 #[test]

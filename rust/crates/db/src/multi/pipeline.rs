@@ -819,12 +819,13 @@ impl MultiDatabase {
         self.require_armed_rotation()?;
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;
-        let now = (self.clock)();
+        // Each request samples the clock at its own ordering point (`decide_batch`).
+        let clock = Arc::clone(&self.clock);
         let features = self.write_features();
         let writer = self.writer.as_mut().ok_or_else(no_writer)?;
         Ok(writer
             .pipeline
-            .decide_batch(requests, now, features, claims)
+            .decide_batch(requests, &*clock, features, claims)
             .into_iter()
             .map(|decision| decision.and_then(|decision| plan(decision, lease, generation, coordinates)))
             .collect())

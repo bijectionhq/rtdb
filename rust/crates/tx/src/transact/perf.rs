@@ -70,7 +70,7 @@ fn pipeline_commit_cost_as_the_table_grows() {
     let mut committed = 0u64;
     let commit_group = |pipeline: &mut TransactPipeline, from: u64| {
         let requests = (from..from + GROUP).map(put).collect::<Vec<_>>();
-        let decisions = pipeline.decide_batch(&requests, Timestamp(from as i64 * 10), &[LINEARIZABLE], &claims);
+        let decisions = pipeline.decide_batch(&requests, &|| Timestamp(from as i64 * 10), &[LINEARIZABLE], &claims);
         assert!(decisions.iter().all(|decision| matches!(decision, Ok(Decision::Append { .. }))));
         let released = pipeline.acknowledge(pipeline.next_position() - 1).unwrap();
         assert_eq!(released.len(), GROUP as usize);
