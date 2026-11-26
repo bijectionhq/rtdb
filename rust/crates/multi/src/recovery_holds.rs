@@ -1,18 +1,18 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{envelope::ReplicaFrame, keys::CURRENT_STORAGE_VERSION};
 use rtdb_storage::{Error, ObjectKey, Result,
-    log::{LogOffset, LogRecord, ReplicaObjectCustody, ReplicaPayload, ReplicaPayloadBroker}};
+    log::{LogOffset, LogRecord, ReplicaObjectCustody, ReplicaPayload, ReplicaPayloadBroker}, release::Settled};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, StorageEpoch};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::deployment::LogkeeperLogConfig;
+use crate::hold_release::release_hold;
 use crate::keys::KeyService;
 use crate::hosted_recovery::replay_start;
 use crate::replay_broker::{Client, History};
@@ -115,17 +115,13 @@ impl RecoveryAdmission {
                 let _ = closed.await;
             }
             if attempted {
-                loop {
-                    match crate::store::release_region(worker.holds.directory.as_ref(), &worker.deployment, id, !opened).await {
-                        Ok(()) => {
-                            crate::residence_trace::record("finish-recovery", || serde_json::json!({
-                                "installation": worker.deployment, "stream": worker.stream, "epoch": worker.log_epoch, "hold": id,
-                            }));
-                            break;
-                        }
-                        Err(error) => eprintln!("Recovery hold {id} for {} is pending release: {}", worker.deployment, error.code),
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                let (directory, deployment) = (&worker.holds.directory, &worker.deployment);
+                let settled = release_hold(format!("recovery hold {id} for {deployment}"),
+                    move || crate::store::release_region(directory.as_ref(), deployment, id, !opened)).await;
+                if let Settled::Released = settled {
+                    crate::residence_trace::record("finish-recovery", || serde_json::json!({
+                        "installation": worker.deployment, "stream": worker.stream, "epoch": worker.log_epoch, "hold": id,
+                    }));
                 }
             }
             if witness.is_some() {

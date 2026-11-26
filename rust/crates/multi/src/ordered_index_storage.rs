@@ -108,13 +108,9 @@ impl HostedIndexPages {
             let _ = drained.await;
             // A lost CAS response may have recorded the permit. Fence an
             // ambiguous admission even if the first read sees it absent.
-            loop {
-                match release_permit(directory.as_ref(), &deployment, &scope, permit_id).await {
-                    Ok(()) => break,
-                    Err(error) => eprintln!("Ordered index permit {permit_id} is retained: {}", error.code),
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            let (directory, installation, scope) = (&directory, deployment.as_str(), &scope);
+            crate::hold_release::release_hold(format!("ordered index permit {permit_id} for {installation}"),
+                move || release_permit(directory.as_ref(), installation, scope, permit_id)).await;
         });
         admitted.await.map_err(|_| closed_scope())?
     }

@@ -1273,18 +1273,14 @@ impl Service {
 
     async fn release(&self, history: History, region: Uuid) {
         let deployment = history.deployment.to_string();
-        loop {
-            match crate::store::release_region(self.directory.as_ref(), &deployment, region, true).await {
-                Ok(()) => {
-                    crate::residence_trace::record("finish-recovery", || serde_json::json!({
-                        "installation": deployment, "stream": history.stream(),
-                        "epoch": history.log_epoch, "hold": region,
-                    }));
-                    return;
-                }
-                Err(error) => tracing::warn!(%deployment, %region, code = %error.code, "Broker read region is awaiting release"),
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let (directory, installation) = (&self.directory, deployment.as_str());
+        let settled = crate::hold_release::release_hold(format!("broker read region {region} for {deployment}"),
+            move || crate::store::release_region(directory.as_ref(), installation, region, true)).await;
+        if let rtdb_storage::release::Settled::Released = settled {
+            crate::residence_trace::record("finish-recovery", || serde_json::json!({
+                "installation": deployment, "stream": history.stream(),
+                "epoch": history.log_epoch, "hold": region,
+            }));
         }
     }
 }

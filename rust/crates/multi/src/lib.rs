@@ -42,6 +42,7 @@ mod receiver_clock;
 mod reclamation_decision;
 pub mod relay;
 mod replica_retention;
+mod hold_release;
 mod hosted_recovery;
 mod residence_trace;
 pub mod session;

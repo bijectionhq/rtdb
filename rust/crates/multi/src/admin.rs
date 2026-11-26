@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
 use crate::deployment::{CellStorage, ensemble_servers, journal_endpoint, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
+use crate::hold_release::ChangeFailure;
 
 mod cell_attempts;
 pub use cell_attempts::dispose_abandoned;
@@ -1630,7 +1631,7 @@ async fn stage_cell_storage(
     if !local {
         crate::store::track_transfer_publications(&mut io, to.directory.clone(), staged.id.clone(), region, staged.epoch);
     }
-    let admitted = update_installation(to.directory.as_ref(), &staged.id, |record| {
+    let admitted = change_installation(to.directory.as_ref(), &staged.id, |record| {
         if !same_cell_move(record, staged) || record.epoch != staged.epoch
             || record.lifecycle != Lifecycle::Moving || record.move_from != staged.move_from
             || record.storage_generation.is_some_and(|generation| record.abandoned_generations.contains_key(&generation))
@@ -1644,7 +1645,8 @@ async fn stage_cell_storage(
         });
         Ok(())
     }).await;
-    let uncertain = admitted.as_ref().is_err_and(|error| error.code != "rtdb.multi/cell-transfer");
+    let uncertain = admitted.as_ref().is_err_and(ChangeFailure::may_have_applied);
+    let admitted = admitted.map_err(Anomaly::from);
     let result = async {
         admitted?;
         use rtdb_storage::ObjectKey;
@@ -1694,7 +1696,17 @@ pub(crate) async fn update_installation(
     id: &str,
     change: impl Fn(&mut DeploymentRecord) -> Result<()>,
 ) -> Result<DeploymentRecord> {
-    update_installation_under_disposal(directory, id, None, change).await
+    Ok(change_installation(directory, id, change).await?)
+}
+
+/// [`update_installation`], telling a refused change from one whose
+/// compare-and-replace may have applied without a reply.
+pub(crate) async fn change_installation(
+    directory: &dyn Directory,
+    id: &str,
+    change: impl Fn(&mut DeploymentRecord) -> Result<()>,
+) -> std::result::Result<DeploymentRecord, ChangeFailure> {
+    change_installation_under_disposal(directory, id, None, change).await
 }
 
 async fn update_installation_under_disposal(
@@ -1703,24 +1715,35 @@ async fn update_installation_under_disposal(
     disposal: Option<&rtdb_directory::ReferenceDisposal>,
     change: impl Fn(&mut DeploymentRecord) -> Result<()>,
 ) -> Result<DeploymentRecord> {
+    Ok(change_installation_under_disposal(directory, id, disposal, change).await?)
+}
+
+async fn change_installation_under_disposal(
+    directory: &dyn Directory,
+    id: &str,
+    disposal: Option<&rtdb_directory::ReferenceDisposal>,
+    change: impl Fn(&mut DeploymentRecord) -> Result<()>,
+) -> std::result::Result<DeploymentRecord, ChangeFailure> {
+    // Every earlier attempt ended in a definite conflict, so only a lost
+    // reply to the replace itself leaves the outcome unknown.
     for _ in 0..8 {
-        let current = directory.deployment(id).await?.ok_or_else(|| {
-            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+        let current = directory.deployment(id).await.map_err(ChangeFailure::NotApplied)?.ok_or_else(|| {
+            ChangeFailure::NotApplied(Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}")))
         })?;
         let mut next = current.clone();
-        change(&mut next)?;
+        change(&mut next).map_err(ChangeFailure::NotApplied)?;
         if next == current {
             return Ok(current);
         }
         let replaced = match disposal {
-            Some(permit) => directory.settle_reference_disposal(permit, next, current.version).await?,
-            None => directory.replace_deployment(next, current.version).await?,
+            Some(permit) => directory.settle_reference_disposal(permit, next, current.version).await,
+            None => directory.replace_deployment(next, current.version).await,
         };
-        if let Cas::Applied(stored) = replaced {
+        if let Cas::Applied(stored) = replaced.map_err(ChangeFailure::Unknown)? {
             return Ok(stored);
         }
     }
-    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/installation-contended", format!("Installation {id} kept changing")))
+    Err(ChangeFailure::NotApplied(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/installation-contended", format!("Installation {id} kept changing"))))
 }
 
 pub(crate) async fn administration_stream(directory: &dyn Directory, record: &DeploymentRecord, maximum_message_bytes: usize) -> Result<StreamConfig> {

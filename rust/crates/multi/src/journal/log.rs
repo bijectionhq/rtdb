@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::task::TaskTracker;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-const RELEASE_RETRY: Duration = Duration::from_secs(1);
+const ORDERED_ADMISSION_RETRY: Duration = Duration::from_secs(1);
 const DELIVERED_RECORD_OVERHEAD: usize = 256;
 const MAX_RANGE_RECORDS: usize = 4096;
 const MAX_RANGE_BYTES: usize = 32 << 20;
@@ -147,7 +147,7 @@ impl Held {
             let admitted = loop {
                 match journal.hold(&request).await {
                     Err(error) if error.code == "rtdb.multi/ordered-journal" => {
-                        tokio::time::sleep(RELEASE_RETRY).await
+                        tokio::time::sleep(ORDERED_ADMISSION_RETRY).await
                     }
                     result => break result,
                 }
@@ -171,16 +171,8 @@ impl Held {
         let (release, closed) = oneshot::channel();
         tasks.spawn(async move {
             let _ = closed.await;
-            loop {
-                match journal.release(hold).await {
-                    Ok(()) => break,
-                    Err(error) => eprintln!(
-                        "Ordered replay release {} remains pending: {}",
-                        hold.id.nonce, error.code
-                    ),
-                }
-                tokio::time::sleep(RELEASE_RETRY).await;
-            }
+            let journal = &journal;
+            crate::hold_release::release_hold(format!("ordered replay hold {}", hold.id.nonce), move || journal.release(hold)).await;
         });
         Arc::new(Self {
             hold,

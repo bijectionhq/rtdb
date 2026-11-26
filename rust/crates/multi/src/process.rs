@@ -363,10 +363,8 @@ impl rtdb_node::ReadFence for FenceSlot {
         }
         // The write may have committed after losing its reply. Fence the
         // claim and its predecessor before returning the local permit.
-        while let Err(error) = claim.release().await {
-            eprintln!("Audience seat {index} release will retry: {}", error.code);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        let claim = &claim;
+        crate::hold_release::release_hold(format!("audience seat {index}"), move || claim.release()).await;
     }
 }
 

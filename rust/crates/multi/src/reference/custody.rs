@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageNamespaces, StorageRegion};
 use rtdb_storage::Error;
@@ -8,6 +7,7 @@ use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
+use crate::hold_release::{ChangeFailure, release_hold};
 use crate::keys::KeyService;
 
 mod admission;
@@ -62,7 +62,7 @@ impl ReferenceReads {
                     Err(error) => { let _ = ready.send(Err(error)); return; }
                 }
             } else { None };
-            let accepted = crate::admin::update_installation(worker.directory.as_ref(), &deployment, |owner| {
+            let accepted = crate::admin::change_installation(worker.directory.as_ref(), &deployment, |owner| {
                 if !admission::may_admit_reference_read(
                     matches!(owner.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
                     owner.storage_prefix() == residence && owner.org == worker.org && owner.lineage == worker.lineage,
@@ -74,20 +74,14 @@ impl ReferenceReads {
                 Ok(())
             }).await;
             let opened = accepted.is_ok();
-            let uncertain = accepted.as_ref().err().is_some_and(|error| !matches!(
-                error.code.as_str(), CLOSED | "rtdb.multi/unknown-installation"
-            ));
-            if ready.send(accepted.map(|_| Arc::new(release) as Arc<dyn Send + Sync>)).is_ok() && opened {
+            let uncertain = accepted.as_ref().err().is_some_and(ChangeFailure::may_have_applied);
+            if ready.send(accepted.map(|_| Arc::new(release) as Arc<dyn Send + Sync>).map_err(Anomaly::from)).is_ok() && opened {
                 let _ = drained.await;
             }
             if opened || uncertain {
-                loop {
-                    match crate::store::release_region(worker.directory.as_ref(), &deployment, id, uncertain).await {
-                        Ok(()) => break,
-                        Err(error) => eprintln!("Reference read {id} for {deployment} is pending release: {}", error.code),
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                let (directory, installation) = (&worker.directory, deployment.as_str());
+                release_hold(format!("reference read {id} for {deployment}"),
+                    move || crate::store::release_region(directory.as_ref(), installation, id, uncertain)).await;
             }
             if let Some(witness) = witness {
                 drop(witness);
@@ -106,6 +100,7 @@ impl ReferenceReads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use bytes::Bytes;
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{IoRegion, ObjectStore};

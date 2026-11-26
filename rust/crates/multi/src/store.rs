@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::cipher::{Cipher, object};
 use crate::catalog_readers::CatalogReaders;
+use crate::hold_release::{ChangeFailure, release_hold};
 use crate::deployment::CellStorage;
 use crate::keys::{DeploymentDelivery, KeyService, UnitLedger, UnitOperation, UnitOutput, UnitScope};
 pub use rtdb_storage::sealing::EncryptingStore;
@@ -506,7 +507,7 @@ impl CellStoreFactory {
                 }
                 track_publications(&mut io, directory.clone(), config.deployment.clone(), id, config.writer_epoch);
             }
-            let accepted = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
+            let accepted = crate::admin::change_installation(directory.as_ref(), &config.deployment, |record| {
                 if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
                     || record.storage_prefix() != config.prefix
                     || config.writer_epoch.is_some_and(|epoch| epoch != record.epoch || record.holder.is_none())
@@ -532,26 +533,23 @@ impl CellStoreFactory {
                 Ok(())
             }).await;
             let opened = accepted.is_ok();
-            // The admission predicate and missing installation are local
-            // refusals. Other directory errors may hide an applied CAS.
-            let uncertain = accepted.as_ref().err().is_some_and(|error| !matches!(
-                error.code.as_str(), rtdb_node::NOT_HELD | "rtdb.multi/unknown-installation" | CHECKPOINT_ADVANCED
-                    | "rtdb.storage/log-range-unavailable" | "rtdb.multi/storage-region"
-            ));
-            if ready.send(accepted.map(|record| (record, io.clone()))).is_ok() && opened {
+            let uncertain = accepted.as_ref().err().is_some_and(ChangeFailure::may_have_applied);
+            if ready.send(accepted.map(|record| (record, io.clone())).map_err(Anomaly::from)).is_ok() && opened {
                 tokio::select! {
                     _ = &mut dropped => {}
-                    _ = read => loop {
-                        let result = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
-                            if let Some(region) = record.storage_regions.get_mut(&id) {
-                                region.release_checkpoint_startup();
-                            }
-                            Ok(())
-                        }).await;
-                        if result.is_ok() { let _ = dropped.await; break; }
+                    _ = read => {
+                        let (directory, deployment) = (&directory, &config.deployment);
+                        let startup = release_hold(format!("checkpoint startup of storage region {id} in {deployment}"), move || async move {
+                            crate::admin::update_installation(directory.as_ref(), deployment, |record| {
+                                if let Some(region) = record.storage_regions.get_mut(&id) {
+                                    region.release_checkpoint_startup();
+                                }
+                                Ok(())
+                            }).await.map(drop)
+                        });
                         tokio::select! {
-                            _ = &mut dropped => break,
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            _ = &mut dropped => {}
+                            _ = startup => { let _ = (&mut dropped).await; }
                         }
                     }
                 }
@@ -561,13 +559,8 @@ impl CellStoreFactory {
             // A failed registration may already be committed. Compare and
             // replace even if absent to fence that attempt's old version.
             if opened || uncertain {
-                loop {
-                    match release_region(directory.as_ref(), &config.deployment, id, uncertain).await {
-                        Ok(()) => break,
-                        Err(error) => eprintln!("Storage region {id} still open in {}: {}", config.deployment, error.code),
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                let (directory, deployment) = (&directory, &config.deployment);
+                release_hold(format!("storage region {id} in {deployment}"), move || release_region(directory.as_ref(), deployment, id, uncertain)).await;
             }
             if witnessed && let Err(error) = keys.forget_local_storage_region(id) {
                 eprintln!("Could not remove storage region witness {id}: {}", error.code);

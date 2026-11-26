@@ -1,6 +1,6 @@
 //! An enrolled process keeps each broker duty through its last plaintext owner.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
 use ordered_logkeeper::ordered::Placement;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -146,25 +146,9 @@ impl WorkOwner {
             observation,
             signature: self.process.sign(&statement).as_ref().to_vec(),
         };
-        loop {
-            match self
-                .broker
-                .custody_domain(
-                    self.domain,
-                    Action::Join {
-                        generation,
-                        id,
-                        join: join.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(_) => return,
-                Err(error) => {
-                    tracing::warn!(code = %error.code, "Installed custody drain awaits broker settlement")
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        let join = &join;
+        crate::hold_release::release_hold(format!("custody work {id} join in generation {generation}"), move || async move {
+            self.broker.custody_domain(self.domain, Action::Join { generation, id, join: join.clone() }).await.map(drop)
+        }).await;
     }
 }
