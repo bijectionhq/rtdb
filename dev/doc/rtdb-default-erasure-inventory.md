@@ -34,7 +34,8 @@ The enrollment only covers the installation's own storage and delivery paths. [O
 
 The enrolled profile serves Classic SQL and unscoped v1 Erase.
 It stops background compaction, derived artefact publication and automatic collection on that residence so the inventory has one publication owner.
-Raw inspection, maintenance reset, plaintext query spills, and retained or offline export have no admission on this profile.
+Raw inspection, maintenance reset, and retained or offline export have no admission on this profile.
+A query reading this profile still spills, but each spill file is encrypted under a key made for that file and held only in the query's memory, so no readable copy of an erased row outlives the query or the process. [Sealed spill](../../rust/crates/query/src/spill.rs)
 Ordinary block writes stage Arrow data through unnamed file descriptors under the original Local I/O owner.
 The provider forbids independent object copies and shared decrypted cache entries. [Node profile](../../rust/crates/node/src/database.rs) · [Private publication](../../rust/crates/replication/src/blocks.rs) · [Exact-read cache](../../rust/crates/storage/src/cache.rs)
 

@@ -501,15 +501,17 @@ impl QueryContext {
     }
     /// Both cancellation sources end active pulls; cancelling a cursor leaves either parent unchanged.
     /// The query holds a child of each, so its per-row checks never contend on a token every query shares.
-    pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, mut options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
+    pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
         if options.batch_rows == 0 || options.list_batch_rows == 0 || options.sort_memory_bytes == 0 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         if options.spill_partitions < 2 { return Err(invalid("invalid-options", "Spill partitions must be at least two")); }
-        if catalog.databases.values().any(|database| database.storage.object_store().local_erasure_custody().is_some()) {
-            options.spill_limit_bytes = 0;
-        }
-        let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
+        // Under local erasure custody no readable copy of an erased row may outlive the query, so its spill files are sealed.
+        let spill = Arc::new(if catalog.databases.values().any(|database| database.storage.object_store().local_erasure_custody().is_some()) {
+            SpillRegion::sealed(options.spill_limit_bytes)?
+        } else {
+            SpillRegion::new(options.spill_limit_bytes)?
+        });
         Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None, delivery_guard: None, spatial_refinement: false, shared_plans: None }))
     }
 

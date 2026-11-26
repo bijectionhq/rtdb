@@ -5693,6 +5693,7 @@ dependencies = [
 name = "rtdb-query"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
@@ -5703,6 +5704,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "ctr",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-functions",
@@ -5710,6 +5712,7 @@ dependencies = [
  "futures",
  "libc",
  "parking_lot",
+ "ring",
  "rtdb-columnar",
  "rtdb-expr",
  "rtdb-format",

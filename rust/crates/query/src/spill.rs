@@ -10,6 +10,7 @@ use arrow_ipc::{
     writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions, write_message},
 };
 use arrow_schema::{ArrowError, SchemaRef};
+use ctr::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::RecordSpans;
 use rtdb_types::Result;
@@ -23,10 +24,101 @@ use crate::{
 
 const IPC_ALIGNMENT: usize = 64;
 
+/// How a query's spill files hold their rows on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpillSealing {
+    /// As written, which is what the reference does.
+    Plain,
+    /// Encrypted under a key made for each file and held only in the query's memory, for a query reading a store under
+    /// local erasure custody: no readable copy of an erased row may outlive the query, and a file a crash leaves behind
+    /// is unreadable once the process that held its key has gone.
+    Sealed,
+}
+
+/// The stream cipher a sealed spill file is encrypted with: positional, so a frame reads back from any offset and a
+/// rolled-back tail is rewritten in place, and length-preserving, so the spill quota counts the same bytes either way.
+type SpillCipher = ctr::Ctr128BE<aes::Aes128>;
+
+/// The key of one sealed spill file; each file has its own, so one counter sequence never encrypts two files.
+#[derive(Clone, Copy)]
+struct SpillKey([u8; 16]);
+
+impl SpillKey {
+    fn generate() -> Result<Self> {
+        use ring::rand::SecureRandom;
+        let mut key = [0; 16];
+        ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| io_error("The system random source refused a spill key"))?;
+        Ok(Self(key))
+    }
+
+    /// The cipher positioned at byte `offset` of the file.
+    fn cipher_at(&self, offset: u64) -> std::io::Result<SpillCipher> {
+        let mut cipher = SpillCipher::new_from_slices(&self.0, &[0; 16]).map_err(|_| std::io::Error::other("The spill key has the wrong length"))?;
+        cipher.try_seek(offset).map_err(|_| keystream_exhausted())?;
+        Ok(cipher)
+    }
+}
+
+fn keystream_exhausted() -> std::io::Error { std::io::Error::other("The spill file exceeds its cipher's keystream") }
+
+/// The bytes one cipher step takes from the caller at a time, encrypted on the stack rather than in a heap buffer.
+const SEAL_CHUNK_BYTES: usize = 4 << 10;
+
+/// A spill file as its writer sees it: the bytes it writes reach the disk encrypted when the file has a key.
+struct SpillSink { file: File, cipher: Option<(SpillKey, SpillCipher)> }
+
+impl Write for SpillSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some((_, cipher)) = &mut self.cipher else { return self.file.write(bytes) };
+        let mut chunk = [0; SEAL_CHUNK_BYTES];
+        let length = bytes.len().min(SEAL_CHUNK_BYTES);
+        chunk[..length].copy_from_slice(&bytes[..length]);
+        cipher.try_apply_keystream(&mut chunk[..length]).map_err(|_| keystream_exhausted())?;
+        // A partial write would leave the keystream ahead of the file, so the chunk is written whole or not at all.
+        self.file.write_all(&chunk[..length])?;
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { self.file.flush() }
+}
+
+impl Seek for SpillSink {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let offset = self.file.seek(position)?;
+        if let Some((key, cipher)) = &mut self.cipher { *cipher = key.cipher_at(offset)?; }
+        Ok(offset)
+    }
+}
+
+/// A spill file as one of its readers sees it, decrypting what it reads when the file has a key.
+struct SpillSource { file: File, cipher: Option<(SpillKey, SpillCipher)> }
+
+impl Read for SpillSource {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(bytes)?;
+        if let Some((_, cipher)) = &mut self.cipher { cipher.try_apply_keystream(&mut bytes[..read]).map_err(|_| keystream_exhausted())?; }
+        Ok(read)
+    }
+}
+
+impl Seek for SpillSource {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let offset = self.file.seek(position)?;
+        if let Some((key, cipher)) = &mut self.cipher { *cipher = key.cipher_at(offset)?; }
+        Ok(offset)
+    }
+}
+
 /// A query's spill files, in a directory created by the first of them: most queries never spill.
-pub(crate) struct SpillRegion { directory: std::sync::OnceLock<TempDir>, limit: u64, retained: AtomicU64, peak: AtomicU64 }
+pub(crate) struct SpillRegion { directory: std::sync::OnceLock<TempDir>, limit: u64, sealing: SpillSealing, retained: AtomicU64, peak: AtomicU64 }
 impl SpillRegion {
-    pub fn new(limit: u64) -> Result<Self> { Ok(Self { directory: std::sync::OnceLock::new(), limit, retained: AtomicU64::new(0), peak: AtomicU64::new(0) }) }
+    /// Spill files that hold their rows as written.
+    pub fn new(limit: u64) -> Result<Self> { Ok(Self::with_sealing(limit, SpillSealing::Plain)) }
+    /// Spill files each encrypted under a key only this region's memory holds; see [`SpillSealing::Sealed`].
+    pub fn sealed(limit: u64) -> Result<Self> { Ok(Self::with_sealing(limit, SpillSealing::Sealed)) }
+    fn with_sealing(limit: u64, sealing: SpillSealing) -> Self {
+        Self { directory: std::sync::OnceLock::new(), limit, sealing, retained: AtomicU64::new(0), peak: AtomicU64::new(0) }
+    }
     fn directory(&self) -> Result<&std::path::Path> {
         if let Some(directory) = self.directory.get() { return Ok(directory.path()); }
         let created = TempDir::new().map_err(io_error)?;
@@ -36,29 +128,39 @@ impl SpillRegion {
     pub fn peak_bytes(&self) -> u64 { self.peak.load(Ordering::Relaxed) }
     fn reserve(&self, bytes: u64) -> Result<()> {
         let old = self.retained.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(bytes).filter(|next| *next <= self.limit))
-            .map_err(|_| invalid("spill-limit", "Query spill byte limit exceeded"))?;
+            .map_err(|_| spill_limit("Query spill byte limit exceeded"))?;
         self.peak.fetch_max(old + bytes, Ordering::Relaxed);
         Ok(())
     }
     pub fn create(self: &Arc<Self>) -> Result<SpillWriter> {
-        if self.limit == 0 { return Err(invalid("spill-limit", "Query spilling is disabled")); }
+        if self.limit == 0 { return Err(spill_limit("Query spilling is disabled")); }
+        let key = match self.sealing { SpillSealing::Plain => None, SpillSealing::Sealed => Some(SpillKey::generate()?) };
         let (file, path) = NamedTempFile::new_in(self.directory()?).map_err(io_error)?.into_parts();
-        Ok(SpillWriter { file: BufWriter::with_capacity(WRITER_BUFFER_BYTES, file), position: 0, retained: Arc::new(SpillFile { path, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
+        let cipher = key.map(|key| key.cipher_at(0).map(|cipher| (key, cipher))).transpose().map_err(io_error)?;
+        let sink = SpillSink { file, cipher };
+        Ok(SpillWriter { file: BufWriter::with_capacity(WRITER_BUFFER_BYTES, sink), position: 0, retained: Arc::new(SpillFile { path, key, region: Arc::clone(self), bytes: AtomicU64::new(0) }) })
     }
 }
 
-pub(crate) struct SpillFile { path: TempPath, region: Arc<SpillRegion>, bytes: AtomicU64 }
+/// The spill quota refusing more bytes: SQLSTATE 53400, which PostgreSQL reports when a query's temporary files
+/// exceed `temp_file_limit`.
+fn spill_limit(message: &str) -> rtdb_types::Anomaly {
+    invalid("spill-limit", message).with_kind(rtdb_types::AnomalyKind::ResourceExhausted).with_context("sql-state", "53400".into())
+}
+
+pub(crate) struct SpillFile { path: TempPath, key: Option<SpillKey>, region: Arc<SpillRegion>, bytes: AtomicU64 }
 impl Drop for SpillFile {
     fn drop(&mut self) { self.region.retained.fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::AcqRel); }
 }
 impl SpillFile {
     pub fn reader(self: &Arc<Self>, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
         let file = File::open(&self.path).map_err(io_error)?;
-        Ok(SpillReader { file: BufReader::new(file), retained: Arc::clone(self), memory })
+        let cipher = self.key.map(|key| key.cipher_at(0).map(|cipher| (key, cipher))).transpose().map_err(io_error)?;
+        Ok(SpillReader { file: BufReader::new(SpillSource { file, cipher }), retained: Arc::clone(self), memory })
     }
 }
 
-pub(crate) struct SpillWriter { file: BufWriter<File>, position: u64, retained: Arc<SpillFile> }
+pub(crate) struct SpillWriter { file: BufWriter<SpillSink>, position: u64, retained: Arc<SpillFile> }
 impl SpillWriter {
     pub fn position(&mut self) -> Result<u64> { Ok(self.position) }
     pub fn write_frame(&mut self, bytes: &[u8]) -> Result<()> {
@@ -75,7 +177,7 @@ impl SpillWriter {
     }
 
     fn write_frame_with(
-        &mut self, marker: Option<u8>, length: u64, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+        &mut self, marker: Option<u8>, length: u64, write: impl FnOnce(&mut BufWriter<SpillSink>) -> Result<()>,
     ) -> Result<()> {
         let count = length.checked_add(8 + if marker.is_some() { 9 } else { 0 })
             .ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
@@ -199,7 +301,7 @@ impl SpillWriter {
     pub fn discard_from(&mut self, offset: u64) -> Result<()> {
         let bytes = self.position.checked_sub(offset).ok_or_else(|| invalid("invalid-spill", "Spill rollback exceeds its file"))?;
         self.file.flush().map_err(io_error)?;
-        self.file.get_ref().set_len(offset).map_err(io_error)?;
+        self.file.get_ref().file.set_len(offset).map_err(io_error)?;
         self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
         self.position = offset;
         self.retained.bytes.fetch_sub(bytes, Ordering::Relaxed);
@@ -221,7 +323,7 @@ fn exact_spill_spans(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<
     }
 }
 
-pub(crate) struct SpillReader { file: BufReader<File>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
+pub(crate) struct SpillReader { file: BufReader<SpillSource>, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
 impl SpillReader {
     pub fn seek(&mut self, offset: u64) -> Result<()> {
         if offset > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill","Spill offset exceeds its file")); }
@@ -858,4 +960,49 @@ fn malformed_spill_fragments_keep_the_decoder_error() {
     let error = reader.read_columns(1).err().unwrap();
     assert_eq!(error.code, "rtdb.query/fragment-decode");
     assert!(error.message.as_deref().unwrap().contains("fragment frame is truncated"));
+}
+
+#[test]
+fn sealed_spill_files_hold_no_readable_rows_and_replay_from_any_offset() {
+    let memory = MemoryBudget::new(1 << 20);
+    let secret = b"an erased row's payload, which must not reach the disk in the clear".to_vec();
+    let long = vec![7; SEAL_CHUNK_BYTES * 2 + 3];
+    let mut ciphertexts = Vec::new();
+    for (region, readable) in [(SpillRegion::new(1 << 16).unwrap(), true), (SpillRegion::sealed(1 << 16).unwrap(), false), (SpillRegion::sealed(1 << 16).unwrap(), false)] {
+        let spill = Arc::new(region);
+        let mut writer = spill.create().unwrap();
+        writer.write_frame(b"first").unwrap();
+        let start = writer.position().unwrap();
+        writer.write_frame(&secret).unwrap();
+        let rollback = writer.position().unwrap();
+        writer.write_frame(b"rolled back").unwrap();
+        writer.discard_from(rollback).unwrap();
+        writer.write_frame(&long).unwrap();
+        let file = writer.finish().unwrap();
+        let raw = std::fs::read(&*file.path).unwrap();
+        assert_eq!(raw.len() as u64, spill.retained_bytes(), "sealing keeps every frame's length");
+        assert_eq!(raw.windows(secret.len()).any(|window| window == secret.as_slice()), readable);
+        if !readable { ciphertexts.push(raw); }
+        let mut reader = file.reader(Arc::clone(&memory)).unwrap();
+        reader.seek(start).unwrap();
+        assert_eq!(reader.read_frame(1).unwrap().unwrap().0, secret);
+        assert_eq!(reader.read_frame(1).unwrap().unwrap().0, long);
+        assert!(reader.read_frame(1).unwrap().is_none());
+        reader.rewind().unwrap();
+        assert_eq!(reader.read_frame(1).unwrap().unwrap().0, b"first".to_vec());
+        drop((reader, file));
+        assert_eq!(spill.retained_bytes(), 0);
+    }
+    assert_ne!(ciphertexts[0], ciphertexts[1], "each sealed file has its own key");
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn a_refused_spill_reports_an_exhausted_temporary_file_limit() {
+    for spill in [SpillRegion::new(0).unwrap(), SpillRegion::sealed(0).unwrap()] {
+        let error = Arc::new(spill).create().err().unwrap();
+        assert_eq!(error.code, "rtdb.query/spill-limit");
+        assert!(error.is(rtdb_types::AnomalyKind::ResourceExhausted));
+        assert_eq!(error.context.get("sql-state").and_then(serde_json::Value::as_str), Some("53400"));
+    }
 }
