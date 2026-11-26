@@ -976,12 +976,11 @@ impl Node {
         let payload = source.encode()?.into_bytes();
         drop(source);
         if let Some(reading) = prepared_clock {
-            let delay = reading.0.saturating_sub(self.now().0);
-            if delay > 1_000_000 {
-                return Err(Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"));
-            }
-            if delay > 0 {
-                let wait = tokio::time::sleep(std::time::Duration::from_micros(delay as u64));
+            let delay = rtdb_tx::clock_slot_wait(reading, self.now()).ok_or_else(|| {
+                Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable")
+            })?;
+            if !delay.is_zero() {
+                let wait = tokio::time::sleep(delay);
                 cancellation.run_until_cancelled(wait).await.ok_or_else(cancelled)?;
             }
         }

@@ -70,7 +70,19 @@ const CLOCK_SLOT_WIDTH: i64 = 1_000_000;
 const CLOCK_SLOT_LEAD: i64 = 500_000;
 
 #[cfg(not(verus_keep_ghost))]
-pub const MAX_CLOCK_SLOT_WAIT_MICROS: i64 = CLOCK_SLOT_WIDTH + CLOCK_SLOT_LEAD;
+/// `next_grid_reading` places a slot's reading in `[observed + LEAD, observed + LEAD + WIDTH)`.
+const MAX_CLOCK_SLOT_WAIT_MICROS: i64 = CLOCK_SLOT_WIDTH + CLOCK_SLOT_LEAD;
+
+/// The one rule every submit path applies before appending a transaction that
+/// consumes an offered clock slot: how long to wait for the local clock to
+/// reach `reading`, or `None` when the reading lies further ahead than any
+/// slot this node issues.
+#[cfg(not(verus_keep_ghost))]
+pub fn clock_slot_wait(reading: rtdb_types::Timestamp, now: rtdb_types::Timestamp) -> Option<std::time::Duration> {
+    let delay = reading.0.saturating_sub(now.0);
+    if delay > MAX_CLOCK_SLOT_WAIT_MICROS { return None; }
+    Some(std::time::Duration::from_micros(delay.max(0) as u64))
+}
 
 #[cfg(not(verus_keep_ghost))]
 pub fn clock_slot_reading(observed: rtdb_types::Timestamp) -> Option<rtdb_types::Timestamp> {
@@ -195,7 +207,22 @@ mod tests {
     use rtdb_types::{Timestamp, TransactionKey, TxId};
 
     use crate::{DecisionObservation, OwnedClockSlot};
-    use super::{clock_slot_reading, clock_slot_time};
+    use super::{clock_slot_reading, clock_slot_time, clock_slot_wait};
+
+    #[test]
+    fn clock_slot_wait_admits_every_reading_a_slot_can_offer() {
+        let now = Timestamp(10_000_000);
+        let ahead = |micros: i64| Timestamp(now.0 + micros);
+        assert_eq!(clock_slot_wait(ahead(1_200_000), now), Some(std::time::Duration::from_millis(1_200)));
+        assert_eq!(clock_slot_wait(ahead(1_500_000), now), Some(std::time::Duration::from_millis(1_500)));
+        assert_eq!(clock_slot_wait(ahead(1_500_001), now), None);
+        assert_eq!(clock_slot_wait(ahead(0), now), Some(std::time::Duration::ZERO));
+        assert_eq!(clock_slot_wait(ahead(-5), now), Some(std::time::Duration::ZERO));
+        for observed in [0, 1, 499_999, 500_000, 500_001, 999_999, 7_654_321] {
+            let reading = clock_slot_reading(Timestamp(observed)).unwrap();
+            assert!(clock_slot_wait(reading, Timestamp(observed)).is_some(), "{observed}");
+        }
+    }
 
     #[test]
     fn clock_slot_tests_position_and_independent_half_open_window() {

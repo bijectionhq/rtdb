@@ -12,7 +12,7 @@ mod bounded_retry;
 mod resolver;
 mod system_time;
 #[cfg(not(verus_keep_ghost))]
-pub use system_time::{clock_slot_reading, MAX_CLOCK_SLOT_WAIT_MICROS};
+pub use system_time::{clock_slot_reading, clock_slot_wait};
 mod replica;
 mod submission;
 mod inspection;

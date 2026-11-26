@@ -1512,12 +1512,9 @@ impl Service {
     }
 
     async fn wait_for_clock_slot(&self, call: &Call, slot: OwnedClockSlot) -> Result<(), Status> {
-        let delay = slot.reading.0.saturating_sub(self.0.node.now().0);
-        if delay > rtdb_tx::MAX_CLOCK_SLOT_WAIT_MICROS {
-            return Err(Self::clock_slot_missed());
-        }
-        if delay > 0 {
-            let wait = tokio::time::sleep(std::time::Duration::from_micros(delay as u64));
+        let delay = rtdb_tx::clock_slot_wait(slot.reading, self.0.node.now()).ok_or_else(Self::clock_slot_missed)?;
+        if !delay.is_zero() {
+            let wait = tokio::time::sleep(delay);
             call.cancellation.run_until_cancelled(wait).await
                 .ok_or_else(|| Status::cancelled("The ordered clock slot was cancelled"))?;
         }
