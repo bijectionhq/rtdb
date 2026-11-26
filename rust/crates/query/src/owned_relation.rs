@@ -711,7 +711,7 @@ pub async fn open_owned_unique_window(
     key: Option<&[u8]>,
     valid: Interval,
     system: Timestamp,
-    mask: Option<(Timestamp, u32)>,
+    mask: Option<(TransactionKey, u32)>,
     fetch: usize,
 ) -> Result<Option<QueryCursor>> {
     if !relation.is_root_data() {

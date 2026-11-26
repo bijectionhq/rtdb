@@ -3629,8 +3629,8 @@ mod tests {
         }
         for (key, mask, expected) in [
             (Some([2u8].as_slice()), None, vec![]),
-            (Some([2u8].as_slice()), Some((Timestamp(100), 2)), vec![(10, 20, vec![2])]),
-            (None, Some((Timestamp(100), 2)), vec![(5, 10, vec![1]), (10, 20, vec![2]), (20, 28, vec![4])]),
+            (Some([2u8].as_slice()), Some((TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) }, 2)), vec![(10, 20, vec![2])]),
+            (None, Some((TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) }, 2)), vec![(5, 10, vec![1]), (10, 20, vec![2]), (20, 28, vec![4])]),
         ] {
             let mut cursor = crate::open_owned_unique_window(
                 Arc::clone(&context), "alice", &relation, "k", key,

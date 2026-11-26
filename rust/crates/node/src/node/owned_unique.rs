@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_query::OwnedUniqueHit;
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, OwnedRelation, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, Interval, OwnedRelation, Result, Timestamp, TransactionKey};
 
 use super::{OwnedRangeWitness, OwnedReadSession};
 
@@ -64,7 +64,7 @@ impl OwnedReadSession {
         key: Option<&[u8]>,
         valid: Interval,
         system: Timestamp,
-        mask: Option<(Timestamp, u32)>,
+        mask: Option<(TransactionKey, u32)>,
         limit: usize,
     ) -> Result<(Vec<rtdb_columnar::OwnedBatch>, String, Option<OwnedRangeWitness>)> {
         let unavailable = || Anomaly::new(
@@ -76,9 +76,9 @@ impl OwnedReadSession {
             return Err(unavailable());
         }
         let at_head = self.admit_root_system(relation, system).await?;
-        let retained = mask.map_or(system, |(commit, _)| system.min(commit));
+        let retained = mask.map_or(system, |(commit, _)| system.min(commit.system_time));
         if let Some((commit, _)) = mask {
-            if commit > self.present.system_time { return Err(unavailable()); }
+            if commit.system_time > self.present.system_time { return Err(unavailable()); }
             self.certify_historical_cut(relation, retained).await?;
         }
         let guard = self.relation_release_guard([relation])?;
