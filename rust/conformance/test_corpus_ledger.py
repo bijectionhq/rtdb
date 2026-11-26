@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from corpus_ledger import build, canonical_var
+from corpus_summary import Exclusions
 from runtime_inventory import read_plan, reconcile
 
 CONFIGURATION = "corpus:native-release"
@@ -40,6 +41,12 @@ CORPUS = [{"var": "xtdb.a-test/passes", "ns": "xtdb.a-test", "result": "pass"},
           {"var": "xtdb.kafka-test/streams", "ns": "xtdb.kafka-test", "result": "pass"}]
 
 
+EXCLUSIONS = Exclusions({
+    "decisions": {"not-a-jvm-node": {"outcome": "jvm-api-boundary", "decision": "the binding's node is not an xtdb.api.Xtdb",
+                                     "match": [r"cannot be cast to class xtdb\.api\.Xtdb\b"]}},
+    "vars": [{"var": "xtdb.a-test/reaches-the-jvm", "decision": "not-a-jvm-node"}]})
+
+
 def runtime_fixture(directory):
     directory = Path(directory)
     descriptors = [clojure_descriptor("xtdb.a-test/passes"), clojure_descriptor("xtdb.a-test/fails"),
@@ -64,7 +71,7 @@ def runtime_fixture(directory):
 class CorpusLedgerTests(unittest.TestCase):
     def generate(self, directory):
         cases, reference = runtime_fixture(directory)
-        return build(SOURCE, cases, CORPUS, CONFIGURATION, reference, "corpus-revision")
+        return build(SOURCE, cases, CORPUS, CONFIGURATION, reference, "corpus-revision", EXCLUSIONS)
 
     def test_namespace_metadata_does_not_hide_a_var(self):
         self.assertEqual(canonical_var(SOURCE["candidates"][3]), "xtdb.kafka-test/streams")
@@ -75,7 +82,8 @@ class CorpusLedgerTests(unittest.TestCase):
         by_name = {case["identity"]["qualified_name"]: case for case in ledger["cases"]}
         self.assertEqual(by_name["xtdb.a-test/passes"]["counterparts"], ["corpus:xtdb.a-test/passes"])
         self.assertEqual(by_name["xtdb.a-test/fails"]["counterparts"], ["corpus:xtdb.a-test/fails"])
-        self.assertEqual(by_name["xtdb.a-test/reaches-the-jvm"]["classification"]["kind"], "jvm-api-boundary")
+        self.assertEqual(by_name["xtdb.a-test/reaches-the-jvm"]["classification"],
+                         {"kind": "jvm-api-boundary", "reason": "the binding's node is not an xtdb.api.Xtdb"})
         self.assertEqual(by_name["xtdb.StorageTest.lists"]["classification"]["kind"], "engine-internal")
         self.assertEqual(by_name["^:kafka/streams"]["counterparts"], ["corpus:xtdb.kafka-test/streams"])
         self.assertEqual(len(invocations), 5)
@@ -99,7 +107,7 @@ class CorpusLedgerTests(unittest.TestCase):
         redefined = dict(SOURCE, candidates=SOURCE["candidates"] + [dict(candidate("clojure_var_candidate", "src/test/clojure/xtdb/a_test.clj", "xtdb.a-test/passes"), id="again")])
         with tempfile.TemporaryDirectory() as directory:
             cases, reference = runtime_fixture(directory)
-            ledger, invocations, aliases, native, counts = build(redefined, cases, CORPUS, CONFIGURATION, reference, "corpus-revision")
+            ledger, invocations, aliases, native, counts = build(redefined, cases, CORPUS, CONFIGURATION, reference, "corpus-revision", EXCLUSIONS)
             for test in native["tests"]:
                 test["outcome"] = "pass"
             report = reconcile(redefined, ledger, Path(directory), native, aliases, invocations)

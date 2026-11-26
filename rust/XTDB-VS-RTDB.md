@@ -23,6 +23,10 @@ Both engines skip exactly the same assertions, so the runner reports these as mi
 
 The corpus runner loads every XTDB Clojure test namespace and runs it against the native engine through its JVM binding.
 
+**These numbers do not measure upstream conformance and are superseded until the corpus is re-run** (`rust/conformance/README.adoc`, "Native corpus").
+The run behind them loaded this repository's copies of the tests, whose assertions RTDB edited, kept only each Var's first failure, and excused failing Vars by pattern rather than from a reviewed list.
+The runner now loads upstream XTDB's own test sources and fixtures at the pinned commit, records every failure, excuses a Var only through `rust/conformance/corpus-exclusions.json`, and reports native-free passes as `pass-jvm-only` rather than as not applicable.
+
 | Outcome | Tests |
 | --- | ---: |
 | Pass | 935 |

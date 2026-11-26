@@ -1,5 +1,7 @@
 (ns xtdb.rust.corpus
-  "Runs original XTDB test Vars against the native engine and records one outcome per Var."
+  "Runs upstream XTDB's own test Vars against the native engine and records one outcome, and every failure, per Var.
+   The test sources, test resources and xtdb.test-util come from the tree rust/conformance/upstream_tests.sh extracts
+   at the pinned upstream commit, which the runner puts ahead of this repository's edited copies on the classpath."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :as t]
@@ -35,6 +37,20 @@
        (map #(file->ns root %))
        sort))
 
+(defn source-file
+  "The file `ns-sym` loads from, when the classpath resolves its source to a plain file."
+  ^File [ns-sym]
+  (let [path (str (-> (name ns-sym) (str/replace "-" "_") (str/replace "." "/")) ".clj")]
+    (when-let [url (io/resource path)]
+      (when (= "file" (.getProtocol url))
+        (.getCanonicalFile (io/file (.toURI url)))))))
+
+(defn loads-from?
+  "Whether `ns-sym`'s source resolves to a file under `root`."
+  [^File root ns-sym]
+  (boolean (when-let [file (source-file ns-sym)]
+             (.startsWith ^Path (.toPath file) ^Path (.toPath (.getCanonicalFile root))))))
+
 (defn- truncate [s n]
   (let [s (str s)] (if (> (count s) n) (str (subs s 0 n) "…") s)))
 
@@ -56,7 +72,7 @@
     (pos? fail) "fail"
     (and (pos? pass) native) "pass"
     (and (pos? pass) wire) "pass-wire"
-    (pos? pass) "jvm-internal"
+    (pos? pass) "pass-jvm-only"
     :else "no-assertions"))
 
 
@@ -188,8 +204,11 @@
                                      (if (instance? NativeDatabase node)
                                        (.syncAll ^NativeDatabase node timeout)
                                        (jvm-sync-node node timeout))))]
-    (binding [tu/*query-ra-executor* (observing :native native-query-ra)
-              tu/*flush-block-executor* (fn [^NativeDatabase node timeout] (.flushAll node timeout))]
+    (with-redefs [tu/query-ra (let [run (observing :native native-query-ra)]
+                                (fn ([query] (run query {}))
+                                    ([query options] (run query options))))
+                  tu/flush-block! (fn ([^NativeDatabase node] (.flushAll node (Duration/ofSeconds 5)))
+                                      ([^NativeDatabase node timeout] (.flushAll node timeout)))]
       (with-root #'tu/connectables native-connectables f))))
 
 (defn- port-fixture [port-var server-var]
@@ -218,15 +237,17 @@
         each (t/join-fixtures (native-fixtures (::t/each-fixtures fixtures)))]
     (once #(tu/with-allocator (fn [] (each (:test (meta v))))))))
 
+(def ^:private max-recorded-failures 200)
+
 (defn run-var [v timeout-ms]
   (let [counts (atom {:pass 0 :fail 0 :error 0})
-        first-problem (atom nil)
+        problems (atom [])
         thrown (atom nil)
         report (fn [{:keys [type] :as m}]
                  (case type
                    :pass (swap! counts update :pass inc)
                    (:fail :error) (do (swap! counts update type inc)
-                                      (compare-and-set! first-problem nil (describe m)))
+                                      (swap! problems #(cond-> % (< (count %) max-recorded-failures) (conj (describe m)))))
                    nil))
         started (System/nanoTime)
         _ (reset! touched {})
@@ -244,22 +265,28 @@
       (future-cancel task)
       (let [closing (future (doseq [^NativeDatabase node @open-nodes] (try (.close node) (catch Throwable _))))]
         (deref closing 30000 nil)))
-    (let [result (classify @counts @thrown timed-out? @touched)]
+    (let [result (classify @counts @thrown timed-out? @touched)
+          {:keys [fail error]} @counts
+          problems (or (not-empty @problems) (some-> @thrown ex-message vector))]
       (merge {:var (str (symbol v))
               :result result
               :millis (.toMillis TimeUnit/NANOSECONDS (- (System/nanoTime) started))}
              @counts
-             (when-let [problem (or @first-problem (some-> @thrown ex-message))]
-               (when-not (= result "pass") {:detail problem}))))))
+             (when (and problems (not= result "pass"))
+               (cond-> {:detail (first problems) :failures problems}
+                 (> (+ fail error) (count problems)) (assoc :failures-truncated true)))))))
 
 (defn- test-vars [ns-sym]
   (->> (ns-interns ns-sym) vals (filter (comp :test meta)) (sort-by (comp :line meta))))
 
 (defn run-namespace
-  "`ns-sym` names a namespace, or a single test Var as `ns/var`."
-  [ns-sym timeout-ms]
+  "`ns-sym` names a namespace, or a single test Var as `ns/var`, whose source must load from `root`."
+  [^File root ns-sym timeout-ms]
   (try
-    (require (symbol (or (namespace ns-sym) (name ns-sym))) :reload)
+    (let [test-ns (symbol (or (namespace ns-sym) (name ns-sym)))]
+      (when-not (loads-from? root test-ns)
+        (throw (ex-info (str "the test namespace's source resolves outside the upstream corpus root " root ": " (source-file test-ns)) {})))
+      (require test-ns :reload))
     (vec (for [v (if (namespace ns-sym) [(resolve ns-sym)] (test-vars ns-sym))]
            (if (:integration (meta v))
              {:var (str (symbol v)) :result "skipped-integration"}
@@ -267,8 +294,21 @@
     (catch Throwable e
       [{:var (str ns-sym) :result "load-error" :detail (truncate (ex-message e) 2000)}])))
 
+(defn- required-dir ^File [property]
+  (let [dir (some-> (System/getProperty property) io/file)]
+    (when-not (and dir (.isDirectory ^File dir))
+      (binding [*out* *err*]
+        (println (str "corpus needs -D" property " naming a tree from rust/conformance/upstream_tests.sh; use rust/conformance/run_corpus.sh")))
+      (System/exit 2))
+    dir))
+
 (defn -main [& namespaces]
-  (let [root (io/file (System/getProperty "xtdb.corpus.root"))
+  (let [root (required-dir "xtdb.corpus.root")
+        fixtures-root (required-dir "xtdb.corpus.fixtures-root")
+        _ (when-not (loads-from? fixtures-root 'xtdb.test-util)
+            (binding [*out* *err*]
+              (println "xtdb.test-util loaded from" (str (source-file 'xtdb.test-util)) "rather than the upstream fixtures under" (str fixtures-root)))
+            (System/exit 2))
         out (io/file (System/getProperty "xtdb.corpus.out" "build/corpus/results.jsonl"))
         timeout-ms (Long/parseLong (System/getProperty "xtdb.corpus.timeout-ms" "120000"))
         namespaces (if (seq namespaces) (map symbol namespaces) (test-namespaces root))
@@ -277,7 +317,7 @@
     (with-open [w (io/writer out :append (Boolean/getBoolean "xtdb.corpus.append"))]
       (with-native-engine
         #(doseq [ns-sym namespaces
-              row (run-namespace ns-sym timeout-ms)]
+              row (run-namespace root ns-sym timeout-ms)]
         (swap! totals update (:result row) (fnil inc 0))
         (.write w (json/write-value-as-string (assoc row :ns (str ns-sym))))
         (.write w "\n")

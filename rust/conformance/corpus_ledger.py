@@ -18,12 +18,8 @@ import corpus_summary  # noqa: E402
 import runtime_inventory  # noqa: E402
 
 CLASSIFIED_OUTCOMES = {"jvm-api-boundary": "jvm-api-boundary", "jvm-internal": "jvm-internal",
-                       "environment-unavailable": "environment-unavailable"}
-CORPUS_REASONS = {
-    "jvm-api-boundary": "the corpus run reaches a JVM-only API (node system map, database catalog or a JVM type cast)",
-    "jvm-internal": "the corpus run's assertions observe JVM implementation state or depend on redefining JVM vars",
-    "environment-unavailable": "the corpus run needs cloud CLIs, credentials, endpoints or a Docker build context absent from this lane",
-}
+                       "environment-unavailable": "environment-unavailable", "pass-jvm-only": "jvm-internal"}
+PASS_JVM_ONLY_REASON = "the Var passes without reaching a native entry point, so it is no evidence about the native engine"
 PARAMETER_FIXTURE = "none"
 REFERENCE_CONFIGURATION = "reference-pinned"
 CLASS_DECLARATION = re.compile(r"\bclass\s+(\w+)\b[^{;]*?(?::\s*([A-Za-z_][\w.]*)\s*\(|\bextends\s+([A-Za-z_][\w.]*))", re.S)
@@ -102,11 +98,22 @@ def alias_for(name, candidates_by_name, junit_by_method, parents):
     return None
 
 
-def build(source, runtime_cases, corpus_rows, native_configuration, reference_root, corpus_source_revision):
+def corpus_reason(row, outcome, exclusions):
+    """Why a classified corpus Var is not a counterpart: its exclusion's decision, or that it passed without native code."""
+    if outcome == "pass-jvm-only":
+        return PASS_JVM_ONLY_REASON
+    return exclusions.decisions[exclusions.vars[row["var"]]["decision"]][0]["decision"]
+
+
+def build(source, runtime_cases, corpus_rows, native_configuration, reference_root, corpus_source_revision, exclusions=None):
     reference = source["reference"]
+    exclusions = exclusions or corpus_summary.EXCLUSIONS
     corpus = {}
     for row in corpus_rows:
-        corpus[row["var"]] = {"outcome": corpus_summary.outcome(row), "detail": (row.get("detail") or "")[:500]}
+        outcome = corpus_summary.outcome(row, exclusions)
+        corpus[row["var"]] = {"outcome": outcome, "detail": (row.get("detail") or "")[:500]}
+        if outcome in CLASSIFIED_OUTCOMES:
+            corpus[row["var"]]["reason"] = corpus_reason(row, outcome, exclusions)
     candidates_by_name = defaultdict(list)
     junit_by_method = defaultdict(list)
     meta_named = {}
@@ -137,7 +144,7 @@ def build(source, runtime_cases, corpus_rows, native_configuration, reference_ro
                 continue
             kind = CLASSIFIED_OUTCOMES.get(native["outcome"])
             if kind:
-                cases.append({"identity": identity, "counterparts": [], "classification": {"kind": kind, "reason": CORPUS_REASONS[kind]}})
+                cases.append({"identity": identity, "counterparts": [], "classification": {"kind": kind, "reason": native["reason"]}})
             else:
                 cases.append({"identity": identity, "counterparts": ["corpus:" + var]})
             continue

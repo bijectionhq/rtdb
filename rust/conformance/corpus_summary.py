@@ -1,18 +1,11 @@
-"""Summarises native corpus results: totals per outcome and the largest failure clusters.
+"""Summarises native corpus results: totals per outcome, the explicit exclusions applied, and the largest failure clusters.
 
-Errors raised because a test reaches a JVM-only API (a cast to xtdb.api.Xtdb, NodeBase or the database catalog)
-are reported as jvm-api-boundary: the binding documents those types as a migration boundary, so such Vars
-cannot run natively without changing the original test. So are Vars that read the JVM node's system map for a port
-(their URL has an empty port) or its pgwire server's state atom and connection futures, plan a logical operator the
-test itself defines on the JVM, or configure the
-test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials, real cloud endpoints or a Docker build context report
-environment-unavailable. A failed assertion on the spills a test counts by redefining the JVM's temporary-directory
-function observes JVM operator internals, so it reports jvm-internal, as do the Vars in JVM_INTERNAL_VARS, whose
-assertions hold only through a with-redefs of a JVM implementation var, and a metrics assertion missing only
-JVM-runtime or child-allocator gauges.
-A block-catalog comparison whose expected and actual maps differ only in a data file's byte size reports
-jvm-layout: the reference's union vectors keep a default in their first leg under a null struct depending on how
-its row copiers moved the row, a layout the native writer does not reproduce, and every cell reads back the same.
+A Var that failed counts as a failure unless `corpus-exclusions.json` lists it and every failure the corpus recorded for it
+satisfies the match of the entry's decision (a Var with more failures than the runner records is never excused); each decision names the RTDB feature or decision that justifies it.
+There is no pattern that excuses a Var the list does not name, and one unexcused failure is enough for the Var to count.
+A Var that passed without reaching a native entry point is `pass-jvm-only`: it is neither a failure nor native evidence.
+The summary also names the test sources the run loaded (the pinned upstream commit `upstream_tests.sh` extracted), entries that
+no longer apply (stale) and entries a recorded failure fell outside (uncovered), so the list is re-reviewed after each run.
 """
 
 import argparse
@@ -21,29 +14,17 @@ import json
 import pathlib
 import re
 
-BOUNDARY = re.compile(
-    r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|Cannot invoke \"xtdb\.database\.DatabaseCatalog\.|"
-    r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)|"
-    r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
-    r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog|"
-    r"plans a logical operator it defines on the JVM|Unknown object store configuration tag '!InMemory'|"
-    r"jdbc:(postgresql|xtdb)://localhost:/|"
-    r'Cannot invoke "clojure\.lang\.IAtom\.swap\(.*because "atom" is null|Cannot invoke "java\.util\.concurrent\.Future\.get\(\)" because "fut" is null')
-ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|working dir should be core2 root \(with Dockerfile\)|Unable to load credentials from any of the providers|'
-                         r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
-JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
-# Vars whose assertions hold only through a with-redefs of a JVM implementation var, which the native engine never reads.
-JVM_INTERNAL_VARS = {
-    "xtdb.pgwire-test/canned-response-test": "redefines xtdb.pgwire/canned-responses",
-    "xtdb.pgwire-test/close-drains-active-extended-queries-before-stopping-test": "counts its latch down from a redefined xtdb.pgwire/parse-sql",
-    "xtdb.pgwire-test/psql-interactive-test": "redefines xtdb.pgwire/cmd-exec-query; later reads see the native results of those statements",
-}
-# Gauges of the JVM runtime and of Arrow Java's child-allocator tree; a metric assertion missing only these is jvm-internal.
-JVM_ONLY_METRICS = {"jvm.memory.used", "xtdb.allocator.memory.allocated"}
-MISSING_METRICS = re.compile(r'actual: \(not \(empty\? #\{([^}]*)\}\)\)')
+HERE = pathlib.Path(__file__).resolve().parent
+EXCLUSIONS_PATH = HERE / "corpus-exclusions.json"
+EXCLUDED_OUTCOMES = {"jvm-api-boundary", "jvm-internal", "environment-unavailable", "jvm-layout"}
+FAILED_RESULTS = {"error", "fail"}
+PASSED_RESULTS = {"pass", "pass-wire", "pass-jvm-only", "no-assertions"}
+UNSUCCESSFUL = {"error", "fail", "timeout", "process-crash", "load-error"}
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
-
+# Gauges of the JVM runtime and of Arrow Java's child-allocator tree.
+JVM_ONLY_METRICS = {"jvm.memory.used", "xtdb.allocator.memory.allocated"}
+MISSING_METRICS = re.compile(r'actual: \(not \(empty\? #\{([^}]*)\}\)\)')
 DATA_FILE_SIZE = re.compile(r":data-file-size \d+")
 
 
@@ -65,23 +46,86 @@ def only_data_file_sizes_differ(detail):
     return False
 
 
-def outcome(row):
-    detail = row.get("detail") or ""
-    if row["result"] in ("error", "fail") and BOUNDARY.search(detail):
-        return "jvm-api-boundary"
-    if row["result"] in ("error", "fail") and ENVIRONMENT.search(detail):
-        return "environment-unavailable"
-    if row["result"] in ("error", "fail") and only_data_file_sizes_differ(detail):
-        return "jvm-layout"
-    if row["result"] == "fail" and JVM_INTERNAL.search(detail):
-        return "jvm-internal"
-    if row["result"] in ("error", "fail") and row["var"] in JVM_INTERNAL_VARS:
-        return "jvm-internal"
-    if row["result"] == "fail" and row["var"] == "xtdb.information-schema-test/test-metrics":
-        missing = [set(re.findall(r'"([^"]+)"', names)) for names in MISSING_METRICS.findall(detail)]
-        if missing and all(names <= JVM_ONLY_METRICS for names in missing):
-            return "jvm-internal"
-    return row["result"]
+def only_jvm_runtime_metrics_missing(detail):
+    """Whether a metrics assertion failed only because JVM-runtime or child-allocator gauges are absent."""
+    missing = [set(re.findall(r'"([^"]+)"', names)) for names in MISSING_METRICS.findall(detail)]
+    return bool(missing) and all(names <= JVM_ONLY_METRICS for names in missing)
+
+
+CHECKS = {
+    "block-catalog-differs-only-in-data-file-size": only_data_file_sizes_differ,
+    "missing-only-jvm-runtime-metrics": only_jvm_runtime_metrics_missing,
+    "any-failure": lambda detail: True,
+}
+
+
+class Exclusions:
+    """The reviewed exclusion list: decisions, and the Vars each one excuses."""
+
+    def __init__(self, document):
+        problems = []
+        self.decisions = {}
+        for name, decision in document.get("decisions", {}).items():
+            unknown = set(decision) - {"outcome", "decision", "match", "check"}
+            if unknown: problems.append(f"decision {name} has unknown keys {sorted(unknown)}")
+            if decision.get("outcome") not in EXCLUDED_OUTCOMES: problems.append(f"decision {name} has outcome {decision.get('outcome')!r}")
+            if not (decision.get("decision") or "").strip(): problems.append(f"decision {name} does not name its justification")
+            if ("match" in decision) == ("check" in decision): problems.append(f"decision {name} needs exactly one of match or check")
+            if "check" in decision and decision["check"] not in CHECKS: problems.append(f"decision {name} has unknown check {decision['check']!r}")
+            if "match" in decision and not decision["match"]: problems.append(f"decision {name} has an empty match")
+            matchers = [re.compile(pattern) for pattern in decision.get("match", [])]
+            self.decisions[name] = (decision, matchers)
+        self.vars = {}
+        for entry in document.get("vars", []):
+            var = entry.get("var")
+            unknown = set(entry) - {"var", "decision", "note"}
+            if unknown: problems.append(f"entry {var} has unknown keys {sorted(unknown)}")
+            if not var or "/" not in var: problems.append(f"entry {entry!r} does not name a Var as ns/var")
+            if entry.get("decision") not in self.decisions: problems.append(f"entry {var} names unknown decision {entry.get('decision')!r}")
+            if var in self.vars: problems.append(f"entry {var} is listed twice")
+            self.vars[var] = entry
+        if problems:
+            raise ValueError("invalid corpus exclusions:\n  " + "\n  ".join(problems))
+
+    def covers(self, var, failure):
+        decision, matchers = self.decisions[self.vars[var]["decision"]]
+        if "check" in decision:
+            return CHECKS[decision["check"]](failure)
+        return any(matcher.search(failure) for matcher in matchers)
+
+    def outcome_of(self, var):
+        return self.decisions[self.vars[var]["decision"]][0]["outcome"]
+
+
+def load_exclusions(path=EXCLUSIONS_PATH):
+    return Exclusions(json.loads(pathlib.Path(path).read_text(encoding="utf-8")))
+
+
+EXCLUSIONS = load_exclusions()
+
+
+def failures(row):
+    """Every failure the corpus recorded for a Var; rows from a runner that kept only the first carry it as `detail`."""
+    if "failures" in row:
+        return list(row["failures"])
+    return [row["detail"]] if row.get("detail") else []
+
+
+def uncovered_failures(row, exclusions=None):
+    """The recorded failures of a listed Var that its exclusion does not cover."""
+    exclusions = exclusions or EXCLUSIONS
+    return [failure for failure in failures(row) if not exclusions.covers(row["var"], failure)]
+
+
+def outcome(row, exclusions=None):
+    exclusions = exclusions or EXCLUSIONS
+    result = row["result"]
+    if result == "jvm-internal":
+        return "pass-jvm-only"  # a native-free pass, as the runner named it before pass-jvm-only
+    if (result in FAILED_RESULTS and row["var"] in exclusions.vars and failures(row) and not row.get("failures-truncated")
+            and not uncovered_failures(row, exclusions)):
+        return exclusions.outcome_of(row["var"])
+    return result
 
 
 def load(directory: pathlib.Path):
@@ -91,29 +135,72 @@ def load(directory: pathlib.Path):
                 yield json.loads(line)
 
 
-def summarise(rows):
+def upstream_commit_of(directory: pathlib.Path):
+    """The upstream commit whose test sources the run loaded, as upstream_tests.sh recorded it, or None."""
+    marker = directory / ".upstream-tests" / ".commit"
+    return marker.read_text(encoding="utf-8").strip() if marker.is_file() else None
+
+
+def summarise(rows, exclusions=None):
+    exclusions = exclusions or EXCLUSIONS
     totals = collections.Counter()
+    excluded = collections.Counter()
     clusters = collections.Counter()
     examples = {}
+    stale, uncovered, seen = [], [], set()
+    failure_count = legacy = 0
     for row in rows:
-        kind = outcome(row)
+        var = row["var"]
+        seen.add(var)
+        kind = outcome(row, exclusions)
         totals[kind] += 1
-        if kind in ("error", "fail", "timeout", "process-crash", "load-error"):
-            signature = NOISE.sub("#", (row.get("detail") or "")[:160])
-            clusters[(kind, signature)] += 1
-            examples.setdefault((kind, signature), row["var"])
-    return totals, clusters, examples
+        if row["result"] in FAILED_RESULTS and "failures" not in row:
+            legacy += 1
+        if kind in EXCLUDED_OUTCOMES and var in exclusions.vars:
+            excluded[exclusions.vars[var]["decision"]] += 1
+        elif var in exclusions.vars:
+            if row["result"] in PASSED_RESULTS or row["result"] == "jvm-internal":
+                stale.append(var)
+            elif row["result"] in FAILED_RESULTS:
+                missed = uncovered_failures(row, exclusions)
+                uncovered.append((var, len(missed), (missed or ["(no failure text recorded)"])[0][:300]))
+        if kind in UNSUCCESSFUL:
+            texts = failures(row) or [row.get("detail") or ""]
+            failure_count += len(texts)
+            for text in texts:
+                signature = NOISE.sub("#", text[:160])
+                clusters[(kind, signature)] += 1
+                examples.setdefault((kind, signature), var)
+    ran = {var.split("/")[0] for var in seen}
+    absent = sorted(var for var in exclusions.vars if var not in seen and var.split("/")[0] in ran)
+    return {"totals": totals, "excluded": excluded, "clusters": clusters, "examples": examples, "stale": sorted(stale),
+            "uncovered": sorted(uncovered), "absent": absent, "failure_count": failure_count, "legacy_rows": legacy}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=pathlib.Path)
     parser.add_argument("--clusters", type=int, default=40)
+    parser.add_argument("--exclusions", type=pathlib.Path, default=EXCLUSIONS_PATH)
     args = parser.parse_args(argv)
-    totals, clusters, examples = summarise(load(args.results))
-    print(json.dumps(dict(totals.most_common()), indent=1))
-    for (kind, signature), count in clusters.most_common(args.clusters):
-        print(f"{count:4d} {kind:13s} {examples[(kind, signature)]}\n     {signature}")
+    summary = summarise(load(args.results), load_exclusions(args.exclusions))
+    commit = upstream_commit_of(args.results)
+    print(f"test sources: upstream XTDB {commit}" if commit else
+          "test sources: UNKNOWN - this run did not load upstream_tests.sh's extraction, so it does not measure upstream conformance")
+    if summary["legacy_rows"]:
+        print(f"warning: {summary['legacy_rows']} failed Vars recorded only their first failure (results from the older runner)")
+    print(json.dumps(dict(summary["totals"].most_common()), indent=1))
+    print(f"failures recorded across unsuccessful Vars: {summary['failure_count']}")
+    print("excluded by decision (corpus-exclusions.json):")
+    print(json.dumps(dict(summary["excluded"].most_common()), indent=1))
+    for var, count, first in summary["uncovered"]:
+        print(f"uncovered exclusion: {var} has {count} failure(s) outside its decision\n     {first}")
+    for var in summary["stale"]:
+        print(f"stale exclusion: {var} no longer fails")
+    for var in summary["absent"]:
+        print(f"absent exclusion: {var} is not in its namespace's results")
+    for (kind, signature), count in summary["clusters"].most_common(args.clusters):
+        print(f"{count:4d} {kind:13s} {summary['examples'][(kind, signature)]}\n     {signature}")
 
 
 if __name__ == "__main__":

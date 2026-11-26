@@ -1,0 +1,1185 @@
+{
+ "about": "Every corpus Var that does not count as a conformance failure although it failed. An entry applies only when every failure the corpus recorded for its Var satisfies its decision's match; any other failure counts. Each decision names the RTDB feature or decision that justifies it. Seeded from the corpus-full9 run (fork tests, first failure only); re-review every entry the summary reports as uncovered or stale after a run against the upstream test sources.",
+ "decisions": {
+  "native-database-is-not-a-jvm-node": {
+   "outcome": "jvm-api-boundary",
+   "decision": "RTDB's JVM binding exposes a node as xtdb.rust.NativeDatabase, reached through ADBC, pgwire and Flight SQL (bindings/jvm/README.adoc). It is not an xtdb.api.Xtdb, an xtdb.NodeBase or an xtdb.api.Xtdb$Connection, does not carry the JVM node's database catalog, does not implement the xtdb.db / xtdb.node protocols and is not a Clojure map.",
+   "match": [
+    "cannot be cast to class xtdb\\.api\\.Xtdb\\b",
+    "xtdb\\.NodeBase",
+    "xtdb\\.database\\.Database\\$Catalog",
+    "Cannot invoke \"xtdb\\.database\\.DatabaseCatalog\\.",
+    "cannot be cast to class xtdb\\.api\\.Xtdb\\$Connection",
+    "No implementation of method: :\\S+ of protocol: #'xtdb\\.(db|node)",
+    "NativeDatabase cannot be cast to class clojure\\.lang\\.(Associative|ILookup|IPersistentMap)"
+   ]
+  },
+  "native-node-config-is-yaml": {
+   "outcome": "jvm-api-boundary",
+   "decision": "A native node is opened from its YAML node configuration (xtdb.rust.NativeDatabase/open). start-node options that are not a map, or that hold JVM objects with no YAML spelling, have no native form.",
+   "match": [
+    "Unsupported native start-node options",
+    "No serializer found for class"
+   ]
+  },
+  "sql-logic-runs-through-run-sql-logic": {
+   "outcome": "jvm-api-boundary",
+   "decision": "The SQL logic test runner's XTDB engine plans through the JVM node's database catalog; RTDB runs the SQL logic corpus through rust/conformance/run_sql_logic.py (rust/conformance/sql-logic.adoc) instead.",
+   "match": [
+    "plans through the JVM database catalog"
+   ]
+  },
+  "test-defined-jvm-logical-operator": {
+   "outcome": "jvm-api-boundary",
+   "decision": "The test plans a logical operator it implements itself on the JVM (a namespaced operator keyword); the native planner only carries XTDB's own operators.",
+   "match": [
+    "plans a logical operator it defines on the JVM"
+   ]
+  },
+  "test-defined-jvm-object-store": {
+   "outcome": "jvm-api-boundary",
+   "decision": "The test configures the '!InMemory' object store that its own namespace implements as a JVM class; the native engine's object stores are the configured production ones.",
+   "match": [
+    "Unknown object store configuration tag '!InMemory'"
+   ]
+  },
+  "jvm-node-system-map": {
+   "outcome": "jvm-api-boundary",
+   "decision": "The test reads the JVM node's integrant system map, for its server port or its pgwire server's state atom and connection futures; a NativeDatabase exposes its ports through getServerPort / getFlightSqlPort and keeps its server state native.",
+   "match": [
+    "jdbc:(postgresql|xtdb)://localhost:/",
+    "Cannot invoke \"clojure\\.lang\\.IAtom\\.swap\\(.*because \"atom\" is null",
+    "Cannot invoke \"java\\.util\\.concurrent\\.Future\\.get\\(\\)\" because \"fut\" is null"
+   ]
+  },
+  "cloud-environment-unavailable": {
+   "outcome": "environment-unavailable",
+   "decision": "Not an RTDB decision: the test needs a cloud CLI, cloud credentials, a real cloud endpoint or a Docker build context that the corpus environment does not provide. Re-run it where they are available.",
+   "match": [
+    "Cannot run program \"(az|gcloud)\"",
+    "working dir should be core2 root \\(with Dockerfile\\)",
+    "Unable to load credentials from any of the providers",
+    "error occurred while loading credentials",
+    "POST https://oauth\\d*\\.googleapis\\.com/token",
+    "xtdb-object-store-iam-test",
+    "addressed using the specified endpoint",
+    "Moved Permanently \\(Service: S3"
+   ]
+  },
+  "jvm-operator-spills": {
+   "outcome": "jvm-internal",
+   "decision": "The test counts the spill files the JVM operators write by redefining the JVM's temporary-directory function; RTDB's operators spill natively and never call it.",
+   "match": [
+    "\\(clojure\\.core/deref !spills\\)"
+   ]
+  },
+  "redefines-jvm-pgwire-implementation": {
+   "outcome": "jvm-internal",
+   "decision": "The test's assertions hold only through a with-redefs of a var in the JVM pgwire implementation (xtdb.pgwire); RTDB's pgwire server is native and never reads that var.",
+   "check": "any-failure"
+  },
+  "jvm-runtime-metrics": {
+   "outcome": "jvm-internal",
+   "decision": "RTDB has no JVM heap and no Arrow Java child-allocator tree, so it does not publish jvm.memory.used or xtdb.allocator.memory.allocated; every other metric the test asserts must still be present.",
+   "check": "missing-only-jvm-runtime-metrics"
+  },
+  "native-data-file-layout": {
+   "outcome": "jvm-layout",
+   "decision": "RTDB's writer does not reproduce the reference's union-vector leg layout under null structs, so a data file's byte size can differ while every cell reads back the same; the block-catalog maps must agree in everything else.",
+   "check": "block-catalog-differs-only-in-data-file-size"
+  }
+ },
+ "vars": [
+  {
+   "var": "xtdb.api-adbc-test/concurrent-writers-awaits-share-one-plan-6216",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/a-committed-write-is-visible-to-another-connection",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/a-flight-status-without-an-anomaly-maps-from-its-status",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/anomaly-code-crosses-the-wire",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/client-op-conversions",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/connection-rejects-database-opt",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/execute-tx-and-query",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/mixed-type-argument-reaches-the-server",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/mixed-type-column-round-trips",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/multi-op-tx-is-atomic",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/multi-row-batches",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/pages-shaped-differently-from-the-declared-result-type",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/put-docs-valid-time",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/query-args-and-plan-q",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/query-basis-opts",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/sql-anomaly-propagates",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/status-over-flight-sql",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/struct-field-order-differs-between-nodes",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/submit-tx-then-query-sees-write",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/tx-opts",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-flight-sql-test/unknown-db-is-rejected-at-open",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.api-test/first-class-tstz-ranges",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.aws.s3-test/list-after-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.aws.s3-test/multipart-put-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.aws.s3-test/multipart-start-and-cancel",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.aws.s3-test/put-delete-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/get-latest-block-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/get-object-to-file-twice-shouldnt-fail",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/interrupt-multipart-upload",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/list-after-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/list-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/list-test-with-prior-objects",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/multipart-object-already-exists",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/multipart-put-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/multipart-start-and-cancel",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/multipart-uploads-with-more-parts-work-correctly",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/multiple-node-list-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/node-level-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/put-delete-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.azure-test/tpch-test-node",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.block-boundary-test/local-log-restart-block-boundary",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.block-boundary-test/mixed-ops-across-boundaries",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.block-boundary-test/mixed-records-flush-and-compact-boundary",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.block-boundary-test/single-typed-value-to-nils-across-blocks",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.block-boundary-test/type-change-across-blocks",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.buffer-pool-test/test-latest-available-block-logic-local-node",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.buffer-pool-test/test-remote-buffer-pool-setup",
+   "decision": "test-defined-jvm-object-store"
+  },
+  {
+   "var": "xtdb.compactor-recency-branching-test/deleted-and-erased-entities-compact-through-recency-cells",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-recency-branching-test/historical-files-branch-by-recency-and-a-recent-window-reads-a-fraction-of-them",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-recency-branching-test/recency-branched-pages-keep-each-entitys-iid-in-one-run",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/compaction-settles-merging-null-put-leg-5714",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/compactor-trie-metadata",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/different-recency-partitioning",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/dont-lose-erases-during-compaction",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/losing-data-when-compacting-3459",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/null-duv-issue-4231",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-compaction-promotion-bug-3673",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-compaction-with-erase-4017",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-compactor-does-not-leak-tmp-merge-dirs",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-copes-with-missing-put",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-historical-compaction-within-file-recency-branching",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-l1-compaction",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-l1-compaction-by-recency",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-l2+-compaction",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-l2+-compaction-by-recency",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-l2-compaction-badly-distributed",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-no-empty-pages-3580",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor-test/test-same-entity-same-transaction-4303",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor.iid-runs-test/compaction-writes-historical-iids-as-runs-when-configured",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.compactor.reset-test/test-compactor-reset",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.docker-test/build-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.docker-test/run-and-connect-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.docker-test/run-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.export-test/test-export-snapshot",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/set-time-zone-sets-the-session-zone",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-adbc",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-adbc-multi-db",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-anomaly-propagates-through-prepare-5812",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-anomaly-propagates-through-query-5812",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-client",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-dml-anomaly-propagates-through-update-5812",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-dml-via-query-path-writes-its-row-5082",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-flightsql-multi-db",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-prepared-stmt-explicit-close-mid-session",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-prepared-stmt-no-params",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-prepared-stmts",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-prepared-stmts-in-tx",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql-test/test-transaction",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.flight-sql.playground-test/catalog-option-creates-the-database",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.flight-sql.playground-test/database-header-creates-the-database",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.gcp-test/get-latest-block-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/list-after-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/list-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/list-test-with-prior-objects",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/multiple-node-list-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/node-level-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/put-delete-test",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/put-object-twice-shouldnt-throw",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.gcp-test/tpch-test-node",
+   "decision": "cloud-environment-unavailable"
+  },
+  {
+   "var": "xtdb.healthz-test/test-alive-critical-secondary",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-alive-primary-always-critical",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-block-lag-uses-list-after",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-error-response",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-finish-block-endpoint",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-healthz-endpoints",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-indexer-error",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-started-catchup-4273",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-started-ignores-non-critical-catchup-5909",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.healthz-test/test-started-ignores-unresolved-source-messages-6398",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.hikari-test/works-with-hikaricp-postgresql-url",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.hikari-test/works-with-hikaricp-xtdb-driver",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.indexer-test/can-build-block-as-arrow-ipc-file-format",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/can-ingest-ts-devices-mini",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/can-ingest-ts-devices-mini-with-stop-start-and-reach-same-state",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/can-stop-node-without-writing-blocks",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/merges-column-fields-on-restart",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/test-compacted-trie-details",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/test-indexes-sql-insert",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer-test/test-multi-block-metadata",
+   "decision": "native-data-file-layout"
+  },
+  {
+   "var": "xtdb.indexer.crash-logger-test/test-crash-log",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer.live-index-test/can-build-live-index",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer.live-index-test/live-index-row-counter-reinitialization",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer.live-index-test/staged-empty-create-table-visible-across-a-batch-5507",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer.live-index-test/test-block",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.indexer.live-table-test/test-live-trie-can-overflow-log-limit-at-max-depth",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.information-schema-test/metrics-tags-stream-as-arrow",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.information-schema-test/test-metrics",
+   "decision": "jvm-runtime-metrics"
+  },
+  {
+   "var": "xtdb.information-schema-test/test-multi-db",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.information-schema-test/trie-stats",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.information-schema-test/trie-stats-temporal-metadata-streams-as-arrow",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.log-test/no-srcmsgid-replay-advances-watermark-5586",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.log-test/no-srcmsgid-replay-leader-transition-clean-5586",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.log-test/test-local-log-starts-at-correct-point-after-block-cut",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.log-test/test-local-log-starts-at-correct-point-after-flush-block",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.main-test/test-config-yaml",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.main-test/test-multi-dot-yaml",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.metadata-test/test-bloom-filter-for-datetime-types-2133",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-bloom-filter-for-num-types-2133",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-bloom-filter-for-time-types",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-boolean-metadata",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-duration-metadata-4198",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-is-not-null-metadata",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-min-max-on-xt-id",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-missing-type-metadata-4665",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-set-metadata",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metadata-test/test-temporal-metadata",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-block-uploaded-timer",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-error-and-warning-counter",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-gc-metrics",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-in-process-query-metrics",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-in-process-tx-error-counter",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-per-database-metrics",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-pgwire-tx-latency-timer",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-query-timer",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-total-and-active-connections",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-transaction-exception-counter",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-transaction-exception-counter-on-submit-tx",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-tx-await-timer",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.metrics-test/test-tx-submit-and-execute-timers",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.mixed-iid-encoding-test/a-scan-over-plain-and-run-end-encoded-iid-pages-answers-as-over-plain-ones-6258",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/dml-mixed-record-id-types-4876",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/pushdown-bloom-col-renaming-at-cursor-build-time-4279",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/start-node-from-non-map-config",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.node-test/test-decimal-support",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-default-param-types",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-erase-followed-by-join-4577",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-prepared-statements",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-prepared-statements-default-tz",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-skipped-tx-stored-in-object-store",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-unconsumed-nodes-4675",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-unconsumed-nodes-nullable-into-duv-4675",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.node-test/test-unconsumed-nodes-struct-duv-4675",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.group-by.percentile-test/test-percentile-spill-dir-cleaned-up-after-an-error-mid-aggregation",
+   "decision": "jvm-operator-spills"
+  },
+  {
+   "var": "xtdb.operator.group-by.percentile-test/test-percentile-spill-matches-in-memory",
+   "decision": "jvm-operator-spills"
+  },
+  {
+   "var": "xtdb.operator.group-by.percentile-test/test-percentile-spill-non-integer-values",
+   "decision": "jvm-operator-spills"
+  },
+  {
+   "var": "xtdb.operator.interrupt-test/operators-that-drain-their-input-stop-at-the-next-page-once-interrupted",
+   "decision": "test-defined-jvm-logical-operator"
+  },
+  {
+   "var": "xtdb.operator.join-test/test-mark-join-no-bloom-pushdown",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.order-by-test/test-top-k-within-block-doesnt-spill",
+   "decision": "jvm-operator-spills"
+  },
+  {
+   "var": "xtdb.operator.patch-test/patch-with-forbidden-columns-fails-4120",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/scanning-a-database-that-didnt-resolve-raises-rather-than-npeing",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-block-boundary",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-block-boundary-different-struct-types",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-iid-fast-path-multiple-pages",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-leaves-are-in-system-order",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-metadata",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-pushdown-blooms",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-range-query-earlier-filtering",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.operator.scan-test/test-recency-filtering",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/canned-response-test",
+   "decision": "redefines-jvm-pgwire-implementation",
+   "note": "redefines xtdb.pgwire/canned-responses"
+  },
+  {
+   "var": "xtdb.pgwire-test/client-disconnecting-mid-query-cancels-the-query",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.pgwire-test/close-drains-active-extended-queries-before-stopping-test",
+   "decision": "redefines-jvm-pgwire-implementation",
+   "note": "counts its latch down from a redefined xtdb.pgwire/parse-sql"
+  },
+  {
+   "var": "xtdb.pgwire-test/close_disposes_of_outstanding_queries",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/closing-the-playground-closes-its-node",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.pgwire-test/conn-closed-by-client-frees-resources-test",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.pgwire-test/conn-force-closed-by-server-frees-resources-test",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.pgwire-test/execute-two-transactions-4809",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/pg-authentication",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/pg-user-list-authentication",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/psql-interactive-test",
+   "decision": "redefines-jvm-pgwire-implementation",
+   "note": "redefines xtdb.pgwire/cmd-exec-query; later reads see the native results of those statements"
+  },
+  {
+   "var": "xtdb.pgwire-test/server-close-closes-idle-conns-test",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/session-access-mode-default-test",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.pgwire-test/snapshot-token-after-lctx-4465",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/ssl-test",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/test-current-time",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.pgwire-test/test-datetime-formatting",
+   "decision": "jvm-node-system-map"
+  },
+  {
+   "var": "xtdb.pgwire-test/test-pg-port",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/test-playground",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.pgwire-test/test-remote-client",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire-test/test-ro-server-4043",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire.authz-test/role-membership-managed-on-primary-only",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire.authz-test/superuser-only",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.pgwire.playground-test/ingestion-stopped-assert-4837",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.pgwire.playground-test/test-multi-db",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.pgwire.playground-test/update-filter-repro-4894",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.query-test/test-find-eq-ivan",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.query-test/test-find-gt-ivan",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql-test/decimal-casting",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--dml",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--dollar_identifiers",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--gcse-statistics",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--limit",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--no-projected-cols",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--numeric-value-functions-6.28",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--object-array",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--period_predicates",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--period_specifications",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--periods-and-derived-cols",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--qualified_joins",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--qualified_joins-correlated",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--set-functions",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--sl-a5",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--sl-demo",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.direct-sql-test/direct-sql--system_time",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-insert->doc->doc",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-parse-create-table",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-parse-create-view",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-skip-statement?",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-sql-logic-test-completion",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-sql-logic-test-execution",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.logic-test.runner-test/test-sql-logic-test-parser",
+   "decision": "sql-logic-runs-through-run-sql-logic"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/attach-database",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/connected-to-secondary-db",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/cross-db-refs-in-dml-5831",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/deals-with-table-ref-ambiguities",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/detach-dormant-database",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/skip-dbs-on-startup",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.sql.multi-db-test/test-resolves-other-db",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.stats-test/test-scan",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.table-catalog-test/current-tries-on-finish-block",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.table-catalog-test/trie-file-order-in-table-block-files",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.tpch-test/test-001-ra",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.tpch-test/test-001-sql",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.tpch-test/test-001-sql-explain",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.tpch-test/test-001-xtql",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.tracer-test/EXPLAIN_works_with_tracer_enabled__issue-5091",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/ensure-pgwire-simple-query-behaves-with-traces",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/test-query-creates-span",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/test-query-tracing-disabled",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/test-scan-span-includes-table-name",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/test-transaction-multiple-ops-tracing",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/test-transaction-tracing",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.tracer-test/test-transaction-tracing-disabled",
+   "decision": "native-node-config-is-yaml"
+  },
+  {
+   "var": "xtdb.trie-catalog-test/reconstructs-state-on-startup",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.trie-catalog-test/test-default-garbage-collection",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.trie-catalog-test/test-l0-blocks",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.trie-catalog-test/test-l0-blocks-dropped-on-compaction",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.trie-catalog-test/test-reset-rebuilds-l0-from-object-store",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.ts-devices-small-test/test-busiest-low-battery-devices",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.ts-devices-small-test/test-min-max-battery-levels-per-hour",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.ts-devices-small-test/test-recent-battery-temperatures",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.update-test/test-after-compaction",
+   "decision": "native-database-is-not-a-jvm-node"
+  },
+  {
+   "var": "xtdb.xtql.plan-test/sort-current-tries-by-block-index-4191",
+   "decision": "native-database-is-not-a-jvm-node"
+  }
+ ]
+}
