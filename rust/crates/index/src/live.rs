@@ -733,7 +733,7 @@ impl BlockPages<'_> {
                 let arrays = puts.iter().map(|put| put.column(index).as_ref()).collect::<Vec<_>>();
                 copy_block_column(field, &arrays, &picks, builder)
             }).collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), columns, None, picks.len()).map_err(invalid)?) as ArrayRef)
+            rtdb_columnar::build_struct_array(fields.clone(), &columns, picks.len(), None)
         }).collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(UnionArray::try_new(legs.clone(), tags.into(), Some(offsets.into()), children).map_err(invalid)?))
     }
