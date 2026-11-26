@@ -191,12 +191,28 @@ impl OutcomeQuery {
     }
 }
 
+/// The node's run, which ends once, when the node shuts down or closes.
+/// `closed` answers the per-request check without taking the cancellation token's lock, which every session would share.
+struct NodeRun {
+    token: CancellationToken,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl NodeRun {
+    fn end(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        self.token.cancel();
+    }
+
+    fn ended(&self) -> bool { self.closed.load(std::sync::atomic::Ordering::Acquire) }
+}
+
 #[derive(Clone)]
 pub struct Node {
     catalog: Arc<DatabaseCatalog>,
     factory: Arc<DatabaseFactory>,
     commands: mpsc::Sender<CatalogCommand>,
-    cancellation: CancellationToken,
+    run: Arc<NodeRun>,
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
     read_fence: Option<Arc<dyn ReadFence>>,
     scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
@@ -290,14 +306,14 @@ impl Node {
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
         let shared_plans = Arc::new(rtdb_query::SharedPlans::new(&factory.memory));
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, placement_slots,
+        let node = Self { catalog, factory, commands, run: Arc::new(NodeRun { token: CancellationToken::new(), closed: Default::default() }), runtime, read_fence, scan_fragmenter, placement_slots,
             sql_snapshots: Arc::default(), outcome_queries: Default::default(), shared_plans };
-        node.sql_snapshots.start(node.cancellation.clone());
+        node.sql_snapshots.start(node.run.token.clone());
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
                 if skipped.contains("xtdb") { return Err(Anomaly::incorrect("xtdb/cannot-skip-primary", "The primary database must run on this node")); }
-                let opened = node.factory.open("xtdb".into(), primary, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation).await?;
+                let opened = node.factory.open("xtdb".into(), primary, Arc::clone(&node.catalog), node.commands.clone(), &node.run.token).await?;
                 let secondaries = opened.secondaries;
                 node.catalog.insert_open(Arc::clone(&opened.database))?;
                 initial.push((opened.database, opened.driver));
@@ -306,7 +322,7 @@ impl Node {
                     crate::resources::validate_database_shape(&name, &configuration)?;
                     if node.catalog.skipped(&name) { node.catalog.insert_skipped(name, configuration)?; }
                     else {
-                        let opened = node.factory.open(name, configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation).await?;
+                        let opened = node.factory.open(name, configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.run.token).await?;
                         node.catalog.insert_open(Arc::clone(&opened.database))?;
                         initial.push((opened.database, opened.driver));
                     }
@@ -314,7 +330,7 @@ impl Node {
             }
             Membership::Placed => {}
             Membership::Fixed(databases) | Membership::Managed(databases) => for (name, configuration) in databases {
-                let opened = node.factory.open(name, configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation).await?;
+                let opened = node.factory.open(name, configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.run.token).await?;
                 node.catalog.insert_open(Arc::clone(&opened.database))?;
                 initial.push((opened.database, opened.driver));
             },
@@ -374,16 +390,21 @@ impl Node {
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
     pub fn query_instant(&self) -> rtdb_types::Instant { self.factory.clock.query_instant() }
-    pub fn shutdown(&self) { self.cancellation.cancel(); }
-    pub fn cancellation(&self) -> &CancellationToken { &self.cancellation }
+    pub fn shutdown(&self) { self.run.end(); }
+    pub fn cancellation(&self) -> &CancellationToken { &self.run.token }
     pub fn critical_ingestion_error(&self) -> Option<Anomaly> {
         self.catalog.open_databases().values().filter(|db| db.name() == "xtdb" || db.configuration().critical.unwrap_or(false)).find_map(|db| db.progress().fault())
     }
-    fn ensure_open(&self) -> Result<()> { if self.cancellation.is_cancelled() { Err(closed()) } else { Ok(()) } }
+    fn ensure_open(&self) -> Result<()> { if self.run.ended() { Err(closed()) } else { Ok(()) } }
 
     async fn admit(&self, database: &str, access: DatabaseAccess, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<()> {
         self.ensure_open()?;
-        self.cancellation.run_until_cancelled(cancellation.run_until_cancelled(identity.revalidate(self.now()))).await.flatten().ok_or_else(cancelled)??;
+        // Revalidation is usually ready at once; only a pending one waits under the node's and the caller's cancellation.
+        let mut revalidation = std::pin::pin!(identity.revalidate(self.now()));
+        match futures::poll!(revalidation.as_mut()) {
+            std::task::Poll::Ready(outcome) => outcome?,
+            std::task::Poll::Pending => self.run.token.run_until_cancelled(cancellation.run_until_cancelled(revalidation)).await.flatten().ok_or_else(cancelled)??,
+        }
         if cancellation.is_cancelled() { return Err(cancelled()); }
         self.ensure_open()?;
         // A placed node may stop holding a session's database at any moment; the command is refused before anything runs, so the gateway may resend it to the new holder.
@@ -422,7 +443,7 @@ impl Node {
             None
         };
         let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory, audience_storage });
-        let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
+        let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.run.token)?;
         Ok(NativeSession { state, service, applied_preparation: None })
     }
     pub fn snapshot_basis(&self) -> Result<TimeBasis> {
@@ -505,11 +526,11 @@ impl Node {
         let work = async {
             for database in databases.rows().iter().filter(|database| !database.read_only()) {
                 let position = database.flush().await?;
-                database.progress().await_source(position, &self.cancellation).await?;
+                database.progress().await_source(position, &self.run.token).await?;
             }
             Ok(())
         };
-        tokio::time::timeout(timeout, self.cancellation.run_until_cancelled(work))
+        tokio::time::timeout(timeout, self.run.token.run_until_cancelled(work))
             .await.map_err(|_| timeout_error())?.ok_or_else(closed)?
     }
     pub async fn sync_all(&self, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
@@ -735,7 +756,7 @@ impl Node {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
             _ => self.factory.options.query.query_memory(&self.factory.memory),
         };
-        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.run.token)?
             .with_shared_plans(Arc::clone(&self.shared_plans));
         let context = if audience { context } else { context.with_accelerators(Arc::clone(&self.factory.accelerators)) };
         context
@@ -856,7 +877,7 @@ impl Node {
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }
-        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
+        let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.run.token)?;
         rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment_with_arguments(context, fragment, arguments)).await
     }
 
@@ -1205,7 +1226,7 @@ impl Node {
         self.ensure_open()?;
         if let Ok(database) = self.catalog.database(&name) { return Ok(Some(database)); }
         let slot = if let Some(slots) = &self.placement_slots {
-            let permit = self.cancellation.run_until_cancelled(Arc::clone(slots).acquire_owned()).await
+            let permit = self.run.token.run_until_cancelled(Arc::clone(slots).acquire_owned()).await
                 .ok_or_else(closed)?.map_err(|_| closed())?;
             if let Ok(database) = self.catalog.database(&name) { return Ok(Some(database)); }
             Some(permit)
@@ -1330,7 +1351,7 @@ impl NodeDriver {
         for (database, driver) in self.initial.drain(..) { tasks.spawn(async move { DatabaseCompletion::Worker { database, result: driver.run().await } }); }
         let mut failure = None;
         loop {
-            if self.node.cancellation.is_cancelled() { break; }
+            if self.node.run.token.is_cancelled() { break; }
             if self.node.catalog.is_placed() && let Some(completion) = tasks.try_join_next() {
                 match completion {
                     Ok(completion) => { let _ = self.complete(completion, &mut tasks); }
@@ -1340,10 +1361,10 @@ impl NodeDriver {
             }
             tokio::select! {
                 biased;
-                _ = self.node.cancellation.cancelled() => break,
+                _ = self.node.run.token.cancelled() => break,
                 command = self.commands.recv() => match command {
                     Some(command) => {
-                        let token = self.node.cancellation.clone();
+                        let token = self.node.run.token.clone();
                         if token.run_until_cancelled(self.command(command, &mut tasks)).await.is_none() { break; }
                     }
                     None => break,
@@ -1394,7 +1415,7 @@ impl NodeDriver {
     }
 
     fn dispatch_local(&mut self, name: String, request: LocalRequest, tasks: &mut JoinSet<DatabaseCompletion>) {
-        if self.node.cancellation.is_cancelled() {
+        if self.node.run.token.is_cancelled() {
             match request {
                 LocalRequest::Attach { completion, .. } => { let _ = completion.send(Err(closed())); }
                 LocalRequest::Detach { completion } => { let _ = completion.send(Err(closed())); }
@@ -1418,8 +1439,8 @@ impl NodeDriver {
                 self.local_opens.insert(name.clone(), LocalOpen { _slot: slot, completion, queued: VecDeque::new() });
                 let node = self.node.clone();
                 tasks.spawn(async move {
-                    let prepare = node.factory.open(name.clone(), configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation);
-                    let result = node.cancellation.run_until_cancelled(prepare).await.unwrap_or_else(|| Err(closed()));
+                    let prepare = node.factory.open(name.clone(), configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.run.token);
+                    let result = node.run.token.run_until_cancelled(prepare).await.unwrap_or_else(|| Err(closed()));
                     DatabaseCompletion::LocalOpened { name, result }
                 });
             }
@@ -1436,7 +1457,7 @@ impl NodeDriver {
         let opening = self.local_opens.remove(&name).expect("an open owns its name until it completes");
         let result = result.and_then(|opened| {
             let database = Arc::clone(&opened.database);
-            let admitted = if self.node.cancellation.is_cancelled() { Err(closed()) }
+            let admitted = if self.node.run.token.is_cancelled() { Err(closed()) }
                 else { self.node.catalog.insert_open(Arc::clone(&database)) };
             match admitted {
                 Ok(()) => {
@@ -1485,7 +1506,7 @@ impl NodeDriver {
         if local { self.node.catalog.check_local_attach(&name, &configuration)?; } else { self.node.catalog.check_attach(&name, &configuration)?; }
         if local && default_restore::read_install(&name, &configuration)?.is_some() { return Err(default_restore::unsupported()); }
         if self.node.catalog.skipped(&name) { self.node.catalog.insert_skipped(name, configuration)?; return Ok(None); }
-        let opened = self.node.factory.open(name, configuration, Arc::clone(&self.node.catalog), self.node.commands.clone(), &self.node.cancellation).await?;
+        let opened = self.node.factory.open(name, configuration, Arc::clone(&self.node.catalog), self.node.commands.clone(), &self.node.run.token).await?;
         let database = Arc::clone(&opened.database);
         let published = async {
             if !local { default_restore::mark_ordered_attachment(&database).await?; }
