@@ -106,6 +106,8 @@ pub struct NodeConfiguration {
     pub local_log_uses_clock: bool,
     pub kafka_auto_create_topic: bool,
     pub join_build_rows: i64,
+    /// Overrides the per-query spill limit, which otherwise follows the free disk.
+    pub query_spill_limit_bytes: Option<u64>,
     pub generate_series_end_exclusive: bool,
     pub object_sort: rtdb_types::ObjectSort,
 }
@@ -156,6 +158,9 @@ impl NodeConfiguration {
         let indexer = indexer(fields.take("indexer"), environment)?;
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
         let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").as_deref().and_then(join_threshold).unwrap_or(100_000);
+        let query_spill_limit_bytes = environment("XTDB_QUERY_SPILL_LIMIT_BYTES")
+            .map(|text| text.trim().parse::<u64>().map_err(|_| invalid("XTDB_QUERY_SPILL_LIMIT_BYTES must be a non-negative byte count")))
+            .transpose()?;
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
         let default_erasure = DefaultErasureSettings {
             local: erasure_flag(&mut fields, "defaultLocalErasure", "RTDB_DEFAULT_LOCAL_ERASURE", environment)?,
@@ -176,7 +181,7 @@ impl NodeConfiguration {
                 default_checkpoint_restore_directory: None,
                 health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -213,7 +218,7 @@ impl NodeConfiguration {
                 deployment_admin,
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory,
-                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)
