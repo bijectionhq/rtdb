@@ -96,6 +96,9 @@ Frontend planning admission still requires reservations before parsing and catal
 `new_nullable` preserves an absent message separately from an empty message.
 Native serde retains absence as JSON null; native display prints the code alone when the message is absent and `code: message` when present.
 Wire adapters apply their own message rendering rules.
+An optional `AnomalyKind` says what went wrong for the anomalies callers act on by what happened rather than by whose fault it was; `ResourceExhausted` marks a memory budget or byte limit that had no room.
+Native serde carries a present kind and omits an absent one.
+Formats that carry only the code, such as XTDB's Transit errors, recover the kind from the code with `AnomalyKind::from_wire_code`.
 
 == Checked Clojure collection construction
 

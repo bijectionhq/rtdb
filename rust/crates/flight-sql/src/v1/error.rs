@@ -168,12 +168,9 @@ pub fn map_status(status: Status) -> Status {
         && let Ok(bytes) = bytes.to_bytes()
         && let Ok(native) = serde_json::from_slice::<FlightAnomaly>(&bytes)
     {
-        return anomaly(Anomaly {
-            category: native.category,
-            code: native.code.unwrap_or_default(),
-            message: native.message,
-            context: native.data,
-        });
+        let mut decoded = Anomaly::new_nullable(native.category, native.code.unwrap_or_default(), native.message);
+        decoded.context = native.data;
+        return anomaly(decoded);
     }
     let category = match status.code() {
         Code::InvalidArgument | Code::OutOfRange => Category::Incorrect,

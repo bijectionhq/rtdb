@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, Weak, atomic::{AtomicUsize, Ordering}};
 
-use crate::{Anomaly, Result};
+use crate::{Anomaly, AnomalyKind, Result};
 
 /// Finite byte admission shared across retained allocation leases.
 /// Child scopes track their own retained/peak bytes while charging every ancestor.
@@ -120,7 +120,7 @@ impl MemoryBudget {
     }
 
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
-    /// Exceeding this budget or an ancestor limit, including size overflow, returns an error.
+    /// Exceeding this budget or an ancestor limit, including size overflow, returns an error of kind `ResourceExhausted`.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.admit(bytes)?;
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: Box::default() }))
@@ -228,7 +228,8 @@ impl MemoryBudget {
         let mut current = self.used_bytes.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(bytes).filter(|next| *next <= self.limit_bytes)
-                .ok_or_else(|| Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {} with {current} retained", self.limit_bytes)))?;
+                .ok_or_else(|| Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {} with {current} retained", self.limit_bytes))
+                    .with_kind(AnomalyKind::ResourceExhausted))?;
             match self.used_bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
                     if next > self.peak_bytes.load(Ordering::Relaxed) { self.peak_bytes.fetch_max(next, Ordering::Relaxed); }

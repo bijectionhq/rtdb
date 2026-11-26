@@ -58,7 +58,7 @@ pub mod java_text;
 pub mod transit_value;
 mod murmur3;
 
-pub use error::{Anomaly, AnomalyCategory, Result};
+pub use error::{Anomaly, AnomalyCategory, AnomalyKind, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
 pub use zone::{FixedOffset, ZoneId, timezone_names, TZDB_VERSION, TZDB_SHA256};
 pub use legacy_zone::LegacyTimeZone;

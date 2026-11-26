@@ -18,6 +18,24 @@ pub enum AnomalyCategory {
     Fault,
 }
 
+/// What went wrong, for the anomalies a caller acts on by what happened rather than by whose fault it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnomalyKind {
+    /// A memory budget or byte limit had no room for the work.
+    ResourceExhausted,
+}
+
+impl AnomalyKind {
+    /// The kind of an anomaly read from a format that carries only its code, such as XTDB's Transit errors.
+    pub fn from_wire_code(code: &str) -> Option<Self> {
+        match code {
+            "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit" => Some(Self::ResourceExhausted),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Anomaly {
     pub category: AnomalyCategory,
@@ -25,6 +43,8 @@ pub struct Anomaly {
     pub message: Option<String>,
     #[serde(with = "context")]
     pub context: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AnomalyKind>,
 }
 
 /// A JSON value decodes only from a self-describing format, so a binary
@@ -53,7 +73,7 @@ impl Anomaly {
     }
 
     pub fn new_nullable(category: AnomalyCategory, code: impl Into<String>, message: Option<String>) -> Self {
-        Self { category, code: code.into(), message, context: BTreeMap::new() }
+        Self { category, code: code.into(), message, context: BTreeMap::new(), kind: None }
     }
 
     pub fn incorrect(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -72,6 +92,13 @@ impl Anomaly {
         self.context.insert(key.into(), value);
         self
     }
+
+    pub fn with_kind(mut self, kind: AnomalyKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    pub fn is(&self, kind: AnomalyKind) -> bool { self.kind == Some(kind) }
 
     pub fn with_transit_context(self, key: impl Into<String>, value: &crate::transit_value::TransitValue) -> Result<Self> {
         Ok(self.with_context(key, crate::transit_value::to_json_value(value)?))
@@ -109,6 +136,28 @@ mod tests {
             assert_eq!(serde_json::from_str::<Anomaly>(&serde_json::to_string(&error).unwrap()).unwrap(), error);
         }
         assert_ne!(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", None), Anomaly::fault("test/error", ""));
+    }
+
+    #[test]
+    fn a_kind_survives_serialisation_and_an_absent_kind_adds_no_field() {
+        let exhausted = Anomaly::incorrect("test/error", "detail").with_kind(AnomalyKind::ResourceExhausted);
+        assert!(exhausted.is(AnomalyKind::ResourceExhausted));
+        let json = serde_json::to_value(&exhausted).unwrap();
+        assert_eq!(json["kind"], "resource-exhausted");
+        assert_eq!(serde_json::from_value::<Anomaly>(json).unwrap(), exhausted);
+
+        let plain = Anomaly::incorrect("test/error", "detail");
+        assert!(!plain.is(AnomalyKind::ResourceExhausted));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("kind").is_none());
+        assert_eq!(serde_json::from_value::<Anomaly>(json).unwrap(), plain);
+    }
+
+    #[test]
+    fn wire_codes_of_exhausted_limits_decode_to_their_kind() {
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/memory-budget-exceeded"), Some(AnomalyKind::ResourceExhausted));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.storage/memory-limit"), Some(AnomalyKind::ResourceExhausted));
+        assert_eq!(AnomalyKind::from_wire_code("xtdb/sql-error"), None);
     }
 
     #[test]

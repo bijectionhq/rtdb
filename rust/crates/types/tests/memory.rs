@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use rtdb_types::MemoryBudget;
+use rtdb_types::{AnomalyKind, MemoryBudget};
 
 #[test]
 fn shrinking_a_lease_releases_every_ancestor_without_changing_peaks() {
@@ -201,4 +201,19 @@ fn moving_a_charge_does_not_require_headroom() {
     assert_eq!(memory.used_bytes(), 128);
     drop(destination);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn every_refusal_by_a_budget_is_resource_exhaustion() {
+    let root = MemoryBudget::new(100);
+    let leaf = root.scope_with_limit(50).scope();
+    let mut reservation = leaf.reserve(10).unwrap();
+    let refused_growth = Arc::get_mut(&mut reservation).unwrap().grow_to(51).unwrap_err();
+    drop(reservation);
+    for error in [leaf.reserve(51).unwrap_err(), root.reserve(usize::MAX).unwrap_err(), refused_growth] {
+        assert!(error.is(AnomalyKind::ResourceExhausted), "{error}");
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    }
+    assert_eq!(root.used_bytes(), 0);
+    assert!(!Arc::get_mut(&mut root.reserve(10).unwrap()).unwrap().shrink_to(11).unwrap_err().is(AnomalyKind::ResourceExhausted));
 }

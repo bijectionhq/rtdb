@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, MemoryBudget, MemoryReservation, Result};
 
 mod arrow_json;
 pub use arrow_json::{write_arrow_batch_json, write_arrow_json, write_arrow_row_json};
@@ -983,7 +983,8 @@ pub fn decode_anomaly(bytes: &[u8]) -> Result<Anomaly> {
         }).collect::<Result<_>>()?,
         _ => return Err(invalid("Error context is not a map")),
     };
-    Ok(Anomaly { category, code, message, context })
+    let kind = AnomalyKind::from_wire_code(&code);
+    Ok(Anomaly { category, code, message, context, kind })
 }
 
 fn anomaly_category(category: &str) -> Result<AnomalyCategory> {
@@ -1019,5 +1020,19 @@ mod compact_array_tests {
             assert_eq!(cached.as_ref(), &("^0".into(), vec![3.0, 4.0]));
             assert_eq!(unpack_array(items, None, &mut ReadCache::new(), 0, &mut WireValues).unwrap(), value);
         }
+    }
+}
+
+#[cfg(test)]
+mod anomaly_tests {
+    use super::*;
+
+    #[test]
+    fn resource_exhaustion_survives_a_transit_round_trip_through_its_code() {
+        let exhausted = MemoryBudget::new(0).reserve(1).unwrap_err();
+        assert!(exhausted.is(AnomalyKind::ResourceExhausted));
+        assert_eq!(decode_anomaly(&encode_anomaly(&exhausted).unwrap()).unwrap(), exhausted);
+        let other = Anomaly::incorrect("xtdb/sql-error", "bad");
+        assert_eq!(decode_anomaly(&encode_anomaly(&other).unwrap()).unwrap().kind, None);
     }
 }

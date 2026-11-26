@@ -66,8 +66,9 @@ impl Error {
 
 impl From<Error> for rtdb_types::Anomaly {
     fn from(error: Error) -> Self {
-        use rtdb_types::{Anomaly, AnomalyCategory as Category};
+        use rtdb_types::{Anomaly, AnomalyCategory as Category, AnomalyKind};
         let message = error.to_string();
+        let kind = matches!(error, Error::MemoryLimit { .. }).then_some(AnomalyKind::ResourceExhausted);
         let (category, code, context) = match error {
             Error::InvalidKey(key) => (Category::Incorrect, "rtdb.storage/invalid-key", serde_json::json!({"key": key})),
             Error::MissingObject(key) => (Category::NotFound, "rtdb.storage/missing-object", serde_json::json!({"key": key})),
@@ -102,6 +103,7 @@ impl From<Error> for rtdb_types::Anomaly {
             }
         };
         let mut anomaly = Anomaly::new(category, code, message);
+        anomaly.kind = kind;
         if let serde_json::Value::Object(context) = context { anomaly.context.extend(context); }
         anomaly
     }
@@ -135,5 +137,13 @@ mod tests {
         assert_eq!(anomaly.context["multipart-abort"]["code"], "rtdb.storage/remote");
         assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("upload denied")));
         assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("abort unavailable")));
+    }
+
+    #[test]
+    fn only_the_memory_limit_is_resource_exhaustion() {
+        let exhausted = rtdb_types::Anomaly::from(Error::MemoryLimit { requested: 2, limit: 1, retained: 0 });
+        assert!(exhausted.is(rtdb_types::AnomalyKind::ResourceExhausted));
+        assert_eq!(exhausted.category, rtdb_types::AnomalyCategory::Busy);
+        assert!(!rtdb_types::Anomaly::from(Error::AudienceWorkLimit).is(rtdb_types::AnomalyKind::ResourceExhausted));
     }
 }
