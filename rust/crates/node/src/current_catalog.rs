@@ -25,9 +25,10 @@ impl CurrentCatalog {
     }
 
     /// Keeps `hold` as the database's share if it is a registered hold of exactly the published cut.
+    /// Ordinary reads hold their cut anchored at its checkpoint, so an anchored hold is a share like any other.
     pub(crate) fn offer(&self, hold: &Arc<HeldCatalogRead>) {
         let address = Arc::as_ptr(hold) as usize;
-        if self.held.load(Ordering::Acquire) == address || !hold.is_registered() || hold.is_anchored() || hold.cut().is_none() {
+        if self.held.load(Ordering::Acquire) == address || !hold.is_registered() || hold.cut().is_none() {
             return;
         }
         let replaced = {
@@ -115,5 +116,25 @@ mod tests {
         assert!(collector.advance_catalog_floor(cut(1)).await.unwrap(), "a share of the current version never blocks a floor it covers");
         drop(current);
         assert!(tickets(location.path()).is_empty(), "a closed database holds nothing");
+    }
+
+    #[tokio::test]
+    async fn sequential_readers_holding_the_current_version_anchored_register_once() {
+        let location = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+        let pool = BufferPool::new(store, 1 << 20);
+        let partition = PartitionState::empty(Default::default()).unwrap();
+        partition.publish_catalog_cut(cut(0)).unwrap();
+        let current = CurrentCatalog::observe(&partition);
+        let anchor = rtdb_types::CatalogCheckpoint { boundary: ReplicaPosition(-1), root: [0; 32] };
+        let mut registration = None;
+        for _ in 0..10 {
+            let hold = pool.hold_anchored_catalog(cut(0), anchor, None).await.unwrap();
+            current.offer(&hold);
+            drop(hold);
+            let now = tickets(location.path());
+            assert_eq!(now.len(), 1, "the database keeps the anchored current version registered between readers");
+            assert_eq!(registration.get_or_insert_with(|| now.clone()), &now, "later readers share the first registration");
+        }
     }
 }
