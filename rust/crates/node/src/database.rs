@@ -43,6 +43,7 @@ pub struct Database {
     read_only: bool,
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
+    pub(crate) current_catalog: Arc<crate::current_catalog::CurrentCatalog>,
     pub(crate) resolve: Arc<ResolveContext>,
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
@@ -712,7 +713,8 @@ impl DatabaseFactory {
                 }));
             }
             static ATTACHMENTS: AtomicU64 = AtomicU64::new(0);
-            let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
+            let current_catalog = crate::current_catalog::CurrentCatalog::observe(&partition);
+            let database = Arc::new(Database { attachment: ATTACHMENTS.fetch_add(1, Ordering::Relaxed), writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, current_catalog, resolve,
                 audience_storage: resources.audience_storage, logs, replication, serving, native_serving_authority: native_authority, default_native_handle,
                 custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,

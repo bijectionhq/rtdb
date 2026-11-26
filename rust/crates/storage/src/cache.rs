@@ -250,6 +250,8 @@ pub struct HeldCatalogRead {
 impl HeldCatalogRead {
     pub fn is_registered(&self) -> bool { self.registration.is_some() }
     pub fn cut(&self) -> Option<rtdb_types::CatalogCut> { self.cut }
+    /// Whether the hold admits an exact checkpoint and suffix rather than a cut alone.
+    pub fn is_anchored(&self) -> bool { self.checkpoint.is_some() }
 
     fn covers(&self, cut: Option<rtdb_types::CatalogCut>) -> bool {
         match (self.cut, cut) {

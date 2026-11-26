@@ -777,7 +777,11 @@ impl Node {
                 self.attached_database(&name, placement)?;
                 snapshot.with_catalog_read(permit)
             } else {
-                rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?
+                let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
+                if let Some(hold) = snapshot.catalog_read_permit::<rtdb_storage::cache::HeldCatalogRead>() {
+                    database.current_catalog.offer(&hold);
+                }
+                snapshot
             };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage });
         }

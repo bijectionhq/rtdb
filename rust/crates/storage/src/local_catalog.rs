@@ -54,6 +54,7 @@ fn terminal_name(key: &str) -> bool {
 }
 
 pub(crate) struct LocalCatalogLedger {
+    id: u64,
     directory: PathBuf,
     root: Arc<PathBuf>,
     replica_epoch: StorageEpoch,
@@ -62,14 +63,15 @@ pub(crate) struct LocalCatalogLedger {
 
 impl LocalCatalogLedger {
     pub(crate) fn new(root: Arc<PathBuf>, replica_epoch: StorageEpoch) -> Self {
-        Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch,
+        static LEDGERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self { id: LEDGERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), directory: root.join(".tmp/catalog-ledger"), root, replica_epoch,
             search_witness: parking_lot::Mutex::new(None) }
     }
 
     pub(crate) fn retain(&self, cut: Option<CatalogCut>, paths: Option<&[String]>) -> Result<tempfile::NamedTempFile> {
         let _gate = self.lock()?;
         let claim = CatalogHold::new(cut, paths);
-        self.admit_floor(cut)?;
+        self.admit_floor(cut, self.floor()?)?;
         if let Some(paths) = &claim.catalog_file_paths {
             for name in paths.iter().filter(|name| terminal_name(name)) {
                 if self.is_terminal(name)? {
@@ -87,16 +89,38 @@ impl LocalCatalogLedger {
     }
 
     /// Admits another reader of a catalog whose ticket this process holds, as `retain` would admit it.
-    /// The held ticket keeps every path its claim names from turning terminal, so only the floor can have moved since; the
-    /// floor file is replaced by rename, so it reads whole without the gate, and the ticket already orders this read before
-    /// any later floor.
+    /// The held ticket keeps every path its claim names from turning terminal, but a retirement naming paths or an erasure
+    /// installs the floor past held tickets, so the floor is checked again.
+    /// The floor file is replaced by rename, so it reads whole without the gate, and the ticket already orders this read
+    /// before any later floor.
     pub(crate) fn readmit(&self, cut: Option<CatalogCut>) -> Result<()> {
-        self.admit_floor(cut)
+        self.admit_floor(cut, self.current_floor()?)
     }
 
-    fn admit_floor(&self, cut: Option<CatalogCut>) -> Result<()> {
+    /// The floor as `floor` reads it, parsed again only when the floor file has been replaced since this thread last read it.
+    #[cfg(unix)]
+    fn current_floor(&self) -> Result<Option<CatalogCut>> {
+        use std::os::unix::fs::MetadataExt;
+        type Seen = Option<(u64, (u64, u64, i64, i64, u64), Option<CatalogCut>)>;
+        thread_local! { static SEEN: std::cell::Cell<Seen> = const { std::cell::Cell::new(None) }; }
+        let path = self.directory.join("floor");
+        let stamp = match fs::metadata(&path) {
+            Ok(metadata) => (metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec(), metadata.size()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::io(path, error).into()),
+        };
+        if let Some((id, seen, floor)) = SEEN.get() && id == self.id && seen == stamp { return Ok(floor); }
+        let floor = self.floor()?;
+        SEEN.set(Some((self.id, stamp, floor)));
+        Ok(floor)
+    }
+
+    #[cfg(not(unix))]
+    fn current_floor(&self) -> Result<Option<CatalogCut>> { self.floor() }
+
+    fn admit_floor(&self, cut: Option<CatalogCut>, floor: Option<CatalogCut>) -> Result<()> {
         if cut.is_some_and(|cut| cut.replica_epoch != self.replica_epoch || !well_formed(cut))
-            || self.floor()?.is_some_and(|floor| floor.replica_epoch >= self.replica_epoch
+            || floor.is_some_and(|floor| floor.replica_epoch >= self.replica_epoch
                 && !cut.is_some_and(|cut| covers(cut, floor)))
         {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",

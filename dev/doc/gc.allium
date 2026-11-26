@@ -36,6 +36,7 @@
 -- An admitted capture retains that registration through its provider requests.
 -- The captures of one catalog version through one buffer pool share one registration, which ends when the last of them ends.
 -- Each capture that joins a held registration is admitted against the floor exactly as a new registration would be.
+-- A database holds its own share of the registration for the cut its partition publishes, from that cut's first capture until it publishes another.
 -- Compaction and stored artefact builds register their input catalogs on coordinated storage.
 -- A fallback build registers the catalog it recaptures for its own reads.
 -- Replicated snapshots on uncoordinated storage hold a bounded read lease.

@@ -172,6 +172,9 @@ async fn a_shared_catalog_hold_blocks_the_floor_until_its_last_reader_and_readmi
     assert!(collector.advance_catalog_floor(installed).await?, "the floor advances as soon as the last reader drops");
 
     let current = pool.hold_catalog(Some(installed)).await?;
+    let joiner = pool.hold_catalog(Some(installed)).await?;
+    assert!(std::sync::Arc::ptr_eq(&current, &joiner), "a joiner admitted at the installed floor shares the hold");
+    drop(joiner);
     let file = ObjectKey::new("tables/orders/data/l01-rc-b01.arrow")?;
     collector.put(&file, Bytes::from_static(b"retired data")).await?;
     let plan = serde_json::to_vec(&RetirementIntent {

@@ -211,6 +211,31 @@ pub struct PartitionState {
     value: RwLock<Arc<PartitionValue>>,
     published: Mutex<Option<Arc<PartitionValue>>>,
     retention: Mutex<Retention>,
+    observers: Observers,
+}
+
+/// Told of each change to the catalog cut a partition publishes.
+pub trait CatalogPublicationObserver: Send + Sync {
+    /// The partition now publishes `cut`, or nothing.
+    /// Called under the partition's state lock; what it returns is dropped after the lock is released.
+    fn published(&self, cut: Option<CatalogCut>) -> Option<Box<dyn Send>>;
+}
+
+#[derive(Default)]
+struct Observers(Mutex<Vec<Weak<dyn CatalogPublicationObserver>>>);
+
+impl std::fmt::Debug for Observers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Observers") }
+}
+
+impl Observers {
+    /// What the observers release, and their handles, for the caller to drop once it has released the state lock.
+    fn notify(&self, cut: Option<CatalogCut>) -> Vec<Box<dyn Send>> {
+        let observers: Vec<_> = self.0.lock().iter().filter_map(Weak::upgrade).collect();
+        let mut released: Vec<Box<dyn Send>> = observers.iter().filter_map(|observer| observer.published(cut)).collect();
+        released.extend(observers.into_iter().map(|observer| Box::new(observer) as Box<dyn Send>));
+        released
+    }
 }
 
 pub struct PreparedWrite {
@@ -229,12 +254,30 @@ impl PartitionState {
             value: RwLock::new(Arc::new(initial)),
             published: Mutex::new(None),
             retention: Mutex::new(Retention::default()),
+            observers: Observers::default(),
         }
     }
     pub fn empty(config: TrieConfig) -> Result<Self> {
         Ok(Self::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables()?, config)?))
     }
     pub fn value(&self) -> Arc<PartitionValue> { Arc::clone(&self.value.read()) }
+
+    /// Tells `observer` the cut published now and every later change, in publication order, while the observer lives.
+    pub fn observe_publication(&self, observer: &Arc<dyn CatalogPublicationObserver>) {
+        let value = self.value.read();
+        {
+            let mut observers = self.observers.0.lock();
+            observers.retain(|observer| observer.strong_count() > 0);
+            observers.push(Arc::downgrade(observer));
+        }
+        let cut = match value.catalog_publication {
+            CatalogPublication::Installed(cut) => Some(cut),
+            CatalogPublication::Untracked | CatalogPublication::Suspended => None,
+        };
+        let released = observer.published(cut);
+        drop(value);
+        drop(released);
+    }
 
     fn retain_catalog(&self, value: &PartitionValue) {
         let mut retention = self.retention.lock();
@@ -306,6 +349,9 @@ impl PartitionState {
         self.retain_catalog(&next);
         *self.published.lock() = Some(Arc::clone(&next));
         *value = next;
+        let released = self.observers.notify(Some(cut));
+        drop(value);
+        drop(released);
         Ok(())
     }
 
@@ -465,6 +511,9 @@ impl PartitionState {
         next.catalog_publication = CatalogPublication::Suspended;
         *self.published.lock() = None;
         *value = Arc::new(next);
+        let released = self.observers.notify(None);
+        drop(value);
+        drop(released);
         Ok(())
     }
     pub fn prepare_block(&self) -> Result<BlockPreparation> {
@@ -500,6 +549,9 @@ impl PartitionState {
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(durable), checkpoint_tries,
             table_catalog: Arc::new(tables), live: Arc::new(live), live_snapshot: None,
             catalog_publication: CatalogPublication::Untracked });
+        let released = self.observers.notify(None);
+        drop(value);
+        drop(released);
         Ok(())
     }
 
