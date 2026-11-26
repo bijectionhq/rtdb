@@ -31,6 +31,7 @@
 -- Consensus streams place each stream on three keepers in distinct failure domains and move one voter at a time off draining keepers.
 -- With installed keeper trust they prove timed originals from signed syncs on two voters, so funded appends work on them.
 -- The Multi writer checkpoints and trims before its retained journal suffix reaches the consensus stream's record bound.
+-- With deferred checkpoints the writer captures that checkpoint under its database lock, builds and uploads it without the lock, and announces it later, so commits continue while it builds.
 -- The stream driver submits contiguous append groups in LSN order and acknowledges the group after every record in it commits.
 -- An unavailable append can leave a committed prefix, which the driver recovers from the journal before resuming writes.
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
@@ -1035,9 +1036,14 @@ contract FencedStreamWriter {
         -- Reads and status lookups use the committed fold.
 
     @invariant CheckpointRecovery
-        -- A writer trims through the position immediately before a committed checkpoint record.
+        -- A checkpoint record names its cut, the last position its image covers, at or before the record itself.
+        -- A writer trims only through the cut of a committed checkpoint record.
+        -- A classic checkpoint's cut is the position immediately before its record; a deferred checkpoint's cut is the head when the writer captured it, and the records between the cut and the announcement stay retained.
+        -- A deferred checkpoint is announced only under the epoch and key generation it was captured in, with no erasure, rotation or restore started since the capture.
         -- A checkpoint image carries the applied transaction cut, active pins and the publishing writer's lease.
-        -- A follower starts from the retained checkpoint and applies its committed suffix in position order.
+        -- The base of a retained suffix is the first retained checkpoint whose cut is the position before the floor; a suffix from position one has no base.
+        -- A follower installs the base and applies every retained record from the floor in position order; the base's own record only announces it.
+        -- That replay equals replay from position one, so followers, fresh processes and the writer agree.
 
     @invariant AssignedFollowerReplay
         -- An installed follower process opens a prepared, ready incarnation under one cell assignment.
