@@ -192,7 +192,29 @@ impl Pushdowns {
 }
 
 /// A build key's filters while the build side is read; its Bloom positions are buffered and added in bulk.
-struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter, pending: Pending }
+struct Key { expression: Expr, probe: ColumnId, filter: ColumnFilter, pending: Pending, recorded: RecordedIntegers }
+
+/// Integer build keys already added with these Bloom hashes, so a repeated key is not hashed into the filter again.
+#[derive(Default)]
+struct RecordedIntegers { keys: std::collections::HashSet<(i64, i32, i32)>, charge: Option<Arc<MemoryReservation>> }
+
+impl RecordedIntegers {
+    const CHARGE_STEP: usize = 1024;
+
+    /// Whether this is the first time the key is recorded.
+    fn record(&mut self, key: (i64, i32, i32), memory: &Arc<MemoryBudget>) -> Result<bool> {
+        if self.keys.contains(&key) { return Ok(false); }
+        if self.keys.len().is_multiple_of(Self::CHARGE_STEP) {
+            let bytes = (self.keys.len() + Self::CHARGE_STEP).checked_mul(2 * size_of::<(i64, i32, i32)>()).ok_or_else(size_error)?;
+            match &mut self.charge {
+                Some(charge) => Arc::get_mut(charge).expect("The recorded keys own their charge").grow_to(bytes)?,
+                None => self.charge = Some(memory.reserve(bytes)?),
+            }
+        }
+        self.keys.insert(key);
+        Ok(true)
+    }
+}
 const PENDING_POSITIONS: usize = 16 * 1024;
 /// Builds of more rows than this mark their Bloom positions in a dense bitmap rather than sorting them.
 const DENSE_ROWS: i64 = 16 * 1024;
@@ -242,6 +264,7 @@ impl PushdownBuilder {
             let column = schema.position(*id).and_then(|position| batch.columns.get(position))
                 .ok_or_else(|| invalid("pushdown-key", "Build key column is outside its batch"))?;
             if let Some(((xxhash, murmur3), scalar)) = crate::set_keys::direct_bloom_hashes(column, row) {
+                if let Some(ScalarKey::Signed(value)) = scalar && !key.recorded.record((value, xxhash, murmur3), memory)? { continue; }
                 key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
                 if let Some(iids) = &mut key.filter.iids {
                     let supported = match scalar {
@@ -291,7 +314,8 @@ fn collect_keys(expr: &Expr, build: &Schema, probe: &Schema, bitmap_bound: usize
                 let pending = if !blooms { 0 } else if dense { DENSE_WORDS * std::mem::size_of::<u64>() } else { PENDING_POSITIONS * std::mem::size_of::<u32>() };
                 let reservation = execution.context.memory.reserve(if blooms { bitmap_bound.saturating_add(pending) } else { 256 })?;
                 keys.push(Key { expression: expression.clone(), probe: *id, filter: ColumnFilter { bloom: blooms.then(BloomFilter::default), iids, _reservation: reservation },
-                    pending: if dense { Pending::Dense(vec![0; DENSE_WORDS]) } else { Pending::Sorted(Vec::with_capacity(if blooms { PENDING_POSITIONS } else { 0 })) } });
+                    pending: if dense { Pending::Dense(vec![0; DENSE_WORDS]) } else { Pending::Sorted(Vec::with_capacity(if blooms { PENDING_POSITIONS } else { 0 })) },
+                    recorded: RecordedIntegers::default() });
                 break;
             }
         }
@@ -305,6 +329,18 @@ fn size_error() -> rtdb_types::Anomaly { invalid("pushdown-size", "Join filter a
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_repeated_integer_key_is_recorded_once_per_bloom_hashing() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut recorded = RecordedIntegers::default();
+        assert!(recorded.record((7, 1, 2), &memory).unwrap());
+        assert!(!recorded.record((7, 1, 2), &memory).unwrap());
+        assert!(recorded.record((7, 3, 4), &memory).unwrap(), "the same value hashed as another width still marks its positions");
+        assert!(memory.used_bytes() > 0);
+        drop(recorded);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
     use super::*;
     use rtdb_format::metadata::LeafColumns;
     use rtdb_types::StructFields;
@@ -334,6 +370,7 @@ mod tests {
                     _reservation: memory.reserve(1024).unwrap(),
                 },
                 pending: Pending::Sorted(Vec::new()),
+                recorded: RecordedIntegers::default(),
             }],
             _reservation: memory.reserve(1024).unwrap(),
         };
