@@ -3,6 +3,7 @@
 pub(crate) mod apply;
 pub(crate) mod float_vector;
 mod float_vectors;
+mod functions;
 mod patch;
 pub(crate) mod search;
 pub(crate) mod window;
@@ -4041,6 +4042,21 @@ mod kernel {
                     _ => return None,
                 }))).collect()
             }
+            Expr::Like { expr, pattern, escape, case_insensitive, negated } => {
+                let pattern = match pattern.as_ref() {
+                    Expr::Literal(Value::Utf8(pattern)) => pattern.as_str(),
+                    Expr::Parameter { index, .. } => match parameters.known(*index)? { Value::Utf8(pattern) => pattern.as_str(), _ => return None },
+                    _ => return None,
+                };
+                let like = rtdb_expr::kernels::LikeMatcher::compile(pattern, *escape, *case_insensitive, *negated)?;
+                let mut matches = like.matcher();
+                let operand = Operand::of(expr, schema, batch, parameters)?;
+                (0..rows).map(|row| match operand.get(row).ok()? {
+                    None => Some(None),
+                    Some(Cell::Text(text)) => Some(Some(matches(text))),
+                    Some(_) => None,
+                }).collect()
+            }
             Expr::Between { operand, low, high, symmetric: false } => {
                 let (operand, low, high) = (Operand::of(operand, schema, batch, parameters)?, Operand::of(low, schema, batch, parameters)?, Operand::of(high, schema, batch, parameters)?);
                 (0..rows).map(|row| {
@@ -5254,6 +5270,12 @@ impl BatchCursor for BatchExpressions {
             }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+            if let Some(column) = functions::column(kernel, &self.schema, &batch, parameters) {
+                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+                continue;
+            }
             let scope = self.execution.scope()?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
