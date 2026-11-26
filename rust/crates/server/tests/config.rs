@@ -1,6 +1,6 @@
 use std::time::Duration;
 use rtdb_auth::{AuthConfig, Method};
-use rtdb_server::config::{NodeConfiguration, RemoteConfig, parse_duration};
+use rtdb_server::config::{NodeConfiguration, RemoteConfig, host_timezone_from, parse_duration};
 
 fn decode(yaml: &str) -> rtdb_types::Result<NodeConfiguration> { NodeConfiguration::from_yaml_with_environment(yaml, &|_| None, false) }
 
@@ -147,6 +147,25 @@ fn yaml_and_edn_preserve_the_difference_between_omitted_and_configured_timezones
         r#"{:default-tz "Europe/Paris"}"#, &|_| None,
     ).unwrap();
     assert_eq!(paris.node_options(1 << 20).unwrap().default_timezone, "Europe/Paris");
+}
+
+#[test]
+fn a_configured_default_timezone_is_the_pgwire_session_zone() {
+    assert_eq!(decode("defaultTz: Asia/Tokyo").unwrap().pgwire_timezone(), "Asia/Tokyo");
+}
+
+#[test]
+fn the_host_timezone_is_found_where_the_jvm_looks_for_it() {
+    use std::path::Path;
+    let paris = Path::new("/var/db/timezone/zoneinfo/Europe/Paris");
+    assert_eq!(host_timezone_from(Some("Asia/Tokyo"), Some("America/New_York\n"), Some(paris)), "Asia/Tokyo");
+    assert_eq!(host_timezone_from(Some(":Asia/Tokyo"), None, None), "Asia/Tokyo");
+    assert_eq!(host_timezone_from(Some("/usr/share/zoneinfo/Asia/Tokyo"), None, None), "Asia/Tokyo");
+    assert_eq!(host_timezone_from(None, Some("America/New_York\n"), Some(paris)), "America/New_York");
+    assert_eq!(host_timezone_from(Some(""), None, Some(paris)), "Europe/Paris");
+    assert_eq!(host_timezone_from(Some("Mars/Olympus"), None, Some(paris)), "Europe/Paris");
+    assert_eq!(host_timezone_from(None, None, Some(Path::new("/etc/elsewhere"))), "UTC");
+    assert_eq!(host_timezone_from(None, None, None), "UTC");
 }
 
 #[test]

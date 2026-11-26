@@ -312,6 +312,7 @@ impl ServerDriver {
         let mut addresses = ListenerAddresses::default();
         let mut pgwire = Vec::new();
         if let Some(settings) = &config.server {
+            let timezone = config.pgwire_timezone();
             let tls = match &installed_tls {
                 Some(tls) => Some(Arc::clone(tls)),
                 None => settings.ssl.as_ref().map(|settings| crate::tls::load(settings, node.memory())).transpose()?,
@@ -321,9 +322,7 @@ impl ServerDriver {
                 let mut configuration = rtdb_pgwire::ServerConfig { address: address(&settings.host, port).await?, maximum_connections: settings.connections,
                     pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), require_tls: installed_tls.is_some(),
                     capabilities: capabilities.clone(), gateway_session_state, ..Default::default() };
-                if let Some(zone) = &config.default_timezone {
-                    configuration.parameters.insert("timezone".into(), zone.clone());
-                }
+                configuration.parameters.insert("timezone".into(), timezone.clone());
                 let (handle, driver) = rtdb_pgwire::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 registrations.push(metrics.register_provider(handle.metrics_provider()?)?);
                 if read_only { addresses.read_only_pgwire = Some(handle.address()); } else { addresses.pgwire = Some(handle.address()); }

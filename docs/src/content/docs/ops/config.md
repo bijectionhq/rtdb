@@ -208,6 +208,11 @@ server:
   readOnlyPort: -1
 ```
 
+A Postgres wire session starts in the time zone its client names in the startup `TimeZone` parameter.
+Without one, it starts in the node's `defaultTz` where that is configured, and otherwise in the host's time zone: the `TZ` environment variable, then `/etc/timezone`, then the zone `/etc/localtime` links to, falling back to `UTC`.
+The server reports that zone in the `TimeZone` parameter status, and it decides how casts between local and zoned dates and timestamps read.
+Set `defaultTz: UTC` to keep sessions in UTC on a host configured for another zone.
+
 ### Flight SQL Server
 
 By default a Flight SQL server is started on localhost, on a port the server picks; the XTDB Docker images pin it to 3000.

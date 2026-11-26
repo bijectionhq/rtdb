@@ -1905,3 +1905,18 @@ async fn float_array_bind_round_trips_through_queries_and_dml() {
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn a_server_default_timezone_starts_each_session_in_that_zone() {
+    let mut config = ServerConfig::default();
+    config.parameters.insert("timezone".into(), "Europe/Paris".into());
+    let running = Running::start(config, None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"Europe/Paris".to_vec())]]);
+    let cast = rows(&client.query("SELECT CAST(TIMESTAMP '2020-01-01 12:00:00+02:00' AS TIMESTAMP), CAST(DATE '2020-01-01' AS TIMESTAMP WITH TIME ZONE)").await);
+    let text = |cell: &Option<Vec<u8>>| String::from_utf8(cell.clone().unwrap()).unwrap();
+    assert!(text(&cast[0][0]).contains("11:00:00"), "{}", text(&cast[0][0]));
+    assert!(text(&cast[0][1]).contains("00:00:00+01:00"), "{}", text(&cast[0][1]));
+    drop(client);
+    running.stop().await;
+}

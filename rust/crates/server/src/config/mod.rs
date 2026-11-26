@@ -4,6 +4,7 @@ mod node;
 mod edn;
 mod bounded;
 mod receiver_clock;
+mod host_zone;
 pub(crate) mod properties;
 
 use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, time::Duration};
@@ -15,6 +16,7 @@ pub use remotes::RemoteConfig;
 pub use crate::custody_provider::Settings as CustodyProviderSettings;
 pub use bounded::{ConfigurationEnvironment, EnvironmentValue, ParsedConfiguration, ParsedYamlDocument, ProcessEnvironment};
 pub use properties::object_sort_properties;
+pub use host_zone::host_timezone_from;
 
 #[derive(Clone, Debug)]
 pub struct PgwireSettings { pub host: String, pub port: i32, pub read_only_port: i32, pub connections: usize, pub ssl: Option<KeyStoreSettings> }
