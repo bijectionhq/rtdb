@@ -673,6 +673,16 @@ impl OwnedSchema {
         Ok(())
     }
 
+    /// A stored column reads an absent cell back as null, so a stored null in an
+    /// optional non-nullable field is that field's absence.
+    pub fn restore_stored_absence(&self, row: &mut StructFields<Value>) {
+        for field in self.0.fields.iter().filter(|field| field.optional && !field.nullable) {
+            if matches!(row.get(field.name.as_str()), Some(Value::Null)) {
+                row.remove(field.name.as_str());
+            }
+        }
+    }
+
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
         for field in &self.0.fields {
             if !field.accepts(row.get(field.name.as_str())) {

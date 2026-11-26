@@ -150,6 +150,7 @@ impl OpenTransaction<'_> {
         for event in &mut data_history.events {
             self.context.check_cancelled()?;
             let StoredOperation::Put(document) = &mut event.operation else { continue; };
+            previous.restore_stored_absence(document);
             previous.validate_row(document)?;
             for (index, (old, new)) in orders.iter().enumerate() {
                 let Some(Value::Binary(key)) = document.remove(*old) else {
@@ -610,15 +611,16 @@ mod tests {
         let control = |id: &str, value| StructFields::from([
             ("_id".into(), Value::Utf8(id.into())), ("layout".into(), Value::I64(value)),
         ]);
+        let installed = Interval::new(Timestamp(0), Timestamp::MAX)?;
         let mut install = OpenTransaction::new(state.snapshot(), key(1, 100), &options, &context)?;
         for (table, id) in [("bj_fact_root_owner", "root"), ("bj_relation_declarations", "tablet")] {
-            install.buffer.put(TableRef::new("public", table), control(id, 1), Interval::ALL)?;
+            install.buffer.put(TableRef::new("public", table), control(id, 1), installed)?;
         }
         install.buffer.put(TableRef::new("public", "bj_installation"), StructFields::from([
             ("_id".into(), Value::Utf8("authority".into())), ("kind".into(), Value::Utf8("hosted".into())),
             ("incarnation".into(), Value::Binary(vec![7; 16])),
             ("writer".into(), Value::Utf8("11111111111111111111111111111111".into())),
-        ]), Interval::ALL)?;
+        ]), installed)?;
         install.declare_owned_relation(&source, &original_schema).await?;
         install.declare_owned_relation(&target, &next_schema).await?;
         for (relation, orders) in [(&source, [&source_order, &source_creation]), (&target, [&target_order, &target_creation])] {
@@ -734,9 +736,12 @@ mod tests {
         )?)));
         assert_eq!(parts.get("scale"), Some(&Value::I8(2)));
         assert_eq!(fields.get(&target_order), Some(&Value::Binary(Vec::new())));
-        let StoredOperation::Put(missing) = data.view().read_event(1)?.operation else { unreachable!() };
+        let StoredOperation::Put(mut missing) = data.view().read_event(1)?.operation else { unreachable!() };
         let StoredOperation::Put(null) = data.view().read_event(2)?.operation else { unreachable!() };
-        assert!(matches!(missing.get(PAYLOAD), Some(Value::Undefined) | None));
+        assert_eq!(missing.get(PAYLOAD), Some(&Value::Null));
+        next_schema.restore_stored_absence(&mut missing);
+        assert_eq!(missing.get(PAYLOAD), None);
+        next_schema.validate_row(&missing)?;
         assert_eq!(null.get(PAYLOAD), Some(&Value::Binary(vec![2])));
         assert_eq!(data.header(0)?.position.unwrap().transaction, TxId(2));
         assert_eq!(data.header(3)?.position.unwrap().transaction, TxId(3));
