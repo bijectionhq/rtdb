@@ -69,13 +69,13 @@ impl Sample {
     /// Buffer numbers are scoped to this operation. A number can follow the
     /// same backing through a slice or ownership transfer.
     pub fn record(self, edge: &'static str, measures: Measures) {
-        let _ = writeln!(
-            io::stderr().lock(),
+        // One write per record keeps it whole when stdout shares the descriptor.
+        let line = format!(
             concat!(
                 "arrow-flow {{\"version\":1,\"process\":{},\"session\":\"{}\",\"operation\":{},",
                 "\"edge\":\"{}\",\"rows\":{},\"encoded_bytes\":{},\"copied_bytes\":{},",
                 "\"new_backing_bytes\":{},\"reservation_bytes\":{},",
-                "\"input_buffer\":{},\"output_buffer\":{},\"layout\":\"{}\",\"fallback_reason\":\"{}\"}}"
+                "\"input_buffer\":{},\"output_buffer\":{},\"layout\":\"{}\",\"fallback_reason\":\"{}\"}}\n"
             ),
             std::process::id(),
             self.session,
@@ -91,5 +91,6 @@ impl Sample {
             measures.layout.unwrap_or_default(),
             measures.fallback_reason.unwrap_or_default(),
         );
+        let _ = io::stderr().lock().write_all(line.as_bytes());
     }
 }
