@@ -1,7 +1,9 @@
-//! Column-at-a-time projection of scalar calls and searched CASE over plain scalar cells, through
-//! `rtdb_expr::kernels`, which share the scalar functions' per-value code.
-//! A projection resolves its calls to kernels once; `Ok(None)` then leaves a batch to the row evaluator: any layout or
-//! cell outside these kernels, and any cell the evaluator would fail on, so that it raises that error in row order.
+//! Column-at-a-time evaluation of scalar expressions over plain scalar cells: calls, arithmetic, negation, numeric
+//! casts and searched CASE through `rtdb_expr::kernels`, which share the scalar functions' per-value code, and
+//! predicates through the predicate kernel.
+//! A failing cell raises the row evaluator's error for that cell. Each CASE branch is computed only over the rows that
+//! take it, so a cell fails only where the row evaluator would evaluate it.
+//! `Ok(None)` leaves a batch to the row evaluator where a layout, a cell type or a result is outside these vectors.
 //! Every vector built along the way is charged to the query's memory budget while it lives.
 
 use std::sync::Arc;
@@ -9,8 +11,8 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray, new_null_array};
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_expr::kernels::{self, Function};
-use rtdb_plan::{Expr, Schema};
+use rtdb_expr::kernels::{self, Function, Selection};
+use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use super::{Column, ColumnBatch, SelectedColumn, plain_scalar};
@@ -201,7 +203,7 @@ fn constant(value: &Value, len: usize) -> Option<Vector> {
     })
 }
 
-/// A projected scalar call or searched CASE, its calls resolved once to the kernels that compute them.
+/// A projected expression, its calls resolved once to the kernels that compute them.
 pub(crate) struct Projection(Node);
 
 struct Node { kind: Kind, declared: LogicalType }
@@ -220,24 +222,34 @@ enum Kind {
     Substring { text: Box<Node>, position: Box<Node>, length: Option<Box<Node>> },
     /// A function of one double, reading an integer argument as the double nearest it.
     Double(fn(f64) -> f64, Box<Node>),
+    /// `+`, `-`, `*`, `/` or MOD.
+    Arithmetic { op: BinaryOp, left: Box<Node>, right: Box<Node> },
+    Negate(Box<Node>),
+    /// A CAST to the node's declared scalar.
+    Cast(Box<Node>),
+    /// A predicate, whose truths the predicate kernel computes.
+    Truth(Expr),
     /// The values of the branches, then the otherwise value.
     Case { conditions: Vec<Expr>, values: Vec<Node> },
-    Vectorised(Expr),
 }
 
 impl Projection {
-    /// `None` for an expression no batch can compute here.
+    /// `None` for an expression no batch can compute here; a bare column, literal or parameter is copied elsewhere.
     pub(crate) fn bind(expr: &Expr, schema: &Schema) -> Option<Self> {
-        if !matches!(expr, Expr::Call { .. } | Expr::Case { .. }) { return None; }
+        if matches!(expr, Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter { .. }) { return None; }
         Node::bind(expr, schema).map(Self)
     }
 
     /// The column over `batch`, typed as the evaluator's packed results are, or `Ok(None)` where the evaluator must
     /// compute it.
     pub(crate) fn column(&self, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
-        let Some(charged) = (Evaluation { schema, batch, parameters, memory }).vector(&self.0)? else { return Ok(None) };
+        self.evaluated(&Evaluation { schema, columns: &batch.columns, len: batch.len, batch: Some(batch), parameters: Parameters::Values(parameters), memory })
+    }
+
+    fn evaluated(&self, evaluation: &Evaluation<'_>) -> Result<Option<Column>> {
+        let Some(charged) = evaluation.vector(&self.0, None)? else { return Ok(None) };
         let vector = charged.vector;
-        let len = batch.len;
+        let len = evaluation.len;
         let (array, logical): (ArrayRef, LogicalType) = match (vector.array(), vector.scalar()) {
             (Some(array), Some(scalar)) if array.null_count() < len => {
                 let logical = LogicalType::Scalar(scalar);
@@ -248,6 +260,65 @@ impl Projection {
         };
         let field = rtdb_columnar::to_field("value", &logical)?;
         Ok((field.data_type() == array.data_type()).then(|| Column::Arrow { array, field: Arc::new(field), logical: Some(logical) }))
+    }
+}
+
+/// The column of `expr` over `batch`, `Ok(None)` where the row evaluator computes it.
+pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
+    match Projection::bind(expr, schema) {
+        Some(projection) => projection.column(schema, batch, parameters, memory),
+        None => Ok(None),
+    }
+}
+
+/// The one-row column of `expr` over `columns`, reading its parameters from the one-row `arguments`, charged to
+/// `memory` for as long as it lives.
+pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arguments: &[Column], memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
+    if !bound_lowerable(expr) { return Ok(None); }
+    let Some(projection) = Projection::bind(expr, schema) else { return Ok(None) };
+    let evaluation = Evaluation { schema, columns, len: 1, batch: None, parameters: Parameters::Columns(arguments), memory };
+    let Some(Column::Arrow { array, field, logical }) = projection.evaluated(&evaluation)? else { return Ok(None) };
+    let charge = memory.reserve(array.get_array_memory_size())?;
+    let array = rtdb_columnar::retain_array(array, &charge)?;
+    Ok(Some(Column::Arrow { array, field, logical }))
+}
+
+/// Whether a leaf of this declared type can be read as a vector.
+fn plain_leaf(logical: &LogicalType) -> bool {
+    match logical {
+        LogicalType::Maybe(inner) => plain_leaf(inner),
+        LogicalType::Scalar(scalar) => matches!(scalar, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+            | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Bool),
+        _ => false,
+    }
+}
+
+/// Whether the shape of `expr` could be computed here; its inputs' layouts decide per batch.
+pub(crate) fn lowerable(expr: &Expr) -> bool { lowerable_at(expr, None) }
+
+/// As `lowerable`, for an expression over parameters bound one row at a time, to a bounded depth.
+pub(crate) fn bound_lowerable(expr: &Expr) -> bool { lowerable_at(expr, Some(32)) }
+
+fn lowerable_at(expr: &Expr, remaining: Option<usize>) -> bool {
+    if remaining == Some(0) { return false; }
+    let lower = |expr: &Expr| lowerable_at(expr, remaining.map(|depth| depth - 1));
+    match expr {
+        Expr::Parameter { .. } if remaining.is_some() => true,
+        Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => plain_leaf(&expr.data_type()),
+        Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
+            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lower(left) && lower(right),
+        Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lower(expr),
+        Expr::Cast { expr, target: CastTarget::Fixed(_) } => lower(expr),
+        Expr::Case { branches, otherwise } => branches.iter().all(|(condition, value)| lower(condition) && lower(value)) && lower(otherwise),
+        Expr::Call { name, args, .. } => match (Function::resolve(name), args.as_slice()) {
+            (Some(Function::Upper | Function::Lower), [arg]) if remaining.is_some() => {
+                matches!(arg, Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_)) && lower(arg)
+            }
+            (Some(Function::Upper | Function::Lower | Function::Length | Function::Abs), [arg]) => lower(arg),
+            (Some(Function::Mod), [left, right]) => lower(left) && lower(right),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -262,6 +333,7 @@ impl Node {
             Expr::Column { id, .. } => Kind::Column(schema.position(*id)?),
             Expr::Literal(value) => Kind::Literal(value.clone()),
             Expr::Parameter { index, .. } => Kind::Parameter(*index),
+            Expr::Call { name, args, .. } if name == "===" && args.len() == 2 => Kind::Truth(expr.clone()),
             Expr::Call { name, args, .. } => match (Function::resolve(name)?, args.as_slice()) {
                 (Function::Extract, [Expr::Literal(Value::Utf8(field)), source]) => Kind::Extract { field: field.clone(), source: child(source)? },
                 (Function::Round, [value]) => Kind::Round { value: child(value)?, scale: None },
@@ -273,92 +345,127 @@ impl Node {
                 (Function::Length, [text]) => Kind::Length(child(text)?),
                 (Function::Substring, [text, position]) => Kind::Substring { text: child(text)?, position: child(position)?, length: None },
                 (Function::Substring, [text, position, length]) => Kind::Substring { text: child(text)?, position: child(position)?, length: Some(child(length)?) },
+                (Function::Mod, [left, right]) => Kind::Arithmetic { op: BinaryOp::Modulo, left: child(left)?, right: child(right)? },
                 (function, [value]) => Kind::Double(function.double()?, child(value)?),
                 _ => return None,
             },
+            Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo), left, right } =>
+                Kind::Arithmetic { op: *op, left: child(left)?, right: child(right)? },
+            Expr::Unary { op: UnaryOp::Negate, expr: operand } => Kind::Negate(child(operand)?),
+            Expr::Cast { expr: operand, target: CastTarget::Fixed(_) } => Kind::Cast(child(operand)?),
             Expr::Case { branches, otherwise } => Kind::Case {
                 conditions: branches.iter().map(|(condition, _)| condition.clone()).collect(),
                 values: branches.iter().map(|(_, value)| value).chain(std::iter::once(otherwise.as_ref()))
                     .map(|value| Self::bind(value, schema)).collect::<Option<_>>()?,
             },
-            expr => Kind::Vectorised(expr.clone()),
+            expr if plain_scalar(&expr.data_type()) == Some(&ScalarType::Bool) => Kind::Truth(expr.clone()),
+            _ => return None,
         };
         Some(Self { kind, declared: expr.data_type() })
     }
 }
 
-struct Evaluation<'a> { schema: &'a Schema, batch: &'a ColumnBatch, parameters: rtdb_expr::Parameters<'a>, memory: &'a Arc<MemoryBudget> }
+/// Where parameters are read from: values known for the whole batch, or one-row columns bound with the query.
+#[derive(Clone, Copy)]
+enum Parameters<'a> { Values(rtdb_expr::Parameters<'a>), Columns(&'a [Column]) }
+
+struct Evaluation<'a> {
+    schema: &'a Schema,
+    columns: &'a [Column],
+    len: usize,
+    /// The batch the predicate kernel reads, `None` for parameters bound one row at a time.
+    batch: Option<&'a ColumnBatch>,
+    parameters: Parameters<'a>,
+    memory: &'a Arc<MemoryBudget>,
+}
+
+/// Integers of the type `result`, held as 64-bit integers, as a vector of that type.
+fn narrowed(values: Int64Array, result: &ScalarType) -> Vector {
+    match result {
+        ScalarType::I32 => Vector::I32(values.unary(|value| value as i32)),
+        _ => Vector::I64(values),
+    }
+}
 
 impl Evaluation<'_> {
-    fn vector(&self, node: &Node) -> Result<Option<Charged>> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.vector_at(node))
+    /// `node` over the rows `selection` picks; the others are null.
+    fn vector(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
+        // A branch no row takes computes nothing, so nothing in it can fail.
+        if selection.is_some_and(|rows| !rows.contains(&true)) { return Ok(Some(Charged::shared(Vector::Null))); }
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.vector_at(node, selection))
     }
 
     fn built(&self, vector: Option<Vector>) -> Result<Option<Charged>> {
         vector.map(|vector| Charged::built(vector, self.memory)).transpose()
     }
 
-    fn vector_at(&self, node: &Node) -> Result<Option<Charged>> {
-        let len = self.batch.len;
+    fn vector_at(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
+        let len = self.len;
         let null = || -> Result<Option<Charged>> { Ok(Some(Charged::shared(Vector::Null))) };
         let charged = match &node.kind {
-            Kind::Column(position) => read(&self.batch.columns[*position], &node.declared, len, self.memory)?,
+            Kind::Column(position) => read(&self.columns[*position], &node.declared, len, self.memory)?,
             Kind::Literal(value) => self.built(constant(value, len))?,
-            Kind::Parameter(index) => match self.parameters.known(*index) {
-                Some(value) => self.built(constant(value, len))?,
-                None => None,
+            Kind::Parameter(index) => match self.parameters {
+                Parameters::Values(parameters) => match parameters.known(*index) {
+                    Some(value) => self.built(constant(value, len))?,
+                    None => None,
+                },
+                Parameters::Columns(arguments) => match arguments.get(*index) {
+                    Some(argument) => read(argument, &node.declared, len, self.memory)?,
+                    None => None,
+                },
             },
             Kind::Extract { field, source } => {
-                let Some(source) = self.vector(source)? else { return Ok(None) };
+                let Some(source) = self.vector(source, selection)? else { return Ok(None) };
                 match &source.vector {
                     Vector::Null => return null(),
-                    Vector::Micros(values, zone) => self.built(kernels::extract_timestamps(field, values, zone.as_deref()).map(Vector::I32))?,
+                    Vector::Micros(values, zone) => self.built(kernels::extract_timestamps(field, values, zone.as_deref(), selection)?.map(Vector::I32))?,
                     _ => None,
                 }
             }
             Kind::Round { value, scale } => {
-                let Some(value) = self.vector(value)? else { return Ok(None) };
+                let Some(value) = self.vector(value, selection)? else { return Ok(None) };
                 // Rounding an integer to no places is the integer itself.
                 if scale.is_none() && matches!(value.vector, Vector::I32(_) | Vector::I64(_)) {
                     Some(value)
                 } else {
                     match &value.vector {
                         Vector::Null => return null(),
-                        Vector::F64(values) => self.built(kernels::round_doubles(values, scale.unwrap_or(0)).map(Vector::F64))?,
+                        Vector::F64(values) => self.built(Some(Vector::F64(kernels::round_doubles(values, scale.unwrap_or(0), selection)?)))?,
                         _ => None,
                     }
                 }
             }
             Kind::Abs(argument) => {
-                let Some(argument) = self.vector(argument)? else { return Ok(None) };
+                let Some(argument) = self.vector(argument, selection)? else { return Ok(None) };
                 match &argument.vector {
                     Vector::Null => return null(),
                     Vector::F64(values) => self.built(Some(Vector::F64(kernels::doubles(f64::abs, values))))?,
-                    Vector::I64(values) => self.built(kernels::abs_integers(values).map(Vector::I64))?,
+                    Vector::I64(values) => self.built(Some(Vector::I64(kernels::abs_integers(values, selection)?)))?,
                     _ => None,
                 }
             }
             Kind::TextCase { text, upper } => {
-                let Some(text) = self.vector(text)? else { return Ok(None) };
+                let Some(text) = self.vector(text, selection)? else { return Ok(None) };
                 match &text.vector {
                     Vector::Null => return null(),
-                    Vector::Text(values) => self.built(kernels::text_case(values, *upper).map(Vector::Text))?,
+                    Vector::Text(values) => self.built(kernels::text_case(values, *upper, selection)?.map(Vector::Text))?,
                     _ => None,
                 }
             }
             Kind::Length(text) => {
-                let Some(text) = self.vector(text)? else { return Ok(None) };
+                let Some(text) = self.vector(text, selection)? else { return Ok(None) };
                 match &text.vector {
                     Vector::Null => return null(),
-                    Vector::Text(values) => self.built(kernels::text_lengths(values).map(Vector::I32))?,
+                    Vector::Text(values) => self.built(Some(Vector::I32(kernels::text_lengths(values))))?,
                     _ => None,
                 }
             }
             Kind::Substring { text, position, length } => {
-                let Some(text) = self.vector(text)? else { return Ok(None) };
-                let Some(position) = self.vector(position)? else { return Ok(None) };
+                let Some(text) = self.vector(text, selection)? else { return Ok(None) };
+                let Some(position) = self.vector(position, selection)? else { return Ok(None) };
                 let length = match length {
-                    Some(length) => match self.vector(length)? { Some(length) => Some(length), None => return Ok(None) },
+                    Some(length) => match self.vector(length, selection)? { Some(length) => Some(length), None => return Ok(None) },
                     None => None,
                 };
                 // The scalar call answers null for a null argument before reading the others.
@@ -371,23 +478,72 @@ impl Evaluation<'_> {
                     Some(length) => match self.integers(&length.vector)? { Some(lengths) => Some(lengths), None => return Ok(None) },
                     None => None,
                 };
-                self.built(kernels::text_substrings(values, &positions.0, lengths.as_ref().map(|lengths| &lengths.0)).map(Vector::Text))?
+                self.built(kernels::text_substrings(values, &positions.0, lengths.as_ref().map(|lengths| &lengths.0), selection)?.map(Vector::Text))?
             }
             Kind::Double(function, argument) => {
-                let Some(argument) = self.vector(argument)? else { return Ok(None) };
+                let Some(argument) = self.vector(argument, selection)? else { return Ok(None) };
                 if matches!(argument.vector, Vector::Null) { return null(); }
                 let Some(values) = self.doubles(&argument.vector)? else { return Ok(None) };
                 self.built(Some(Vector::F64(kernels::doubles(*function, &values.0))))?
             }
-            Kind::Case { conditions, values } => self.case(conditions, values)?,
-            Kind::Vectorised(expr) => match crate::vector::column(expr, self.schema, self.batch, self.parameters) {
-                // The read shares the computed column's buffers, which live as long as it does.
-                Some(column) => match read(&column, &node.declared, len, self.memory)? {
-                    Some(read) => Some(Charged::built(read.vector, self.memory)?),
-                    None => None,
-                },
-                None => None,
-            },
+            Kind::Arithmetic { op, left, right } => {
+                // Both operands are evaluated, as the row evaluator evaluates both before reading either.
+                let Some(left) = self.vector(left, selection)? else { return Ok(None) };
+                let Some(right) = self.vector(right, selection)? else { return Ok(None) };
+                if matches!(left.vector, Vector::Null) || matches!(right.vector, Vector::Null) { return null(); }
+                let floating = matches!(left.vector, Vector::F64(_)) || matches!(right.vector, Vector::F64(_));
+                let wide = matches!(left.vector, Vector::I64(_)) || matches!(right.vector, Vector::I64(_));
+                match plain_scalar(&node.declared) {
+                    Some(ScalarType::F64) if floating => {
+                        let (Some(left), Some(right)) = (self.doubles(&left.vector)?, self.doubles(&right.vector)?) else { return Ok(None) };
+                        self.built(Some(Vector::F64(kernels::float_arithmetic(*op, &left.0, &right.0, selection)?)))?
+                    }
+                    // Two integers give the wider of their types.
+                    Some(result @ (ScalarType::I32 | ScalarType::I64)) if !floating && wide == (*result == ScalarType::I64) => {
+                        let (Some(left), Some(right)) = (self.integers(&left.vector)?, self.integers(&right.vector)?) else { return Ok(None) };
+                        let values = kernels::integer_arithmetic(*op, &left.0, &right.0, result, selection)?;
+                        self.built(Some(narrowed(values, result)))?
+                    }
+                    _ => None,
+                }
+            }
+            Kind::Negate(operand) => {
+                let Some(operand) = self.vector(operand, selection)? else { return Ok(None) };
+                match &operand.vector {
+                    Vector::Null => return null(),
+                    Vector::F64(values) => self.built(Some(Vector::F64(kernels::doubles(|value: f64| -value, values))))?,
+                    vector @ (Vector::I32(_) | Vector::I64(_)) => {
+                        let result = vector.scalar().expect("an integer vector has a type");
+                        let Some(values) = self.integers(vector)? else { return Ok(None) };
+                        self.built(Some(narrowed(kernels::negate_integers(&values.0, &result, selection)?, &result)))?
+                    }
+                    _ => None,
+                }
+            }
+            Kind::Cast(operand) => {
+                let Some(operand) = self.vector(operand, selection)? else { return Ok(None) };
+                let Some(target) = plain_scalar(&node.declared) else { return Ok(None) };
+                let identity = !matches!(operand.vector, Vector::Micros(..)) && operand.vector.scalar().as_ref() == Some(target);
+                if identity {
+                    Some(operand)
+                } else {
+                    match (&operand.vector, target) {
+                        (Vector::Null, _) => return null(),
+                        (Vector::I32(values), ScalarType::I64) => self.built(Some(Vector::I64(values.unary(i64::from))))?,
+                        (Vector::I64(values), ScalarType::I32) => self.built(Some(narrowed(kernels::cast_integers(values, &ScalarType::I32, selection)?, &ScalarType::I32)))?,
+                        (Vector::I32(values), ScalarType::F64) => self.built(Some(Vector::F64(values.unary(f64::from))))?,
+                        (Vector::I64(values), ScalarType::F64) => self.built(Some(Vector::F64(values.unary(|value| value as f64))))?,
+                        _ => None,
+                    }
+                }
+            }
+            Kind::Truth(predicate) => {
+                let (Some(batch), Parameters::Values(parameters)) = (self.batch, self.parameters) else { return Ok(None) };
+                // The predicate kernel raises nothing, so its truths can be computed for every row.
+                let Some(truth) = super::kernel::truth(predicate, self.schema, batch, parameters) else { return Ok(None) };
+                self.built(Some(Vector::Bool(BooleanArray::from(truth))))?
+            }
+            Kind::Case { conditions, values } => self.case(conditions, values, selection)?,
         };
         let Some(charged) = charged else { return Ok(None) };
         // Each node yields its declared type, as the evaluator's cells do.
@@ -423,20 +579,27 @@ impl Evaluation<'_> {
         Ok(Some((array, Some(charge))))
     }
 
-    /// Each row takes the value of the first branch whose condition holds, as the evaluator's searched CASE does;
-    /// every branch is computed for every row, so one failing anywhere leaves the batch to the evaluator.
-    fn case(&self, conditions: &[Expr], values: &[Node]) -> Result<Option<Charged>> {
-        let len = self.batch.len;
+    /// Each row takes the value of the first branch whose condition holds, as the evaluator's searched CASE does,
+    /// and each branch is computed over only the rows that take it.
+    fn case(&self, conditions: &[Expr], values: &[Node], selection: Selection<'_>) -> Result<Option<Charged>> {
+        let (Some(batch), Parameters::Values(parameters)) = (self.batch, self.parameters) else { return Ok(None) };
+        let len = self.len;
         let truth_bytes = conditions.len().checked_mul(len).and_then(|cells| cells.checked_mul(size_of::<Option<bool>>())).ok_or_else(super::size_error)?;
         let _truths = self.memory.reserve(truth_bytes)?;
         let mut truths = Vec::with_capacity(conditions.len());
         for condition in conditions {
-            let Some(truth) = super::kernel::truth(condition, self.schema, self.batch, self.parameters) else { return Ok(None) };
+            let Some(truth) = super::kernel::truth(condition, self.schema, batch, parameters) else { return Ok(None) };
             truths.push(truth);
         }
+        let _cells = self.memory.reserve(cell_bytes(len)?.checked_add(len).ok_or_else(super::size_error)?)?;
+        let cells: Vec<(usize, usize)> = (0..len)
+            .map(|row| (truths.iter().position(|truth| truth[row] == Some(true)).unwrap_or(conditions.len()), row))
+            .collect();
+        drop(truths);
         let mut computed = Vec::with_capacity(values.len());
-        for value in values {
-            let Some(value) = self.vector(value)? else { return Ok(None) };
+        for (branch, value) in values.iter().enumerate() {
+            let taken: Vec<bool> = cells.iter().map(|(chosen, row)| *chosen == branch && selection.is_none_or(|rows| rows[*row])).collect();
+            let Some(value) = self.vector(value, Some(taken.as_slice()))? else { return Ok(None) };
             computed.push(value);
         }
         let mut typed = computed.iter().map(|value| &value.vector).filter(|value| !matches!(value, Vector::Null));
@@ -448,10 +611,6 @@ impl Evaluation<'_> {
         let _nulls = self.memory.reserve(nulls.get_array_memory_size())?;
         let arrays = computed.iter().map(|value| value.vector.array()).collect::<Vec<_>>();
         let sources: Vec<&dyn Array> = arrays.iter().map(|array| array.as_deref().unwrap_or(nulls.as_ref())).collect();
-        let _cells = self.memory.reserve(cell_bytes(len)?)?;
-        let cells: Vec<(usize, usize)> = (0..len)
-            .map(|row| (truths.iter().position(|truth| truth[row] == Some(true)).unwrap_or(conditions.len()), row))
-            .collect();
         let Ok(chosen) = super::interleave(&sources, &cells) else { return Ok(None) };
         self.built(Vector::of(chosen.as_ref(), &scalar))
     }
@@ -461,7 +620,7 @@ impl Evaluation<'_> {
 mod tests {
     use super::*;
     use rtdb_columnar::MemoryBudget;
-    use rtdb_plan::{BinaryOp, ColumnId, Field};
+    use rtdb_plan::{ColumnId, Field};
     use rtdb_types::Timestamp;
 
     struct Random(u64);
@@ -486,9 +645,9 @@ mod tests {
         Expr::Call { name: name.into(), args, return_type }
     }
 
-    /// The kernel column of `expr` over `batch`, `None` where the evaluator computes it.
-    fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>) -> Option<Column> {
-        Projection::bind(expr, schema)?.column(schema, batch, rtdb_expr::Parameters::Values(&[]), memory).unwrap()
+    /// The kernel column of `expr` over `batch`, `Ok(None)` where the evaluator computes it.
+    fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Column>> {
+        super::column(expr, schema, batch, rtdb_expr::Parameters::Values(&[]), memory)
     }
 
     /// The cells of one column, laid out as the scan's three column shapes lay them out.
@@ -545,10 +704,20 @@ mod tests {
             };
         }
         let argument = number(random, depth - 1);
-        match random.below(4) {
+        match random.below(7) {
             0 => call(random.pick(&["sqrt", "ln", "exp", "sin", "atan", "floor", "ceil", "log10"]), vec![argument]),
             1 => if random.below(2) == 0 { call("round", vec![argument]) } else { call("round", vec![argument, Expr::Literal(Value::I64(random.below(9) as i64 - 3))]) },
             2 => call("abs", vec![argument]),
+            3 => {
+                let op = random.pick(&[BinaryOp::Add, BinaryOp::Subtract, BinaryOp::Multiply, BinaryOp::Divide, BinaryOp::Modulo]);
+                Expr::binary(op, argument, number(random, depth - 1))
+            }
+            4 => Expr::Unary { op: rtdb_plan::UnaryOp::Negate, expr: Box::new(argument) },
+            5 => match plain_scalar(&argument.data_type()) {
+                Some(ScalarType::I64) => Expr::Cast { expr: Box::new(argument), target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::I32)) },
+                Some(ScalarType::I32 | ScalarType::F64) => Expr::Cast { expr: Box::new(argument), target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::F64)) },
+                _ => argument,
+            },
             _ => {
                 let ty = argument.data_type();
                 let other = if ty == LogicalType::Scalar(ScalarType::F64).maybe() { column(2) } else { argument.clone() };
@@ -590,7 +759,7 @@ mod tests {
         let memory = MemoryBudget::new(1 << 28);
         let schema = Schema::new((0..6).map(field).collect()).unwrap();
         let mut random = Random(0x2545_f491_4f6c_dd1d);
-        let (mut computed, mut declined) = (0, 0);
+        let (mut computed, mut raised, mut declined) = (0, 0, 0);
         for round in 0..1500 {
             let batch = batch(&mut random, 40, &memory);
             let expr = match round % 3 { 0 => number(&mut random, 3), 1 => text(&mut random, 3), _ => tally(&mut random) };
@@ -601,7 +770,17 @@ mod tests {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 rtdb_expr::evaluate(&expr, &schema, &values, &context)
             }).collect();
-            let Some(column) = project(&expr, &schema, &batch, &memory) else { declined += 1; continue };
+            let column = match project(&expr, &schema, &batch, &memory) {
+                Ok(Some(column)) => column,
+                Ok(None) => { declined += 1; continue }
+                Err(error) => {
+                    // Cells fail in column order rather than row order, but only cells the evaluator also fails on.
+                    let failures: Vec<_> = expected.iter().filter_map(|result| result.as_ref().err()).collect();
+                    assert!(failures.iter().any(|failure| failure.code == error.code), "{expr:?}: the kernel raised {error:?} where the evaluator raises {failures:?}");
+                    raised += 1;
+                    continue;
+                }
+            };
             computed += 1;
             for (row, expected) in expected.into_iter().enumerate() {
                 let expected = expected.unwrap_or_else(|error| panic!("the kernel computed {expr:?} where the evaluator raises {error:?}"));
@@ -610,7 +789,7 @@ mod tests {
                 assert!(same, "{expr:?} at row {row}: evaluator {expected:?}, kernel {actual:?}");
             }
         }
-        assert!(computed > 300, "the kernels should compute many generated expressions: computed {computed}, declined {declined}");
+        assert!(computed > 300 && raised > 0, "the kernels should compute many generated expressions: computed {computed}, raised {raised}, declined {declined}");
     }
 
     #[test]
@@ -649,12 +828,12 @@ mod tests {
         let column = Column::Arrow { field: Arc::new(ArrowField::new("ts", array.data_type().clone(), false)), array, logical: Some(field.data_type.clone()) };
         let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(0).unwrap()).unwrap();
         let month = call("extract", vec![Expr::Literal(Value::Utf8("MONTH".into())), field.expression()]);
-        let Some(Column::Arrow { array, logical, .. }) = project(&month, &schema, &batch, &memory) else { panic!("EXTRACT over timestamps is a kernel") };
+        let Ok(Some(Column::Arrow { array, logical, .. })) = project(&month, &schema, &batch, &memory) else { panic!("EXTRACT over timestamps is a kernel") };
         assert_eq!(logical, Some(LogicalType::Scalar(ScalarType::I32)));
         assert_eq!(array.as_any().downcast_ref::<Int32Array>().unwrap().values().to_vec(), vec![1, 2]);
 
         let null = call("extract", vec![Expr::Literal(Value::Utf8("MONTH".into())), Expr::Literal(Value::Null)]);
-        let Some(Column::Arrow { logical, .. }) = project(&null, &schema, &batch, &memory) else { panic!("a null argument is a null column") };
+        let Ok(Some(Column::Arrow { logical, .. })) = project(&null, &schema, &batch, &memory) else { panic!("a null argument is a null column") };
         assert_eq!(logical, Some(LogicalType::Null));
     }
 
@@ -688,5 +867,47 @@ mod tests {
         assert!(Projection::bind(&spelled("char_length"), &schema).is_some());
         assert!(Projection::bind(&spelled("reverse"), &schema).is_none());
         assert!(Projection::bind(&column(3), &schema).is_none(), "a bare column is no call");
+    }
+
+    #[test]
+    fn a_failing_cell_raises_the_evaluators_error_and_an_untaken_branch_cannot_fail() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new((0..6).map(field).collect()).unwrap();
+        let rows = 3;
+        let integers: ArrayRef = Arc::new(Int64Array::from(vec![Some(i64::MIN), Some(4), Some(0)]));
+        let flags: ArrayRef = Arc::new(BooleanArray::from(vec![Some(false), Some(true), Some(true)]));
+        let mut columns: Vec<Column> = (0..6).map(|id| {
+            let logical = LogicalType::Scalar(types()[id].clone()).maybe();
+            let field = Arc::new(rtdb_columnar::to_field("c", &logical).unwrap());
+            Column::Arrow { array: new_null_array(field.data_type(), rows), field, logical: Some(logical) }
+        }).collect();
+        for (id, array) in [(0, integers), (4, flags)] {
+            let logical = LogicalType::Scalar(types()[id].clone()).maybe();
+            columns[id] = Column::Arrow { field: Arc::new(rtdb_columnar::to_field("c", &logical).unwrap()), array, logical: Some(logical) };
+        }
+        let batch = ColumnBatch::settled(columns, rows, memory.reserve(0).unwrap()).unwrap();
+        let context = rtdb_expr::EvalContext::default();
+        let evaluated = |expr: &Expr| -> Vec<rtdb_types::Result<Value>> { (0..rows).map(|row| {
+            let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
+            rtdb_expr::evaluate(expr, &schema, &values, &context)
+        }).collect() };
+
+        // ABS(i64::MIN) overflows only in the row that doesn't take the branch.
+        let guarded = Expr::Case { branches: vec![(column(4), call("abs", vec![column(0)]))], otherwise: Box::new(Expr::Literal(Value::I64(-1))) };
+        let Some(Column::Arrow { array, .. }) = project(&guarded, &schema, &batch, &memory).unwrap() else { panic!("the guarded ABS is a kernel") };
+        let expected: Vec<Value> = evaluated(&guarded).into_iter().map(|result| result.unwrap()).collect();
+        assert_eq!(expected, [Value::I64(-1), Value::I64(4), Value::I64(0)]);
+        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>(), [Some(-1), Some(4), Some(0)]);
+
+        // Taken by every row, the branch fails as the evaluator does, rather than leaving the batch to it.
+        for failing in [call("abs", vec![column(0)]), Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(8)), column(0)), Expr::binary(BinaryOp::Subtract, column(0), Expr::Literal(Value::I64(1)))] {
+            let expected = evaluated(&failing).into_iter().find_map(|result| result.err()).expect("some row fails");
+            let error = project(&failing, &schema, &batch, &memory).err().unwrap_or_else(|| panic!("{failing:?} raises"));
+            assert_eq!(error.code, expected.code, "{failing:?}");
+        }
+        let divided = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(8)), column(0));
+        let guarded = Expr::Case { branches: vec![(Expr::binary(BinaryOp::NotEq, column(0), Expr::Literal(Value::I64(0))), divided)], otherwise: Box::new(Expr::Literal(Value::I64(7))) };
+        let Some(Column::Arrow { array, .. }) = project(&guarded, &schema, &batch, &memory).unwrap() else { panic!("the guarded division is a kernel") };
+        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>(), [Some(0), Some(2), Some(7)]);
     }
 }

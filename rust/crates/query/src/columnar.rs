@@ -3,7 +3,7 @@
 pub(crate) mod apply;
 pub(crate) mod float_vector;
 mod float_vectors;
-mod functions;
+pub(crate) mod functions;
 mod patch;
 pub(crate) mod search;
 pub(crate) mod window;
@@ -2447,7 +2447,7 @@ fn joined_union(children: &[Option<StoredVector>], cells: &[(usize, usize)], nam
         }).collect();
         arrow_select::interleave::interleave(&arrays, picked).map_err(|error| invalid("column-gather", error))
     }).collect::<Result<Vec<_>>>()?;
-    let array = UnionArray::try_new(legs.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children)
+    let array = UnionArray::try_new(legs.clone(), arrow_buffer::ScalarBuffer::from(ids), Some(arrow_buffer::ScalarBuffer::from(offsets)), children)
         .map_err(|error| invalid("column-gather", error))?;
     Ok(Some(Column::Arrow { array: Arc::new(array), field: Arc::new(target), logical: Some(logical) }))
 }
@@ -3556,8 +3556,7 @@ impl BatchCursor for BatchFilter {
 pub(crate) fn typed_predicate_mask(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, parameters: rtdb_expr::Parameters<'_>,
 ) -> Option<Vec<bool>> {
-    let truth = kernel::truth(predicate, schema, batch, parameters)
-        .or_else(|| crate::vector::truth(predicate, schema, batch, parameters))?;
+    let truth = kernel::truth(predicate, schema, batch, parameters)?;
     Some(truth.into_iter().map(|value| value == Some(true)).collect())
 }
 
@@ -3594,15 +3593,6 @@ async fn admitted_predicate_selection(
     if let Some(truth) = kernel::truth(predicate, schema, batch, params) {
         prepare_typed()?;
         return PredicateSelection::from_bits(truth.into_iter().map(|value| value == Some(true)), memory);
-    }
-    if let Some(array) = crate::vector::evaluate(predicate, schema, batch, params)
-        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
-    {
-        prepare_typed()?;
-        let reservation = memory.reserve(values.get_array_memory_size())?;
-        let values = values.clone();
-        drop(array);
-        return PredicateSelection::from_arrow(values, reservation);
     }
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
@@ -3649,12 +3639,6 @@ pub(crate) async fn predicate_truth(
     if let Some(truth) = kernel::truth(predicate, schema, batch, params) {
         prepare_typed()?;
         return Ok((truth.into_iter().collect(), reservation));
-    }
-    if let Some(array) = crate::vector::evaluate(predicate, schema, batch, params)
-        && let Some(values) = array.as_any().downcast_ref::<BooleanArray>()
-    {
-        prepare_typed()?;
-        return Ok((from_arrow(values), reservation));
     }
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
@@ -3886,6 +3870,8 @@ mod kernel {
         Int32(Int32Array),
         Int64(Int64Array),
         Float64(Float64Array),
+        Text(StringArray),
+        Bool(BooleanArray),
     }
 
     struct ComputedOperand {
@@ -3894,16 +3880,14 @@ mod kernel {
     }
 
     impl ComputedOperand {
+        /// `None` where the column kernels don't compute the operand or one of its cells fails: the predicate kernel
+        /// evaluates every row, so only the row evaluator, which skips what AND, OR and CASE don't reach, raises.
         fn of(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<Self> {
             let memory = batch.reservation.budget();
             let mut reservation = memory.reserve(projection::arithmetic_bound(expr, batch.len)?).ok()?;
             let column = match projection::column(expr, schema, batch, parameters).ok()? {
                 Some(column) => column,
-                None => {
-                    drop(reservation);
-                    reservation = memory.reserve(crate::vector::comparison_operand_bound(expr, schema, batch, parameters)?).ok()?;
-                    crate::vector::column(expr, schema, batch, parameters)?
-                }
+                None => super::functions::column(expr, schema, batch, parameters, memory).ok()??,
             };
             let Column::Arrow { array, .. } = column else { return None; };
             let any = array.as_any();
@@ -3914,15 +3898,18 @@ mod kernel {
                 DataType::Int32 => ComputedCells::Int32(any.downcast_ref::<Int32Array>()?.clone()),
                 DataType::Int64 => ComputedCells::Int64(any.downcast_ref::<Int64Array>()?.clone()),
                 DataType::Float64 => ComputedCells::Float64(any.downcast_ref::<Float64Array>()?.clone()),
+                DataType::Utf8 => ComputedCells::Text(any.downcast_ref::<StringArray>()?.clone()),
+                DataType::Boolean => ComputedCells::Bool(any.downcast_ref::<BooleanArray>()?.clone()),
                 _ => return None,
             };
             let retained = array.get_array_memory_size();
             drop(array);
-            Arc::get_mut(&mut reservation)?.shrink_to(retained).ok()?;
+            let lease = Arc::get_mut(&mut reservation)?;
+            if retained <= lease.bytes() { lease.shrink_to(retained).ok()?; } else { lease.grow_to(retained).ok()?; }
             Some(Self { cells, _reservation: reservation })
         }
 
-        fn get(&self, row: usize) -> Option<Cell<'static>> {
+        fn get(&self, row: usize) -> Option<Cell<'_>> {
             match &self.cells {
                 ComputedCells::Null => None,
                 ComputedCells::Int8(array) => integral(array, row),
@@ -3930,6 +3917,8 @@ mod kernel {
                 ComputedCells::Int32(array) => integral(array, row),
                 ComputedCells::Int64(array) => integral(array, row),
                 ComputedCells::Float64(array) => array.is_valid(row).then(|| Cell::Float(array.value(row))),
+                ComputedCells::Text(array) => array.is_valid(row).then(|| Cell::Text(array.value(row))),
+                ComputedCells::Bool(array) => array.is_valid(row).then(|| Cell::Bool(array.value(row))),
             }
         }
     }
@@ -3964,12 +3953,12 @@ mod kernel {
                 }
                 Expr::Literal(value) => scalar(value).ok().map(Self::Constant),
                 Expr::Parameter { index, .. } => scalar(parameters.known(*index)?).ok().map(Self::Constant),
-                Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, .. } =>
+                Expr::Binary { .. } | Expr::Unary { .. } | Expr::Cast { .. } | Expr::Call { .. } | Expr::Case { .. } =>
                     ComputedOperand::of(expr, schema, batch, parameters).map(Self::Computed),
                 _ => None,
             }
         }
-        fn get(&self, row: usize) -> Result<Option<Cell<'a>>, ()> {
+        fn get(&self, row: usize) -> Result<Option<Cell<'_>>, ()> {
             match self {
                 Self::Cells(cells) => cells.get(row),
                 Self::Computed(computed) => Ok(computed.get(row)),
@@ -4056,6 +4045,8 @@ mod kernel {
                     Some(_) => None,
                 }).collect()
             }
+            Expr::Literal(Value::Null) => Some(vec![None; rows]),
+            Expr::Literal(Value::Bool(value)) => Some(vec![Some(*value); rows]),
             Expr::Between { operand, low, high, symmetric: false } => {
                 let (operand, low, high) = (Operand::of(operand, schema, batch, parameters)?, Operand::of(low, schema, batch, parameters)?, Operand::of(high, schema, batch, parameters)?);
                 (0..rows).map(|row| {
@@ -4065,13 +4056,17 @@ mod kernel {
                     Some(match (above, below) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None })
                 }).collect()
             }
+            Expr::Case { .. } | Expr::Call { .. } if super::plain_scalar(&expr.data_type()) == Some(&ScalarType::Bool) => {
+                let operand = ComputedOperand::of(expr, schema, batch, parameters)?;
+                (0..rows).map(|row| match operand.get(row) { None => Some(None), Some(Cell::Bool(value)) => Some(Some(value)), Some(_) => None }).collect()
+            }
             _ => None,
         }
     }
 
     #[cfg(test)]
     #[test]
-    fn computed_operands_hold_admission_for_native_and_datafusion_arrays() {
+    fn computed_operands_hold_admission_for_their_arrays() {
         use arrow_array::ArrayRef;
         use rtdb_plan::{ColumnId, Field};
         use rtdb_types::LogicalType;
@@ -5235,13 +5230,6 @@ impl BatchCursor for BatchExpressions {
                     Err(error) => return Err(error),
                 }
             }
-            if let Some(column) = crate::vector::column(expression, &self.schema, &batch, parameters) {
-                // A vectorised column's size is known once computed; it is charged before the next is built.
-                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
-                columns.push(column);
-                continue;
-            }
             if batch.len != 0
                 && matches!(plain_scalar(&expression.data_type()), Some(rtdb_types::ScalarType::Bool))
                 && let Some(truth) = kernel::truth(kernel, &self.schema, &batch, parameters)
@@ -5836,7 +5824,7 @@ pub(crate) mod projection {
             Expr::Call { name, args, .. } if clock(name, args) => true,
             call if super::search::shaped(call) => true,
             Expr::Cast { expr: inner, target: CastTarget::Fixed(_) } if shaped(inner) => true,
-            expr => crate::vector::lowerable(expr),
+            expr => super::functions::lowerable(expr),
         }
     }
     fn literal(value: &Value) -> bool { constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_) | Value::Timestamp { .. }) }

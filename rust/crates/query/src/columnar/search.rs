@@ -273,8 +273,10 @@ pub(super) fn funded_column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, p
         let value = if shaped(arg) {
             column(arg, schema, batch, params, context)?
         } else {
-            super::projection::column(arg, schema, batch, params)?
-                .or_else(|| crate::vector::column(arg, schema, batch, params))
+            match super::projection::column(arg, schema, batch, params)? {
+                Some(value) => Some(value),
+                None => super::functions::column(arg, schema, batch, params, &context.memory)?,
+            }
         };
         let Some(value) = value else { return Ok(None); };
         let lease = Arc::get_mut(&mut retained).expect("Search projection owns its argument allocation");

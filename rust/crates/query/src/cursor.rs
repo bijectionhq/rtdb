@@ -565,7 +565,7 @@ fn parameter_projection_expression(expression: &Expr) -> bool {
                 || parameter_projection_expression(expr);
             operand(left) && operand(right)
         }
-        _ => crate::vector::bound_lowerable(expression),
+        _ => crate::columnar::functions::bound_lowerable(expression),
     })
 }
 
@@ -608,7 +608,7 @@ fn project_bound_columns(
                 column => Ok(Some(column)),
             };
         }
-        crate::vector::bound_column(expr, schema, input, &parameters.columns, memory)
+        crate::columnar::functions::bound_column(expr, schema, input, &parameters.columns, memory)
     };
     let mut layers = Vec::new();
     let mut relation = relation;

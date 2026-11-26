@@ -1,21 +1,39 @@
 //! Column-at-a-time forms of scalar functions over whole Arrow columns of one plain type.
 //! Each computes, cell by cell, what the scalar call computes for that cell's value, through the same implementation;
-//! a null cell gives a null.
-//! `None` means the column is the scalar evaluator's to compute: some cell fails there, or its result has a layout
-//! these columns can't hold, and only the evaluator reproduces that error or result in row order.
+//! a null cell gives a null. A failing cell raises the scalar call's error for that cell, as the row evaluator would
+//! on reaching it, and the rows a `Selection` leaves out are never read, as the row evaluator never evaluates a CASE
+//! branch its row doesn't take.
+//! `Ok(None)` is left only for a result whose layout these columns can't hold: text past `i32::MAX` bytes.
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, builder::StringBuilder};
+use rtdb_plan::{BinaryOp, CastTarget};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
-/// EXTRACT(`field` FROM cell) over microsecond timestamps sharing the zone label `timezone`.
-pub fn extract_timestamps(field: &str, values: &TimestampMicrosecondArray, timezone: Option<&str>) -> Option<Int32Array> {
-    crate::temporal_functions::extract_timestamps(field, values, timezone)
+/// The rows a kernel computes, `None` for every row; the others give null.
+pub type Selection<'a> = Option<&'a [bool]>;
+
+fn reads(selection: Selection<'_>, row: usize) -> bool { selection.is_none_or(|rows| rows[row]) }
+
+/// Each row's cell, `None` for a null or unselected row; the first failing cell, in row order, raises.
+fn cells<T>(values: &dyn Array, selection: Selection<'_>, mut cell: impl FnMut(usize) -> Result<T>) -> Result<Vec<Option<T>>> {
+    let mut cells = Vec::with_capacity(values.len());
+    for row in 0..values.len() {
+        cells.push(if values.is_null(row) || !reads(selection, row) { None } else { Some(cell(row)?) });
+    }
+    Ok(cells)
+}
+
+/// EXTRACT(`field` FROM cell) over microsecond timestamps sharing the zone label `timezone`; `Ok(None)` where the field
+/// doesn't apply to them or the label isn't a zone.
+pub fn extract_timestamps(field: &str, values: &TimestampMicrosecondArray, timezone: Option<&str>, selection: Selection<'_>) -> Result<Option<Int32Array>> {
+    crate::temporal_functions::extract_timestamps(field, values, timezone, selection)
 }
 
 pub use crate::functions::FloatMath;
 
 /// A scalar function with a column-at-a-time form, resolved once from its call's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Function { Extract, Round, Abs, Upper, Lower, Length, Substring, Floor, Ceil, Float(FloatMath) }
+pub enum Function { Extract, Round, Abs, Upper, Lower, Length, Substring, Floor, Ceil, Mod, Float(FloatMath) }
 
 impl Function {
     /// The function a call of `name`, in any case and with hyphens or underscores, runs here.
@@ -31,6 +49,7 @@ impl Function {
             "substring" => Self::Substring,
             "floor" => Self::Floor,
             "ceil" | "ceiling" => Self::Ceil,
+            "mod" => Self::Mod,
             name => Self::Float(FloatMath::resolve(name)?),
         })
     }
@@ -43,7 +62,7 @@ impl Function {
             Self::Ceil => Some(f64::ceil),
             Self::Abs => Some(f64::abs),
             Self::Float(math) => math.unary(),
-            Self::Extract | Self::Round | Self::Upper | Self::Lower | Self::Length | Self::Substring => None,
+            Self::Extract | Self::Round | Self::Upper | Self::Lower | Self::Length | Self::Substring | Self::Mod => None,
         }
     }
 }
@@ -52,53 +71,89 @@ impl Function {
 pub fn doubles(function: fn(f64) -> f64, values: &Float64Array) -> Float64Array { values.unary(function) }
 
 /// ROUND(cell, `scale`) over doubles.
-pub fn round_doubles(values: &Float64Array, scale: i64) -> Option<Float64Array> {
-    let mut cells = Vec::with_capacity(values.len());
-    for row in 0..values.len() {
-        cells.push(if values.is_null(row) { None } else { Some(crate::functions::round_float(values.value(row), scale).ok()?) });
-    }
-    Some(Float64Array::from(cells))
+pub fn round_doubles(values: &Float64Array, scale: i64, selection: Selection<'_>) -> Result<Float64Array> {
+    Ok(cells(values, selection, |row| crate::functions::round_float(values.value(row), scale))?.into())
 }
 
 /// ABS over 64-bit integers.
-pub fn abs_integers(values: &Int64Array) -> Option<Int64Array> {
-    let mut cells = Vec::with_capacity(values.len());
-    for row in 0..values.len() {
-        cells.push(if values.is_null(row) { None } else { Some(values.value(row).checked_abs()?) });
+pub fn abs_integers(values: &Int64Array, selection: Selection<'_>) -> Result<Int64Array> {
+    Ok(cells(values, selection, |row| values.value(row).checked_abs().ok_or_else(crate::numeric::overflow))?.into())
+}
+
+/// `left op right` over integers, for the arithmetic operators and MOD; each result must fit `result`, the integer type
+/// the row evaluator gives the pair (the wider of the two), as an `Int64Array` holding values of that width.
+pub fn integer_arithmetic(op: BinaryOp, left: &Int64Array, right: &Int64Array, result: &ScalarType, selection: Selection<'_>) -> Result<Int64Array> {
+    let mut values = Vec::with_capacity(left.len());
+    for row in 0..left.len() {
+        if left.is_null(row) || right.is_null(row) || !reads(selection, row) { values.push(None); continue; }
+        let value = crate::numeric::integer_arithmetic(op, i128::from(left.value(row)), i128::from(right.value(row)))?;
+        crate::numeric::integer_cell(value, result)?;
+        values.push(Some(value as i64));
     }
-    Some(Int64Array::from(cells))
+    Ok(values.into())
+}
+
+/// `left op right` over doubles, for the arithmetic operators and MOD.
+pub fn float_arithmetic(op: BinaryOp, left: &Float64Array, right: &Float64Array, selection: Selection<'_>) -> Result<Float64Array> {
+    let mut values = Vec::with_capacity(left.len());
+    for row in 0..left.len() {
+        if left.is_null(row) || right.is_null(row) || !reads(selection, row) { values.push(None); continue; }
+        let value = crate::numeric::float_arithmetic(op, left.value(row), right.value(row))
+            .unwrap_or_else(|| Err(crate::numeric::inapplicable("arithmetic", &[])))?;
+        values.push(Some(value));
+    }
+    Ok(values.into())
+}
+
+/// Unary minus over integers of the type `result`.
+pub fn negate_integers(values: &Int64Array, result: &ScalarType, selection: Selection<'_>) -> Result<Int64Array> {
+    Ok(cells(values, selection, |row| {
+        let value = i128::from(values.value(row)).checked_neg().ok_or_else(crate::numeric::overflow)?;
+        crate::numeric::integer_cell(value, result)?;
+        Ok(value as i64)
+    })?.into())
+}
+
+/// CAST of integers to the integer type `target`, as an `Int64Array` holding values of that width; a cell outside it
+/// raises the scalar cast's error.
+pub fn cast_integers(values: &Int64Array, target: &ScalarType, selection: Selection<'_>) -> Result<Int64Array> {
+    Ok(cells(values, selection, |row| {
+        let value = values.value(row);
+        if crate::numeric::integer_cell(i128::from(value), target).is_ok() { return Ok(value); }
+        let cast = CastTarget::Fixed(LogicalType::Scalar(target.clone()));
+        let cell = crate::pg_catalog::cast(&Value::I64(value), &cast, &crate::EvalContext::default())?;
+        crate::numeric::integer(&cell).and_then(|value| i64::try_from(value).ok()).ok_or_else(|| crate::numeric::inapplicable("cast", &[&cell]))
+    })?.into())
 }
 
 /// UPPER or LOWER over text, under the process default locale's case rules.
-pub fn text_case(values: &StringArray, upper: bool) -> Option<StringArray> {
-    let language = crate::string::case_language().ok()?;
+pub fn text_case(values: &StringArray, upper: bool, selection: Selection<'_>) -> Result<Option<StringArray>> {
+    let mut language = None;
     let mut texts = TextColumn::new(values.len());
     for row in 0..values.len() {
-        if values.is_null(row) { texts.null(); continue; }
+        if values.is_null(row) || !reads(selection, row) { texts.null(); continue; }
+        let language = match language { Some(language) => language, None => *language.insert(crate::string::case_language()?) };
         let text = values.value(row);
-        texts.push(&if upper { language.to_upper(text) } else { language.to_lower(text) })?;
+        if texts.push(&if upper { language.to_upper(text) } else { language.to_lower(text) }).is_none() { return Ok(None); }
     }
-    Some(texts.finish())
+    Ok(Some(texts.finish()))
 }
 
 /// SUBSTRING(cell FROM position [FOR length]), the integer arguments being per-row columns of the same length.
-pub fn text_substrings(values: &StringArray, positions: &Int64Array, lengths: Option<&Int64Array>) -> Option<StringArray> {
+pub fn text_substrings(values: &StringArray, positions: &Int64Array, lengths: Option<&Int64Array>, selection: Selection<'_>) -> Result<Option<StringArray>> {
     let mut texts = TextColumn::new(values.len());
     for row in 0..values.len() {
-        if values.is_null(row) || positions.is_null(row) || lengths.is_some_and(|lengths| lengths.is_null(row)) { texts.null(); continue; }
+        let null = values.is_null(row) || positions.is_null(row) || lengths.is_some_and(|lengths| lengths.is_null(row));
+        if null || !reads(selection, row) { texts.null(); continue; }
         let length = lengths.map(|lengths| lengths.value(row));
-        texts.push(crate::string::text_substring(values.value(row), positions.value(row), length).ok()?)?;
+        if texts.push(crate::string::text_substring(values.value(row), positions.value(row), length)?).is_none() { return Ok(None); }
     }
-    Some(texts.finish())
+    Ok(Some(texts.finish()))
 }
 
-/// LENGTH in characters over text.
-pub fn text_lengths(values: &StringArray) -> Option<Int32Array> {
-    let mut cells = Vec::with_capacity(values.len());
-    for row in 0..values.len() {
-        cells.push(if values.is_null(row) { None } else { Some(i32::try_from(values.value(row).chars().count()).ok()?) });
-    }
-    Some(Int32Array::from(cells))
+/// LENGTH in characters over text; a text vector's `i32` offsets bound every count.
+pub fn text_lengths(values: &StringArray) -> Int32Array {
+    values.iter().map(|text| text.map(|text| text.chars().count() as i32)).collect()
 }
 
 /// A LIKE pattern compiled once for many inputs.
@@ -143,7 +198,7 @@ mod tests {
     use super::*;
     use crate::{EvalContext, evaluate};
     use rtdb_plan::{ColumnId, Expr, Field, Schema};
-    use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
+    use rtdb_types::TimeUnit;
 
     struct Random(u64);
     impl Random {
@@ -162,10 +217,19 @@ mod tests {
         Expr::Call { name: name.into(), args, return_type }
     }
 
-    /// Each cell's scalar evaluation: `None` where any cell fails.
-    fn scalar(expr: &Expr, schema: &Schema, cells: impl Iterator<Item = Value>) -> Option<Vec<Value>> {
+    /// Each cell's scalar evaluation, or the first failing cell's error in row order.
+    fn scalar(expr: &Expr, schema: &Schema, cells: impl Iterator<Item = Value>) -> Result<Vec<Value>> {
         let context = EvalContext::default();
-        cells.map(|cell| evaluate(expr, schema, &[cell], &context).ok()).collect()
+        cells.map(|cell| evaluate(expr, schema, &[cell], &context)).collect()
+    }
+
+    /// The kernel raised exactly the error the row evaluator raises first, or computed exactly its values.
+    fn agree<T>(what: &str, expected: Result<Vec<Value>>, actual: Result<T>, values: impl FnOnce(T) -> Vec<Value>) -> bool {
+        match (expected, actual) {
+            (Ok(expected), Ok(actual)) => { same(&expected, values(actual).into_iter()); true }
+            (Err(expected), Err(actual)) => { assert_eq!(expected.code, actual.code, "{what}"); false }
+            (expected, actual) => panic!("{what}: evaluator succeeded {}, kernel succeeded {}", expected.is_ok(), actual.is_ok()),
+        }
     }
 
     fn same(expected: &[Value], actual: impl Iterator<Item = Value>) {
@@ -191,32 +255,27 @@ mod tests {
             2..=5 => Some(anchors[random.below(5) as usize] + random.below(7_200_000_000) as i64 - 3_600_000_000),
             _ => Some(random.next() as i64 >> random.below(20)),
         }).collect();
-        let (mut computed, mut declined) = (0, 0);
+        let (mut computed, mut raised, mut declined) = (0, 0, 0);
+        let int32s = |array: Int32Array| array.iter().map(|cell| cell.map_or(Value::Null, Value::I32)).collect::<Vec<_>>();
         for zone in ZONES {
             let (schema, column) = single(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: zone.map(str::to_owned) });
-            let values = TimestampMicrosecondArray::from(cells.clone()).with_timezone_opt(zone);
+            let bounded: Vec<Option<i64>> = cells.iter().map(|cell| cell.map(|value| value.rem_euclid(4_000_000_000_000_000))).collect();
             for field in FIELDS {
                 let expr = Expr::Call { name: "extract".into(), args: vec![Expr::Literal(Value::Utf8(field.into())), column.clone()],
                     return_type: LogicalType::Scalar(ScalarType::I32).maybe() };
-                let timestamps = cells.iter().map(|cell| cell.map_or(Value::Null, |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: zone.map(str::to_owned) }));
-                let expected = scalar(&expr, &schema, timestamps);
-                let actual = extract_timestamps(field, &values, zone);
-                match (expected, actual) {
-                    (Some(expected), Some(actual)) => { computed += 1; same(&expected, actual.iter().map(|cell| cell.map_or(Value::Null, Value::I32))) }
-                    (None, None) => declined += 1,
-                    (expected, actual) => panic!("{field} in {zone:?}: evaluator succeeded {}, kernel succeeded {}", expected.is_some(), actual.is_some()),
-                }
-                let bounded: Vec<Option<i64>> = cells.iter().map(|cell| cell.map(|value| value.rem_euclid(4_000_000_000_000_000))).collect();
-                let expected = scalar(&expr, &schema, bounded.iter().map(|cell| cell.map_or(Value::Null, |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: zone.map(str::to_owned) })));
-                let actual = extract_timestamps(field, &TimestampMicrosecondArray::from(bounded).with_timezone_opt(zone), zone);
-                match (expected, actual) {
-                    (Some(expected), Some(actual)) => { computed += 1; same(&expected, actual.iter().map(|cell| cell.map_or(Value::Null, Value::I32))) }
-                    (None, None) => declined += 1,
-                    (expected, actual) => panic!("{field} in {zone:?}: evaluator succeeded {}, kernel succeeded {}", expected.is_some(), actual.is_some()),
+                for cells in [&cells, &bounded] {
+                    let timestamps = cells.iter().map(|cell| cell.map_or(Value::Null, |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: zone.map(str::to_owned) }));
+                    let expected = scalar(&expr, &schema, timestamps);
+                    let values = TimestampMicrosecondArray::from(cells.clone()).with_timezone_opt(zone);
+                    match extract_timestamps(field, &values, zone, None) {
+                        Ok(None) => { assert!(expected.is_err(), "{field} in {zone:?} declined where the evaluator computes it"); declined += 1 }
+                        Ok(Some(actual)) => { agree(field, expected, Ok(actual), int32s); computed += 1 }
+                        Err(error) => { agree::<Int32Array>(field, expected, Err(error), int32s); raised += 1 }
+                    }
                 }
             }
         }
-        assert!(computed > 40 && declined > 0, "computed {computed}, declined {declined}");
+        assert!(computed > 40 && raised + declined > 0, "computed {computed}, raised {raised}, declined {declined}");
     }
 
     #[test]
@@ -239,15 +298,13 @@ mod tests {
         for name in ["power", "log", "round", "upper", "extract"] {
             assert!(Function::resolve(name).and_then(Function::double).is_none(), "{name}");
         }
+        let float64s = |array: Float64Array| array.iter().map(|cell| cell.map_or(Value::Null, Value::F64)).collect::<Vec<_>>();
         for scale in [-400, -3, -1, 0, 1, 2, 5, 15, 300, 400] {
             let expr = call("round", vec![column.clone(), Expr::Literal(Value::I64(scale))]);
-            let expected = scalar(&expr, &schema, doubles());
-            let actual = round_doubles(&values, scale);
-            assert_eq!(expected.is_some(), actual.is_some(), "scale {scale}");
-            if let (Some(expected), Some(actual)) = (expected, actual) { same(&expected, actual.iter().map(|cell| cell.map_or(Value::Null, Value::F64))); }
+            agree(&format!("scale {scale}"), scalar(&expr, &schema, doubles()), round_doubles(&values, scale, None), float64s);
         }
         let expected = scalar(&call("round", vec![column.clone()]), &schema, doubles()).unwrap();
-        same(&expected, round_doubles(&values, 0).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::F64)));
+        same(&expected, round_doubles(&values, 0, None).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::F64)));
     }
 
     #[test]
@@ -262,22 +319,79 @@ mod tests {
     fn rounding_keeps_non_finite_doubles() {
         let values = Float64Array::from(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]);
         for scale in [0, 3, -400] {
-            let rounded = round_doubles(&values, scale).expect("a non-finite double rounds to itself");
+            let rounded = round_doubles(&values, scale, None).expect("a non-finite double rounds to itself");
             let bits: Vec<u64> = rounded.values().iter().map(|value| value.to_bits()).collect();
             assert_eq!(bits, values.values().iter().map(|value| value.to_bits()).collect::<Vec<_>>(), "scale {scale}");
         }
     }
 
     #[test]
-    fn integer_abs_agrees_with_the_scalar_call_and_leaves_overflow_to_it() {
+    fn integer_abs_agrees_with_the_scalar_call_and_raises_its_overflow() {
         let (schema, column) = single(ScalarType::I64);
         let expr = call("abs", vec![column]);
+        let int64s = |cells: &[Option<i64>]| cells.iter().map(|cell| cell.map_or(Value::Null, Value::I64)).collect::<Vec<_>>();
         let fine = [Some(0), Some(-5), None, Some(i64::MAX), Some(i64::MIN + 1)];
-        let expected = scalar(&expr, &schema, fine.iter().map(|cell| cell.map_or(Value::Null, Value::I64))).unwrap();
-        same(&expected, abs_integers(&Int64Array::from(fine.to_vec())).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::I64)));
+        let expected = scalar(&expr, &schema, int64s(&fine).into_iter()).unwrap();
+        same(&expected, abs_integers(&Int64Array::from(fine.to_vec()), None).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::I64)));
         let overflowing = [Some(1), Some(i64::MIN)];
-        assert!(scalar(&expr, &schema, overflowing.iter().map(|cell| cell.map_or(Value::Null, Value::I64))).is_none());
-        assert!(abs_integers(&Int64Array::from(overflowing.to_vec())).is_none());
+        let expected = scalar(&expr, &schema, int64s(&overflowing).into_iter()).unwrap_err();
+        assert_eq!(abs_integers(&Int64Array::from(overflowing.to_vec()), None).unwrap_err().code, expected.code);
+        // A row the selection leaves out is never read, as an untaken CASE branch isn't.
+        let selected = abs_integers(&Int64Array::from(overflowing.to_vec()), Some(&[true, false][..])).unwrap();
+        assert_eq!(selected.iter().collect::<Vec<_>>(), [Some(1), None]);
+    }
+
+    const EDGES: [Option<i64>; 12] = [None, Some(0), Some(1), Some(-1), Some(7), Some(-7), Some(i32::MAX as i64), Some(i32::MIN as i64),
+        Some(i64::MAX), Some(i64::MIN), Some(1 << 40), Some(-(1 << 33))];
+
+    #[test]
+    fn integer_arithmetic_negation_and_casts_agree_with_the_scalar_evaluator() {
+        let fields = [ScalarType::I64, ScalarType::I64].map(|scalar| LogicalType::Scalar(scalar).maybe());
+        let schema = Schema::new(fields.iter().enumerate().map(|(id, data_type)| Field { id: ColumnId(id as u32), name: format!("c{id}"), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: data_type.clone() }).collect()).unwrap();
+        let column = |id: u32| Expr::Column { id: ColumnId(id), data_type: fields[id as usize].clone() };
+        let pairs: Vec<(Option<i64>, Option<i64>)> = EDGES.iter().flat_map(|left| EDGES.iter().map(move |right| (*left, *right))).collect();
+        let (left, right): (Vec<_>, Vec<_>) = pairs.iter().copied().unzip();
+        let (left, right) = (Int64Array::from(left), Int64Array::from(right));
+        let context = EvalContext::default();
+        let int64s = |array: Int64Array| array.iter().map(|cell| cell.map_or(Value::Null, Value::I64)).collect::<Vec<_>>();
+        for op in [BinaryOp::Add, BinaryOp::Subtract, BinaryOp::Multiply, BinaryOp::Divide, BinaryOp::Modulo] {
+            let expr = Expr::binary(op, column(0), column(1));
+            for (row, (a, b)) in pairs.iter().enumerate() {
+                let cells = [a.map_or(Value::Null, Value::I64), b.map_or(Value::Null, Value::I64)];
+                let expected = evaluate(&expr, &schema, &cells, &context).map(|value| vec![value]);
+                let actual = integer_arithmetic(op, &left.slice(row, 1), &right.slice(row, 1), &ScalarType::I64, None);
+                agree(&format!("{a:?} {op:?} {b:?}"), expected, actual, int64s);
+            }
+        }
+        let expr = Expr::Unary { op: rtdb_plan::UnaryOp::Negate, expr: Box::new(column(0)) };
+        for cell in EDGES {
+            let expected = evaluate(&expr, &schema, &[cell.map_or(Value::Null, Value::I64), Value::Null], &context).map(|value| vec![value]);
+            agree(&format!("-{cell:?}"), expected, negate_integers(&Int64Array::from(vec![cell]), &ScalarType::I64, None), int64s);
+        }
+        let narrowed = Expr::Cast { expr: Box::new(column(0)), target: CastTarget::Fixed(LogicalType::Scalar(ScalarType::I32)) };
+        for cell in EDGES {
+            let expected = evaluate(&narrowed, &schema, &[cell.map_or(Value::Null, Value::I64), Value::Null], &context)
+                .map(|value| vec![match value { Value::I32(value) => Value::I64(i64::from(value)), value => value }]);
+            agree(&format!("CAST({cell:?} AS INTEGER)"), expected, cast_integers(&Int64Array::from(vec![cell]), &ScalarType::I32, None), int64s);
+        }
+    }
+
+    #[test]
+    fn float_arithmetic_agrees_with_the_scalar_evaluator_bit_for_bit() {
+        let edges = [None, Some(0.0), Some(-0.0), Some(1.5), Some(-2.0), Some(f64::INFINITY), Some(f64::NAN), Some(1e308), Some(3.0)];
+        let (schema, column) = single(ScalarType::F64);
+        let context = EvalContext::default();
+        for op in [BinaryOp::Add, BinaryOp::Subtract, BinaryOp::Multiply, BinaryOp::Divide, BinaryOp::Modulo] {
+            for a in edges {
+                for b in edges {
+                    let expr = Expr::binary(op, column.clone(), Expr::Literal(b.map_or(Value::Null, Value::F64)));
+                    let expected = evaluate(&expr, &schema, &[a.map_or(Value::Null, Value::F64)], &context).map(|value| vec![value]);
+                    let actual = float_arithmetic(op, &Float64Array::from(vec![a]), &Float64Array::from(vec![b]), None);
+                    agree(&format!("{a:?} {op:?} {b:?}"), expected, actual, |array| array.iter().map(|cell| cell.map_or(Value::Null, Value::F64)).collect());
+                }
+            }
+        }
     }
 
     const TEXTS: [&str; 14] = ["", "a", "B", "ß", "straße", "Ǆx", "İstanbul", "ﬁne", "name-0000007-éß", "name-0000012-ab", "日本語テキスト", "e\u{301}", "😀x😀", "line\nbreak"];
@@ -292,10 +406,10 @@ mod tests {
         let text_values = |array: StringArray| array.iter().map(|cell| cell.map_or(Value::Null, |text| Value::Utf8(text.into()))).collect::<Vec<_>>().into_iter();
         for upper in [true, false] {
             let expected = scalar(&call(if upper { "upper" } else { "lower" }, vec![column.clone()]), &schema, texts()).unwrap();
-            same(&expected, text_values(text_case(&values, upper).unwrap()));
+            same(&expected, text_values(text_case(&values, upper, None).unwrap().unwrap()));
         }
         let expected = scalar(&call("length", vec![column.clone()]), &schema, texts()).unwrap();
-        same(&expected, text_lengths(&values).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::I32)));
+        same(&expected, text_lengths(&values).iter().map(|cell| cell.map_or(Value::Null, Value::I32)));
         for position in [i64::MIN, -3, 0, 1, 2, 6, 14, 100, i64::from(i32::MAX) + 7] {
             for length in [None, Some(-1), Some(0), Some(1), Some(3), Some(i64::from(i32::MAX)), Some(1 << 33)] {
                 let mut args = vec![column.clone(), Expr::Literal(Value::I64(position))];
@@ -303,9 +417,8 @@ mod tests {
                 let expected = scalar(&call("substring", args), &schema, texts());
                 let positions = Int64Array::from(vec![position; cells.len()]);
                 let lengths = length.map(|length| Int64Array::from(vec![length; cells.len()]));
-                let actual = text_substrings(&values, &positions, lengths.as_ref());
-                assert_eq!(expected.is_some(), actual.is_some(), "substring from {position} for {length:?}");
-                if let (Some(expected), Some(actual)) = (expected, actual) { same(&expected, text_values(actual)); }
+                let actual = text_substrings(&values, &positions, lengths.as_ref(), None).map(|texts| texts.expect("the texts fit one vector"));
+                agree(&format!("substring from {position} for {length:?}"), expected, actual, |texts| text_values(texts).collect());
             }
         }
     }
@@ -319,7 +432,7 @@ mod tests {
         for pattern in ["%7-é%", "%", "_", "", "a", "%ß", "S%", "%a%e", "__%__", "%\\%%", "%x\\", "%e_", "line%", "%😀_"] {
             for (escape, case_insensitive, negated) in [(None, false, false), (Some('\\'), false, true), (Some('\\'), true, false), (None, true, true)] {
                 let expr = Expr::Like { expr: Box::new(column.clone()), pattern: Box::new(Expr::Literal(Value::Utf8(pattern.into()))), escape, case_insensitive, negated };
-                let expected = scalar(&expr, &schema, cells.iter().map(|cell| cell.map_or(Value::Null, |text| Value::Utf8(text.into()))));
+                let expected = scalar(&expr, &schema, cells.iter().map(|cell| cell.map_or(Value::Null, |text| Value::Utf8(text.into())))).ok();
                 let matcher = LikeMatcher::compile(pattern, escape, case_insensitive, negated);
                 assert_eq!(expected.is_some(), matcher.is_some(), "{pattern:?} escaped by {escape:?}");
                 if let (Some(expected), Some(matcher)) = (expected, matcher) {

@@ -113,17 +113,19 @@ fn timestamp_field(field: F,value: i64,unit: U,zone: Option<ZoneId>) -> Result<i
 }
 
 /// EXTRACT over microsecond timestamps sharing one zone label, cell for cell as the scalar call computes it.
-/// `None` where the field doesn't apply, the label isn't a zone, or any cell fails: the scalar call raises that error.
-pub(crate) fn extract_timestamps(field: &str,values: &arrow_array::TimestampMicrosecondArray,timezone: Option<&str>) -> Option<arrow_array::Int32Array> {
+/// `Ok(None)` where the field doesn't apply or the label isn't a zone, which the scalar call decides per non-null cell;
+/// a failing cell raises the scalar call's error for it. Unselected rows give null and are never read.
+pub(crate) fn extract_timestamps(field: &str,values: &arrow_array::TimestampMicrosecondArray,timezone: Option<&str>,selection: crate::kernels::Selection<'_>) -> Result<Option<arrow_array::Int32Array>> {
     use arrow_array::Array;
-    let field = F::parse(field).ok()?;
-    field.validate_for("extract",&S::Timestamp { unit: U::Microsecond,timezone: timezone.map(str::to_owned) }).ok()?;
-    let zone = timezone.map(ZoneId::parse).transpose().ok()?;
+    let Ok(field) = F::parse(field) else { return Ok(None) };
+    if field.validate_for("extract",&S::Timestamp { unit: U::Microsecond,timezone: timezone.map(str::to_owned) }).is_err() { return Ok(None); }
+    let Ok(zone) = timezone.map(ZoneId::parse).transpose() else { return Ok(None) };
     let mut cells = Vec::with_capacity(values.len());
     for row in 0..values.len() {
-        cells.push(if values.is_null(row) { None } else { Some(timestamp_field(field,values.value(row),U::Microsecond,zone).and_then(extracted).ok()?) });
+        let read = !values.is_null(row) && selection.is_none_or(|rows| rows[row]);
+        cells.push(if read { Some(timestamp_field(field,values.value(row),U::Microsecond,zone).and_then(extracted)?) } else { None });
     }
-    Some(arrow_array::Int32Array::from(cells))
+    Ok(Some(arrow_array::Int32Array::from(cells)))
 }
 
 fn truncated_date(field: F,date: CivilDate) -> Result<CivilDate> {

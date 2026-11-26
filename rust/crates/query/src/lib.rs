@@ -35,7 +35,6 @@ pub use scan::{trie_row_count_up_to, visit_trie_iids};
 pub use scan::{visit_full_trie_events, visit_projected_data_events, visit_trie_events};
 mod fragment;
 mod columnar;
-mod vector;
 mod cosine;
 mod page_metadata;
 mod scan_tasks;
