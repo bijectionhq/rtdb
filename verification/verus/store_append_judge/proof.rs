@@ -47,7 +47,7 @@ pub mod order {
 
 #[path = "../../../rust/vendor/bijection-store-judge/src/judge.rs"]
 mod judge;
-pub use judge::*;
+pub use judge::{admit, admitted, Admitted};
 
 #[path = "../../../rust/crates/tx/src/transact/store_clock.rs"]
 mod store_clock;

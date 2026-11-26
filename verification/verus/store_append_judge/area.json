@@ -8,7 +8,7 @@
     "store_clock",
     "--verify-root"
   ],
-  "min_verified_functions": 6,
+  "min_verified_functions": 13,
   "controls": {
     "tie_refusal": {
       "defect": "The resolver refuses a sample equal to the last stamp's micros (the strict rule MP-port-2 shipped).",
@@ -27,7 +27,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 5
+      "min_verified_functions": 12
     },
     "raised_to_head": {
       "defect": "The resolver raises a sample at the last stamp to the next microsecond.",
@@ -36,7 +36,7 @@
         {
           "file": "rust/crates/tx/src/transact/store_clock.rs",
           "find": "    store_judge::admit(head, last, now, not_before, before, write_free)\n",
-          "replace": "    let now = if last == Some(now) { now.saturating_add(1) } else { now };\n    store_judge::admit(head, last, now, not_before, before, write_free)\n"
+          "replace": "    let now = if last == Some(now) { if now < i64::MAX { now + 1 } else { now } } else { now };\n    store_judge::admit(head, last, now, not_before, before, write_free)\n"
         }
       ],
       "expect": [
@@ -46,7 +46,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 5
+      "min_verified_functions": 12
     }
   }
 }

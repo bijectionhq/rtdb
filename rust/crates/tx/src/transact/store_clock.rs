@@ -16,6 +16,8 @@
 #![allow(unexpected_cfgs)]
 
 use store_judge::Admitted;
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 /// The decision `judge::admit` gives an append whose reads passed: `head` is
 /// the store's last version, `last` the last stamp's micros (`None` before
