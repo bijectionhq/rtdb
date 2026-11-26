@@ -1856,6 +1856,7 @@ mod tests {
                 let singleton = image_array(std::slice::from_ref(&row), 2).unwrap();
                 assert_eq!(singleton.value(0), expected.as_slice());
             }
+            drop(projection);
             drop(layout);
             assert_eq!(memory.used_bytes(), 0);
         }
