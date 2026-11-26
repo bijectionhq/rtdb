@@ -54,7 +54,17 @@ pub(crate) type BoxCursor = Box<dyn RowCursor>;
 
 #[derive(Clone)]
 pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>>,
-    emissions: Arc<Emissions> }
+    emissions: Arc<Emissions>, facts: Arc<PlanFacts> }
+
+/// What a plan's relation alone decides, worked out on first use and shared by every copy of the plan.
+#[derive(Default)]
+struct PlanFacts {
+    allocation_bound: std::sync::OnceLock<usize>,
+    requests_token: std::sync::OnceLock<bool>,
+    fills_row_batches: std::sync::OnceLock<bool>,
+    uses_row_batch_limit: std::sync::OnceLock<bool>,
+    projection_has_computation: std::sync::OnceLock<bool>,
+}
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 
@@ -88,7 +98,7 @@ impl PreparedQuery {
         relation.validate()?;
         let relation = crate::optimize::prepare(relation)?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, emissions: Arc::new(Emissions::kept_by(None)) })
+        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, emissions: Arc::new(Emissions::kept_by(None)), facts: Default::default() })
     }
     /// Retains query metadata as well as the relation; SQL callers should use this constructor.
     pub fn from_prepared(prepared: rtdb_plan::PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -108,7 +118,7 @@ impl PreparedQuery {
         relation.validate()?;
         let required_parameter_count = lexical_parameters.max(relation.parameter_count()).max(prepared.settings.parameter_count());
         let emissions = Arc::new(Emissions::kept_by(Some(Arc::clone(plan_reservation.budget()))));
-        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), emissions })
+        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), emissions, facts: Default::default() })
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
@@ -244,8 +254,8 @@ impl PreparedQuery {
         let runtime_schema = self.emit(&operator.catalog, types, &operator.memory, EmissionMode::Execution)?.output();
         let logical = runtime_schema.schema();
         let memory = &operator.memory;
-        let computed = if projection_has_computation(&self.relation) {
-            let bytes = crate::runtime_schema::allocation_bound(&self.relation)?
+        let computed = if *self.facts.projection_has_computation.get_or_init(|| projection_has_computation(&self.relation)) {
+            let bytes = self.allocation_bound()?
                 .checked_add(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)
                 .ok_or_else(parameter_projection_size)?;
             let scratch = memory.reserve(bytes)?;
@@ -309,7 +319,7 @@ impl PreparedQuery {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         let context = context.reopen_sql_snapshot(&self.settings, rtdb_expr::Parameters::Values(&parameters)).await?;
         self.check_dependencies(&context)?;
-        let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
+        let bound = parameters.iter().try_fold(self.allocation_bound()?, |bytes, value| {
             bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
         })?;
         let temporary = context.memory.reserve(bound)?;
@@ -326,7 +336,7 @@ impl PreparedQuery {
 
     async fn open_arrow(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         if types.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
-        let bound = types.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, ty| {
+        let bound = types.iter().try_fold(self.allocation_bound()?, |bytes, ty| {
             ty.retained_bytes()?.checked_mul(8).and_then(|size| bytes.checked_add(size))
                 .ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
         })?;
@@ -352,7 +362,7 @@ impl PreparedQuery {
                 found
             }) || relation.children().into_iter().any(|child| requests_token(child))
         }
-        if context.snapshot_token().is_none() && context.snapshot_tokens.is_some() && requests_token(&self.relation)
+        if context.snapshot_token().is_none() && context.snapshot_tokens.is_some() && *self.facts.requests_token.get_or_init(|| requests_token(&self.relation))
             && let Some(token) = context.issue_snapshot_token()?
         {
             return context.with_exact_snapshot_token(token);
@@ -360,8 +370,14 @@ impl PreparedQuery {
         Ok(context)
     }
 
+    fn allocation_bound(&self) -> Result<usize> {
+        if let Some(bound) = self.facts.allocation_bound.get() { return Ok(*bound); }
+        let bound = crate::runtime_schema::allocation_bound(&self.relation)?;
+        Ok(*self.facts.allocation_bound.get_or_init(|| bound))
+    }
+
     fn check_dependencies(&self, context: &QueryContext) -> Result<()> {
-        for dependency in self.relation.dependencies() {
+        for dependency in dependencies(&self.relation) {
             let Some(current) = context.catalog.table(&dependency.name)? else {
                 if dependency.oid.is_none() && dependency.columns.is_empty() { continue; }
                 return Err(invalid("stale-plan", "Prepared table is no longer present"));
@@ -408,11 +424,11 @@ impl PreparedQuery {
                 }
                 Batching::Rows | Batching::Columns | Batching::ColumnRows => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
                     Some(input) => {
-                        if matches!(batching, Batching::Rows | Batching::ColumnRows) || fills_row_batches(operators.relation()) {
+                        if matches!(batching, Batching::Rows | Batching::ColumnRows) || *self.facts.fills_row_batches.get_or_init(|| fills_row_batches(operators.relation())) {
                             let input = Box::new(RowBatchedColumns { input, pending: None, context: Arc::clone(&context) });
                             return Ok(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None }));
                         }
-                        let limit = if uses_row_batch_limit(operators.relation()) {
+                        let limit = if *self.facts.uses_row_batch_limit.get_or_init(|| uses_row_batch_limit(operators.relation())) {
                             context.options.batch_rows
                         } else {
                             usize::MAX
@@ -550,6 +566,17 @@ fn parameter_projection_expression(expression: &Expr) -> bool {
         }
         _ => crate::vector::bound_lowerable(expression),
     })
+}
+
+/// `Relation::dependencies`, borrowed from the plan.
+fn dependencies(relation: &Relation) -> Vec<&rtdb_plan::TableBinding> {
+    fn visit<'a>(relation: &'a Relation, found: &mut Vec<&'a rtdb_plan::TableBinding>) {
+        if let RelationNode::Scan(scan) = relation.node() && !found.contains(&&scan.table) { found.push(&scan.table); }
+        for child in relation.children() { visit(child, found); }
+    }
+    let mut found = Vec::new();
+    visit(relation, &mut found);
+    found
 }
 
 fn projection_has_computation(mut relation: &Relation) -> bool {
@@ -1293,6 +1320,38 @@ mod tests {
         assert_eq!(emitted.schema(), fresh.schema());
         drop((first, second, emitted, again));
         assert_eq!((first_query.used_bytes(), second_query.used_bytes()), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_decides_its_relation_facts_once_for_every_copy() -> Result<()> {
+        let query = PreparedQuery::new(parameter_values()?)?;
+        let fresh = crate::runtime_schema::allocation_bound(query.relation())?;
+        assert_eq!(query.allocation_bound()?, fresh);
+        let copy = query.recharged(&MemoryBudget::new(1 << 20))?;
+        assert!(Arc::ptr_eq(&copy.facts, &query.facts));
+        assert_eq!(copy.allocation_bound()?, fresh);
+        assert_eq!(*copy.facts.projection_has_computation.get_or_init(|| projection_has_computation(copy.relation())),
+            projection_has_computation(query.relation()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_borrows_its_dependencies_in_first_reference_order() -> Result<()> {
+        use rtdb_plan::{ColumnId, Field, JoinKind, QualifiedTable, Scan, TableBinding, TemporalFilter};
+        let scan = |table: &str, column: u32| -> Result<Arc<Relation>> {
+            let id = Field { id: ColumnId(column), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false,
+                data_type: LogicalType::Scalar(ScalarType::I64) };
+            let table = TableBinding { name: QualifiedTable { database: "xtdb".into(), table: rtdb_types::TableRef::new("public", table) },
+                oid: None, columns: Default::default() };
+            Ok(Arc::new(Relation::scan(Scan { table, columns: vec![id], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+                clamp_valid_time: false, iids: None, predicates: vec![], top_k: None, ordered_top_k: None, matches: Vec::new() })?))
+        };
+        let inner = Arc::new(Relation::join(scan("b", 1)?, scan("a", 2)?, JoinKind::Cross, None)?);
+        let relation = Relation::join(scan("a", 0)?, inner, JoinKind::Cross, None)?;
+        let borrowed = dependencies(&relation).into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(borrowed, relation.dependencies());
+        assert_eq!(borrowed.len(), 2);
         Ok(())
     }
 
