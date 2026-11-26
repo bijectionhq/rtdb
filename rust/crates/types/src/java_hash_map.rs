@@ -60,7 +60,7 @@ struct PutResult<V> { index: usize, previous: Option<V>, preserved: bool }
 enum TreePut { Existing(usize), Vacant { parent: usize, left: bool } }
 const MAXIMUM_CAPACITY: usize = 1 << 30;
 fn invalid(message: &'static str) -> Anomaly { Anomaly::incorrect("rtdb/java-hash-map", message) }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-overflow", "Java HashMap storage overflow") }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-overflow", "Java HashMap storage overflow").with_kind(crate::AnomalyKind::ProgramLimitExceeded) }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(overflow) }
 fn mul(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
 fn growth<T>(values: &Vec<T>) -> Result<Option<(usize, usize)>> {

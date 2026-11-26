@@ -465,7 +465,7 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
             },
             _ => if let Some(size) = fixed { flat.extend((0..size).map(|_| Cow::Borrowed(&Value::Undefined))); },
         }
-        offsets.push(i32::try_from(flat.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
+        offsets.push(i32::try_from(flat.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
     }
     let array = build(element, &flat, check_precision)?;
     match field.data_type() {
@@ -516,7 +516,7 @@ fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[impl Borro
                 }
                 if width.is_none() {
                     offsets.push(i32::try_from(arrow_array::builder::ArrayBuilder::len(&builder))
-                        .map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
+                        .map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
                 }
             }
             let child = Arc::new(builder.finish());
@@ -571,7 +571,7 @@ fn build_packed_lists(item: &Arc<Field>, width: Option<i32>, values: &[impl Borr
             children.push(array);
         }
         if width.is_none() {
-            offsets.push(i32::try_from(length).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
+            offsets.push(i32::try_from(length).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
         }
     }
     let child = match children.as_slice() {
@@ -606,7 +606,7 @@ fn build_union(logical: &LogicalType, values: &[impl Borrow<Value>], check_preci
             admissions.iter().position(|leg| leg.accepts(value)).ok_or_else(|| Anomaly::incorrect("rtdb/union-value", "Value has no matching union leg"))?
         };
         type_ids.push(ids[leg]);
-        offsets.push(i32::try_from(children[leg].len()).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
+        offsets.push(i32::try_from(children[leg].len()).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
         children[leg].push(value);
     }
     let children = legs.iter().zip(children).map(|(leg, values)| build(leg, &values, check_precision)).collect::<Result<Vec<_>>>()?;
@@ -1202,7 +1202,7 @@ fn copy_numeric_components(values: &dyn Array) -> Result<ArrayRef> {
 
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
 fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
-fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width") }
+fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "Array length exceeds its run-end index width") }
 
 #[cfg(test)]

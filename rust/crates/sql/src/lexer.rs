@@ -369,4 +369,4 @@ fn whitespace(value: char) -> bool { matches!(value, ' ' | '\n' | '\r' | '\t') }
 fn identifier_start(value: char) -> bool { value.is_ascii_alphabetic() || value == '_' }
 fn tag_part(value: char) -> bool { identifier_start(value) || value.is_ascii_digit() }
 fn identifier_part(value: char) -> bool { tag_part(value) || value == '$' }
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.sql/allocation-size", "SQL lexer allocation exceeds addressable memory") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.sql/allocation-size", "SQL lexer allocation exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }

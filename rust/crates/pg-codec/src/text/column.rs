@@ -241,7 +241,7 @@ pub fn read_source_text_column<'a>(
         1700 => scalar_column(name, count, cell, output, parse_decimal,
             |value| ScalarType::Decimal { precision: value.precision, scale: value.scale, bit_width: value.bit_width },
             |value| value.unscaled.len(), |field, rows| {
-                let decimal_width = |_| Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width");
+                let decimal_width = |_| Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
                 if matches!(field.data_type(), DataType::Decimal128(_, _)) {
                     let values = rows.into_iter().map(|value| value.map(|value| {
                         value.unscaled.as_slice().try_into().map(i128::from_be_bytes).map_err(decimal_width)
@@ -478,7 +478,7 @@ fn scalar_column<'a, P>(
                 for (leg, value) in rows {
                     ids.push(leg as i8);
                     offsets.push(i32::try_from(children[leg].len()).map_err(|_| {
-                        Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets")
+                        Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
                     })?);
                     children[leg].push(value);
                 }

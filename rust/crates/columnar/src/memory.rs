@@ -673,4 +673,4 @@ fn allocation_overhead(data: &ArrayData) -> Result<usize> {
     Ok(size)
 }
 
-fn allocation_overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-overflow", "Arrow allocation bound exceeds usize") }
+fn allocation_overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-overflow", "Arrow allocation bound exceeds usize").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }

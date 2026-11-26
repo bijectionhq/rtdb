@@ -144,7 +144,7 @@ fn array_argument(child: arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef>
     use arrow_schema::{DataType, Field};
 
     let len = child.len();
-    let end = i32::try_from(len).map_err(|_| rtdb_types::Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?;
+    let end = i32::try_from(len).map_err(|_| rtdb_types::Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
     let (field, child) = if child.null_count() == len {
         (Field::new("$data$", DataType::Null, len != 0), Arc::new(NullArray::new(len)) as arrow_array::ArrayRef)
     } else {

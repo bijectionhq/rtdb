@@ -172,7 +172,7 @@ fn definition_text_error() -> Anomaly {
 }
 
 fn definition_allocation_overflow() -> Anomaly {
-    Anomaly::incorrect("rtdb/allocation-overflow", "Ordered index definitions exceed addressable memory")
+    Anomaly::incorrect("rtdb/allocation-overflow", "Ordered index definitions exceed addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
 }
 
 type DefinitionEntry = Arc<tokio::sync::OnceCell<Arc<DefinitionSet>>>;

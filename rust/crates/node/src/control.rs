@@ -702,7 +702,7 @@ fn wrap_execute_list(item: &arrow_schema::FieldRef, width: Option<i32>, child: a
     let array: arrow_array::ArrayRef = match width {
         Some(width) => Arc::new(FixedSizeListArray::try_new(Arc::clone(item), width, child, None).map_err(error)?),
         None => {
-            let len = i32::try_from(child.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?;
+            let len = i32::try_from(child.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
             Arc::new(ListArray::try_new(Arc::clone(item), OffsetBuffer::new(vec![0, len].into()), child, None).map_err(error)?)
         }
     };

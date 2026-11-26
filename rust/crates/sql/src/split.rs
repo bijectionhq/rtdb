@@ -75,7 +75,7 @@ impl SplitTokens {
     }
 }
 
-fn token_array_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/token-array-size", "SQL token array exceeds addressable memory") }
+fn token_array_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/token-array-size", "SQL token array exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 pub(super) fn boundary_lexical_bytes(source: &str) -> Option<usize> {
     source.len().checked_mul(8).and_then(|bytes| bytes.checked_add(1024))
@@ -106,7 +106,7 @@ fn collect_split_ranges(source: &str, tokens: &mut Vec<TokenWithSpan>, memory: &
     Ok(SplitStatements { storage: SplitStorage::Allocated { spans, _reservation: reservation } })
 }
 
-fn split_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/split-size", "SQL split span storage exceeds addressable memory") }
+fn split_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/split-size", "SQL split span storage exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {

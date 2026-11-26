@@ -37,6 +37,11 @@ fn crl(root: &support::Credential) -> Vec<u8> {
 }
 
 #[test]
+fn an_unrepresentable_snapshot_is_resource_exhaustion() {
+    assert!(overflow().is(rtdb_types::AnomalyKind::ResourceExhausted));
+}
+
+#[test]
 fn snapshots_keep_each_native_filename_and_bytes_after_unlinking() {
     let directory = tempfile::tempdir().unwrap();
     let memory = MemoryBudget::new(32 << 20);

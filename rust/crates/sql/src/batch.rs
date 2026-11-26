@@ -340,7 +340,7 @@ pub fn parse_statement_batch_with_frontend_response<'input>(
     })
 }
 
-fn batch_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/batch-size", "SQL batch exceeds addressable memory") }
+fn batch_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/batch-size", "SQL batch exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 fn command_size(len: usize) -> Result<usize> {
     crate::statement_syntax_estimate(len).ok_or_else(batch_size)

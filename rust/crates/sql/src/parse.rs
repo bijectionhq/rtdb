@@ -113,7 +113,7 @@ impl RetainedStatementSyntax {
 
 fn require_syntax_budget(forms: crate::bind::FormAllocation<'_>, memory: &Arc<MemoryBudget>) -> Result<()> {
     if !matches!(forms, crate::bind::FormAllocation::Tracked(origin) if Arc::ptr_eq(origin, memory)) {
-        return Err(Anomaly::incorrect("rtdb.sql/syntax-budget", "SQL syntax belongs to a different raw metadata budget"));
+        return Err(Anomaly::fault("rtdb.sql/syntax-budget", "SQL syntax belongs to a different raw metadata budget"));
     }
     Ok(())
 }

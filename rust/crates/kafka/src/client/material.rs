@@ -151,7 +151,9 @@ fn snapshot(path: &str, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryRese
 }
 
 fn unavailable(error: io::Error) -> Contents { Contents::Unavailable(error.raw_os_error().unwrap_or(libc::EIO)) }
-fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/memory-budget-exceeded", "Native TLS snapshot exceeds its representable allocation bound") }
+fn overflow() -> Anomaly {
+    Anomaly::incorrect("rtdb/memory-budget-exceeded", "Native TLS snapshot exceeds its representable allocation bound").with_kind(rtdb_types::AnomalyKind::ResourceExhausted)
+}
 
 #[cfg(test)]
 mod tests;

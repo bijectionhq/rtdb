@@ -65,7 +65,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
                 return Err(Anomaly::incorrect("rtdb/rank-bound", "Rank admission requires nonnegative integer counts"));
             };
             if count > limit {
-                return Err(Anomaly::unsupported("rtdb/rank-bound", "The selected candidate set exceeds the ranking bound"));
+                return Err(Anomaly::unsupported("rtdb/rank-bound", "The selected candidate set exceeds the ranking bound").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
             }
             return Ok(Value::I64(count));
         }

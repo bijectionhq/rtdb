@@ -98,4 +98,4 @@ impl SharedPlans {
     }
 }
 
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.query/shared-plan-size", "Shared plan retained size exceeds usize") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.query/shared-plan-size", "Shared plan retained size exceeds usize").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }

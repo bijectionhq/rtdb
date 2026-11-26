@@ -108,7 +108,7 @@ pub(super) fn pack(
         for value in values {
             let len = value.list_view().map_or(0, |view| view.len());
             end += len;
-            offsets.push(i32::try_from(end).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
+            offsets.push(i32::try_from(end).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
         }
         Arc::new(ListArray::try_new(construction_item, OffsetBuffer::new(ScalarBuffer::from(offsets)), child, nulls).map_err(arrow_error)?)
     };
@@ -164,7 +164,7 @@ fn dense_child(
             },
         };
         tags.push(tag);
-        offsets.push(i32::try_from(offset).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
+        offsets.push(i32::try_from(offset).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
     }
     let children = fields.iter().map(|(_, field)| -> ArrayRef {
         match field.data_type() {

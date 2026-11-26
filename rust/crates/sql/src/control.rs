@@ -49,7 +49,7 @@ pub fn parse_admitted_control_in(source: &str, options: &PrepareOptions, memory:
     syntax.map(|syntax| syntax.bind(options).map(|statement| AdmittedControl { statement, _reservation: reservation })).transpose()
 }
 
-fn control_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/control-size", "SQL control statement exceeds addressable memory") }
+fn control_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/control-size", "SQL control statement exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 fn control_parser_bytes(source_len: usize, tokens: usize) -> Result<usize> {
     let per_token = 4 * (size_of::<TokenWithSpan>() + size_of::<ast::Expr>() + size_of::<rtdb_plan::Expr>()) + 64;

@@ -153,7 +153,7 @@ fn build_touches<'a>(
             id_tags.push(tag);
             id_offsets.push(i32::try_from(offset).map_err(|_| status(Anomaly::incorrect(
                 "rtdb/union-offset-overflow", "Union child exceeds i32 offsets",
-            )))?);
+            ).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)))?);
             let (op, lifetime) = touch_operation(touch.kind);
             ops.append_value(op);
             valid_from.append_value(touch.valid.lower().0);
@@ -210,7 +210,7 @@ fn struct_fields(field: &Field) -> Result<&Fields, Status> {
 fn list_offset(length: usize) -> Result<i32, Status> {
     i32::try_from(length).map_err(|_| status(Anomaly::incorrect(
         "rtdb/list-offset-overflow", "List children exceed i32 offsets",
-    )))
+    ).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)))
 }
 
 fn layout_error() -> Status {

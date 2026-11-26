@@ -369,7 +369,7 @@ impl ReadPlan {
             },
             (LogicalType::Scalar(ScalarType::Decimal { bit_width, .. }), _)
                 if !matches!(bit_width, 32 | 64 | 128 | 256) =>
-                Self::Invalid(Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width")),
+                Self::Invalid(Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)),
             _ => Self::Invalid(layout()),
         }
     }

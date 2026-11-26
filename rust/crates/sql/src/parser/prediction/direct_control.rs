@@ -18,7 +18,7 @@ impl StatementSyntaxDiagnostic {
     pub fn with_sql_context(self, original: &str) -> rtdb_types::Result<ContextualStatementDiagnostic> {
         let mut listener = self.0;
         let bytes = original.len().checked_add(1024)
-            .ok_or_else(|| Anomaly::incorrect("rtdb.sql/allocation-size", "SQL diagnostic context exceeds addressable memory"))?;
+            .ok_or_else(|| Anomaly::incorrect("rtdb.sql/allocation-size", "SQL diagnostic context exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?;
         let context_charge = listener.budget().reserve(bytes)?;
         listener.anomaly.context.insert("sql".into(), original.into());
         Ok(ContextualStatementDiagnostic { listener, _context_charge: context_charge })

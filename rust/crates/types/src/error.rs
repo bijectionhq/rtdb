@@ -42,7 +42,9 @@ impl AnomalyKind {
             "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit"
             | "rtdb/allocation-failed" | "rtdb.expr/allocation-failed" => Some(Self::ResourceExhausted),
             "rtdb.query/spill-limit" => Some(Self::ConfigurationLimitExceeded),
-            "rtdb.expr/regex-limit" | "rtdb.expr/regex-host-limit" | "rtdb.query/sort-size" => Some(Self::ProgramLimitExceeded),
+            "rtdb.expr/regex-limit" | "rtdb.expr/regex-host-limit" | "rtdb.query/sort-size" | "rtdb.query/shared-plan-size"
+            | "rtdb.sql/allocation-size" | "rtdb.sql/token-array-size" | "rtdb.sql/split-size" | "rtdb.sql/control-size" | "rtdb.sql/batch-size"
+            | "rtdb/list-offset-overflow" | "rtdb/union-offset-overflow" | "rtdb/allocation-overflow" | "rtdb/decimal-width" => Some(Self::ProgramLimitExceeded),
             "rtdb/decimal-precision" | "rtdb.pgwire/integer-out-of-range" => Some(Self::NumericValueOutOfRange),
             "xtdb/table-not-found" => Some(Self::TableNotFound),
             _ => None,
@@ -174,6 +176,10 @@ mod tests {
         assert_eq!(AnomalyKind::from_wire_code("rtdb/allocation-failed"), Some(AnomalyKind::ResourceExhausted));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.query/spill-limit"), Some(AnomalyKind::ConfigurationLimitExceeded));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.expr/regex-limit"), Some(AnomalyKind::ProgramLimitExceeded));
+        for code in ["rtdb.query/shared-plan-size", "rtdb.sql/allocation-size", "rtdb.sql/token-array-size", "rtdb.sql/split-size", "rtdb.sql/control-size",
+            "rtdb.sql/batch-size", "rtdb/list-offset-overflow", "rtdb/union-offset-overflow", "rtdb/allocation-overflow", "rtdb/decimal-width"] {
+            assert_eq!(AnomalyKind::from_wire_code(code), Some(AnomalyKind::ProgramLimitExceeded), "{code}");
+        }
         assert_eq!(AnomalyKind::from_wire_code("rtdb/decimal-precision"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.pgwire/integer-out-of-range"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/table-not-found"), Some(AnomalyKind::TableNotFound));

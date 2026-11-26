@@ -301,7 +301,7 @@ impl PreparedSql {
             let (field, array, shared): (_, ArrayRef, _) = match rtdb_expr::cast_bound_float_list(cell, &target, &allocation, backing)? {
                 Some((element, child, shared)) => {
                     let length = i32::try_from(child.len()).map_err(|_| {
-                        Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets")
+                        Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)
                     })?;
                     allocation.reserve(field.name().len().checked_add(1024).ok_or_else(size_error)?)?;
                     let field = rtdb_columnar::to_field(field.name(), &LogicalType::list(element))?;

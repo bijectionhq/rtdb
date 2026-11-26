@@ -137,7 +137,7 @@ fn scalar_layout(scalar: &ScalarType) -> Result<(DataType, Option<&'static str>)
         Decimal { precision, scale, bit_width: 64 } => (DataType::Decimal64(crate::decimal_storage_precision(*precision), crate::decimal_storage_scale(*scale)), None),
         Decimal { precision, scale, bit_width: 128 } => (DataType::Decimal128(crate::decimal_storage_precision(*precision), crate::decimal_storage_scale(*scale)), None),
         Decimal { precision, scale, bit_width: 256 } => (DataType::Decimal256(crate::decimal_storage_precision(*precision), crate::decimal_storage_scale(*scale)), None),
-        Decimal { .. } => return Err(Anomaly::unsupported("rtdb/decimal-width", "XTDB decimal storage requires 32, 64, 128, or 256 bits")),
+        Decimal { .. } => return Err(Anomaly::unsupported("rtdb/decimal-width", "XTDB decimal storage requires 32, 64, 128, or 256 bits").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded)),
         DateDay => (DataType::Date32, None), DateMilli => (DataType::Date64, None),
         Time { unit, bit_width: 32 } if matches!(unit, TimeUnit::Second | TimeUnit::Millisecond) => (DataType::Time32(arrow_unit(*unit)), None),
         Time { unit, bit_width: 64 } if matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond) => (DataType::Time64(arrow_unit(*unit)), None),

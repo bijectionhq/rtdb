@@ -333,7 +333,7 @@ fn hash_sequence(
 
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
 fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/hash-array-layout", "Hash cell index, field, and array must agree") }
-fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width") }
+fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 
 #[cfg(test)]

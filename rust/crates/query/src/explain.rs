@@ -32,7 +32,7 @@ impl ExplainPlan {
 }
 fn size_error() -> rtdb_types::Anomaly { invalid("explain-size", "Plan description exceeds addressable memory") }
 fn region_error() -> rtdb_types::Anomaly { invalid("explain-region", "Plan description belongs to a different construction region") }
-fn allocation_error() -> rtdb_types::Anomaly { rtdb_types::Anomaly::incorrect("rtdb/allocation-overflow", "Execution vector allocation bound exceeds usize") }
+fn allocation_error() -> rtdb_types::Anomaly { rtdb_types::Anomaly::incorrect("rtdb/allocation-overflow", "Execution vector allocation bound exceeds usize").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(size_error) }
 fn array_bytes<T>(capacity: usize) -> Result<usize> { Ok(Layout::array::<T>(capacity).map_err(|_| size_error())?.size()) }
 fn map_node_bytes<K, V>() -> Result<usize> { add(size_of::<(K, V)>().checked_mul(16).ok_or_else(size_error)?, 256) }

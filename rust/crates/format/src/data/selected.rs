@@ -466,7 +466,7 @@ fn gather(target: &Field, cells: &[Cell<'_>]) -> Result<Option<ArrayRef>> {
                 };
                 ids.push(id);
                 offsets.push(i32::try_from(picks[position].len())
-                    .map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
+                    .map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?);
                 picks[position].push(cell);
             }
             let mut values = Vec::with_capacity(legs.len());
@@ -506,7 +506,7 @@ fn gather(target: &Field, cells: &[Cell<'_>]) -> Result<Option<ArrayRef>> {
         }
         DataType::FixedSizeList(item, 2) if is_range(target) => {
             if cells.len() > i32::MAX as usize / 2 {
-                return Err(Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"));
+                return Err(Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded));
             }
             // Range values store the endpoint integers verbatim and write them in the canonical UTC layout.
             let field = rtdb_columnar::to_field(item.name(), &range_endpoint_type())?;
@@ -561,7 +561,7 @@ fn gather(target: &Field, cells: &[Cell<'_>]) -> Result<Option<ArrayRef>> {
                         width.unwrap_or(0)
                     }
                 };
-                let overflow = || Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets");
+                let overflow = || Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
                 let offset = i32::try_from(added).map_err(|_| overflow())?;
                 length = length.checked_add(offset).ok_or_else(overflow)?;
                 if width.is_none() { offsets.push(length); }

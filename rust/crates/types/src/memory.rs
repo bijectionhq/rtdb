@@ -122,7 +122,7 @@ impl MemoryBudget {
         let mut count = 1usize;
         let mut budget = self;
         while let Some(parent) = &budget.parent {
-            count = count.checked_add(1).ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Reservation ancestor count exceeds range"))?;
+            count = count.checked_add(1).ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Reservation ancestor count exceeds range").with_kind(crate::AnomalyKind::ProgramLimitExceeded))?;
             budget = parent;
         }
         Ok(count)
