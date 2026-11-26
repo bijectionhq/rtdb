@@ -279,13 +279,14 @@ impl PartitionState {
         drop(released);
     }
 
+    /// Records each live catalog a reader captures once, however its captures interleave with other catalogs'.
     fn retain_catalog(&self, value: &PartitionValue) {
         let mut retention = self.retention.lock();
         let identity = Arc::as_ptr(value.trie_catalog());
         if retention.readers.last().is_some_and(|reader| reader.as_ptr() == identity) {
             return;
         }
-        retention.readers.retain(|reader| reader.strong_count() != 0);
+        retention.readers.retain(|reader| reader.strong_count() != 0 && reader.as_ptr() != identity);
         retention.readers.push(Arc::downgrade(value.trie_catalog()));
     }
 
@@ -601,3 +602,24 @@ fn with_entries_for<'a>(catalog: &Arc<TableCatalog>, tables: impl Iterator<Item 
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-partition-transition", message.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alternating_captures_of_two_catalogs_retain_each_once() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let other = PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables().unwrap(), TrieConfig::default()).unwrap();
+        let current = state.value();
+        for _ in 0..100 {
+            state.retain_catalog(&current);
+            state.retain_catalog(&other);
+        }
+        assert_eq!(state.retention.lock().readers.len(), 2, "readers are bounded by the live catalogs, not by captures");
+        assert_eq!(state.trie_collection().readers.len(), 2);
+        drop(other);
+        state.retain_catalog(&current);
+        assert_eq!(state.retention.lock().readers.len(), 1, "a catalog no reader holds is forgotten");
+    }
+}
