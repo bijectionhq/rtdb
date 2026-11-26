@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{data::{EventBatch, PageEvent}, ipc::ArrowFileWriter, metadata::MetadataBuilder};
-use rtdb_types::{Iid, Result, Timestamp};
+use rtdb_types::{AnomalyKind, Iid, Result, Timestamp};
 use tokio_util::sync::CancellationToken;
 use super::{MergeConfig, MergeOutput, MergePages, OutputSchema, check_disk, create_file, disk_remaining, limit_writer, open_input, read_page, row_bytes};
 use super::planner::bucket;
@@ -67,7 +67,7 @@ impl FinalWriter<'_> {
             match rtdb_format::data::copy_spill_event_ranges(sources, self.memory) {
                 Ok(Some(batch)) => return self.page(batch.batch()),
                 Ok(None) => {}
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) => {}
                 Err(error) => return Err(error),
             }
         }

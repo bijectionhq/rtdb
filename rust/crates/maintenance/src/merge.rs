@@ -19,7 +19,7 @@ use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_sc
 use rtdb_index::{PartitionValue, TrieState};
 use rtdb_storage::{HeldView, IoRegion, LocalFile, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_temporal::AdmittedPolygonCalculator;
-use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp};
+use rtdb_types::{AnomalyKind, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CompactionExecutor, CompactionJob, RecencyMode, SnapshotSource};
 
@@ -240,6 +240,20 @@ fn reserve_input_read(
     Ok(ReadReservation::funded(count, retained, scratch))
 }
 
+/// Funds a retained read if both budgets have room for it, so the caller can take the download path instead.
+fn try_reserve_input_read(
+    store: &dyn ObjectStore, key: &ObjectKey, count: usize, ranges: bool,
+    retained_memory: &Arc<MemoryBudget>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<ReadReservation>> {
+    let allocation = if ranges { store.scan_range_allocation(key, count)? } else { store.whole_object_allocation(key, count)? };
+    let Some(retained) = retained_memory.try_reserve(allocation.retained_bytes.max(count)) else { return Ok(None) };
+    let scratch = match allocation.scratch_bytes {
+        0 => None,
+        bytes => match memory.try_reserve(bytes) { Some(scratch) => Some(scratch), None => return Ok(None) },
+    };
+    Ok(Some(ReadReservation::funded(count, retained, scratch)))
+}
+
 async fn read_input_bytes(
     store: &dyn ObjectStore, key: &ObjectKey, position: u64, ranges: bool,
     reservation: ReadReservation, cancellation: &CancellationToken,
@@ -278,7 +292,7 @@ async fn download_sized(
 fn if_memory_available<T>(result: Result<T>) -> Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -291,13 +305,13 @@ async fn open_metadata(
     let ranges = store.supports_scan_ranges(key);
     let (mut file, inspected) = if let Ok(count) = usize::try_from(size)
         && count > 0 && count <= retained_memory.limit_bytes()
-        && let Some(reservation) = if_memory_available(reserve_input_read(store, key, count, ranges, retained_memory, memory))?
+        && let Some(reservation) = try_reserve_input_read(store, key, count, ranges, retained_memory, memory)?
     {
         let bytes = read_input_bytes(store, key, 0, ranges, reservation, cancellation).await?;
         let mut cursor = Cursor::new(bytes.as_slice());
         let inspected = match if_memory_available(inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes)))? {
             Some(layout) if layout.uncompressed => {
-                if let Some(reservation) = if_memory_available(memory.reserve(layout.full_allocation_bound()?))? {
+                if let Some(reservation) = memory.try_reserve(layout.full_allocation_bound()?) {
                     if cancellation.is_cancelled() { return Err(crate::closed()); }
                     let buffer = Bytes::from_owner(InputBytes(bytes)).into();
                     let file = ArrowFile::from_inspected_buffer(buffer, None, layout)?;
@@ -379,7 +393,7 @@ impl PrimaryData {
             && count > 0 && count <= retained.limit_bytes()
         {
             let ranges = store.supports_scan_ranges(key);
-            if let Some(reservation) = if_memory_available(reserve_input_read(store, key, count, ranges, retained, memory))? {
+            if let Some(reservation) = try_reserve_input_read(store, key, count, ranges, retained, memory)? {
                 let bytes = read_input_bytes(store, key, 0, ranges, reservation, cancellation).await?;
                 return Ok(Self::Retained { bytes: Bytes::from_owner(InputBytes(bytes)), spill });
             }
@@ -583,7 +597,7 @@ impl SegmentCompactor {
         let (directory, mut outputs) = loop {
             let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
             match self.merge_inputs(job, &entry.slug, directory.path(), &retained_data, &retained_metadata, cancellation).await {
-                Err(error) if error.code == "rtdb/memory-budget-exceeded"
+                Err(error) if error.is(AnomalyKind::ResourceExhausted)
                     && (retained_data.peak_bytes() > 0 || retained_metadata.peak_bytes() > 0) => {
                     if cancellation.is_cancelled() { return Err(crate::closed()); }
                     directory.close().map_err(crate::invalid)?;
@@ -694,7 +708,7 @@ impl SegmentCompactor {
             }
             match self.merge_tasks(job, &mut inputs, &plan, initial, cancellation).await {
                 // The next task can run out of scratch before it can spill the retained pages.
-                Err(error) if retain && retain_multiple && error.code == "rtdb/memory-budget-exceeded" => {
+                Err(error) if retain && retain_multiple && error.is(AnomalyKind::ResourceExhausted) => {
                     if cancellation.is_cancelled() { return Err(crate::closed()); }
                     remove_temporary_file(&initial_path)?;
                     retain = false;
@@ -879,7 +893,7 @@ impl MergeOutput {
     fn normalize(&mut self, config: &MergeConfig, memory: &Arc<MemoryBudget>, data: &Path, meta: &Path,
         cancellation: &CancellationToken) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
         let result = layout::normalize(self, config, memory, data, meta, cancellation);
-        if !matches!(self.pages, MergePages::Retained(_)) || !result.as_ref().is_err_and(|error| error.code == "rtdb/memory-budget-exceeded") {
+        if !matches!(self.pages, MergePages::Retained(_)) || !result.as_ref().is_err_and(|error| error.is(AnomalyKind::ResourceExhausted)) {
             return result;
         }
         if cancellation.is_cancelled() { return Err(crate::closed()); }
