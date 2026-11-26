@@ -1095,6 +1095,8 @@ mod tests {
     #[tokio::test]
     async fn a_live_offload_after_the_startup_tip_pins_its_replica_position() {
         use rtdb_directory::{DeploymentRecord, Directory, MemoryDirectory, ReplayCustody};
+        use tokio_util::task::TaskTracker;
+        use crate::{deployment::CellStorage, keys::LocalKeyService, replay_broker::Client};
 
         let directory = MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
@@ -1106,10 +1108,14 @@ mod tests {
             placed_receipt_retirement: false,
         };
         let directory_files = tempfile::tempdir().unwrap();
+        let tasks = TaskTracker::new();
+        let broker = Client::standalone(directory.clone(), CellStorage::Local { root: directory_files.path().join("detached") },
+            &CellStorage::Local { root: directory_files.path().join("serving") },
+            Arc::new(LocalKeyService::new(directory_files.path().join("detached-keys")).unwrap()), tasks.clone()).unwrap();
         let holds = Arc::new(RecoveryHolds {
-            directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(directory_files.path()).unwrap()),
-            broker: None,
-            custody: ReplayCustody::Local, tasks: Default::default(),
+            directory: directory.clone(), keys: Arc::new(LocalKeyService::new(directory_files.path().join("keys")).unwrap()),
+            broker: Some(broker),
+            custody: ReplayCustody::Local, tasks,
         });
         holds.keys.key(&config.key_id).await.unwrap();
         let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &config, holds.clone()).await.unwrap();
