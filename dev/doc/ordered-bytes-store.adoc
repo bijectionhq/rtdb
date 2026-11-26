@@ -57,6 +57,14 @@ It always reports how far it inspected, so a caller resumes from there.
   System time strictly increases along positions because Default's shared physical partition names a transaction by its system time: its stage carries no event position, and its recovery groups events into transactions by time.
   So the writer samples its clock for each append at that append's ordering point, a batched group included, and a commit waits only when two samples fall in one microsecond.
 
+== Atomic multi-place commits
+
+A host transaction that spans places needs no port change: one `Append` already orders every write of every partition prefix at one stamp, judges all its read ranges together and answers one outcome.
+Bijection's atomic multi-label branch landing (round-4 T2) is one ordinary `Append`.
+Each replayed root's reads lie inside its own label's partitions, all of them inside the lander's, and the append's window is the intersection of the roots' windows.
+Every root's writes, the landing record and the disclosure audit commit at that one stamp, or a conflict, bound refusal or `outside` writes nothing anywhere.
+A lower place learns the landing only through the keys written into it: its own writes and the stamp the host turns into that place's own opaque token.
+
 == Mechanism
 
 The store is one relation, `store.entries`, on the main branch of the v1 branch index.
