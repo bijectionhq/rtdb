@@ -27,6 +27,7 @@ mod bitwise;
 mod series;
 mod volatile;
 mod admission;
+pub mod kernels;
 
 pub use rtdb_types::AllocationScope as EvaluationScope;
 pub use pg_catalog::{PgCatalogLookup, format_relation_name, requires_pg_catalog};
