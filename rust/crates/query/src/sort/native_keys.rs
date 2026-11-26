@@ -71,6 +71,19 @@ impl Kind {
         kind
     }
 
+    fn orders_totally(self, ty: &LogicalType) -> bool {
+        match self {
+            Self::MonthDay(_) => false,
+            Self::Number => {
+                let legs = ty.legs();
+                let floats = legs.iter().filter(|leg| matches!(leg, LogicalType::Scalar(ScalarType::F32 | ScalarType::F64))).count();
+                let numbers = legs.iter().filter(|leg| !matches!(leg, LogicalType::Null)).count();
+                floats == 0 || floats == numbers
+            }
+            _ => true,
+        }
+    }
+
     fn accepts(self, column: &Column) -> bool {
         match column {
             Column::Values(values) => values.iter().all(|value| self.value(value).is_some()),
@@ -324,19 +337,32 @@ fn float_order(left: f64, right: f64) -> Ordering {
     }
 }
 
-pub(super) struct NativeOrder(Vec<(usize, Kind)>);
+pub(super) struct NativeOrder {
+    keys: Vec<(usize, Kind)>,
+    total: bool,
+}
 
 impl NativeOrder {
     pub fn bind(schema: &Schema, columns: &[usize]) -> Option<Self> {
-        columns
+        let mut total = true;
+        let keys = columns
             .iter()
-            .map(|&column| Some((column, Kind::of(&schema.fields().get(column)?.data_type)?)))
-            .collect::<Option<Vec<_>>>()
-            .map(Self)
+            .map(|&column| {
+                let ty = &schema.fields().get(column)?.data_type;
+                let kind = Kind::of(ty)?;
+                total &= kind.orders_totally(ty);
+                Some((column, kind))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { keys, total })
     }
 
+    /// Whether every comparison succeeds and the order is transitive, so any comparison schedule yields the same order.
+    /// Month-day intervals with months raise on comparison, and integers compared with floats lose precision past 2^53.
+    pub fn is_total(&self) -> bool { self.total }
+
     pub fn accepts(&self, batch: &ColumnBatch) -> bool {
-        self.0
+        self.keys
             .iter()
             .all(|&(column, kind)| kind.accepts(&batch.columns[column]))
     }
@@ -349,7 +375,7 @@ impl NativeOrder {
         right_row: usize,
         order: &[SortExpr],
     ) -> rtdb_types::Result<Ordering> {
-        for (&(column, kind), order) in self.0.iter().zip(order) {
+        for (&(column, kind), order) in self.keys.iter().zip(order) {
             let left = kind.read(&left.columns[column], left_row);
             let right = kind.read(&right.columns[column], right_row);
             let comparison = left.compare(right, order)?;

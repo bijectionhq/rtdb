@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{
-    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::NativeOrder, size_error,
+    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::NativeOrder, select, size_error,
     timsort,
 };
 
@@ -411,10 +411,11 @@ impl Block {
             ObjectSort::LegacyMergeSort => legacy::scratch_bytes(len)?,
         };
         let _temporary = context.memory.reserve(bytes)?;
-        let mut order: Vec<_> = (0..len).collect();
         let mut keys = (!self.native).then(|| BlockKeys::new(len, &context.memory)).flatten();
+        let mut comparisons = 0usize;
         let compare = |left_index, right_index| {
-            context.check_cancelled()?;
+            context.check_cancelled_at(comparisons)?;
+            comparisons += 1;
             let (left, left_row) = self.positions[left_index];
             let (right, right_row) = self.positions[right_index];
             let (left, right) = (&self.batches[left], &self.batches[right]);
@@ -427,12 +428,23 @@ impl Block {
             native.expect("only an admitted sort can borrow its keys")
                 .compare(left, left_row, right, right_row, &plan.order)
         };
-        match algorithm {
-            ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
-            ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
-        }
+        let limit = usize::try_from(plan.limit).unwrap_or(usize::MAX);
+        // Under a total order, selecting the first rows yields exactly the stable sort's prefix.
+        // The legacy merge sort is kept for its comparison schedule, so it always sorts in full.
+        let selects = self.native && algorithm == ObjectSort::TimSort
+            && native.is_some_and(NativeOrder::is_total) && limit < len / 8;
+        let order = if selects {
+            select::first(len, limit, compare)?
+        } else {
+            let mut order: Vec<_> = (0..len).collect();
+            match algorithm {
+                ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
+                ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
+            }
+            order.truncate(limit);
+            order
+        };
         drop(keys);
-        order.truncate(usize::try_from(plan.limit).unwrap_or(usize::MAX));
         let Self {
             batches,
             positions,

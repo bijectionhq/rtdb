@@ -198,3 +198,92 @@ async fn sorted_output_keeps_equal_key_order_and_memory_and_spill_page_sizes() {
         assert_eq!(context.memory.used_bytes(), baseline);
     }
 }
+
+mod limited {
+    use super::*;
+    use std::collections::VecDeque;
+    use async_trait::async_trait;
+    use rtdb_plan::{ColumnId, Field};
+    use rtdb_types::ScalarType;
+    use crate::{columnar::{BatchCursor, Column, ColumnBatch}, context::OuterRows, parameters::BoundParameters};
+
+    struct Batches(VecDeque<ColumnBatch>);
+    #[async_trait]
+    impl BatchCursor for Batches {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.pop_front()) }
+    }
+
+    fn execution(sort_memory_bytes: usize) -> Execution {
+        let mut context = context(ObjectSort::TimSort);
+        Arc::get_mut(&mut context).unwrap().options.sort_memory_bytes = sort_memory_bytes;
+        Execution {
+            parameters: Arc::new(BoundParameters::infer(vec![], &context.memory).unwrap()),
+            outer: OuterRows::empty(&context.memory).unwrap(),
+            context, bindings: None, analysis: None,
+        }
+    }
+
+    fn field(id: u32, name: &str, data_type: LogicalType) -> Field {
+        Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type }
+    }
+
+    /// Pages of (key, ordinal) rows, the ordinal being each row's input position.
+    fn pages(execution: &Execution, key: &Field, keys: &[Value], page_rows: usize) -> Batches {
+        let ordinal = field(1, "ordinal", LogicalType::Scalar(ScalarType::I64));
+        Batches(keys.chunks(page_rows).enumerate().map(|(page, values)| {
+            let ids = (0..values.len()).map(|row| Value::I64((page * page_rows + row) as i64)).collect::<Vec<_>>();
+            let columns = [(key, values), (&ordinal, &ids[..])].into_iter().map(|(field, values)| Column::Arrow {
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                array: rtdb_columnar::copy_array(&field.data_type, values).unwrap(),
+                logical: Some(field.data_type.clone()),
+            }).collect();
+            ColumnBatch::settled(columns, values.len(), execution.context.memory.reserve(1 << 16).unwrap()).unwrap()
+        }).collect())
+    }
+
+    async fn sorted(execution: &Execution, key: Field, keys: &[Value], order: SortExpr, limit: u64) -> Result<Vec<usize>> {
+        let ordinal = field(1, "ordinal", LogicalType::Scalar(ScalarType::I64));
+        let schema = Schema::new(vec![key.clone(), ordinal]).unwrap();
+        let input = pages(execution, &key, keys, 64);
+        let mut sort = batches::BatchSort::new(Box::new(input), schema, vec![order], execution.clone(), false, 0, limit)?;
+        let mut ids = Vec::new();
+        while let Some(batch) = sort.next_batch().await? {
+            for row in 0..batch.len {
+                let Value::I64(id) = batch.columns[1].value(row)? else { panic!("expected an ordinal") };
+                ids.push(id as usize);
+            }
+        }
+        Ok(ids)
+    }
+
+    #[tokio::test]
+    async fn a_limited_sort_returns_the_prefix_of_the_full_sort_with_ties_in_input_order() {
+        let key = field(0, "key", LogicalType::Scalar(ScalarType::I64).maybe());
+        let keys: Vec<Value> = (0..1000_i64).map(|i| if i % 37 == 0 { Value::Null } else { Value::I64((i * 7919) % 13) }).collect();
+        for sort_memory_bytes in [usize::MAX, 1] {
+            let execution = execution(sort_memory_bytes);
+            for (descending, nulls_first) in [(false, false), (true, true), (true, false)] {
+                let order = SortExpr { expr: key.expression(), descending, nulls_first };
+                let full = sorted(&execution, key.clone(), &keys, order.clone(), u64::MAX).await.unwrap();
+                for limit in [1, 10, 100] {
+                    let limited = sorted(&execution, key.clone(), &keys, order.clone(), limit).await.unwrap();
+                    assert_eq!(limited, full[..limit as usize], "desc {descending}, nulls first {nulls_first}, limit {limit}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limited_sort_still_compares_intervals_with_months() {
+        let key = field(0, "key", LogicalType::Scalar(ScalarType::Interval(rtdb_types::IntervalUnit::MonthDayNano)).maybe());
+        let mut keys = vec![Value::Null; 1000];
+        keys[500] = Value::IntervalMonthDayNano { months: 1, days: 0, nanoseconds: 0 };
+        keys[900] = Value::IntervalMonthDayNano { months: 0, days: 2, nanoseconds: 0 };
+        let order = SortExpr { expr: key.expression(), descending: false, nulls_first: true };
+        let execution = execution(usize::MAX);
+        let full = sorted(&execution, key.clone(), &keys, order.clone(), u64::MAX).await.unwrap_err();
+        let limited = sorted(&execution, key, &keys, order, 5).await.unwrap_err();
+        assert_eq!(limited.code, full.code);
+        assert_eq!(limited.code, "xtdb.expression/cannot-compare-mdn-interval-with-months");
+    }
+}

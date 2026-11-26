@@ -8,6 +8,7 @@ use crate::{context::Execution, invalid};
 pub(crate) mod batches;
 mod timsort;
 mod legacy;
+mod select;
 mod native_keys;
 
 const BLOCK_ROWS: usize = 102_400;
