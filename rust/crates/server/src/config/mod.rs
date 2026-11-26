@@ -89,6 +89,8 @@ pub struct NodeConfiguration {
     pub disk_cache: Option<DiskCacheSettings>,
     /// A configured time zone shared by the node and PostgreSQL startup.
     pub default_timezone: Option<String>,
+    /// The host's zone, from the startup environment's `TZ` or the host's zone files; PostgreSQL sessions start in it without `defaultTz`.
+    pub host_timezone: String,
     pub indexer: IndexerSettings,
     pub compactor: CompactorSettings,
     pub garbage: GarbageSettings,
@@ -161,6 +163,7 @@ impl NodeConfiguration {
             .map(|text| join_threshold(&text).ok_or_else(|| invalid("XTDB_JOIN_SPILL_THRESHOLD must be a signed 64-bit integer")))
             .transpose()?.unwrap_or(100_000);
         let query_spill_limit_bytes = query_spill_limit(fields.take("query"), environment)?;
+        let host_timezone = host_zone::host_timezone(environment)?;
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
         let default_erasure = DefaultErasureSettings {
             local: erasure_flag(&mut fields, "defaultLocalErasure", "RTDB_DEFAULT_LOCAL_ERASURE", environment)?,
@@ -180,7 +183,7 @@ impl NodeConfiguration {
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory: None,
                 health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
-                default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
+                default_timezone: None, host_timezone, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
                 tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
@@ -218,7 +221,7 @@ impl NodeConfiguration {
                 deployment_admin,
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory,
-                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, host_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)

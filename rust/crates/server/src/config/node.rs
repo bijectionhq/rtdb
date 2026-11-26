@@ -12,7 +12,7 @@ impl NodeConfiguration {
     /// The zone a Postgres wire session starts in when its client names none: the configured `defaultTz`, else the
     /// host's zone, as XTDB's server starts its sessions in the JVM's default zone.
     pub fn pgwire_timezone(&self) -> String {
-        self.default_timezone.clone().unwrap_or_else(super::host_zone::host_timezone)
+        self.default_timezone.clone().unwrap_or_else(|| self.host_timezone.clone())
     }
 
     /// Funds the installed audience before splitting the ordinary allocation between cache and execution.

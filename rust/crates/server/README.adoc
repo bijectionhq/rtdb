@@ -84,6 +84,8 @@ The startup owner retains the resulting lease through server shutdown.
 The default is 100,000, and zero or negative values disable filters for nonempty builds.
 A value that is not a signed 64-bit integer fails startup, where XTDB's `parse-long` silently keeps the default.
 YAML, EDN, ingest, and packaged server startup use the same captured environment value.
+A PostgreSQL session whose client names no zone starts in `defaultTz`, else in the host's zone, found where the JVM looks on Unix: the startup environment's `TZ`, then `/etc/timezone`, then the zone `/etc/localtime` links to, else UTC.
+A non-empty `TZ` that names no zone, as an unknown zone ID or a path outside a `zoneinfo` directory, fails startup rather than falling through to the host's files.
 `defaultLocalErasure` and `defaultKafkaErasure` enroll fresh Default primaries for physical erasure; both default to `false`.
 Without the YAML key, each reads `RTDB_DEFAULT_LOCAL_ERASURE` or `RTDB_DEFAULT_KAFKA_ERASURE`, where exactly `1` enables it, `0` or empty disables it, and any other value is a configuration error.
 `defaultLocalErasure` applies only with `defaultV1Serving`; `defaultKafkaErasure` fails startup without native Kafka, `defaultV1Serving` and both original key vaults.

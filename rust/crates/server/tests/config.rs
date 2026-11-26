@@ -158,14 +158,34 @@ fn a_configured_default_timezone_is_the_pgwire_session_zone() {
 fn the_host_timezone_is_found_where_the_jvm_looks_for_it() {
     use std::path::Path;
     let paris = Path::new("/var/db/timezone/zoneinfo/Europe/Paris");
-    assert_eq!(host_timezone_from(Some("Asia/Tokyo"), Some("America/New_York\n"), Some(paris)), "Asia/Tokyo");
-    assert_eq!(host_timezone_from(Some(":Asia/Tokyo"), None, None), "Asia/Tokyo");
-    assert_eq!(host_timezone_from(Some("/usr/share/zoneinfo/Asia/Tokyo"), None, None), "Asia/Tokyo");
-    assert_eq!(host_timezone_from(None, Some("America/New_York\n"), Some(paris)), "America/New_York");
-    assert_eq!(host_timezone_from(Some(""), None, Some(paris)), "Europe/Paris");
-    assert_eq!(host_timezone_from(Some("Mars/Olympus"), None, Some(paris)), "Europe/Paris");
-    assert_eq!(host_timezone_from(None, None, Some(Path::new("/etc/elsewhere"))), "UTC");
-    assert_eq!(host_timezone_from(None, None, None), "UTC");
+    let zone = |tz, etc_timezone, localtime| host_timezone_from(tz, etc_timezone, localtime).unwrap();
+    assert_eq!(zone(Some("Asia/Tokyo"), Some("America/New_York\n"), Some(paris)), "Asia/Tokyo");
+    assert_eq!(zone(Some(":Asia/Tokyo"), None, None), "Asia/Tokyo");
+    assert_eq!(zone(Some("/usr/share/zoneinfo/Asia/Tokyo"), None, None), "Asia/Tokyo");
+    assert_eq!(zone(None, Some("America/New_York\n"), Some(paris)), "America/New_York");
+    assert_eq!(zone(Some(""), None, Some(paris)), "Europe/Paris");
+    assert_eq!(zone(None, None, Some(Path::new("/etc/elsewhere"))), "UTC");
+    assert_eq!(zone(None, None, None), "UTC");
+}
+
+#[test]
+fn a_tz_that_names_no_zone_fails_startup() {
+    use std::path::Path;
+    let paris = Path::new("/var/db/timezone/zoneinfo/Europe/Paris");
+    for tz in ["Mars/Olympus", ":Mars/Olympus", "/etc/elsewhere"] {
+        assert_eq!(host_timezone_from(Some(tz), None, Some(paris)).unwrap_err().code, "xtdb/invalid-node-config", "{tz}");
+        let environment = |name: &str| (name == "TZ").then(|| tz.to_owned());
+        for ingest in [false, true] {
+            assert_eq!(NodeConfiguration::from_yaml_with_environment("", &environment, ingest).unwrap_err().code, "xtdb/invalid-node-config", "{tz}");
+        }
+    }
+}
+
+#[test]
+fn the_startup_environment_s_tz_is_the_pgwire_session_zone() {
+    let environment = |name: &str| (name == "TZ").then(|| "Asia/Tokyo".to_owned());
+    assert_eq!(NodeConfiguration::from_yaml_with_environment("", &environment, false).unwrap().pgwire_timezone(), "Asia/Tokyo");
+    assert_eq!(NodeConfiguration::from_yaml_with_environment("defaultTz: Europe/Paris", &environment, false).unwrap().pgwire_timezone(), "Europe/Paris");
 }
 
 #[test]
