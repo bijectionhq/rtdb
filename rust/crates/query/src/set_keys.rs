@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, mem::size_of, sync::Arc};
 
 use arrow_buffer::BooleanBufferBuilder;
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Result, Value};
 
 use crate::{
@@ -221,6 +221,16 @@ impl<'a> Key<'a> {
         Ok((hash, key))
     }
 
+    /// Whether every part of the key reads directly from its column, as the decoded comparison needs.
+    fn decodable(&self) -> bool { !self.has_uri && self.values.is_empty() }
+
+    fn direct_parts(&self) -> impl ExactSizeIterator<Item = Option<ScalarKey<'_>>> {
+        (0..self.len()).map(|index| match self.direct(index)? {
+            DirectKey::Scalar(scalar) => Some(scalar),
+            DirectKey::FloatList(_) => None,
+        })
+    }
+
     pub(crate) fn vector_hash(&self) -> Result<u32> {
         (0..self.len()).try_fold(0, |hash, index| {
             let cell = match self.cached(index) {
@@ -361,7 +371,7 @@ impl Positions {
         bucket: u64,
         all: bool,
         context: &QueryContext,
-        equal: impl Fn(Position) -> Result<bool>,
+        mut equal: impl FnMut(usize, Position) -> Result<bool>,
     ) -> Result<Option<usize>> {
         let mut next = self.chains.get(&bucket).map(|&(first, _)| first);
         let mut checked = 0usize;
@@ -369,7 +379,7 @@ impl Positions {
             context.check_cancelled_at(checked)?;
             checked += 1;
             let position = self.rows[index];
-            if (!all || !position.consumed) && equal(position)? {
+            if (!all || !position.consumed) && equal(index, position)? {
                 if all {
                     self.rows[index].consumed = true;
                 }
@@ -390,6 +400,109 @@ pub(crate) struct BatchKeyIndex {
     positions: Positions,
     reservation: Arc<MemoryReservation>,
     hashing: KeyHash,
+    /// Stored keys already decoded for comparison, by position.
+    decoded: DecodedKeys,
+}
+
+/// Owned copies of stored direct keys, decoded on their first comparison, so that a key met again is not read again.
+#[derive(Default)]
+struct DecodedKeys { keys: Vec<Option<Decoded>>, charge: Option<Arc<MemoryReservation>>, bytes: usize }
+
+enum Decoded {
+    Scalars(Box<[OwnedScalar]>),
+    /// A key with a part outside the owned scalars, compared through its columns.
+    General,
+}
+
+/// A direct scalar key part held by the index; it compares through the same `ScalarKey::equal` as the part it copies.
+enum OwnedScalar { Null, Bool(bool), Signed(i64), Float(f64), Text(Box<str>), Keyword(Box<str>), Bytes(Box<[u8]>), FixedBytes(Box<[u8]>), Uuid([u8; 16]), Reference(i32) }
+
+impl OwnedScalar {
+    /// URIs compare by parsed equivalence and can raise, so they take the general comparison.
+    fn of(key: ScalarKey<'_>) -> Option<Self> {
+        Some(match key {
+            ScalarKey::Null => Self::Null,
+            ScalarKey::Bool(value) => Self::Bool(value),
+            ScalarKey::Signed(value) => Self::Signed(value),
+            ScalarKey::Float(value) => Self::Float(value),
+            ScalarKey::Text(value) => Self::Text(value.into()),
+            ScalarKey::Keyword(value) => Self::Keyword(value.into()),
+            ScalarKey::Bytes(value) => Self::Bytes(value.into()),
+            ScalarKey::FixedBytes(value) => Self::FixedBytes(value.into()),
+            ScalarKey::Uuid(value) => Self::Uuid(*value),
+            ScalarKey::Reference(value) => Self::Reference(value),
+            ScalarKey::Uri(_) => return None,
+        })
+    }
+
+    fn key(&self) -> ScalarKey<'_> {
+        match self {
+            Self::Null => ScalarKey::Null,
+            Self::Bool(value) => ScalarKey::Bool(*value),
+            Self::Signed(value) => ScalarKey::Signed(*value),
+            Self::Float(value) => ScalarKey::Float(*value),
+            Self::Text(value) => ScalarKey::Text(value),
+            Self::Keyword(value) => ScalarKey::Keyword(value),
+            Self::Bytes(value) => ScalarKey::Bytes(value),
+            Self::FixedBytes(value) => ScalarKey::FixedBytes(value),
+            Self::Uuid(value) => ScalarKey::Uuid(value),
+            Self::Reference(value) => ScalarKey::Reference(*value),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        size_of::<Self>() + match self {
+            Self::Text(value) | Self::Keyword(value) => value.len(),
+            Self::Bytes(value) | Self::FixedBytes(value) => value.len(),
+            _ => 0,
+        }
+    }
+}
+
+impl DecodedKeys {
+    const CHARGE_STEP: usize = 64 * 1024;
+
+    fn get(&mut self, index: usize, columns: &[Column], row: usize, memory: &Arc<MemoryBudget>) -> Result<&Decoded> {
+        if self.keys.len() <= index { self.keys.resize_with(index + 1, || None); }
+        if self.keys[index].is_none() {
+            let scalars = columns.iter().map(|column| match DirectKey::read(column, row) {
+                Some(DirectKey::Scalar(scalar)) => OwnedScalar::of(scalar),
+                _ => None,
+            }).collect::<Option<Box<[OwnedScalar]>>>();
+            let bytes = scalars.as_ref().map_or(0, |scalars| scalars.iter().map(OwnedScalar::bytes).sum::<usize>())
+                .checked_add(size_of::<Option<Decoded>>()).ok_or_else(size_error)?;
+            self.charge(bytes, memory)?;
+            self.keys[index] = Some(scalars.map_or(Decoded::General, Decoded::Scalars));
+        }
+        Ok(self.keys[index].as_ref().expect("The key was decoded"))
+    }
+
+    fn charge(&mut self, bytes: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(size_error)?;
+        let held = self.charge.as_ref().map_or(0, |charge| charge.bytes());
+        if self.bytes <= held { return Ok(()); }
+        let target = self.bytes.checked_add(Self::CHARGE_STEP).ok_or_else(size_error)?;
+        match &mut self.charge {
+            Some(charge) => Arc::get_mut(charge).expect("The decoded keys own their charge").grow_to(target)?,
+            None => self.charge = Some(memory.reserve(target)?),
+        }
+        Ok(())
+    }
+}
+
+/// Whether a key equals a decoded one, as `Key::equals` decides it; `None` where only the general comparison can decide.
+fn decoded_equal<'a>(probe: impl ExactSizeIterator<Item = Option<ScalarKey<'a>>>, stored: &[OwnedScalar]) -> Option<bool> {
+    if probe.len() != stored.len() { return None; }
+    for (left, right) in probe.zip(stored) {
+        let equal = match (left?, right.key()) {
+            (ScalarKey::Uri(_), _) => return None,
+            (ScalarKey::Null, ScalarKey::Null) => true,
+            (ScalarKey::Null, _) | (_, ScalarKey::Null) => false,
+            (left, right) => left.equal(right)?,
+        };
+        if !equal { return Some(false); }
+    }
+    Some(true)
 }
 
 impl BatchKeyIndex {
@@ -407,6 +520,7 @@ impl BatchKeyIndex {
             positions: Positions::default(),
             reservation: context.memory.reserve(0)?,
             hashing,
+            decoded: DecodedKeys::default(),
         })
     }
 
@@ -545,8 +659,16 @@ impl BatchKeyIndex {
         context: &QueryContext,
     ) -> Result<Option<usize>> {
         let batches = &self.batches;
-        self.positions.find(u64::from(hash), all, context, |position| {
+        let decoded = &mut self.decoded;
+        let direct = key.decodable();
+        self.positions.find(u64::from(hash), all, context, |index, position| {
             let (batch, projected) = &batches[position.batch];
+            if direct
+                && let Decoded::Scalars(stored) = decoded.get(index, &batch.columns, position.row, &context.memory)?
+                && let Some(equal) = decoded_equal(key.direct_parts(), stored)
+            {
+                return Ok(equal);
+            }
             key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected: *projected }, None, context)
         })
     }
@@ -561,7 +683,7 @@ impl BatchKeyIndex {
         let source = &self.batches;
         let group = u32::try_from(group).map_err(|_| size_error())?;
         let bucket = (u64::from(group) << 32) | u64::from(hash);
-        if self.positions.find(bucket, false, context, |position| {
+        if self.positions.find(bucket, false, context, |_, position| {
             let (batch, projected) = &source[position.batch];
             let other = Key::read(ArrowKey { columns: &batch.columns, row: position.row, projected: *projected }, None, context)?;
             Ok(key.equal_at(&other, 0, false, context, None)? == Some(true))
@@ -640,7 +762,7 @@ impl BatchKeyIndex {
                 visit(row, index, false)?;
                 continue;
             }
-            let known = current.find(u64::from(hash), false, context, |position| {
+            let known = current.find(u64::from(hash), false, context, |_, position| {
                 key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected }, positions, context)
             })?;
             let index = previous
@@ -710,6 +832,19 @@ mod tests {
             RecordBatch::try_new(schema, vec![integers, Arc::new(StringArray::from(texts))])
                 .unwrap();
         ColumnBatch::from_owned(OwnedBatch::new(batch, &context.memory).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn decoded_keys_compare_as_the_column_keys_they_copy() {
+        let stored = [OwnedScalar::Signed(1), OwnedScalar::Text("a".into()), OwnedScalar::Null];
+        let parts = |keys: &[ScalarKey<'static>]| keys.to_vec().into_iter().map(Some);
+        assert_eq!(decoded_equal(parts(&[ScalarKey::Float(1.0), ScalarKey::Keyword("a"), ScalarKey::Null]), &stored),
+            Some(ScalarKey::Float(1.0).equal(ScalarKey::Signed(1)) == Some(true) && ScalarKey::Keyword("a").equal(ScalarKey::Text("a")) == Some(true)));
+        assert_eq!(decoded_equal(parts(&[ScalarKey::Signed(2), ScalarKey::Text("a"), ScalarKey::Null]), &stored), Some(false));
+        assert_eq!(decoded_equal(parts(&[ScalarKey::Signed(1), ScalarKey::Text("a"), ScalarKey::Signed(0)]), &stored), Some(false), "null differs from a value");
+        assert_eq!(decoded_equal(parts(&[ScalarKey::Signed(1)]), &stored), None, "a different width takes the general comparison");
+        assert_eq!(decoded_equal(parts(&[ScalarKey::Uri("https://example.com"), ScalarKey::Text("a"), ScalarKey::Null]), &stored), None);
+        assert!(OwnedScalar::of(ScalarKey::Uri("https://example.com")).is_none());
     }
 
     #[test]
