@@ -2725,18 +2725,21 @@ async fn binary_owned_flight_retains_identity_order_and_the_scalar_batch_refusal
 }
 
 #[tokio::test]
-async fn held_sealed_search_unit_rows_preserve_text_order_and_original_completion() {
+async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_completion() {
     use arrow_array::{ArrayRef, BinaryArray, BooleanArray, TimestampMicrosecondArray};
+    use rtdb_types::SEALED_SEARCH_UNIT_ROWS as INVENTORY;
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
 
-    const INVENTORY: &str = "fact_sealed_search_unit_rows";
-    const ACTION: &str = "rtdb.owned.ReadHeldSealedSearchUnitRows.v1";
+    const ACTION: &str = "rtdb.owned.ReadHeldSealedSearchUnitRows.v2";
     const MORE: &str = "rtdb.owned.identity_more";
     const WITNESS: &str = "rtdb.owned.range_witness";
 
     fn ipc(columns: Vec<(&str, ArrayRef)>) -> Vec<u8> {
-        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        nullable_ipc(columns.into_iter().map(|(name, column)| { let nullable = column.null_count() > 0; (name, column, nullable) }).collect())
+    }
+    fn nullable_ipc(columns: Vec<(&str, ArrayRef, bool)>) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter_with_nullable(columns).unwrap();
         write_arrow_stream(batch.schema_ref(), &[batch.clone()], IpcWriteOptions::default()).unwrap()
     }
     fn relation_frame(relation: &str) -> Vec<u8> {
@@ -2761,22 +2764,25 @@ async fn held_sealed_search_unit_rows_preserve_text_order_and_original_completio
     client.update("CREATE TABLE bj_rtdb_restore_hold (_id TEXT, binding BYTEA)", None).await;
     let claim = client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await[0]
         .column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
-    let prefix = format!("{}/", "bc".repeat(32));
+    let prefix = vec![0xbc; 32];
     let derived = format!("fact_{}_search", "01".repeat(32));
-    let tablet = "02".repeat(16);
-    let first = format!("{prefix}{derived}/0b{tablet}0300ff0001");
-    let last = format!("{prefix}{derived}/0b{tablet}03010001");
-    let other = format!("{}/{derived}/0b{tablet}03010001", "bd".repeat(32));
-    let request = |hold: &[u8], relation, prefix: &str, after: ArrayRef, limit| {
+    let key = |alias: &[u8], payload: &[u8]| {
+        let address = [&[11][..], &[2; 16], payload, &[0, 1]].concat();
+        [alias, &[derived.len() as u8], derived.as_bytes(), &address].concat()
+    };
+    let first = key(&prefix, &[3, 0, 255]);
+    let last = key(&prefix, &[3, 1]);
+    let other = key(&[0xbd; 32], &[3, 1]);
+    let request = |hold: &[u8], relation, prefix: &[u8], after: ArrayRef, limit| {
         let mut body = [hold, &relation_frame(relation)].concat();
-        body.extend(ipc(vec![
-            ("prefix", Arc::new(StringArray::from(vec![prefix]))),
-            ("after", after),
-            ("limit", Arc::new(Int64Array::from(vec![limit]))),
+        body.extend(nullable_ipc(vec![
+            ("prefix", Arc::new(BinaryArray::from_iter_values([prefix])), false),
+            ("after", after, true),
+            ("limit", Arc::new(Int64Array::from(vec![limit])), false),
         ]));
         Bytes::from(body)
     };
-    let after = |value: Option<&str>| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+    let after = |value: Option<&[u8]>| Arc::new(BinaryArray::from(vec![value])) as ArrayRef;
     let undeclared = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap().remove(0).body.slice(..16);
     assert!(client.action(ACTION, request(&undeclared, INVENTORY, &prefix, after(None), 1)).await.is_err());
     client.action("rtdb.owned.CloseRead.v1", undeclared).await.unwrap();
@@ -2784,10 +2790,10 @@ async fn held_sealed_search_unit_rows_preserve_text_order_and_original_completio
     let mut declaration = relation_frame(INVENTORY);
     declaration.extend(br#"{"fields":[]}"#);
     client.action("rtdb.owned.DeclareRelation.v1", declaration.into()).await.unwrap();
-    let stored = [last.as_str(), other.as_str(), first.as_str()];
+    let stored = [last.as_slice(), other.as_slice(), first.as_slice()];
     let mut facts = 1u16.to_be_bytes().to_vec();
     group(&mut facts, INVENTORY, &ipc(vec![
-        ("_id", Arc::new(StringArray::from(stored.to_vec()))),
+        ("_id", Arc::new(BinaryArray::from_iter_values(stored))),
         ("_op", Arc::new(StringArray::from(vec!["replace"; stored.len()]))),
         ("_valid_from", Arc::new(TimestampMicrosecondArray::from_value(i64::MIN, stored.len()).with_timezone("UTC"))),
     ]));
@@ -2807,13 +2813,13 @@ async fn held_sealed_search_unit_rows_preserve_text_order_and_original_completio
     client.action("rtdb.owned.DecideHosted.v4", commit.into()).await.unwrap();
 
     let hold = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap().remove(0).body.slice(..16);
-    for (bound, expected, more) in [(None, Some(first.as_str()), true), (Some(first.as_str()), Some(last.as_str()), false),
-        (Some(last.as_str()), None, false)]
+    for (bound, expected, more) in [(None, Some(first.as_slice()), true), (Some(first.as_slice()), Some(last.as_slice()), false),
+        (Some(last.as_slice()), None, false)]
     {
         let reply = client.action(ACTION, request(&hold, INVENTORY, &prefix, after(bound), 1)).await.unwrap().remove(0).body;
         let stream = StreamReader::try_new(reply.as_ref(), None).unwrap();
         let schema = stream.schema();
-        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(0).data_type(), &DataType::Binary);
         assert_eq!(schema.metadata()[MORE], if more { "1" } else { "0" });
         assert_eq!(schema.metadata().contains_key(WITNESS), !more);
         if let Some(nonce) = schema.metadata().get(WITNESS) {
@@ -2822,16 +2828,16 @@ async fn held_sealed_search_unit_rows_preserve_text_order_and_original_completio
         let mut result = Vec::new();
         for batch in stream {
             let batch = batch.unwrap();
-            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            result.extend(ids.iter().map(|id| id.unwrap().to_owned()));
+            let ids = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            result.extend(ids.iter().map(|id| id.unwrap().to_vec()));
         }
-        assert_eq!(result.iter().map(String::as_str).collect::<Vec<_>>(), expected.into_iter().collect::<Vec<_>>());
+        assert_eq!(result.iter().map(Vec::as_slice).collect::<Vec<_>>(), expected.into_iter().collect::<Vec<_>>());
     }
     for refused in [
-        request(&hold, INVENTORY, &prefix.to_ascii_uppercase(), after(None), 1),
-        request(&hold, INVENTORY, &prefix, after(Some(&other)), 1),
-        request(&hold, INVENTORY, &prefix, after(Some(&prefix)), 1),
-        request(&hold, INVENTORY, &prefix, Arc::new(BinaryArray::from(vec![None::<&[u8]>])), 1),
+        request(&hold, INVENTORY, &prefix[..31], after(None), 1),
+        request(&hold, INVENTORY, &prefix, after(Some(other.as_slice())), 1),
+        request(&hold, INVENTORY, &prefix, after(Some(prefix.as_slice())), 1),
+        request(&hold, INVENTORY, &prefix, Arc::new(StringArray::from(vec![None::<&str>])), 1),
         request(&hold, INVENTORY, &prefix, after(None), 65),
         request(&hold, rtdb_types::SHARED_COLUMN_CARRIERS, &prefix, after(None), 1),
     ] {
