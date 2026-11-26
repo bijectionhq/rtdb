@@ -131,17 +131,19 @@ impl PreparedSql {
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let (query, inferred, lookups) = match sharable.then(|| shared_plan(source, context, &options)).transpose()?.flatten() {
+                let (query, inferred, kept) = match sharable.then(|| shared_plan(source, context, &options)).transpose()?.flatten() {
                     Some(shared) => {
                         notices.clone_from(&shared.notices);
-                        (shared.query.clone(), shared.parameter_types.clone(), Some(Arc::clone(&shared.lookups)))
+                        (shared.query.clone(), shared.parameter_types.clone(), Some(KeptPlan::Shared(Arc::downgrade(&shared))))
                     }
                     None => {
                         let recording = RecordingCatalog::new(&context.catalog);
                         let prepared = parsed.bind(&recording, &options)?;
                         let inferred = prepared.parameter_types.clone();
                         notices = prepared.notices.clone();
-                        (PreparedQuery::from_prepared_in(prepared, &context.catalog, &context.memory)?, inferred, recording.finish().map(Arc::new))
+                        let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, &context.memory)?;
+                        let kept = recording.finish().map(|lookups| KeptPlan::Own { lookups: Arc::new(lookups), query: query.clone() });
+                        (query, inferred, kept)
                     }
                 };
                 for (index, ty) in &inferred {
@@ -154,7 +156,7 @@ impl PreparedSql {
                 };
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
                 let result = PreparedResult::Query { schema, pg_types, parameter_projection: query.is_parameter_projection() };
-                cached = lookups.map(|lookups| CachedPlan { options: options.clone(), lookups, query });
+                cached = kept.map(|plan| CachedPlan { options: options.clone(), plan });
                 result
             }
             StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
@@ -401,13 +403,13 @@ impl PreparedSql {
         if argument_types.len() != self.parameter_count() { return Err(parameter_error("Parameter field count differs from the prepared statement")); }
         let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref()
             .filter(|plan| self.binds_to(&plan.options, &context.timezone, argument_types, execution))
-            .map(|plan| (plan.lookups.clone(), plan.query.clone())));
+            .and_then(|plan| plan.plan.lookups_and_query()));
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
         let options = self.bound_options(&context.timezone, argument_types, execution);
         if let Some(shared) = self.0.sharable.then(|| shared_plan(&self.0.source, context, &options)).transpose()?.flatten() {
             let query = shared.query.recharged(&context.memory)?;
             if let Ok(mut plan) = self.0.plan.lock() {
-                *plan = Some(CachedPlan { options, lookups: Arc::clone(&shared.lookups), query: shared.query.clone() });
+                *plan = Some(CachedPlan { options, plan: KeptPlan::Shared(Arc::downgrade(&shared)) });
             }
             return Ok(query);
         }
@@ -426,7 +428,7 @@ impl PreparedSql {
         };
         let query = kept.recharged(&context.memory)?;
         if let Some(lookups) = lookups && let Ok(mut plan) = self.0.plan.lock() {
-            *plan = Some(CachedPlan { options, lookups: Arc::new(lookups), query: kept });
+            *plan = Some(CachedPlan { options, plan: KeptPlan::Own { lookups: Arc::new(lookups), query: kept } });
         }
         Ok(query)
     }
@@ -471,7 +473,23 @@ impl PreparedSql {
 
 /// The last plan a statement bound, and what its planning read from the catalog: a snapshot that answers those
 /// lookups the same plans the statement the same way, so it reuses the plan.
-struct CachedPlan { options: PrepareOptions, lookups: Arc<CatalogLookups>, query: PreparedQuery }
+struct CachedPlan { options: PrepareOptions, plan: KeptPlan }
+
+enum KeptPlan {
+    /// Planned by the statement and charged to it.
+    Own { lookups: Arc<CatalogLookups>, query: PreparedQuery },
+    /// The node's shared plan, which stays charged to the node's cache, so the statement keeps it only while the cache does.
+    Shared(std::sync::Weak<SharedPlan>),
+}
+
+impl KeptPlan {
+    fn lookups_and_query(&self) -> Option<(Arc<CatalogLookups>, PreparedQuery)> {
+        match self {
+            Self::Own { lookups, query } => Some((Arc::clone(lookups), query.clone())),
+            Self::Shared(plan) => plan.upgrade().map(|shared| (Arc::clone(&shared.lookups), shared.query.clone())),
+        }
+    }
+}
 
 /// The node's shared plan for `source`, planning it into the node's cache on a miss.
 /// None where the context carries no cache, or where the statement is not a query the cache can keep; the caller then
@@ -585,7 +603,7 @@ fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
     let statement_budget = MemoryBudget::new(1 << 20);
     let context = QueryContext::new(catalog, Arc::clone(&statement_budget), rtdb_types::Timestamp(0), "UTC", QueryOptions::default(), &cancellation).unwrap();
     let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    let original = prepared.0.plan.lock().unwrap().as_ref().unwrap().query.relation().clone();
+    let original = prepared.0.plan.lock().unwrap().as_ref().unwrap().plan.lookups_and_query().unwrap().1.relation().clone();
     let query_budget = MemoryBudget::new(1 << 20);
     let mut query_context = context;
     Arc::make_mut(&mut query_context).memory = Arc::clone(&query_budget);
@@ -818,6 +836,30 @@ mod shared_plan_tests {
         drop((first, second));
         drop(plans);
         assert_eq!(node.used_bytes(), 0);
+    }
+
+    #[test]
+    fn an_evicted_plan_stops_charging_the_cache_while_its_statement_lives_on() {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let sql = "SELECT 1 AS one";
+        let after_eviction = |keep: bool| {
+            let node = MemoryBudget::new(1 << 30);
+            let plans = Arc::new(SharedPlans::new(&node));
+            let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+            let statement = PreparedSql::prepare(sql, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+            drop(statement.bind(&context, &[], true).unwrap());
+            let kept = keep.then_some(statement);
+            for n in 0..200 {
+                drop(PreparedSql::prepare(&format!("SELECT {n} AS c"), &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap());
+            }
+            let used = node.used_bytes();
+            if let Some(statement) = &kept {
+                drop(statement.bind(&context, &[], true).unwrap());
+                assert!(node.used_bytes() > used, "rebinding after eviction shares the plan again");
+            }
+            used
+        };
+        assert_eq!(after_eviction(true), after_eviction(false));
     }
 }
 
