@@ -206,7 +206,7 @@ async fn a_fragment_whose_node_fails_is_read_by_the_coordinator() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head() {
+async fn a_fragment_is_served_only_from_its_residence_and_answers_as_of_its_basis_after_later_writes() {
     let (node, driver, fragmenter) = start().await;
     let mut session = node.session(DATABASE, Arc::new(Authority)).unwrap();
     populate(&node, &mut session).await;
