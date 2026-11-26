@@ -10,7 +10,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, StorageEpoch,
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CompactionFailure, CompactionObserver, SnapshotSource, StderrCompactionObserver};
+use crate::{CompactionFailure, CompactionObserver, SnapshotSource, LoggingCompactionObserver};
 use crate::driver::Completion;
 
 /// One version of one definition of an artefact kind over one table.
@@ -348,7 +348,7 @@ impl ArtefactDriver {
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
         let retirement = Retirement { kind: kind.to_string(), store, publisher: Arc::clone(&publisher), storage, looked: None, again: BTreeSet::new() };
-        Ok((Self { snapshots, builder, publisher, observer: Arc::new(StderrCompactionObserver), storage, parallelism, automatic, signals: signal_receiver, requests: request_receiver, retirement },
+        Ok((Self { snapshots, builder, publisher, observer: Arc::new(LoggingCompactionObserver), storage, parallelism, automatic, signals: signal_receiver, requests: request_receiver, retirement },
             ArtefactHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)) }))
     }
 

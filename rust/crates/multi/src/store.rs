@@ -139,7 +139,7 @@ impl LocalWitnessPool {
                 Ok(Some(file)) => LocalWitnessSlot::Ready(id, file),
                 Ok(None) => LocalWitnessSlot::Empty,
                 Err(error) => {
-                    eprintln!("Could not prepare a standby storage witness: {}", error.code);
+                    tracing::warn!("Could not prepare a standby storage witness: {}", error.code);
                     LocalWitnessSlot::Empty
                 }
             };
@@ -154,7 +154,7 @@ impl Drop for LocalWitnessPool {
         if let LocalWitnessSlot::Ready(id, file) = std::mem::replace(self.slot.get_mut(), LocalWitnessSlot::Empty) {
             drop(file);
             if let Err(error) = self.keys.forget_local_storage_region(id) {
-                eprintln!("Could not remove standby storage witness {id}: {}", error.code);
+                tracing::warn!("Could not remove standby storage witness {id}: {}", error.code);
             }
         }
     }
@@ -565,7 +565,7 @@ impl CellStoreFactory {
             } else { true };
             // An unreleased region keeps its witness, unlocked, for `reconcile_storage_regions`.
             if witnessed && released && let Err(error) = keys.forget_local_storage_region(id) {
-                eprintln!("Could not remove storage region witness {id}: {}", error.code);
+                tracing::warn!("Could not remove storage region witness {id}: {}", error.code);
             }
         });
         let (record, region) = admitted.await.map_err(|_| Anomaly::new(
@@ -2028,7 +2028,7 @@ pub async fn run_reaper(
                             }
                             if cancellation.is_cancelled() { return; }
                             if let Err(error) = reconcile_storage_regions(directory.as_ref(), &storage, keys, record).await {
-                                eprintln!("Storage publications for {} are pending: {}", record.id, error.code);
+                                tracing::warn!("Storage publications for {} are pending: {}", record.id, error.code);
                             }
                         }
                         for record in &deployments {
@@ -2039,7 +2039,7 @@ pub async fn run_reaper(
                             }
                             if cancellation.is_cancelled() { return; }
                             if let Err(error) = crate::admin::dispose_generations(directory.as_ref(), &storage, keys, &record.id).await {
-                                eprintln!("Closed transfer generations of {} are pending: {}", record.id, error.code);
+                                tracing::warn!("Closed transfer generations of {} are pending: {}", record.id, error.code);
                             }
                         }
                     }
@@ -2060,14 +2060,14 @@ pub async fn run_reaper(
                         ).await {
                             None => return,
                             Some(Ok(())) => {}
-                            Some(Err(error)) => eprintln!("Ordered index pages for {} are retained: {}", record.id, error.code),
+                            Some(Err(error)) => tracing::warn!("Ordered index pages for {} are retained: {}", record.id, error.code),
                         }
                     }
                     if let Some(maintenance) = &maintenance {
                         for record in &deployments {
                             if cancellation.is_cancelled() { return; }
                             if let Err(error) = reap_local(directory.as_ref(), &storage, maintenance.clone(), record, keys.as_deref()).await {
-                                eprintln!("Local garbage for {} is pending: {}", record.id, error.code);
+                                tracing::warn!("Local garbage for {} is pending: {}", record.id, error.code);
                             }
                         }
                     } else {
@@ -2082,21 +2082,21 @@ pub async fn run_reaper(
                                                 directory.as_ref(), bucket.as_ref(), record, task,
                                             ).await
                                         {
-                                            eprintln!("Inherited release for {} is pending: {}", record.id, error.code);
+                                            tracing::warn!("Inherited release for {} is pending: {}", record.id, error.code);
                                         }
                                         if let Err(error) = exact_retirement::reap(directory.as_ref(), bucket.as_ref(), &provider, record, references.as_ref().ok(), keys.as_deref()).await {
-                                            eprintln!("Exact garbage for {} is pending: {}", record.id, error.code);
+                                            tracing::warn!("Exact garbage for {} is pending: {}", record.id, error.code);
                                         }
                                         if let (Some(keys), Some(task)) = (keys.as_deref(), hosted_task.as_ref())
                                             && let Err(error) = replay_retirement::reap_hosted(
                                                 directory.as_ref(), &storage, keys, task, bucket.as_ref(), &provider, record,
                                             ).await
                                         {
-                                            eprintln!("Original replay packs for {} are pending: {}", record.id, error.code);
+                                            tracing::warn!("Original replay packs for {} are pending: {}", record.id, error.code);
                                         }
                                     }
                                 }
-                                Err(error) => eprintln!("The reaper could not open the provider inventory: {}", error.code),
+                                Err(error) => tracing::warn!("The reaper could not open the provider inventory: {}", error.code),
                             }
                         }
                     }
@@ -2105,7 +2105,7 @@ pub async fn run_reaper(
                         for record in &deployments {
                             match cancellation.run_until_cancelled(crate::admin::close_abandoned_fork(directory.as_ref(), record)).await {
                                 None => return,
-                                Some(Err(error)) => eprintln!("Fork {} is retained: {}", record.id, error.code),
+                                Some(Err(error)) => tracing::warn!("Fork {} is retained: {}", record.id, error.code),
                                 Some(Ok(())) => {},
                             }
                         }
@@ -2118,7 +2118,7 @@ pub async fn run_reaper(
                                 );
                                 match cancellation.run_until_cancelled(disposal).await {
                                     None => return,
-                                    Some(Err(error)) => eprintln!("Automatic fork input {capture} is retained: {}", error.code),
+                                    Some(Err(error)) => tracing::warn!("Automatic fork input {capture} is retained: {}", error.code),
                                     Some(Ok(())) => {}
                                 }
                             }
@@ -2129,7 +2129,7 @@ pub async fn run_reaper(
                                 );
                                 match cancellation.run_until_cancelled(disposal).await {
                                     None => return,
-                                    Some(Err(error)) => eprintln!("Capture {capture} disposal is pending: {}", error.code),
+                                    Some(Err(error)) => tracing::warn!("Capture {capture} disposal is pending: {}", error.code),
                                     Some(Ok(_)) => {},
                                 }
                             }
@@ -2140,7 +2140,7 @@ pub async fn run_reaper(
                                 let disposal = crate::archive::retire_world_suffix(directory.as_ref(), &record.id, suffix);
                                 match cancellation.run_until_cancelled(disposal).await {
                                     None => return,
-                                    Some(Err(error)) => eprintln!("World suffix {suffix} disposal is pending: {}", error.code),
+                                    Some(Err(error)) => tracing::warn!("World suffix {suffix} disposal is pending: {}", error.code),
                                     Some(Ok(())) => {},
                                 }
                             }
@@ -2153,7 +2153,7 @@ pub async fn run_reaper(
                             );
                             match cancellation.run_until_cancelled(disposal).await {
                                 None => return,
-                                Some(Err(error)) => eprintln!("Disposal of {} is pending: {}", record.id, error.code),
+                                Some(Err(error)) => tracing::warn!("Disposal of {} is pending: {}", record.id, error.code),
                                 Some(Ok(_)) => {}
                             }
                         }
@@ -2165,7 +2165,7 @@ pub async fn run_reaper(
                                 match cancellation.run_until_cancelled(reconcile_storage_regions(directory.as_ref(), &storage, keys, record)).await {
                                     None => return,
                                     Some(Err(error)) => {
-                                        eprintln!("Archive readers for {id} are pending: {}", error.code);
+                                        tracing::warn!("Archive readers for {id} are pending: {}", error.code);
                                         continue;
                                     }
                                     Some(Ok(())) => {}
@@ -2173,7 +2173,7 @@ pub async fn run_reaper(
                             }
                             match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), keys, id)).await {
                                 None => return,
-                                Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
+                                Some(Err(error)) => tracing::warn!("Archive retirement of {id} is pending: {}", error.code),
                                 Some(Ok(_)) => {},
                             }
                         }

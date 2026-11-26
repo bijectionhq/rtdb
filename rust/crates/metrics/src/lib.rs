@@ -2,6 +2,7 @@ mod histogram;
 mod disk;
 mod trace;
 mod step;
+pub mod logging;
 pub use trace::{TracePayload, TraceReceiver, TraceRecord, TraceRecorder, TraceStats};
 #[cfg(feature = "pg-source")]
 mod postgres;
@@ -9,7 +10,6 @@ mod postgres;
 mod kafka;
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
@@ -126,7 +126,10 @@ impl ExecutionObserver for Registry {
 impl CollectionObserver for Registry {
     fn table_failed(&self, table: Option<&TableRef>, error: &Anomaly) {
         let mut state = self.state.lock(); state.counters.collection_errors.add(1); drop(state);
-        let _ = writeln!(std::io::stderr().lock(), "RTDB garbage collection failed for {table:?}: {error}");
+        match table {
+            Some(table) => tracing::error!(table = %table.schema_and_table(), "Garbage collection failed: {error}"),
+            None => tracing::error!("Garbage collection failed: {error}"),
+        }
     }
 }
 impl Registry {

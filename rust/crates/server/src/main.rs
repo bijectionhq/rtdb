@@ -39,6 +39,7 @@ fn main() -> ExitCode {
 async fn run() -> Result<()> {
     rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
     let command = cli::parse(std::env::args().skip(1), &|key| std::env::var(key).ok())?;
+    rtdb_server::logging::install(rtdb_server::logging::LogConfig::from_environment(rtdb_server::logging::process_environment())?, log_output(&command))?;
     match command {
         Command::Help => { print!("{}", cli::HELP); Ok(()) }
         Command::AdminHelp => { print!("{}", cli::ADMIN_HELP); Ok(()) }
@@ -165,6 +166,15 @@ async fn run() -> Result<()> {
             let (handle, driver) = ServerDriver::open_with_memory(config, limit, memory).await?;
             run_started(&handle, driver).await
         }
+    }
+}
+
+/// Commands that print their own output to stdout log to stderr; serving a node logs to stdout, as upstream does.
+fn log_output(command: &Command) -> rtdb_server::logging::LogOutput {
+    match command {
+        Command::Start(_) | Command::StartMulti { native_follower: None, .. } => rtdb_server::logging::LogOutput::Stdout,
+        Command::Dev(options) if options.multi_tls.is_none() => rtdb_server::logging::LogOutput::Stdout,
+        _ => rtdb_server::logging::LogOutput::Stderr,
     }
 }
 
@@ -373,7 +383,7 @@ async fn join_with_deadline<T>(owner: impl std::future::Future<Output = Result<T
         result = &mut owner => return result,
         () = deadline => {},
     }
-    let _ = writeln!(std::io::stderr().lock(), "{expired}; waiting for shutdown to finish");
+    tracing::warn!("{expired}; waiting for shutdown to finish");
     match owner.await {
         Ok(_) => Err(expired),
         Err(error) => Err(expired.with_context("resource-close-error", error.to_string().into())),

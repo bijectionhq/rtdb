@@ -2228,7 +2228,7 @@ impl ReplicationDriver {
                 ReplicaBody::TriesAdded(message)
             }
             Err(error) => {
-                eprintln!("FactStore compaction retained the previous history: {}", error.code);
+                tracing::warn!("FactStore compaction retained the previous history: {}", error.code);
                 ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0), ..Default::default() })
             }
         };

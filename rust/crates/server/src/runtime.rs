@@ -1,5 +1,4 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use std::io::Write;
 
 use rtdb_auth::{AuthConfig, Authenticator};
 use rtdb_columnar::MemoryBudget;
@@ -251,7 +250,7 @@ impl ServerDriver {
         let metrics = Registry::new(&config.node_id, Arc::clone(&memory))?;
         let metric_export = crate::metric_export::MetricsExporter::open(&config.modules, metrics.clone(), Arc::clone(&memory)).await?;
         let tracing = if config.tracing.enabled {
-            match crate::tracing::TraceExporter::open(&config.tracing, Arc::clone(&memory)) { Ok(tracing) => Some(tracing), Err(error) => { let _ = writeln!(std::io::stderr().lock(), "Failed to create tracer; tracing is disabled: {error}"); None } }
+            match crate::tracing::TraceExporter::open(&config.tracing, Arc::clone(&memory)) { Ok(tracing) => Some(tracing), Err(error) => { ::tracing::warn!("Failed to create tracer; tracing is disabled: {error}"); None } }
         } else { None };
         let tracer = tracing.as_ref().map(|(handle, _)| handle.recorder().clone() as Arc<dyn rtdb_plan::Tracer>);
         let auth = Authenticator::open_native(

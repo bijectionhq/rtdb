@@ -5376,6 +5376,7 @@ dependencies = [
  "tokio",
  "tokio-openssl",
  "tokio-util",
+ "tracing",
  "url",
  "zeroize",
 ]
@@ -5426,6 +5427,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -5435,6 +5437,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
+ "libc",
  "parking_lot",
  "rtdb-columnar",
  "rtdb-kafka",
@@ -5446,6 +5450,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -5561,6 +5566,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -5735,6 +5741,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -5858,6 +5865,7 @@ dependencies = [
  "tokio-rustls 0.26.6",
  "tokio-util",
  "tonic",
+ "tracing",
  "url",
  "uuid",
  "zeroize",
@@ -5954,6 +5962,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -6071,6 +6080,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tracing",
  "unicode-normalization",
  "uuid",
 ]

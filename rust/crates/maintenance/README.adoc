@@ -47,11 +47,11 @@ The exact `rtdb.maintenance/closed` code and the `Interrupted` category are excl
 Cancellation of the owner does not suppress an actual storage or publication error returned during draining.
 Later signals and `compact_all` requests that encounter the retained failure do not emit it again.
 `CompactionFailure` is a passive event value containing the job's `schema/table` name, output trie key, typed anomaly code/category, operation, relative object key, and message digest.
-The default `StderrCompactionObserver` writes one JSON object per line without an exporter or background task.
+The default `LoggingCompactionObserver` logs one ERROR event per failure through `tracing`, carrying the failure's fields, without an exporter or background task.
 `with_observer` replaces that sink before the driver starts.
-Observers return promptly and do not panic; an unavailable stderr does not alter the worker result.
+Observers return promptly and do not panic; an unavailable log output does not alter the worker result.
 
-The JSON event is `compaction_failed`, with `table`, `output_trie_key`, `anomaly_code`, `anomaly_category`, `operation`, `object_key`, `permission_denied`, and `message_sha256` fields.
+`CompactionFailure::write_json_line` encodes the event as JSON: `compaction_failed`, with `table`, `output_trie_key`, `anomaly_code`, `anomaly_category`, `operation`, `object_key`, `permission_denied`, and `message_sha256` fields.
 Missing operation or object-key context is serialized as null.
 `permission_denied` comes only from the typed `rtdb.storage/permission-denied` code.
 `message_sha256` is lowercase SHA-256 of a present message's UTF-8 bytes, including the digest of empty bytes for an empty message.

@@ -828,7 +828,7 @@ impl DatabaseDriver {
                 while database.cancellation.run_until_cancelled(cadence.tick()).await.is_some() {
                     if let Err(error) = driver.reconcile_custody(&database.cancellation).await
                         && !database.cancellation.is_cancelled() {
-                        eprintln!("{} custody reconciliation: {error}", database.name);
+                        tracing::warn!("{} custody reconciliation: {error}", database.name);
                     }
                 }
                 Ok(())
@@ -847,7 +847,7 @@ impl DatabaseDriver {
                     for builder in &builders {
                         if let Err(error) = builder.build_live_pages(&partition, &database.cancellation).await
                             && !database.cancellation.is_cancelled() {
-                            eprintln!("{} live search coverage: {error}", database.name);
+                            tracing::warn!("{} live search coverage: {error}", database.name);
                         }
                     }
                     tokio::select! {

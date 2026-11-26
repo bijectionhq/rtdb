@@ -69,6 +69,7 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 journal-contract.workspace = true

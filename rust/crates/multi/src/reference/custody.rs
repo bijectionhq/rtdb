@@ -86,7 +86,7 @@ impl ReferenceReads {
             if let Some(witness) = witness {
                 drop(witness);
                 if released && let Err(error) = worker.keys.forget_local_storage_region(id) {
-                    eprintln!("Could not remove reference read witness {id}: {}", error.code);
+                    tracing::warn!("Could not remove reference read witness {id}: {}", error.code);
                 }
             }
         });

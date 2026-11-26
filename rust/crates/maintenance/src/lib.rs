@@ -15,7 +15,7 @@ pub use artefact::{ArtefactBuilder, ArtefactSource, wants, ArtefactDatabase, Art
 pub use table_history::{HistoryCoverage, HistoryRead, HistoryRow, HistoryVisitor, TableHistorySource};
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};
 pub use entity_history::EntityHistoryArtefacts;
-pub use failure::{CompactionFailure, CompactionObserver, StderrCompactionObserver};
+pub use failure::{CompactionFailure, CompactionObserver, LoggingCompactionObserver};
 pub use gc::{BlockCollector, CollectionObserver, CollectorClock, GarbageConfig, TrieCollector, block_is_garbage};
 pub use job::{CompactionJob, RecencyMode, available_jobs};
 pub use merge::{MergeConfig, RecencyPartition, SegmentCompactor, recency_partition};

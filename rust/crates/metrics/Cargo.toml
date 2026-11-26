@@ -25,6 +25,9 @@ serde_json.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+libc = "0.2"
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

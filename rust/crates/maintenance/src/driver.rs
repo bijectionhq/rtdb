@@ -6,7 +6,7 @@ use rtdb_format::{keys::TrieKey, log::proto::TriesAdded};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use crate::{CompactionFailure, CompactionJob, CompactionObserver, CompactionPublisher, SnapshotSource, StderrCompactionObserver, available_jobs};
+use crate::{CompactionFailure, CompactionJob, CompactionObserver, CompactionPublisher, SnapshotSource, LoggingCompactionObserver, available_jobs};
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync {
@@ -55,7 +55,7 @@ impl CompactionDriver {
         if parallelism == 0 || request_capacity == 0 { return Err(crate::invalid("Maintenance concurrency and request capacity must be positive")); }
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
-        Ok((Self { snapshots, executor, publisher, observer: Arc::new(StderrCompactionObserver), job_slots: None, parallelism, automatic: !ignore_signal,
+        Ok((Self { snapshots, executor, publisher, observer: Arc::new(LoggingCompactionObserver), job_slots: None, parallelism, automatic: !ignore_signal,
                 signals: signal_receiver, requests: request_receiver },
             CompactionHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)), ignore_signal }))
     }

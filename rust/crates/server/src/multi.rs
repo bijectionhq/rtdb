@@ -990,13 +990,13 @@ impl MultiRuntime {
                 for driver in databases {
                     match driver.maintain_journal_bound().await {
                         Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
-                            eprintln!("Multi journal checkpoint deferred: {error}");
+                            ::tracing::warn!("Multi journal checkpoint deferred: {error}");
                         }
                         _ => (),
                     }
                     match driver.maintain_ranked_catalog(&maintenance).await {
                         Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
-                            eprintln!("Multi ranked catalogue publication deferred: {error}");
+                            ::tracing::warn!("Multi ranked catalogue publication deferred: {error}");
                         }
                         _ => (),
                     }
@@ -1197,7 +1197,7 @@ impl MultiRuntime {
         futures::stream::iter(drivers)
             .for_each_concurrent(32, |driver| async move {
                 if let Err(error) = driver.shutdown_writer().await {
-                    eprintln!("Multi writer release deferred at shutdown: {}", error.code);
+                    ::tracing::warn!("Multi writer release deferred at shutdown: {}", error.code);
                 }
             })
             .await;
@@ -1348,18 +1348,18 @@ async fn reconcile_placement(placement: &PlacementSource, databases: &[Arc<Multi
     match JournalConfig::read(&placement.config).and_then(|config| placement.journal.update_placement(&config)) {
         Ok(()) => (),
         Err(error) => {
-            eprintln!("Multi journal placement deferred: {error}");
+            ::tracing::warn!("Multi journal placement deferred: {error}");
             return;
         }
     }
     for driver in databases {
         let Some(stream) = driver.written_stream().await.map(StreamId) else { continue };
         match placement.journal.reconcile_placement(stream).await {
-            Ok(Some(configuration)) => eprintln!(
+            Ok(Some(configuration)) => ::tracing::info!(
                 "Multi journal placement moved stream {:032x} to revision {}", stream.0, configuration.revision,
             ),
             Ok(None) => (),
-            Err(error) => eprintln!("Multi journal placement deferred: {error}"),
+            Err(error) => ::tracing::warn!("Multi journal placement deferred: {error}"),
         }
     }
 }

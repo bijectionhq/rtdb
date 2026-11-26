@@ -347,6 +347,7 @@ fn watch_parent(arguments: &Arguments, cancellation: &CancellationToken) {
 
 async fn run(arguments: Vec<String>) -> Result<()> {
     rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
+    rtdb_server::logging::install(rtdb_server::logging::LogConfig::from_environment(rtdb_server::logging::process_environment())?, rtdb_server::logging::LogOutput::Stderr)?;
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
     if command == "--build-info" {
         if !rest.is_empty() {
@@ -421,7 +422,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "directory" => {
             let directory = MemoryDirectory::open(std::path::Path::new(arguments.required("state")?))?;
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7001")?).await.map_err(io)?;
-            eprintln!("directory listening on {}", listener.local_addr().map_err(io)?);
+            tracing::info!("directory listening on {}", listener.local_addr().map_err(io)?);
             rtdb_directory::serve(listener, directory, cancellation).await
         }
         "replay-broker" => {
@@ -561,7 +562,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 cache_bytes: arguments.number("cache-bytes", rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES)?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), lease: LeaseOptions::default(),
             }).await?;
-            eprintln!("logkeeper {} listening on {}", logkeeper.lease.id(), logkeeper.address);
+            tracing::info!("logkeeper {} listening on {}", logkeeper.lease.id(), logkeeper.address);
             logkeeper.run_until(cancellation).await
         }
         "node" => {
@@ -624,7 +625,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 classic_retained_flight_key: arguments.optional("classic-retained-flight-key").map(PathBuf::from),
                 keys: key_service(&keys).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
-            eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
+            tracing::info!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
             node.shutdown().await
         }
@@ -666,7 +667,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             };
             if classic_audience { directory.require_audience_reads()?; }
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
-            eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
+            tracing::info!("gateway listening on {}", listener.local_addr().map_err(io)?);
             let tls = if let Some(path) = arguments.optional("config") {
                 let configuration = NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?;
                 let settings = configuration.server.and_then(|server| server.ssl)
@@ -700,7 +701,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 let endpoint = arguments.required("flight-listen")?.parse::<SocketAddr>()
                     .map_err(|_| usage("--flight-listen must be HOST:PORT".into()))?;
                 let flight = tokio::net::TcpListener::bind(endpoint).await.map_err(io)?;
-                eprintln!("Flight SQL gateway listening on {}", flight.local_addr().map_err(io)?);
+                tracing::info!("Flight SQL gateway listening on {}", flight.local_addr().map_err(io)?);
                 Some(flight)
             } else { None };
             let flight = async {
@@ -712,7 +713,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let serving = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone());
             let audience = if let Some(((address, audience), holder_port)) = audience.zip(holder_port) {
                 let listener = tokio::net::TcpListener::bind(address).await.map_err(io)?;
-                eprintln!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
+                tracing::info!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
                 Some((listener, audience, holder_port))
             } else { None };
             let audience_flight = async {
@@ -781,7 +782,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 Some(prefix) => dynamo_cell_map(prefix).await?,
                 None => MemoryCellMap::new(),
             };
-            eprintln!("cell map listening on {}", listener.local_addr().map_err(io)?);
+            tracing::info!("cell map listening on {}", listener.local_addr().map_err(io)?);
             rtdb_multi::cells::serve(listener, map, cancellation).await
         }
         "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {

@@ -128,7 +128,7 @@ impl RecoveryAdmission {
             if witness.is_some() {
                 drop(witness);
                 if released && let Err(error) = worker.holds.keys.forget_local_storage_region(id) {
-                    eprintln!("Could not remove recovery hold witness {id}: {}", error.code);
+                    tracing::warn!("Could not remove recovery hold witness {id}: {}", error.code);
                 }
             }
         });

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::Write as _, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use rdkafka::ClientConfig;
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::{Anomaly, Result};
@@ -8,7 +8,7 @@ pub(crate) mod material;
 pub(crate) fn prepare(options: &BTreeMap<String, String>, memory: &Arc<MemoryBudget>) -> Result<ClientConfig> {
     let (mut properties, ignored) = crate::config::native_client_properties(options)?;
     for name in ignored {
-        let _ = writeln!(std::io::stderr().lock(), "RTDB Kafka configuration warning: The configuration '{name}' was supplied but isn't a known config.");
+        tracing::warn!("The configuration '{name}' was supplied but isn't a known config.");
     }
     for name in ["security.protocol", "ssl.protocol", "ssl.provider", "ssl.keystore.type", "ssl.keystore.location", "ssl.truststore.type", "ssl.truststore.location",
         "ssl.keymanager.algorithm", "ssl.trustmanager.algorithm", "ssl.endpoint.identification.algorithm", "ssl.secure.random.implementation", "ssl.engine.factory.class"] {

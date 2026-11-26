@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::Write as _, mem::size_of, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::BTreeMap, mem::size_of, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, message::{Header, OwnedHeaders}, native_byte_account::NativeByteAccount, producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
@@ -119,7 +119,7 @@ impl ProducerContext for DeliveryContext {
     type DeliveryOpaque = usize;
     fn delivery(&self, result: &DeliveryResult<'_>, delivery: Self::DeliveryOpaque) {
         self.completed(delivery);
-        if let Err((cause, _)) = result { let _ = writeln!(std::io::stderr().lock(), "Kafka Registry dead-letter delivery failed: {cause}"); }
+        if let Err((cause, _)) = result { tracing::warn!("Kafka Registry dead-letter delivery failed: {cause}"); }
     }
 }
 pub(super) struct DlqProducer {

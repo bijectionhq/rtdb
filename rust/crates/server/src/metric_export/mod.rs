@@ -4,7 +4,6 @@ mod cloudwatch;
 mod points;
 
 use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
-use std::io::Write;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{CatalogMetric, CatalogMetrics};
@@ -83,7 +82,7 @@ impl MetricsExporter {
                 }
             }
         }
-        if tokio::time::timeout(Duration::from_secs(30), self.close_exports(&mut pending, last_polled_step)).await.is_err() { let _ = writeln!(std::io::stderr().lock(), "Metric export drain timed out"); }
+        if tokio::time::timeout(Duration::from_secs(30), self.close_exports(&mut pending, last_polled_step)).await.is_err() { ::tracing::warn!("Metric export drain timed out"); }
     }
     async fn close_exports(&mut self, pending: &mut Publications, last_polled_step: Option<i64>) {
         let flush = self.publishers.iter().enumerate().filter_map(|(index, publisher)| (!publisher.busy && last_polled_step.is_some_and(|step| step > publisher.last_published_step)).then_some(index)).collect::<Vec<_>>();
@@ -106,7 +105,7 @@ fn publish(index: usize, publisher: Arc<dyn MetricPublisher>, metrics: Arc<dyn C
 }
 fn wall_time_millis() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0) }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.metrics/export", message) }
-fn report(result: Result<()>) { if let Err(error) = result { let _ = writeln!(std::io::stderr().lock(), "Metric export failed: {error}"); } }
+fn report(result: Result<()>) { if let Err(error) = result { ::tracing::warn!("Metric export failed: {error}"); } }
 
 #[cfg(test)]
 mod tests {

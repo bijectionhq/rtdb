@@ -35,7 +35,7 @@ impl<'a> ReadDrain<'a> {
 
     async fn forget(&self, reader: &Path) {
         if let Err(error) = self.client.delete(reader).await {
-            eprintln!("Provider read census entry for {} is awaiting release: {error}", self.key);
+            tracing::warn!("Provider read census entry for {} is awaiting release: {error}", self.key);
         }
     }
 
@@ -78,10 +78,7 @@ impl<'a> ReadDrain<'a> {
             .map_err(|error| super::provider_error(self.key, error))?
         {
             live_reads_seen = true;
-            eprintln!(
-                "WARN Provider read registration is blocking installed reclamation object_key={} registration={}",
-                self.key, registration.location
-            );
+            tracing::warn!(object_key = %self.key, registration = %registration.location, "Provider read registration is blocking installed reclamation");
         }
         Ok(decision::provider_drain_completed(true, live_reads_seen))
     }

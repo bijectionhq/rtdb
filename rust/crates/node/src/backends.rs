@@ -147,7 +147,7 @@ impl KafkaFactory {
                         Ok(true) => 30,
                         Ok(false) => 1,
                         Err(error) => {
-                            eprintln!("Kafka prefix custody settlement failed: {}", error.code);
+                            tracing::warn!("Kafka prefix custody settlement failed: {}", error.code);
                             30
                         }
                     };

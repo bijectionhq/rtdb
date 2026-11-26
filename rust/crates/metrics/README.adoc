@@ -42,7 +42,7 @@ The PostgreSQL feature retains counters and the commit-lag summary for the datab
 Assignment guards reset connection and last-event gauges on demotion while preserving those accumulators.
 Live samples query upstream WAL lag only while assigned, returning NaN for unavailable slots or failed queries.
 An in-flight sample retains charged source configuration and ends when either its caller or source assignment is cancelled.
-Collection failures and Kafka configuration warnings also reach the process standard-error stream.
+Collection failures and Kafka configuration warnings are also logged, at ERROR and WARN.
 Disk-cache registrations observe pinned, evictable, free and maximum bytes without extending the cache's lifetime.
 Free bytes retain a negative result while pinned files exceed configured capacity.
 CloudWatch and Azure Monitor publishers run under the server's exporter owner.
@@ -74,3 +74,15 @@ Transport/TLS internals remain owned by reqwest; payloads, decoded response tree
 
 Fixtures cover accumulator windows, missed and backward step polling, final partial steps, counter sharing, snapshot retention, provider deduplication, common labels, source registration lifetime, cancellation during live sampling, trace parentage, queue saturation and retained export payloads.
 They are source only under the implementation execution gate.
+
+== Logging
+
+`logging` holds the process's `tracing` subscriber; the `rtdb` and `rtdb-multi` binaries install it once their command is parsed, and embedded or FFI nodes leave the host's subscriber alone.
+It reads the environment variables upstream's `log4j2.xml` and `xtdb.logging/set-from-env!` read.
+`XTDB_LOG_FORMAT` is `text` (the default) or `json`; any other value refuses startup.
+Text lines follow upstream's `HH:mm:ss | LEVEL logger | message` pattern in local time, with event fields appended as `name=value`.
+JSON lines carry upstream's CloudWatch layout fields: a UTC `timestamp`, `level`, `logger`, `message`, `thread` and, when the event has fields, `context`.
+`XTDB_LOGGING_LEVEL` sets the `xtdb` logger and `XTDB_LOGGING_LEVEL_<NS>` sets `xtdb.<ns>`, with `_` separating components; values are log4j2 level names, and an unknown one refuses startup.
+A `rtdb_<crate>::<module>` target is the logger `xtdb.<crate>.<module>`, with `_` inside a component written as `-`, so `XTDB_LOGGING_LEVEL_STORAGE_DISK-CACHE=debug` reaches `rtdb_storage::disk_cache`.
+RTDB's loggers default to INFO; other crates' loggers default to WARN, in place of the dependency loggers upstream quietens individually.
+`rtdb node`, `rtdb node --multi` and `rtdb dev` log to stdout as upstream does; commands that print their own results to stdout, Multi development qualification, the standalone and follower protocols, and `rtdb-multi` log to stderr.

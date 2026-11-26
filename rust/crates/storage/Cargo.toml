@@ -30,6 +30,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"

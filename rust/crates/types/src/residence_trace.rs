@@ -27,7 +27,7 @@ fn sink() -> Option<&'static Mutex<Option<File>>> {
         match options.open(path) {
             Ok(file) => Some(Mutex::new(Some(file))),
             Err(error) => {
-                eprintln!("Could not start the residence trace: {error}");
+                tracing::warn!("Could not start the residence trace: {error}");
                 None
             }
         }
@@ -42,7 +42,7 @@ pub fn record(event: &'static str, fields: impl FnOnce() -> Value) {
     bytes.push(b'\n');
     if let Err(error) = file.write_all(&bytes) {
         *trace = None;
-        eprintln!("Residence trace stopped after a write error: {error}");
+        tracing::warn!("Residence trace stopped after a write error: {error}");
     }
 }
 

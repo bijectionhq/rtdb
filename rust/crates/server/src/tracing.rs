@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::time::Duration;
-use std::io::Write;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_metrics::{TraceReceiver, TraceRecord, TraceRecorder};
 use rtdb_types::{Anomaly, Result};
@@ -33,14 +32,14 @@ impl TraceExporter {
         let work = self.export_all(); tokio::pin!(work);
         tokio::select! {
             _ = &mut work => (),
-            _ = drain.cancelled() => { if tokio::time::timeout(Duration::from_secs(30), &mut work).await.is_err() { let _ = writeln!(std::io::stderr().lock(), "Trace export drain timed out"); } }
+            _ = drain.cancelled() => { if tokio::time::timeout(Duration::from_secs(30), &mut work).await.is_err() { ::tracing::warn!("Trace export drain timed out"); } }
         }
     }
     async fn export_all(&mut self) {
         while let Some(record) = self.receiver.next().await {
             match self.export(&record).await {
                 Ok(()) => self.receiver.exported(),
-                Err(error) => { self.receiver.failed(); let _ = writeln!(std::io::stderr().lock(), "Trace export failed: {error}"); }
+                Err(error) => { self.receiver.failed(); ::tracing::warn!("Trace export failed: {error}"); }
             }
         }
     }
@@ -69,7 +68,7 @@ impl TraceExporter {
                                 let rejected = partial.get("rejectedSpans").and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|value| value.parse().ok()))).unwrap_or(0);
                                 let message = partial.get("errorMessage").and_then(serde_json::Value::as_str).unwrap_or("");
                                 if rejected > 0 { return Err(invalid(format!("OTLP rejected {rejected} span(s): {message}"))); }
-                                if !message.is_empty() { let _ = writeln!(std::io::stderr().lock(), "OTLP export warning: {message}"); }
+                                if !message.is_empty() { ::tracing::warn!("OTLP export warning: {message}"); }
                             }
                             return Ok(());
                         }

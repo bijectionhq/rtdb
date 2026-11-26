@@ -58,12 +58,18 @@ pub trait CompactionObserver: Send + Sync {
     fn failed(&self, failure: &CompactionFailure);
 }
 
-/// Writes each failure as one JSON line under the stderr lock; an unavailable stderr does not fail maintenance.
+/// Logs each failure as one ERROR event whose fields are the failure's own.
 #[derive(Default)]
-pub struct StderrCompactionObserver;
+pub struct LoggingCompactionObserver;
 
-impl CompactionObserver for StderrCompactionObserver {
+impl CompactionObserver for LoggingCompactionObserver {
     fn failed(&self, failure: &CompactionFailure) {
-        let _ = failure.write_json_line(std::io::stderr().lock());
+        tracing::error!(
+            event = failure.event, table = %failure.table, output_trie_key = %failure.output_trie_key,
+            anomaly_code = %failure.anomaly_code, anomaly_category = ?failure.anomaly_category,
+            operation = failure.operation.as_deref(), object_key = failure.object_key.as_deref(),
+            permission_denied = failure.permission_denied, message_sha256 = failure.message_sha256.as_deref(),
+            "Compaction job failed"
+        );
     }
 }

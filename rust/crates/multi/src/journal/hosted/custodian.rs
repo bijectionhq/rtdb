@@ -89,7 +89,7 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
             {
                 next_discovery = Instant::now() + Duration::from_secs(30);
                 if let Err(error) = refresh(discovery, &configured, &mut discovered).await {
-                    eprintln!("{}: {}", error.code, error.message.as_deref().unwrap_or(""));
+                    tracing::warn!("{}: {}", error.code, error.message.as_deref().unwrap_or(""));
                 }
             }
             for (_, placement) in routes.custody_placements() {

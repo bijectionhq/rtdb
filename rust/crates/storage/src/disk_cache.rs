@@ -156,7 +156,7 @@ impl DiskCache {
                 match fs::remove_file(&path) {
                     Ok(()) => bytes = bytes.saturating_sub(file.size),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => bytes = bytes.saturating_sub(file.size),
-                    Err(error) => { eprintln!("RTDB disk cache eviction failed at {}: {error}", path.display()); state.entries.insert(key, entry); break; }
+                    Err(error) => { tracing::warn!("Disk cache eviction failed at {}: {error}", path.display()); state.entries.insert(key, entry); break; }
                 }
             }
         }

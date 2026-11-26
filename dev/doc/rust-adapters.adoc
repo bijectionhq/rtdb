@@ -77,7 +77,7 @@ Java `fetch.max.wait.ms` is translated to the native client's `fetch.wait.max.ms
 Other Java client properties take their native equivalents: `send.buffer.bytes`/`receive.buffer.bytes` become the `socket.*` buffer sizes, `buffer.memory` becomes `queue.buffering.max.kbytes`, `max.request.size` becomes `message.max.bytes`, the `compression.*.level` matching `compression.type` becomes `compression.level`, `auto.offset.reset=none` becomes `error`, and the standard Java assignor classes become their native names.
 A Java property and its native equivalent that disagree are rejected.
 Serializer and deserializer classes are dropped, since XTDB chooses its own.
-Java-only properties with no native meaning, such as `max.block.ms`, `max.poll.records` and `default.api.timeout.ms`, are dropped with kafka-clients' "was supplied but isn't a known config" warning on standard error.
+Java-only properties with no native meaning, such as `max.block.ms`, `max.poll.records` and `default.api.timeout.ms`, are dropped with kafka-clients' "was supplied but isn't a known config" message as a WARN log event.
 Non-empty `interceptor.classes` and SASL login or callback handler classes are rejected, since they would run Java code.
 Properties neither client recognises still fail native client construction.
 

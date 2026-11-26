@@ -14,3 +14,4 @@ mod resources;
 pub mod multi;
 pub use runtime::{ServerDriver, ServerHandle, ListenerAddresses, PlacedOptions};
 pub use resources::open_backend_resources;
+pub use rtdb_metrics::logging;

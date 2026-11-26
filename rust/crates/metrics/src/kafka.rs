@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryReservation;
@@ -61,7 +60,7 @@ impl KafkaObserver for Registry {
         let index = match &warning { KafkaWarning::AcknowledgementsOverridden { .. } => 0, KafkaWarning::IdempotenceDisabled => 1,
             KafkaWarning::InsufficientReplicas { .. } => 2, KafkaWarning::UncleanElection { .. } => 3, KafkaWarning::ConfigurationUnavailable { .. } => 4 };
         let mut state = self.state.lock(); state.counters.kafka_warnings[index].add(1); drop(state);
-        let _ = writeln!(std::io::stderr().lock(), "RTDB Kafka configuration warning: {warning:?}");
+        tracing::warn!("Kafka configuration warning: {warning:?}");
     }
 }
 

@@ -647,7 +647,7 @@ impl StartOptions {
             (_, Some("edn")) => ParsedConfiguration::from_edn(&text, &ProcessEnvironment, &memory)?,
             _ => ParsedConfiguration::from_yaml(&text, &ProcessEnvironment, &memory, false)?,
         };
-        for warning in parsed.warnings() { eprintln!("{warning}"); }
+        for warning in parsed.warnings() { ::tracing::warn!("{warning}"); }
         Ok(parsed.with_object_sort(self.object_sort))
     }
 
@@ -669,7 +669,7 @@ impl StartOptions {
             (NodeMode::Ingest, _) => NodeConfiguration::from_ingest_yaml(&text),
             (_, Some("edn")) => {
                 let (configuration, warnings) = NodeConfiguration::from_edn_with_environment(&text, &|name| std::env::var(name).ok())?;
-                for warning in warnings { eprintln!("{warning}"); }
+                for warning in warnings { ::tracing::warn!("{warning}"); }
                 Ok(configuration)
             }
             _ => NodeConfiguration::from_yaml(&text),
