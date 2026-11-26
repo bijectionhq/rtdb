@@ -207,6 +207,23 @@ async fn a_placed_query_refuses_a_database_detached_or_replaced_while_checking_i
 }
 
 #[tokio::test]
+async fn waiting_for_a_local_detach_resolves_when_its_teardown_finishes() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    tokio::time::timeout(Duration::from_secs(5), node.catalog().detached("shop")).await.unwrap();
+    node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
+
+    node.detach_local("shop".into()).await.unwrap();
+    let catalog = Arc::clone(node.catalog());
+    let waiter = tokio::spawn(async move { catalog.detached("shop").await });
+    tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap();
+    assert!(!node.catalog().is_draining("shop"));
+    node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_placed_session_cannot_reopen_a_replaced_database() {
     let mut config = options();
     config.membership = Membership::Placed;

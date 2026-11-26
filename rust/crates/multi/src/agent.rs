@@ -895,14 +895,22 @@ impl NodeAgent {
         self.wait_until_detached(name).await;
     }
 
+    /// Waits for the node to finish tearing `name` down, or to shut down, which clears every teardown.
     async fn wait_until_detached(&self, name: &str) {
-        while self.node.catalog().is_draining(name) { tokio::time::sleep(Duration::from_millis(5)).await; }
+        tokio::select! {
+            _ = self.node.catalog().detached(name) => {}
+            _ = self.node.cancellation().cancelled() => {}
+        }
     }
 
     async fn stop_serving(&self, name: &str) {
         self.holdings.lock().remove(name);
         self.subscriptions.lock().remove(name);
-        if self.node.catalog().database(name).is_ok() { let _ = self.node.detach_local(name.to_owned()).await; }
+        if self.node.catalog().database(name).is_ok()
+            && let Err(error) = self.node.detach_local(name.to_owned()).await
+        {
+            tracing::warn!(database = name, code = %error.code, "The local detach failed");
+        }
     }
 
     /// Flushes through the source position observed when this request starts.

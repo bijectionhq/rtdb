@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use rtdb_format::{database::proto::DatabaseConfig, log::proto::resolved_tx::DbOp};
 use rtdb_replication::DatabaseEffects;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc, oneshot};
 
 use crate::Database;
 
@@ -46,6 +46,8 @@ impl DatabaseSet {
 pub struct DatabaseCatalog {
     value: RwLock<Arc<DatabaseSet>>,
     membership: Membership,
+    /// Woken whenever a detaching entry leaves the set.
+    detached: Notify,
 }
 
 impl DatabaseCatalog {
@@ -132,7 +134,7 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn new(membership: Membership) -> Arc<Self> {
-        Arc::new(Self { value: RwLock::new(Arc::new(DatabaseSet::default())), membership })
+        Arc::new(Self { value: RwLock::new(Arc::new(DatabaseSet::default())), membership, detached: Notify::new() })
     }
     pub fn database_names(&self) -> BTreeSet<String> { self.open_databases().into_keys().collect() }
     /// Whether this node's databases are tenants placed by an outside authority, each visible only to its own sessions.
@@ -175,6 +177,17 @@ impl DatabaseCatalog {
     }
     /// Whether a name is still occupied by a database whose detach is draining it.
     pub fn is_draining(&self, name: &str) -> bool { matches!(self.value.read().entries.get(name), Some(Entry::Detaching(_))) }
+    /// Resolves once `name` is not draining: its teardown finished or the node cleared its catalog.
+    /// Dropping the future only stops the wait; it does not affect the detach.
+    pub async fn detached(&self, name: &str) {
+        loop {
+            let notified = self.detached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_draining(name) { return; }
+            notified.await;
+        }
+    }
     pub(crate) fn check_local_attach(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         if !matches!(self.membership, Membership::Placed | Membership::Managed(_)) { self.require_mutable()?; }
         self.check_new_name(name, configuration)
@@ -269,6 +282,8 @@ impl DatabaseCatalog {
         let mut next = value.as_ref().clone();
         next.entries.remove(database.name());
         *value = next.publish();
+        drop(value);
+        self.detached.notify_waiters();
     }
     pub(crate) fn held_databases(&self) -> Vec<Arc<Database>> {
         self.value.read().entries.values().filter_map(|entry| match entry {
@@ -281,7 +296,10 @@ impl DatabaseCatalog {
             if let Entry::Open { database, .. } | Entry::Detaching(database) = entry { database.cancel(); }
         }
     }
-    pub(crate) fn clear_after_join(&self) { *self.value.write() = Arc::new(DatabaseSet::default()); }
+    pub(crate) fn clear_after_join(&self) {
+        *self.value.write() = Arc::new(DatabaseSet::default());
+        self.detached.notify_waiters();
+    }
 }
 
 pub(crate) enum CatalogCommand {
