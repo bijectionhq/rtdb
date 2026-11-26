@@ -60,7 +60,8 @@ pub(crate) fn stays_in_source_residence(name: &str) -> bool {
                 || (record.starts_with('/') && record.ends_with(TRIE_RETIREMENT_RELEASE)))
 }
 
-pub(crate) fn directory_publications(keys: &dyn KeyService, record: &DeploymentRecord, region: Arc<IoRegion>) -> Result<PublicationSealing> {
+/// The cipher that seals and opens the serving objects of the deployment `record` names.
+pub fn directory_publications(keys: &dyn KeyService, record: &DeploymentRecord, region: Arc<IoRegion>) -> Result<PublicationSealing> {
     let ledger = keys.retained_unit_ledger(UnitScope::directory_serving(&record.org, &record.lineage), region)?;
     let origin = UnitScope::publication_origin(&record.storage_prefix());
     Ok(PublicationSealing::new(ledger, origin, |name| {

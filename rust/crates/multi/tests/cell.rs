@@ -4700,7 +4700,7 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_its_source() {
     use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
-    use rtdb_multi::{cipher::Cipher, packing::PackDiscovery, reference::Base, store};
+    use rtdb_multi::{packing::PackDiscovery, reference::Base, store};
     use rtdb_storage::ObjectStore;
     use rtdb_types::BlockIndex;
 
@@ -4731,8 +4731,8 @@ async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_i
     let parent_key = keys.existing_key(&parent.key_id()).await.unwrap().unwrap();
     let child_key = keys.existing_key(&historical.key_id()).await.unwrap().unwrap();
     assert_ne!(parent_key, child_key);
-    let parent_cipher = Cipher::new(&parent_key).unwrap();
-    let child_cipher = Cipher::new(&child_key).unwrap();
+    let parent_cipher = store::directory_publications(&keys, &parent, rtdb_storage::IoRegion::new()).unwrap();
+    let child_cipher = store::directory_publications(&keys, &historical, rtdb_storage::IoRegion::new()).unwrap();
     for child in [&current, &historical] {
         assert_eq!(child.parent.as_deref(), Some(parent.id.as_str()));
         assert_eq!((child.org.as_str(), child.lineage.as_str()), ("recipient-org", child.id.as_str()));
@@ -4743,8 +4743,8 @@ async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_i
     let child_store = store::open_deployment_store(bucket.clone(), &root(&historical), PackDiscovery::List, store::wall_clock()).await.unwrap();
     let source = parent_store.get(&catalog).await.unwrap();
     let copied = child_store.get(&catalog).await.unwrap();
-    assert_eq!(parent_cipher.open(catalog.as_str(), &source).unwrap(), child_cipher.open(catalog.as_str(), &copied).unwrap());
-    assert!(parent_cipher.open(catalog.as_str(), &copied).is_err());
+    assert_eq!(parent_cipher.open(&catalog, source).await.unwrap(), child_cipher.open(&catalog, copied.clone()).await.unwrap());
+    assert!(parent_cipher.open(&catalog, copied).await.is_err());
 
     admin::delete_deployment(directory, &storage, &keys, "shop", 4 << 20).await.unwrap();
     assert_eq!(keys.existing_key(&parent.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");
