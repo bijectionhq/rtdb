@@ -505,6 +505,10 @@ impl DatabaseFactory {
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?
                 .with_placed_transfer(opened_logs.placed_transfer)?;
+            // Replica replay reads the logs, so an out-of-sync source log has to be reported before it fails there instead.
+            if let Some(boundary) = recovered.block.as_ref().and_then(|block| block.latest_source_position()) {
+                logs.validate_source_boundary(&name, boundary)?;
+            }
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
             } else {
