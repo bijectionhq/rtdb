@@ -853,7 +853,10 @@ mod tests {
 
         let error = decoder.decode(data).err().unwrap();
 
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let bytes = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+        let anomaly: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(anomaly["code"], "rtdb/memory-budget-exceeded");
     }
 
     #[test]
