@@ -47,6 +47,13 @@ Each entry is one of four kinds, each with one exact law:
 * an _edged_ boundary (a timeline aggregate): a record keyed by its valid-time edge, `identity ‖ ordered(edge) ‖ stamp ‖ ordinal`, `+v` where coverage begins and `−v` where it ends, so a read at instant `t` sums the records with edge at or before `t`; an erasure retracts it unless it is retained;
 * a _single_ (an expiry entry): one key, deleted when its entry loses coverage.
 
+An entry's identity may carry stamp placeholders the store fills at the ordering point, before it diffs the line.
+A _key stamp_ is 16 zero bytes that take the stamp's encoding (for a commit-stamped column).
+An _instant placeholder_ (`KeyInstant { offset, escapes, plus_micros }`) is 8 zero bytes that take the stamp's micros plus `plus_micros`, saturating, big-endian with the sign bit flipped: the first eight bytes of the stamp's encoding, and the order bytes of an Instant or Int64 sort key or fact cell.
+Each zero byte of an instant's fill is followed by `escapes` bytes `0xff`, one per escaped segment enclosing the placeholder, so a filled key sorts where that instant does.
+This is how a write whose time is acceptance-relative takes the commit's stamp, never the writer's entry instant (T7): a default-validity series `at` or timeline `validFrom`, an aggregate boundary at the stamp, or a field placed as `now + d`, wherever it sits in an ordered index key.
+An entry carries at most one key stamp and any number of instant placeholders; each lies at or past the partition and world prefix, inside the identity, over zero bytes, apart from every other, with at most four escapes, or the derive is a request error.
+
 At the ordering point, after the reads, the window and the bounds are judged, the store takes the latest manifest, at or below its bound, of the first level that has one, re-roots it into the target world, and applies Bijection's one total function `apply`: an entry the line already holds identically over the whole interval writes nothing, so an identical re-put emits no index key.
 It stores the new manifest at the stamp, with the concrete marker and single keys it wrote, which is the exact inventory a `Purge` deletes (with every manifest version) after retracting the line's live boundaries and unretained edged contributions.
 Derives apply in write order, before plain writes, and each sees the manifest left by earlier derives of the same row in the same append.

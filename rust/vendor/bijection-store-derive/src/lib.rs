@@ -33,6 +33,14 @@
 //! - [`EntryKind::Single`] (expiry entries): one key, deleted when the entry
 //!   loses coverage.
 //!
+//! An entry's identity may carry placeholders the store fills at ordering:
+//! a [`KeyStamp`] (the 16-byte stamp, for a `t.accepted()` column) and any
+//! number of [`KeyInstant`]s (the stamp's micros plus an offset in the
+//! instant encoding, for a value whose time is acceptance-relative: a
+//! default-validity series `at` or timeline `validFrom`, an aggregate
+//! boundary at the stamp, a field placed as `now + d`). Each is escaped for
+//! the segments enclosing it, so a filled key sorts where its value does.
+//!
 //! The function is pure, total and deterministic: [`apply`] and [`purge`]
 //! return a result for every input, and a malformed derive is a request error
 //! [`check`] decides before ordering. Every emitted key lies at the
@@ -117,6 +125,30 @@ pub enum KeyStamp {
     DoubleEscapedSegment(u32),
 }
 
+/// Encoded width of an instant-encoded stamp placeholder ([`KeyInstant`]).
+pub const INSTANT_BYTES: usize = 8;
+
+/// The deepest segment nesting a [`KeyInstant`] may be escaped for.
+pub const MAX_INSTANT_ESCAPES: u8 = 4;
+
+/// An instant-encoded stamp placeholder inside an entry's `identity` (T7:
+/// an acceptance-relative write takes the commit's stamp). The
+/// [`INSTANT_BYTES`] zero bytes at `offset` become the stamp's micros plus
+/// `plus_micros` (saturating) in the instant encoding: big-endian with the
+/// sign bit flipped, the first eight bytes of the stamp's encoding and the
+/// order bytes of an Instant or Int64 sort key or fact cell. Each zero byte
+/// of the fill is followed by `escapes` bytes `0xff`, one per escaped
+/// segment enclosing the placeholder, so the key keeps every enclosing
+/// segment's order. A series sample's `at`, a timeline fact's `validFrom`,
+/// a maintained aggregate's boundary and any field placed as `now + d`
+/// carry one wherever their value sits in an index key.
+#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
+pub struct KeyInstant {
+    pub offset: u32,
+    pub escapes: u8,
+    pub plus_micros: i64,
+}
+
 /// The kind of one derived entry on a row's derived line.
 #[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
 pub enum EntryKind {
@@ -149,6 +181,9 @@ pub struct DeriveEntry {
     pub identity: Vec<u8>,
     /// Optional stamp placeholder inside `identity`.
     pub key_stamp: Option<KeyStamp>,
+    /// Instant-encoded stamp placeholders inside `identity`, disjoint from
+    /// each other and from `key_stamp`'s region.
+    pub key_instants: Vec<KeyInstant>,
     /// Value written where coverage begins.
     pub enter_value: Vec<u8>,
     /// Value written where coverage ends (`[]` for `Marker` and `Single`,
@@ -669,32 +704,70 @@ pub fn resolve_interval(interval: DeriveInterval, stamp_micros: i64) -> ValidInt
     }
 }
 
-/// Fill a `KeyStamp` placeholder inside an entry's `identity` key. Total: a
-/// placeholder outside the identity (which [`check`] refuses) leaves the
-/// identity as it is.
+/// The instant encoding of `stamp`'s micros plus `plus_micros`
+/// (saturating): big-endian with the sign bit flipped.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
-fn fill_key_stamp(identity: &[u8], key_stamp: Option<KeyStamp>, stamp: &[u8; STAMP_BYTES]) -> Vec<u8> {
-    let (offset, escape) = match key_stamp {
-        None => return identity.to_vec(),
-        Some(KeyStamp::Raw(offset)) => (offset, 0usize),
-        Some(KeyStamp::EscapedSegment(offset)) => (offset, 1),
-        Some(KeyStamp::DoubleEscapedSegment(offset)) => (offset, 2),
-    };
-    let start = offset as usize;
-    let Some(end) = start.checked_add(STAMP_BYTES).filter(|end| *end <= identity.len()) else {
+fn instant_fill(stamp: &[u8; STAMP_BYTES], plus_micros: i64) -> [u8; INSTANT_BYTES] {
+    let mut word = [0u8; INSTANT_BYTES];
+    word.copy_from_slice(&stamp[..INSTANT_BYTES]);
+    let micros = (u64::from_be_bytes(word) ^ (1 << 63)) as i64;
+    ((micros.saturating_add(plus_micros) as u64) ^ (1 << 63)).to_be_bytes()
+}
+
+/// Every placeholder region of an entry: `(start, width, escapes)`, the
+/// stamp's first, then each instant's.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn placeholder_regions(key_stamp: Option<KeyStamp>, key_instants: &[KeyInstant]) -> Vec<(usize, usize, usize)> {
+    let mut regions = Vec::with_capacity(key_instants.len() + 1);
+    match key_stamp {
+        None => {},
+        Some(KeyStamp::Raw(offset)) => regions.push((offset as usize, STAMP_BYTES, 0)),
+        Some(KeyStamp::EscapedSegment(offset)) => regions.push((offset as usize, STAMP_BYTES, 1)),
+        Some(KeyStamp::DoubleEscapedSegment(offset)) => regions.push((offset as usize, STAMP_BYTES, 2)),
+    }
+    for instant in key_instants {
+        regions.push((instant.offset as usize, INSTANT_BYTES, usize::from(instant.escapes)));
+    }
+    regions
+}
+
+/// Fill every placeholder inside an entry's `identity` key: the stamp
+/// placeholder with the stamp and each instant placeholder with its instant,
+/// each escaped as its region asks, in offset order (offsets name the
+/// template). Total: regions outside the identity or overlapping one another
+/// (which [`check`] refuses) leave the identity as it is.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn fill_key_stamp(identity: &[u8], key_stamp: Option<KeyStamp>, key_instants: &[KeyInstant], stamp: &[u8; STAMP_BYTES]) -> Vec<u8> {
+    let mut fills: Vec<(usize, usize, usize, Vec<u8>)> = Vec::with_capacity(key_instants.len() + 1);
+    for (index, (start, width, escapes)) in placeholder_regions(key_stamp, key_instants).into_iter().enumerate() {
+        let bytes = match (key_stamp.is_some(), index) {
+            (true, 0) => stamp.to_vec(),
+            (stamped, index) => instant_fill(stamp, key_instants[index - usize::from(stamped)].plus_micros).to_vec(),
+        };
+        fills.push((start, width, escapes, bytes));
+    }
+    if fills.is_empty() {
         return identity.to_vec();
-    };
-    let mut out = Vec::with_capacity(identity.len() + STAMP_BYTES * escape);
-    out.extend_from_slice(&identity[..start]);
-    for &byte in stamp {
-        out.push(byte);
-        if byte == 0 {
-            for _ in 0..escape {
-                out.push(0xff);
+    }
+    fills.sort_by_key(|fill| fill.0);
+    let mut out = Vec::with_capacity(identity.len() + STAMP_BYTES * 2);
+    let mut at = 0usize;
+    for (start, width, escapes, bytes) in fills {
+        let Some(end) = start.checked_add(width).filter(|end| start >= at && *end <= identity.len()) else {
+            return identity.to_vec();
+        };
+        out.extend_from_slice(&identity[at..start]);
+        for byte in bytes {
+            out.push(byte);
+            if byte == 0 {
+                for _ in 0..escapes {
+                    out.push(0xff);
+                }
             }
         }
+        at = end;
     }
-    out.extend_from_slice(&identity[end..]);
+    out.extend_from_slice(&identity[at..]);
     out
 }
 
@@ -739,6 +812,28 @@ pub fn check(derive: &Derive) -> Result<(), DeriveError> {
                 if entry.identity[start..end].iter().any(|&b| b != 0) {
                     return Err(DeriveError::new("A derived entry key stamp placeholder must be 16 zero bytes"));
                 }
+            }
+            for instant in &entry.key_instants {
+                let start = instant.offset as usize;
+                let end = start.checked_add(INSTANT_BYTES)
+                    .ok_or_else(|| DeriveError::new("A derived entry key instant offset overflows"))?;
+                if start < place_len {
+                    return Err(DeriveError::new("A derived entry key instant lies inside the partition and world prefix"));
+                }
+                if end > entry.identity.len() {
+                    return Err(DeriveError::new("A derived entry key instant lies outside the entry identity"));
+                }
+                if entry.identity[start..end].iter().any(|&b| b != 0) {
+                    return Err(DeriveError::new("A derived entry key instant placeholder must be 8 zero bytes"));
+                }
+                if instant.escapes > MAX_INSTANT_ESCAPES {
+                    return Err(DeriveError::new("A derived entry key instant is escaped too deep"));
+                }
+            }
+            let mut regions = placeholder_regions(entry.key_stamp, &entry.key_instants);
+            regions.sort_by_key(|region| region.0);
+            if regions.windows(2).any(|pair| pair[0].0 + pair[0].1 > pair[1].0) {
+                return Err(DeriveError::new("A derived entry's key placeholders overlap"));
             }
         }
     }
@@ -837,7 +932,7 @@ pub fn apply(
             from: interval.from,
             to: interval.to,
             kind: entry.kind,
-            identity: fill_key_stamp(&entry.identity, entry.key_stamp, &stamp),
+            identity: fill_key_stamp(&entry.identity, entry.key_stamp, &entry.key_instants, &stamp),
             enter_value: entry.enter_value.clone(),
             leave_value: entry.leave_value.clone(),
             live_key: Vec::new(),
@@ -1226,6 +1321,12 @@ impl Derive {
                             out.extend_from_slice(&offset.to_be_bytes());
                         },
                     }
+                    out.extend_from_slice(&(entry.key_instants.len() as u32).to_be_bytes());
+                    for instant in &entry.key_instants {
+                        out.extend_from_slice(&instant.offset.to_be_bytes());
+                        out.push(instant.escapes);
+                        out.extend_from_slice(&instant.plus_micros.to_be_bytes());
+                    }
                     put_bytes(&mut out, &entry.enter_value);
                     put_bytes(&mut out, &entry.leave_value);
                 }
@@ -1279,9 +1380,17 @@ impl Derive {
                         3 => Some(KeyStamp::DoubleEscapedSegment(take_u32(&mut rest)?)),
                         _ => return Err(DeriveError::new("Invalid derive key stamp tag")),
                     };
+                    let instant_count = take_u32(&mut rest)? as usize;
+                    let mut key_instants = Vec::with_capacity(instant_count.min(16));
+                    for _ in 0..instant_count {
+                        let offset = take_u32(&mut rest)?;
+                        let escapes = take_u8(&mut rest)?;
+                        let plus_micros = take_i64(&mut rest)?;
+                        key_instants.push(KeyInstant { offset, escapes, plus_micros });
+                    }
                     let enter_value = take_bytes(&mut rest)?;
                     let leave_value = take_bytes(&mut rest)?;
-                    entries.push(DeriveEntry { kind, identity, key_stamp, enter_value, leave_value });
+                    entries.push(DeriveEntry { kind, identity, key_stamp, key_instants, enter_value, leave_value });
                 }
                 DeriveMode::Replace { interval, entries }
             },
@@ -1325,7 +1434,7 @@ mod tests {
     }
 
     fn entry(kind: EntryKind, family: u8, name: &[u8], enter: &[u8], leave: &[u8]) -> DeriveEntry {
-        DeriveEntry { kind, identity: key(b"p", family, [0; 16], name), key_stamp: None, enter_value: enter.to_vec(), leave_value: leave.to_vec() }
+        DeriveEntry { kind, identity: key(b"p", family, [0; 16], name), key_stamp: None, key_instants: Vec::new(), enter_value: enter.to_vec(), leave_value: leave.to_vec() }
     }
 
     fn prefix() -> Vec<u8> {
@@ -1412,14 +1521,53 @@ mod tests {
                     kind: EntryKind::Edged { retain: true },
                     identity: key(b"p", PERSISTENCE, [1; 16], b"agg"),
                     key_stamp: None,
+                    key_instants: vec![KeyInstant { offset: 40, escapes: 2, plus_micros: -7 }],
                     enter_value: vec![0, 1],
                     leave_value: vec![0xff, 0xff],
                 }],
             },
         };
+        let mut derive = derive;
+        if let DeriveMode::Replace { entries, .. } = &mut derive.mode {
+            entries[0].identity.resize(48, 0);
+        }
         check(&derive).unwrap();
         assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
         let applied = apply(&prefix, &Manifest::empty(), ValidInterval { from: 1, to: 9 }, &[], stamp(1, 1), DERIVE_ORDINAL_BASE);
         assert_eq!(Manifest::decode(&applied.manifest.encode()).unwrap(), applied.manifest);
+    }
+
+    #[test]
+    fn an_instant_placeholder_takes_the_stamps_micros_escaped_per_segment() {
+        // Micros 0x01 plus 1: the order bytes `80 00 00 00 00 00 00 02`.
+        let stamp = stamp(1, 9);
+        let template = [key(b"p", INDEX, [0; 16], b"i"), vec![0x08], vec![0; INSTANT_BYTES], vec![0x00, 0xff, 0x01]].concat();
+        let offset = u32::try_from(template.len() - 3 - INSTANT_BYTES).unwrap();
+        let instant = KeyInstant { offset, escapes: 2, plus_micros: 1 };
+        let filled = fill_key_stamp(&template, None, &[instant], &stamp);
+        let start = offset as usize;
+        let mut expected = vec![0x80];
+        for _ in 0..6 {
+            expected.extend_from_slice(&[0x00, 0xff, 0xff]);
+        }
+        expected.push(0x02);
+        assert_eq!(&filled[..start], &template[..start]);
+        assert_eq!(&filled[start..start + expected.len()], expected.as_slice());
+        assert_eq!(&filled[start + expected.len()..], &[0x00, 0xff, 0x01]);
+        let marker = DeriveEntry { identity: template.clone(), key_instants: vec![instant], ..entry(EntryKind::Marker, INDEX, b"i", &[1], &[]) };
+        let derive = Derive {
+            manifest_prefix: prefix(),
+            levels: Vec::new(),
+            mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: OPEN_END }, entries: vec![marker.clone()] },
+        };
+        check(&derive).unwrap();
+        let applied = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 1, to: OPEN_END }, &[marker.clone()], stamp, DERIVE_ORDINAL_BASE);
+        assert_eq!(applied.manifest.segments[0].identity, filled, "the line keeps the filled identity");
+        let overlapping = DeriveEntry { key_instants: vec![instant, KeyInstant { offset: offset + 4, ..instant }], ..marker.clone() };
+        let refused = Derive { mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: OPEN_END }, entries: vec![overlapping] }, ..derive.clone() };
+        assert!(check(&refused).is_err());
+        let nonzero = DeriveEntry { identity: [&template[..start], &[1u8][..], &template[start + 1..]].concat(), ..marker };
+        let refused = Derive { mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: OPEN_END }, entries: vec![nonzero] }, ..derive };
+        assert!(check(&refused).is_err());
     }
 }

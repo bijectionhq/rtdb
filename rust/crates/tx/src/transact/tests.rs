@@ -152,6 +152,7 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
         kind: EntryKind::Marker,
         identity: id.clone(),
         key_stamp: None,
+        key_instants: Vec::new(),
         enter_value: vec![1],
         leave_value: Vec::new(),
     };
