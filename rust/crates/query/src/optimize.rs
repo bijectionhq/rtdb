@@ -35,20 +35,36 @@ pub(crate) trait TableStatistics {
     fn row_count(&self, table: &rtdb_plan::QualifiedTable) -> Option<u64>;
 }
 
-/// Each partition's flushed rows, from its table catalog, and its live rows.
+/// Each partition's flushed rows, from its table catalog, and its live rows; a partition that holds none of the table's
+/// rows counts as none, and only a table no partition knows is unknown.
 impl TableStatistics for crate::CatalogSnapshot {
     fn row_count(&self, table: &rtdb_plan::QualifiedTable) -> Option<u64> {
-        let partitions = &self.database(&table.database).ok()?.partitions;
-        if partitions.is_empty() { return None; }
-        let mut rows = 0u64;
-        for partition in partitions {
+        let partitions = self.database(&table.database).ok()?.partitions.iter().map(|partition| {
             let flushed = partition.table_catalog().metadata(&table.table).map(|meta| meta.row_count);
             let live = partition.iter_segments(&table.table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
-            if flushed.is_none() && live == 0 { return None; }
-            rows = rows.checked_add(u64::try_from(flushed.unwrap_or(0)).ok()?)?.checked_add(u64::try_from(live).ok()?)?;
-        }
-        Some(rows)
+            (flushed, live)
+        });
+        partition_rows(partitions)
     }
+}
+
+/// The rows of a table from each partition's flushed rows, if its catalog knows the table, and its live rows.
+fn partition_rows(partitions: impl IntoIterator<Item = (Option<i64>, i64)>) -> Option<u64> {
+    let mut known = false;
+    let mut rows = 0u64;
+    for (flushed, live) in partitions {
+        known |= flushed.is_some() || live != 0;
+        rows = rows.checked_add(u64::try_from(flushed.unwrap_or(0)).ok()?)?.checked_add(u64::try_from(live).ok()?)?;
+    }
+    known.then_some(rows)
+}
+
+#[test]
+fn an_empty_partition_adds_no_rows_rather_than_hiding_the_others() {
+    assert_eq!(partition_rows([(Some(40), 2), (None, 0)]), Some(42));
+    assert_eq!(partition_rows([(None, 0), (None, 5)]), Some(5));
+    assert_eq!(partition_rows([(None, 0), (None, 0)]), None, "no partition knows the table");
+    assert_eq!(partition_rows([]), None);
 }
 
 /// The rows a join input holds as the reference's planner estimates them: a scan's table row count, carried through the
