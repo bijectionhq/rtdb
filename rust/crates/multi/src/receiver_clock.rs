@@ -6,6 +6,10 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// A successor publisher can install a sample only once its predecessor's has expired, so a reader waits out one
+/// directory lease (3 s), a publish interval and a publish write before reporting the clock unavailable.
+const PUBLISHER_TAKEOVER: Duration = Duration::from_millis(4_500);
+
 /// The publisher's elapsed clock is anchored once to the cell's system time scale.
 /// Each live read confirms the persisted authority and expiry with a strong point read.
 pub(crate) struct ReceiverClock {
@@ -48,12 +52,16 @@ impl ReceiverClock {
 #[async_trait::async_trait]
 impl DecisionClock for ReceiverClock {
     async fn observe(&self) -> Result<DecisionObservation> {
-        let sample = tokio::time::timeout(Duration::from_secs(1), self.directory.receiver_clock(self.domain))
-            .await.map_err(|_| unavailable())??.ok_or_else(unavailable)?;
-        if !sample.admits(self.domain, self.elapsed()?) {
-            return Err(unavailable());
+        let deadline = tokio::time::Instant::now() + PUBLISHER_TAKEOVER;
+        loop {
+            let sample = tokio::time::timeout(Duration::from_secs(1), self.directory.receiver_clock(self.domain))
+                .await.map_err(|_| unavailable())??;
+            if let Some(sample) = sample && sample.admits(self.domain, self.elapsed()?) {
+                return Ok(DecisionObservation { domain: *sample.domain.as_bytes(), epoch: sample.epoch, sequence: sample.sequence, instant: sample.instant });
+            }
+            if tokio::time::Instant::now() >= deadline { return Err(unavailable()); }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Ok(DecisionObservation { domain: *sample.domain.as_bytes(), epoch: sample.epoch, sequence: sample.sequence, instant: sample.instant })
     }
 }
 
