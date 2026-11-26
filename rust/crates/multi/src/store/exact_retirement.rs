@@ -1909,12 +1909,15 @@ mod tests {
                 ("GET", &key, "", format!("{replacement}{}", entry(&key, "released-data", false))),
                 ("DELETE", &key, "released-data", String::new()),
                 ("GET", &key, "", replacement.clone()),
+                ("GET", &key, "", replacement.clone()),
                 ("GET", &queue, "", entry(&queue, "release-record", true)),
                 ("DELETE", &queue, "release-record", String::new()),
                 ("GET", &queue, "", entry(&queue, "release-record", true)),
+                ("GET", &key, "", replacement.clone()),
                 ("GET", &key, "", replacement),
                 ("GET", &queue, "", format!("{}{}", entry(&queue, "new-record", true), entry(&queue, "release-record", false))),
                 ("DELETE", &queue, "release-record", String::new()),
+                ("GET", &queue, "", entry(&queue, "new-record", true)),
                 ("GET", &queue, "", entry(&queue, "new-record", true)),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
