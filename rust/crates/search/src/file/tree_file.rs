@@ -980,6 +980,19 @@ mod tests {
     fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Interval, TemporalBounds, Timestamp};
 
+    /// Postings builds carry a text revision per document, which a plain SearchRow page does not.
+    struct Revised(Vec<super::super::SearchRow>);
+
+    impl super::super::SearchPage for Revised {
+        fn len(&self) -> usize { self.0.len() }
+
+        fn row(&mut self, row: usize, columns: &[String]) -> Result<super::super::IndexedRow<'_>> {
+            let mut indexed = super::super::SearchPage::row(&mut self.0, row, columns)?;
+            indexed.revisions = vec![Some([row as u8; 32]); columns.len()];
+            Ok(indexed)
+        }
+    }
+
     fn logical_run(columns: &[String]) -> Result<(TableSlug, SearchRun, Vec<u8>, std::ops::Range<usize>)> {
         use super::super::{BuildMode, SearchRow, write_group_as};
 
@@ -994,7 +1007,7 @@ mod tests {
             op: EventOp::Put, values: vec![Some(tokens("invoice"))],
         }];
         let mut bytes = Vec::new();
-        let (_, _, written) = write_group_as(columns, [[Ok(rows)]], &identity, Some(1), None, &mut bytes, None,
+        let (_, _, written) = write_group_as(columns, [[Ok(Revised(rows))]], &identity, Some(1), None, &mut bytes, None,
             LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
         let encoded = written.unwrap().encode(false);
         let (locator, inline) = TreeLocator::decode_route_with_inline(&encoded.text).unwrap();

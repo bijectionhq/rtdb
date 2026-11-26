@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recorded_tantivy_batches_are_cached_and_repair_keeps_its_fresh_mapped_read() {
+    async fn recorded_tantivy_batches_are_cached_and_repair_reads_the_original_bundle() {
         use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
         let store = Arc::new(MemoryStore::default());
         let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
@@ -1265,10 +1265,13 @@ mod tests {
         assert!(Arc::ptr_eq(&file, &runtime.file("xtdb", &pool, &key, &columns).await.unwrap()));
 
         let repair = runtime.file_for_repair("xtdb", &pool, &key, &columns, None).await.unwrap();
-        assert!(repair.metadata_bytes() > 0);
+        assert!(!Arc::ptr_eq(&file, &repair), "repair reads afresh rather than through the cached batches");
         assert!(repair.matches_artefact("job", 1));
         repair.verify().unwrap();
         assert_eq!(runtime.legacy_residency.used_bytes(), charge);
+        assert!(runtime.file_admission.used_bytes() > 0, "the repair's fresh read holds file admission");
+        drop(repair);
+        assert_eq!(runtime.file_admission.used_bytes(), 0);
         let scratch = runtime.file_admission.reserve(runtime.file_admission.limit_bytes()).unwrap();
         assert!(matches!(runtime.file_for_repair("xtdb", &pool, &key, &columns, None).await,
             Err(FileError::Unavailable(error)) if error.code == "rtdb/memory-budget-exceeded"));

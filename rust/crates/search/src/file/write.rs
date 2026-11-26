@@ -626,7 +626,7 @@ mod tests {
         writer.finish()?;
 
         let mut actual = Vec::new();
-        let memory = rtdb_columnar::MemoryBudget::new(4096);
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 16);
         write_group_as(&columns, [[Ok(documents())]], "token-fixture", Some(1), None, &mut actual,
             Some(memory.reserve(4096)?), format, BuildMode::Postings)?;
         assert_eq!(actual, expected);

@@ -1539,6 +1539,7 @@ mod tests {
         async fn put_file(&self, key: &rtdb_storage::ObjectKey, source: &std::path::Path) -> rtdb_storage::Result<()> { self.store.put_file(key, source).await }
         async fn list(&self, key: Option<&rtdb_storage::ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.store.list(key).await }
         async fn delete(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<()> { self.store.delete(key).await }
+        fn permits_shared_read_cache(&self) -> bool { true }
     }
 
     #[tokio::test]
