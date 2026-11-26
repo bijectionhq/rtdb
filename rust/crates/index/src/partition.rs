@@ -300,7 +300,8 @@ impl PartitionState {
     pub fn resolving_snapshot(&self, predecessors: &[Arc<StagedWrite>]) -> Result<Snapshot> { self.snapshot().with_staged(predecessors) }
 
     /// Builds the next live index and table catalog from a captured value, so readers opening snapshots are not held behind the
-    /// build, and installs them if neither changed meanwhile; otherwise, or on any failure, it applies under the lock as before.
+    /// build, and installs them if neither changed meanwhile. Only that conflict applies again under the lock: a build that
+    /// fails against an unchanged value would fail the same way there, so its error is returned.
     pub fn apply(&self, write: &StagedWrite) -> Result<()> {
         if write.tables().values().any(crate::TableWrite::is_adopted_history) { return self.apply_locked(write); }
         let captured = self.value();
@@ -308,12 +309,16 @@ impl PartitionState {
             live.search = None;
             Ok((live, with_entries_for(&captured.table_catalog, write.tables().keys())?))
         });
-        let Ok((live, table_catalog)) = built else { return self.apply_locked(write); };
         let mut value = self.value.write();
-        if !Arc::ptr_eq(&value.live, &captured.live) || !Arc::ptr_eq(&value.table_catalog, &captured.table_catalog) {
-            drop((value, live, table_catalog));
-            return self.apply_locked(write);
-        }
+        let unchanged = Arc::ptr_eq(&value.live, &captured.live) && Arc::ptr_eq(&value.table_catalog, &captured.table_catalog);
+        let (live, table_catalog) = match built {
+            Ok(built) if unchanged => built,
+            Err(error) if unchanged => return Err(error),
+            built => {
+                drop((value, built));
+                return self.apply_locked(write);
+            }
+        };
         let mut next = value.as_ref().clone();
         next.live = Arc::new(live);
         next.table_catalog = table_catalog;
@@ -525,5 +530,23 @@ mod tests {
             "a collection selects from the current catalog alone");
         drop(collection);
         assert!(state.trie_collection().current().trie_catalog().tables().next().is_none());
+    }
+
+    #[test]
+    fn a_write_that_no_longer_follows_the_live_index_is_refused_and_leaves_it_unchanged() {
+        use rtdb_columnar::MemoryBudget;
+        use rtdb_types::{Interval, StructFields, Value};
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let table = TableRef::new("public", "docs");
+        let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) };
+        let mut transaction = crate::TransactionBuffer::new(state.value().snapshot(), key, MemoryBudget::new(1 << 24)).unwrap();
+        let document = StructFields::from([("_id".into(), Value::I64(1))]);
+        transaction.put(table, document, Interval::new(Timestamp(10), Timestamp::MAX).unwrap()).unwrap();
+        let staged = transaction.stage().unwrap();
+        state.apply(&staged).unwrap();
+        let applied = state.value();
+        let refused = state.apply(&staged).unwrap_err();
+        assert_eq!(refused.code, "rtdb.index/invalid-live-index", "{refused:?}");
+        assert!(Arc::ptr_eq(&state.value(), &applied), "a refused write installs nothing");
     }
 }
