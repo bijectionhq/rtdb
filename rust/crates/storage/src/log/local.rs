@@ -59,7 +59,14 @@ pub struct LocalLogDriver {
     writer: Option<Writer>,
     queue: mpsc::Receiver<Queued>,
     progress: Arc<Progress>,
+    /// A moving average of recent batch sizes: above one, appenders are concurrent and a batch waits briefly to share its sync.
+    recent_batch: f64,
 }
+
+/// How long a batch waits for more frames once recent batches show concurrent appenders.
+/// A lone appender never waits; concurrent ones trade it for fewer syncs, each of which costs several milliseconds where the
+/// drive flushes its cache.
+const APPEND_LINGER: Duration = Duration::from_millis(2);
 
 struct Writer { file: JournalFile, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource>, keys: Option<Arc<ClassicObjectKeys>> }
 
@@ -304,7 +311,7 @@ impl LocalLog {
         let (send, queue) = mpsc::channel(options.queue_capacity);
         let log = Arc::new(Self { path: path.clone(), lineage: file.lineage(), queue: send, progress: progress.clone(),
             maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads });
-        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress }))
+        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent_batch: 1.0 }))
     }
 
     /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
@@ -417,7 +424,12 @@ impl LocalLogDriver {
                     match record { Some(record) => record, None => break },
             };
             let mut writer = self.writer.take().ok_or_else(|| Error::Closed("local writer unavailable".into()))?;
-            let (records, deferred) = self.ready_batch(first, writer.keys.is_some(), Instant::now() + APPEND_BATCH_TIME);
+            let sealed = writer.keys.is_some();
+            let (mut records, mut deferred) = self.ready_batch(first, sealed, Instant::now() + APPEND_BATCH_TIME);
+            if deferred.is_none() && self.recent_batch >= 1.5 {
+                deferred = self.linger(&mut records, sealed).await;
+            }
+            self.recent_batch = self.recent_batch * 0.75 + records.len() as f64 * 0.25;
             next = deferred;
             let joined = tokio::task::spawn_blocking(move || {
                 let result = writer.append(&records);
@@ -464,6 +476,20 @@ impl LocalLogDriver {
             bytes += size;
         }
         (records, None)
+    }
+
+    /// Waits up to the linger for further frames to share this batch's sync, returning a frame that would overflow it.
+    async fn linger(&mut self, records: &mut Vec<Queued>, sealed: bool) -> Option<Queued> {
+        let mut bytes: usize = records.iter().map(|record| record.frame_bytes(sealed)).sum();
+        let deadline = tokio::time::Instant::now() + APPEND_LINGER;
+        while bytes < APPEND_BATCH_BYTES {
+            let Ok(Some(record)) = tokio::time::timeout_at(deadline, self.queue.recv()).await else { return None; };
+            let size = record.frame_bytes(sealed);
+            if size > APPEND_BATCH_BYTES - bytes { return Some(record); }
+            records.push(record);
+            bytes += size;
+        }
+        None
     }
 
     fn reject_pending(&mut self, deferred: Option<Queued>, reason: String) {
@@ -962,6 +988,25 @@ mod tests {
         let (ready, deferred) = driver.ready_batch(expired.pop().unwrap(), false, Instant::now() + Duration::from_secs(5));
         assert!(deferred.is_none());
         assert_eq!(ready.iter().map(|record| record.timestamp.0).collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_appenders_share_a_sync_with_frames_arriving_during_the_linger() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, mut driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 16 })?;
+        let _first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
+        let mut records = vec![driver.queue.try_recv().unwrap()];
+        let late = {
+            let log = log.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                log.enqueue(Bytes::from_static(b"late"), Timestamp(2)).await
+            })
+        };
+        assert!(driver.linger(&mut records, false).await.is_none());
+        let _late = late.await.unwrap()?;
+        assert_eq!(records.iter().map(|record| record.timestamp.0).collect::<Vec<_>>(), [1, 2]);
         Ok(())
     }
 
