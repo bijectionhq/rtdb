@@ -2540,8 +2540,10 @@ mod tests {
         let cipher = directory_publications(&keys, &record, IoRegion::new()).unwrap()
             .with_attempts(journal, prefix.clone());
         let name = key("blocks/b00.binpb");
-        let abandoned = cipher.seal(&name, Bytes::from_static(b"abandoned")).await.unwrap();
-        let selected = cipher.seal(&name, Bytes::from_static(b"selected")).await.unwrap();
+        let abandoned_body = Bytes::from(vec![b'a'; 64]);
+        let selected_body = Bytes::from(vec![b's'; 64]);
+        let abandoned = cipher.seal(&name, abandoned_body).await.unwrap();
+        let selected = cipher.seal(&name, selected_body.clone()).await.unwrap();
         assert_ne!(&abandoned[..rtdb_types::ServingPublication::BYTES], &selected[..rtdb_types::ServingPublication::BYTES]);
         let (pack, _) = crate::packing::encode_pack(&BTreeMap::from([(name.to_string(), selected.clone())]), vec![], 0);
         bucket.put(&key(&format!("{prefix}/~packs/b00.pack")), pack).await.unwrap();
@@ -2554,7 +2556,7 @@ mod tests {
         let drained = directory.deployment(&record.id).await.unwrap().unwrap();
         let reaped = reap_local(directory.as_ref(), &storage, lock, &drained, Some(&keys)).await.unwrap();
         assert_eq!(reaped.erased, 1);
-        assert_eq!(cipher.open(&name, selected).await.unwrap().as_ref(), b"selected");
+        assert_eq!(cipher.open(&name, selected).await.unwrap(), selected_body);
         assert!(matches!(cipher.open(&name, abandoned).await, Err(Error::ErasedUnderView)));
     }
 
