@@ -120,6 +120,23 @@ fn staged_predecessors_and_own_writes_are_each_scanned_once() {
 }
 
 #[test]
+fn an_applied_write_installs_once_and_a_rejected_one_leaves_the_partition_unchanged() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let first = stage(&state, &budget, 0);
+    state.apply(&first).unwrap();
+    let held = state.open_snapshot(None);
+    let before = state.value();
+    let error = state.apply(&first).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Staged transaction no longer follows this live index"));
+    assert!(Arc::ptr_eq(&before, &state.value()));
+    state.apply(&stage(&state, &budget, 1)).unwrap();
+    assert_eq!(state.value().live().block_row_count(), 2);
+    assert_eq!(rows(&held), 1);
+    assert_eq!(rows(&state.open_snapshot(Some(key(1).tx_id))), 2);
+}
+
+#[test]
 fn cached_snapshot_rebuilds_only_when_a_newer_basis_is_demanded() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);

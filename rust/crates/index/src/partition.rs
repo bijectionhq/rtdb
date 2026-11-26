@@ -337,7 +337,29 @@ impl PartitionState {
 
     pub fn resolving_snapshot(&self, predecessors: &[Arc<StagedWrite>]) -> Result<Snapshot> { self.snapshot().with_staged(predecessors) }
 
+    /// Builds the next live index and table catalog from a captured value, so readers opening snapshots are not held behind the
+    /// build, and installs them if neither changed meanwhile; otherwise, or on any failure, it applies under the lock as before.
     pub fn apply(&self, write: &StagedWrite) -> Result<()> {
+        if write.tables().values().any(crate::TableWrite::is_adopted_history) { return self.apply_locked(write); }
+        let captured = self.value();
+        let built = captured.live.apply(write).and_then(|mut live| {
+            live.search = None;
+            Ok((live, captured.table_catalog.with_entries_for(write.tables().keys().cloned())?))
+        });
+        let Ok((live, table_catalog)) = built else { return self.apply_locked(write); };
+        let mut value = self.value.write();
+        if !Arc::ptr_eq(&value.live, &captured.live) || !Arc::ptr_eq(&value.table_catalog, &captured.table_catalog) {
+            drop((value, live, table_catalog));
+            return self.apply_locked(write);
+        }
+        let mut next = value.as_ref().clone();
+        next.live = Arc::new(live);
+        next.table_catalog = Arc::new(table_catalog);
+        *value = Arc::new(next);
+        Ok(())
+    }
+
+    fn apply_locked(&self, write: &StagedWrite) -> Result<()> {
         let mut value = self.value.write();
         if write.tables().values().any(crate::TableWrite::is_adopted_history) {
             value.snapshot().require_virgin_adoption(write)?;
