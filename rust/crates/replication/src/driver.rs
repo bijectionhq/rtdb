@@ -112,9 +112,9 @@ pub struct InstalledPrefix {
     pub image_digest: [u8; 32],
 }
 
-fn chain_tx_image_digest<'a>(
-    prev: [u8; 32],
-    position: ReplicaPosition,
+/// Content leaf of one replica record's transaction image: its key, commit
+/// flag, source progress and the set of tables it wrote.
+fn tx_image_leaf<'a>(
     tx_id: i64,
     system_time_micros: i64,
     committed: bool,
@@ -125,9 +125,7 @@ fn chain_tx_image_digest<'a>(
     let mut sorted: Vec<&str> = tables.collect();
     sorted.sort_unstable();
     let mut hasher = Sha256::new();
-    hasher.update(b"rtdb.replication.applied-image.tx.v1\0");
-    hasher.update(prev);
-    hasher.update(position.0.to_be_bytes());
+    hasher.update(b"rtdb.replication.applied-image.tx.v2\0");
     hasher.update(tx_id.to_be_bytes());
     hasher.update(system_time_micros.to_be_bytes());
     hasher.update([u8::from(committed)]);
@@ -140,21 +138,36 @@ fn chain_tx_image_digest<'a>(
     hasher.finalize().into()
 }
 
-fn chain_control_image_digest(
-    prev: [u8; 32],
-    position: ReplicaPosition,
-    tag: u8,
-    detail: &[u8],
-) -> [u8; 32] {
+/// Content leaf of one replica record's control image (tag and detail).
+fn control_image_leaf(tag: u8, detail: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"rtdb.replication.applied-image.control.v1\0");
-    hasher.update(prev);
-    hasher.update(position.0.to_be_bytes());
+    hasher.update(b"rtdb.replication.applied-image.control.v2\0");
     hasher.update([tag]);
     hasher.update((detail.len() as u64).to_be_bytes());
     hasher.update(detail);
     hasher.finalize().into()
+}
+
+/// Extends an applied-image chain by the record at `position`.
+fn chain_image_digest(prev: [u8; 32], position: ReplicaPosition, leaf: [u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"rtdb.replication.applied-image.chain.v2\0");
+    hasher.update(prev);
+    hasher.update(position.0.to_be_bytes());
+    hasher.update(leaf);
+    hasher.finalize().into()
+}
+
+/// One admitted replica position's contribution to the applied-image chain.
+#[derive(Clone, Copy)]
+enum ImageLeaves {
+    /// The leaf derived from the authenticated record and the leaf derived from what was applied.
+    Applied { expected: [u8; 32], applied: [u8; 32] },
+    /// The body could not be recognized, so its effects are unknown and the
+    /// chain can never again be complete in this driver incarnation.
+    Unrecognized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -628,6 +641,12 @@ pub struct ReplicationDriver {
     track_catalog_cut: bool,
     recognized_prefix: bool,
     applied_image: AppliedImageDigest,
+    /// Admitted replica positions not yet folded into `applied_image`, in replica order.
+    /// `None` marks a record that was admitted but is still held (pending block or
+    /// in-flight resolution) and has not been applied yet.
+    image_backlog: BTreeMap<i64, Option<ImageLeaves>>,
+    /// Set once an unrecognized frame has been folded: the chain is then permanently incomplete.
+    image_unrecognized: bool,
     installed: Option<InstalledPrefix>,
     first_erasure: Option<CommittedErasure>,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
@@ -687,7 +706,7 @@ impl ReplicationDriver {
         let applied_image = applied_image_from_base(read_position.0, base_digest);
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, applied_image, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, applied_image, image_backlog: BTreeMap::new(), image_unrecognized: false, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None, clock_lease: i64::MIN }))
     }
 
@@ -1318,6 +1337,7 @@ impl ReplicationDriver {
     async fn consume_record(&mut self, raw: LogRecord, decode_reservation: Option<Arc<MemoryReservation>>) -> Result<()> {
         let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, raw.metadata.offset.0)?;
         if position <= self.read_position { return Err(invalid("Replica reader did not advance")); }
+        self.admit_image_position(position)?;
         let own_term = self.leader.as_ref().map(|leader| leader.term);
         // Buffered read-back may outlive this leader and be applied as follower replay.
         let immediate = self.pending_block.is_none() && self.claim != Some(position)
@@ -1350,7 +1370,7 @@ impl ReplicationDriver {
                     return Err(invalid("The current writer cannot apply an unrecognized replica frame"));
                 }
                 self.recognized_prefix = false;
-                let _ = self.applied_image.observe_authenticated(position.0, [0xff; 32]);
+                self.record_image(position, ImageLeaves::Unrecognized, "Unrecognized replica frame was already recorded in the applied image")?;
                 self.read_position = position;
                 self.complete_trie_removals();
                 return Ok(());
@@ -1382,20 +1402,14 @@ impl ReplicationDriver {
             if !self.confirm_recovered_block(&record).await? {
                 self.apply_admitted(record).await?;
             } else {
-                let digest = chain_control_image_digest(self.applied_image.expected_digest, position, 2, &[]);
-                if !self.applied_image.observe_authenticated(position.0, digest)
-                    || !self.applied_image.record_applied(position.0, digest)
-                {
-                    return Err(invalid("Recovered block confirmation diverged from applied image digest"));
-                }
+                let leaf = control_image_leaf(2, &[]);
+                self.record_image(position, ImageLeaves::Applied { expected: leaf, applied: leaf },
+                    "Recovered block confirmation diverged from applied image digest")?;
             }
         } else {
-            let digest = chain_control_image_digest(self.applied_image.expected_digest, position, 0, &[]);
-            if !self.applied_image.observe_authenticated(position.0, digest)
-                || !self.applied_image.record_applied(position.0, digest)
-            {
-                return Err(invalid("Voided replica record diverged from applied image digest"));
-            }
+            let leaf = control_image_leaf(0, &[]);
+            self.record_image(position, ImageLeaves::Applied { expected: leaf, applied: leaf },
+                "Voided replica record diverged from applied image digest")?;
         }
         self.require_transferred_debt(position)?;
         self.read_position = position;
@@ -1514,14 +1528,70 @@ impl ReplicationDriver {
         Ok(())
     }
 
-    fn record_control_image(&mut self, position: ReplicaPosition, tag: u8, detail: &[u8]) -> Result<()> {
-        let digest = chain_control_image_digest(self.applied_image.expected_digest, position, tag, detail);
-        if !self.applied_image.observe_authenticated(position.0, digest)
-            || !self.applied_image.record_applied(position.0, digest)
+    /// Every replica position the reader advances over enters the applied-image
+    /// chain in replica order, before its record is applied or held.
+    fn admit_image_position(&mut self, position: ReplicaPosition) -> Result<()> {
+        let last = self.image_backlog.last_key_value().map_or(self.applied_image.expected_position, |(last, _)| *last);
+        if position.0 <= last {
+            return Err(invalid("Replica record regressed the applied image chain"));
+        }
+        self.image_backlog.insert(position.0, None);
+        Ok(())
+    }
+
+    /// Records the authenticated and applied leaves of an admitted position.
+    /// Records may be applied out of replica order (records held behind a
+    /// pending block or an in-flight resolution are applied after a later
+    /// upload, no-op or voided record), so leaves are folded into the chain
+    /// in replica order once every earlier admitted position has been applied.
+    fn record_image(&mut self, position: ReplicaPosition, leaves: ImageLeaves, diverged: &'static str) -> Result<()> {
+        if let ImageLeaves::Applied { expected, applied } = leaves
+            && !crate::image_digest::same_digest(&expected, &applied)
         {
-            return Err(invalid("Applied control record diverged from authenticated image digest"));
+            return Err(invalid(diverged));
+        }
+        match self.image_backlog.get_mut(&position.0) {
+            Some(slot @ None) => *slot = Some(leaves),
+            _ => return Err(invalid("Replica record was applied twice or without admission to the applied image chain")),
+        }
+        self.fold_image(diverged)
+    }
+
+    fn fold_image(&mut self, diverged: &'static str) -> Result<()> {
+        while let Some(entry) = self.image_backlog.first_entry() {
+            let Some(leaves) = *entry.get() else { break; };
+            let (position, _) = entry.remove_entry();
+            match leaves {
+                ImageLeaves::Unrecognized => {
+                    // The frame's effects are unknown: observe it without an applied
+                    // counterpart, leaving the chain incomplete for this incarnation.
+                    self.image_unrecognized = true;
+                    let _ = self.applied_image.observe_authenticated(position, [0xff; 32]);
+                }
+                // Past an unrecognized frame the chain can never complete again, and
+                // `recognized_prefix` (never reset) already withholds promotion,
+                // writer activation and installed-prefix publication.
+                ImageLeaves::Applied { .. } if self.image_unrecognized => {}
+                ImageLeaves::Applied { expected, applied } => {
+                    let at = ReplicaPosition(position);
+                    let expected = chain_image_digest(self.applied_image.expected_digest, at, expected);
+                    if !self.applied_image.observe_authenticated(position, expected) {
+                        return Err(invalid("Authenticated transaction record regressed the applied image chain"));
+                    }
+                    let applied = chain_image_digest(self.applied_image.applied_digest, at, applied);
+                    if !self.applied_image.record_applied(position, applied) {
+                        return Err(invalid(diverged));
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    fn record_control_image(&mut self, position: ReplicaPosition, tag: u8, detail: &[u8]) -> Result<()> {
+        let leaf = control_image_leaf(tag, detail);
+        self.record_image(position, ImageLeaves::Applied { expected: leaf, applied: leaf },
+            "Applied control record diverged from authenticated image digest")
     }
 
     async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
@@ -1626,9 +1696,7 @@ impl ReplicationDriver {
                             let key = resolved.result().tx_key();
                             let names: Vec<String> = resolved.writes().tables().keys()
                                 .map(|table| format!("{}/{}", table.schema, table.table)).collect();
-                            chain_tx_image_digest(
-                                self.applied_image.expected_digest,
-                                record.metadata.position,
+                            tx_image_leaf(
                                 key.tx_id.0,
                                 key.system_time.0,
                                 resolved.result().committed(),
@@ -1644,9 +1712,7 @@ impl ReplicationDriver {
                                 self.progress.source_position().0,
                                 expected_tx_id,
                             ));
-                            chain_tx_image_digest(
-                                self.applied_image.expected_digest,
-                                record.metadata.position,
+                            tx_image_leaf(
                                 expected_tx_id,
                                 message.system_time_micros.unwrap_or_default(),
                                 message.committed.unwrap_or_default(),
@@ -1655,16 +1721,12 @@ impl ReplicationDriver {
                             )
                         }
                     };
-                    if !self.applied_image.observe_authenticated(record.metadata.position.0, expected_image) {
-                        return Err(invalid("Authenticated transaction record regressed the applied image chain"));
-                    }
                     if own {
                         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
                         let head = leader.resolver_mut()?.take_head();
                         let (pending, expected) = leader.pending_tx_at(record.envelope.term_sequence).ok_or_else(|| readback_mismatch(message.tx_id))?;
                         let pending = Arc::clone(pending);
                         let expected = Arc::clone(expected);
-                        let prev_applied = self.applied_image.applied_digest;
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
                             let delta = confirmed_search_delta(pending.body.search_delta(), message.search_delta.as_ref());
@@ -1676,18 +1738,15 @@ impl ReplicationDriver {
                             let result = Arc::new(head.result().clone());
                             let applied_names: Vec<String> = head.writes().tables().keys()
                                 .map(|table| format!("{}/{}", table.schema, table.table)).collect();
-                            let applied_digest = chain_tx_image_digest(
-                                prev_applied,
-                                record.metadata.position,
+                            let applied_image = tx_image_leaf(
                                 result.tx_key().tx_id.0,
                                 result.tx_key().system_time.0,
                                 result.committed(),
                                 head.source_position(),
                                 applied_names.iter().map(String::as_str),
                             );
-                            if !self.applied_image.record_applied(record.metadata.position.0, applied_digest) {
-                                return Err(invalid("Applied transaction image omitted a control row, table write, or receipt"));
-                            }
+                            self.record_image(record.metadata.position, ImageLeaves::Applied { expected: expected_image, applied: applied_image },
+                                "Applied transaction image omitted a control row, table write, or receipt")?;
                             self.progress.applied(Some(head.source_position()), Some(AppliedTransaction::new(Arc::clone(&result), head.placed_attempt())), head.external_token().map(<[u8]>::to_vec))?;
                             Ok(result)
                         }.await;
@@ -1724,18 +1783,15 @@ impl ReplicationDriver {
                         ));
                         let applied_names: Vec<String> = writes.tables().keys()
                             .map(|table| format!("{}/{}", table.schema, table.table)).collect();
-                        let applied_digest = chain_tx_image_digest(
-                            self.applied_image.applied_digest,
-                            record.metadata.position,
+                        let applied_image = tx_image_leaf(
                             result.tx_key().tx_id.0,
                             result.tx_key().system_time.0,
                             result.committed(),
                             source,
                             applied_names.iter().map(String::as_str),
                         );
-                        if !self.applied_image.record_applied(record.metadata.position.0, applied_digest) {
-                            return Err(invalid("Replayed transaction image omitted a control row, table write, or receipt"));
-                        }
+                        self.record_image(record.metadata.position, ImageLeaves::Applied { expected: expected_image, applied: applied_image },
+                            "Replayed transaction image omitted a control row, table write, or receipt")?;
                         self.progress.applied(Some(source), Some(AppliedTransaction::new(Arc::new(result), placed_attempt)), message.external_source_token.clone())?;
                     }
                     if placed {
