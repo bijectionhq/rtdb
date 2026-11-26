@@ -95,6 +95,42 @@ pub struct StoreWrite {
     pub value_stamp: Option<u32>,
 }
 
+/// One atomic bounded-counter update of a store append over a 64-bit signed
+/// big-endian integer stored at `key` (absent key = `0`). At the append's
+/// version, the resolver adds `delta` and refuses the whole append if the sum
+/// leaves `[min, max]` or overflows `i64`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoreBound {
+    pub key: Vec<u8>,
+    pub delta: i64,
+    pub min: i64,
+    pub max: i64,
+}
+
+/// Validate `bounds` before anything is ordered: every bound must have a
+/// non-empty range (`min <= max`).
+pub fn check_bounds(bounds: &[StoreBound]) -> Result<()> {
+    for bound in bounds {
+        if bound.min > bound.max {
+            return Err(Anomaly::incorrect("rtdb.store/invalid-bound", "A store bound's min must not exceed its max"));
+        }
+    }
+    Ok(())
+}
+
+/// Decode a stored 8-byte signed big-endian counter (`None` = `0`).
+pub fn decode_bound_value(value: Option<&[u8]>) -> Result<i64> {
+    match value {
+        None => Ok(0),
+        Some(bytes) => {
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+                Anomaly::fault("rtdb.store/invalid-bound-value", "A store bound entry must hold an 8-byte big-endian i64")
+            })?;
+            Ok(i64::from_be_bytes(bytes))
+        }
+    }
+}
+
 fn invalid_placeholder(message: &'static str) -> Anomaly {
     Anomaly::incorrect("rtdb.store/invalid-stamp-placeholder", message)
 }
@@ -294,6 +330,17 @@ impl BranchView<'_> {
             entries.push(StoreEntry { key: key.clone(), value, written });
         }
         Ok(StorePage { cut: self.cut, entries, resume })
+    }
+
+    /// The live value of `key` in the ordered-bytes store at this view's cut,
+    /// or `None` if absent.
+    pub fn store_value(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+        let table = store_table();
+        let id = EntityId::Binary(key.to_vec());
+        match self.row(&table, &id, self.cut.system_time) {
+            Some(event) => Ok(Some(value_of(event)?)),
+            None => Ok(None),
+        }
     }
 
     /// The first key in `range` written or erased after `since`, if any.

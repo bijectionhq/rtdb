@@ -14,11 +14,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use prost::Message;
 use rtdb_index::branches::store::{
-    KeyRange, MAX_PAGE_ENTRIES, Projection, StoreRead, StoreWrite, ValueFilter, check_placeholders, store_table,
+    KeyRange, MAX_PAGE_ENTRIES, Projection, StoreBound, StoreRead, StoreWrite, ValueFilter, check_bounds, check_placeholders,
+    store_table,
 };
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{
-    Guard, Op, Outcome, STORE_CLOCK_BEHIND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
+    Guard, Op, Outcome, STORE_BOUND, STORE_CLOCK_BEHIND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
 };
 use rtdb_types::{EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
 use tonic::Status;
@@ -138,8 +139,12 @@ impl Service {
         let writes = request.writes.into_iter()
             .map(|write| StoreWrite { key: write.key, value: write.value, key_stamp: write.key_stamp, value_stamp: write.value_stamp })
             .collect::<Vec<_>>();
-        // Placeholder and window errors are the request's, decided before anything is ordered.
+        let bounds = request.bounds.into_iter()
+            .map(|bound| StoreBound { key: bound.key, delta: bound.delta, min: bound.min, max: bound.max })
+            .collect::<Vec<_>>();
+        // Placeholder, bound and window errors are the request's, decided before anything is ordered.
         check_placeholders(&writes).map_err(error::anomaly)?;
+        check_bounds(&bounds).map_err(error::anomaly)?;
         let window = request.window.map_or(Window::default(), |window| Window {
             not_before: window.not_before.map(Timestamp),
             before: window.before.map(Timestamp),
@@ -148,7 +153,7 @@ impl Service {
             return Err(error::incorrect("The append's window is empty"));
         }
         // Every append records its outcome under its key, a write-free one included.
-        let validation = writes.is_empty();
+        let validation = writes.is_empty() && bounds.is_empty();
         let (database, incarnation) = self.store_database(call, DatabaseAccess::Write, Some(&request.incarnation)).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let since = Basis::new(incarnation, request.since);
@@ -160,7 +165,7 @@ impl Service {
             require: Vec::new(),
             window: Window::default(),
             guards,
-            ops: vec![Op::Store(StoreAppend { writes, window })],
+            ops: vec![Op::Store(StoreAppend { writes, bounds, window })],
             otherwise: Vec::new(),
             requires: Vec::new(),
             custody_request_digest: None,
@@ -190,6 +195,11 @@ impl Service {
                     Outcome::Otherwise { failed } => {
                         let first = failed.first().copied().ok_or_else(|| Status::internal("A failed append names no read"))?;
                         proto::append_reply::Outcome::Conflict(u32::try_from(first).map_err(|_| Status::internal("Read index overflow"))?)
+                    }
+                    Outcome::Refused { error } if error.code == STORE_BOUND => {
+                        let bound = error.context.get("bound").and_then(|value| value.as_u64())
+                            .ok_or_else(|| Status::internal("A failed bound names no index"))?;
+                        proto::append_reply::Outcome::Bound(u32::try_from(bound).map_err(|_| Status::internal("Bound index overflow"))?)
                     }
                     Outcome::Refused { error } => return Err(error::anomaly(error)),
                 }

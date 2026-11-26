@@ -100,6 +100,17 @@ message Write {
   optional uint32 value_stamp = 4;
 }
 
+// An atomic bounded-counter update over a 64-bit signed big-endian integer
+// stored at key (absent key = 0). At the append's version, the store adds
+// delta and refuses the whole append if the sum leaves [min, max] or overflows
+// i64. Concurrent Bounds on the same key never conflict with each other.
+message Bound {
+  bytes key = 1;
+  int64 delta = 2;
+  int64 min = 3;
+  int64 max = 4;
+}
+
 // The stamp's micros must lie in [not_before, before). Absent bounds are
 // unbounded.
 message Window {
@@ -137,6 +148,10 @@ message AppendRequest {
   // Judged after the reads, against the clock sample the stamp carries.
   // Absent is unbounded; an empty window fails with INVALID_ARGUMENT.
   optional Window window = 6;
+  // Atomic bounded-counter checks and updates evaluated at the append's
+  // version after the reads and window. A bound with min > max fails with
+  // INVALID_ARGUMENT before anything is ordered.
+  repeated Bound bounds = 7;
 }
 
 message AppendReply {
@@ -146,13 +161,17 @@ message AppendReply {
     Stamp committed = 2;
     // The index of the first read range a later write intersected.
     uint32 conflict = 3;
-    // An append with no writes validated its reads through this version: its
-    // own record, which writes nothing. Like a commit and a conflict, it is a
-    // receipt, so a retry under the same key returns it.
+    // An append with no writes or bounds validated its reads through this
+    // version: its own record, which writes nothing. Like a commit, a conflict
+    // and a bound refusal, it is a receipt, so a retry under the same key
+    // returns it.
     uint64 validated = 4;
     // The clock sample fell outside the window. Nothing was written and no
     // receipt was kept: a retry under the same key is judged again.
     Side outside = 5;
+    // The index of the first bound whose sum left [min, max] or overflowed.
+    // Nothing was written; recorded as a receipt under the append's key.
+    uint32 bound = 6;
   }
 }
 

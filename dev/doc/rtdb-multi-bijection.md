@@ -937,3 +937,13 @@ Each phase rolls back on its own, because the `WorldStore` conformance suite gat
    Built from the change feed with ownership unchanged, or moved into RTDB later.
 4. **Files and blobs.**
    They stay in Bijection's per-tenant buckets; moving them under RTDB's storage roots and reaper is possible and not required.
+
+## One order, sharded resolution, and `Bound`
+
+An installation's appends share one version line.
+Today one holder bounds ordering, resolution and its resident set (object storage is elastic); Bijection's `kernel.md` states this ceiling honestly.
+RTDB's endgame splits an ordering tier from place-sharded resolvers and storage, with epoch-fenced place handoff and no change to commit order (modeled in [`verification/tla/ShardedOrder.tla`](../../verification/tla/ShardedOrder.tla)).
+
+`rtdb.store.v1.Append` accepts `Bound { key, delta, min, max }` operations over 64-bit signed big-endian integers (absent key = `0`).
+At the append's version, the store adds `delta` and refuses the whole append (`rtdb.store/bound`, mapped to `rtdb.owned/bound` in Bijection) if the sum leaves `[min, max]` or overflows `i64`.
+Concurrent `Bound`s on the same key never conflict with each other.

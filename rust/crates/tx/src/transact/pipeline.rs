@@ -721,7 +721,7 @@ mod tests {
             custody_request_digest: None,
             request_memory: None,
             key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
-            ops: vec![Op::Store(StoreAppend { writes, window: Window::default() })],
+            ops: vec![Op::Store(StoreAppend { writes, bounds: Vec::new(), window: Window::default() })],
             otherwise: Vec::new(),
             requires: Vec::new(),
         }

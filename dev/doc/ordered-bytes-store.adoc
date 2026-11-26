@@ -22,16 +22,19 @@ A filtered read returns exactly what an unfiltered read of the same ranges and v
 Bijection defines what a filter means; RTDB only runs it next to the data.
 With `arrow`, each page is one Arrow IPC stream with columns `key`, `written` and `value`.
 
-`rtdb.store.v1.Append`:: Commits its writes at a new version, unless a write committed after `since` intersects one of its read ranges.
-A refused append names the first such range and writes nothing.
+`rtdb.store.v1.Append`:: Commits its writes and bounded-counter updates at a new version, unless a write committed after `since` intersects one of its read ranges, the clock falls outside its window, or a `Bound` leaves `[min, max]`.
+A refused append names the first conflicting read range (or first failing bound) and writes nothing.
 Its reads are judged first; then the writer's clock, sampled at the ordering point, is judged against the append's window `[not_before, before)`.
 A sample outside it answers `outside` (early or late), writes nothing and keeps no receipt, so a retry under the same key is judged again.
+Next, each `Bound { key, delta, min, max }` is evaluated at the append's version over a 64-bit signed big-endian integer stored at `key` (absent key = `0`).
+If `current + delta` leaves `[min, max]` or overflows `i64`, the whole append refuses with `bound` naming that index, writes nothing, and records a receipt under its idempotency key.
+Concurrent `Bound`s on the same key never add to `reads` and never conflict with each other.
 A committing append receives its stamp: the clock sample in microseconds and the commit's version.
 The store overwrites every stamp placeholder of the writes (16 zero bytes at a named offset of a key or value) with the stamp's encoding, micros big-endian with the sign bit flipped and then the version big-endian, so stamped keys sort in commit order.
 A key placeholder lies at or past the key's partition prefix (a big-endian `u16` length, then that many bytes).
-A placeholder out of bounds, over non-zero bytes or inside the prefix, a value placeholder on a delete, and a stamped key that could land on another write's key (equal length and equal bytes outside both placeholders) are request errors, decided before anything is ordered.
-An append with no writes only validates: it is recorded at a new version with no effects, the version it answers it validated through.
-Every outcome but `outside` is a receipt under the append's idempotency key, so a retry returns the first outcome: a commit with its first stamp, a conflict, or a validation with its version, even after a later write that a fresh judgement would conflict with.
+A placeholder out of bounds, over non-zero bytes or inside the prefix, a value placeholder on a delete, a `Bound` with `min > max`, and a stamped key that could land on another write's key (equal length and equal bytes outside both placeholders) are request errors, decided before anything is ordered.
+An append with no writes or bounds only validates: it is recorded at a new version with no effects, the version it answers it validated through.
+Every outcome but `outside` is a receipt under the append's idempotency key, so a retry returns the first outcome: a commit with its first stamp, a conflict, a bound refusal, or a validation with its version, even after a later write that a fresh judgement would conflict with.
 The key belongs to its first request; another request under it is refused.
 
 `rtdb.store.v1.Watch`:: Reports the first version after `after` that wrote into one of its ranges, waiting up to a bounded time.
@@ -58,10 +61,17 @@ It always reports how far it inspected, so a caller resumes from there.
 
 The store is one relation, `store.entries`, on the main branch of the v1 branch index.
 An entry's id is its key bytes and its `v` cell holds the value.
-`Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }` and whose one operation is `Op::Store`, its writes and window.
-The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time.
-It fills the placeholders and applies the stamped writes as puts and deletes of `store.entries`.
+`Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }` and whose one operation is `Op::Store`, its writes, bounds and window.
+The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time, and then each `Bound` against the live 8-byte signed big-endian entry (absent = `0`).
+It fills the placeholders and applies the stamped writes and updated bound counters as puts and deletes of `store.entries`.
+A failing bound records `Outcome::Refused` with `rtdb.store/bound` and its index as a receipt under the append's key and writes nothing.
 A sample at or behind the head's time refuses as `rtdb.store/clock-behind`, and the Flight action waits it out and retries.
+
+== Ordering ceiling and sharded resolution
+
+An installation's appends share one version line.
+Today one holder bounds ordering, resolution and its resident set (object storage is elastic).
+RTDB's target splits an ordering tier from place-sharded resolvers and storage, with epoch-fenced place handoff and no change to commit order (`verification/tla/ShardedOrder.tla`).
 A conflict and a validation carry no stamp: their records take the next time past the head when the sample does not pass it, as a native transaction's does.
 A write-free append is therefore not a v1 validation (`Transact::validates_only`), which answers at the acquired basis without a record: it is ordered and appended like a commit, so every append needs write access.
 `Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.

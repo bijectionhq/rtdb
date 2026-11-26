@@ -48,10 +48,16 @@ fn visible(state: &TransactState, branch: &str, layer: Layer, at: i64) -> Vec<i6
 }
 
 fn store_append(key: u8, since: u64, reads: Vec<KeyRange>, writes: Vec<StoreWrite>, window: Window) -> Transact {
+    store_append_with_bounds(key, since, reads, writes, Vec::new(), window)
+}
+
+fn store_append_with_bounds(
+    key: u8, since: u64, reads: Vec<KeyRange>, writes: Vec<StoreWrite>, bounds: Vec<StoreBound>, window: Window,
+) -> Transact {
     Transact {
         key: vec![key; 16], require: Vec::new(), window: Window::default(),
         guards: reads.into_iter().map(|range| Guard::Unwritten { range, since: basis(since) }).collect(),
-        ops: vec![Op::Store(StoreAppend { writes, window })], otherwise: Vec::new(), requires: Vec::new(),
+        ops: vec![Op::Store(StoreAppend { writes, bounds, window })], otherwise: Vec::new(), requires: Vec::new(),
         custody_request_digest: None, request_memory: None,
     }
 }
@@ -157,6 +163,58 @@ fn a_store_append_records_its_validation_and_conflict_as_receipts() {
     let validated = plan(&state, &late, 4, 400, DEFAULT);
     let receipt = apply(&mut state, 4, validated.record()).unwrap();
     assert_eq!((receipt.basis, receipt.outcome), (basis(4), Outcome::Then));
+}
+
+#[test]
+fn a_store_append_bound_updates_without_conflicts_and_refuses_out_of_range() {
+    use rtdb_index::branches::store::{Projection, StoreRead};
+    let mut state = TransactState::new(INCARNATION);
+    let host = vec![0u8, 4, b'h', b'o', b's', b't'];
+    let counter = [host.as_slice(), b"shared/places"].concat();
+    let payload = StoreWrite { key: [host.as_slice(), b"side"].concat(), value: Some(b"ok".to_vec()), key_stamp: None, value_stamp: None };
+
+    // Invalid bound (min > max) is a request error before ordering.
+    let invalid = store_append_with_bounds(1, 0, Vec::new(), Vec::new(), vec![StoreBound { key: counter.clone(), delta: 1, min: 5, max: 4 }], Window::default());
+    assert_eq!(refused(&state, &invalid, 1, 100), "rtdb.store/invalid-bound");
+
+    // Two concurrent appends from since=0 both succeed on the same counter without conflicting.
+    let b1 = store_append_with_bounds(2, 0, Vec::new(), Vec::new(), vec![StoreBound { key: counter.clone(), delta: 3, min: 0, max: 5 }], Window::default());
+    let p1 = plan(&state, &b1, 1, 100, DEFAULT);
+    assert_eq!(apply(&mut state, 1, p1.record()).unwrap().outcome, Outcome::Then);
+
+    let b2 = store_append_with_bounds(3, 0, Vec::new(), vec![payload.clone()], vec![StoreBound { key: counter.clone(), delta: 2, min: 0, max: 5 }], Window::default());
+    let p2 = plan(&state, &b2, 2, 200, DEFAULT);
+    assert_eq!(apply(&mut state, 2, p2.record()).unwrap().outcome, Outcome::Then);
+
+    // Exceeding max refuses the whole append (writes nothing) and records a receipt.
+    let over = store_append_with_bounds(4, 0, Vec::new(), vec![StoreWrite { key: [host.as_slice(), b"never"].concat(), value: Some(b"x".to_vec()), key_stamp: None, value_stamp: None }], vec![StoreBound { key: counter.clone(), delta: 1, min: 0, max: 5 }], Window::default());
+    let p3 = plan(&state, &over, 3, 300, DEFAULT);
+    let receipt = apply(&mut state, 3, p3.record()).unwrap();
+    match &receipt.outcome {
+        Outcome::Refused { error } => {
+            assert_eq!(error.code, STORE_BOUND);
+            assert_eq!(error.context.get("bound").and_then(|v| v.as_u64()), Some(0));
+        }
+        other => panic!("expected bound refusal, got {other:?}"),
+    }
+
+    // Retry replays the refusal receipt even after a decrement frees headroom.
+    let refund = store_append_with_bounds(5, 3, Vec::new(), Vec::new(), vec![StoreBound { key: counter.clone(), delta: -2, min: 0, max: 5 }], Window::default());
+    let p4 = plan(&state, &refund, 4, 400, DEFAULT);
+    assert_eq!(apply(&mut state, 4, p4.record()).unwrap().outcome, Outcome::Then);
+    let Resolution::Answer(replayed) = state.resolve(&over, 5, Timestamp(500), DEFAULT, &claims()).unwrap() else {
+        panic!("a retried bound refusal replays its receipt");
+    };
+    assert!(replayed.replayed);
+    assert!(matches!(replayed.outcome, Outcome::Refused { ref error } if error.code == STORE_BOUND));
+
+    // Counter value is 3 + 2 - 2 = 3, and the refused write never landed.
+    let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(500)).unwrap();
+    let page = view.store_page(&StoreRead {
+        range: KeyRange { start: host, end: None }, after: None, limit: 10, projection: Projection::Values, filter: None, reverse: false,
+    }).unwrap();
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(view.store_value(&counter).unwrap(), Some(3i64.to_be_bytes().as_slice()));
 }
 
 #[test]

@@ -4379,9 +4379,10 @@ open question "How is per-deployment cryptographic erasure reconciled with objec
     -- Erasing a row (ERASE) applies to every member of the lineage that can see it; the compliance contract has to say so.
 
 open question "What lies beyond one holder's write rate?"
-    -- A deployment beyond one resolver's throughput gets a dedicated class first.
-    -- Parallel deterministic resolution over the one order (Block-STM over non-interactive transactions) raises the ceiling without changing the log.
-    -- Declared partitions with a deterministic cross-partition sequencer are the step after that, and are not designed here.
+    -- One installation's appends share one version line.
+    -- Today one holder bounds ordering, resolution and its resident set while object storage stays elastic.
+    -- RTDB's target splits an ordering tier from place-sharded resolvers and storage, with epoch-fenced place handoff and no change to commit order (modeled in verification/tla/ShardedOrder.tla).
+    -- Generic Bound { key, delta, min, max } in rtdb.store.v1.Append evaluates atomic bounded-counter updates at the ordering point without read-set conflicts between concurrent spenders.
 
 open question "Is the batched seal check the right price for linearizable reads?"
     -- It adds up to one group-commit round to a linearizable read, and involves no clock.

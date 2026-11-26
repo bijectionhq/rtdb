@@ -9,9 +9,11 @@ pub use rtdb_index::branches::{
     CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition,
     ReviewedCustodyReservation, Visibility,
     RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind, ScopedHoldCommand,
-    store::{KeyRange, StoreWrite},
+    store::{KeyRange, StoreBound, StoreWrite},
 };
-use rtdb_index::branches::store::{StoreStamp, VALUE_COLUMN, check_placeholders, stamp_writes, store_table};
+use rtdb_index::branches::store::{
+    StoreStamp, VALUE_COLUMN, check_bounds, check_placeholders, decode_bound_value, stamp_writes, store_table,
+};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
     Term, TimeUnit, Timestamp, Value,
@@ -284,11 +286,14 @@ pub enum Op {
 }
 
 /// A store append (`dev/doc/ordered-bytes-store.adoc`): its writes, with stamp
-/// placeholders the resolver fills at the ordering point, and its clock window,
-/// judged against the clock sample the stamp carries. No writes only validates.
+/// placeholders the resolver fills at the ordering point, its atomic bounded
+/// counter updates (`bounds`), and its clock window, judged against the clock
+/// sample the stamp carries. No writes or bounds only validates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreAppend {
     pub writes: Vec<StoreWrite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounds: Vec<StoreBound>,
     pub window: Window,
 }
 
@@ -299,6 +304,8 @@ pub const STORE_CLOCK_BEHIND: &str = "rtdb.store/clock-behind";
 pub const STORE_OUTSIDE_EARLY: &str = "rtdb.store/outside-early";
 /// The clock sample is at or past the store window's `before`.
 pub const STORE_OUTSIDE_LATE: &str = "rtdb.store/outside-late";
+/// A `Bound` check left `[min, max]` or overflowed `i64`; nothing was written.
+pub const STORE_BOUND: &str = "rtdb.store/bound";
 
 fn store_append_shape() -> Anomaly {
     Anomaly::incorrect("rtdb.store/append-shape", "A store append carries only its store operation and read guards")
@@ -1323,9 +1330,10 @@ impl TransactState {
             return Err(Anomaly::incorrect("rtdb.store/empty-window", "The store append's window is empty"));
         }
         check_placeholders(&append.writes)?;
+        check_bounds(&append.bounds)?;
         if view.pending { return Err(pending_error()); }
         let head = view.index.head();
-        let stamped = !append.writes.is_empty();
+        let mutates = !append.writes.is_empty() || !append.bounds.is_empty();
         let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
             key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
         };
@@ -1340,7 +1348,7 @@ impl TransactState {
             // A commit's time is its own sample, past the head's; a validation's sample
             // is at least the head's, since the store's clock never regresses.
             let floor = head.system_time.max(view.time_floor.unwrap_or(Timestamp::MIN));
-            if now < floor || (stamped && now == floor) {
+            if now < floor || (mutates && now == floor) {
                 return Err(Anomaly::new(AnomalyCategory::Busy, STORE_CLOCK_BEHIND, "The writer clock is behind the store's last commit")
                     .with_context("retry_after_micros", floor.0.saturating_sub(now.0).saturating_add(1).into()));
             }
@@ -1353,13 +1361,38 @@ impl TransactState {
             }
         }
 
+        // Evaluate bounded-counter ops against the live store state at the
+        // ordering point, after read guards and window checks. Concurrent Bounds
+        // on the same key never add to reads and never conflict with each other.
+        let mut failed_bound: Option<usize> = None;
+        let mut bound_updates: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+        if failed.is_empty() && !append.bounds.is_empty() {
+            let store_view = view.index.view(MAIN_BRANCH, At::Latest, Layer::Merged, guard_time)?;
+            for (idx, bound) in append.bounds.iter().enumerate() {
+                let current = match bound_updates.get(&bound.key) {
+                    Some(&value) => value,
+                    None => decode_bound_value(store_view.store_value(&bound.key)?)?,
+                };
+                match current.checked_add(bound.delta) {
+                    Some(next) if next >= bound.min && next <= bound.max => {
+                        bound_updates.insert(bound.key.clone(), next);
+                    }
+                    _ => {
+                        failed_bound = Some(idx);
+                        break;
+                    }
+                }
+            }
+        }
+
         if position <= head.basis.position() {
             return Err(Anomaly::fault("rtdb/transaction-order", "The append must follow the applied prefix"));
         }
-        // Only a commit's time is its sample. A conflict and a validation carry no
-        // stamp: their records take the next time past the head when the sample does
-        // not pass it, as a native transaction's does.
-        let system_time = if stamped && failed.is_empty() {
+        // Only a commit's time is its sample. A conflict, bound refusal, or
+        // validation carries no stamp: its record takes the next time past the
+        // head when the sample does not pass it, as a native transaction's does.
+        let commits = mutates && failed.is_empty() && failed_bound.is_none();
+        let system_time = if commits {
             now
         } else {
             now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN))
@@ -1369,10 +1402,15 @@ impl TransactState {
         index.advance(cut)?;
         let (outcome, effects, after) = if !failed.is_empty() {
             (Outcome::Otherwise { failed }, Vec::new(), index)
-        } else if stamped {
+        } else if let Some(bound_idx) = failed_bound {
+            let error = Anomaly::new(AnomalyCategory::Conflict, STORE_BOUND, "A store bound check failed")
+                .with_context("bound", (bound_idx as u64).into());
+            (Outcome::Refused { error }, Vec::new(), index)
+        } else if commits {
             let stamp = StoreStamp { micros: now.0, version: position };
             let mut ops: Vec<Op> = Vec::new();
-            for (key, value) in stamp_writes(&append.writes, stamp)? {
+            let bound_writes = bound_updates.into_iter().map(|(key, next)| (key, Some(next.to_be_bytes().to_vec())));
+            for (key, value) in stamp_writes(&append.writes, stamp)?.into_iter().chain(bound_writes) {
                 let id = EntityId::Binary(key);
                 // Consecutive puts and deletes keep their order, so a later write of a key wins.
                 match (value, ops.last_mut()) {
