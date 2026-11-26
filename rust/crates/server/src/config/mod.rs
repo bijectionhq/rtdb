@@ -106,7 +106,7 @@ pub struct NodeConfiguration {
     pub local_log_uses_clock: bool,
     pub kafka_auto_create_topic: bool,
     pub join_build_rows: i64,
-    /// Overrides the per-query spill limit, which otherwise follows the free disk.
+    /// Overrides the per-query spill limit: `query.spillLimitBytes`, else `RTDB_QUERY_SPILL_LIMIT_BYTES`.
     pub query_spill_limit_bytes: Option<u64>,
     pub generate_series_end_exclusive: bool,
     pub object_sort: rtdb_types::ObjectSort,
@@ -157,10 +157,10 @@ impl NodeConfiguration {
         let health = fields.take_nullable("healthz").map(health).transpose()?;
         let indexer = indexer(fields.take("indexer"), environment)?;
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
-        let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").as_deref().and_then(join_threshold).unwrap_or(100_000);
-        let query_spill_limit_bytes = environment("XTDB_QUERY_SPILL_LIMIT_BYTES")
-            .map(|text| text.trim().parse::<u64>().map_err(|_| invalid("XTDB_QUERY_SPILL_LIMIT_BYTES must be a non-negative byte count")))
-            .transpose()?;
+        let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD")
+            .map(|text| join_threshold(&text).ok_or_else(|| invalid("XTDB_JOIN_SPILL_THRESHOLD must be a signed 64-bit integer")))
+            .transpose()?.unwrap_or(100_000);
+        let query_spill_limit_bytes = query_spill_limit(fields.take("query"), environment)?;
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
         let default_erasure = DefaultErasureSettings {
             local: erasure_flag(&mut fields, "defaultLocalErasure", "RTDB_DEFAULT_LOCAL_ERASURE", environment)?,
@@ -247,6 +247,20 @@ pub fn install_apple_sync(environment: &impl Fn(&str) -> Option<String>) -> Resu
         .map_err(|error| error.with_context("setting", APPLE_SYNC_SETTING.into()))?;
     policy.install()?;
     Ok(policy)
+}
+
+/// The process setting that caps one query's spill files when the YAML sets no `query.spillLimitBytes`.
+pub const QUERY_SPILL_LIMIT_SETTING: &str = "RTDB_QUERY_SPILL_LIMIT_BYTES";
+
+/// Reads `query.spillLimitBytes`, else [`QUERY_SPILL_LIMIT_SETTING`].
+/// - Errors: a value that is not a non-negative byte count, or an unknown key in the `query` section.
+fn query_spill_limit(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<Option<u64>> {
+    let mut fields = YamlFields::new(value.unwrap_or_else(empty), "query")?;
+    let configured = fields.string("spillLimitBytes")?.map(|text| (text, "query.spillLimitBytes"));
+    fields.finish()?;
+    configured.or_else(|| environment(QUERY_SPILL_LIMIT_SETTING).map(|text| (text, QUERY_SPILL_LIMIT_SETTING)))
+        .map(|(text, source)| text.trim().parse::<u64>().map_err(|_| invalid(format!("{source} must be a non-negative byte count"))))
+        .transpose()
 }
 
 fn join_threshold(value: &str) -> Option<i64> {
