@@ -188,8 +188,8 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         }
     }
     match name.as_str() {
-        "lower" => Ok(Value::Utf8(text(&args[0])?.to_lowercase())),
-        "upper" => Ok(Value::Utf8(text(&args[0])?.to_uppercase())),
+        "lower" => Ok(Value::Utf8(crate::string::case_language()?.to_lower(text(&args[0])?))),
+        "upper" => Ok(Value::Utf8(crate::string::case_language()?.to_upper(text(&args[0])?))),
         "length" => match &args[0] { Value::Utf8(text) => count(text.chars().count()), Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => count(bytes.len()), Value::List(items) => count(items.len()), value => Err(inapplicable(&name, &[value])) },
         "epoch_nanos_be" => {
             let Value::Timestamp { value, unit, timezone: Some(_) } = &args[0] else {

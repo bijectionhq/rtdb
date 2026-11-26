@@ -150,10 +150,13 @@ fn spread<'a>(value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<Vec<Hos
     })).collect()
 }
 
+/// `String.toUpperCase()` or `toLowerCase()` under the process default locale; an unpaired surrogate maps to itself and,
+/// having combining class 0 and no case, bounds every conditional mapping as a run boundary does.
 fn change_case(source: JavaText<'_>,upper: bool,output: &mut Units<'_,'_>) -> Result<()> {
+    let language = crate::string::case_language()?;
     let mut run = String::new();
     let flush = |run: &mut String,output: &mut Units<'_,'_>| -> Result<()> {
-        let changed = if upper { run.to_uppercase() } else { run.to_lowercase() };
+        let changed = if upper { language.to_upper(run) } else { language.to_lower(run) };
         run.clear();output.push_str(&changed)
     };
     for point in source.code_points() {

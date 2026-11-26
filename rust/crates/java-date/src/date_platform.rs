@@ -9,22 +9,37 @@ pub(super) fn capture(initialized_at: i64,observed_at: i64,constructed_at: i64) 
     Ok(DateEnvironmentInput { language,script,region,variant,unicode: BTreeMap::new(),timezone,initialized_at,observed_at,constructed_at })
 }
 
+/// The language of the JVM's `Locale.getDefault()`, which `String.toUpperCase()` and `toLowerCase()` use.
+/// On Linux it comes from the startup environment's `LC_MESSAGES` category, so `LC_ALL`, then `LC_MESSAGES`, then `LANG`;
+/// a `C` or `POSIX` locale, or one the host cannot load, gives `en`. On macOS it is the first preferred language.
+/// - Errors: a host locale name over 4096 bytes or not UTF-8; on other hosts, always.
+pub fn process_language() -> Result<String> { display_locale().map(|locale|posix_parts(&locale).0) }
+
 #[cfg(target_os = "linux")]
-fn host_locale() -> Result<String> {
+fn host_locale() -> Result<String> { category_locale(libc::LC_CTYPE) }
+#[cfg(target_os = "linux")]
+fn display_locale() -> Result<String> { category_locale(libc::LC_MESSAGES) }
+/// The name glibc's `_NL_LOCALE_NAME(category)` gives for the environment's locale, or `C` when it cannot be loaded.
+#[cfg(target_os = "linux")]
+fn category_locale(category: libc::c_int) -> Result<String> {
     struct Locale(libc::locale_t);
     impl Drop for Locale { fn drop(&mut self) { unsafe { libc::freelocale(self.0) }; } }
     let locale = unsafe { libc::newlocale(libc::LC_ALL_MASK,c"".as_ptr(),std::ptr::null_mut()) };
     if locale.is_null() { return Ok("C".into()); }
     let locale = Locale(locale);
-    let name = unsafe { libc::nl_langinfo_l(0xffff,locale.0) };
+    let name = unsafe { libc::nl_langinfo_l((category << 16) | 0xffff,locale.0) };
     bounded_c_string(name,4096).map(|value|if value.is_empty() { "C".into() } else { value })
 }
 #[cfg(target_os = "macos")]
 fn host_locale() -> Result<String> { macos::locale().or_else(||std::env::var("LANG").ok()).map_or_else(||Ok("en".into()),|locale| {
     if locale.len() > 4096 { Err(limit()) } else { Ok(locale) }
 }) }
+#[cfg(target_os = "macos")]
+fn display_locale() -> Result<String> { host_locale() }
 #[cfg(not(any(target_os = "linux",target_os = "macos")))]
 fn host_locale() -> Result<String> { Err(error("unsupported-date-environment","Process locale capture requires a Linux or macOS adapter; supply explicit DateEnvironmentInput")) }
+#[cfg(not(any(target_os = "linux",target_os = "macos")))]
+fn display_locale() -> Result<String> { host_locale() }
 
 #[cfg(unix)]
 fn bounded_c_string(value: *const libc::c_char,maximum: usize) -> Result<String> {

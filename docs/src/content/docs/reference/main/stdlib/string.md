@@ -94,7 +94,7 @@ title: String functions
   See [Regular expressions in XTDB](#regexes) for more details.
 
 `LOWER(str)`
-: lower-case
+: lower-case, using the case rules of the server process's default locale: Turkish and Azeri (`İ` → `i`, `I` → `ı`) and Lithuanian locales have their own rules, and every other locale uses the Unicode defaults.
 
 `OVERLAY(str PLACING replacement FROM start_pos [FOR length])`
 : replace `length` characters of `str` starting at `start_pos` with `replacement`
@@ -181,7 +181,7 @@ title: String functions
   ```
 
 `UPPER(str)`
-: upper-case
+: upper-case, with the same locale rules as `LOWER`; characters with a multi-character upper case expand (`ß` → `SS`).
 
 ## Regular expressions ('regexes') in XTDB
 

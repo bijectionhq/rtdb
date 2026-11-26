@@ -69,13 +69,14 @@ pub fn abs_integers(values: &Int64Array) -> Option<Int64Array> {
     Some(Int64Array::from(cells))
 }
 
-/// UPPER or LOWER over text.
+/// UPPER or LOWER over text, under the process default locale's case rules.
 pub fn text_case(values: &StringArray, upper: bool) -> Option<StringArray> {
+    let language = crate::string::case_language().ok()?;
     let mut texts = TextColumn::new(values.len());
     for row in 0..values.len() {
         if values.is_null(row) { texts.null(); continue; }
         let text = values.value(row);
-        texts.push(&if upper { text.to_uppercase() } else { text.to_lowercase() })?;
+        texts.push(&if upper { language.to_upper(text) } else { language.to_lower(text) })?;
     }
     Some(texts.finish())
 }

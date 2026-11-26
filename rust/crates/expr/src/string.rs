@@ -8,6 +8,13 @@ mod java_unicode;
 pub(crate) mod pattern;
 pub(crate) mod render;
 
+/// The case rules of the process's default locale, which upstream's `UPPER` and `LOWER` get from `String.toUpperCase()`
+/// and `toLowerCase()`; read once, as the JVM fixes `Locale.getDefault()` at startup.
+pub(crate) fn case_language() -> Result<rtdb_types::CaseLanguage> {
+    static LANGUAGE: std::sync::OnceLock<Result<rtdb_types::CaseLanguage>> = std::sync::OnceLock::new();
+    LANGUAGE.get_or_init(|| rtdb_java_date::process_language().map(|language| rtdb_types::CaseLanguage::of(&language))).clone()
+}
+
 pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
     if matches!(name,"like" | "ilike") { return Some(pattern::like(&args[0],&args[1],None,name == "ilike",false,context)); }
     if !matches!(name, "str" | "format" | "concat" | "trim" | "trim_leading" | "trim_trailing" | "substring" | "overlay" | "position" | "octet_position" | "character_length" | "octet_length" | "default_overlay_length" | "replace" | "reverse" | "string_to_array" | "parse_ident" | "quote_ident") { return None; }

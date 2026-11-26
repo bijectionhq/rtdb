@@ -294,3 +294,12 @@ fn batch_output_container_budget_is_checked_before_any_row_is_evaluated() {
     assert_eq!(memory.peak_bytes(), 0);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn upper_and_lower_use_the_process_default_locale_case_rules() {
+    let language = rtdb_types::CaseLanguage::of(&rtdb_java_date::process_language().unwrap());
+    let source = "istanbul İSTANBUL Straße I\u{307}";
+    assert_eq!(call("upper", &[text(source)]), text(&language.to_upper(source)));
+    assert_eq!(call("lower", &[text(source)]), text(&language.to_lower(source)));
+    assert_eq!(call("upper", &[text("straße")]), text("STRASSE"));
+}
