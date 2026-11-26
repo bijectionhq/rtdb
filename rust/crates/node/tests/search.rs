@@ -142,7 +142,7 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
     assert!(!settled.is_empty(), "compaction produced no settled trie");
     for trie in settled {
         let record = trie.artefacts.iter().find(|record| record.kind() == "search").unwrap_or_else(|| panic!("{} has no search file", trie.key));
-        assert!(record.definition_id().starts_with("docs_body~a"));
+        assert!(record.definition_id().starts_with(&format!("docs_body~{}.a", rtdb_text::Analyzer::default())), "{}", record.definition_id());
     }
     database.build_artefacts().await.unwrap();
     node.shutdown();
