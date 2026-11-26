@@ -258,6 +258,7 @@ impl Call {
 }
 impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, binding: Binding) -> rtdb_types::Result<Self> {
+        crate::v1::store::check_rank_digest()?;
         let memory = Arc::clone(node.memory());
         let audience = if let Some(profile) = config.audience {
             let cache = CacheBudget::with_memory(memory.prepay(profile.cache_bytes())?);

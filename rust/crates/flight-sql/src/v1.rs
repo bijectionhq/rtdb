@@ -23,7 +23,7 @@ pub(crate) mod error;
 pub(crate) mod exact_read;
 mod query;
 mod scoped_hold;
-mod store;
+pub(crate) mod store;
 mod tokens;
 pub(crate) mod appointment;
 mod transact;
