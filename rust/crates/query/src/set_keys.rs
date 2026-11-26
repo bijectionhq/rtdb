@@ -845,6 +845,40 @@ mod tests {
         ColumnBatch::from_owned(OwnedBatch::new(batch, &context.memory).unwrap()).unwrap()
     }
 
+    /// Each hashing mode reads a cell either directly from Arrow or as a decoded value; a cell must hash alike either way,
+    /// and the join spill partitions and Bloom probes hash it as the vector mode does.
+    #[test]
+    fn every_key_hash_path_agrees_on_each_cell() {
+        let context = context();
+        let values = [
+            Value::Null, Value::Bool(true), Value::I8(-3), Value::I16(300), Value::I32(-70_000), Value::I64(1 << 40),
+            Value::F32(1.5), Value::F64(-2.25), Value::Utf8("text".into()), Value::Binary(vec![1, 2, 3]),
+            Value::FixedSizeBinary(vec![4; 8]), Value::Uuid([7; 16]), Value::Oid(5), Value::Uri("http://example.com/a".into()),
+            Value::list(vec![Value::F64(1.0), Value::Null, Value::F64(2.5)]), Value::list(vec![Value::I64(1), Value::I64(2)]),
+            Value::DateDay(19_000), Value::Timestamp { value: 1_700_000_000_000_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) },
+        ];
+        for value in values {
+            let logical = value.logical_type();
+            let field = rtdb_columnar::to_field("k", &logical).unwrap();
+            let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+            let record = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+            let batch = ColumnBatch::from_owned(OwnedBatch::new(record, &context.memory).unwrap()).unwrap();
+            let cells = std::slice::from_ref(&value);
+
+            let (set, _) = Key::bind(&batch, 0, false, &context, KeyHash::Set).unwrap();
+            assert_eq!(set, crate::operators::equality_hash(cells, &context.timezone), "set hash of {value:?}");
+            let (vector, key) = Key::bind(&batch, 0, false, &context, KeyHash::Vector).unwrap();
+            assert_eq!(vector, crate::join_storage::hash_values(cells).unwrap(), "vector hash of {value:?}");
+            assert_eq!(key.vector_hash().unwrap(), vector);
+            if let Some(direct) = DirectKey::from_value(&value) {
+                let cell = direct.clone().hash();
+                assert_eq!(cell, rtdb_columnar::hash_value(&value, 0).unwrap(), "direct and vector cell hash of {value:?}");
+                assert_eq!(cell as u32, crate::operators::equality_cell_hash(&value, &context.timezone), "direct and set cell hash of {value:?}");
+                assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).map(|(hashes, _)| hashes.0), Some(cell), "Bloom hash of {value:?}");
+            }
+        }
+    }
+
     #[test]
     fn decoded_keys_compare_as_the_column_keys_they_copy() {
         let stored = [OwnedScalar::Signed(1), OwnedScalar::Text("a".into()), OwnedScalar::Null];
