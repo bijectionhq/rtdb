@@ -1832,7 +1832,7 @@ async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
     use rtdb_node::serving::NativeServingAuthority;
 
     let incarnation = [29; 16];
-    let resources: FixtureResources = Box::new(move |clock| Arc::new(rtdb_node::NativeResources::default().with_local_log_clock(clock, false)
+    let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
         .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
     let running = Running::start_with_clocked_resources(
         None, FlightConfig::default(), &[], None, Default::default(), None, Some(resources),
@@ -2193,7 +2193,7 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     let incarnation = [27; 16];
     let mut options = rtdb_node::NodeOptions::default();
     options.replication.rows_per_block = 2;
-    let resources: FixtureResources = Box::new(move |clock| Arc::new(rtdb_node::NativeResources::default().with_local_log_clock(clock, false)
+    let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
         .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
     let running = Running::start_with_clocked_resources(Some("secret"), FlightConfig::default(), &[], None, options, None, Some(resources)).await;
     let database = running.node.catalog().database("xtdb").unwrap();

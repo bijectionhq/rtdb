@@ -557,7 +557,9 @@ impl DatabaseFactory {
             replication_options.may_lead &= !read_only;
             replication_options.external_source = configuration.external_source.is_some();
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
-            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone())?;
+            // Native serving stamps its transactions on this clock, so it must be the one queries read at.
+            let replication_clock = { let clock = Arc::clone(&self.clock); Arc::new(move || clock.now()) };
+            let (replication, replica_driver) = ReplicationDriver::new_with_clock(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone(), replication_clock)?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let mut builders = if read_only || sealed_local_erasure || self.options.artefact_threads == 0 { Vec::new() } else {
                 let history = match self.resources.table_history(&configuration)? {

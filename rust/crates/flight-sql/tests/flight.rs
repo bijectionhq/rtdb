@@ -100,6 +100,10 @@ impl rtdb_node::ResourceFactory for HostedFixtureResources {
 }
 
 type FixtureResources = Box<dyn FnOnce(Arc<dyn Clock>) -> Arc<dyn rtdb_node::ResourceFactory> + Send>;
+/// Native resources whose in-memory and local source logs both stamp transactions on `clock`, the clock the node reads at.
+fn fixture_resources(clock: Arc<dyn Clock>) -> rtdb_node::NativeResources {
+    rtdb_node::NativeResources::default().with_log_clock(Arc::new(move || Ok(clock.now())))
+}
 type StartFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Running> + Send + 'a>>;
 
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
@@ -135,7 +139,7 @@ impl Running {
         } else if config.hosted_controls.is_some() {
             services.resources = Arc::new(HostedFixtureResources(rtdb_node::NativeResources::default()));
         } else {
-            services.resources = Arc::new(rtdb_node::NativeResources::default().with_local_log_clock(node_clock.clone(), false));
+            services.resources = Arc::new(fixture_resources(node_clock.clone()));
         }
         options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         options.owned_relations = config.owned_native_actions;
