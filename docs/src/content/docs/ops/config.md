@@ -209,9 +209,11 @@ server:
 ```
 
 A Postgres wire session starts in the time zone its client names in the startup `TimeZone` parameter.
-Without one, it starts in the node's `defaultTz` where that is configured, and otherwise in the host's time zone: the `TZ` environment variable, then `/etc/timezone`, then the zone `/etc/localtime` links to, falling back to `UTC`.
+Without one, it starts in the host's time zone, as the JVM finds it, whatever the node's `defaultTz` says.
+That zone is the `TZ` environment variable where it is set, else the zone `/etc/localtime` links to or, for a copied file as in many container images, the file under `/usr/share/zoneinfo` with the same contents, falling back to `GMT`.
+A `TZ` the JVM does not recognise gives the host's current offset, such as `GMT+01:00`.
 The server reports that zone in the `TimeZone` parameter status, and it decides how casts between local and zoned dates and timestamps read.
-Set `defaultTz: UTC` to keep sessions in UTC on a host configured for another zone.
+Set `TZ=UTC` in the server's environment to keep sessions in UTC on a host configured for another zone.
 
 ### Flight SQL Server
 

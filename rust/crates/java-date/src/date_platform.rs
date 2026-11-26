@@ -69,8 +69,18 @@ fn posix_parts(locale: &str) -> (String,String,String,String) {
 }
 
 pub(super) fn host_timezone(now: i64) -> Result<String> {
-    let environment = std::env::var("TZ").ok().filter(|value|!value.is_empty());
-    let mut zone = if let Some(value) = environment { if value.len() > 4096 { return Err(limit()); }Some(value) } else { platform_timezone()? };
+    default_timezone_id(std::env::var("TZ").ok().as_deref(),Path::new("/etc/localtime"),Path::new("/usr/share/zoneinfo"),now)
+}
+
+/// The ID OpenJDK's `TimeZone.getDefault()` takes on Linux and macOS without `user.timezone`.
+/// A non-empty `tz` wins; otherwise `localtime` names it, by the `zoneinfo/` part of its link or by the file under `zoneinfo` with the same bytes.
+/// A leading `:`, and `posix/` on Linux, are dropped; no source gives `GMT`, and an unknown ID gives the host's `GMT±hh:mm` offset at `now` (Date milliseconds).
+/// - Errors: zone data beyond the bounded capture limits, or a non-Unix host.
+pub fn default_timezone_id(tz: Option<&str>,localtime: &Path,zoneinfo: &Path,now: i64) -> Result<String> {
+    let mut zone = match tz.filter(|value|!value.is_empty()) {
+        Some(value) => { if value.len() > 4096 { return Err(limit()); }Some(value.to_owned()) },
+        None => platform_timezone(localtime,zoneinfo)?,
+    };
     if let Some(value) = &mut zone {
         if value.starts_with(':') { value.remove(0); }
         if cfg!(target_os = "linux") && value.starts_with("posix/") { value.drain(..6); }
@@ -80,14 +90,12 @@ pub(super) fn host_timezone(now: i64) -> Result<String> {
     if parsed.to_string() != "GMT" || zone == "GMT" { return Ok(zone); }
     host_offset(now)
 }
-fn platform_timezone() -> Result<Option<String>> {
-    let path = Path::new("/etc/localtime");
+fn platform_timezone(path: &Path,root: &Path) -> Result<Option<String>> {
     if let Ok(link) = std::fs::read_link(path) {
         let text = normalized_path(&link);
         if let Some((_,zone)) = text.split_once("zoneinfo/") { return Ok(Some(zone.into())); }
     }
     let Some(bytes) = read_zone(path)? else { return Ok(None); };
-    let root = Path::new("/usr/share/zoneinfo");
     for name in ["UTC","GMT"] {
         if read_zone(&root.join(name))?.is_some_and(|value|value == bytes) { return Ok(Some(name.into())); }
     }

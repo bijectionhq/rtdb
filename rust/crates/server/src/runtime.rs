@@ -311,7 +311,7 @@ impl ServerDriver {
         let mut addresses = ListenerAddresses::default();
         let mut pgwire = Vec::new();
         if let Some(settings) = &config.server {
-            let timezone = config.pgwire_timezone();
+            let timezone = config.pgwire_timezone().to_owned();
             let tls = match &installed_tls {
                 Some(tls) => Some(Arc::clone(tls)),
                 None => settings.ssl.as_ref().map(|settings| crate::tls::load(settings, node.memory())).transpose()?,

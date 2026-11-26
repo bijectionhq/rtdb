@@ -105,9 +105,9 @@ pub struct NodeConfiguration {
     pub fixed_databases: Option<BTreeMap<String, DatabaseConfig>>,
     pub memory_cache: MemoryCacheSettings,
     pub disk_cache: Option<DiskCacheSettings>,
-    /// A configured time zone shared by the node and PostgreSQL startup.
+    /// The configured node time zone; PostgreSQL sessions do not start in it.
     pub default_timezone: Option<String>,
-    /// The host's zone, from the startup environment's `TZ` or the host's zone files; PostgreSQL sessions start in it without `defaultTz`.
+    /// The host's zone, from the startup environment's `TZ` or `/etc/localtime`; PostgreSQL sessions start in it.
     pub host_timezone: String,
     pub indexer: IndexerSettings,
     pub compactor: CompactorSettings,

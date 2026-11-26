@@ -171,34 +171,56 @@ fn yaml_and_edn_preserve_the_difference_between_omitted_and_configured_timezones
 }
 
 #[test]
-fn a_configured_default_timezone_is_the_pgwire_session_zone() {
-    assert_eq!(decode("defaultTz: Asia/Tokyo").unwrap().pgwire_timezone(), "Asia/Tokyo");
+fn a_configured_default_timezone_does_not_reach_the_pgwire_session_zone() {
+    let environment = |name: &str| (name == "TZ").then(|| "Asia/Tokyo".to_owned());
+    let config = NodeConfiguration::from_yaml_with_environment("defaultTz: Europe/Paris", &environment, false).unwrap();
+    assert_eq!(config.node_timezone(), "Europe/Paris");
+    assert_eq!(config.pgwire_timezone(), "Asia/Tokyo");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_host_timezone_is_found_where_the_jvm_looks_for_it() {
     use std::path::Path;
-    let paris = Path::new("/var/db/timezone/zoneinfo/Europe/Paris");
-    let zone = |tz, etc_timezone, localtime| host_timezone_from(tz, etc_timezone, localtime).unwrap();
-    assert_eq!(zone(Some("Asia/Tokyo"), Some("America/New_York\n"), Some(paris)), "Asia/Tokyo");
-    assert_eq!(zone(Some(":Asia/Tokyo"), None, None), "Asia/Tokyo");
-    assert_eq!(zone(Some("/usr/share/zoneinfo/Asia/Tokyo"), None, None), "Asia/Tokyo");
-    assert_eq!(zone(None, Some("America/New_York\n"), Some(paris)), "America/New_York");
-    assert_eq!(zone(Some(""), None, Some(paris)), "Europe/Paris");
-    assert_eq!(zone(None, None, Some(Path::new("/etc/elsewhere"))), "UTC");
-    assert_eq!(zone(None, None, None), "UTC");
+    let directory = tempfile::tempdir().unwrap();
+    let zoneinfo = directory.path().join("zoneinfo");
+    std::fs::create_dir_all(zoneinfo.join("Europe")).unwrap();
+    std::fs::create_dir_all(zoneinfo.join("Asia")).unwrap();
+    std::fs::write(zoneinfo.join("Europe/Paris"), b"paris").unwrap();
+    std::fs::write(zoneinfo.join("Asia/Tokyo"), b"tokyo").unwrap();
+    std::fs::write(zoneinfo.join("UTC"), b"utc").unwrap();
+    let linked = directory.path().join("linked");
+    std::os::unix::fs::symlink(zoneinfo.join("Europe/Paris"), &linked).unwrap();
+    let copied = directory.path().join("copied");
+    std::fs::write(&copied, b"tokyo").unwrap();
+    let copied_utc = directory.path().join("copied-utc");
+    std::fs::write(&copied_utc, b"utc").unwrap();
+    let unknown = directory.path().join("unknown");
+    std::fs::write(&unknown, b"elsewhere").unwrap();
+    let missing = directory.path().join("missing");
+    let zone = |tz: Option<&str>, localtime: &Path| host_timezone_from(tz, localtime, &zoneinfo, 0).unwrap();
+    assert_eq!(zone(Some("Asia/Tokyo"), &linked), "Asia/Tokyo");
+    assert_eq!(zone(Some(":Asia/Tokyo"), &missing), "Asia/Tokyo");
+    assert_eq!(zone(Some(""), &linked), "Europe/Paris");
+    assert_eq!(zone(None, &linked), "Europe/Paris");
+    assert_eq!(zone(None, &copied), "Asia/Tokyo", "a copied localtime is matched by content, as the JDK does");
+    assert_eq!(zone(None, &copied_utc), "UTC");
+    assert_eq!(zone(None, &unknown), "GMT");
+    assert_eq!(zone(None, &missing), "GMT");
+    assert_eq!(zone(Some("PST"), &missing), "America/Los_Angeles");
+    assert_eq!(zone(Some("EST"), &missing), "-05:00");
+    assert_eq!(zone(Some("GMT+9"), &missing), "GMT+09:00");
 }
 
+#[cfg(unix)]
 #[test]
-fn a_tz_that_names_no_zone_fails_startup() {
-    use std::path::Path;
-    let paris = Path::new("/var/db/timezone/zoneinfo/Europe/Paris");
+fn a_tz_the_jvm_does_not_know_starts_in_a_gmt_offset_rather_than_failing_startup() {
+    let paris = std::path::Path::new("/var/db/timezone/zoneinfo/Europe/Paris");
     for tz in ["Mars/Olympus", ":Mars/Olympus", "/etc/elsewhere"] {
-        assert_eq!(host_timezone_from(Some(tz), None, Some(paris)).unwrap_err().code, "xtdb/invalid-node-config", "{tz}");
+        let zone = host_timezone_from(Some(tz), paris, std::path::Path::new("/usr/share/zoneinfo"), 0).unwrap();
+        assert!(zone.starts_with("GMT"), "{tz}: {zone}");
         let environment = |name: &str| (name == "TZ").then(|| tz.to_owned());
-        for ingest in [false, true] {
-            assert_eq!(NodeConfiguration::from_yaml_with_environment("", &environment, ingest).unwrap_err().code, "xtdb/invalid-node-config", "{tz}");
-        }
+        assert!(NodeConfiguration::from_yaml_with_environment("", &environment, false).unwrap().pgwire_timezone().starts_with("GMT"), "{tz}");
     }
 }
 
@@ -206,7 +228,6 @@ fn a_tz_that_names_no_zone_fails_startup() {
 fn the_startup_environment_s_tz_is_the_pgwire_session_zone() {
     let environment = |name: &str| (name == "TZ").then(|| "Asia/Tokyo".to_owned());
     assert_eq!(NodeConfiguration::from_yaml_with_environment("", &environment, false).unwrap().pgwire_timezone(), "Asia/Tokyo");
-    assert_eq!(NodeConfiguration::from_yaml_with_environment("defaultTz: Europe/Paris", &environment, false).unwrap().pgwire_timezone(), "Europe/Paris");
 }
 
 #[test]

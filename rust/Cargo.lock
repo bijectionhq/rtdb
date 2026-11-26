@@ -5860,6 +5860,7 @@ dependencies = [
  "rtdb-expr",
  "rtdb-flight-sql",
  "rtdb-format",
+ "rtdb-java-date",
  "rtdb-journal-logkeeper",
  "rtdb-kafka",
  "rtdb-maintenance",
