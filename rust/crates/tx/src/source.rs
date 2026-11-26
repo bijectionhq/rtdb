@@ -2807,8 +2807,11 @@ impl SourceOperationReader<'_> {
                     crate::HostedControlWrite::arrow_catalog(relation, scope, expected, documents)?
                         .ok_or_else(|| invalid("Hosted catalog document has an invalid layout"))?
                 } else {
-                    let Value::Struct(document) = value("document")? else { return Err(invalid("Hosted control document is not a struct")); };
+                    let Value::Struct(mut document) = value("document")? else { return Err(invalid("Hosted control document is not a struct")); };
                     if name == "rtdb-hosted-control-check-v1" {
+                        // Checks in one transaction share a document layout, which fills each check's absent fields with nulls;
+                        // a check has no null fields of its own.
+                        document.retain(|_, value| !matches!(value, Value::Null));
                         crate::HostedControlWrite::source_check(relation, scope, expected, document)?
                     } else {
                         crate::HostedControlWrite::new(relation, scope, expected, document)?
