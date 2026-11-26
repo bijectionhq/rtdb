@@ -150,6 +150,22 @@ fn round_changes_decimal_metadata_and_rejects_dynamic_integer_scales() {
     }
 }
 
+#[test]
+fn round_of_a_double_adds_a_half_and_truncates_as_the_reference_does() {
+    let context = EvalContext::default();
+    for (input, expected) in [
+        (0.49999999999999994, 1.0), (-0.49999999999999994, -1.0), (4503599627370497.0, 4503599627370498.0),
+        (-4503599627370497.0, -4503599627370498.0), (0.5, 1.0), (1.5, 2.0), (2.5, 3.0), (-2.5, -3.0), (0.4, 0.0), (-0.4, -0.0),
+    ] {
+        assert_eq!(scalar_call("round", &[V::F64(input)], &context).unwrap(), V::F64(expected), "{input}");
+    }
+    let V::F64(zero) = scalar_call("round", &[V::F64(-0.0)], &context).unwrap() else { panic!() };
+    assert!(zero == 0.0 && zero.is_sign_positive());
+    assert_eq!(scalar_call("round", &[V::F64(0.49999999999999994), V::I64(0)], &context).unwrap(), V::F64(1.0));
+    assert_eq!(scalar_call("round", &[V::F64(-25.0), V::I64(-1)], &context).unwrap(), V::F64(-30.0));
+    assert!(matches!(scalar_call("round", &[V::F64(f64::NAN)], &context).unwrap(), V::F64(value) if value.is_nan()));
+}
+
 fn equality_scope() -> rtdb_expr::EvaluationScope {
     rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }

@@ -58,6 +58,7 @@ The standard arithmetic functions are available:
   - For numeric types (`INTEGER`, `DOUBLE`): `s` can be a literal or column value.
   - For `DECIMAL` types: `s` must be a literal constant. Returns `DECIMAL` with the specified scale.
   - To use a non-constant scale with `DECIMAL`, cast to `DOUBLE` first: `ROUND(val::DOUBLE, scale_column)`
+  - A `DOUBLE` is rounded as `FLOOR(x + 0.5)` at or above zero and `CEIL(x - 0.5)` below it, in double precision, so the addition can itself round: `ROUND(0.49999999999999994E0)` → `1.0`, and `ROUND(4503599627370497.0E0)` → `4503599627370498.0`.
 
   **Error handling:**
   - Throws an error if the scale parameter would cause numeric overflow.

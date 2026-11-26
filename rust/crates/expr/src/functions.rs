@@ -266,6 +266,10 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     }
 }
 
+/// The reference rounds a double as `floor(v + 0.5)` from zero up and `ceil(v - 0.5)` below zero, not to the nearest
+/// integer: the addition itself rounds, so 0.49999999999999994 becomes 1 and 2^52 + 1 becomes 2^52 + 2.
+fn reference_round(value: f64) -> f64 { if value >= 0.0 { (value + 0.5).floor() } else { (value - 0.5).ceil() } }
+
 pub(crate) fn is_float_math(name: &str) -> bool {
     matches!(name, "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "sin" | "cos" | "tan"
         | "sinh" | "cosh" | "tanh" | "double" | "asin" | "acos" | "atan")
@@ -296,5 +300,5 @@ pub(crate) fn round_float(x: f64, scale: i64) -> Result<f64> {
     let factor = 10.0_f64.powf((scale as f64).abs());
     let value = if scale >= 0 { x * factor } else { x / factor };
     if !value.is_finite() { return Err(overflow()); }
-    Ok(if scale >= 0 { value.round() / factor } else { value.round() * factor })
+    Ok(if scale >= 0 { reference_round(value) / factor } else { reference_round(value) * factor })
 }
