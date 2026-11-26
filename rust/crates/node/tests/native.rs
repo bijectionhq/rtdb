@@ -1657,7 +1657,7 @@ async fn sql_snapshot_tokens_reopen_original_position_and_query_clock() {
     let original = rows(reader.query_sql("SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
     let Value::Utf8(token) = original[0][2].clone() else { panic!("expected a snapshot token"); };
     let next = writer.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap().unwrap().tx_key();
-    assert_eq!(first.system_time, next.system_time);
+    assert_eq!(next.system_time, Timestamp(first.system_time.0 + 1));
     assert!(first.tx_id < next.tx_id);
     let live = rows(reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await;
     assert_eq!(live, [vec![Value::I64(20)]]);

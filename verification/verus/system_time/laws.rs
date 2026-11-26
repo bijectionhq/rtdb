@@ -1,25 +1,12 @@
-use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, original_funded_seat, advances, automatic_time};
 use vstd::prelude::*;
 
 verus! {
 
-// LAW T4-HISTORY-FLOOR.
-pub fn sql_history_uses_the_logged_time_or_preceding_floor(previous: i64, logged: i64) {
-    let at = historical_time(Some(previous), logged);
-    assert(previous <= at && logged <= at);
-    assert(at == previous || at == logged);
-    if logged <= previous {
-        assert(at == previous);
-    }
-}
-
-// LAW T4-NO-LEAD.
-pub fn a_tied_explicit_history_time_still_has_the_original_append_bound(previous: i64, requested: i64, logged: i64) {
-    let admitted = admits_historical_time(Some(previous), requested, logged);
-    assert(admitted == (previous <= requested && requested <= logged));
-    if previous == requested && requested <= logged {
-        assert(admitted);
-    }
+// LAW TIME-SYSTEM-STRICT. A read basis names a transaction by its system time, so a tie never advances.
+pub fn a_tied_time_does_not_advance(previous: i64) {
+    let tied = advances(Some(previous), previous);
+    assert(!tied);
 }
 
 // LAW TIME-SYSTEM-FIRST.

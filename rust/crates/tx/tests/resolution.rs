@@ -57,7 +57,7 @@ async fn a_static_insert_preserves_interleaved_assertion_order_for_one_identity(
 }
 
 #[tokio::test]
-async fn ordinary_sql_orders_at_a_tied_history_coordinate_after_a_regression() {
+async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_same_time() {
     use rtdb_format::envelope::SourceMessage;
 
     let context = context();
@@ -79,14 +79,18 @@ async fn ordinary_sql_orders_at_a_tied_history_coordinate_after_a_regression() {
         resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(previous), request(vec![], &context), &context).await.unwrap();
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
         let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(90), replay(), &context).await.unwrap();
-        assert_eq!(result.result().tx_key().system_time, Timestamp(previous));
-        assert_eq!(result.result().tx_key().tx_id.0, 1);
+        assert_eq!(result.result().tx_key().system_time, Timestamp(previous + 1));
+        if previous == 101 {
+            assert_eq!(result.result().error().unwrap().code, "xtdb/assert-failed");
+            assert!(!result.writes().tables().contains_key(&table()));
+            continue;
+        }
         assert!(result.result().committed(), "{:?}", result.result().error());
         let event = result.writes().tables()[&table()].batch().unwrap().view().read_event(0).unwrap();
-        assert_eq!(event.valid_time, Interval::from_micros(2_000_000 + previous, 3_000_000 + previous).unwrap());
+        assert_eq!(event.valid_time, Interval::from_micros(2_000_101, 3_000_101).unwrap());
         let StoredOperation::Put(row) = event.operation else { panic!("Expected a put"); };
         let Value::Utf8(id) = &row["_id"] else { panic!("Expected an encoded key"); };
-        let expected = Timestamp(1_000_000 + previous);
+        let expected = Timestamp(1_000_101);
         assert_eq!(rtdb_types::parse_sql_timestamp_instant(id.strip_prefix("at-").unwrap(), "UTC").unwrap().as_micros().unwrap(), expected);
         assert_eq!(rtdb_expr::timestamp_micros(&row["v"], "UTC").unwrap(), expected);
     }

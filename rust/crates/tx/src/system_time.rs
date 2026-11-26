@@ -30,29 +30,6 @@ pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i6
     }
 }
 
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == match previous {
-        Some(last) if logged < last => last,
-        _ => logged,
-    },
-))]
-pub(crate) fn historical_time(previous: Option<i64>, logged: i64) -> i64 {
-    match previous {
-        Some(last) if logged < last => last,
-        _ => logged,
-    }
-}
-
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (match previous {
-        Some(last) => last <= requested,
-        None => true,
-    } && requested <= logged),
-))]
-pub(crate) fn admits_historical_time(previous: Option<i64>, requested: i64, logged: i64) -> bool {
-    historical_time(previous, requested) == requested && requested <= logged
-}
-
 const CLOCK_SLOT_WIDTH: i64 = 1_000_000;
 const CLOCK_SLOT_LEAD: i64 = 500_000;
 

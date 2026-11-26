@@ -182,7 +182,7 @@
 -- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
 -- The authenticated history position orders decisions, and the operation ordinal orders effects inside a decision.
--- SQL system time is nondecreasing and can tie.
+-- SQL system time is strictly increasing per partition.
 -- The receiver judges live preconditions with a fresh certified reading of its installed independent clock domain.
 -- A deadline is exclusive.
 -- A funded turn can bind an attempt to an advertised grid reading and a half-open service window.
@@ -221,9 +221,8 @@
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
 -- A present point identifies the original transaction position and event ordinal.
 -- A Root publication selected for a fork retains the winning marker's position through archive choice, suffix replay and landing.
--- An owned archive scan at that Root publication excludes transactions above its position even when their SQL history times tie.
+-- An owned archive scan at that Root publication excludes transactions above its position.
 -- Applicable erasure continues to govern the selected historical winner.
--- Equal SQL system times do not make two owned assertions interchangeable.
 -- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
 -- With no relation batches, the commit validates the deadline at its ordered position and changes no owned relation.
 -- Observations across those relations share the ordered cut, and their mutations apply atomically in group and row order.
@@ -613,8 +612,7 @@ value CommitOpts {
     -- Write-side options, grammar-scoped to READ WRITE (readWriteTxOption in the SQL
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
-    -- Automatic history time is the maximum of the preceding value and the append observation,
-    -- or the append observation at genesis. Owned publications require a distinct history coordinate.
+    -- Automatic system time is the append observation, or one tick past the preceding value when the observation does not exceed it.
     --   user_metadata — per-transaction metadata.
     --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
     --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.

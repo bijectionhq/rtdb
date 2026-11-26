@@ -417,8 +417,7 @@ value ExternalSourceToken {
 value TransactionKey {
     -- tx_id is the increasing commit-order position, assigned by the source log or off the RESOLVED head for an external-source database.
     -- system_time is the strictly increasing projection used by temporal SQL.
-    -- An ordinary explicit system_time that does not advance the resolved history or leads the append clock aborts the transaction.
-    -- An owned explicit time instead witnesses the append observation and uses the ordinary automatic projection.
+    -- A client transaction carries no system_time of its own: the resolver projects it from the append observation.
     -- That projection advances by a chronon when an observed clock ties or regresses.
     -- Native source outcomes retain the unmodified append observation in xt.txs.source_log_time.
     -- Strictness is what lets a read basis name a transaction by its system_time — see snapshot_token.
@@ -1217,7 +1216,7 @@ rule LeaderProcessesTx {
     ensures:
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
-        -- The resolver assigns SQL history time from the source append observation and its preceding history coordinate.
+        -- The resolver assigns system time from the source append observation, smoothed one tick past the preceding transaction's when it does not exceed it.
         -- A version-one bounded application retry carries an exclusive cutoff and a nonce in a dedicated source field.
         -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
         -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.
