@@ -18,7 +18,7 @@ async fn retained_control_cast_uses_each_execution_timezone() {
 
 #[tokio::test]
 async fn write_metadata_resolves_timezone_even_when_listed_last() {
-    let ControlStatement::Begin(options) = parse("BEGIN READ WRITE WITH (METADATA {sample: CAST('2024-01-01T00:00:00' AS TIMESTAMPTZ)}, TIMEZONE 'America/New_York')") else { panic!() };
+    let ControlStatement::Begin(options) = parse("BEGIN READ WRITE WITH (METADATA {sample: CAST(TIMESTAMP '2024-01-01 00:00:00' AS TIMESTAMPTZ)}, TIMEZONE 'America/New_York')") else { panic!() };
     let memory = MemoryBudget::new(1_000_000);
     let allocation = rtdb_expr::EvaluationScope::new(&memory).unwrap();
     let settings = transaction_settings(&options, &[], "UTC", "UTC", Timestamp(0), &memory, &allocation, None).await.unwrap();
