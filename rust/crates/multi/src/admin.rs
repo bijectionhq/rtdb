@@ -456,7 +456,7 @@ async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId
     }.await;
     if outcome.is_err()
         && let Err(error) = clear_move_reservation(directory, &intended.id, reservation.request).await {
-        eprintln!("RTDB could not clear the move reservation for {name}: {error}");
+        tracing::warn!(database = %name, code = %error.code, "RTDB could not clear the move reservation: {error}");
     }
     outcome
 }
@@ -631,7 +631,7 @@ async fn with_fork_access<F: std::future::Future<Output = Result<DeploymentRecor
     io.close_and_wait().await;
     if result.is_err() && let Err(error) = directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation }).await
     {
-        eprintln!("RTDB fork preparation {} is retained: {}", preparation.token, error.code);
+        tracing::warn!(preparation = %preparation.token, code = %error.code, "RTDB fork preparation is retained");
     }
     result
 }
@@ -865,7 +865,7 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
                 Ok::<(), Anomaly>(())
             }.await;
             if let Err(cleanup) = cleanup {
-                eprintln!("RTDB fork cleanup failed for {}: {cleanup}", child.id);
+                tracing::warn!(child = %child.id, code = %cleanup.code, "RTDB fork cleanup failed: {cleanup}");
             }
             Err(error)
         }
