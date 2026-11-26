@@ -61,11 +61,11 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::V1Appointment | Self::TxStatus)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::Store | Self::V1Appointment | Self::TxStatus)
     }
 
     fn serves_assigned_follower(self) -> bool {
@@ -90,6 +90,11 @@ impl CallKind {
 
     fn allows_workload_grant(self) -> bool {
         matches!(self, Self::Handshake | Self::ManagedCreate | Self::ManagedWorkload | Self::TxStatus)
+    }
+
+    /// A placement fence credential reaches only the store contract.
+    fn allows_store_fence(self) -> bool {
+        matches!(self, Self::Handshake | Self::Store)
     }
 
     fn allows_funded_appointment(self) -> bool {
@@ -411,7 +416,9 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                let allowed = if grant.is_original_private_replay() {
+                let allowed = if grant.is_store_fence() {
+                    kind.allows_store_fence()
+                } else if grant.is_original_private_replay() {
                     matches!(kind, CallKind::Handshake | CallKind::V1OriginalPrivateReplay)
                 } else if grant.is_original_custody_control() {
                     kind.allows_original_custody_control()
@@ -462,11 +469,11 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
+            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::Store | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus | CallKind::AudienceCleanup)
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::V1Capabilities | CallKind::V1Action | CallKind::Store | CallKind::V1Appointment | CallKind::TxStatus | CallKind::AudienceCleanup)
             {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
@@ -904,6 +911,7 @@ impl FlightService for Service {
                 crate::v1::original_family_readback::ACTION => CallKind::V1OriginalFamilyReadback,
                 crate::v1::original_family_landing::private_replay::ACTION => CallKind::V1OriginalPrivateReplay,
                 crate::v1::appointment::PREPARE | crate::v1::appointment::ACTIVATE | "rtdb.v1.Transact" => CallKind::V1Appointment,
+                name if crate::v1::is_store_action(name) => CallKind::Store,
                 _ => CallKind::V1Action,
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)

@@ -258,6 +258,17 @@ struct Claim<'a> {
     original_custody: Option<OriginalCustodyControl>,
     original_family: Option<OriginalFamilyGrant>,
     original_family_readback: Option<OriginalFamilyReadbackGrant>,
+    store_fence: Option<StoreFence>,
+}
+
+/// Bijection's managed placement fence (grant version 6): ordinary
+/// `rtdb.store.v1` access to the database, for closing its writer row at
+/// one placement epoch. Bijection owns the fence's meaning; RTDB only
+/// admits the store calls.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "role", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum StoreFence {
+    FencePlacement { epoch: u64 },
 }
 
 pub struct VerifiedWorkloadGrant {
@@ -275,6 +286,7 @@ enum Permission {
     OriginalFamily { scope: Box<OriginalFamilyGrant>, point: Point },
     OriginalFamilyReadback { scope: Box<OriginalFamilyReadbackGrant>, point: Point },
     FundedAppointment { scope: Box<FundedAppointmentScope>, point: Point },
+    StoreFence(StoreFence),
 }
 
 impl VerifiedWorkloadGrant {
@@ -300,7 +312,17 @@ impl VerifiedWorkloadGrant {
         {
             return Err(invalid_grant());
         }
-        let permission = if config.original_family_readback {
+        let store_fence_fields = ["operations", "authority", "original_custody", "original_family", "original_family_readback"];
+        let permission = if claim.version == 6 {
+            match (claim.store_fence, config.assignment()) {
+                (Some(fence @ StoreFence::FencePlacement { epoch }), Some(_))
+                    if epoch > 0 && store_fence_fields.iter().all(|field| claim_field_absent(raw, field)) =>
+                    Permission::StoreFence(fence),
+                _ => return Err(invalid_grant()),
+            }
+        } else if !claim_field_absent(raw, "store_fence") {
+            return Err(invalid_grant());
+        } else if config.original_family_readback {
             match (claim.version, claim.original_family_readback, config.assignment()) {
                 (5, Some(scope), Some(point)) if ["operations", "authority", "original_custody", "original_family"]
                     .iter().all(|field| claim_field_absent(raw, field)) && scope.valid(claim.incarnation) =>
@@ -378,6 +400,21 @@ impl VerifiedWorkloadGrant {
 
     pub(super) fn is_assignment_issued(&self) -> bool {
         self.is_assignment() || self.is_original_custody_control() || self.is_funded_appointment()
+            || self.is_store_fence()
+    }
+
+    /// A Bijection placement fence credential: `rtdb.store.v1` calls only.
+    pub fn is_store_fence(&self) -> bool {
+        matches!(self.permission, Permission::StoreFence(_))
+    }
+
+    /// Admit a store call of a placement fence credential on `database` at
+    /// its current `incarnation`, while the grant lives.
+    pub fn admit_store_fence(&self, database: &str, incarnation: [u8; 16], now: Timestamp) -> Result<()> {
+        if !self.is_store_fence() || self.database != database || self.incarnation != incarnation {
+            return Err(invalid_grant());
+        }
+        self.revalidate(now)
     }
 
     pub fn is_original_custody_control(&self) -> bool {
@@ -573,6 +610,37 @@ mod tests {
         let mut changed = raw(90);
         changed["authority"]["writer"]["namespace"] = json!(([9; 32]));
         assert_ne!(first.receipt_namespace(), verify(&changed, &enrolled).unwrap().receipt_namespace());
+    }
+
+    #[test]
+    fn a_store_fence_grant_admits_only_its_database_and_incarnation_from_the_assignment_issuer() {
+        let incarnation = [1; 16];
+        let raw = |fence: serde_json::Value| json!({
+            "version": 6, "audience": "assignment", "database": "exact", "incarnation": incarnation,
+            "grant_id": ([2; 16]), "expires_at_micros": 80, "store_fence": fence,
+        });
+        let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
+            raw, "https://assignment.example.invalid/", config, "fence", Timestamp(100), Timestamp(0),
+        );
+        let point = Point::new("public.writer", "authority".into(), Timestamp(0)).unwrap();
+        let unassigned = WorkloadGrantConfig::new("assignment".into(), "assignment-".into()).unwrap();
+        let assignment = unassigned.clone().with_assignment(point);
+        let fence = json!({ "role": "fence-placement", "epoch": 2 });
+        assert!(verify(&raw(fence.clone()), &unassigned).is_err());
+        let grant = verify(&raw(fence.clone()), &assignment).unwrap();
+        assert!(grant.is_store_fence() && grant.is_assignment_issued() && !grant.is_assignment());
+        assert!(grant.admit_store_fence("exact", incarnation, Timestamp(0)).is_ok());
+        assert!(grant.admit_store_fence("other", incarnation, Timestamp(0)).is_err());
+        assert!(grant.admit_store_fence("exact", [3; 16], Timestamp(0)).is_err());
+        assert!(grant.admit_store_fence("exact", incarnation, Timestamp(80)).is_err());
+        assert!(grant.assignment("exact", incarnation, Timestamp(0)).is_err());
+        assert!(verify(&raw(json!({ "role": "fence-placement", "epoch": 0 })), &assignment).is_err());
+        let mut mixed = raw(fence.clone());
+        mixed["operations"] = json!(["create-deployment"]);
+        assert!(verify(&mixed, &assignment).is_err());
+        let mut older = raw(fence);
+        older["version"] = json!(2);
+        assert!(verify(&older, &assignment).is_err());
     }
 
     #[test]

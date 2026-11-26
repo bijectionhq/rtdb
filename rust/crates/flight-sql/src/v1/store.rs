@@ -80,6 +80,9 @@ impl Service {
         let database = self.wire_attachment(call, access).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let current = driver.incarnation();
+        if let Some(grant) = call.session.caller.principal.workload_grant().filter(|grant| grant.is_store_fence()) {
+            grant.admit_store_fence(&call.database, current, self.0.node.now()).map_err(error::anomaly)?;
+        }
         if let Some(stated) = stated.filter(|stated| !stated.is_empty())
             && incarnation(stated)? != current
         {

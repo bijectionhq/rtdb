@@ -83,6 +83,11 @@ pub(crate) fn store_only_admits(name: &str) -> bool {
     store::ACTIONS.contains(&name) || name.starts_with("rtdb.admin.v1.")
 }
 
+/// An `rtdb.store.v1` call (`Read`, `Append`, `Watch`).
+pub(crate) fn is_store_action(name: &str) -> bool {
+    store::ACTIONS.contains(&name)
+}
+
 pub(crate) fn is_action(name: &str) -> bool {
     ACTIONS.contains(&name) || store::ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
 }
