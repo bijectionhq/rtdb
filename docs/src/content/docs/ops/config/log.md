@@ -128,42 +128,58 @@ Once restarted, nodes will begin writing to the new log generation, and prior lo
 
 ## Reading an RTDB log with an XTDB node
 
-RTDB writes the same log and storage formats as XTDB, so an XTDB node can follow a log and store that RTDB wrote — until RTDB uses a feature XTDB does not implement.
-From then on, the XTDB node stops with an error at the first such record, rather than skipping it or applying it without the feature.
+RTDB writes the same log and storage formats as XTDB, so an XTDB node can follow a log and open a store that RTDB wrote — until RTDB uses a feature XTDB does not implement.
+From then on, the XTDB node stops with an error at the first log record or block file that uses it, rather than skipping it or applying it without the feature.
 
-These RTDB features mark the records that use them:
+These RTDB features mark the records and files that use them:
 
-Native `rtdb.v1` transactions
+Native `rtdb.v1` transactions and owned relations
 
-: Every source-log record of a native transaction.
+: Every source-log record of a native transaction, every replica-log record that writes, adds files to, deletes files from or retires an owned (`rtdb_owned_*`) table, and every block that lists one.
 
-Retry guards
+Retry guards and placed transactions
 
-: Transactions submitted with an `idempotency_key`, `rtdb_retry_v1` bounded retry or a private replay permit.
+: Transactions submitted with an `idempotency_key`, `rtdb_retry_v1` bounded retry, a private replay permit or a placed attempt, their replica-log outcomes, and the records and blocks of the receipt tables (`xt/idempotency_receipts`, `xt/bounded_retry_receipts`, `xt/rtdb_replay_keys`, the placed attempt outcomes).
 
-Owned-relation retirement
+Native serving
 
-: The replica-log record that retires a table.
+: Serving records, slot reservations and clock leases in the replica log, and blocks that carry a serving checkpoint.
+
+Search, vector, spatial, ordered-index and entity-history artefacts
+
+: Every artefact record, every log record or table block naming a data file that carries artefacts, and every table block holding search runs, term directories or entity directories.
+  A node whose search lane writes entity history marks the first compaction output or sealed block that carries an entity-history artefact, even if the workload defines no index.
+
+Relation retirement
+
+: The replica-log record that retires a table, and the table blocks that record it.
 
 Online compactor reset, and recovery from a primary
 
-: Every log record that names a data file of the new naming epoch (keys ending in `-e<epoch>`), and every block's upload record from then on, so that a node opening the store at a later block also stops.
+: Every log record and table block that names a data file of the new naming epoch (keys ending in `-e<epoch>`), and every block and block-upload record from then on, so that a node opening the store at a later block also stops.
 
 Receipt-table cleanup in Multi mode
 
-: The replica-log record that deletes a receipt table's L0 files, which XTDB never deletes.
+: The replica-log record that deletes an L0 file, which XTDB never deletes.
 
-A workload that uses none of these keeps writing exactly the records XTDB writes, and stays readable by XTDB.
-Search, vector and entity-history artefact records, and the extra fields RTDB adds to ordinary transactions, are not marked: an XTDB node ignores them without changing any result it returns.
+Transaction operations in an Arrow layout XTDB does not write
+
+: A transaction whose operations use dictionary, view, list-view or run-end-encoded columns.
+
+A workload that uses none of these keeps writing exactly the records and files XTDB writes, and stays readable by XTDB.
+RTDB also adds four annotations that XTDB loses nothing by ignoring, and which therefore mark nothing: the block-file digest on block uploads, the object versions of published data files, the payload digest on offloaded records, and the table-block digests in each block.
 
 What the XTDB node reports:
 
 Source log
 
-: An error naming `Unknown message type: 4` — RTDB frames these records with header byte 4, which XTDB does not recognise.
+: `java.lang.IllegalArgumentException: Unknown message type: 4` — RTDB frames these records with header byte 4, which XTDB's source decoder does not accept.
 
-Replica log
+Replica log, and block files
 
-: `can't resolve oversized message at <id>: written at storage v1381254210/e0, …` — the record ends with a reference to storage version 1381254210 (`0x52544442`, ASCII `RTDB`), which no XTDB release writes.
+: `com.google.protobuf.InvalidProtocolBufferException: Protocol message contained an invalid tag (zero).` — RTDB starts these records' protobuf (after the header byte, which XTDB ignores on the replica log) and these files with a zero byte, which no protobuf parser accepts.
+  On a block file, the error comes from `Block.parseFrom` or `TableBlock.parseFrom`, at node start or when following a block upload.
 
-RTDB never rewrites these records: once a log carries one, an XTDB node stops there every time it replays past it.
+Neither error means the log or the store is corrupt: the record or file is intact, and an RTDB node reads it.
+It means the log or store uses an RTDB feature from that point, and only an RTDB node can follow it from there.
+RTDB never rewrites these records or files: once a log carries one, an XTDB node stops there every time it replays past it.
