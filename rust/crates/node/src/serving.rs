@@ -165,6 +165,20 @@ pub struct FundingSubmission {
     pub clock: Arc<dyn rtdb_tx::DecisionClock>,
 }
 
+#[cfg(feature = "multi")]
+pub use rtdb_db::AppliedWatch;
+
+/// Without `multi` no attachment applies a journal, so there is no position to watch.
+#[cfg(not(feature = "multi"))]
+pub enum AppliedWatch {}
+
+#[cfg(not(feature = "multi"))]
+impl AppliedWatch {
+    pub fn mark_seen(&mut self) { match *self {} }
+
+    pub async fn changed(&mut self, _until: tokio::time::Instant) -> Result<()> { match *self {} }
+}
+
 /// An admitted database attachment. Each mode establishes its own barriers and publishes only applied state.
 #[async_trait]
 pub trait ServingDriver: Send + Sync {
@@ -313,7 +327,7 @@ pub trait ServingDriver: Send + Sync {
 
     /// Watches the journal position this attachment has applied, and the journal past it; a long
     /// poll over `changes_workload_root` waits on it between pages.
-    async fn watch_applied(&self) -> Option<rtdb_db::AppliedWatch> {
+    async fn watch_applied(&self) -> Option<AppliedWatch> {
         None
     }
 
