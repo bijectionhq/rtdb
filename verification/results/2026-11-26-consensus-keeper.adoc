@@ -103,6 +103,24 @@ The comparison, with every acknowledged commit verified:
 |64 |249 |6,595 |5,781 |9.3 / 18.1
 |===
 
+=== Qualification and comparison at `e24e496`
+
+Logkeeper `e24e496` appends WAL rounds to segments, can host the catalog as its own consensus stream, multiplexes peer messages, keeps parked and deleted streams' files from the reaper, and adds operator recovery of a stream that lost two of its three voters.
+The process qualification passed every phase, with 230,283 acknowledged commits rechecked after the voter restart, the RTDB reopen and the full keeper restart (steady 2,819, 5,207 and 7,695 commits/s at 1, 4 and 16 clients; p99 0.6, 1.3 and 4.3 ms).
+The comparison, every acknowledged commit verified, ran while other builds shared the host:
+
+[cols="1,1,1,1,1",options="header"]
+|===
+|Clients |File journal commits/s |Stream Writer commits/s |Consensus commits/s |Consensus p50 / p99 ms
+
+|1 |222 |596 |2,671 |0.35 / 0.69
+|4 |287 |1,558 |4,815 |0.73 / 1.30
+|16 |284 |5,002 |6,361 |1.92 / 4.47
+|64 |286 |6,296 |4,153 |12.2 / 26.0
+|===
+
+The 64-client phase runs last on the largest database. RTDB's journal-bound checkpoints then stall commits for up to 2.7 s each, and a fresh database at 64 clients commits 6,554 per second. Taking checkpoints off the commit path is in progress.
+
 === First run, before keeper batches, at `749260e`
 
 [cols="2,1,1,1,1,1",options="header"]
