@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Barrier, atomic::{AtomicUsize, Ordering}};
 use rtdb_types::{AnomalyKind, MemoryBudget};
 
 #[test]
@@ -216,4 +216,60 @@ fn every_refusal_by_a_budget_is_resource_exhaustion() {
     }
     assert_eq!(root.used_bytes(), 0);
     assert!(!Arc::get_mut(&mut root.reserve(10).unwrap()).unwrap().shrink_to(11).unwrap_err().is(AnomalyKind::ResourceExhausted));
+}
+
+#[test]
+fn idle_children_report_nothing_used_and_hold_nothing_back() {
+    let limit = 64 << 10;
+    let root = MemoryBudget::new(limit);
+    let child = root.scope();
+    let workers = (0..8).map(|_| {
+        let child = Arc::clone(&child);
+        std::thread::spawn(move || drop(child.reserve(100).unwrap()))
+    }).collect::<Vec<_>>();
+    for worker in workers { worker.join().unwrap(); }
+    assert_eq!((child.used_bytes(), root.used_bytes()), (0, 0));
+    assert!(child.peak_bytes() <= 800 && root.peak_bytes() <= 800, "peaks count only what was retained");
+    assert_eq!(root.available_bytes(), limit);
+    assert_eq!(child.available_bytes(), limit);
+    let whole = root.reserve(limit).unwrap();
+    assert!(child.reserve(1).is_err());
+    drop(whole);
+}
+
+#[test]
+fn concurrent_reservations_through_a_shared_child_never_exceed_the_limit_and_leak_nothing() {
+    let limit = 256 << 10;
+    let root = MemoryBudget::new(limit);
+    let child = root.scope();
+    let live = Arc::new(AtomicUsize::new(0));
+    let threads = 16;
+    let start = Arc::new(Barrier::new(threads));
+    let workers = (0..threads).map(|thread| {
+        let (child, live, start) = (Arc::clone(&child), Arc::clone(&live), Arc::clone(&start));
+        std::thread::spawn(move || {
+            let scope = child.scope();
+            let mut held = Vec::new();
+            start.wait();
+            for step in 0..20_000usize {
+                let bytes = 1 + (step * 7919 + thread * 104_729) % 12_000;
+                if let Ok(reservation) = scope.reserve(bytes) {
+                    let total = live.fetch_add(bytes, Ordering::SeqCst) + bytes;
+                    assert!(total <= limit, "{total} retained bytes exceed the {limit} byte limit");
+                    held.push(reservation);
+                }
+                if held.len() > 8 || step % 3 == 0 {
+                    if let Some(reservation) = held.pop() {
+                        live.fetch_sub(reservation.bytes(), Ordering::SeqCst);
+                        drop(reservation);
+                    }
+                }
+            }
+            for reservation in held.drain(..) { live.fetch_sub(reservation.bytes(), Ordering::SeqCst); }
+            assert_eq!(scope.used_bytes(), 0);
+        })
+    }).collect::<Vec<_>>();
+    for worker in workers { worker.join().unwrap(); }
+    assert_eq!((live.load(Ordering::SeqCst), child.used_bytes(), root.used_bytes()), (0, 0, 0));
+    assert!(root.peak_bytes() <= limit);
 }

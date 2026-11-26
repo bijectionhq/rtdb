@@ -414,7 +414,7 @@ pub(crate) struct DatabaseFactory {
     pub options: NodeOptions,
     pub resources: Arc<dyn ResourceFactory>,
     pub memory: Arc<MemoryBudget>,
-    /// The execution budget's credited child, which every query on this node reserves from.
+    /// The execution budget's child that every query on this node reserves from.
     pub query_memory: Arc<MemoryBudget>,
     pub cache: Arc<CacheBudget>,
     pub clock: Arc<dyn Clock>,

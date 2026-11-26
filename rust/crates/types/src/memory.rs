@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, Weak, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 use crate::{Anomaly, AnomalyKind, Result};
 
@@ -11,60 +11,16 @@ pub struct MemoryBudget {
     peak_bytes: AtomicUsize,
     parent: Option<Arc<MemoryBudget>>,
     funding: Option<Arc<MemoryReservation>>,
-    /// Bytes this budget and its ancestors have admitted ahead of use, which small reservations draw on per thread.
-    credit: Option<Credit>,
-    /// On a budget without a parent, the credited budgets beneath it, whose unspent credit a refused admission reclaims.
-    credited: Mutex<Vec<Weak<MemoryBudget>>>,
-}
-
-/// The largest reservation a credited budget admits from a thread's credit, and the batch in which a thread refills it.
-const CREDIT_BATCH: usize = 8 << 10;
-/// The most unspent credit one shard keeps after a release; the excess goes back to the budget and its ancestors.
-const CREDIT_KEPT: usize = 2 * CREDIT_BATCH;
-
-#[repr(align(128))]
-#[derive(Debug, Default)]
-struct CreditShard(AtomicUsize);
-
-/// Per-thread shards of admitted but unreserved bytes, each on its own cache line.
-#[derive(Debug)]
-struct Credit { shards: Box<[CreditShard]> }
-
-static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
-thread_local! { static SHARD: usize = NEXT_SHARD.fetch_add(1, Ordering::Relaxed); }
-
-impl Credit {
-    fn new() -> Self {
-        let shards = std::thread::available_parallelism().map_or(8, |threads| threads.get()).clamp(1, 64).next_power_of_two();
-        Self { shards: (0..shards).map(|_| CreditShard::default()).collect() }
-    }
-
-    fn shard(&self) -> &AtomicUsize {
-        let index = SHARD.try_with(|shard| *shard).unwrap_or(0) & (self.shards.len() - 1);
-        &self.shards[index].0
-    }
-
-    fn take(shard: &AtomicUsize, bytes: usize) -> bool {
-        shard.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |credit| credit.checked_sub(bytes)).is_ok()
-    }
-
-    fn outstanding(&self) -> usize {
-        self.shards.iter().fold(0usize, |total, shard| total.saturating_add(shard.0.load(Ordering::Acquire)))
-    }
-
-    fn drain(&self) -> usize {
-        self.shards.iter().fold(0usize, |total, shard| total.saturating_add(shard.0.swap(0, Ordering::AcqRel)))
-    }
 }
 
 impl MemoryBudget {
-    fn with_parts(limit_bytes: usize, parent: Option<Arc<Self>>, funding: Option<Arc<MemoryReservation>>, credit: Option<Credit>) -> Arc<Self> {
-        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent, funding, credit, credited: Mutex::new(Vec::new()) })
+    fn with_parts(limit_bytes: usize, parent: Option<Arc<Self>>, funding: Option<Arc<MemoryReservation>>) -> Arc<Self> {
+        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent, funding })
     }
 
     /// Creates a root budget with a byte limit; zero permits only zero-byte reservations.
     pub fn new(limit_bytes: usize) -> Arc<Self> {
-        Self::with_parts(limit_bytes, None, None, None)
+        Self::with_parts(limit_bytes, None, None)
     }
 
     /// Tracks a region's retained and peak bytes while charging every reservation to the shared parent limit.
@@ -76,31 +32,14 @@ impl MemoryBudget {
     /// Opens a child with its own byte ceiling and the parent's existing admission limits.
     /// The effective ceiling cannot exceed this budget's byte limit.
     pub fn scope_with_limit(self: &Arc<Self>, limit_bytes: usize) -> Arc<Self> {
-        Self::with_parts(limit_bytes.min(self.limit_bytes), Some(Arc::clone(self)), None, None)
-    }
-
-    /// A child for reservations made from many threads at once.
-    /// Each thread admits a reservation of at most `CREDIT_BATCH` bytes from credit its shard holds, which this child and its
-    /// ancestors admitted `CREDIT_BATCH` bytes at a time, so such a reservation writes no counter other threads write.
-    /// Unspent credit counts as used on this child's ancestors and in its `peak_bytes`, but not in its `used_bytes`.
-    /// A shard keeps at most `CREDIT_KEPT` bytes once its thread releases, so idle credit is bounded by the shard count, not by
-    /// the number of sessions.
-    /// A reservation refused anywhere under the same root reclaims all unspent credit there and is tried once more, so credit
-    /// refuses nothing that would fit, except the bytes other threads take as credit in between.
-    pub fn credited(self: &Arc<Self>) -> Arc<Self> {
-        let child = Self::with_parts(self.limit_bytes, Some(Arc::clone(self)), None, Some(Credit::new()));
-        if let Ok(mut credited) = self.root().credited.lock() {
-            credited.retain(|budget| budget.strong_count() > 0);
-            credited.push(Arc::downgrade(&child));
-        }
-        child
+        Self::with_parts(limit_bytes.min(self.limit_bytes), Some(Arc::clone(self)), None)
     }
 
     /// Pays for a separate budget in full before it can admit work.
     /// Retained reservations keep the funding alive, even after the owner closes.
     pub fn prepay(self: &Arc<Self>, bytes: usize) -> Result<Arc<Self>> {
         let funding = self.reserve(bytes)?;
-        Ok(Self::with_parts(bytes, None, Some(funding), None))
+        Ok(Self::with_parts(bytes, None, Some(funding)))
     }
 
     pub fn is_prepaid(&self) -> bool { self.funding.is_some() }
@@ -137,77 +76,19 @@ impl MemoryBudget {
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: backing.collect() }))
     }
 
-    fn root(&self) -> &Self {
-        let mut root = self;
-        while let Some(parent) = &root.parent { root = parent; }
-        root
-    }
-
-    /// Admits bytes through the chain; if a limit refuses them, reclaims the root's unspent credit and tries once more.
-    fn admit(&self, bytes: usize) -> Result<()> {
-        match self.acquire_chain(bytes) {
-            Ok(()) => Ok(()),
-            Err(error) if self.root().reclaim_credit() => self.acquire_chain(bytes).map_err(|_| error),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Returns every credited descendant's unspent credit to its ancestors; true if there was any.
-    fn reclaim_credit(&self) -> bool {
-        let credited: Vec<Arc<Self>> = match self.credited.lock() {
-            Ok(credited) => credited.iter().filter_map(Weak::upgrade).collect(),
-            Err(_) => return false,
-        };
-        let mut reclaimed = false;
-        for budget in &credited {
-            let Some(credit) = &budget.credit else { continue };
-            let drained = credit.drain();
-            if drained > 0 {
-                budget.release_direct(drained);
-                reclaimed = true;
-            }
-        }
-        reclaimed
-    }
-
     /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
-    fn acquire_chain(&self, bytes: usize) -> Result<()> {
-        if let Some(credit) = &self.credit && bytes <= CREDIT_BATCH {
-            let shard = credit.shard();
-            if Credit::take(shard, bytes) { return Ok(()); }
-            if self.acquire_direct(bytes + CREDIT_BATCH).is_ok() {
-                shard.fetch_add(CREDIT_BATCH, Ordering::AcqRel);
-                return Ok(());
-            }
-        }
-        self.acquire_direct(bytes)
-    }
-
-    fn acquire_direct(&self, bytes: usize) -> Result<()> {
-        if let Some(parent) = &self.parent { parent.acquire_chain(bytes)?; }
+    fn admit(&self, bytes: usize) -> Result<()> {
+        if let Some(parent) = &self.parent { parent.admit(bytes)?; }
         if let Err(error) = self.acquire(bytes) {
-            if let Some(parent) = &self.parent { parent.release_chain(bytes); }
+            if let Some(parent) = &self.parent { parent.release(bytes); }
             return Err(error);
         }
         Ok(())
     }
 
-    fn release_chain(&self, bytes: usize) {
-        if let Some(credit) = &self.credit && bytes <= CREDIT_BATCH {
-            let shard = credit.shard();
-            if shard.fetch_add(bytes, Ordering::AcqRel) + bytes > CREDIT_KEPT
-                && let Ok(kept) = shard.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |credit| (credit > CREDIT_BATCH).then_some(CREDIT_BATCH))
-            {
-                self.release_direct(kept - CREDIT_BATCH);
-            }
-            return;
-        }
-        self.release_direct(bytes);
-    }
-
-    fn release_direct(&self, bytes: usize) {
+    fn release(&self, bytes: usize) {
         self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
-        if let Some(parent) = &self.parent { parent.release_chain(bytes); }
+        if let Some(parent) = &self.parent { parent.release(bytes); }
     }
 
     /// Counts the reservation controls created by a successful `reserve`, including this budget and every ancestor.
@@ -240,48 +121,21 @@ impl MemoryBudget {
         }
     }
 
-    /// Bytes retained by reservations on this budget and its descendants, excluding this budget's own unspent credit.
-    pub fn used_bytes(&self) -> usize {
-        let used = self.used_bytes.load(Ordering::Acquire);
-        self.credit.as_ref().map_or(used, |credit| used.saturating_sub(credit.outstanding()))
-    }
+    /// Bytes retained by reservations on this budget and its descendants.
+    pub fn used_bytes(&self) -> usize { self.used_bytes.load(Ordering::Acquire) }
     pub fn peak_bytes(&self) -> usize { self.peak_bytes.load(Ordering::Relaxed) }
     pub fn limit_bytes(&self) -> usize { self.limit_bytes }
 
     /// Estimates the bytes available under this limit and all ancestor limits.
     /// A subsequent reservation still checks the shared limits.
-    /// Unspent credit counts as available, since a refused reservation reclaims it: on a chain through a credited budget,
-    /// that budget's credit, and otherwise, at the root, the credit of every credited budget beneath it.
     pub fn available_bytes(&self) -> usize {
         let mut available = usize::MAX;
-        let mut credit: Option<usize> = None;
         let mut budget = Some(self);
         while let Some(current) = budget {
-            let reclaimable = match credit {
-                Some(credit) => credit,
-                None if current.parent.is_none() => current.registered_credit(),
-                None => 0,
-            };
-            available = available.min(current.limit_bytes.saturating_sub(current.used_bytes().saturating_sub(reclaimable)));
-            if let Some(own) = &current.credit { credit = Some(credit.unwrap_or(0).saturating_add(own.outstanding())); }
+            available = available.min(current.limit_bytes.saturating_sub(current.used_bytes()));
             budget = current.parent.as_deref();
         }
         available
-    }
-
-    fn registered_credit(&self) -> usize {
-        let Ok(credited) = self.credited.lock() else { return 0 };
-        credited.iter().filter_map(Weak::upgrade)
-            .fold(0usize, |total, budget| total.saturating_add(budget.credit.as_ref().map_or(0, Credit::outstanding)))
-    }
-}
-
-impl Drop for MemoryBudget {
-    fn drop(&mut self) {
-        if let (Some(credit), Some(parent)) = (&self.credit, &self.parent) {
-            let unspent = credit.drain();
-            if unspent > 0 { parent.release_chain(unspent); }
-        }
     }
 }
 
@@ -346,19 +200,19 @@ impl MemoryReservation {
     fn release_to(&mut self, bytes: usize) {
         let released = self.bytes - bytes;
         self.bytes = bytes;
-        self.budget.release_chain(released);
+        self.budget.release(released);
     }
 }
 
 impl Drop for MemoryReservation {
-    fn drop(&mut self) { self.budget.release_chain(self.bytes); }
+    fn drop(&mut self) { self.budget.release(self.bytes); }
 }
 
 
 #[test]
 fn ordered_index_snapshot_budget_shares_only_ordinary_equal_limit_scopes() {
     let root = MemoryBudget::new(8192);
-    let request = root.scope().credited().scope();
+    let request = root.scope().scope();
     assert!(Arc::ptr_eq(&root, request.snapshot_budget().unwrap()));
     assert!(root.scope_with_limit(4096).scope().snapshot_budget().is_none());
     assert!(root.prepay(4096).unwrap().scope().snapshot_budget().is_none());

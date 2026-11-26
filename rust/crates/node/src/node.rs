@@ -316,7 +316,7 @@ impl Node {
         let compaction_slots = (matches!(options.membership, Membership::Placed) && options.compaction_threads > 0)
             .then(|| Arc::new(Semaphore::new(options.compaction_threads.min(Semaphore::MAX_PERMITS))));
         services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
-        let factory = Arc::new(DatabaseFactory { query_memory: memory.credited(), memory, cache: CacheBudget::new(options.cache_bytes),
+        let factory = Arc::new(DatabaseFactory { query_memory: memory.scope(), memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, compaction_relay: services.compaction_relay, world_constraints: services.world_constraints, compaction_slots, clock: services.clock, decision_clock: services.decision_clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
