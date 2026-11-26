@@ -1635,11 +1635,7 @@ impl ScanVerifier<'_> {
         }
         let Some(rows) = resolved else { return Ok(None); };
         if rows.is_empty() { return Ok(Some(None)); }
-        let mut batch = match self.gather_search_rows(scan, &rows, None).await {
-            Ok(batch) => batch,
-            Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => return Ok(None),
-            Err(error) => return Err(error),
-        };
+        let mut batch = self.gather_search_rows(scan, &rows, None).await?;
         if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
             let schema = Schema::new(scan.columns.clone())?;
             let selection = crate::columnar::predicate_selection(&batch, &predicate, &schema, execution).await?;
@@ -4140,6 +4136,31 @@ mod tests {
         }).await.unwrap(), Some(2));
         assert_eq!(recorded, [(0, 0, Some(origins[0]), vec![1]), (0, 1, Some(origins[1]), vec![2])]);
         assert!(crate::table_point_rows(&request, &keys).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn point_and_gap_reads_surface_a_missing_data_file_instead_of_declining() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let value = state.value();
+        let entry = value.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(value.live().block_index()).unwrap();
+        store.delete(&ObjectKey::new(entry.slug.data_key(&trie)).unwrap()).await.unwrap();
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let snapshot = value.snapshot();
+        let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
+            storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
+        let point = Interval::at(Timestamp(150)).unwrap();
+        let mut request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
+            bounds: TemporalBounds { valid_time: point, system_time: point }, memory: &memory,
+            current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+            constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+        let keys = [events[0].iid].into();
+        assert!(crate::table_point_rows(&request, &keys).await.is_err(), "a missing data file must not read as an inapplicable fast path");
+        request.bounds = TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL };
+        assert!(crate::uncovered_history_iids(&request, &BTreeSet::new(), None, 16).await.is_err());
     }
 
     #[tokio::test]

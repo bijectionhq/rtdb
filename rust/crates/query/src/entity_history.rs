@@ -47,15 +47,8 @@ pub async fn table_point_rows(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -
         || !request.bounds.system_time.is_point() || !request.bounds.valid_time.is_point() {
         return Ok(None);
     }
-    match crate::entity_directory::resolve_points(request, keys).await {
-        Ok(Some(rows)) if !rows.windows(2).any(|pair| pair[0].version.iid == pair[1].version.iid) => return Ok(Some(rows)),
-        Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
-        _ => {}
-    }
-    match read_history(request, keys).await {
-        Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
-        result => result,
-    }
+    if let Some(rows) = crate::entity_directory::resolve_points(request, keys).await? { return Ok(Some(rows)); }
+    read_history(request, keys).await
 }
 
 async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result<Option<Vec<ResolvedSearchRow>>> {
@@ -161,12 +154,10 @@ pub(crate) fn contains(part: &[u8], iid: Iid) -> bool {
 
 pub(crate) fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Entity history read cancelled") }
 
+/// `None` when more than `limit` IIDs, or more events than their budget, are uncovered.
 pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex>,
     scope: Option<crate::IidScope<'_>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
-    match read_uncovered(request, covered, scope, limit).await {
-        Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
-        result => result,
-    }
+    read_uncovered(request, covered, scope, limit).await
 }
 
 pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_format::keys::TableSlug,
@@ -225,8 +216,12 @@ async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex
         }
         Ok(true)
     };
-    let (through, mut inspected) = crate::entity_directory::nominate(request, covered, scope, budget, &mut nominate)
-        .await?.map_or((None, 0), |(through, count)| (Some(through), count));
+    use crate::entity_directory::Nomination;
+    let (through, mut inspected) = match crate::entity_directory::nominate(request, covered, scope, budget, &mut nominate).await? {
+        Nomination::Undirected => (None, 0),
+        Nomination::Nominated { through, inspected } => (Some(through), inspected),
+        Nomination::OverBudget => return Ok(None),
+    };
     for trie in request.snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == TrieState::Live) {
         let is_l0 = trie.key.level() == 0;
         let block = trie.key.block_index();

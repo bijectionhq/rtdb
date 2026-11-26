@@ -12,7 +12,7 @@ use rtdb_format::{
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_storage::{audience_work, cache::BufferPool};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result, TableRef,
+    Anomaly, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result, TableRef,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -243,14 +243,10 @@ pub async fn resolve_points(
     }
     let mut previous = None;
     let mut resolved = Vec::new();
-    for ((iid, key), events) in histories {
-        if previous == Some(iid) {
+    for ((iid, _), events) in histories {
+        // Two recorded keys behind one IID are distinct entities, which an IID-keyed answer cannot separate.
+        if previous.replace(iid) == Some(iid) {
             return Ok(None);
-        }
-        if key.is_none() {
-            previous = Some(iid);
-        } else {
-            previous = None;
         }
         let Some(rows) = resolve_located_point(
             BTreeMap::from([(iid, events)]),
@@ -291,7 +287,7 @@ pub async fn resolve_points(
                         }
                         Ok(true)
                     };
-                    match entity_history::visit_trie_events(
+                    entity_history::visit_trie_events(
                         request,
                         &entry.slug,
                         trie,
@@ -299,23 +295,7 @@ pub async fn resolve_points(
                         usize::MAX,
                         &mut matching,
                     )
-                    .await
-                    {
-                        Err(error) if error.category != AnomalyCategory::Interrupted => {
-                            crate::scan::primary_point_events(
-                                request,
-                                &entry.slug,
-                                &trie.key,
-                                Some(crate::IidScope::Set(&keys)),
-                                usize::MAX,
-                                matching,
-                            )
-                            .await?;
-                        }
-                        result => {
-                            result?;
-                        }
-                    }
+                    .await?;
                     if location.is_some() {
                         break;
                     }
@@ -329,22 +309,31 @@ pub async fn resolve_points(
     Ok(Some(resolved))
 }
 
+pub(crate) enum Nomination {
+    /// The table has no entity directory.
+    Undirected,
+    /// The directory covers every block through `through`, after `inspected` uncovered events were visited.
+    Nominated { through: BlockIndex, inspected: usize },
+    /// The uncovered events exceeded the limit, or the visitor stopped.
+    OverBudget,
+}
+
 pub(crate) async fn nominate(
     request: &ScanRequest<'_>,
     covered: &BTreeSet<BlockIndex>,
     scope: Option<crate::IidScope<'_>>,
     limit: usize,
     visit: &mut (impl FnMut(EventHeader) -> Result<bool> + Send),
-) -> Result<Option<(BlockIndex, usize)>> {
+) -> Result<Nomination> {
     let table = &request.scan.table.name.table;
     let catalog = request.snapshot.trie_catalog();
     let Some(receipt) = catalog.entity_directory(table) else {
-        return Ok(None);
+        return Ok(Nomination::Undirected);
     };
     let through = BlockIndex(receipt.through_block());
     // A checkpoint can keep directory rows for compacted blocks with no L0 descriptor.
     if every_block_is_live_or_posted(catalog, table, covered, through) {
-        return Ok(Some((through, 0)));
+        return Ok(Nomination::Nominated { through, inspected: 0 });
     }
     let entry = request
         .snapshot
@@ -366,9 +355,9 @@ pub(crate) async fn nominate(
     })
     .await?;
     if !complete {
-        return Err(invalid("Directory gap nomination exceeded its budget"));
+        return Ok(Nomination::OverBudget);
     }
-    Ok(Some((through, inspected)))
+    Ok(Nomination::Nominated { through, inspected })
 }
 
 fn every_block_is_live_or_posted(catalog: &rtdb_index::TrieCatalog, table: &TableRef, covered: &BTreeSet<BlockIndex>, through: BlockIndex) -> bool {
