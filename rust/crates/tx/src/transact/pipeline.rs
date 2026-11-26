@@ -140,7 +140,7 @@ impl TransactPipeline {
     pub fn decide(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Result<Decision> {
-        self.decide_after(request, now, features, claims, None, None)
+        self.decide_after(request, now, features, claims, None)
     }
 
     /// Decide one request in an admitted scope (see [`TransactState::resolve_scoped`]).
@@ -148,31 +148,31 @@ impl TransactPipeline {
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: ScopedTransact<'_>,
     ) -> Result<Decision> {
-        self.decide_after(request, now, features, claims, Some(authority), None)
+        self.decide_after(request, now, features, claims, Some(authority))
     }
 
     pub fn decide_after(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
-        authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>,
+        authority: Option<ScopedTransact<'_>>,
     ) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, authority, time_floor, None, None)
+        self.decide_with_admission(request, now, features, claims, authority, None, None)
     }
 
     pub fn decide_workload(&mut self, request: &Transact, now: Timestamp, features: &[&str],
                            claims: &dyn ClaimVerifier, workload: &workload::Admission) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, None, None, Some(workload), None)
+        self.decide_with_admission(request, now, features, claims, None, Some(workload), None)
     }
 
     pub fn decide_funded(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
-        authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>, funding: FundingInput, record_limit: usize,
+        authority: Option<ScopedTransact<'_>>, funding: FundingInput, record_limit: usize,
     ) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, authority, time_floor, None, Some((funding, record_limit)))
+        self.decide_with_admission(request, now, features, claims, authority, None, Some((funding, record_limit)))
     }
 
     fn decide_with_admission(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
-        authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>, workload: Option<&workload::Admission>,
+        authority: Option<ScopedTransact<'_>>, workload: Option<&workload::Admission>,
         funding: Option<(FundingInput, usize)>,
     ) -> Result<Decision> {
         let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
@@ -190,7 +190,6 @@ impl TransactPipeline {
                 receipts: &self.durable.receipts,
                 appointment_addresses: &self.durable.appointment_addresses,
                 pending: false,
-                time_floor,
             };
             let position = self.durable.index.head().basis.position();
             return match TransactState::resolve_in(view, request, position, now, features, claims, authority, workload, None)?.0 {
@@ -209,7 +208,6 @@ impl TransactPipeline {
             receipts: &self.durable.receipts,
             appointment_addresses: &self.durable.appointment_addresses,
             pending: false,
-            time_floor,
         };
         let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority, workload,
             funding.map(|(input, _)| input))?;
@@ -257,11 +255,8 @@ impl TransactPipeline {
     /// Decide queued requests in order, as one group the driver may append in one journal
     /// request. Each result is independent; a full pipeline refuses the rest.
     ///
-    /// The writer's `clock` is sampled for each request at its own ordering point, never
-    /// once for the group. System time strictly increases along positions, and a store
-    /// commit's time is its own sample, never raised: one sample shared by the group
-    /// would leave every store commit after the first behind the head it set, waiting
-    /// out `rtdb.store/clock-behind` and retrying.
+    /// The writer's `clock` is sampled for each request at its own ordering point.
+    /// Ties at one microsecond are admitted and ordered by version.
     pub fn decide_batch(
         &mut self, requests: &[Transact], clock: &dyn Fn() -> Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Vec<Result<Decision>> {
@@ -750,11 +745,16 @@ mod tests {
         assert_eq!(times, vec![Timestamp(100), Timestamp(101), Timestamp(102), Timestamp(103)]);
         assert!(released.iter().all(|receipt| receipt.outcome == Outcome::Then));
 
-        // One sample for the whole group leaves the second commit behind the first.
+        // Two commits sampled at the same microsecond both commit, ordered by version.
         let mut shared = TransactPipeline::new(TransactState::new(INCARNATION), 1, 8).unwrap();
         let decisions = shared.decide_batch(&requests[..2], &|| Timestamp(100), FEATURES, &claims());
-        assert!(matches!(decisions[0], Ok(Decision::Append { .. })));
-        assert!(matches!(&decisions[1], Err(error) if error.code == STORE_CLOCK_BEHIND));
+        assert!(matches!(decisions[0], Ok(Decision::Append { position: 1, .. })));
+        assert!(matches!(decisions[1], Ok(Decision::Append { position: 2, .. })));
+        let tied = shared.acknowledge(2).unwrap();
+        assert_eq!(tied.iter().map(|r| r.system_time).collect::<Vec<_>>(), vec![Timestamp(100), Timestamp(100)]);
+        // A regressed sample below the last commit faults rather than waiting or clamping.
+        let regressed = shared.decide(&requests[2], Timestamp(99), FEATURES, &claims());
+        assert!(matches!(regressed, Err(error) if error.code == STORE_CLOCK_REGRESSED));
     }
 
     #[test]

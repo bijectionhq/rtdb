@@ -91,25 +91,44 @@ fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
     assert_eq!(&page.entries[0].key[4..], stamp.as_slice());
     assert_eq!(page.entries[0].value.as_deref(), Some(stamp.as_slice()));
 
-    // A sample at the head's time is waited out, never raised.
-    assert_eq!(refused(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 100), STORE_CLOCK_BEHIND);
+    // Ties at the head's time commit in version order; a regressed sample faults.
+    assert_eq!(refused(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 99), STORE_CLOCK_REGRESSED);
+    let tied = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 100, DEFAULT);
+    let tied_receipt = apply(&mut state, 2, tied.record()).unwrap();
+    assert_eq!((tied_receipt.basis, tied_receipt.system_time, tied_receipt.outcome), (basis(2), Timestamp(100), Outcome::Then));
     // Outside the window nothing is decided.
     let closed = Window { not_before: None, before: Some(Timestamp(150)) };
     let unopened = Window { not_before: Some(Timestamp(300)), before: None };
-    assert_eq!(refused(&state, &store_append(3, 1, Vec::new(), vec![other.clone()], closed), 2, 200), STORE_OUTSIDE_LATE);
-    assert_eq!(refused(&state, &store_append(4, 1, Vec::new(), vec![other.clone()], unopened), 2, 200), STORE_OUTSIDE_EARLY);
+    assert_eq!(refused(&state, &store_append(3, 2, Vec::new(), vec![other.clone()], closed), 3, 200), STORE_OUTSIDE_LATE);
+    assert_eq!(refused(&state, &store_append(4, 2, Vec::new(), vec![other.clone()], unopened), 3, 200), STORE_OUTSIDE_EARLY);
     // A misplaced placeholder is the request's error.
     let inside = StoreWrite { key_stamp: Some(1), ..stamped.clone() };
-    assert_eq!(refused(&state, &store_append(5, 1, Vec::new(), vec![inside], Window::default()), 2, 200), "rtdb.store/invalid-stamp-placeholder");
+    assert_eq!(refused(&state, &store_append(5, 2, Vec::new(), vec![inside], Window::default()), 3, 200), "rtdb.store/invalid-stamp-placeholder");
 
     // The reads are judged before the window: a conflict is recorded.
-    let conflicting = plan(&state, &store_append(6, 0, vec![everything.clone()], vec![other.clone()], closed), 2, 200, DEFAULT);
-    let receipt = apply(&mut state, 2, conflicting.record()).unwrap();
+    let conflicting = plan(&state, &store_append(6, 0, vec![everything.clone()], vec![other.clone()], closed), 3, 200, DEFAULT);
+    let receipt = apply(&mut state, 3, conflicting.record()).unwrap();
     assert_eq!(receipt.outcome, Outcome::Otherwise { failed: vec![0] });
     // A write-free append validates through its own record, which writes nothing.
-    let validated = plan(&state, &store_append(7, 2, vec![everything], Vec::new(), Window::default()), 3, 300, DEFAULT);
-    let receipt = apply(&mut state, 3, validated.record()).unwrap();
-    assert_eq!((receipt.basis, receipt.outcome), (basis(3), Outcome::Then));
+    let validated = plan(&state, &store_append(7, 3, vec![everything], Vec::new(), Window::default()), 4, 300, DEFAULT);
+    let receipt = apply(&mut state, 4, validated.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.outcome), (basis(4), Outcome::Then));
+}
+
+/// The SHA-256 of Bijection's `crates/fact_store/src/persistence/judge.rs`.
+/// Bijection's `fact_store` pins the same digest of its own copy
+/// (`persistence::tests::the_store_judge_matches_rtdbs_vendored_copy`), so a
+/// change on either side alone fails a test. Change the judge in Bijection,
+/// copy it to `vendor/bijection-store-judge/src/judge.rs` and update both pins
+/// in the paired commits.
+const BIJECTION_STORE_JUDGE_SHA256: &str = "5010d6fb02ae6aaff5ae37417ed816d2cc09b0f3dd5973ab127754e3b6ea92e3";
+
+#[test]
+fn the_vendored_store_judge_is_bijections_pinned_copy() {
+    use sha2::{Digest, Sha256};
+    let source = include_bytes!("../../../../vendor/bijection-store-judge/src/judge.rs");
+    let digest = Sha256::digest(source).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    assert_eq!(digest, BIJECTION_STORE_JUDGE_SHA256, "vendor/bijection-store-judge drifted from Bijection's judge.rs");
 }
 
 #[test]

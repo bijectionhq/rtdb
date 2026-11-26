@@ -181,7 +181,7 @@ pub(crate) async fn visit_table(
                     let block = BlockIndex(logical.installed.block.checked_add(1).ok_or_else(suffix_unavailable)?);
                     let transaction = rtdb_tx::decode_replica(&message, latest, block, memory)?;
                     let tx = transaction.writes.tx_key();
-                    if latest.is_some_and(|prior| tx.tx_id <= prior.tx_id || tx.system_time <= prior.system_time) {
+                    if latest.is_some_and(|prior| tx.tx_id <= prior.tx_id || tx.system_time < prior.system_time) {
                         return Err(suffix_unavailable());
                     }
                     if let Some(batch) = transaction.writes.tables().get(table).and_then(|write| write.batch()) {

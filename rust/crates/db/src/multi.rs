@@ -1037,10 +1037,20 @@ impl MultiDatabase {
         (self.clock)().0.saturating_add(self.options.drift_micros)
     }
 
+    /// The writer clock lease (T7): a writer samples only while its clock plus
+    /// the drift bound is before its durable lease end, so every sample it
+    /// issues lies below `until`.
     fn before(&self, deadline: i64) -> bool {
         self.upper() < deadline
     }
 
+    /// A successor writer (or one restored from the lineage's lease) starts
+    /// only once its clock passes the predecessor's lease end plus the drift
+    /// bound. It waits once, at takeover, on the lease alone: never on the
+    /// last stamp, which would make the wait depend on hidden commits, and
+    /// never per append. Its samples then exceed every predecessor sample, so
+    /// a sample below the head's time is a clock fault
+    /// (`rtdb.store/clock-regressed`).
     fn observed_lapse(&self) -> bool {
         self.state()
             .lease

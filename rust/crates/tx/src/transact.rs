@@ -29,6 +29,7 @@ pub mod encoding;
 mod funding;
 mod operations;
 mod pipeline;
+mod store_clock;
 pub mod workload;
 use workload::Family as WorkloadFamily;
 
@@ -340,9 +341,9 @@ pub struct StoreAppend {
     pub window: Window,
 }
 
-/// The writer's clock sample is behind the head: the caller waits it out and
-/// retries, so a commit's time is never raised to a predecessor's.
-pub const STORE_CLOCK_BEHIND: &str = "rtdb.store/clock-behind";
+/// The writer's clock sample regressed below the store's last stamp: a fault,
+/// never raised to a predecessor's time and never waited out per append.
+pub const STORE_CLOCK_REGRESSED: &str = "rtdb.store/clock-regressed";
 /// The clock sample is before the store window's `not_before`.
 pub const STORE_OUTSIDE_EARLY: &str = "rtdb.store/outside-early";
 /// The clock sample is at or past the store window's `before`.
@@ -728,7 +729,6 @@ pub(crate) struct View<'a> {
     pub(crate) receipts: &'a Receipts,
     appointment_addresses: &'a BTreeSet<[u8; 32]>,
     pub(crate) pending: bool,
-    pub(crate) time_floor: Option<Timestamp>,
 }
 
 /// State folded from a single stream. A caller resolves at its fresh committed prefix.
@@ -1152,7 +1152,6 @@ impl TransactState {
             receipts: &self.receipts,
             appointment_addresses: &self.appointment_addresses,
             pending: self.pending.is_some(),
-            time_floor: None,
         };
         Self::resolve_in(view, request, position, now, features, claims, authority, None, None).map(|(resolution, _)| resolution)
     }
@@ -1278,7 +1277,7 @@ impl TransactState {
                 .and_then(FundingInput::appointment_observed_at).unwrap_or(Timestamp::MIN);
             BranchCut {
                 basis: Basis::new(head.basis.incarnation(), receipt_position),
-                system_time: now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN)).max(receiver_time),
+                system_time: now.max(head.system_time).max(receiver_time),
             }
         };
         let appointment = match appointment {
@@ -1374,20 +1373,19 @@ impl TransactState {
     }
 
     /// `rtdb.store.v1.Append`, resolved at the ordering point. Its reads are judged
-    /// first. The writer's clock sample `now` is then judged against the window and,
-    /// for writes, is the commit's system time and its stamp's micros, with the
-    /// commit's position as the stamp's version. The sample is never raised to a
-    /// predecessor's: one at or behind the head refuses as [`STORE_CLOCK_BEHIND`],
-    /// and the caller waits it out. A commit's sample must pass the head's because
-    /// system time strictly increases along positions: Default's shared physical
-    /// partition names a transaction by its system time (its stage carries no event
-    /// position, and its recovery groups events into transactions by time). Outside
-    /// the window nothing is decided or recorded, so a retry is judged again.
+    /// first. The writer's clock sample `now` is then judged by
+    /// [`store_clock::judge_store_clock`], the vendored `store_judge::admit`
+    /// (Bijection's `fact_store::persistence::judge::admit`, V9′):
+    /// ties at the head's time are admitted and ordered by position, a sample below
+    /// the head's time faults as [`STORE_CLOCK_REGRESSED`] (never raised, never
+    /// waited out per append), and a sample outside the window decides and records
+    /// nothing so a retry is judged again.
     ///
     /// Every other outcome is a receipt under the request's key, so a retry returns
-    /// the first one: a commit with its stamp, a conflict, or a write-free append's
-    /// validation. A validation is recorded at its own position with no effects; that
-    /// position is the version it validated its reads through.
+    /// the first one: a commit with its stamp `{ micros: now, version: position }`,
+    /// a conflict, or a write-free append's validation. A validation is recorded at
+    /// its own position with no effects; that position is the version it validated
+    /// its reads through.
     #[allow(clippy::too_many_arguments)]
     fn resolve_store(
         view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
@@ -1405,34 +1403,64 @@ impl TransactState {
         }
         check_placeholders(&append.writes)?;
         check_bounds(&append.bounds)?;
-        if view.pending { return Err(pending_error()); }
         let head = view.index.head();
         let mutates = !append.writes.is_empty() || !append.bounds.is_empty();
         let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
             key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
         };
 
-        let guard_time = now.max(head.system_time);
+        let guard_time = now;
         let mut failed = Vec::new();
         for (i, guard) in request.guards.iter().enumerate() {
             if !guard.evaluate(view.index, guard_time, claims, None)? { failed.push(i); }
         }
 
+        let last = (head.basis.position() > 0).then_some(head.system_time.0);
         if failed.is_empty() {
-            // A commit's time is its own sample, past the head's; a validation's sample
-            // is at least the head's, since the store's clock never regresses.
-            let floor = head.system_time.max(view.time_floor.unwrap_or(Timestamp::MIN));
-            if now < floor || (mutates && now == floor) {
-                return Err(Anomaly::new(AnomalyCategory::Busy, STORE_CLOCK_BEHIND, "The writer clock is behind the store's last commit")
-                    .with_context("retry_after_micros", floor.0.saturating_sub(now.0).saturating_add(1).into()));
+            match store_clock::judge_store_clock(
+                head.basis.position(),
+                last,
+                now.0,
+                not_before.map(|t| t.0),
+                before.map(|t| t.0),
+                !mutates,
+            ) {
+                store_judge::Admitted::Regressed => {
+                    return Err(Anomaly::fault(
+                        STORE_CLOCK_REGRESSED,
+                        "The writer clock regressed below the store's last commit",
+                    ));
+                }
+                store_judge::Admitted::Outside(store_judge::Side::Early) => {
+                    return Err(Anomaly::new(
+                        AnomalyCategory::Busy,
+                        STORE_OUTSIDE_EARLY,
+                        "The store append's window has not opened",
+                    )
+                    .with_context("retry_after_micros", not_before.unwrap_or(now).0.saturating_sub(now.0).into()));
+                }
+                store_judge::Admitted::Outside(store_judge::Side::Late) => {
+                    return Err(Anomaly::new(
+                        AnomalyCategory::Conflict,
+                        STORE_OUTSIDE_LATE,
+                        "The store append's window has closed",
+                    ));
+                }
+                store_judge::Admitted::Exhausted => {
+                    return Err(Anomaly::fault("rtdb/transaction-order", "The store version space is exhausted"));
+                }
+                store_judge::Admitted::Validated(_) | store_judge::Admitted::Committed { .. } => {}
             }
-            if let Some(start) = not_before.filter(|start| now < *start) {
-                return Err(Anomaly::new(AnomalyCategory::Busy, STORE_OUTSIDE_EARLY, "The store append's window has not opened")
-                    .with_context("retry_after_micros", start.0.saturating_sub(now.0).into()));
-            }
-            if before.is_some_and(|end| now >= end) {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, STORE_OUTSIDE_LATE, "The store append's window has closed"));
-            }
+        } else if matches!(
+            // A conflict's record takes the sample as its time too, so a
+            // regressed sample faults whatever the reads decided.
+            store_clock::judge_store_clock(head.basis.position(), last, now.0, None, None, true),
+            store_judge::Admitted::Regressed
+        ) {
+            return Err(Anomaly::fault(
+                STORE_CLOCK_REGRESSED,
+                "The writer clock regressed below the store's last commit",
+            ));
         }
 
         // Evaluate bounded-counter ops against the live store state at the
@@ -1462,15 +1490,11 @@ impl TransactState {
         if position <= head.basis.position() {
             return Err(Anomaly::fault("rtdb/transaction-order", "The append must follow the applied prefix"));
         }
-        // Only a commit's time is its sample. A conflict, bound refusal, or
-        // validation carries no stamp: its record takes the next time past the
-        // head when the sample does not pass it, as a native transaction's does.
         let commits = mutates && failed.is_empty() && failed_bound.is_none();
-        let system_time = if commits {
-            now
-        } else {
-            now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN))
-        };
+        // Every store record takes the writer's own clock sample: a conflict's,
+        // a bound refusal's and a validation's too. Ties are admitted and ordered
+        // by position, so no record's time is minted past the head's.
+        let system_time = now;
         let cut = BranchCut { basis: Basis::new(head.basis.incarnation(), position), system_time };
         let mut index = view.index.clone();
         index.advance(cut)?;
@@ -1690,7 +1714,7 @@ impl TransactState {
                 };
                 if self.pending.is_some() || position <= head.basis.position()
                     || Some(receipt.basis.position()) != expected
-                    || receipt.basis.incarnation() != head.basis.incarnation() || receipt.system_time <= head.system_time
+                    || receipt.basis.incarnation() != head.basis.incarnation() || receipt.system_time < head.system_time
                     || receipt.replayed || validate_key(&receipt.key).is_err()
                     || !exact_booking
                     || (matches!(&receipt.outcome, Outcome::Refused { .. }) && !tx.effects.is_empty())

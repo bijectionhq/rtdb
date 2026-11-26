@@ -19,9 +19,10 @@ syntax = "proto3";
 // A stamp is what the store assigns a committing append under its ordering:
 // its version, and the writer's clock sampled at the ordering point, in
 // microseconds. Micros never decrease along versions and are never raised to
-// a predecessor's: a clock reading behind the last commit is waited out. Its
-// 16-byte encoding is the micros big-endian with the sign bit flipped, then
-// the version big-endian, so encoded stamps sort in commit order.
+// a predecessor's; ties are admitted and ordered by version. Regression is a
+// fault of the writer clock, never a per-append wait. Its 16-byte encoding is
+// the micros big-endian with the sign bit flipped, then the version big-endian,
+// so encoded stamps sort in commit order.
 package rtdb.store.v1;
 
 // A half-open key range [start, end). An absent end is unbounded.
@@ -86,6 +87,9 @@ message ReadReply {
   uint64 at = 2;
   // One page per requested range, in request order.
   repeated RangePage pages = 3;
+  // The store's clock sample in microseconds when this read opened, giving the
+  // host one clock domain with commit stamps.
+  optional int64 clock_micros = 4;
 }
 
 message Write {

@@ -340,7 +340,7 @@ mod tests {
         pipeline: &mut TransactPipeline, request: &Transact, scope: Option<ScopedTransact<'_>>, input: FundingInput,
     ) -> Result<Decision> {
         let claims = ClaimSealer::new(INCARNATION, [2; 32]);
-        pipeline.decide_funded(request, Timestamp(3_000_000), FEATURES, &claims, scope, None, input, usize::MAX)
+        pipeline.decide_funded(request, Timestamp(3_000_000), FEATURES, &claims, scope, input, usize::MAX)
     }
 
     fn append(pipeline: &mut TransactPipeline, decision: Decision) -> (Receipt, ResolvedTransact) {

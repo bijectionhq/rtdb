@@ -647,7 +647,7 @@ impl NativeServing {
             && self.durable().tx_status(&request.transaction.key).is_err()
     }
 
-    pub(crate) fn decide_source(&mut self, source: SourcePosition, now: Timestamp, time_floor: Option<Timestamp>, request: Result<SourceRequest>) -> Result<proto::NoOp> {
+    pub(crate) fn decide_source(&mut self, source: SourcePosition, now: Timestamp, request: Result<SourceRequest>) -> Result<proto::NoOp> {
         if !self.source_ready() { return Err(invalid()); }
         let request = match request {
             Ok(_) if !self.view.borrow().compatible => return self.source_reply(source, Err(incompatible())),
@@ -672,9 +672,9 @@ impl NativeServing {
             (Some(input), None | Some(0)) if input.is_appointment() =>
                 Err(rtdb_tx::transact::appointment_unavailable()),
             (Some(funding), Some(limit)) =>
-                pipeline.decide_funded(&request.transaction, now, &features, &request.claims, scope, time_floor, funding, limit),
+                pipeline.decide_funded(&request.transaction, now, &features, &request.claims, scope, funding, limit),
             (Some(_), None) => Err(rtdb_tx::transact::funding_unsupported()),
-            (None, _) => pipeline.decide_after(&request.transaction, now, &features, &request.claims, scope, time_floor),
+            (None, _) => pipeline.decide_after(&request.transaction, now, &features, &request.claims, scope),
         };
         match decision {
             Ok(Decision::Answer(receipt)) => self.source_reply(source, Ok(receipt)),
@@ -1211,7 +1211,7 @@ mod tests {
         let mut transaction = put(1);
         transaction.window.before = Some(Timestamp(90));
         let source = SourcePosition(3);
-        let original = writer.decide_source(source, Timestamp(40), None, Ok(unscoped(transaction.clone()))).unwrap();
+        let original = writer.decide_source(source, Timestamp(40), Ok(unscoped(transaction.clone()))).unwrap();
         assert!(writer.apply_ordered(&original, true, Some((ReplicaPosition(8), Term(2))), |_, _, _, _| unreachable!()).unwrap().is_none());
         assert!(super::retained::apply(Some(&mut retained), &original, partition.snapshot(), SourcePosition(2), ReplicaPosition(8), Term(2), &memory).unwrap().is_none());
         let terminal = writer.progress_timed(Timestamp(41)).unwrap().unwrap();
@@ -1225,7 +1225,7 @@ mod tests {
         assert_eq!(replay.source, source);
         assert_eq!(replay.write.unwrap().0.tx_key().tx_id.0, source.0);
         let witness = InstalledReceipt { source, replica: ReplicaPosition(11), term: Term(2) };
-        let retry = writer.decide_source(SourcePosition(4), Timestamp(43), None, Ok(unscoped(transaction))).unwrap();
+        let retry = writer.decide_source(SourcePosition(4), Timestamp(43), Ok(unscoped(transaction))).unwrap();
         assert!(writer.apply_ordered(&retry, true, Some((ReplicaPosition(12), Term(2))), |_, _, _, _| unreachable!()).unwrap().unwrap().1.unwrap().replayed);
         for serving in [&mut writer, &mut retained] {
             let image = serving.checkpoint(Term(2), true).unwrap().image;
@@ -1245,7 +1245,7 @@ mod tests {
 
         let (mut writer, _) = open(None);
         let source = SourcePosition(3);
-        let fresh = writer.decide_source(source, Timestamp(40), None, Ok(unscoped(put(1)))).unwrap();
+        let fresh = writer.decide_source(source, Timestamp(40), Ok(unscoped(put(1)))).unwrap();
         let (position, _, bytes) = decode(fresh.serving_record.as_deref().unwrap()).unwrap();
         let old_record = decision_message(position, bytes, Some(source), true, false);
         let (mut legacy, _) = open(None);
@@ -1274,7 +1274,7 @@ mod tests {
         let source = SourcePosition(5);
         let envelope = serving.source_authority.seal(NativeRequest { transaction, claims: VerifiedClaims::default(), scope: None, funding: None }).await.unwrap();
         let request = serving.source_authority.open(&envelope).await.unwrap();
-        let message = serving.decide_source(source, Timestamp(40), None, request).unwrap();
+        let message = serving.decide_source(source, Timestamp(40), request).unwrap();
         assert_eq!(message.serving_record.as_deref().unwrap()[0], SOURCE_REPLY_FRAME);
         let (_, reply) = serving.apply(&message, true, |_, _, _, _| unreachable!()).unwrap().unwrap();
         assert_eq!(reply.unwrap_err().code, "rtdb/feature-required");
@@ -1336,7 +1336,7 @@ mod tests {
         let (mut writer, _) = open(None);
         let offset = SourcePosition(7);
         let replica = ReplicaPosition(10);
-        let message = writer.decide_source(offset, Timestamp(40), None, Ok(unscoped(put(1)))).unwrap();
+        let message = writer.decide_source(offset, Timestamp(40), Ok(unscoped(put(1)))).unwrap();
         let (_, receipt) = writer.apply_ordered(&message, true, Some((replica, Term(2))), |_, _, _, _| Ok(())).unwrap().unwrap();
         let receipt = receipt.unwrap();
         let image = writer.checkpoint(Term(2), true).unwrap().image;
@@ -1390,7 +1390,7 @@ mod tests {
             let mut request = put(1);
             request.window.before = Some(Timestamp(80));
             let source = SourcePosition(8);
-            let original = leader.decide_source(source, Timestamp(50), None, Ok(unscoped(request))).unwrap();
+            let original = leader.decide_source(source, Timestamp(50), Ok(unscoped(request))).unwrap();
             assert_eq!(original.src_msg_id, None);
             assert!(!leader.source_ready());
             assert!(leader.apply(&original, true, |_, _, _, _| Ok(())).unwrap().is_none());
@@ -1416,7 +1416,7 @@ mod tests {
         let mut request = put(1);
         request.window.before = Some(Timestamp(80));
         let source = SourcePosition(9);
-        let message = original.decide_source(source, Timestamp(50), None, Ok(unscoped(request.clone()))).unwrap();
+        let message = original.decide_source(source, Timestamp(50), Ok(unscoped(request.clone()))).unwrap();
         let (mut successor, _) = open(None);
         assert!(successor.apply(&message, false, |_, _, _, _| Ok(())).unwrap().is_none());
         successor.withdraw();
@@ -1427,7 +1427,7 @@ mod tests {
         assert!(matches!(&receipt.outcome,
             rtdb_tx::transact::Outcome::Refused { error } if error.code == "rtdb/timed-transaction-refused"));
         let next = SourcePosition(10);
-        let retry = successor.decide_source(next, Timestamp(53), None, Ok(unscoped(request))).unwrap();
+        let retry = successor.decide_source(next, Timestamp(53), Ok(unscoped(request))).unwrap();
         let (retried_at, retry) = successor.apply(&retry, true, |_, _, _, _| Ok(())).unwrap().unwrap();
         assert_eq!(retried_at, next);
         assert!(retry.as_ref().unwrap().replayed);
@@ -1437,8 +1437,8 @@ mod tests {
     #[test]
     fn serving_source_takes_over_from_the_read_back_prefix() {
         let (mut serving, view) = open(None);
-        let first = serving.decide_source(SourcePosition(2), Timestamp(41), None, Ok(unscoped(put(1)))).unwrap();
-        let excluded = serving.decide_source(SourcePosition(3), Timestamp(41), None, Ok(unscoped(put(2)))).unwrap();
+        let first = serving.decide_source(SourcePosition(2), Timestamp(41), Ok(unscoped(put(1)))).unwrap();
+        let excluded = serving.decide_source(SourcePosition(3), Timestamp(41), Ok(unscoped(put(2)))).unwrap();
         let (position, source, bytes) = decode(first.serving_record.as_deref().unwrap()).unwrap();
         let TransactionRecord::Tx(record) = TransactionRecord::decode(bytes).unwrap() else { panic!() };
         assert_eq!((position, source), (1, Some(SourcePosition(2))));
@@ -1452,7 +1452,7 @@ mod tests {
         assert_eq!(serving.apply(&first, false, |_, _, _, _| Ok(())).unwrap().unwrap().0, SourcePosition(2));
         assert!(serving.status(&[1; 16], None).unwrap().replayed);
         assert_eq!(serving.status(&[2; 16], None).unwrap_err().code, "rtdb/unknown-transaction");
-        let reread = serving.decide_source(SourcePosition(3), Timestamp(42), None, Ok(unscoped(put(2)))).unwrap();
+        let reread = serving.decide_source(SourcePosition(3), Timestamp(42), Ok(unscoped(put(2)))).unwrap();
         assert!(serving.apply(&excluded, true, |_, _, _, _| Ok(())).is_err());
         assert_eq!(serving.apply(&reread, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap().basis.position(), 2);
 
@@ -1468,7 +1468,7 @@ mod tests {
             let (mut follower, _) = open(None);
             for batch in (1..=24).collect::<Vec<u8>>().chunks(batch_size) {
                 let messages = batch.iter().map(|&key| {
-                    leader.decide_source(SourcePosition(i64::from(key) * 2), Timestamp(50), None, Ok(unscoped(put(key)))).unwrap()
+                    leader.decide_source(SourcePosition(i64::from(key) * 2), Timestamp(50), Ok(unscoped(put(key)))).unwrap()
                 }).collect::<Vec<_>>();
                 for (&key, message) in batch.iter().zip(messages) {
                     let (position, reply) = leader.apply(&message, true, |_, _, _, _| Ok(())).unwrap().unwrap();
@@ -1491,7 +1491,7 @@ mod tests {
             table: TableRef::new("public", "items"),
             change: Declaration::Visibility(Visibility { column: "label".into() }),
         }];
-        let declared = serving.decide_source(SourcePosition(1), Timestamp(40), None, Ok(unscoped(declaration))).unwrap();
+        let declared = serving.decide_source(SourcePosition(1), Timestamp(40), Ok(unscoped(declaration))).unwrap();
         assert_eq!(serving.apply(&declared, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap().outcome, Outcome::Then);
 
         let scope = NativeServingScope {
@@ -1504,7 +1504,7 @@ mod tests {
         rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![7])));
         let fingerprint = submission.logical_sha256().unwrap();
         let request = NativeRequest { transaction: submission, claims: source::SourceClaims::default(), scope: Some(scope.clone()), funding: None };
-        let message = serving.decide_source(SourcePosition(2), Timestamp(41), None, Ok(request)).unwrap();
+        let message = serving.decide_source(SourcePosition(2), Timestamp(41), Ok(request)).unwrap();
         let receipt = serving.apply(&message, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap();
         let receipt = project_receipt(serving.durable().index(), receipt, Some(&scope)).unwrap();
         assert_eq!(receipt.outcome, Outcome::Then);

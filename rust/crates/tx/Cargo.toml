@@ -32,6 +32,7 @@ async-trait.workspace = true
 bytes.workspace = true
 prost.workspace = true
 sha2.workspace = true
+store_judge = { package = "bijection-store-judge", path = "../../vendor/bijection-store-judge" }
 
 [dev-dependencies]
 rtdb-metrics.workspace = true

@@ -1310,6 +1310,17 @@ name = "bijection-store-filter"
 version = "0.1.0"
 
 [[package]]
+name = "bijection-store-judge"
+version = "0.1.0"
+dependencies = [
+ "bijection-store-read-order",
+]
+
+[[package]]
+name = "bijection-store-read-order"
+version = "0.1.0"
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6034,6 +6045,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "bijection-store-judge",
  "bincode",
  "bytes",
  "ciborium",

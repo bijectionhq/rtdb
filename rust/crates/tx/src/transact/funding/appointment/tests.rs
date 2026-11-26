@@ -72,7 +72,7 @@ fn check_appointment_order(managed_until: Option<Timestamp>) -> Result<()> {
     let decide = |pipeline: &mut TransactPipeline, request: &Transact, command, sample| {
         let input = FundingInput::Appointment { owner: OWNER, command, sample, managed_until };
         let now = if managed_until.is_some() { Timestamp(0) } else { Timestamp(2_000_000) };
-        pipeline.decide_funded(request, now, &[TRANSACT_REQUIRES], &claims, None, None, input, usize::MAX)
+        pipeline.decide_funded(request, now, &[TRANSACT_REQUIRES], &claims, None, input, usize::MAX)
     };
     let status = |pipeline: &TransactPipeline, key: &[u8]| {
         if pipeline.is_deciding(key, namespace) { return Err(pending_error()); }
@@ -169,7 +169,7 @@ fn an_ordered_exclusion_blocks_a_later_consume_without_binding_a_terminal() -> R
         vec![1; 16], absent(&table, receipt_id.clone()), Timestamp(1_950_000),
     )?;
     let decide = |pipeline: &mut TransactPipeline, request: &Transact, command, sample| {
-        pipeline.decide_funded(request, Timestamp(2_000_000), &[TRANSACT_REQUIRES], &claims, None, None,
+        pipeline.decide_funded(request, Timestamp(2_000_000), &[TRANSACT_REQUIRES], &claims, None,
             FundingInput::Appointment { owner: OWNER, command, sample, managed_until: None }, usize::MAX)
     };
     let ordered = decide(&mut pipeline, &prepare, AppointmentCommand::Prepare { predecessor, booking: BOOKING, intent: INTENT },

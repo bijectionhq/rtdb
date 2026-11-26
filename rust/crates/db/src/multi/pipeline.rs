@@ -779,7 +779,7 @@ impl MultiDatabase {
             else if scope.is_some() { SCOPED_FEATURES }
             else { self.write_features() };
         let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
-            .decide_funded(request, now, features, &claims, scope, None, funding, record_limit)?;
+            .decide_funded(request, now, features, &claims, scope, funding, record_limit)?;
         let mut write = match plan(decision, lease, generation, coordinates)? {
             Planned::Answer(receipt) => return self.project_receipt(receipt, scope),
             Planned::Append(write) => write,

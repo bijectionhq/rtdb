@@ -679,9 +679,6 @@ impl BranchIndex {
     }
 
     pub fn advance(&mut self, cut: BranchCut) -> Result<()> {
-        if cut.system_time == self.head.system_time {
-            return Err(Anomaly::fault("rtdb/transaction-order", "The applied transaction cut must advance system time"));
-        }
         self.advance_classic(cut)
     }
 

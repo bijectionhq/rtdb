@@ -19,7 +19,7 @@ use rtdb_index::branches::store::{
 };
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{
-    Guard, Op, Outcome, STORE_BOUND, STORE_CLOCK_BEHIND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
+    Guard, Op, Outcome, STORE_BOUND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
 };
 use rtdb_types::{EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
 use tonic::Status;
@@ -31,10 +31,6 @@ pub(crate) const READ: &str = "rtdb.store.v1.Read";
 pub(crate) const APPEND: &str = "rtdb.store.v1.Append";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const ACTIONS: [&str; 3] = [READ, APPEND, WATCH];
-
-/// How long an append waits out a writer clock behind the store's last commit
-/// (a failover's clock, or two commits in one microsecond) before failing.
-const CLOCK_WAIT: Duration = Duration::from_secs(5);
 
 fn decode<M: Message + Default>(bytes: Bytes) -> Result<M, Status> {
     M::decode(bytes).map_err(|_| error::incorrect("Invalid protobuf request"))
@@ -109,10 +105,11 @@ impl Service {
             .map_err(|refused| error::incorrect(&refused.to_string()))?;
         let mut pages = Vec::with_capacity(request.ranges.len());
         let mut read_at = None;
+        let clock = self.0.node.now();
         for key_range in ranges(request.ranges)? {
             let after = request.after.clone().filter(|after| key_range.contains(after));
             let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone(), reverse: request.reverse };
-            let page = driver.read_store(read, at, self.0.node.now(), &call.cancellation).await.map_err(error::anomaly)?;
+            let page = driver.read_store(read, at, clock, &call.cancellation).await.map_err(error::anomaly)?;
             // Every later range reads the cut the first one selected.
             at = At::Exactly(page.cut.basis);
             read_at = Some(page.cut.basis.position());
@@ -128,6 +125,7 @@ impl Service {
             incarnation: incarnation.to_vec(),
             at: read_at.unwrap_or_default(),
             pages,
+            clock_micros: Some(clock.0),
         }.encode_to_vec())
     }
 
@@ -171,19 +169,7 @@ impl Service {
             custody_request_digest: None,
             request_memory: Some(call.request_reservation()),
         };
-        // The resolver never raises a commit's time to a predecessor's: a clock
-        // behind the last commit is waited out here, then judged again.
-        let deadline = tokio::time::Instant::now() + CLOCK_WAIT;
-        let decided = loop {
-            match driver.transact(transaction.clone(), &call.cancellation).await {
-                Err(behind) if behind.code == STORE_CLOCK_BEHIND && tokio::time::Instant::now() < deadline => {
-                    let micros = behind.context.get("retry_after_micros").and_then(|wait| wait.as_u64()).unwrap_or(1);
-                    if micros < 1_000 { tokio::task::yield_now().await; }
-                    else { tokio::time::sleep(Duration::from_micros(micros).min(MAX_WAIT)).await; }
-                }
-                decided => break decided,
-            }
-        };
+        let decided = driver.transact(transaction, &call.cancellation).await;
         let outcome = match decided {
             Ok(receipt) => {
                 self.check_attachment(call, &database)?;

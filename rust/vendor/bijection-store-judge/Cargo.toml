@@ -1,0 +1,15 @@
+[package]
+name = "bijection-store-judge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "store_judge"
+# The verbatim Bijection file is the crate root, so its `use
+# store_read::order::…` resolves to the extern crate below.
+path = "src/judge.rs"
+doctest = false
+
+[dependencies]
+store_read = { package = "bijection-store-read-order", path = "store-read-order" }

@@ -2200,8 +2200,6 @@ impl ReplicationDriver {
             }
             request => request,
         };
-        let time_floor = serving.shares_main().then(|| leader.resolver().map(|resolver| resolver.resolved_head()))
-            .transpose()?.flatten().map(|key| key.system_time);
         let request = match request {
             Ok(request) if self.logs.default_erasure_kafka_topics().is_some() && serving.needs_erasure_history(&request) => {
                 self.cancellation.run_until_cancelled(self.logs.validate_default_erasure_kafka_history(position, self.read_position))
@@ -2223,7 +2221,7 @@ impl ReplicationDriver {
             }
         }
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
-        let message = serving.decide_source(position, (self.clock)(), time_floor, request)?;
+        let message = serving.decide_source(position, (self.clock)(), request)?;
         let block = self.partition.value().live().block_index();
         leader.cycle.resolved(1)?;
         leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;
