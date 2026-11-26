@@ -2009,6 +2009,7 @@ impl ReplicationDriver {
                     latest_processed_msg_id: boundary.latest_processed_msg_id, external_source_token: boundary.external_source_token.clone(),
                     catalog_sha256: Some(checkpoint_digest(&produced.catalog)?.to_vec()),
                     tries: produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
+                    naming_epoch: crate::blocks::uploaded_naming_epoch(&produced.catalog),
                 });
                 let write = PendingWrite::new(WriteBody::Message(message), pending.block_index(), None, &self.resolve.memory)?;
                 leader.pending.push_back(Arc::clone(&write));

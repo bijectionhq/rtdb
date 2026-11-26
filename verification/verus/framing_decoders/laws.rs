@@ -56,7 +56,7 @@ use crate::decoder::{
     RETIREMENT_MARKER, ReplicaEnvelope, SourceMessage, decode_replica_envelope, decode_replica_outcome_attempt, decode_source_wire,
     encode_replica_envelope, encode_replica_outcome_attempt, encode_source_wire,
 };
-use crate::decoder_leaves::{prost_replica_round_trips, prost_source_round_trips, replica_bytes, source_bytes, valid_stage};
+use crate::decoder_leaves::{framed_replica_body, prost_replica_round_trips, prost_source_round_trips, source_bytes, valid_stage};
 
 #[verus_spec(out =>
     ensures out matches Ok((decoded, retired)) && decoded == attempt && retired == retirement,
@@ -86,7 +86,7 @@ fn a_valid_encoded_replica_envelope_round_trips(original: &ReplicaEnvelope)
     proof! {
         let sequence = match original.term_sequence { Some(sequence) => Some(sequence.0), None => None };
         prost_replica_round_trips(original.term.0, sequence, original.message);
-        assert(bytes@.skip(1) =~= replica_bytes(original.term.0, sequence, original.message));
+        framed_replica_body(original.term.0, sequence, original.message);
         assert(original.term_sequence == (match sequence { Some(value) => Some(TermSequence(value)), None => None }));
     }
     decode_replica_envelope(&bytes)

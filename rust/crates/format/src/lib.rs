@@ -72,6 +72,9 @@ impl log::proto::PublishedObjectVersion {
 
 #[path = "envelope/log_headers.rs"]
 mod log_headers;
-pub use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+pub use log_headers::{
+    LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, RTDB_EXTENSION_STORAGE_VERSION,
+    XTDB_REFUSAL_SUFFIX,
+};
 
 pub mod journal;

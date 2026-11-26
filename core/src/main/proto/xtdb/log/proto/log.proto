@@ -66,6 +66,9 @@ message BlockUploaded {
     bytes external_source_token = 6;
     // SHA-256 of the exact encoded block catalog selected by this upload.
     bytes catalog_sha256 = 7;
+    // The block catalog's naming epoch, when above 0: its compaction outputs carry trie keys XTDB cannot parse,
+    // so the record is framed for XTDB to refuse. See dev/doc/db.allium (XtdbRefusesRtdbExtensionRecords).
+    int64 naming_epoch = 8;
 }
 
 message FlushBlock {

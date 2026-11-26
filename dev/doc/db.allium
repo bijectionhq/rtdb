@@ -637,7 +637,8 @@ variant TxMessage : SourceMessage {
 }
 
 variant ServingTransactMessage : SourceMessage {
-    -- The sealed source admission: the canonical request with its admission context, in the binary record encoding.
+    -- The sealed source admission: the canonical request with its admission context, in the binary record encoding;
+    -- a native rtdb.v1 transaction is framed for an XTDB node to refuse, per XtdbRefusesRtdbExtensionRecords.
     authenticated_request: Bytes
 }
 
@@ -775,6 +776,8 @@ variant BlockUploadedMessage : ReplicaMessage {
     storage_epoch: Integer
     tries: List<trie_cat/TrieDetails>
     external_source_token: ExternalSourceToken?
+    -- The block catalog's naming epoch, present only when above 0, so that the upload is framed for an XTDB node to refuse.
+    naming_epoch: Integer?
 }
 
 variant TriesAddedMessage : ReplicaMessage {
@@ -2117,6 +2120,31 @@ contract CompactorReset {
     @invariant DryRunPlan
         -- A dry run performs the initial catch-up flush and reports the prospective primary catalog and retirements.
         -- Its plan leaves the catalog and files as they stood after that catch-up.
+}
+
+contract XtdbRefusesRtdbExtensionRecords {
+    -- A log record that uses a feature XTDB does not implement is framed so that an XTDB node replaying the log fails on it, instead of skipping it or applying it without that feature.
+    -- A record that uses no such feature keeps XTDB's framing byte for byte.
+
+    @invariant ExtensionSourceRecords
+        -- The source framing header is 4 (RTDB_EXTENSION_LOG_HEADER) for a ServingTransactMessage, for a TxMessage carrying an idempotency, replay or bounded-retry guard, and for a TriesAddedMessage naming a trie of a naming epoch above 0.
+        -- Its protobuf body is the one the plain header (3) would carry.
+        -- XTDB's source decoder accepts only the headers 0xff, 2 and 3, and fails on any other.
+
+    @invariant ExtensionReplicaRecords
+        -- The replica framing header is 4 for a table retirement (TablesRetired), for a TriesAddedMessage naming a trie of a naming epoch above 0, for a TriesDeletedMessage naming such a trie or an L0 trie, and for a BlockUploadedMessage carrying a naming_epoch or naming such a trie.
+        -- The protobuf body is followed by XTDB_REFUSAL_SUFFIX, an oversized_message member naming storage version 0x52544442 (ASCII "RTDB").
+        -- XTDB ignores the replica header byte and keeps the last oneof member on the wire, so it reads the record as an OversizedMessage of a storage version it does not have, and fails on it before fencing or applying it.
+        -- An RTDB reader requires the suffix after header 4, strips it, and reads the body the plain header would carry.
+
+    @invariant RefusalReachesAnOpeningNode
+        -- Once a compactor reset or recovery has started a later naming epoch, every block's upload record carries that epoch.
+        -- An XTDB node opening the store at such a block fails on that block's upload record, which follows the block's boundary in the replica log.
+
+    @invariant PlainRecordsStayPlain
+        -- Every other record keeps header 3 and no suffix, including a ResolvedTxMessage carrying RTDB fields, a TxMessage carrying only a placed attempt seed, and the artefact records.
+        -- Storage keys and block files are unchanged; only log framing marks the extension.
+        -- RTDB readers accept either framing for every kind, so records written before this framing existed still replay.
 }
 
 contract OrderedIndexReplay {

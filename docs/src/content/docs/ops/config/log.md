@@ -125,3 +125,45 @@ When applying a new epoch:
 Once restarted, nodes will begin writing to the new log generation, and prior log history will be disregarded.
 
 :::
+
+## Reading an RTDB log with an XTDB node
+
+RTDB writes the same log and storage formats as XTDB, so an XTDB node can follow a log and store that RTDB wrote — until RTDB uses a feature XTDB does not implement.
+From then on, the XTDB node stops with an error at the first such record, rather than skipping it or applying it without the feature.
+
+These RTDB features mark the records that use them:
+
+Native `rtdb.v1` transactions
+
+: Every source-log record of a native transaction.
+
+Retry guards
+
+: Transactions submitted with an `idempotency_key`, `rtdb_retry_v1` bounded retry or a private replay permit.
+
+Owned-relation retirement
+
+: The replica-log record that retires a table.
+
+Online compactor reset, and recovery from a primary
+
+: Every log record that names a data file of the new naming epoch (keys ending in `-e<epoch>`), and every block's upload record from then on, so that a node opening the store at a later block also stops.
+
+Receipt-table cleanup in Multi mode
+
+: The replica-log record that deletes a receipt table's L0 files, which XTDB never deletes.
+
+A workload that uses none of these keeps writing exactly the records XTDB writes, and stays readable by XTDB.
+Search, vector and entity-history artefact records, and the extra fields RTDB adds to ordinary transactions, are not marked: an XTDB node ignores them without changing any result it returns.
+
+What the XTDB node reports:
+
+Source log
+
+: An error naming `Unknown message type: 4` — RTDB frames these records with header byte 4, which XTDB does not recognise.
+
+Replica log
+
+: `can't resolve oversized message at <id>: written at storage v1381254210/e0, …` — the record ends with a reference to storage version 1381254210 (`0x52544442`, ASCII `RTDB`), which no XTDB release writes.
+
+RTDB never rewrites these records: once a log carries one, an XTDB node stops there every time it replays past it.

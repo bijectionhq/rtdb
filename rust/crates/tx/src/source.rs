@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::{BufMut, Bytes};
 use prost::{Message, encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len}};
 use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array_refs, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
-use rtdb_format::{PROTOBUF_LOG_HEADER, envelope::{SourceBody, SourceMessage}};
+use rtdb_format::{PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, envelope::{SourceBody, SourceMessage}};
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{ArrowDocumentWrite, ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
@@ -494,7 +494,8 @@ impl SourceTransaction {
 
         // Prost writes tx_ops first. Right-align the actual prefix so the IPC stays in place.
         let mut header = &mut encoded[start..SOURCE_PREFIX_SPACE];
-        header.put_u8(PROTOBUF_LOG_HEADER);
+        // Each guard is one of the fields `source_uses_extension` classifies; XTDB would apply the transaction without it.
+        header.put_u8(if self.guard.is_some() { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER });
         encode_key(SOURCE_TX_TAG, WireType::LengthDelimited, &mut header);
         encode_varint(tx_len as u64, &mut header);
         encode_key(TX_OPS_TAG, WireType::LengthDelimited, &mut header);
@@ -3423,6 +3424,8 @@ mod tests {
             let base_charge = memory.used_bytes();
             let actual = source.encode().unwrap();
             assert_eq!(actual.as_slice(), expected.as_slice());
+            let header = if source.guard.is_some() { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER };
+            assert_eq!(actual.as_slice()[0], header, "a guarded transaction is framed for XTDB to refuse");
             let address = actual.as_slice().as_ptr();
             let bytes = actual.into_bytes();
             assert_eq!(bytes.as_ptr(), address);

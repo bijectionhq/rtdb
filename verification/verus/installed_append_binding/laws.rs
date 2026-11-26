@@ -1,10 +1,10 @@
 use crate::decoder::ReplicaEnvelope;
-use crate::decoder_leaves::{Result, replica_from_bytes};
+use crate::decoder_leaves::{Result, replica_from_bytes, replica_wire_body};
 use crate::digest_leaf::sha256;
 use crate::journal_identity::{JournalKey, journal_key_for_grant};
 use crate::production::{chosen_result_at, matches_pending_append};
 use crate::replay_cursor::select_record;
-use crate::{RetainedRecord, AppendClass, Grant, Placement, ReplicaBody, TermSequence, PROTOBUF_LOG_HEADER};
+use crate::{RetainedRecord, AppendClass, Grant, Placement, ReplicaBody, TermSequence};
 use vstd::prelude::*;
 
 verus! {
@@ -52,8 +52,8 @@ fn resolves_detached_payload(proxy: &ReplicaEnvelope, bytes: &[u8]) -> (result: 
         && payload.term == proxy.term && payload.term_sequence == proxy.term_sequence
         && !(payload.message is OversizedMessage)
         && (payload.message matches ReplicaBody::ResolvedTx(tx) ==> tx.acceptance_stage is None)
-        && bytes@.len() > 0 && bytes@[0] == PROTOBUF_LOG_HEADER
-        && (replica_from_bytes(bytes@.skip(1)) matches Some((term, sequence, body))
+        && replica_wire_body(bytes@) matches Some(wire)
+        && (replica_from_bytes(wire) matches Some((term, sequence, body))
             && payload.term.0 == term.unwrap_or(0)
             && payload.term_sequence == match sequence { Some(value) => Some(TermSequence(value)), None => None }
             && body == Some(payload.message))),

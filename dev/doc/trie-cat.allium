@@ -124,6 +124,7 @@ value TrieKey {
     --   l01-r20200106-b00  level 1, historical, week ending 2020-01-06
     --   l02-rc-p0-b00      level 2, current, IID partition 0, block 0
     --   l02-rc-p0-b00-e01  the same position planned in naming epoch 1
+-- XTDB cannot parse a key with an epoch segment, so a log record naming one is framed for an XTDB node to refuse (db.allium: XtdbRefusesRtdbExtensionRecords).
 -- Replica publications of compaction output are admitted only in the current naming epoch.
 -- A checkpoint in a different naming epoch installs its persisted trie catalog before replay continues.
 -- A removal matches the entire trie key, including the naming epoch, in addition to the garbage state.

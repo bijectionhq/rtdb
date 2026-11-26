@@ -151,6 +151,7 @@ impl RecoveredBlockConfirmation {
             external_source_token: catalog.external_source_token().map(<[u8]>::to_vec),
             catalog_sha256: Some(checkpoint_digest(&catalog)?.to_vec()),
             tries: tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
+            naming_epoch: uploaded_naming_epoch(&catalog),
         };
         Ok(Self { catalog, body: ReplicaBody::BlockUploaded(upload), _reservation: reservation })
     }
@@ -180,6 +181,11 @@ pub(crate) fn matches_confirmation(catalog: &BlockCatalog, upload: &proto::Block
         && upload.block_index == Some(catalog.block_index().0)
         && upload.latest_processed_msg_id == catalog.as_proto().latest_processed_msg_id
         && upload.external_source_token.as_deref() == catalog.external_source_token()
+}
+
+/// Recorded only once a compactor reset or recovery has started a later epoch, which XTDB cannot read.
+pub(crate) fn uploaded_naming_epoch(catalog: &BlockCatalog) -> Option<i64> {
+    i64::try_from(catalog.naming_epoch()).ok().filter(|epoch| *epoch > 0)
 }
 
 pub(crate) fn checkpoint_digest(catalog: &BlockCatalog) -> Result<[u8; 32]> {
@@ -891,3 +897,18 @@ pub(crate) fn validate_boundary(catalog: &BlockCatalog, prepared: &BlockPreparat
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::fault("rtdb.replication/invalid-block", message) }
 fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.replication/block-io", error.to_string()) }
 fn check_cancelled(cancellation: &CancellationToken) -> Result<()> { if cancellation.is_cancelled() { Err(crate::progress::cancelled()) } else { Ok(()) } }
+
+#[cfg(test)]
+mod naming_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn an_upload_names_its_catalog_epoch_only_once_a_later_epoch_has_started() {
+        for (epoch, recorded) in [(None, None), (Some(0), None), (Some(2), Some(2))] {
+            let catalog = BlockCatalog::from_proto(block_pb::Block { block_index: Some(1), naming_epoch: epoch, ..Default::default() }).unwrap();
+            assert_eq!(uploaded_naming_epoch(&catalog), recorded);
+            let upload = ReplicaBody::BlockUploaded(proto::BlockUploaded { block_index: Some(1), naming_epoch: recorded, ..Default::default() });
+            assert_eq!(rtdb_format::envelope::replica_uses_extension(&upload), recorded.is_some());
+        }
+    }
+}

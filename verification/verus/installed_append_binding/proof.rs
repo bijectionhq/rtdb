@@ -19,7 +19,7 @@ mod decoder_leaves;
 mod digest_leaf;
 mod laws;
 
-use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_SUFFIX};
 
 #[derive(Clone, Copy)]
 pub enum AppendClass { Data, Maintenance }

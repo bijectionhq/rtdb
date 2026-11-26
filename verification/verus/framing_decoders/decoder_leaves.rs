@@ -1,4 +1,4 @@
-use crate::{PROTOBUF_LOG_HEADER, PlacedAttempt, ReplicaBody, SourceBody};
+use crate::{PROTOBUF_LOG_HEADER, PlacedAttempt, RTDB_EXTENSION_LOG_HEADER, ReplicaBody, SourceBody, XTDB_REFUSAL_SUFFIX};
 use vstd::prelude::*;
 
 pub type SourceBytes = Vec<u8>;
@@ -14,6 +14,43 @@ pub uninterp spec fn valid_stage(body: Option<ReplicaBody>) -> bool;
 pub uninterp spec fn attempt_bytes(attempt: PlacedAttempt) -> Seq<u8>;
 pub uninterp spec fn attempt_from_bytes(bytes: Seq<u8>) -> Option<PlacedAttempt>;
 pub uninterp spec fn replica_bytes(term: i64, sequence: Option<i64>, body: ReplicaBody) -> Seq<u8>;
+pub uninterp spec fn replica_extension(body: ReplicaBody) -> bool;
+
+/// The protobuf body of a framed replica record: after the plain header, or between the extension header and its refusal suffix.
+pub open spec fn replica_wire_body(bytes: Seq<u8>) -> Option<Seq<u8>> {
+    if bytes.len() > 0 && bytes[0] == PROTOBUF_LOG_HEADER {
+        Some(bytes.skip(1))
+    } else if bytes.len() > XTDB_REFUSAL_SUFFIX@.len() && bytes[0] == RTDB_EXTENSION_LOG_HEADER
+        && bytes.skip(bytes.len() - XTDB_REFUSAL_SUFFIX@.len()) == XTDB_REFUSAL_SUFFIX@
+    {
+        Some(bytes.subrange(1, bytes.len() - XTDB_REFUSAL_SUFFIX@.len()))
+    } else {
+        None
+    }
+}
+
+/// How a replica record is framed: a body that uses an RTDB extension takes the extension header and the refusal suffix.
+pub open spec fn replica_framed(term: i64, sequence: Option<i64>, body: ReplicaBody) -> Seq<u8> {
+    if replica_extension(body) {
+        seq![RTDB_EXTENSION_LOG_HEADER] + replica_bytes(term, sequence, body) + XTDB_REFUSAL_SUFFIX@
+    } else {
+        seq![PROTOBUF_LOG_HEADER] + replica_bytes(term, sequence, body)
+    }
+}
+
+/// Every framed replica record yields its own protobuf body back.
+pub proof fn framed_replica_body(term: i64, sequence: Option<i64>, body: ReplicaBody)
+    ensures replica_wire_body(replica_framed(term, sequence, body)) == Some(replica_bytes(term, sequence, body)),
+{
+    let bytes = replica_framed(term, sequence, body);
+    let inner = replica_bytes(term, sequence, body);
+    if replica_extension(body) {
+        assert(bytes.skip(bytes.len() - XTDB_REFUSAL_SUFFIX@.len()) =~= XTDB_REFUSAL_SUFFIX@);
+        assert(bytes.subrange(1, bytes.len() - XTDB_REFUSAL_SUFFIX@.len()) =~= inner);
+    } else {
+        assert(bytes.skip(1) =~= inner);
+    }
+}
 
 #[verifier::external_body]
 pub fn split_header(bytes: &[u8]) -> (out: Option<(u8, &[u8])>)
@@ -52,7 +89,7 @@ pub fn decode_replica(bytes: &[u8]) -> (out: Result<(Option<i64>, Option<i64>, O
 
 #[verifier::external_body]
 pub fn encode_replica(term: i64, sequence: Option<i64>, message: &ReplicaBody) -> (out: Vec<u8>)
-    ensures out@ == seq![PROTOBUF_LOG_HEADER] + replica_bytes(term, sequence, *message),
+    ensures out@ == replica_framed(term, sequence, *message),
 { unimplemented!() }
 
 #[verifier::external_body]
@@ -77,6 +114,12 @@ pub fn encode_attempt(attempt: PlacedAttempt) -> (out: [u8; 96])
 pub fn strip_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> (out: Option<&'a [u8]>)
     ensures (out is Some) == (prefix@.len() <= bytes@.len() && bytes@.take(prefix@.len() as int) == prefix@),
         out matches Some(body) ==> bytes@ == prefix@ + body@ && body@ == bytes@.skip(prefix@.len() as int),
+{ unimplemented!() }
+
+#[verifier::external_body]
+pub fn strip_suffix<'a>(bytes: &'a [u8], suffix: &[u8]) -> (out: Option<&'a [u8]>)
+    ensures (out is Some) == (suffix@.len() <= bytes@.len() && bytes@.skip(bytes@.len() - suffix@.len()) == suffix@),
+        out matches Some(body) ==> bytes@ == body@ + suffix@ && body@ == bytes@.take(bytes@.len() - suffix@.len()),
 { unimplemented!() }
 
 #[verifier::external_body]

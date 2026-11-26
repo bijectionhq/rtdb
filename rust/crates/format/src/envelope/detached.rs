@@ -37,8 +37,8 @@ impl ReplicaEnvelope {
     /// Checks the fetched record against the already-admitted envelope without admitting it a second time.
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         ensures out matches Ok(payload) ==> accepts_detached_frame(*self, payload, bytes@)
-            && bytes@.len() > 0 && bytes@[0] == super::PROTOBUF_LOG_HEADER
-            && (super::decoder_leaves::replica_from_bytes(bytes@.skip(1)) matches Some((term, seq, body))
+            && super::decoder_leaves::replica_wire_body(bytes@) matches Some(wire)
+            && (super::decoder_leaves::replica_from_bytes(wire) matches Some((term, seq, body))
                 && payload.term.0 == term.unwrap_or(0)
                 && payload.term_sequence == match seq { Some(value) => Some(super::TermSequence(value)), None => None }
                 && body == Some(payload.message)),

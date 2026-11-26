@@ -84,7 +84,7 @@ fn raw(position: i64, term: i64, sequence: i64, body: ReplicaBody) -> LogRecord 
 fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary(proto::BlockBoundary { block_index: Some(index), latest_processed_msg_id: Some(source), external_source_token: None }) }
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
 fn upload(index: i64, source: i64) -> ReplicaBody {
-    ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None, catalog_sha256: None })
+    ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None, catalog_sha256: None, naming_epoch: None })
 }
 
 #[tokio::test]
@@ -1701,7 +1701,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
         let boundary_offset = boundary_record.metadata.offset;
         old.consume(boundary_record).await.unwrap();
         let mut production = old.leader.as_mut().unwrap().production.take();
-        let super::ProductionResult::Written(Ok(produced)) = super::pending_production(&mut production).await else {
+        let super::ProductionResult::Written(_, Ok(produced)) = super::pending_production(&mut production).await else {
             panic!("expected the catalog to be persisted before the upload append");
         };
         drop(production);
@@ -3579,6 +3579,7 @@ fn produced_upload(produced: &ProducedBlock, index: i64, source: i64) -> Replica
         storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source),
         tries: produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
         external_source_token: None, catalog_sha256: Some(produced.catalog.publication_sha256().unwrap().to_vec()),
+        naming_epoch: None,
     })
 }
 

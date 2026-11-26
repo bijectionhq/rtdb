@@ -1,19 +1,22 @@
 use super::{PlacedAttempt, ReplicaBody, SourceBody, Term, TermSequence, invalid};
 use super::decoder_leaves::{
     Result, check_stage, decode_attempt, decode_replica, decode_source, encode_attempt, encode_replica, encode_source, join_bytes,
-    legacy_source, SourceBytes, split_header, strip_prefix, unknown_header,
+    legacy_source, SourceBytes, split_header, strip_prefix, strip_suffix, unknown_header,
 };
 use super::wire::scan_external_payload;
-use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_SUFFIX};
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
-use super::decoder_leaves::{attempt_bytes, attempt_from_bytes, replica_bytes, replica_from_bytes, source_bytes, source_from_bytes, valid_stage};
+use super::decoder_leaves::{
+    attempt_bytes, attempt_from_bytes, replica_framed, replica_from_bytes, replica_wire_body, source_bytes, source_from_bytes, valid_stage,
+};
 #[cfg(verus_keep_ghost)]
 use super::wire::scan_complete;
 
 pub const RETIREMENT_MARKER: &[u8; 34] = b"rtdb/placed-receipt-retirement/v1\0";
+
 
 #[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq))]
 pub enum SourceMessage {
@@ -88,27 +91,48 @@ pub(super) fn encode_source_wire(message: &SourceMessage) -> Result<Vec<u8>> {
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures match out {
-        Ok(payload) => bytes@.len() > 0 && bytes@[0] == PROTOBUF_LOG_HEADER && payload@ == bytes@.skip(1),
-        Err(_) => bytes@.len() == 0 || bytes@[0] != PROTOBUF_LOG_HEADER,
+        Ok(payload) => replica_wire_body(bytes@) == Some(payload@),
+        Err(_) => replica_wire_body(bytes@) is None,
     },
 ))]
 fn replica_payload(bytes: &[u8]) -> Result<&[u8]> {
     let (header, payload) = split_header(bytes).ok_or_else(|| invalid("Empty replica message"))?;
-    if header != PROTOBUF_LOG_HEADER { return Err(unknown_header(header, "replica")); }
-    Ok(payload)
+    if header == PROTOBUF_LOG_HEADER { return Ok(payload); }
+    if header != RTDB_EXTENSION_LOG_HEADER { return Err(unknown_header(header, "replica")); }
+    match strip_suffix(payload, &XTDB_REFUSAL_SUFFIX) {
+        Some(body) => {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(bytes@.skip(bytes@.len() - XTDB_REFUSAL_SUFFIX@.len()) =~= payload@.skip(payload@.len() - XTDB_REFUSAL_SUFFIX@.len()));
+                assert(body@ =~= bytes@.subrange(1, bytes@.len() - XTDB_REFUSAL_SUFFIX@.len()));
+            }
+            Ok(body)
+        }
+        None => {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                if payload@.len() >= XTDB_REFUSAL_SUFFIX@.len() {
+                    assert(bytes@.skip(bytes@.len() - XTDB_REFUSAL_SUFFIX@.len()) =~= payload@.skip(payload@.len() - XTDB_REFUSAL_SUFFIX@.len()));
+                }
+            }
+            Err(invalid("RTDB extension replica record is missing its XTDB refusal suffix"))
+        }
+    }
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures
-        out matches Ok(frame) ==> bytes@.len() > 0 && bytes@[0] == PROTOBUF_LOG_HEADER
-            && (replica_from_bytes(bytes@.skip(1)) matches Some((term, sequence, message))
+        out matches Ok(frame) ==> replica_wire_body(bytes@) matches Some(body)
+            && (replica_from_bytes(body) matches Some((term, sequence, message))
             && valid_stage(message)
             && frame.term.0 == term.unwrap_or(0)
             && frame.term_sequence == (match sequence { Some(value) => Some(TermSequence(value)), None => None })
             && frame.message == message),
-        out is Err ==> bytes@.len() == 0 || bytes@[0] != PROTOBUF_LOG_HEADER
-            || replica_from_bytes(bytes@.skip(1)).is_none()
-            || (replica_from_bytes(bytes@.skip(1)) matches Some((_, _, message)) && !valid_stage(message)),
+        out is Err ==> match replica_wire_body(bytes@) {
+            None => true,
+            Some(body) => replica_from_bytes(body).is_none()
+                || (replica_from_bytes(body) matches Some((_, _, message)) && !valid_stage(message)),
+        },
 ))]
 pub(super) fn decode_replica_frame(bytes: &[u8]) -> Result<ReplicaFrame> {
     let payload = replica_payload(bytes)?;
@@ -121,16 +145,18 @@ pub(super) fn decode_replica_frame(bytes: &[u8]) -> Result<ReplicaFrame> {
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures
-        out matches Ok(envelope) ==> bytes@.len() > 0 && bytes@[0] == PROTOBUF_LOG_HEADER
-            && (replica_from_bytes(bytes@.skip(1)) matches Some((term, sequence, message))
+        out matches Ok(envelope) ==> replica_wire_body(bytes@) matches Some(body)
+            && (replica_from_bytes(body) matches Some((term, sequence, message))
             && valid_stage(message)
             && (envelope is None <==> message is None)
             && (envelope matches Some(value) ==> message == Some(value.message)
                 && value.term.0 == term.unwrap_or(0)
                 && value.term_sequence == (match sequence { Some(value) => Some(TermSequence(value)), None => None }))),
-        out is Err ==> bytes@.len() == 0 || bytes@[0] != PROTOBUF_LOG_HEADER
-            || replica_from_bytes(bytes@.skip(1)).is_none()
-            || (replica_from_bytes(bytes@.skip(1)) matches Some((_, _, message)) && !valid_stage(message)),
+        out is Err ==> match replica_wire_body(bytes@) {
+            None => true,
+            Some(body) => replica_from_bytes(body).is_none()
+                || (replica_from_bytes(body) matches Some((_, _, message)) && !valid_stage(message)),
+        },
 ))]
 pub(super) fn decode_replica_envelope(bytes: &[u8]) -> Result<Option<ReplicaEnvelope>> {
     Ok(decode_replica_frame(bytes)?.into_envelope())
@@ -152,8 +178,8 @@ impl ReplicaFrame {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out matches Ok(found) ==> bytes@.len() > 0 && bytes@[0] == PROTOBUF_LOG_HEADER
-        && scan_complete(bytes@.skip(1), 0, found),
+    ensures out matches Ok(found) ==> replica_wire_body(bytes@) matches Some(body)
+        && scan_complete(body, 0, found),
 ))]
 pub(super) fn has_external_payload(bytes: &[u8]) -> Result<bool> {
     let payload = replica_payload(bytes)?;
@@ -162,7 +188,7 @@ pub(super) fn has_external_payload(bytes: &[u8]) -> Result<bool> {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out@ == seq![PROTOBUF_LOG_HEADER] + replica_bytes(envelope.term.0,
+    ensures out@ == replica_framed(envelope.term.0,
         match envelope.term_sequence { Some(sequence) => Some(sequence.0), None => None }, envelope.message),
 ))]
 pub(super) fn encode_replica_envelope(envelope: &ReplicaEnvelope) -> Vec<u8> {
