@@ -2150,6 +2150,67 @@ async fn multi_driver_checkpoints_once_the_retained_journal_suffix_reaches_its_b
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 4).await, Some(Value::Utf8("bounded".into())));
 }
 
+/// A Multi journal trace for `verification/multi/check_journal_trace.lean`,
+/// written to `RTDB_JOURNAL_TRACE_DIR` when that is set.
+struct JournalTrace {
+    name: &'static str,
+    events: Vec<String>,
+    traced: Lsn,
+    captured: BTreeSet<u64>,
+    floor: Lsn,
+}
+
+impl JournalTrace {
+    fn new(name: &'static str) -> Self {
+        Self { name, events: Vec::new(), traced: Lsn(0), captured: BTreeSet::new(), floor: Lsn(1) }
+    }
+
+    /// Records every record the writer applied since the last call, then its trim.
+    fn sync(&mut self, writer: &MultiDatabase) {
+        let state = writer.state();
+        for lsn in self.traced.0 + 1..=state.head.0 {
+            let record = &state.records[(lsn - state.floor.0) as usize];
+            let event = match record {
+                Record::Checkpoint(checkpoint) => {
+                    if self.captured.insert(checkpoint.through) {
+                        self.events.push(format!("capture {}", checkpoint.through));
+                    }
+                    format!("announce {lsn} {}", checkpoint.through)
+                }
+                Record::Tx { .. } => format!("commit {lsn}"),
+                _ => format!("control {lsn}"),
+            };
+            self.events.push(event);
+        }
+        self.traced = state.head;
+        if state.floor != self.floor {
+            self.floor = state.floor;
+            self.events.push(format!("trim {}", state.floor.0 - 1));
+        }
+    }
+
+    fn capture(&mut self, writer: &MultiDatabase, cut: Lsn) {
+        self.sync(writer);
+        assert_eq!(cut, self.traced);
+        self.captured.insert(cut.0);
+        self.events.push(format!("capture {}", cut.0));
+    }
+
+    fn replay(&mut self, writer: &MultiDatabase, fresh: &MultiDatabase) {
+        self.sync(writer);
+        let state = fresh.state();
+        let base = state.base.as_ref().map_or(0, |base| base.announced.0);
+        self.events.push(format!("replay {} {base} {}", state.floor.0, state.head.0));
+    }
+
+    fn write(self) {
+        if let Some(directory) = std::env::var_os("RTDB_JOURNAL_TRACE_DIR") {
+            let path = std::path::Path::new(&directory).join(format!("{}.trace", self.name));
+            std::fs::write(path, self.events.join("\n") + "\n").unwrap();
+        }
+    }
+}
+
 /// The replayed state a writer keeps must equal what a fresh process replays.
 fn assert_same_replay(kept: &MultiDatabase, fresh: &MultiDatabase) {
     let (kept, fresh) = (kept.state(), fresh.state());
@@ -2192,6 +2253,7 @@ async fn deferred_checkpoint_keeps_the_commits_between_its_cut_and_its_announcem
     let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    let mut trace = JournalTrace::new("deferred-checkpoint");
     commit_range(&mut writer, 1..=3, "before the cut").await;
     // A follower that replays from LSN 1 and keeps its prefix across the trim.
     let mut early = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
@@ -2200,6 +2262,7 @@ async fn deferred_checkpoint_keeps_the_commits_between_its_cut_and_its_announcem
 
     let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
     let cut = capture.through();
+    trace.capture(&writer, cut);
     commit_range(&mut writer, 4..=6, "while building").await;
     let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
     commit_range(&mut writer, 7..=8, "after the upload").await;
@@ -2224,6 +2287,7 @@ async fn deferred_checkpoint_keeps_the_commits_between_its_cut_and_its_announcem
     assert_eq!(fresh.retained_floor(), Some(floor));
     assert_texts(&mut fresh, &expected).await;
     assert_same_replay(&writer, &fresh);
+    trace.replay(&writer, &fresh);
     assert_texts(&mut early, &expected).await;
     assert_eq!(early.retained_floor(), Some(floor));
 
@@ -2235,6 +2299,8 @@ async fn deferred_checkpoint_keeps_the_commits_between_its_cut_and_its_announcem
     assert_eq!(late.tick(&live(1)).await.unwrap(), Role::Follower);
     assert_texts(&mut late, &[(2, "before the cut"), (5, "while building"), (9, "after the announcement")]).await;
     assert_same_replay(&writer, &late);
+    trace.replay(&writer, &late);
+    trace.write();
 }
 
 #[tokio::test]
@@ -2242,18 +2308,22 @@ async fn replay_installs_a_classic_floor_then_two_deferred_floors_in_a_row() {
     let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    let mut trace = JournalTrace::new("classic-then-two-deferred");
     commit_range(&mut writer, 1..=2, "first").await;
     // A classic checkpoint: the floor names the checkpoint itself.
+    trace.sync(&writer);
     writer.checkpoint(Vec::new()).await.unwrap();
     let classic = writer.retained_floor().unwrap();
     assert!(matches!(first_record(&writer, classic).await, Record::Checkpoint(_)));
     let mut fresh = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
     assert_same_replay(&writer, &fresh);
+    trace.replay(&writer, &fresh);
 
     commit_range(&mut writer, 3..=4, "second").await;
     let first = writer.capture_checkpoint(1).await.unwrap().unwrap();
     let first_cut = first.through();
+    trace.capture(&writer, first_cut);
     commit_range(&mut writer, 5..=6, "between the first cut and its announcement").await;
     let first = writer.checkpoint_builder().build(first).await.unwrap();
     writer.announce_checkpoint(first).await.unwrap();
@@ -2261,8 +2331,10 @@ async fn replay_installs_a_classic_floor_then_two_deferred_floors_in_a_row() {
 
     // The second cut follows the first announcement.
     commit_range(&mut writer, 7..=8, "third").await;
+    trace.sync(&writer);
     let second = writer.capture_checkpoint(1).await.unwrap().unwrap();
     let second_cut = second.through();
+    trace.capture(&writer, second_cut);
     assert!(second_cut > writer.state().base.as_ref().unwrap().announced);
     commit_range(&mut writer, 9..=10, "between the second cut and its announcement").await;
     let second = writer.checkpoint_builder().build(second).await.unwrap();
@@ -2277,6 +2349,8 @@ async fn replay_installs_a_classic_floor_then_two_deferred_floors_in_a_row() {
     let mut fresh = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
     assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
     assert_same_replay(&writer, &fresh);
+    trace.replay(&writer, &fresh);
+    trace.write();
     let mut expected = vec![(1, "first"), (2, "first"), (3, "second"), (4, "second"), (7, "third"), (8, "third")];
     expected.extend([(5, "between the first cut and its announcement"), (6, "between the first cut and its announcement")]);
     expected.extend([(9, "between the second cut and its announcement"), (10, "between the second cut and its announcement")]);

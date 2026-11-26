@@ -18,6 +18,9 @@ promoting leader's recovery confirmation also reads files of historical
 catalogs (`replication/src/blocks.rs:421-436`); installed journals remove
 that path by deriving the term from the Logkeeper grant (design A459).
 The production enumeration is `rtdb_replication::replay_closure`.
+
+`DeferredBase` at the end models the base selection of an RTDB Multi journal
+replay, where a checkpoint may be announced after its cut.
 -/
 
 set_option warningAsError true
@@ -478,5 +481,210 @@ theorem a_suffix_without_a_checkpoint_can_adopt_block_zero :
 #print axioms an_oversized_upload_reads_its_payload_and_its_decoded_catalog
 #print axioms a_stale_decoded_body_still_needs_its_external_payload
 #print axioms rtdb_replay_fixture_requires_retained_l0_nascent_group_artefacts_and_search_runs
+
+
+/-!
+## Deferred checkpoint base of an RTDB Multi journal
+
+Transcribes the base selection of `rust/crates/db/src/replay.rs`
+(`Committed::read_prefix`, `find_deferred_base`, `announces_deferred`). A
+Multi journal holds transactions, checkpoint records and control records. A
+checkpoint record announces an image of the fold through its cut `through`.
+A classic checkpoint is announced right after its cut. A deferred one
+(`rust/crates/db/src/multi/deferred.rs`) is captured at the cut and announced
+after the commits that ran while it was built, and the writer then trims only
+through the cut.
+
+Replay of a suffix after `trimmed` records selects as its base the first
+retained checkpoint whose cut is `trimmed`, installs its image, and folds every
+retained record from the floor in order. Checkpoint and control records leave
+the fold unchanged, so the announcing record is applied as a check only.
+-/
+
+namespace DeferredBase
+
+inductive Entry (State Tx : Type) where
+  | tx (tx : Tx)
+  | checkpoint (through : Nat) (image : State)
+  | control
+
+variable {State Tx : Type}
+
+def step (applyTx : State → Tx → State) : State → Entry State Tx → State
+  | state, .tx tx => applyTx state tx
+  | state, .checkpoint _ _ => state
+  | state, .control => state
+
+def replay (applyTx : State → Tx → State) (initial : State) (records : List (Entry State Tx)) : State :=
+  records.foldl (step applyTx) initial
+
+/-- The writer's invariant: every checkpoint's image is the fold of the records before its cut. -/
+def Faithful (applyTx : State → Tx → State) (initial : State) (history : List (Entry State Tx)) : Prop :=
+  ∀ through image, Entry.checkpoint through image ∈ history →
+    image = replay applyTx initial (history.take through)
+
+/-- The first retained checkpoint whose cut is the record before the floor. -/
+def baseOf (trimmed : Nat) : List (Entry State Tx) → Option State
+  | [] => none
+  | .checkpoint through image :: rest => if through = trimmed then some image else baseOf trimmed rest
+  | _ :: rest => baseOf trimmed rest
+
+/-- Replay of the suffix retained after `trimmed` records. A suffix from LSN 1 has no base. -/
+def replaySuffix (applyTx : State → Tx → State) (initial : State) (trimmed : Nat)
+    (retained : List (Entry State Tx)) : Option State :=
+  if trimmed = 0 then some (replay applyTx initial retained)
+  else (baseOf trimmed retained).map (fun base => replay applyTx base retained)
+
+/-- The rule before deferred checkpoints: the floor record itself must be the base. -/
+def classicSuffix (applyTx : State → Tx → State) (initial : State) (trimmed : Nat) :
+    List (Entry State Tx) → Option State
+  | records@(.checkpoint through image :: _) =>
+      if trimmed = 0 then some (replay applyTx initial records)
+      else if through = trimmed then some (replay applyTx image records) else none
+  | records => if trimmed = 0 then some (replay applyTx initial records) else none
+
+theorem selected_base_is_retained {trimmed : Nat} {image : State} :
+    ∀ {records : List (Entry State Tx)}, baseOf trimmed records = some image →
+      Entry.checkpoint trimmed image ∈ records
+  | [], found => by simp [baseOf] at found
+  | .checkpoint through candidate :: rest, found => by
+      by_cases same : through = trimmed
+      · simp only [baseOf, same, ite_true, Option.some.injEq] at found
+        subst same; subst found; exact List.mem_cons_self
+      · simp only [baseOf, same, ite_false] at found
+        exact List.mem_cons_of_mem _ (selected_base_is_retained found)
+  | .tx _ :: rest, found => List.mem_cons_of_mem _ (selected_base_is_retained (by simpa [baseOf] using found))
+  | .control :: rest, found => List.mem_cons_of_mem _ (selected_base_is_retained (by simpa [baseOf] using found))
+
+theorem a_retained_checkpoint_of_the_cut_is_selected {trimmed : Nat} {image : State} :
+    ∀ {records : List (Entry State Tx)}, Entry.checkpoint trimmed image ∈ records →
+      (baseOf trimmed records).isSome
+  | [], member => by simp at member
+  | .checkpoint through candidate :: rest, member => by
+      by_cases same : through = trimmed
+      · simp [baseOf, same]
+      · simp only [baseOf, same, ite_false]
+        rcases List.mem_cons.mp member with head | tail
+        · cases head; exact absurd rfl same
+        · exact a_retained_checkpoint_of_the_cut_is_selected tail
+  | .tx _ :: rest, member => by
+      simp only [baseOf]
+      rcases List.mem_cons.mp member with head | tail
+      · cases head
+      · exact a_retained_checkpoint_of_the_cut_is_selected tail
+  | .control :: rest, member => by
+      simp only [baseOf]
+      rcases List.mem_cons.mp member with head | tail
+      · cases head
+      · exact a_retained_checkpoint_of_the_cut_is_selected tail
+
+/-- Installing the selected base and folding the retained records from the
+floor equals replay from LSN 1, whether the base is announced at the floor or
+later in the suffix. -/
+theorem deferred_base_replay_equals_replay_from_lsn_one
+    (applyTx : State → Tx → State) (initial : State) (history : List (Entry State Tx)) (trimmed : Nat)
+    (faithful : Faithful applyTx initial history) (state : State)
+    (replayed : replaySuffix applyTx initial trimmed (history.drop trimmed) = some state) :
+    state = replay applyTx initial history := by
+  unfold replaySuffix at replayed
+  by_cases fromOne : trimmed = 0
+  · subst fromOne
+    simpa using replayed.symm
+  · simp only [fromOne, ite_false, Option.map_eq_some_iff] at replayed
+    obtain ⟨base, selected, rfl⟩ := replayed
+    have image := faithful trimmed base
+      (List.mem_of_mem_drop (selected_base_is_retained selected))
+    rw [image, replay, replay, replay, ← List.foldl_append, List.take_append_drop]
+
+/-- A writer that trims only through a cut it announced leaves a suffix that
+replays: its base is retained, wherever the announcement landed. -/
+theorem trimming_through_an_announced_cut_keeps_a_base
+    (applyTx : State → Tx → State) (initial : State) (history : List (Entry State Tx)) (trimmed : Nat)
+    (image : State) (announced : Entry.checkpoint trimmed image ∈ history.drop trimmed) :
+    (replaySuffix applyTx initial trimmed (history.drop trimmed)).isSome := by
+  unfold replaySuffix
+  by_cases fromOne : trimmed = 0
+  · simp [fromOne]
+  · simp only [fromOne, ite_false, Option.isSome_map]
+    exact a_retained_checkpoint_of_the_cut_is_selected announced
+
+/-- The classic rule is the special case whose base is the floor record. -/
+theorem a_classic_floor_selects_the_same_base
+    (applyTx : State → Tx → State) (initial : State) (trimmed : Nat) (image : State)
+    (rest : List (Entry State Tx)) :
+    replaySuffix applyTx initial trimmed (.checkpoint trimmed image :: rest) =
+      classicSuffix applyTx initial trimmed (.checkpoint trimmed image :: rest) := by
+  by_cases fromOne : trimmed = 0 <;> simp [replaySuffix, classicSuffix, baseOf, fromOne]
+
+/-- The writer protocol of `capture_checkpoint` and `announce_checkpoint`: the
+cut is the head at capture, the image is the fold through it, commits run
+until the announcement, and the trim stops at the cut. -/
+def deferredWrite (applyTx : State → Tx → State) (initial : State) (prefix_ : List (Entry State Tx))
+    (during : List Tx) : List (Entry State Tx) :=
+  prefix_ ++ during.map Entry.tx ++ [.checkpoint prefix_.length (replay applyTx initial prefix_)]
+
+theorem a_deferred_write_keeps_every_commit_after_its_cut
+    (applyTx : State → Tx → State) (initial : State) (prefix_ : List (Entry State Tx)) (during : List Tx)
+    (faithful : Faithful applyTx initial prefix_)
+    (bounded : ∀ through image, Entry.checkpoint through image ∈ prefix_ → through ≤ prefix_.length) :
+    replaySuffix applyTx initial prefix_.length
+        ((deferredWrite applyTx initial prefix_ during).drop prefix_.length) =
+      some (replay applyTx initial (deferredWrite applyTx initial prefix_ during)) := by
+  have whole : Faithful applyTx initial (deferredWrite applyTx initial prefix_ during) := by
+    intro through image member
+    simp only [deferredWrite, List.mem_append, List.mem_map, List.mem_singleton] at member
+    rcases member with (old | ⟨_, _, never⟩) | announced
+    · rw [faithful through image old, deferredWrite, List.append_assoc,
+        List.take_append_of_le_length (bounded through image old)]
+    · cases never
+    · cases announced
+      rw [deferredWrite, List.append_assoc, List.take_append_of_le_length (Nat.le_refl _), List.take_length]
+  have retained : Entry.checkpoint prefix_.length (replay applyTx initial prefix_) ∈
+      (deferredWrite applyTx initial prefix_ during).drop prefix_.length := by
+    simp [deferredWrite]
+  obtain ⟨state, found⟩ := Option.isSome_iff_exists.mp
+    (trimming_through_an_announced_cut_keeps_a_base applyTx initial _ _ _ retained)
+  rw [found, deferred_base_replay_equals_replay_from_lsn_one applyTx initial _ _ whole state found]
+
+/-! Witnesses over natural-number folds, matching the deferred-checkpoint tests in
+`rust/crates/db/src/multi/tests.rs`. -/
+
+def add : Nat → Nat → Nat := (· + ·)
+
+-- Two commits, a cut after them, three commits while building, the announcement, one more commit.
+def oneDeferred : List (Entry Nat Nat) :=
+  [.control, .tx 1, .tx 2, .tx 3, .tx 4, .tx 5, .checkpoint 3 3, .tx 6]
+
+theorem a_deferred_floor_replays_the_commits_between_cut_and_announcement :
+    replaySuffix add 0 3 (oneDeferred.drop 3) = some 21 ∧ replay add 0 oneDeferred = 21 := by decide
+
+theorem an_old_reader_refuses_a_deferred_floor :
+    classicSuffix add 0 3 (oneDeferred.drop 3) = none := by decide
+
+/-- Trimming through the announcement instead of the cut drops the commits
+between them, so no retained checkpoint covers the new floor. -/
+theorem trimming_through_the_announcement_leaves_no_base :
+    replaySuffix add 0 6 (oneDeferred.drop 6) = none := by decide
+
+-- A second deferred checkpoint whose cut follows the first announcement.
+def twoDeferred : List (Entry Nat Nat) :=
+  oneDeferred ++ [.tx 7, .tx 8, .checkpoint 10 36, .tx 9]
+
+theorem two_deferred_checkpoints_in_a_row_select_the_second_base :
+    baseOf 10 (twoDeferred.drop 10) = some 36 ∧ replaySuffix add 0 10 (twoDeferred.drop 10) = some 45 ∧
+      replaySuffix add 0 3 (twoDeferred.drop 3) = some 45 ∧ replay add 0 twoDeferred = 45 := by decide
+
+end DeferredBase
+
+#print axioms DeferredBase.selected_base_is_retained
+#print axioms DeferredBase.a_retained_checkpoint_of_the_cut_is_selected
+#print axioms DeferredBase.deferred_base_replay_equals_replay_from_lsn_one
+#print axioms DeferredBase.trimming_through_an_announced_cut_keeps_a_base
+#print axioms DeferredBase.a_classic_floor_selects_the_same_base
+#print axioms DeferredBase.a_deferred_write_keeps_every_commit_after_its_cut
+#print axioms DeferredBase.a_deferred_floor_replays_the_commits_between_cut_and_announcement
+#print axioms DeferredBase.an_old_reader_refuses_a_deferred_floor
+#print axioms DeferredBase.trimming_through_the_announcement_leaves_no_base
+#print axioms DeferredBase.two_deferred_checkpoints_in_a_row_select_the_second_base
 
 end RTDB.Recovery.ReplayClosure
