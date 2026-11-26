@@ -346,6 +346,18 @@ fn copy_flat_cells(arrays: &[&dyn Array], cells: Selection<'_>) -> Result<ArrayR
     }
 }
 
+// MutableArrayData extends a MonthDayNano interval as i128, which needs 16-byte alignment, while the interval's own layout
+// only promises 8, so a buffer sliced from a larger page can be valid Arrow and still panic the copy.
+fn extendable_data(data: ArrayData) -> ArrayData {
+    if !matches!(data.data_type(), DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano))
+        || data.buffers()[0].as_ptr().align_offset(std::mem::align_of::<i128>()) == 0 {
+        return data;
+    }
+    let values = arrow_buffer::Buffer::from_slice_ref(data.buffers()[0].as_slice());
+    // SAFETY: only the values buffer moves; its bytes, length, offset and null mask are unchanged.
+    unsafe { data.into_builder().buffers(vec![values]).build_unchecked() }
+}
+
 fn copy_flat_ranges(arrays: &[&dyn Array], ranges: &CellRanges) -> Result<Option<ArrayRef>> {
     let layout = arrays[0].data_type();
     let len = ranges.len;
@@ -364,7 +376,7 @@ fn copy_flat_ranges(arrays: &[&dyn Array], ranges: &CellRanges) -> Result<Option
         check_buffer_size(len.checked_mul(width).ok_or_else(size_error)?)?;
     }
 
-    let data = arrays.iter().map(|array| array.to_data()).collect::<Vec<_>>();
+    let data = arrays.iter().map(|array| extendable_data(array.to_data())).collect::<Vec<_>>();
     let capacity = match layout {
         DataType::Utf8 | DataType::Binary => byte_range_capacity::<i32>(arrays, &data, ranges)?,
         DataType::LargeUtf8 | DataType::LargeBinary => byte_range_capacity::<i64>(arrays, &data, ranges)?,
