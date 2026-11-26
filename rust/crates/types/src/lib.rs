@@ -1,4 +1,6 @@
 pub mod directory_io;
+mod future;
+pub use future::{boxed, boxed_with};
 pub mod readset;
 pub mod rtdb_v1;
 pub mod residence_trace;

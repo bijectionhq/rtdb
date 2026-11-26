@@ -890,10 +890,10 @@ impl FlightService for Service {
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
                 .await.map_err(crate::v1::error::map_status)?;
-            return self.v1_action(call, request.into_inner()).await;
+            return rtdb_types::boxed(|| self.v1_action(call, request.into_inner())).await;
         }
         let kind = CallKind::action(self.0.audience.is_some(), name);
-        let mut call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
+        let mut call = rtdb_types::boxed(|| self.call_with_kind(&request, request.get_ref().encoded_len(), kind)).await?;
         let proof_headers = request.metadata().get_all(CLASSIC_RETAINED_PROOF);
         let mut proofs = proof_headers.iter();
         if let Some(proof) = proofs.next() {
@@ -917,7 +917,7 @@ impl FlightService for Service {
         }
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)
             .is_some_and(|encoding| encoding == "stream-v1");
-        self.action(call, request.into_inner(), ipc_stream).await
+        rtdb_types::boxed(|| self.action(call, request.into_inner(), ipc_stream)).await
     }
 }
 

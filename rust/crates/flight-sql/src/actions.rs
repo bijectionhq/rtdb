@@ -132,7 +132,7 @@ impl Service {
             if !self.0.config.owned_native_actions {
                 return Err(call.error(unsupported()));
             }
-            return self.held_read_batch(call, batch, action.body).await;
+            return rtdb_types::boxed(|| self.held_read_batch(call, batch, action.body)).await;
         }
         let ipc_stream = ipc_stream && action.r#type.starts_with("rtdb.owned.")
             && call.session.audience_source().is_none();
@@ -168,7 +168,7 @@ impl Service {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
                     PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V5 | CONFIRM_APPLIED_HOSTED_V6 => {}
                     HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V3 => {
-                        self.confirm_audience_observation(&call).await?;
+                        rtdb_types::boxed(|| self.confirm_audience_observation(&call)).await?;
                     }
                     // These actions only relinquish resources under the authenticated local session.
                     CLOSE_OWNED_READ_V1 | CLOSE_SESSION => {}
@@ -193,15 +193,15 @@ impl Service {
                 _ => None,
             };
             if let Some(wire) = spatial_wire {
-                return self.spatial_held_owned_action(&call, &action.body, wire, ipc_stream).await.map(ActionReplies::Owned);
+                return rtdb_types::boxed(|| self.spatial_held_owned_action(&call, &action.body, wire, ipc_stream)).await.map(ActionReplies::Owned);
             }
             if crate::owned_family::is_family_action(action_type) {
-                return Ok(ActionReplies::Results(vec![Ok(self.assertion_family_action(&call, action_type, &action.body).await?)]));
+                return Ok(ActionReplies::Results(vec![Ok(rtdb_types::boxed(|| self.assertion_family_action(&call, action_type, &action.body)).await?)]));
             }
             let reply_format = if ipc_stream { OwnedReplyFormat::StreamV1 } else { OwnedReplyFormat::Unary };
             let results = match action_type {
-                crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
-                crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.seal_hosted_ranges_action(&call, &action.body)).await?)]),
+                crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.validate_fresh_hosted_action(&call, &action.body)).await?)]),
                 crate::owned_actions::DECIDE_HOSTED_V4 | crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1
                 | crate::owned_actions::DECIDE_HOSTED_PACKED_V1 => {
                     use crate::owned_actions::HostedDecisionWire;
@@ -210,168 +210,168 @@ impl Service {
                         crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1 => HostedDecisionWire::ImportPage,
                         _ => HostedDecisionWire::Packed,
                     };
-                    return self.decide_hosted_action(&call, &action.body, wire, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.decide_hosted_action(&call, &action.body, wire, ipc_stream)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 =>
-                    return self.declare_owned_fixed_range_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_fixed_range_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 =>
-                    return self.declare_owned_capacity_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_capacity_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 =>
-                    return self.declare_owned_single_column_path_action(&call, &action.body, true, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_single_column_path_action(&call, &action.body, true, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V2 =>
-                    return self.declare_owned_single_column_path_action(&call, &action.body, false, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_single_column_path_action(&call, &action.body, false, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_VECTOR_PATH_V1 =>
-                    return self.declare_owned_vector_path_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_vector_path_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::OWNED_SHARED_SEARCH_TEXT_V1 => Ok(vec![Ok(self.owned_shared_search_text_action(&action.body)?)]),
                 crate::owned_actions::OWNED_LAYOUT_CAPABILITIES_V1 => Ok(vec![Ok(self.owned_layout_capabilities_action(&action.body)?)]),
                 crate::owned_actions::OWNED_RELATION_LAYOUT_V1 => Ok(vec![Ok(Box::pin(self.owned_relation_layout_action(&call, &action.body)).await?)]),
                 crate::owned_actions::DECLARE_OWNED_RELATION_V1 | crate::owned_actions::DECLARE_OWNED_RELATION_V2 => {
                     let v2 = action_type == crate::owned_actions::DECLARE_OWNED_RELATION_V2;
-                    return self.declare_owned_relation_action(&call, &action.body, v2, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.declare_owned_relation_action(&call, &action.body, v2, ipc_stream)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V1 =>
-                    return self.drop_owned_spatial_path_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.drop_owned_spatial_path_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V2 =>
-                    return self.drop_owned_spatial_path_batch_action(&call, action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.drop_owned_spatial_path_batch_action(&call, action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V1 =>
-                    return self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::TaggedSpatial, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::TaggedSpatial, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V2 =>
-                    return self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::EncodedSpatial, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::EncodedSpatial, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::OWNED_SPATIAL_READINESS_V1 =>
-                    return self.spatial_path_readiness_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.spatial_path_readiness_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::DECLARE_OWNED_PATH_V1 =>
-                    return self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::CREATE_OWNED_V1 =>
-                    return self.create_owned_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
-                crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
-                crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
+                    return rtdb_types::boxed(|| self.create_owned_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
+                crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.observe_held_hosted_action(&call, &action.body)).await?)]),
+                crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(rtdb_types::boxed(|| self.confirm_applied_hosted_action(&call, &action.body)).await?)]),
                 crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 =>
                     return Box::pin(self.confirm_hosted_source_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V3 | crate::owned_actions::READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1 => {
                     let positioned = action_type == crate::owned_actions::READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1;
-                    return self.read_held_hosted_control_action(&call, &action.body, positioned, reply_format).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.read_held_hosted_control_action(&call, &action.body, positioned, reply_format)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 =>
                     return Box::pin(self.read_held_root_catalog_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
-                crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1 => Ok(vec![Ok(self.offer_funded_mutation_clock_action(&call, &action.body).await?)]),
-                crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
+                crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.offer_funded_mutation_clock_action(&call, &action.body)).await?)]),
+                crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.offer_clock_slot_action(&call, &action.body)).await?)]),
                 COMMIT_OWNED_V1 =>
-                    return self.commit_owned_action(&call, &action.body, CommitFormat::Single, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.commit_owned_action(&call, &action.body, CommitFormat::Single, ipc_stream)).await.map(ActionReplies::Owned),
                 COMMIT_OWNED_V3 | COMMIT_ORDERED_V1 | COMMIT_OWNED_V4 => {
                     let format = if action_type == COMMIT_ORDERED_V1 { CommitFormat::Ordered } else { CommitFormat::Grouped };
-                    return self.commit_owned_witnessed_action(&call, &action.body, format, action_type == COMMIT_OWNED_V4, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.commit_owned_witnessed_action(&call, &action.body, format, action_type == COMMIT_OWNED_V4, ipc_stream)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::COMMIT_OWNED_V7 =>
-                    return self.commit_owned_counted_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
-                crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V2 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::OPEN_OWNED_READ_AT_PUBLICATION_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
+                    return rtdb_types::boxed(|| self.commit_owned_counted_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
+                crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_owned_scoped_read_action(&call, &action.body)).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_owned_read_as_of_action(&call, &action.body, false)).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_AT_PUBLICATION_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_owned_read_as_of_action(&call, &action.body, true)).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_owned_read_action(&call, &action.body)).await?)]),
+                crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_fresh_owned_read_action(&call, &action.body)).await?)]),
                 crate::owned_actions::SPATIAL_GATHER_OWNED =>
                     return Box::pin(self.gather_spatial_owned_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
                     let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
-                    return self.next_spatial_owned_action(&call, &action.body, ranked, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.next_spatial_owned_action(&call, &action.body, ranked, ipc_stream)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::SPATIAL_CLOSE_OWNED => {
                     self.close_spatial_owned_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
+                PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(rtdb_types::boxed(|| self.prepare_applied_read_action(&call, &action.body)).await?)]),
+                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_applied_owned_read_action(&call, &action.body)).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V7 =>
-                    return self.search_held_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.search_held_owned_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::NEAREST_HELD_OWNED_V4 =>
-                    return self.nearest_held_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.nearest_held_owned_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HYBRID_HELD_OWNED_V4 =>
-                    return self.hybrid_held_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.hybrid_held_owned_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HYBRID_HELD_WORLD_V3 =>
-                    return self.hybrid_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.hybrid_held_world_action(&call, &action.body, Current, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HYBRID_HELD_WORLD_AT_V3 =>
-                    return self.hybrid_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.hybrid_held_world_action(&call, &action.body, EarlierEffective, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HYBRID_HELD_WORLD_PARENT_AT_V3 =>
-                    return self.hybrid_held_world_action(&call, &action.body, EarlierParent, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.hybrid_held_world_action(&call, &action.body, EarlierParent, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V3 =>
-                    return self.search_held_world_action(&call, &action.body, EarlierParent, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.search_held_world_action(&call, &action.body, EarlierParent, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::SEARCH_HELD_WORLD_AT_V3 =>
-                    return self.search_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.search_held_world_action(&call, &action.body, EarlierEffective, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::SEARCH_HELD_WORLD_V4 =>
-                    return self.search_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.search_held_world_action(&call, &action.body, Current, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::NEAREST_HELD_WORLD_PARENT_AT_V3 =>
-                    return self.nearest_held_world_action(&call, &action.body, EarlierParent, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.nearest_held_world_action(&call, &action.body, EarlierParent, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::NEAREST_HELD_WORLD_AT_V3 =>
-                    return self.nearest_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.nearest_held_world_action(&call, &action.body, EarlierEffective, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::NEAREST_HELD_WORLD_V3 =>
-                    return self.nearest_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.nearest_held_world_action(&call, &action.body, Current, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_RANGE_AT_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_COUNT_AT_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_RANGE_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_COUNT_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCount, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCount, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_MEASURE_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentMeasure, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentMeasure, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_AT_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRangeAt, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRangeAt, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_V1 =>
-                    return self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRange, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRange, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_RANGE_V1 =>
-                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_RANGE_V2 =>
-                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_RANGE_V3 =>
-                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_RANGE_V4 =>
-                    return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_COUNT_V1 =>
-                    return self.held_owned_count_action(&call, &action.body, false, false, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_count_action(&call, &action.body, false, false, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_COUNT_V2 =>
-                    return self.held_owned_count_action(&call, &action.body, true, false, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_count_action(&call, &action.body, true, false, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_MEASURE_V1 =>
-                    return self.held_owned_count_action(&call, &action.body, false, true, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_count_action(&call, &action.body, false, true, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 =>
-                    return self.held_owned_count_action(&call, &action.body, true, true, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_count_action(&call, &action.body, true, true, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2 | crate::owned_actions::READ_HELD_WORLD_CHANGES_V4 => {
                     let descending = action_type == crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2;
-                    return self.held_world_changes_action(&call, &action.body, descending, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.held_world_changes_action(&call, &action.body, descending, ipc_stream)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 =>
-                    return self.held_world_region_changes_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_region_changes_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 =>
-                    return self.held_owned_storage_usage_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_storage_usage_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2 | crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V4 => {
                     let descending = action_type == crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2;
-                    return self.held_owned_merged_changes_action(&call, &action.body, descending, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.held_owned_merged_changes_action(&call, &action.body, descending, ipc_stream)).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::HELD_LOOKUP_PUBLICATION_V1 => Ok(vec![Ok(self.held_lookup_publication_action(&call, &action.body).await?)]),
-                HELD_TABLE_PUBLICATION_SEQUENCE_V1 => Ok(vec![Ok(self.held_table_publication_sequence_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_LOOKUP_PUBLICATION_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_lookup_publication_action(&call, &action.body)).await?)]),
+                HELD_TABLE_PUBLICATION_SEQUENCE_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_table_publication_sequence_action(&call, &action.body)).await?)]),
                 crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 =>
-                    return self.held_expiry_candidates_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_expiry_candidates_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::APPLY_HELD_EXPIRY_V1 =>
-                    return self.apply_held_expiry_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.apply_held_expiry_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::NOMINATE_HELD_EXPIRY_V1 =>
-                    return self.nominate_held_expiry_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.nominate_held_expiry_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_CHANGES_V3 =>
-                    return self.held_owned_changes_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
-                crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(self.held_owned_unique_action(&call, &action.body).await?)]),
+                    return rtdb_types::boxed(|| self.held_owned_changes_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
+                crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_owned_unique_action(&call, &action.body)).await?)]),
                 crate::owned_actions::READ_HELD_UNIQUE_WINDOW_V1 =>
-                    return self.held_owned_unique_window_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_unique_window_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POINT_V1 =>
-                    return self.held_owned_point(&call, &action.body, PointTime::Default, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_point(&call, &action.body, PointTime::Default, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POINT_V2 =>
-                    return self.held_owned_point(&call, &action.body, PointTime::Optional, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_point(&call, &action.body, PointTime::Optional, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_ABSENT_KEYS_V1 => Ok(vec![Ok(Box::pin(self.held_owned_absent_keys_action(&call, &action.body)).await?)]),
                 crate::owned_actions::HELD_OWNED_FIXED_POINT_V1 =>
-                    return self.held_owned_point(&call, &action.body, PointTime::Required, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_point(&call, &action.body, PointTime::Required, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 =>
-                    return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_VALID_AT_V1 =>
-                    return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_VALID_V2 =>
-                    return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_IDENTITIES_AT_V1 | crate::owned_actions::HELD_WORLD_IDENTITIES_AT_V1
                 | crate::owned_actions::HELD_WORLD_IDENTITIES_V1 | crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_AT_V1
                 | crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => {
@@ -386,82 +386,82 @@ impl Service {
                         HELD_WORLD_OVERLAY_IDENTITIES_AT_V1 => WorldIdentityRead::OverlayAt,
                         _ => WorldIdentityRead::Overlay,
                     };
-                    return self.held_world_identities_action(&call, &action.body, mode, reply_format).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.held_world_identities_action(&call, &action.body, mode, reply_format)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::HELD_PROTECTED_COVERAGE_V2 =>
-                    return self.held_protected_coverage_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V2 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
+                    return rtdb_types::boxed(|| self.held_protected_coverage_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_row_carrier_exists_action(&call, &action.body)).await?)]),
                 crate::owned_actions::HELD_PROTECTED_CARRIERS_V2 =>
-                    return self.held_protected_carriers_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_protected_carriers_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_SEALED_SEARCH_UNIT_ROWS_V2 =>
-                    return self.held_sealed_search_unit_rows_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_sealed_search_unit_rows_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_SHARED_COLUMN_CENSUS_V2 =>
-                    return self.held_world_shared_column_census_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_shared_column_census_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 =>
-                    return self.held_owned_identities_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_identities_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_ALL_VALID_V1 =>
-                    return self.held_owned_identities_all_valid_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
-                crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
-                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V5 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
+                    return rtdb_types::boxed(|| self.held_owned_identities_all_valid_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => rtdb_types::boxed(|| self.held_world_parent_touch_images_action(&call, &action.body, true)).await,
+                crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => rtdb_types::boxed(|| self.held_world_parent_touch_images_action(&call, &action.body, false)).await,
+                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V5 => Ok(vec![Ok(rtdb_types::boxed(|| self.prepare_held_world_overlay_action(&call, &action.body)).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V2 | crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V2 => {
                     let ancestor = action_type == crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V2;
-                    return self.archived_world_changes_action(&call, &action.body, ancestor, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.archived_world_changes_action(&call, &action.body, ancestor, ipc_stream)).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
-                crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
-                crate::owned_actions::HELD_WORLD_VERSION_V2 => self.held_world_version_action(&call, &action.body).await,
-                crate::owned_actions::HELD_WORLD_TOUCH_IMAGES_V1 => self.held_world_path_touch_action(&call, &action.body, true).await,
-                crate::owned_actions::HELD_WORLD_PATH_TOUCH_V1 => self.held_world_path_touch_action(&call, &action.body, false).await,
-                crate::owned_actions::HELD_OWNED_PATH_TOUCH_V2 => self.held_owned_path_touch_action(&call, &action.body).await,
+                crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(rtdb_types::boxed(|| self.held_world_parent_versions_action(&call, &action.body)).await?.into_iter().map(Ok).collect()),
+                crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(rtdb_types::boxed(|| self.held_owned_versions_action(&call, &action.body)).await?.into_iter().map(Ok).collect()),
+                crate::owned_actions::HELD_WORLD_VERSION_V2 => rtdb_types::boxed(|| self.held_world_version_action(&call, &action.body)).await,
+                crate::owned_actions::HELD_WORLD_TOUCH_IMAGES_V1 => rtdb_types::boxed(|| self.held_world_path_touch_action(&call, &action.body, true)).await,
+                crate::owned_actions::HELD_WORLD_PATH_TOUCH_V1 => rtdb_types::boxed(|| self.held_world_path_touch_action(&call, &action.body, false)).await,
+                crate::owned_actions::HELD_OWNED_PATH_TOUCH_V2 => rtdb_types::boxed(|| self.held_owned_path_touch_action(&call, &action.body)).await,
                 crate::owned_actions::HELD_OWNED_HISTORICAL_POINT_V1 =>
-                    return self.held_owned_historical_point(&call, &action.body, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_historical_point(&call, &action.body, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POSITION_POINT_V1 =>
-                    return self.held_owned_position_point(&call, &action.body, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_position_point(&call, &action.body, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_ROOT_CUT_POINT_V1 =>
-                    return self.held_root_cut_point_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_root_cut_point_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_VALID_DURING_V2 =>
-                    return self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Timeline, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Timeline, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_VALID_REGION_V1 =>
-                    return self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Region, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Region, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POSITION_VALID_DURING_V1 =>
-                    return self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Positioned, ipc_stream).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Positioned, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::CLOSE_OWNED_READ_V1 => {
                     self.close_owned_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::PREPARE_REPLAY_PARENT_V1 => Ok(vec![Ok(self.prepare_replay_parent_action(&call, &action.body).await?)]),
-                crate::owned_actions::FINISH_REPLAY_PARENTS_V1 => Ok(vec![Ok(self.finish_replay_parents_action(&call, &action.body).await?)]),
-                crate::owned_actions::RETAIN_REPLAYED_WORLD_V5 => Ok(vec![Ok(self.retain_replayed_world_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_WORLD_READ_V6 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::PREPARE_REPLAY_PARENT_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.prepare_replay_parent_action(&call, &action.body)).await?)]),
+                crate::owned_actions::FINISH_REPLAY_PARENTS_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.finish_replay_parents_action(&call, &action.body)).await?)]),
+                crate::owned_actions::RETAIN_REPLAYED_WORLD_V5 => Ok(vec![Ok(rtdb_types::boxed(|| self.retain_replayed_world_action(&call, &action.body)).await?)]),
+                crate::owned_actions::OPEN_WORLD_READ_V6 => Ok(vec![Ok(rtdb_types::boxed(|| self.open_world_read_action(&call, &action.body)).await?)]),
                 crate::owned_actions::READ_HELD_WORLD_HEAD_V1 => Ok(vec![Ok(self.read_held_world_head_action(&call, &action.body)?)]),
-                crate::owned_actions::SELECT_HELD_WORLD_PARENT_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfParent).await?)]),
+                crate::owned_actions::SELECT_HELD_WORLD_PARENT_AS_OF_V1 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfParent)).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_POINT_AT_V1 =>
-                    return self.held_world_point_at(&call, &action.body, true, None, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal).await?)]),
-                crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal).await?)]),
+                    return rtdb_types::boxed(|| self.held_world_point_at(&call, &action.body, true, None, reply_format)).await.map(ActionReplies::Owned),
+                crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal)).await?)]),
+                crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V2 => Ok(vec![Ok(rtdb_types::boxed(|| self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal)).await?)]),
                 crate::owned_actions::HELD_WORLD_POINT_AT_V2 =>
-                    return self.held_world_point_at(&call, &action.body, false, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_point_at(&call, &action.body, false, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_POINT_V2 =>
-                    return self.held_world_point(&call, &action.body, None, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.held_world_point(&call, &action.body, None, reply_format)).await.map(ActionReplies::Owned),
                 crate::owned_actions::CLOSE_WORLD_READ_V1 => {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V5 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
+                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V5 => Ok(vec![Ok(rtdb_types::boxed(|| self.publish_held_world_retention_action(&call, &action.body)).await?)]),
                 crate::owned_actions::PUBLISH_WORLD_CUT_V2 | crate::owned_actions::DECIDE_WORLD_CUT_V2 => {
-                    Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
-                        action_type == crate::owned_actions::DECIDE_WORLD_CUT_V2).await?)])
+                    Ok(vec![Ok(rtdb_types::boxed(|| self.publish_world_cut_action(&call, &action.body,
+                        action_type == crate::owned_actions::DECIDE_WORLD_CUT_V2)).await?)])
                 }
                 crate::owned_actions::DECIDE_HELD_WORLDS_V3 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2 => {
-                    return self.decide_held_worlds_action(&call, &action.body,
-                        action_type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2, ipc_stream).await.map(ActionReplies::Owned);
+                    return rtdb_types::boxed(|| self.decide_held_worlds_action(&call, &action.body,
+                        action_type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2, ipc_stream)).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::READ_OWNED_V1 =>
-                    return self.read_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return rtdb_types::boxed(|| self.read_owned_action(&call, &action.body, reply_format)).await.map(ActionReplies::Owned),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;
-                    let shared = self.connection(&call, &call.database).await?;
+                    let shared = rtdb_types::boxed(|| self.connection(&call, &call.database)).await?;
                     let shared = shared.borrow().await?;
                     let mut native = call.session.open_native(&call.database, &self.0.node)?;
                     native.state_mut().set_await_token(shared.state().effective_await_token().map(str::to_owned)).map_err(status)?;
@@ -503,8 +503,8 @@ impl Service {
                 }
                 "CreatePreparedStatement" => {
                     let request: ActionCreatePreparedStatementRequest = unpack(&action.body)?;
-                    let connection = self.tx_or_session(&call, request.transaction_id.as_ref()).await?;
-                    let shape = self.prepare_shape(connection, &request.query).await?;
+                    let connection = rtdb_types::boxed(|| self.tx_or_session(&call, request.transaction_id.as_ref())).await?;
+                    let shape = rtdb_types::boxed(|| self.prepare_shape(connection, &request.query)).await?;
                     let scope = request.transaction_id.map_or_else(|| PreparedScope::Session(call.database.clone()), PreparedScope::Transaction);
                     let charge = self.memory().reserve(wire::add(request.query.capacity(), wire::add(call.database.len(), 1024)?)?).map_err(status)?;
                     let prepared = Arc::new(Prepared::new(call.session.owner(), request.query, shape.plan, scope, charge));
@@ -535,7 +535,7 @@ impl Service {
                             }
                             "catalog" => match value.value {
                                 Some(protocol::OptionValue::String(value)) if value.is_empty() => { call.session.select_catalog(None)?; None }
-                                Some(protocol::OptionValue::String(value)) => { if self.admit_database(&value).await? { call.session.select_catalog(Some(value))?; None } else { Some(2) } }
+                                Some(protocol::OptionValue::String(value)) => { if rtdb_types::boxed(|| self.admit_database(&value)).await? { call.session.select_catalog(Some(value))?; None } else { Some(2) } }
                                 _ => Some(2),
                             },
                             "schema" => if matches!(value.value, Some(protocol::OptionValue::String(value)) if value == "public") { None } else { Some(2) },
