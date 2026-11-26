@@ -577,7 +577,7 @@ pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<Logical
 fn non_literal_round_scale(input: &str) -> Anomaly {
     Anomaly::unsupported("xtdb.expression/non-literal-scale", format!("ROUND({input}, INTEGER) with non-constant scale is not supported. Use ROUND(val::DOUBLE, scale) for dynamic scales."))
 }
-fn decimal_scale_error() -> Anomaly { Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Decimal scale exceeds signed 32 bits") }
+fn decimal_scale_error() -> Anomaly { Anomaly::incorrect("xtdb.expression/overflow-error", "Decimal scale exceeds signed 32 bits") }
 fn round_type(source: &LogicalType, scale: Option<i32>, explicit: bool) -> Result<LogicalType> {
     if explicit && source.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16))) {
         return Err(Anomaly::unsupported("xtdb.expression/unsupported-round-type", "ROUND with a scale requires i32 or i64 integer input"));

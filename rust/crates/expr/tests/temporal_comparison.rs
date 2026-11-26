@@ -34,8 +34,8 @@ fn temporal_units_check_overflow_before_comparison() {
         (V::Time { value: i64::MAX, unit: U::Second, bit_width: 64 }, V::Time { value: 0, unit: U::Microsecond, bit_width: 64 }),
         (V::DateDay(i32::MAX), timestamp(0, U::Microsecond, None)),
     ] {
-        assert_eq!(compare(&left, &right, false).unwrap_err().code, "xtdb/numeric-value-out-of-range");
-        assert_eq!(sql_eq(&left, &right, &equality_scope()).unwrap_err().code, "xtdb/numeric-value-out-of-range");
+        assert_eq!(compare(&left, &right, false).unwrap_err().code, "xtdb.expression/overflow-error");
+        assert_eq!(sql_eq(&left, &right, &equality_scope()).unwrap_err().code, "xtdb.expression/overflow-error");
     }
     assert_eq!(compare(&timestamp(i64::MAX, U::Second, Some("UTC")), &timestamp(i64::MIN, U::Second, Some("UTC")), false).unwrap(), Ordering::Greater);
     assert!(compare_in_timezone(&timestamp(i64::MAX, U::Second, Some("UTC")), &timestamp(0, U::Second, None), false, "+01:00").is_err());

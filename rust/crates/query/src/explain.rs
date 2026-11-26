@@ -1098,7 +1098,7 @@ mod rendering_tests {
     #[test]
     fn physical_leaf_semantic_errors_follow_actual_left_to_right_demand() {
         for (values, expected) in [
-            (vec![Value::Time { value: -1, unit: TimeUnit::Nanosecond, bit_width: 64 }, Value::Uri("%".into())], "xtdb/numeric-value-out-of-range"),
+            (vec![Value::Time { value: -1, unit: TimeUnit::Nanosecond, bit_width: 64 }, Value::Uri("%".into())], "xtdb.expression/overflow-error"),
             (vec![Value::Uri("%".into()), Value::Time { value: -1, unit: TimeUnit::Nanosecond, bit_width: 64 }], "xtdb/invalid-uri"),
         ] {
             let memory = MemoryBudget::new(1 << 20);

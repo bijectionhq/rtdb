@@ -142,7 +142,7 @@ fn valid_time_cell(cell: ArrowCell<'_>, name: &str) -> Result<Option<Timestamp>>
     };
     let micros = (i128::from(raw) * 1_000_000).div_euclid(units);
     Ok(Some(Timestamp(i64::try_from(micros).map_err(|_| {
-        Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Numeric overflow")
+        Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error")
     })?)))
 }
 

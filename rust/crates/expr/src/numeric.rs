@@ -44,7 +44,7 @@ pub(crate) fn floating_value(value: f64, ty: &ScalarType) -> Value {
     match ty { ScalarType::F16 => Value::F16(half::f16::from_f64(value).to_bits()), ScalarType::F32 => Value::F32(value as f32), _ => Value::F64(value) }
 }
 
-pub(crate) fn overflow() -> Anomaly { Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Numeric overflow") }
+pub(crate) fn overflow() -> Anomaly { Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error") }
 pub(crate) fn division_by_zero() -> Anomaly { Anomaly::incorrect("xtdb.expression/division-by-zero", "data exception - division by zero") }
 
 pub fn signed_modulo(left: i64, right: i64) -> Result<i64> {

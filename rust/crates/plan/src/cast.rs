@@ -99,8 +99,8 @@ impl CastTarget {
     pub fn decimal(precision: Option<i64>, scale: Option<i64>) -> Result<Self> {
         let Some(precision) = precision else { return Ok(Self::DecimalDefault); };
         if precision > 64 { return Err(Anomaly::incorrect("xtdb.expression/unsupported-precision", format!("Unsupported precision: {precision}"))); }
-        let precision = i32::try_from(precision).map_err(|_| Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Decimal precision exceeds signed 32 bits"))?;
-        let scale = i32::try_from(scale.unwrap_or(0)).map_err(|_| Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Decimal scale exceeds signed 32 bits"))?;
+        let precision = i32::try_from(precision).map_err(|_| Anomaly::incorrect("xtdb.expression/overflow-error", "Decimal precision exceeds signed 32 bits"))?;
+        let scale = i32::try_from(scale.unwrap_or(0)).map_err(|_| Anomaly::incorrect("xtdb.expression/overflow-error", "Decimal scale exceeds signed 32 bits"))?;
         Ok(Self::Fixed(LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width: if precision <= 32 { 128 } else { 256 } })))
     }
 

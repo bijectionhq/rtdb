@@ -3,9 +3,6 @@ use crate::{EvalContext, cast, numeric::{division_by_zero, inapplicable, integer
 use rtdb_plan::{BinaryOp, TemporalField as F};
 use rtdb_types::{CivilDate, DateUnit, LogicalType as L, Result, ScalarType as S, TimeUnit as U, Value, ZoneId};
 
-fn temporal_error(error: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
-    if error.code == "xtdb/numeric-value-out-of-range" { overflow() } else { error }
-}
 fn overflow() -> rtdb_types::Anomaly { rtdb_types::Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error") }
 
 pub(crate) fn strict_call(name: &str) -> bool {
@@ -22,7 +19,7 @@ fn origin() -> Value { timestamp(0,U::Microsecond,Some("UTC".into())) }
 pub(crate) fn call(name: &str,args: &[Value],context: &EvalContext<'_>) -> Option<Result<Value>> {
     let name = canonical(name);
     if !matches!(name,"extract" | "date_trunc" | "age" | "date_bin" | "range_bins" | "current_timestamp" | "current_date" | "current_time" | "current_timezone" | "local_date" | "local_time" | "local_timestamp") { return None; }
-    Some((|| {
+    Some((|| -> Result<Value> {
         if args.iter().any(crate::compare::nullish) { return Ok(Value::Null); }
         match name {
             "extract" | "date_trunc" => {
@@ -48,7 +45,7 @@ pub(crate) fn call(name: &str,args: &[Value],context: &EvalContext<'_>) -> Optio
             "range_bins" => match RangeBins::prepare(args,context)? { Some(bins) => bins.materialize(context), None => Ok(Value::Null) },
             _ => clock(name,args,context),
         }
-    })().map_err(temporal_error))
+    })())
 }
 
 fn clock(name: &str,args: &[Value],context: &EvalContext<'_>) -> Result<Value> {
@@ -211,9 +208,9 @@ impl RangeBins {
         context.reserve(args.iter().try_fold(4096usize,|bytes,value|bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
         rtdb_plan::function_type("range_bins",&args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
         if args.iter().any(crate::compare::nullish) { return Ok(None); }
-        let Value::Duration { value: stride,.. } = cast(&args[0],&L::Scalar(S::Duration(U::Microsecond)),context.timezone).map_err(temporal_error)? else { return Err(inapplicable("range_bins",&[])); };
+        let Value::Duration { value: stride,.. } = cast(&args[0],&L::Scalar(S::Duration(U::Microsecond)),context.timezone)? else { return Err(inapplicable("range_bins",&[])); };
         if stride == 0 { return Err(division_by_zero()); }
-        let convert = |value: &Value| -> Result<i64> { let Value::Timestamp { value,.. } = cast(value,&instant_type(),context.timezone).map_err(temporal_error)? else { return Err(inapplicable("range_bins",&[])); };Ok(value) };
+        let convert = |value: &Value| -> Result<i64> { let Value::Timestamp { value,.. } = cast(value,&instant_type(),context.timezone)? else { return Err(inapplicable("range_bins",&[])); };Ok(value) };
         let from = convert(&args[1])?;let to = convert(&args[2])?;let origin = args.get(3).map(convert).transpose()?.unwrap_or(0);
         let base = from.wrapping_sub(origin).wrapping_div(stride).wrapping_mul(stride).wrapping_add(origin);
         let top = to.wrapping_sub(origin).wrapping_sub(1).wrapping_div(stride).wrapping_add(1).wrapping_mul(stride).wrapping_add(origin);

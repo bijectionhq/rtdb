@@ -33,7 +33,7 @@ impl CastOption {
     pub fn checked_long(&self) -> Result<i64> {
         match self {
             Self::Numeric { checked: Some(value), .. } => Ok(*value),
-            Self::Numeric { checked: None, .. } => Err(Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Cast option exceeds signed 64 bits")),
+            Self::Numeric { checked: None, .. } => Err(Anomaly::incorrect("xtdb.expression/overflow-error", "Cast option exceeds signed 64 bits")),
             Self::Character { value, .. } if *value <= u16::MAX as u32 => Ok(i64::from(*value)),
             other => other.long(),
         }

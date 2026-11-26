@@ -86,7 +86,7 @@ async fn uncorrelated_marks_stop_comparison_but_correlated_values_project_the_wh
     let needle = V::list(vec![V::Timestamp { value: i64::MAX, unit: TimeUnit::Second, timezone: Some("UTC".into()) }]);
     let later = V::list(vec![V::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }]);
     assert_eq!(query("SELECT $1 IN ($1,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL)", vec![needle.clone(),later.clone()]).await.unwrap(), [vec![V::Bool(true)]]);
-    assert_eq!(query("SELECT x IN (x,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL) FROM (VALUES ($1)) t(x)", vec![needle,later]).await.unwrap_err().code, "xtdb/numeric-value-out-of-range");
+    assert_eq!(query("SELECT x IN (x,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL) FROM (VALUES ($1)) t(x)", vec![needle,later]).await.unwrap_err().code, "xtdb.expression/overflow-error");
 }
 
 #[tokio::test]
@@ -96,7 +96,7 @@ async fn scalar_shared_marks_select_hash_candidates_before_temporal_comparison()
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Bool(false)]]);
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,NULL)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Null]]);
     assert_eq!(query("SELECT NULL IN ($1,$1,$1,$1,$1,$1,$1,$1,$1)", vec![needle.clone()]).await.unwrap(), [vec![V::Null]]);
-    assert_eq!(query("SELECT x IN ($2,$2,$2,$2,$2,$2,$2,$2,x) FROM (VALUES ($1)) t(x)", vec![needle,candidate]).await.unwrap_err().code, "xtdb/numeric-value-out-of-range");
+    assert_eq!(query("SELECT x IN ($2,$2,$2,$2,$2,$2,$2,$2,x) FROM (VALUES ($1)) t(x)", vec![needle,candidate]).await.unwrap_err().code, "xtdb.expression/overflow-error");
 }
 
 #[tokio::test]

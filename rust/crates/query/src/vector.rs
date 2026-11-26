@@ -571,7 +571,7 @@ mod tests {
             current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC", outer_rows: &[], snapshot_token: None,
             allocation: Some(&scope), catalog: None };
         for (left, right, code) in [
-            (overflow.clone(), zero.clone(), "xtdb/numeric-value-out-of-range"),
+            (overflow.clone(), zero.clone(), "xtdb.expression/overflow-error"),
             (zero.clone(), overflow, "xtdb.expression/division-by-zero"),
         ] {
             let expr = Expr::binary(BinaryOp::Add, left, right);
