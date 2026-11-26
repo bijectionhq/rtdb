@@ -2373,9 +2373,9 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
     client.update("INSERT INTO classic_only (_id, n) VALUES (1, 50)", None).await;
     assert_eq!(ints(&client.query("SELECT n FROM classic_only FOR ALL VALID_TIME").await), [50]);
     let caps = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
-    assert!(v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap().features.is_empty());
-    let refused_status = client.action("rtdb.v1.TxStatus", status_request.into()).await.unwrap_err();
-    error(refused_status, v1::AnomalyCategory::Unsupported, "rtdb/default-serving-classic-history");
+    assert!(v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap().features.iter().any(|feature| feature == "transact"));
+    let shared_status = client.action("rtdb.v1.TxStatus", status_request.into()).await.unwrap();
+    assert_eq!(v1::Receipt::decode(shared_status[0].body.clone()).unwrap(), replayed);
     running.stop().await;
 }
 
