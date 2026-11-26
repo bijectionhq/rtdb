@@ -243,6 +243,7 @@ pub struct HeldCatalogRead {
     registration: Option<Arc<dyn Send + Sync>>,
     catalog_file_paths: Option<Arc<[String]>>,
     checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+    admitted: std::time::Instant,
 }
 
 impl HeldCatalogRead {
@@ -259,9 +260,10 @@ impl HeldCatalogRead {
     }
 }
 
-/// How long the most recently issued catalog hold outlives its last reader.
-/// Reads that capture the same catalog in quick succession share one storage registration instead of each issuing its own.
-const CATALOG_HOLD_LINGER: Duration = Duration::from_millis(500);
+/// How long after its admission a catalog hold may serve further readers of the same catalog, and outlives its own.
+/// Readers arriving within it share one storage registration; later ones are admitted afresh,
+/// so the store's admission checks (floors, erasure, residence) see every catalog at least this often.
+const CATALOG_HOLD_SHARING: Duration = Duration::from_millis(100);
 
 /// Catalog holds this pool has issued and that a later reader of the same catalog may share.
 #[derive(Default)]
@@ -360,11 +362,12 @@ impl BufferPool {
 
     async fn issue_catalog_hold(&self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>)
         -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        let admitted = std::time::Instant::now();
         let registration = match &paths {
             Some(paths) => self.store.retain_catalog_with_paths(cut, Arc::clone(paths)).await?,
             None => self.store.retain_catalog(cut).await?,
         };
-        self.finish_catalog_hold(cut, paths, registration, None)
+        self.finish_catalog_hold(cut, paths, registration, None, admitted)
     }
 
     pub async fn hold_anchored_catalog(
@@ -378,19 +381,21 @@ impl BufferPool {
     async fn issue_anchored_catalog(
         &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint, paths: Option<Arc<[String]>>,
     ) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        let admitted = std::time::Instant::now();
         let registration = self.store.retain_anchored_catalog(cut, base, paths.clone()).await?;
-        self.finish_catalog_hold(Some(cut), paths, registration, Some(base))
+        self.finish_catalog_hold(Some(cut), paths, registration, Some(base), admitted)
     }
 
     fn finish_catalog_hold(
         &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>,
         registration: Option<Arc<dyn Send + Sync>>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+        admitted: std::time::Instant,
     ) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
         if self.store.defers_trie_releases() && registration.is_none() {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-not-held",
                 "The coordinated storage provider returned no catalog hold"));
         }
-        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths, checkpoint }))
+        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths, checkpoint, admitted }))
     }
 
     /// Re-admit the same scope through the current owner. The old cohort retains
@@ -408,7 +413,7 @@ impl BufferPool {
         Ok(renewed)
     }
 
-    /// A registered hold this pool issued for the same catalog, which has been held without a gap since its admission.
+    /// A hold this pool admitted for exactly this catalog within the sharing window, held without a gap since.
     fn issued_hold(&self, cut: Option<rtdb_types::CatalogCut>, paths: Option<&[String]>, checkpoint: Option<rtdb_types::CatalogCheckpoint>)
         -> Option<Arc<HeldCatalogRead>> {
         let same_checkpoint = |held: &HeldCatalogRead| match (held.checkpoint, checkpoint) {
@@ -416,10 +421,17 @@ impl BufferPool {
             (None, None) => true,
             _ => false,
         };
-        let mut issued = self.issued_holds.lock();
-        issued.live.retain(|held| held.strong_count() > 0);
-        issued.live.iter().filter_map(Weak::upgrade)
-            .find(|held| held.is_registered() && same_checkpoint(held) && self.holds_catalog_with_paths(held, cut, paths))
+        let candidates: Vec<Arc<HeldCatalogRead>> = {
+            let mut issued = self.issued_holds.lock();
+            issued.live.retain(|held| held.strong_count() > 0);
+            issued.live.iter().rev().filter_map(Weak::upgrade).collect()
+        };
+        // Dropping a candidate can release its registration, so the choice is made outside the lock.
+        candidates.into_iter().find(|held| {
+            held.is_registered() && Arc::ptr_eq(&self.residence, &held.residence) && held.cut == cut
+                && held.catalog_file_paths.as_deref() == paths && same_checkpoint(held)
+                && held.admitted.elapsed() < CATALOG_HOLD_SHARING
+        })
     }
 
     fn remember_hold(&self, held: Arc<HeldCatalogRead>) -> Arc<HeldCatalogRead> {
@@ -430,6 +442,7 @@ impl BufferPool {
         };
         let replaced = {
             let mut issued = self.issued_holds.lock();
+            issued.live.retain(|held| held.strong_count() > 0);
             issued.live.push(Arc::downgrade(&held));
             issued.lingering.replace(Arc::clone(&held))
         };
@@ -438,7 +451,7 @@ impl BufferPool {
         let issued = Arc::downgrade(&self.issued_holds);
         let lingering = Arc::downgrade(&held);
         runtime.spawn(async move {
-            tokio::time::sleep(CATALOG_HOLD_LINGER).await;
+            tokio::time::sleep(CATALOG_HOLD_SHARING).await;
             let Some(issued) = issued.upgrade() else { return; };
             let expired = {
                 let mut issued = issued.lock();

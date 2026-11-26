@@ -136,12 +136,18 @@ async fn reads_of_one_catalog_share_a_storage_hold_that_lapses_after_its_readers
 
     let consecutive = pool.hold_catalog(Some(cut)).await?;
     assert_eq!(reader_tickets(location.path()), 1, "a read right after the last one reuses its hold");
-    let newer = pool.hold_catalog(Some(CatalogCut { storage_version: StorageVersion(7), ..cut })).await?;
-    assert!(!std::sync::Arc::ptr_eq(&consecutive, &newer));
+    let later = pool.hold_catalog(Some(CatalogCut { through: ReplicaPosition(2), ..cut })).await?;
+    assert!(!std::sync::Arc::ptr_eq(&consecutive, &later), "a later cut is admitted on its own");
     assert_eq!(reader_tickets(location.path()), 2);
-    drop((consecutive, newer));
+    drop((consecutive, later));
 
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(reader_tickets(location.path()), 0, "an idle pool keeps no catalog held");
+
+    let long_lived = pool.hold_catalog(Some(cut)).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let arriving = pool.hold_catalog(Some(cut)).await?;
+    assert!(!std::sync::Arc::ptr_eq(&long_lived, &arriving), "a reader after the sharing window is admitted afresh");
+    assert_eq!(reader_tickets(location.path()), 2);
     Ok(())
 }

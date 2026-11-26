@@ -527,6 +527,18 @@ pub struct LocalStore {
     mapped: Arc<parking_lot::Mutex<MappedObjects>>,
 }
 
+/// The mappings of every local store on one root, so that removing an object through any of them releases its mapping.
+fn root_mappings(root: &Path) -> Arc<parking_lot::Mutex<MappedObjects>> {
+    static ROOTS: std::sync::LazyLock<parking_lot::Mutex<HashMap<PathBuf, std::sync::Weak<parking_lot::Mutex<MappedObjects>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut roots = ROOTS.lock();
+    roots.retain(|_, mapped| mapped.strong_count() > 0);
+    if let Some(mapped) = roots.get(root).and_then(std::sync::Weak::upgrade) { return mapped; }
+    let mapped = Arc::default();
+    roots.insert(root.to_path_buf(), Arc::downgrade(&mapped));
+    mapped
+}
+
 /// How many local objects stay mapped for scan reads at once.
 const MAPPED_OBJECT_LIMIT: usize = 512;
 
@@ -567,6 +579,8 @@ impl FileIdentity {
 }
 
 impl MappedObjects {
+    fn evict(&mut self, path: &Path) -> Option<MappedObject> { self.entries.remove(path) }
+
     fn get(&mut self, path: &Path, identity: FileIdentity) -> Option<Arc<memmap2::Mmap>> {
         self.clock += 1;
         let clock = self.clock;
@@ -600,7 +614,9 @@ fn mapped_object(mapped: &parking_lot::Mutex<MappedObjects>, path: &Path, key: &
     };
     let identity = FileIdentity::of(&metadata);
     if identity.length == 0 { return Ok((None, 0)); }
-    if let Some(map) = mapped.lock().get(path, identity) { return Ok((Some(map), identity.length)); }
+    let hit = mapped.lock().get(path, identity);
+    sweep_mappings(mapped);
+    if let Some(map) = hit { return Ok((Some(map), identity.length)); }
 
     let file = open_object(path, key)?;
     let opened = FileIdentity::of(&file.metadata().map_err(|error| Error::io(path, error))?);
@@ -611,31 +627,38 @@ fn mapped_object(mapped: &parking_lot::Mutex<MappedObjects>, path: &Path, key: &
     Ok((Some(map), opened.length))
 }
 
-fn remember_mapping(mapped: &parking_lot::Mutex<MappedObjects>, path: &Path, identity: FileIdentity, map: Arc<memmap2::Mmap>) {
-    // A new object usually follows others' removal, so a miss first releases mappings whose files are gone.
+/// Releases, at most once per sweep interval, the mappings whose files were removed or replaced outside this store.
+fn sweep_mappings(mapped: &parking_lot::Mutex<MappedObjects>) {
     let held: Vec<(PathBuf, FileIdentity)> = {
         let mut objects = mapped.lock();
         let due = objects.swept.is_none_or(|swept| swept.elapsed() >= MAPPED_OBJECT_SWEEP);
         if due { objects.swept = Some(std::time::Instant::now()); }
         if due { objects.entries.iter().map(|(path, entry)| (path.clone(), entry.identity)).collect() } else { Vec::new() }
     };
+    if held.is_empty() { return; }
     let stale: Vec<PathBuf> = held.into_iter()
         .filter(|(path, identity)| fs::metadata(path).map_or(true, |metadata| FileIdentity::of(&metadata) != *identity))
         .map(|(path, _)| path).collect();
+    let evicted: Vec<MappedObject> = {
+        let mut objects = mapped.lock();
+        stale.iter().filter_map(|path| objects.evict(path)).collect()
+    };
+    drop(evicted);
+}
+
+fn remember_mapping(mapped: &parking_lot::Mutex<MappedObjects>, path: &Path, identity: FileIdentity, map: Arc<memmap2::Mmap>) {
     let mut evicted = Vec::new();
     {
         let mut objects = mapped.lock();
-        for path in &stale {
-            if let Some(entry) = objects.entries.remove(path) { evicted.push(entry); }
-        }
         while objects.entries.len() >= MAPPED_OBJECT_LIMIT {
             let Some(oldest) = objects.entries.iter().min_by_key(|(_, entry)| entry.used).map(|(path, _)| path.clone()) else { break; };
             if let Some(entry) = objects.entries.remove(&oldest) { evicted.push(entry); }
         }
         objects.clock += 1;
         let used = objects.clock;
-        objects.entries.insert(path.to_path_buf(), MappedObject { map, identity, used });
+        evicted.extend(objects.entries.insert(path.to_path_buf(), MappedObject { map, identity, used }));
     }
+    // Unmapping happens outside the lock.
     drop(evicted);
 }
 
@@ -666,7 +689,8 @@ impl LocalStore {
         let root = selected.as_path();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
-        Ok(Self { root: Arc::new(root), io, catalog: None, mapped: Arc::default() })
+        let mapped = root_mappings(&root);
+        Ok(Self { root: Arc::new(root), io, catalog: None, mapped })
     }
     /// Joins the catalog admission and retirement ledger on a shared local filesystem.
     pub fn with_catalog_ledger(mut self, replica_epoch: rtdb_types::StorageEpoch) -> Self {
@@ -1031,7 +1055,14 @@ impl ObjectStore for LocalStore {
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path(key);
         let root = self.root.clone();
-        self.io.run(move || remove_local_object(&root, &path)).await
+        let mapped = Arc::clone(&self.mapped);
+        self.io.run(move || remove_local_object(&root, &path, &mapped)).await
+    }
+
+    async fn forget(&self, key: &ObjectKey) -> Result<()> {
+        let evicted = self.mapped.lock().evict(&self.path(key));
+        drop(evicted);
+        Ok(())
     }
 
     async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
@@ -1044,14 +1075,22 @@ impl ObjectStore for LocalStore {
         let path = self.path(key);
         let root = self.root.clone();
         let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0)));
+        let mapped = Arc::clone(&self.mapped);
         self.io.read(ledger, ("repair-anchor", key.clone(), block), move |ledger, (_, _, block)| {
-            Ok(ledger.collect_recovery_file(*block, || remove_local_object(&root, &path)))
+            Ok(ledger.collect_recovery_file(*block, || remove_local_object(&root, &path, &mapped)))
         }).await?
     }
 }
 
-fn remove_local_object(root: &Path, path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
+fn remove_local_object(root: &Path, path: &Path, mapped: &parking_lot::Mutex<MappedObjects>) -> Result<()> {
+    // A mapping keeps a removed file's space allocated, so it goes with the file;
+    // the second eviction catches a read that mapped the file again before the unlink.
+    let evicted = mapped.lock().evict(path);
+    drop(evicted);
+    let removed = fs::remove_file(path);
+    let evicted = mapped.lock().evict(path);
+    drop(evicted);
+    match removed {
         Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(Error::io(path, error)),
@@ -1067,5 +1106,28 @@ fn remove_local_object(root: &Path, path: &Path) -> Result<()> {
             }
             Err(error) => return Err(Error::io(parent, error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn removing_an_object_releases_its_mapping() {
+        let location = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalStore::open(location.path()).unwrap());
+        let pool = crate::cache::BufferPool::new(store.clone(), 1 << 20);
+        let (kept, removed) = (ObjectKey::new("tables/t/data/kept.arrow").unwrap(), ObjectKey::new("tables/t/data/removed.arrow").unwrap());
+        for key in [&kept, &removed] {
+            store.put(key, Bytes::from_static(b"page bytes")).await.unwrap();
+            drop(pool.get_scan_range(key, 0..4).await.unwrap());
+        }
+        assert_eq!(store.mapped.lock().entries.len(), 2);
+        store.delete(&removed).await.unwrap();
+        assert!(store.mapped.lock().entries.keys().all(|path| path.ends_with("kept.arrow")));
+        let sibling = LocalStore::open(location.path()).unwrap();
+        sibling.delete(&kept).await.unwrap();
+        assert!(store.mapped.lock().entries.is_empty(), "a store on the same root releases the mapping");
     }
 }
