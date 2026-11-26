@@ -59,6 +59,11 @@ enum Command {
         reply: Reply<()>,
     },
     BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
+    /// A deferred checkpoint built off the database lock, ready to announce.
+    AnnounceCheckpoint {
+        prepared: Result<super::deferred::PreparedCheckpoint>,
+        reply: Reply<Option<rtdb_format::journal::ObjectId>>,
+    },
     Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
     OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
     ReleaseExport { ticket: Vec<u8>, reply: Reply<()> },
@@ -127,7 +132,7 @@ impl WritePipeline {
 
     pub fn start(database: Arc<Mutex<MultiDatabase>>) -> Self {
         let (input, receive) = mpsc::channel(CAPACITY);
-        let task = tokio::spawn(run(Arc::clone(&database), receive));
+        let task = tokio::spawn(run(Arc::clone(&database), receive, input.downgrade()));
         Self { input, task, database, tokens: OnceCell::new() }
     }
 
@@ -340,8 +345,13 @@ pub(super) enum AttemptError {
     Journal(JournalError),
 }
 
-async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Command>) {
+async fn run(
+    database: Arc<Mutex<MultiDatabase>>,
+    mut input: mpsc::Receiver<Command>,
+    announcements: mpsc::WeakSender<Command>,
+) {
     let mut barrier = None;
+    let mut building = false;
     loop {
         let command = match barrier.take() {
             Some(command) => command,
@@ -387,7 +397,41 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
                 let _ = reply.send(result);
             }
             Command::BoundJournal { limit, reply } => {
-                let result = database.lock().await.checkpoint_retained_suffix(limit).await;
+                let mut guard = database.lock().await;
+                if !guard.deferred_checkpoints() {
+                    let result = guard.checkpoint_retained_suffix(limit).await;
+                    let _ = reply.send(result);
+                } else if building {
+                    let _ = reply.send(Ok(None));
+                } else {
+                    match guard.capture_checkpoint(limit).await {
+                        Ok(Some(capture)) => {
+                            let builder = guard.checkpoint_builder();
+                            drop(guard);
+                            building = true;
+                            let announcements = announcements.clone();
+                            tokio::spawn(async move {
+                                let prepared = builder.build(capture).await;
+                                if let Some(input) = announcements.upgrade() {
+                                    let _ = input.send(Command::AnnounceCheckpoint { prepared, reply }).await;
+                                }
+                            });
+                        }
+                        result => {
+                            let _ = reply.send(result.map(|_| None));
+                        }
+                    }
+                }
+            }
+            Command::AnnounceCheckpoint { prepared, reply } => {
+                building = false;
+                let result = match prepared {
+                    Ok(prepared) => match database.lock().await.announce_checkpoint(prepared).await {
+                        Err(error) if error.code == "rtdb/checkpoint-invalidated" => Ok(None),
+                        result => result.map(Some),
+                    },
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Command::Export { pin, basis, until, reply } => {

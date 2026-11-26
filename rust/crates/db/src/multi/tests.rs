@@ -158,6 +158,7 @@ impl Cluster {
         )
         .unwrap()
         .with_binary_checkpoints(true)
+        .with_deferred_checkpoints(std::env::var("RTDB_MULTI_DEFERRED_CHECKPOINTS").as_deref() == Ok("1"))
     }
 }
 
@@ -2160,7 +2161,19 @@ fn assert_same_replay(kept: &MultiDatabase, fresh: &MultiDatabase) {
     assert_eq!(kept.transactions.encode_checkpoint().unwrap(), fresh.transactions.encode_checkpoint().unwrap());
 }
 
+async fn first_record(node: &MultiDatabase, at: Lsn) -> Record {
+    let page = node.stream.read(at).await.unwrap();
+    let (lsn, bytes) = &page.records[0];
+    assert_eq!(*lsn, at);
+    node.stream.decode(*lsn, bytes).await.unwrap().record
+}
 
+async fn writer_with_deferred_checkpoints(cluster: &Cluster, journal: Arc<dyn Journal>) -> MultiDatabase {
+    let mut writer = cluster.node(1, journal).with_deferred_checkpoints(true);
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    writer
+}
 
 async fn commit_range(writer: &mut MultiDatabase, ids: std::ops::RangeInclusive<i64>, text: &str) {
     for id in ids {
@@ -2174,11 +2187,230 @@ async fn assert_texts(node: &mut MultiDatabase, expected: &[(i64, &str)]) {
     }
 }
 
+#[tokio::test]
+async fn deferred_checkpoint_keeps_the_commits_between_its_cut_and_its_announcement() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    commit_range(&mut writer, 1..=3, "before the cut").await;
+    // A follower that replays from LSN 1 and keeps its prefix across the trim.
+    let mut early = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(early.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_eq!(early.retained_floor(), Some(Lsn(1)));
 
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let cut = capture.through();
+    commit_range(&mut writer, 4..=6, "while building").await;
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    commit_range(&mut writer, 7..=8, "after the upload").await;
+    let manifest = writer.announce_checkpoint(prepared).await.unwrap();
 
+    // The floor is the first record after the cut, an ordinary commit. The
+    // checkpoint record that announces the base comes after the retained
+    // commits.
+    let floor = Lsn(cut.0 + 1);
+    assert_eq!(writer.retained_floor(), Some(floor));
+    assert!(matches!(first_record(&writer, floor).await, Record::Tx { .. }));
+    let announced = writer.state().head;
+    assert!(matches!(first_record(&writer, announced).await,
+        Record::Checkpoint(Checkpoint { manifest: id, through, .. }) if id == manifest && through == cut.0));
+    assert!(announced.0 > floor.0 + 4);
 
+    cluster.at(50);
+    let expected = [(1, "before the cut"), (3, "before the cut"), (4, "while building"), (6, "while building"),
+        (7, "after the upload"), (8, "after the upload")];
+    let mut fresh = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_eq!(fresh.retained_floor(), Some(floor));
+    assert_texts(&mut fresh, &expected).await;
+    assert_same_replay(&writer, &fresh);
+    assert_texts(&mut early, &expected).await;
+    assert_eq!(early.retained_floor(), Some(floor));
 
+    // Later commits replay over the same base.
+    commit_range(&mut writer, 9..=9, "after the announcement").await;
+    cluster.at(60);
+    assert_texts(&mut fresh, &[(9, "after the announcement")]).await;
+    let mut late = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(late.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_texts(&mut late, &[(2, "before the cut"), (5, "while building"), (9, "after the announcement")]).await;
+    assert_same_replay(&writer, &late);
+}
 
+#[tokio::test]
+async fn replay_installs_a_classic_floor_then_two_deferred_floors_in_a_row() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    commit_range(&mut writer, 1..=2, "first").await;
+    // A classic checkpoint: the floor names the checkpoint itself.
+    writer.checkpoint(Vec::new()).await.unwrap();
+    let classic = writer.retained_floor().unwrap();
+    assert!(matches!(first_record(&writer, classic).await, Record::Checkpoint(_)));
+    let mut fresh = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_same_replay(&writer, &fresh);
+
+    commit_range(&mut writer, 3..=4, "second").await;
+    let first = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let first_cut = first.through();
+    commit_range(&mut writer, 5..=6, "between the first cut and its announcement").await;
+    let first = writer.checkpoint_builder().build(first).await.unwrap();
+    writer.announce_checkpoint(first).await.unwrap();
+    assert_eq!(writer.retained_floor(), Some(Lsn(first_cut.0 + 1)));
+
+    // The second cut follows the first announcement.
+    commit_range(&mut writer, 7..=8, "third").await;
+    let second = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let second_cut = second.through();
+    assert!(second_cut > writer.state().base.as_ref().unwrap().announced);
+    commit_range(&mut writer, 9..=10, "between the second cut and its announcement").await;
+    let second = writer.checkpoint_builder().build(second).await.unwrap();
+    writer.announce_checkpoint(second).await.unwrap();
+    let floor = Lsn(second_cut.0 + 1);
+    assert_eq!(writer.retained_floor(), Some(floor));
+    // Every retained record is applied once: from the floor through the head.
+    assert_eq!(writer.state().records.len() as u64, writer.state().head.0 + 1 - floor.0);
+    assert_eq!(writer.state().base.as_ref().unwrap().checkpoint.through, second_cut.0);
+
+    cluster.at(50);
+    let mut fresh = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_same_replay(&writer, &fresh);
+    let mut expected = vec![(1, "first"), (2, "first"), (3, "second"), (4, "second"), (7, "third"), (8, "third")];
+    expected.extend([(5, "between the first cut and its announcement"), (6, "between the first cut and its announcement")]);
+    expected.extend([(9, "between the second cut and its announcement"), (10, "between the second cut and its announcement")]);
+    assert_texts(&mut fresh, &expected).await;
+    // The follower that installed the classic floor follows both trims.
+    assert_texts(&mut cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY))), &expected).await;
+}
+
+#[tokio::test]
+async fn deferred_announcement_is_refused_after_a_key_rotation_or_a_new_writer() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    commit_range(&mut writer, 1..=2, "kept").await;
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    writer.rotate_clean_checkpoint(&[]).await.unwrap();
+    let floor = writer.retained_floor();
+    let head = writer.state().head;
+    assert_eq!(writer.announce_checkpoint(prepared).await.unwrap_err().code, "rtdb/checkpoint-invalidated");
+    assert_eq!((writer.retained_floor(), writer.state().head), (floor, head));
+    // While the rotation awaits its retirement no capture is taken.
+    assert!(writer.capture_checkpoint(1).await.unwrap().is_none());
+
+    // A capture under one writer epoch is never announced by another.
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    commit_range(&mut writer, 1..=2, "kept").await;
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    cluster.at(120);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY))).with_deferred_checkpoints(true);
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert!(writer.announce_checkpoint(prepared).await.is_err());
+    assert_eq!(successor.retained_floor(), Some(Lsn(1)));
+    commit_range(&mut successor, 3..=3, "successor").await;
+    assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_some());
+    assert_texts(&mut successor, &[(1, "kept"), (2, "kept"), (3, "successor")]).await;
+}
+
+#[tokio::test]
+async fn an_unannounced_deferred_manifest_leaves_replay_unchanged_and_is_reclaimed() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    commit_range(&mut writer, 1..=3, "committed").await;
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    let orphan = prepared.manifest();
+    assert!(read_manifest(cluster.store.as_ref(), cluster.kms.as_ref(), orphan).await.is_ok());
+    // The writer stops after the upload and before the announcement.
+    drop(writer);
+
+    cluster.at(120);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert_eq!(successor.retained_floor(), Some(Lsn(1)));
+    assert!(!successor.state().records.iter().any(|record| matches!(record, Record::Checkpoint(_))));
+    assert_texts(&mut successor, &[(1, "committed"), (3, "committed")]).await;
+    assert!(successor.collect().await.unwrap() >= 1);
+    assert!(read_manifest(cluster.store.as_ref(), cluster.kms.as_ref(), orphan).await.is_err());
+}
+
+#[tokio::test]
+async fn an_announced_deferred_checkpoint_replays_from_the_old_floor_until_the_next_trim() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = writer_with_deferred_checkpoints(&cluster, gate.clone()).await;
+    commit_range(&mut writer, 1..=2, "before").await;
+    assert!(writer.checkpoint_retained_suffix(1).await.unwrap().is_some());
+    let old_floor = writer.retained_floor().unwrap();
+    commit_range(&mut writer, 3..=4, "cut").await;
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let cut = capture.through();
+    commit_range(&mut writer, 5..=6, "between").await;
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    // The announcement commits and the trim does not.
+    gate.block_trim.store(true, Ordering::SeqCst);
+    assert!(writer.announce_checkpoint(prepared).await.is_err());
+    gate.block_trim.store(false, Ordering::SeqCst);
+    drop(writer);
+
+    cluster.at(50);
+    let expected = [(1, "before"), (2, "before"), (3, "cut"), (4, "cut"), (5, "between"), (6, "between")];
+    let mut fresh = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_eq!(fresh.retained_floor(), Some(old_floor));
+    assert!(fresh.state().records.iter().any(|record| matches!(record,
+        Record::Checkpoint(checkpoint) if checkpoint.through == cut.0)));
+    assert_texts(&mut fresh, &expected).await;
+
+    // The next writer checkpoints again and trims past the old floor.
+    cluster.at(120);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY))).with_deferred_checkpoints(true);
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_some());
+    assert!(successor.retained_floor().unwrap() > Lsn(cut.0));
+    assert_texts(&mut successor, &expected).await;
+    let mut reopened = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(reopened.tick(&live(2)).await.unwrap(), Role::Follower);
+    assert_same_replay(&successor, &reopened);
+}
+
+#[tokio::test]
+async fn the_pipeline_commits_while_a_deferred_checkpoint_builds() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    let writes = Arc::new(WritePipeline::start(Arc::new(Mutex::new(writer))));
+    for id in 1..=4 {
+        writes.transact(put(id as u8, id, "before")).await.unwrap();
+    }
+    let commits = {
+        let writes = Arc::clone(&writes);
+        tokio::spawn(async move {
+            for id in 5..=16 {
+                writes.transact(put(id as u8, id, "concurrent")).await.unwrap();
+            }
+        })
+    };
+    let manifest = writes.bound_journal(1).await.unwrap();
+    commits.await.unwrap();
+    assert!(manifest.is_some());
+    assert!(writes.bound_journal(1_000).await.unwrap().is_none());
+    cluster.at(50);
+    let mut fresh = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert!(fresh.retained_floor().unwrap() > Lsn(1));
+    for id in 1..=16 {
+        assert!(text_at(&mut fresh, MAIN_BRANCH, id).await.is_some(), "row {id}");
+    }
+}
 
 #[tokio::test]
 async fn binary_checkpoints_replay_over_json_checkpoints_and_the_reverse() {

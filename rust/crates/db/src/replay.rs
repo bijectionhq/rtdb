@@ -132,8 +132,24 @@ impl ManifestCache {
     }
 }
 
+/// The retained records reachability reads, captured as data so a writer can
+/// resolve them without holding its database.
+#[derive(Clone)]
+pub(crate) struct ClosureInputs {
+    base: Option<Checkpoint>,
+    records: Vec<Record>,
+}
+
+impl ClosureInputs {
+    pub(crate) async fn resolve(&self, stream: &Stream, store: &dyn ObjectStore, epoch: Epoch) -> Result<Reachability> {
+        closure(stream, store, epoch, self.base.as_ref(), &self.records).await
+    }
+}
+
 /// The checkpoint a replay installed before its first retained record, and
-/// the position of the record that announced it, the floor.
+/// the position of the record that announced it. A classic base is announced
+/// at the floor. A deferred base is announced later in the retained suffix
+/// and covers exactly the records before the floor.
 #[derive(Clone)]
 pub(crate) struct ReplayBase {
     pub(crate) announced: Lsn,
@@ -229,6 +245,29 @@ impl Committed {
             let mut state = previous
                 .take()
                 .unwrap_or_else(|| Self::empty(stream, page.floor));
+            if state.awaiting_base() {
+                let classic = match page.records.first() {
+                    Some((lsn, bytes)) if *lsn == state.floor => matches!(
+                        stream.decode(*lsn, bytes).await.map_err(|error| ReplayError::failed(error, None))?.record,
+                        Record::Checkpoint(checkpoint) if checkpoint.through.checked_add(1) == Some(state.floor.0)
+                    ),
+                    _ => false,
+                };
+                if !classic {
+                    match find_deferred_base(stream, state.floor).await.map_err(|error| ReplayError::failed(error, None))? {
+                        BaseSearch::Found { announced, epoch, checkpoint } => {
+                            state.install_checkpoint(stream, store, announced, epoch, &checkpoint).await
+                                .map_err(|error| ReplayError::failed(error, None))?;
+                            state.generation = checkpoint.key_generation;
+                            state.base = Some(ReplayBase { announced, checkpoint });
+                        }
+                        BaseSearch::Moved(floor) => {
+                            from = floor;
+                            continue;
+                        }
+                    }
+                }
+            }
             for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= end) {
                 let entry = match stream.decode(lsn, &bytes).await {
                     Ok(entry) => entry,
@@ -379,8 +418,8 @@ impl Committed {
                 self.generation
             }
             Record::Checkpoint(checkpoint) => {
-                if checkpoint.through != self.head.0
-                    || checkpoint.key_generation != entry.generation
+                if checkpoint.key_generation != entry.generation
+                    || checkpoint.through != self.head.0 && !self.announces_deferred(checkpoint)
                 {
                     return Err(invalid(
                         "The checkpoint does not cover the preceding position",
@@ -491,6 +530,25 @@ impl Committed {
         Ok(receipt)
     }
 
+    /// A deferred checkpoint describes a cut before the record that announces
+    /// it. The records between stay retained and replay after it, so its cut
+    /// must lie in this suffix, in the current key generation, with no
+    /// restored history installed after it.
+    pub(crate) fn announces_deferred(&self, checkpoint: &Checkpoint) -> bool {
+        let Some(first) = checkpoint.through.checked_add(1) else { return false };
+        !checkpoint.restore
+            && checkpoint.through < self.head.0
+            && first >= self.floor.0
+            && checkpoint.key_generation == self.generation
+            && self.records.get((first - self.floor.0) as usize..).is_some_and(|after| {
+                !after.iter().any(|record| matches!(record,
+                    Record::Checkpoint(Checkpoint { restore: true, .. }) | Record::KeyRotate { .. } | Record::KeyRetirement { .. }))
+            })
+    }
+
+    /// Installs a checkpoint of every record through `self.head`. A classic or
+    /// restored checkpoint is announced at the next position. A deferred base
+    /// is announced later and is never rotating or restored.
     async fn install_checkpoint(
         &mut self,
         stream: &Stream,
@@ -500,8 +558,10 @@ impl Committed {
         checkpoint: &Checkpoint,
     ) -> Result<()> {
         let image = read_manifest(store, stream.kms.as_ref(), checkpoint.manifest).await?;
+        let deferred = next(self.head)? != lsn;
         if checkpoint.manifest.database != stream.database
-            || checkpoint.through != lsn.0 - 1
+            || checkpoint.through != self.head.0
+            || deferred && (lsn <= self.head || checkpoint.restore)
             || image.generation.number != checkpoint.key_generation
         {
             return Err(invalid(
@@ -554,6 +614,7 @@ impl Committed {
         }
         if flags & ROTATING_CHECKPOINT != 0 {
             if checkpoint.restore { return Err(invalid("A restored checkpoint cannot stage a rotation")); }
+            if deferred { return Err(invalid("A deferred checkpoint cannot stage a rotation")); }
             self.rotation = Some(Rotation {
                 cut: lsn,
                 generation: checkpoint.key_generation,
@@ -635,6 +696,20 @@ impl Committed {
     ) -> Result<Reachability> {
         let base = self.base.as_ref().map(|base| &base.checkpoint);
         closure(stream, store, epoch, base, &self.records).await
+    }
+
+    /// The base and the retained records reachability reads, without
+    /// transaction payloads.
+    pub(crate) fn closure_inputs(&self) -> ClosureInputs {
+        ClosureInputs {
+            base: self.base.as_ref().map(|base| base.checkpoint.clone()),
+            records: self.records.iter().filter_map(|record| match record {
+                Record::Tx { objects, .. } if objects.is_empty() => None,
+                Record::Tx { objects, .. } => Some(Record::Tx { payload: Vec::new(), objects: objects.clone() }),
+                Record::Checkpoint(_) | Record::RankedCatalog(_) | Record::Pin(_) | Record::Unpin { .. } => Some(record.clone()),
+                _ => None,
+            }).collect(),
+        }
     }
 
     /// Drops the records before `floor` after this writer trimmed through a
@@ -719,6 +794,46 @@ async fn closure(
         manifests.insert(id, manifest);
     }
     Reachability::from_retained(stream.database, epoch.0, base, records, manifests.values().map(Arc::as_ref))
+}
+
+enum BaseSearch {
+    Found { announced: Lsn, epoch: Epoch, checkpoint: Checkpoint },
+    /// The floor advanced during the search. Replay starts again from it.
+    Moved(Lsn),
+}
+
+/// Finds the deferred base of a suffix whose floor is an ordinary record: the
+/// first retained checkpoint whose cut is the record before the floor. The
+/// writer announces it before trimming, so it lies within the retained head.
+async fn find_deferred_base(stream: &Stream, floor: Lsn) -> Result<BaseSearch> {
+    let mut at = floor;
+    loop {
+        let page = match stream.read(at).await {
+            Ok(page) => page,
+            Err(JournalError::Trimmed { floor: moved }) if moved > floor => return Ok(BaseSearch::Moved(moved)),
+            Err(error) => return Err(journal_error(error)),
+        };
+        if page.floor > floor {
+            return Ok(BaseSearch::Moved(page.floor));
+        }
+        if page.records.first().is_none_or(|(lsn, _)| *lsn != at) {
+            if at > page.head {
+                return Err(invalid("The retained floor names no checkpoint"));
+            }
+            return Err(journal_error(JournalError::Unavailable));
+        }
+        for (lsn, bytes) in page.records {
+            if lsn != at {
+                return Err(journal_error(JournalError::Unavailable));
+            }
+            if let Entry { epoch, record: Record::Checkpoint(checkpoint), .. } = stream.decode(lsn, &bytes).await?
+                && checkpoint.through.checked_add(1) == Some(floor.0)
+            {
+                return Ok(BaseSearch::Found { announced: lsn, epoch, checkpoint });
+            }
+            at = next(lsn)?;
+        }
+    }
 }
 
 async fn find_clean_checkpoint(stream: &Stream, head: Lsn) -> Result<Option<Lsn>> {

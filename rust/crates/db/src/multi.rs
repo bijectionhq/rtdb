@@ -20,6 +20,7 @@ use crate::{
 };
 
 mod classic_migration;
+mod deferred;
 mod pin;
 mod pipeline;
 mod ranked;
@@ -80,6 +81,7 @@ pub struct MultiDatabase {
     last_allocated: Epoch,
     competing_seal: Option<Lease>,
     assigned_follower: Weak<()>,
+    deferred_checkpoints: bool,
     binary_checkpoints: bool,
 }
 
@@ -118,6 +120,7 @@ impl MultiDatabase {
             last_allocated: Epoch(0),
             competing_seal: None,
             assigned_follower: Weak::new(),
+            deferred_checkpoints: false,
             binary_checkpoints: false,
         })
     }
@@ -139,6 +142,18 @@ impl MultiDatabase {
     }
 
     pub fn supports_row_custody(&self) -> bool { self.row_custody }
+
+    /// Takes journal-bound checkpoints off the commit path: the writer
+    /// captures the state under its lock, builds and uploads the manifest
+    /// without it, and announces a checkpoint whose cut precedes the
+    /// announcement. Enable only once every reader of the stream replays a
+    /// deferred base.
+    pub fn with_deferred_checkpoints(mut self, enabled: bool) -> Self {
+        self.deferred_checkpoints = enabled;
+        self
+    }
+
+    pub fn deferred_checkpoints(&self) -> bool { self.deferred_checkpoints }
 
     /// Writes checkpoint transaction state in CBOR instead of JSON. Enable
     /// only once every reader of the stream installs binary checkpoints.
@@ -586,6 +601,11 @@ impl MultiDatabase {
         let retained = state.head.0.saturating_add(1).saturating_sub(state.floor.0);
         if retained < limit || self.state().transactions.pending_erasure().is_some() {
             return Ok(None);
+        }
+        if self.deferred_checkpoints {
+            let Some(capture) = self.capture_checkpoint(limit).await? else { return Ok(None) };
+            let prepared = self.checkpoint_builder().build(capture).await?;
+            return self.announce_checkpoint(prepared).await.map(Some);
         }
         self.checkpoint(Vec::new()).await.map(Some)
     }
