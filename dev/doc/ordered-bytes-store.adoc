@@ -39,7 +39,7 @@ Every outcome but `outside` is a receipt under the append's idempotency key, so 
 The key belongs to its first request; another request under it is refused.
 
 *Derived writes.* A write may be a _derive_ (`AppendRequest.derives`, encoded by Bijection's `store_read::derive` and vendored verbatim as `rust/vendor/bijection-store-derive`), also called retire-on-write.
-It names a row's derived-line manifest prefix, the lookup levels in which its previous line is found (the target world's own, then each ancestor bounded by its fork stamp), an interval `[from, to)` of the `i64` valid axis (`from` may be the stamp's micros), and the row's new derived entries over that interval, or `Purge` on erasure or expiry.
+It names a row's derived-line manifest prefix, the lookup levels in which its previous line is found (the target world's own, then each ancestor bounded by its fork stamp), an interval `[from, to)` of the `i64` valid axis (`from` may be the stamp's micros), and the row's new derived entries over that interval, or `Purge` on erasure or expiry, or `Backfill`: a path backfill's entries for the row's history, written as given and added to the line's inventory so a purge deletes them.
 Each entry is one of four kinds, each with one exact law:
 
 * a _marker_ (a path or posting entry): a stamped enter where its coverage begins, and a stamped leave marker (an empty value) where an entry the new image does not re-enter loses coverage;

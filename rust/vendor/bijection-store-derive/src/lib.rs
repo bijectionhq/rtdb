@@ -43,7 +43,8 @@
 //!
 //! A row's line also keeps the exact inventory of every key it ever
 //! emitted (each manifest version's `written_keys`): markers, singles,
-//! statistics deltas and unretained edged records. Erasure purges that whole
+//! statistics deltas and unretained edged records, and the entries a path
+//! backfill wrote for its history ([`backfill`]). Erasure purges that whole
 //! history ([`purge`], erase-derive): every one of those keys is deleted at
 //! every stamp it was written, so no read at any cut, before the erasure or
 //! after it, counts or reveals the erased row through a derived key. Only an
@@ -237,6 +238,12 @@ pub enum DeriveMode {
     /// row's whole derived history goes, so a read at any cut sums and finds
     /// exactly what it would had the row never been written (erase-derive).
     Purge,
+    /// A path backfill of the row's history (`install_path` over rows held
+    /// before the path existed): write each entry as given (its key already
+    /// names the stored precedence of the event it indexes) and add every
+    /// one to the line's inventory, so a purge deletes them with the rest.
+    /// The line's segments are unchanged (erase-derive).
+    Backfill { writes: Vec<(Vec<u8>, Vec<u8>)> },
 }
 
 /// One derived write of a store append (`fact_store::persistence::Derive`).
@@ -828,6 +835,11 @@ pub fn check(derive: &Derive) -> Result<(), DeriveError> {
             return Err(DeriveError::new("A derive lookup level must stay in the manifest's partition"));
         }
     }
+    if let DeriveMode::Backfill { writes } = &derive.mode
+        && writes.iter().any(|(key, _)| !same_place(key, &derive.manifest_prefix))
+    {
+        return Err(DeriveError::new("A backfilled entry must stay in the manifest's partition and world"));
+    }
     if let DeriveMode::Replace { interval, entries } = &derive.mode {
         match *interval {
             DeriveInterval::Fixed { from, to } if from >= to => {
@@ -1201,6 +1213,25 @@ pub fn line_through<'a>(manifest_prefix: &[u8], stored_manifests: &'a [(Vec<u8>,
         .next_back()
 }
 
+/// Apply one `DeriveMode::Backfill` step to the row's previous line: emit
+/// each backfilled entry as given, confined to the manifest's place (P10),
+/// and keep the line's segments and horizon with those keys as this step's
+/// inventory, so a purge deletes them (erase-derive). Total.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn backfill(manifest_prefix: &[u8], previous: &Manifest, writes: &[(Vec<u8>, Vec<u8>)], ordinal: u64) -> Applied {
+    let confined = writes.iter().filter(|(key, _)| place_bounds(manifest_prefix).is_some() && same_place(key, manifest_prefix));
+    let emitted: Vec<EmittedWrite> = confined.map(|(key, value)| put(key.clone(), value.clone())).collect();
+    Applied {
+        manifest: Manifest {
+            segments: previous.segments.clone(),
+            horizon: previous.horizon,
+            written_keys: emitted.iter().map(|write| write.key.clone()).collect(),
+        },
+        writes: emitted,
+        next_ordinal: ordinal,
+    }
+}
+
 // ---------------------------------------------------------------- Binary codec
 
 #[cfg_attr(verus_keep_ghost, verifier::external)]
@@ -1341,6 +1372,14 @@ impl Derive {
         }
         match &self.mode {
             DeriveMode::Purge => out.push(0),
+            DeriveMode::Backfill { writes } => {
+                out.push(2);
+                out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
+                for (key, value) in writes {
+                    put_bytes(&mut out, key);
+                    put_bytes(&mut out, value);
+                }
+            },
             DeriveMode::Replace { interval, entries } => {
                 out.push(1);
                 match *interval {
@@ -1417,6 +1456,16 @@ impl Derive {
         }
         let mode = match take_u8(&mut rest)? {
             0 => DeriveMode::Purge,
+            2 => {
+                let count = take_u32(&mut rest)? as usize;
+                let mut writes = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    let key = take_bytes(&mut rest)?;
+                    let value = take_bytes(&mut rest)?;
+                    writes.push((key, value));
+                }
+                DeriveMode::Backfill { writes }
+            },
             1 => {
                 let interval = match take_u8(&mut rest)? {
                     1 => DeriveInterval::Fixed { from: take_i64(&mut rest)?, to: take_i64(&mut rest)? },
@@ -1554,6 +1603,30 @@ mod tests {
             assert_eq!(purged.contains(key), !retained.contains(key), "every unretained key the line emitted, at either stamp, is deleted");
         }
         assert!(purged.contains(&m1) && purged.contains(&m2), "and every manifest version");
+    }
+
+    #[test]
+    fn a_backfills_entries_join_the_inventory_a_purge_deletes() {
+        let marker = entry(EntryKind::Marker, INDEX, b"idx_a", &[1], &[]);
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: OPEN_END }, &[marker], stamp(10, 1), DERIVE_ORDINAL_BASE);
+        let historical = key(b"p", INDEX, [0; 16], b"idx_b-at-an-old-precedence");
+        let foreign = key(b"q", INDEX, [0; 16], b"elsewhere");
+        let filled = backfill(&prefix(), &first.manifest, &[(historical.clone(), vec![1]), (foreign.clone(), vec![1])], DERIVE_ORDINAL_BASE);
+        assert_eq!(filled.writes, vec![EmittedWrite { key: historical.clone(), value: Some(vec![1]) }], "only the row's own place is written");
+        assert_eq!(filled.manifest.segments, first.manifest.segments, "the line is unchanged");
+        let derive = Derive {
+            manifest_prefix: prefix(),
+            levels: vec![DeriveLevel { prefix: prefix(), through: None }],
+            mode: DeriveMode::Backfill { writes: vec![(historical.clone(), vec![1])] },
+        };
+        check(&derive).unwrap();
+        assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
+        assert!(check(&Derive { mode: DeriveMode::Backfill { writes: vec![(foreign, vec![1])] }, ..derive }).is_err());
+        let stored = [
+            (stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100), first.manifest),
+            (stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE + 100), filled.manifest),
+        ];
+        assert!(purge(&prefix(), &stored).iter().any(|write| write.key == historical && write.value.is_none()));
     }
 
     #[test]

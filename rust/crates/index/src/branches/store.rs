@@ -20,7 +20,7 @@ pub use store_filter::ValueFilter;
 
 /// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
 /// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "f32ef11e46334005f4f30a59fb6e5b589058edf1c3377a72b05a218baa8a393c";
+pub const DERIVE_DIGEST: &str = "b58873edcc3e8d03f9e16bfbbe741e58b538f2588e95980457f5112d5d7f6896";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
@@ -275,8 +275,7 @@ pub fn resolve_derives(
 
     for derive in derives {
         match &derive.mode {
-            store_derive::DeriveMode::Replace { interval, entries } => {
-                let valid = store_derive::resolve_interval(*interval, stamp.micros);
+            store_derive::DeriveMode::Replace { .. } | store_derive::DeriveMode::Backfill { .. } => {
                 let mut previous = store_derive::Manifest::empty();
                 for level in &derive.levels {
                     if level.through.is_none() {
@@ -312,7 +311,16 @@ pub fn resolve_derives(
                     }
                 }
                 // Total: the outcome never depends on the manifest (P8).
-                let applied = store_derive::apply(&derive.manifest_prefix, &previous, valid, entries, stamp_bytes, ordinal);
+                let applied = match &derive.mode {
+                    store_derive::DeriveMode::Replace { interval, entries } => {
+                        let valid = store_derive::resolve_interval(*interval, stamp.micros);
+                        store_derive::apply(&derive.manifest_prefix, &previous, valid, entries, stamp_bytes, ordinal)
+                    },
+                    // A path backfill's history entries, joining the line's
+                    // inventory (Bijection erase-derive).
+                    store_derive::DeriveMode::Backfill { writes } => store_derive::backfill(&derive.manifest_prefix, &previous, writes, ordinal),
+                    store_derive::DeriveMode::Purge => unreachable!("matched above"),
+                };
                 ordinal = applied.next_ordinal;
                 for write in applied.writes {
                     out.push((write.key, write.value));
