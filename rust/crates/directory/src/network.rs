@@ -15,7 +15,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -23,6 +23,10 @@ use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, ForkP
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
+/// The most lines a connection queues for its writer; a producer waits for room.
+const QUEUED_LINES: usize = 1024;
+/// The most requests a server connection dispatches at once; the reader waits for one to finish.
+const CONNECTION_REQUESTS: usize = 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,7 +174,8 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, cancell
 async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, cancellation: CancellationToken, tracker: TaskTracker) {
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
-    let (responses, mut outgoing) = mpsc::unbounded_channel::<String>();
+    let (responses, mut outgoing) = mpsc::channel::<String>(QUEUED_LINES);
+    let requests = Arc::new(Semaphore::new(CONNECTION_REQUESTS));
     let writer_cancellation = cancellation.clone();
     tracker.spawn(async move {
         let mut writer = BufWriter::new(write_half);
@@ -203,29 +208,43 @@ async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, canc
             Err(error) => {
                 let Ok(RequestId { id }) = serde_json::from_str(&line) else { return };
                 let refusal = Anomaly::incorrect("rtdb.directory/malformed-request", format!("Malformed directory request: {error}"));
-                let _ = responses.send(encode(&Response { id, result: Err(refusal) }));
+                let refused = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    sent = responses.send(encode(&Response { id, result: Err(refusal) })) => sent,
+                };
+                if refused.is_err() { return; }
                 continue;
             }
         };
+        let admitted = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            admitted = Arc::clone(&requests).acquire_owned() => admitted,
+        };
+        let Ok(admitted) = admitted else { return };
         let (directory, responses) = (directory.clone(), responses.clone());
         tracker.spawn(async move {
+            let _admitted = admitted;
             let result = dispatch(directory.as_ref(), request.op).await;
-            let _ = responses.send(encode(&Response { id: request.id, result }));
+            let _ = responses.send(encode(&Response { id: request.id, result })).await;
         });
     }
 }
 
 /// Sends every current deployment record, then each change, until the connection closes or the feed lags.
 /// Subscribing before the snapshot means no change between the two is lost; one that arrives older than the snapshot is dropped by the subscriber's `ChangeFeed`.
-async fn forward_changes(directory: Arc<dyn Directory>, id: u64, responses: mpsc::UnboundedSender<String>, closed: CancellationToken) {
-    let send = |result| responses.send(encode(&Changed { id, result })).is_ok();
+/// A subscriber that reads more slowly than changes apply holds its sends, so the feed lags and the subscription ends with `changes-lost`.
+async fn forward_changes(directory: Arc<dyn Directory>, id: u64, responses: mpsc::Sender<String>, closed: CancellationToken) {
+    let send = async |result: Result<DeploymentRecord>| tokio::select! {
+        _ = closed.cancelled() => false,
+        sent = responses.send(encode(&Changed { id, result })) => sent.is_ok(),
+    };
     let Some(mut changes) = directory.deployment_changes() else {
-        send(Err(Anomaly::unsupported("rtdb.directory/no-change-feed", "This directory has no change feed")));
+        send(Err(Anomaly::unsupported("rtdb.directory/no-change-feed", "This directory has no change feed"))).await;
         return;
     };
     match directory.deployments().await {
-        Ok(records) => for record in records { if !send(Ok(record)) { return; } },
-        Err(error) => { send(Err(error)); return; }
+        Ok(records) => for record in records { if !send(Ok(record)).await { return; } },
+        Err(error) => { send(Err(error)).await; return; }
     }
     loop {
         let change = tokio::select! {
@@ -233,12 +252,12 @@ async fn forward_changes(directory: Arc<dyn Directory>, id: u64, responses: mpsc
             change = changes.recv() => change,
         };
         let sent = match change {
-            Ok(record) => send(Ok(record)),
+            Ok(record) => send(Ok(record)).await,
             Err(broadcast::error::RecvError::Lagged(missed)) => {
-                send(Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.directory/changes-lost", format!("The subscriber fell {missed} changes behind"))));
+                send(Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.directory/changes-lost", format!("The subscriber fell {missed} changes behind")))).await;
                 return;
             }
-            Err(broadcast::error::RecvError::Closed) => { send(Err(unavailable("rtdb.directory/feed-closed", "The directory's change feed ended"))); return; }
+            Err(broadcast::error::RecvError::Closed) => { send(Err(unavailable("rtdb.directory/feed-closed", "The directory's change feed ended"))).await; return; }
         };
         if !sent { return; }
     }
@@ -259,7 +278,7 @@ fn lost(write: bool) -> Anomaly {
 
 /// One connection to a directory server.
 struct Connection {
-    outgoing: mpsc::UnboundedSender<String>,
+    outgoing: mpsc::Sender<String>,
     /// Requests awaiting their response; drained, under the same lock, when `closed` fires.
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Reply>>>>,
     closed: CancellationToken,
@@ -271,7 +290,7 @@ impl Connection {
             .map_err(|error| unavailable("rtdb.directory/connect", format!("Cannot reach the directory at {address}: {error}")).with_context("address", address.into()))?;
         let _ = stream.set_nodelay(true);
         let (read_half, write_half) = stream.into_split();
-        let (outgoing, mut lines) = mpsc::unbounded_channel::<String>();
+        let (outgoing, mut lines) = mpsc::channel::<String>(QUEUED_LINES);
         let connection = Arc::new(Self { outgoing, pending: Mutex::new(HashMap::new()), closed });
 
         let writer_closed = connection.closed.clone();
@@ -381,7 +400,11 @@ impl RemoteDirectory {
             pending.insert(id, sender);
         }
         let waiting = Waiting { connection, id };
-        if connection.outgoing.send(encode(&Outgoing { id, op })).is_err() { return Attempt::NotSent; }
+        let sent = tokio::select! {
+            _ = connection.closed.cancelled() => return Attempt::NotSent,
+            sent = connection.outgoing.send(encode(&Outgoing { id, op })) => sent,
+        };
+        if sent.is_err() { return Attempt::NotSent; }
         let answer = receiver.await;
         drop(waiting);
         match answer { Ok(result) => Attempt::Answered(result), Err(_) => Attempt::Lost }
@@ -695,6 +718,32 @@ mod tests {
         assert_eq!(seen, changed);
         drop(remote);
         restarted.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscriber_that_stops_reading_loses_the_feed_instead_of_the_server_buffering_it() {
+        let directory = MemoryDirectory::new();
+        let served = served(directory.clone()).await;
+        let mut record = directory.create_deployment(DeploymentRecord::new("x".repeat(4096), "acme", vec![], 0)).await.unwrap();
+        let mut subscriber = TcpStream::connect(&served.address).await.unwrap();
+        subscriber.write_all(b"{\"id\":1,\"subscribe\":\"deployments\"}\n").await.unwrap();
+        let mut lines = BufReader::new(subscriber).lines();
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await.unwrap().unwrap().unwrap();
+        assert!(snapshot.contains(&record.id), "the subscription opens with the snapshot");
+
+        for epoch in 1..=10_000 {
+            let mut changed = record.clone();
+            changed.epoch = epoch;
+            record = directory.replace_deployment(changed, record.version).await.unwrap().applied().unwrap();
+        }
+        let lost = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("rtdb.directory/changes-lost") { return true; }
+            }
+            false
+        }).await.unwrap();
+        assert!(lost, "a subscriber more than the queue and the feed behind is told it lost changes");
+        served.stop().await;
     }
 
     #[tokio::test]
