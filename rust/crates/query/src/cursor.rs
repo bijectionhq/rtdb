@@ -393,7 +393,10 @@ impl PreparedQuery {
     async fn open_bound(&self, context: Arc<QueryContext>, schema: Arc<RuntimeSchema>, text: Option<&str>, batching: Batching,
         bind: impl FnOnce(&Arc<MemoryBudget>) -> Result<BoundParameters>) -> Result<QueryCursor> {
         let query_span = crate::trace::QueryTrace::start(&context, text);
-        let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
+        let context = match &query_span {
+            None if context.trace_parent.is_none() => context,
+            span => Arc::clone(&context).with_tracer(context.tracer.clone(), span.as_ref().map(|span| span.context())),
+        };
         if let QueryOutput::Plan(plan) = &self.output {
             let reservation = context.memory.reserve(plan.copy_bound()?)?;
             let mut cursor = QueryCursor::from_report_rows(&plan.schema, ReportRows::Plan { plan: Arc::clone(plan), _reservation: reservation }, context, None)?;
@@ -1321,6 +1324,21 @@ mod tests {
         assert_eq!(emitted.schema(), fresh.schema());
         drop((first, second, emitted, again));
         assert_eq!((first_query.used_bytes(), second_query.used_bytes()), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_untraced_query_opens_without_a_trace_parent_and_reads_its_rows() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let context = QueryContext::new(empty_catalog()?, Arc::clone(&memory), rtdb_types::Timestamp(10), "UTC",
+            crate::QueryOptions::default(), &tokio_util::sync::CancellationToken::new())?;
+        let query = PreparedQuery::new_in(parameter_values()?, &memory)?;
+        for value in [7, 8] {
+            let mut cursor = query.execute(Arc::clone(&context), vec![Value::I64(value)]).await?;
+            assert!(cursor.context().trace_parent.is_none());
+            let page = cursor.next_batch().await?.unwrap();
+            assert_eq!(rtdb_columnar::read_value(page.batch().schema_ref().field(0), page.batch().column(0).as_ref(), 0)?, Value::I64(value));
+        }
         Ok(())
     }
 
