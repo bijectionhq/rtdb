@@ -205,6 +205,11 @@ impl Shape {
         !self.polygons.is_empty()
     }
 
+    /// Whether a ring turns around a pole between two of its longitudes.
+    pub(crate) fn has_pole_turns(&self) -> bool {
+        !self.pole_turns.is_empty()
+    }
+
     /// The polygon an edge bounds, if any.
     pub(crate) fn polygon_of(&self, edge: usize) -> Option<usize> {
         match self.edges[edge].role {
@@ -1001,7 +1006,7 @@ pub(crate) fn visit_boundary(
 
 /// Whether arc cd runs the same way as the arc whose normal is `normal`,
 /// on one great circle.
-fn aligned(
+pub(crate) fn aligned(
     normal: &arcs::Exact,
     c: &Point,
     d: &Point,

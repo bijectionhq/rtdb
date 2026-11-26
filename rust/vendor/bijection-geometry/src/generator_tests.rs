@@ -104,7 +104,124 @@ fn realize_answers_values_unions_and_boundaries() {
         assert!(realize(overlap.clone(), 1.0, "outer").get("refusal").is_some());
         assert!(realize(overlap, 0.0, "nearest").get("refusal").is_some());
     }
-    // What needs an overlay, an offset or a reprojection is refused.
-    let meet = realize(json!({"kind":"intersection","left":value(square(0., 0.)),"right":value(square(0.5, 0.5))}), 1.0, "nearest");
-    assert!(meet.get("refusal").is_some());
+}
+
+fn planar() -> serde_json::Value {
+    json!({"frame":{"kind":"cartesian","name":"site","unit":{"metres_per_unit":1.0}},"dimensions":{"kind":"xy"},
+        "segments":"coordinate_linear","numerics":{"topology":"binary64_exact","distance_absolute_m":0.001,"distance_relative":1e-7}})
+}
+
+fn realize_in(space: serde_json::Value, term: serde_json::Value, max: f64, side: &str) -> serde_json::Value {
+    invoke(json!({"operation":"realize","space":space,"term":term,"size":"standard","max_deviation_m":max,"side":side}))
+}
+
+fn relate_in(space: serde_json::Value, a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
+    invoke(json!({"operation":"relate","space":space,"left":value(a),"right":value(b)}))["value"].clone()
+}
+
+fn square_of(x: f64, y: f64, side: f64) -> serde_json::Value {
+    json!({"type":"Polygon","coordinates":[[[x,y],[x+side,y],[x+side,y+side],[x,y+side],[x,y]]]})
+}
+
+#[test]
+fn realize_intersects_and_subtracts_through_the_gated_overlay() {
+    let (a, b) = (square_of(0., 0., 2.), square_of(1., 1., 2.));
+    // Planar: the crossings are exact binary64 points, so nothing rounds.
+    let meet = realize_in(planar(), json!({"kind":"intersection","left":value(a.clone()),"right":value(b.clone())}), 0.0, "outer");
+    assert_eq!(meet["value"]["deviation_m"], json!(0.0), "{meet}");
+    assert_eq!(relate_in(planar(), meet["value"]["value"].clone(), square_of(1., 1., 1.)), json!("2FFF1FFF2"), "{meet}");
+    let less = realize_in(planar(), json!({"kind":"difference","left":value(a.clone()),"right":value(b.clone())}), 0.0, "nearest");
+    let expected = json!({"type":"Polygon","coordinates":[[[0.,0.],[2.,0.],[2.,1.],[1.,1.],[1.,2.],[0.,2.],[0.,0.]]]});
+    assert_eq!(relate_in(planar(), less["value"]["value"].clone(), expected), json!("2FFF1FFF2"), "{less}");
+    // A hole: a square less one inside it.
+    let holed = realize_in(planar(), json!({"kind":"difference","left":value(square_of(0., 0., 4.)),"right":value(square_of(1., 1., 1.))}), 0.0, "inner");
+    assert_eq!(holed["value"]["value"]["coordinates"].as_array().map(Vec::len), Some(2), "{holed}");
+    assert_eq!(holed["value"]["deviation_m"], json!(0.0));
+    // Disjoint operands meet in nothing; squares sharing an edge meet in it.
+    let none = realize_in(planar(), json!({"kind":"intersection","left":value(square_of(0., 0., 1.)),"right":value(square_of(5., 5., 1.))}), 0.0, "nearest");
+    assert_eq!(none["value"]["value"], json!({"type":"GeometryCollection","geometries":[]}), "{none}");
+    let edge = realize_in(planar(), json!({"kind":"intersection","left":value(square_of(0., 0., 1.)),"right":value(square_of(1., 0., 1.))}), 0.0, "nearest");
+    assert_eq!(edge["value"]["value"]["type"], json!("LineString"), "{edge}");
+    let corner = realize_in(planar(), json!({"kind":"intersection","left":value(square_of(0., 0., 1.)),"right":value(square_of(1., 1., 1.))}), 0.0, "nearest");
+    assert_eq!(corner["value"]["value"], json!({"type":"Point","coordinates":[1,1]}), "{corner}");
+    // A line clipped to an area.
+    let line = json!({"type":"LineString","coordinates":[[-1.,0.5],[3.,0.5]]});
+    let clipped = realize_in(planar(), json!({"kind":"intersection","left":value(line),"right":value(square_of(0., 0., 1.))}), 0.0, "nearest");
+    assert_eq!(clipped["value"]["value"], json!({"type":"LineString","coordinates":[[0,0.5],[1,0.5]]}), "{clipped}");
+    // WGS84: crossings of great elliptic arcs round, and report it.
+    let geo = realize(json!({"kind":"intersection","left":value(square(0., 0.)),"right":value(square(0.5, 0.5))}), 1.0, "nearest");
+    let deviation = geo["value"]["deviation_m"].as_f64().expect("a deviation");
+    assert!(deviation < 1e-6, "{geo}");
+    assert_eq!(relate(geo["value"]["value"].clone(), square(0., 0.)).as_str().map(|m| &m[..1]), Some("2"), "{geo}");
+    // A nested square needs no new coordinate, on WGS84 too.
+    let nested = realize(json!({"kind":"intersection","left":value(square_of(0., 0., 3.)),"right":value(square(1., 1.))}), 0.0, "outer");
+    assert_eq!(relate(nested["value"]["value"].clone(), square(1., 1.)), json!("2FFF1FFF2"), "{nested}");
+    // relate reads a term that realizes exactly.
+    let term = invoke(json!({"operation":"relate","space":planar(),
+        "left":{"kind":"intersection","left":value(a),"right":value(b)},"right":value(square_of(1., 1., 1.))}))["value"].clone();
+    assert_eq!(term, json!("2FFF1FFF2"));
+}
+
+#[test]
+fn realize_buffers_on_the_side_asked() {
+    let point = json!({"type":"Point","coordinates":[10.,20.]});
+    let term = json!({"kind":"buffer","of":value(point.clone()),"metres":1000.0});
+    for side in ["outer", "inner", "nearest"] {
+        let answer = realize(term.clone(), 1.0, side);
+        let deviation = answer["value"]["deviation_m"].as_f64().unwrap_or_else(|| panic!("{answer}"));
+        assert!(deviation > 0.0 && deviation <= 1.0, "{answer}");
+        assert_eq!(answer["value"]["side"], json!(side));
+        // Every vertex is within the bound of the circle, on its side.
+        for p in answer["value"]["value"]["coordinates"][0].as_array().expect("a ring") {
+            let d = crate::predicates::point_distance([10., 20.], [p[0].as_f64().unwrap(), p[1].as_f64().unwrap()]);
+            match side {
+                "outer" => assert!((1000.0..=1001.0).contains(&d), "{d}"),
+                "inner" => assert!((999.0..=1000.0).contains(&d), "{d}"),
+                _ => assert!((999.0..=1001.0).contains(&d), "{d}"),
+            }
+        }
+    }
+    // The outer buffer covers the point and a position 999 m east of it.
+    let outer = realize(term.clone(), 1.0, "outer")["value"]["value"].clone();
+    let east = crate::geodesy::direct(20., 10., 90., 999.9);
+    assert_eq!(relate(outer.clone(), json!({"type":"Point","coordinates":[east.lon2, east.lat2]})).as_str().map(|m| &m[..1]), Some("0"));
+    // A zero bound cannot hold a curve.
+    let refused = realize(term, 0.0, "outer");
+    assert_eq!(refused["refusal"]["code"], json!("SpatialPrecisionLoss"), "{refused}");
+    // A line's buffer and a polygon's buffer dissolve into one polygon.
+    let line = json!({"type":"LineString","coordinates":[[0.,0.],[0.01,0.],[0.01,0.01]]});
+    let lined = realize(json!({"kind":"buffer","of":value(line),"metres":100.0}), 0.5, "outer");
+    assert_eq!(lined["value"]["value"]["type"], json!("Polygon"), "{lined}");
+    let planar_square = realize_in(planar(), json!({"kind":"buffer","of":value(square_of(0., 0., 10.)),"metres":1.0}), 0.01, "outer");
+    assert_eq!(planar_square["value"]["value"]["type"], json!("Polygon"), "{planar_square}");
+    assert_eq!(relate_in(planar(), planar_square["value"]["value"].clone(), json!({"type":"Polygon","coordinates":[[[-0.99,0.],[10.99,0.],[10.99,10.],[-0.99,10.],[-0.99,0.]]]})).as_str().map(|m| &m[6..8]), Some("FF"), "{planar_square}");
+    // A ring's buffer keeps its hole.
+    let ring = json!({"type":"LineString","coordinates":[[0.,0.],[10.,0.],[10.,10.],[0.,10.],[0.,0.]]});
+    let annulus = realize_in(planar(), json!({"kind":"buffer","of":value(ring),"metres":1.0}), 0.01, "inner");
+    assert_eq!(annulus["value"]["value"]["coordinates"].as_array().map(Vec::len), Some(2), "{annulus}");
+}
+
+#[test]
+fn realize_recasts_through_a_chart() {
+    let utm = json!({"frame":{"kind":"cartesian","name":"utm-31n","unit":{"metres_per_unit":1.0}},"dimensions":{"kind":"xy"},
+        "segments":"coordinate_linear","numerics":{"topology":"binary64_exact","distance_absolute_m":0.001,"distance_relative":1e-7}});
+    let chart = json!({"kind":"utm","zone":31,"hemisphere":"north"});
+    let term = json!({"kind":"recast","of":value(square(2., 45.)),"target":utm,"via":chart});
+    let answer = realize(term.clone(), 0.5, "nearest");
+    let deviation = answer["value"]["deviation_m"].as_f64().unwrap_or_else(|| panic!("{answer}"));
+    assert!(deviation > 0.0 && deviation <= 0.5, "{answer}");
+    // Edges curve in UTM, so the ring gains vertices.
+    let ring = answer["value"]["value"]["coordinates"][0].as_array().expect("a ring").len();
+    assert!(ring > 5, "{answer}");
+    // A tighter bound needs more vertices; a zero bound refuses.
+    let tight = realize(term.clone(), 0.01, "nearest");
+    assert!(tight["value"]["value"]["coordinates"][0].as_array().expect("a ring").len() > ring, "{tight}");
+    assert!(realize(term, 0.0, "nearest").get("refusal").is_some());
+    // Without a chart, a recast into its own space is the value.
+    let same = realize(json!({"kind":"recast","of":value(square(0., 0.)),"target":space(),"via":null}), 0.0, "outer");
+    assert_eq!(same["value"]["deviation_m"], json!(0.0), "{same}");
+    // Densifying into the frame's own edge model is the value; another is refused.
+    let dense = realize(json!({"kind":"densify","of":value(square(0., 0.)),"segments":"great_elliptic"}), 0.0, "outer");
+    assert_eq!(dense["value"]["deviation_m"], json!(0.0), "{dense}");
+    assert!(realize(json!({"kind":"densify","of":value(square(0., 0.)),"segments":"coordinate_linear"}), 1.0, "nearest").get("refusal").is_some());
 }

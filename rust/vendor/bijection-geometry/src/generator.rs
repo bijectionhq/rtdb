@@ -3,28 +3,37 @@
 //! values in one declared space; the reply is `{ value, usage }` or
 //! `{ refusal, usage }`, as the `geometry` operation's.
 //!
-//! - `relate`: the exact DE-9IM matrix of two values.
+//! - `relate`: the exact DE-9IM matrix of two terms that realize exactly.
 //! - `inverse`: the geodesic inverse problem, with the area under the geodesic.
 //! - `direct`: the geodesic direct problem.
-//! - `sep`: the separation of two values (or a value's boundary) and a
+//! - `sep`: the separation of two such terms (or a value's boundary) and a
 //!   witness pair attaining it.
 //! - `chart`: positions through the closed chart table (UTM, UPS, cube face,
 //!   affine) and back.
 //! - `realize`: a term as an admitted value, with the Hausdorff bound it
-//!   meets (0 iff it creates no coordinate). `value`, `union` (a collection
-//!   of its operands) and `boundary` are realized; `boundary` of areas cuts
-//!   their edges where they cross and rounds those crossings, which it
-//!   reports. A rounded result keeps the `nearest` side only.
+//!   meets (0 iff it creates no coordinate) and the side it holds.
+//!   - `value` is itself; `union` the collection of its operands.
+//!   - `intersection` and `difference` are the gated overlay (`overlay`):
+//!     crossings round to binary64, reported.
+//!   - `boundary` of areas cuts their edges where they cross and rounds those
+//!     crossings, reported.
+//!   - `buffer` is the offset (`offset::buffer`), built on the requested side
+//!     (`outer` covers the exact buffer, `inner` lies in it) and measured.
+//!   - `densify` re-expresses a value in another edge model and `recast` in
+//!     another space through a chart, subdivided until within the bound.
 //!
-//! Refused: `intersection`, `difference`, `buffer`, `densify` and `recast`
-//! in `realize` (the core has no gated overlay, offset or reprojection),
-//! and terms other than values in `relate` and `sep` (`boundary` of a value
-//! in `sep`).
+//!   A rounded result keeps the `nearest` side only, except a buffer, which
+//!   holds the side it was built for. An overlay, boundary, densification or
+//!   recast of a rounded operand has no bound from it and is refused; a
+//!   buffer carries its operand's bound. Past the bound or the side the core
+//!   refuses `SpatialPrecisionLoss` (`RealizeBound`).
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
     binding::GeometryAllowance,
+    offset::Side,
+    overlay::Overlay,
     CoordinateFrame,
     GeometryDeclaration,
     GeometryRefusal,
@@ -144,11 +153,16 @@ fn wgs84(space: &GeometrySpace, operation: &str) -> Result<(), GeometryRefusal> 
     Ok(())
 }
 
-/// A value leaf, admitted in `space` at the large tier: generator operands
-/// are values a caller already admitted.
+/// An operand of `relate` or `sep`: a value leaf, admitted in `space` at the
+/// large tier (generator operands are values a caller already admitted), or
+/// a term that realizes exactly (with no new coordinate).
 fn value_of(space: &GeometrySpace, term: &Term, work: &mut GeometryWork) -> Result<crate::Geometry, GeometryRefusal> {
     let Term::Value { value } = term else {
-        return Err(refused("this core relates admitted values; realize a constructed term first"));
+        let realized = realize_term(space, term, 0.0, Side::Nearest, work)?;
+        if realized.deviation_m > 0.0 {
+            return Err(refused("this term creates coordinates; realize it within a bound and relate its value"));
+        }
+        return Ok(realized.geometry);
     };
     let declaration = GeometryDeclaration::parse(space.clone(), "large").map_err(crate::unsupported_space)?;
     crate::admit_value_with_work(&Gv::from(value), &declaration, work)
@@ -304,7 +318,7 @@ fn boundary_pieces(geometry: &crate::Geometry) -> Vec<(Pos, Pos)> {
 /// The position at parameter `t` of a kernel piece: along the great
 /// elliptic arc (the auxiliary sphere's great circle) in WGS84, the straight
 /// line in a Cartesian frame.
-fn along(space: &GeometrySpace, piece: (Pos, Pos), t: f64) -> Pos {
+pub(crate) fn along(space: &GeometrySpace, piece: (Pos, Pos), t: f64) -> Pos {
     if t <= 0.0 || piece.0 == piece.1 {
         return piece.0;
     }
@@ -405,10 +419,34 @@ fn sep(space: &GeometrySpace, left: &Term, right: &Term, work: &mut GeometryWork
 }
 
 /// A realized term: its admitted value (in the large tier until the reply
-/// admits it at the request's) and the Hausdorff bound it meets.
+/// admits it at the request's), the Hausdorff bound it meets and the sides
+/// it holds (both when exact; `nearest` always).
 struct Realized {
     geometry: crate::Geometry,
     deviation_m: f64,
+    outer: bool,
+    inner: bool,
+}
+
+impl Realized {
+    fn exact(geometry: crate::Geometry) -> Self {
+        Self { geometry, deviation_m: 0.0, outer: true, inner: true }
+    }
+
+    /// A value rounded by `deviation_m`, which holds the nearest side only
+    /// unless it is exact.
+    fn rounded(geometry: crate::Geometry, deviation_m: f64) -> Self {
+        let exact = deviation_m == 0.0;
+        Self { geometry, deviation_m, outer: exact, inner: exact }
+    }
+
+    fn holds(&self, side: Side) -> bool {
+        match side {
+            Side::Outer => self.outer,
+            Side::Inner => self.inner,
+            Side::Nearest => true,
+        }
+    }
 }
 
 /// Which dimensions a value's non-empty members have: (points, lines, areas).
@@ -424,11 +462,7 @@ fn dimensions(geometry: &crate::Geometry) -> (bool, bool, bool) {
     }
 }
 
-/// Admit a constructed value in `space` at the large tier.
-fn construct(space: &GeometrySpace, value: Value, work: &mut GeometryWork) -> Result<crate::Geometry, GeometryRefusal> {
-    let declaration = GeometryDeclaration::parse(space.clone(), "large").map_err(crate::unsupported_space)?;
-    crate::admit_value_with_work(&Gv::from(&value), &declaration, work)
-}
+use crate::overlay::construct;
 
 /// The topological boundary of an admitted value, and the rounding it
 /// reports. Points have none; a line's is its ends of odd degree (OGC's mod
@@ -486,30 +520,162 @@ fn boundary(space: &GeometrySpace, geometry: &crate::Geometry, work: &mut Geomet
     Ok((construct(space, value.0, work)?, value.1))
 }
 
-/// Realize a term: evaluate it to an admitted value and the Hausdorff bound
-/// to its exact set that the value meets.
-fn realize_term(space: &GeometrySpace, term: &Term, work: &mut GeometryWork) -> Result<Realized, GeometryRefusal> {
+/// The space a realized term lands in: its operands' space, except a
+/// `densify` (another edge model) or a `recast` (its target).
+fn term_space(space: &GeometrySpace, term: &Term) -> Result<GeometrySpace, GeometryRefusal> {
+    Ok(match term {
+        Term::Densify { of, segments } => {
+            let mut target = term_space(space, of)?;
+            target.segments = serde_json::from_value(segments.clone()).map_err(crate::invalid)?;
+            target
+        },
+        Term::Recast { target, .. } => serde_json::from_value(target.clone()).map_err(crate::invalid)?,
+        Term::Value { .. } => space.clone(),
+        Term::Union { left, .. } | Term::Intersection { left, .. } | Term::Difference { left, .. } => term_space(space, left)?,
+        Term::Boundary { of } | Term::Buffer { of, .. } => term_space(space, of)?,
+    })
+}
+
+/// An operand an overlay, recast or densification reads exactly: a rounded
+/// operand has no bound through them.
+fn exact_operand(realized: &Realized, what: &str) -> Result<(), GeometryRefusal> {
+    if realized.deviation_m > 0.0 {
+        return Err(refused(format!("realize: a {what} of a rounded term has no bound from it; realize the term and {what} its value")));
+    }
+    Ok(())
+}
+
+/// One position through a chart, in the units of the spaces it joins.
+fn chart_position(c: Chart, direction: Direction, source: &GeometrySpace, target: &GeometrySpace, p: Pos, work: &mut GeometryWork) -> Result<Pos, GeometryRefusal> {
+    let metres = |space: &GeometrySpace| match &space.frame {
+        CoordinateFrame::Cartesian { unit, .. } => unit.metres_per_unit.get(),
+        CoordinateFrame::Wgs84 => 1.0,
+    };
+    let projected = matches!(c, Chart::Utm { .. } | Chart::Ups { .. });
+    let input = if projected && direction == Direction::Inverse { p.map(|x| x * metres(source)) } else { p };
+    let answer = chart(c, direction, &[input], work)?;
+    let Some(q) = answer.get(0).and_then(Value::as_array).and_then(|q| Some([q.first()?.as_f64()?, q.get(1)?.as_f64()?])) else {
+        return Err(refused("realize: a recast position lies outside its chart"));
+    };
+    Ok(if projected && direction == Direction::Forward { q.map(|x| x / metres(target)) } else { q })
+}
+
+/// `recast`: re-express a value of `source` in `target` through a chart
+/// (forward from WGS84, inverse into it, an affine map between Cartesian
+/// frames), or without one between equal frames.
+fn recast(source: &GeometrySpace, target: &GeometrySpace, via: Option<&Value>, of: &crate::Geometry, budget: f64, work: &mut GeometryWork) -> Result<(crate::Geometry, f64), GeometryRefusal> {
+    target.validate().map_err(crate::unsupported_space)?;
+    let Some(via) = via.filter(|via| !via.is_null()) else {
+        if source == target {
+            return Ok((of.clone(), 0.0));
+        }
+        if source.frame != target.frame {
+            return Err(crate::unsupported_space("a recast between frames names a chart"));
+        }
+        return crate::offset::reexpress(source, target, of, &mut |p, _| Ok(p), budget, 0.0, work);
+    };
+    let c: Chart = serde_json::from_value(via.clone()).map_err(crate::invalid)?;
+    let geographic = |space: &GeometrySpace| space.frame == CoordinateFrame::Wgs84;
+    let direction = match (c, geographic(source), geographic(target)) {
+        (Chart::Affine { .. }, false, false) => Direction::Forward,
+        (Chart::Affine { .. }, ..) => return Err(crate::unsupported_space("an affine chart joins Cartesian frames")),
+        (_, true, false) => Direction::Forward,
+        (_, false, true) => Direction::Inverse,
+        _ => return Err(crate::unsupported_space("a UTM, UPS or cube chart joins WGS84 and a Cartesian frame")),
+    };
+    // The map's own error: the projection series, else binary64 rounding.
+    let mut largest = 0.0_f64;
+    let (source_space, target_space) = (source.clone(), target.clone());
+    let mut map = |p: Pos, work: &mut GeometryWork| {
+        let q = chart_position(c, direction, &source_space, &target_space, p, work)?;
+        largest = largest.max(q[0].abs()).max(q[1].abs());
+        Ok(q)
+    };
+    let (geometry, deviation) = crate::offset::reexpress(source, target, of, &mut map, budget, 0.0, work)?;
+    let numeric = match (&target.frame, c) {
+        (_, Chart::Utm { .. } | Chart::Ups { .. }) => 1e-6,
+        (CoordinateFrame::Cartesian { unit, .. }, _) => 4.0 * f64::EPSILON * largest.max(1.0) * unit.metres_per_unit.get(),
+        (CoordinateFrame::Wgs84, _) => 1e-6,
+    };
+    let deviation = deviation + numeric;
+    if deviation > budget {
+        return Err(crate::offset::bound_refusal(format!("the recast value is within {deviation} m, beyond the bound of {budget} m")));
+    }
+    Ok((geometry, deviation))
+}
+
+/// Realize a term: evaluate it to an admitted value, the Hausdorff bound to
+/// its exact set that the value meets (within `budget`), and the sides it
+/// holds. `side` is the side the caller needs, so a construction that can
+/// hold it does (a buffer), and a difference asks its right operand for the
+/// opposite side.
+fn realize_term(space: &GeometrySpace, term: &Term, budget: f64, side: Side, work: &mut GeometryWork) -> Result<Realized, GeometryRefusal> {
     match term {
-        Term::Value { .. } => Ok(Realized { geometry: value_of(space, term, work)?, deviation_m: 0.0 }),
+        Term::Value { .. } => Ok(Realized::exact(value_of(space, term, work)?)),
         Term::Union { left, right } => {
-            // The union of sets within δ of two sets is within δ of theirs.
-            let (a, b) = (realize_term(space, left, work)?, realize_term(space, right, work)?);
-            let geometry = crate::union::reduce([a.geometry, b.geometry], space, work)?;
-            Ok(Realized { geometry, deviation_m: a.deviation_m.max(b.deviation_m) })
+            // The union of sets within δ of two sets is within δ of theirs,
+            // on the side both hold.
+            let (a, b) = (realize_term(space, left, budget, side, work)?, realize_term(space, right, budget, side, work)?);
+            let geometry = crate::union::reduce([a.geometry, b.geometry], &term_space(space, left)?, work)?;
+            Ok(Realized { geometry, deviation_m: a.deviation_m.max(b.deviation_m), outer: a.outer && b.outer, inner: a.inner && b.inner })
+        },
+        Term::Intersection { left, right } | Term::Difference { left, right } => {
+            let operation = if matches!(term, Term::Intersection { .. }) { Overlay::Intersection } else { Overlay::Difference };
+            let a = realize_term(space, left, budget, side, work)?;
+            let b = realize_term(space, right, budget, if operation == Overlay::Difference { side.opposite() } else { side }, work)?;
+            exact_operand(&a, "overlay")?;
+            exact_operand(&b, "overlay")?;
+            if a.geometry.space != b.geometry.space {
+                return Err(crate::unsupported_space("an overlay's operands are in one space"));
+            }
+            let target = a.geometry.space.clone();
+            let (value, deviation_m) = crate::overlay::overlay(&target, &a.geometry, &b.geometry, operation, work)?;
+            Ok(Realized::rounded(construct(&target, value, work)?, deviation_m))
         },
         Term::Boundary { of } => {
-            let of = realize_term(space, of, work)?;
+            let of = realize_term(space, of, budget, Side::Nearest, work)?;
             if of.deviation_m > 0.0 {
                 // A boundary is not bounded by its set's Hausdorff bound.
                 return Err(refused("realize: the boundary of a rounded term has no bound from it; realize the term itself"));
             }
-            let (geometry, deviation_m) = boundary(space, &of.geometry, work)?;
-            Ok(Realized { geometry, deviation_m })
+            let target = of.geometry.space.clone();
+            let (geometry, deviation_m) = boundary(&target, &of.geometry, work)?;
+            Ok(Realized::rounded(geometry, deviation_m))
         },
-        Term::Intersection { .. } | Term::Difference { .. } => Err(refused("realize: this core has no gated overlay for intersection or difference yet")),
-        Term::Buffer { .. } => Err(refused("realize: this core has no gated buffer yet")),
-        Term::Densify { .. } => Err(refused("realize: this core has no gated densification yet")),
-        Term::Recast { .. } => Err(refused("realize: this core has no gated reprojection yet")),
+        Term::Buffer { of, metres } => {
+            // A buffer is 1-Lipschitz in Hausdorff distance and monotone, so
+            // its operand's bound and side carry through it.
+            let of = realize_term(space, of, budget, side, work)?;
+            let target = of.geometry.space.clone();
+            let (geometry, own) = crate::offset::buffer(&target, &of.geometry, *metres, budget - of.deviation_m, side, work)?;
+            let curved = own > 0.0;
+            Ok(Realized {
+                geometry,
+                deviation_m: of.deviation_m + own,
+                outer: of.outer && (!curved || side == Side::Outer),
+                inner: of.inner && (!curved || side == Side::Inner),
+            })
+        },
+        Term::Densify { of, .. } => {
+            let target = term_space(space, term)?;
+            let of = realize_term(space, of, budget, Side::Nearest, work)?;
+            exact_operand(&of, "densification")?;
+            target.validate().map_err(crate::unsupported_space)?;
+            if target == of.geometry.space {
+                return Ok(of);
+            }
+            let source = of.geometry.space.clone();
+            let (geometry, deviation_m) = crate::offset::reexpress(&source, &target, &of.geometry, &mut |p, _| Ok(p), budget, 0.0, work)?;
+            Ok(Realized::rounded(geometry, deviation_m))
+        },
+        Term::Recast { of, via, .. } => {
+            let target = term_space(space, term)?;
+            let of = realize_term(space, of, budget, Side::Nearest, work)?;
+            exact_operand(&of, "recast")?;
+            let source = of.geometry.space.clone();
+            let (geometry, deviation_m) = recast(&source, &target, via.as_ref(), &of.geometry, budget, work)?;
+            Ok(Realized::rounded(geometry, deviation_m))
+        },
     }
 }
 
@@ -518,26 +684,21 @@ fn realize(space: &GeometrySpace, term: &Term, size: &str, max_deviation_m: f64,
     if !(max_deviation_m.is_finite() && max_deviation_m >= 0.0) {
         return Err(refused("A deviation bound is finite and non-negative metres"));
     }
-    if !matches!(side, "outer" | "inner" | "nearest") {
+    let Some(wanted) = Side::parse(side) else {
         return Err(refused("A realized side is outer, inner or nearest"));
-    }
-    let declaration = GeometryDeclaration::parse(space.clone(), size).map_err(crate::unsupported_space)?;
-    let realized = realize_term(space, term, work)?;
+    };
+    let realized = realize_term(space, term, max_deviation_m, wanted, work)?;
     if realized.deviation_m > max_deviation_m {
-        return Err(GeometryRefusal {
-            code: crate::GeometryRefusalCode::SpatialPrecisionLoss,
-            message: format!("RealizeBound: the realized value is within {} m of the term, beyond the bound of {max_deviation_m} m", realized.deviation_m),
-            bound: None,
-        });
+        return Err(crate::offset::bound_refusal(format!(
+            "the realized value is within {} m of the term, beyond the bound of {max_deviation_m} m",
+            realized.deviation_m
+        )));
     }
-    if realized.deviation_m > 0.0 && side != "nearest" {
-        return Err(GeometryRefusal {
-            code: crate::GeometryRefusalCode::SpatialPrecisionLoss,
-            message: format!("RealizeBound: a rounded value holds the nearest side only, not {side}"),
-            bound: None,
-        });
+    if !realized.holds(wanted) {
+        return Err(crate::offset::bound_refusal(format!("a rounded value holds the nearest side only, not {side}")));
     }
-    // The reply admits the value at the request's tier.
+    // The reply admits the value at the request's tier, in its own space.
+    let declaration = GeometryDeclaration::parse(realized.geometry.space.clone(), size).map_err(crate::unsupported_space)?;
     let json: Value = serde_json::from_str(&realized.geometry.js_json()).expect("canonical geometry JSON");
     crate::admit_value_with_work(&Gv::from(&json), &declaration, work)?;
     Ok(serde_json::json!({ "value": json, "deviation_m": realized.deviation_m, "side": side }))
