@@ -20,6 +20,7 @@ use rtdb_types::{Anomaly, Result};
 mod decoded_schema;
 mod event_projection;
 mod java_layout;
+mod java_stream;
 mod nulls;
 mod projection;
 mod record_spans;
@@ -2077,105 +2078,15 @@ pub fn write_uncompressed_stream_from_buffers(
 /// The caller reserves the schema translation and initial encoded schema frame through this call.
 /// A page with different native field metadata is rejected before encoding; the sink may already contain a valid prefix.
 pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
-    match STREAM_SCHEMAS.get(schema).or_else(|| EncodedStreamSchema::new(schema)) {
-        Some(encoded) => write_encoded_stream_to(&encoded, pages, sink),
-        None => write_stream_to_unkept(schema, pages, sink),
+    if java_stream::supports(schema) {
+        java_stream::write_stream(schema, pages, sink)
+    } else {
+        write_rewritten_stream_to(schema, pages, sink)
     }
 }
 
-/// A stream schema's decimal translation and Java-layout schema message, so that the many small streams a log writes over one
-/// schema rebuild neither.
-struct EncodedStreamSchema { decimal: crate::ipc_decimal::DecimalSchema, java: java_layout::StreamSchema }
-
-impl EncodedStreamSchema {
-    const SCHEMA_BYTES: usize = 256 << 10;
-
-    /// Keeps the encoding when it is a function of the schema's equality alone; a schema that fails to encode is left for the
-    /// stream writer to report.
-    fn new(schema: &Schema) -> Option<Arc<Self>> {
-        let decimal = crate::ipc_decimal::DecimalSchema::new(schema).ok()?;
-        if !Self::keepable(&decimal.wire) || schema_translation_bound(schema).ok()? > Self::SCHEMA_BYTES { return None; }
-        let options = write_options().ok()?;
-        let encoded = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(&decimal.wire, &mut DictionaryTracker::new(false), &options);
-        let mut frame = Vec::new();
-        write_message(&mut frame, encoded, &options).ok()?;
-        patch_schema_frame(&mut frame, &decimal).ok()?;
-        let java = java_layout::StreamSchema::new(frame.get(8..)?).ok()?;
-        let kept = Arc::new(Self { decimal, java });
-        STREAM_SCHEMAS.insert(Arc::clone(&kept));
-        Some(kept)
-    }
-
-    /// Dictionaries would leave dictionary ids in the writer's tracker, and two or more unranked metadata keys on one field are
-    /// written in their map's iteration order, which equal schemas need not share.
-    fn keepable(wire: &Schema) -> bool {
-        fn metadata(entries: &HashMap<String, String>) -> bool {
-            entries.keys().filter(|key| !matches!(key.as_str(), "ARROW:extension:name" | "ARROW:extension:metadata")).count() <= 1
-        }
-        fn keepable_field(field: &arrow_schema::Field) -> bool {
-            metadata(field.metadata()) && match field.data_type() {
-                DataType::Dictionary(..) => false,
-                DataType::Struct(fields) => fields.iter().all(|child| keepable_field(child)),
-                DataType::Union(fields, _) => fields.iter().all(|(_, child)| keepable_field(child)),
-                DataType::List(child) | DataType::LargeList(child) | DataType::ListView(child) | DataType::LargeListView(child)
-                | DataType::FixedSizeList(child, _) | DataType::Map(child, _) => keepable_field(child),
-                DataType::RunEndEncoded(ends, values) => keepable_field(ends) && keepable_field(values),
-                _ => true,
-            }
-        }
-        metadata(wire.metadata()) && wire.fields().iter().all(|child| keepable_field(child))
-    }
-}
-
-/// Recently encoded stream schemas, most recent first, found by structural equality; bounded in count and schema size.
-struct StreamSchemas(std::sync::Mutex<Vec<Arc<EncodedStreamSchema>>>);
-
-impl StreamSchemas {
-    const SCHEMAS: usize = 32;
-
-    fn schemas(&self) -> std::sync::MutexGuard<'_, Vec<Arc<EncodedStreamSchema>>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn get(&self, schema: &Schema) -> Option<Arc<EncodedStreamSchema>> {
-        let mut schemas = self.schemas();
-        let index = schemas.iter().position(|kept| kept.decimal.native() == schema)?;
-        schemas[..=index].rotate_right(1);
-        Some(Arc::clone(&schemas[0]))
-    }
-
-    fn insert(&self, kept: Arc<EncodedStreamSchema>) {
-        let mut schemas = self.schemas();
-        schemas.truncate(Self::SCHEMAS - 1);
-        schemas.insert(0, kept);
-    }
-}
-
-static STREAM_SCHEMAS: std::sync::LazyLock<StreamSchemas> = std::sync::LazyLock::new(|| StreamSchemas(Default::default()));
-
-/// The stream writer's message sequence after its schema, through the same tail and Java-layout writers.
-fn write_encoded_stream_to<'a, W: Write>(schema: &EncodedStreamSchema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
-    let options = write_options()?;
-    let inner = java_layout::JavaLayout::resume_stream(sink, &schema.java).map_err(|error| invalid(ArrowError::from(error)))?;
-    let mut writer = TailWriter { inner, pending: Vec::with_capacity(8) };
-    let generator = IpcDataGenerator::default();
-    let mut dictionaries = DictionaryTracker::new(false);
-    let mut compression = CompressionContext::default();
-    for page in pages {
-        schema.decimal.validate_batch(page)?;
-        let (encoded_dictionaries, encoded) = generator.encode(page, &mut dictionaries, &options, &mut compression)
-            .expect("StreamWriter is configured to not error on dictionary replacement");
-        for dictionary in encoded_dictionaries { write_message(&mut writer, dictionary, &options).map_err(invalid)?; }
-        write_message(&mut writer, encoded, &options).map_err(invalid)?;
-    }
-    (|| { writer.write_all(&[0xff; 4])?; writer.write_all(&0i32.to_le_bytes())?; writer.flush() })().map_err(|error| invalid(ArrowError::from(error)))?;
-    if writer.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
-    writer.inner.write_all(&[0; 4]).map_err(invalid)?;
-    writer.inner.flush().map_err(invalid)?;
-    Ok(writer.inner.inner)
-}
-
-fn write_stream_to_unkept<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
+/// arrow-rs's stream, decimal-patched and rewritten into the Java layout as it passes, for the layouts `java_stream` leaves out.
+fn write_rewritten_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
     let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
     let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new_stream(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
     let mut writer = StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
@@ -2655,82 +2566,4 @@ fn owned_stream_revalidates_batch_layout_after_normalizing_metadata() {
     assert!(revalidate_normalized_message(first.message, first.header).is_ok());
     let error = revalidate_normalized_message(first.message, second.header).unwrap_err();
     assert_eq!(error.message.as_deref(), Some("Arrow null-count normalization changed the admitted batch layout"));
-}
-
-#[cfg(test)]
-mod kept_stream_schema_tests {
-    use super::*;
-    use arrow_array::{Int64Array, ListArray, StringArray, types::Int64Type};
-    use arrow_schema::Field;
-    use rtdb_types::{LogicalType, ScalarType};
-
-    fn page(id_nullable: bool) -> RecordBatch {
-        let ids = Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
-        let names = Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef;
-        let tags = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1), None]), None])) as ArrayRef;
-        let schema = Schema::new(vec![
-            Field::new("_id", DataType::Int64, id_nullable),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("tags", tags.data_type().clone(), true),
-        ]);
-        RecordBatch::try_new(Arc::new(schema), vec![ids, names, tags]).unwrap()
-    }
-
-    fn no_pages<'a>() -> std::iter::Empty<&'a RecordBatch> { std::iter::empty() }
-
-    #[test]
-    fn a_kept_stream_schema_writes_the_bytes_of_a_new_encoding() {
-        let page = page(false);
-        assert!(EncodedStreamSchema::new(page.schema_ref()).is_some());
-        let expected = write_stream_to_unkept(page.schema_ref(), [&page], Vec::new()).unwrap();
-        for _ in 0..2 {
-            assert_eq!(write_stream_to(page.schema_ref(), [&page, &page], Vec::new()).unwrap(),
-                write_stream_to_unkept(page.schema_ref(), [&page, &page], Vec::new()).unwrap());
-            assert_eq!(write_stream_to(page.schema_ref(), [&page], Vec::new()).unwrap(), expected);
-        }
-        let rebuilt = Schema::new(page.schema().fields().iter().map(|field| field.as_ref().clone()).collect::<Vec<_>>());
-        assert_eq!(write_stream_to(&rebuilt, [&page], Vec::new()).unwrap(), expected);
-    }
-
-    #[test]
-    fn a_changed_stream_schema_is_encoded_afresh() {
-        let before = page(false);
-        let after = page(true);
-        let first = write_stream_to(before.schema_ref(), [&before], Vec::new()).unwrap();
-        let changed = write_stream_to(after.schema_ref(), [&after], Vec::new()).unwrap();
-        assert_ne!(first, changed);
-        assert_eq!(changed, write_stream_to_unkept(after.schema_ref(), [&after], Vec::new()).unwrap());
-        assert_eq!(write_stream_to(before.schema_ref(), [&before], Vec::new()).unwrap(), first);
-    }
-
-    #[test]
-    fn a_kept_decimal_stream_schema_keeps_its_patched_parameters() {
-        let field = rtdb_columnar::to_field("amount", &LogicalType::Scalar(ScalarType::Decimal { precision: 12, scale: -400, bit_width: 128 })).unwrap();
-        let schema = Schema::new(vec![field]);
-        assert!(EncodedStreamSchema::new(&schema).is_some());
-        let expected = write_stream_to_unkept(&schema, no_pages(), Vec::new()).unwrap();
-        assert_eq!(write_stream_to(&schema, no_pages(), Vec::new()).unwrap(), expected);
-        assert_eq!(write_stream_to(&schema, no_pages(), Vec::new()).unwrap(), expected);
-    }
-
-    #[test]
-    fn a_kept_stream_schema_rejects_a_different_page_as_a_new_encoding_does() {
-        let declared = page(false);
-        let other = page(true);
-        write_stream_to(declared.schema_ref(), [&declared], Vec::new()).unwrap();
-        let actual = write_stream_to(declared.schema_ref(), [&other], Vec::new()).unwrap_err();
-        let expected = write_stream_to_unkept(declared.schema_ref(), [&other], Vec::new()).unwrap_err();
-        assert_eq!((actual.code, actual.message), (expected.code, expected.message));
-    }
-
-    #[test]
-    fn schemas_whose_encoding_equality_does_not_fix_are_not_kept() {
-        let field = Field::new("v", DataType::Int64, true)
-            .with_metadata(HashMap::from([("a".to_owned(), "1".to_owned()), ("b".to_owned(), "2".to_owned())]));
-        let schema = Schema::new(vec![field]);
-        assert!(EncodedStreamSchema::new(&schema).is_none());
-        assert_eq!(write_stream_to(&schema, no_pages(), Vec::new()).unwrap(), write_stream_to_unkept(&schema, no_pages(), Vec::new()).unwrap());
-        let dictionary = Schema::new(vec![Field::new("d", DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)), true)]);
-        assert!(EncodedStreamSchema::new(&dictionary).is_none());
-    }
 }

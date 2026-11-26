@@ -80,31 +80,6 @@ impl<W> JavaLayout<W> {
     }
 }
 
-/// A stream's Java-layout schema message and the batch layouts it implies.
-pub(crate) struct StreamSchema { metadata: Vec<u8>, layouts: Option<Vec<FieldLayout>> }
-
-impl StreamSchema {
-    /// Rewrites `metadata`, an Arrow schema message exactly as a stream writer frames it, without its prefix.
-    pub(super) fn new(metadata: &[u8]) -> Result<Self, String> {
-        let mut layouts = None;
-        let rewritten = rewrite(&mut layouts, metadata)?;
-        match rewritten {
-            Rewritten { metadata: Some(metadata), plan: None, body: 0, header: MessageHeader::Schema } => Ok(Self { metadata, layouts }),
-            _ => Err("Arrow message is not a schema".into()),
-        }
-    }
-}
-
-impl<W: Write> JavaLayout<W> {
-    /// A stream that has already been given `schema` as its first, continuation-framed message.
-    pub(super) fn resume_stream(inner: W, schema: &StreamSchema) -> io::Result<Self> {
-        let mut layout = Self::new(inner, None);
-        frame(&mut Output { inner: &mut layout.inner, footer: None }, &schema.metadata, true)?;
-        layout.layouts = schema.layouts.clone();
-        Ok(layout)
-    }
-}
-
 impl<W: Write> Write for JavaLayout<W> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let written = bytes.len();
@@ -276,7 +251,7 @@ impl BodyPlan {
     }
 }
 
-fn write_all_valid(out: &mut impl Write, length: usize, last_byte: u8) -> io::Result<()> {
+pub(super) fn write_all_valid(out: &mut impl Write, length: usize, last_byte: u8) -> io::Result<()> {
     static FULL_BYTES: [u8; 4096] = [0xff; 4096];
     let masked = last_byte != 0xff;
     let mut remaining = if masked { length - 1 } else { length };
@@ -292,7 +267,7 @@ fn write_all_valid(out: &mut impl Write, length: usize, last_byte: u8) -> io::Re
 }
 
 /// `MessageSerializer.writeMessageBuffer`: the length is padded so the prefix and metadata end on an 8-byte boundary.
-fn frame(out: &mut impl Write, metadata: &[u8], continuation: bool) -> io::Result<()> {
+pub(super) fn frame(out: &mut impl Write, metadata: &[u8], continuation: bool) -> io::Result<()> {
     let prefix = if continuation { 8 } else { 4 };
     let padding = (8 - (metadata.len() + prefix) % 8) % 8;
     if continuation { out.write_all(&(-1i32).to_le_bytes())?; }
@@ -362,7 +337,7 @@ fn footer(schema_message: &[u8], blocks: &[arrow_ipc::Block]) -> Result<Vec<u8>,
     Ok(builder.finished_data().to_vec())
 }
 
-fn message(mut builder: FlatBufferBuilder<'_>, version: i16, header_type: MessageHeader, header: WIPOffset<flatbuffers::UnionWIPOffset>, body: i64) -> Vec<u8> {
+pub(super) fn message(mut builder: FlatBufferBuilder<'_>, version: i16, header_type: MessageHeader, header: WIPOffset<flatbuffers::UnionWIPOffset>, body: i64) -> Vec<u8> {
     let mut table = arrow_ipc::MessageBuilder::new(&mut builder);
     table.add_header_type(header_type);
     table.add_header(header);
