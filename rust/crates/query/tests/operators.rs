@@ -836,7 +836,7 @@ async fn pull_many_keeps_document_field_order_offsets_and_array_custody() {
     let enabled = Expr::binary(BinaryOp::Eq, Expr::Parameter { index: 0, data_type: integer.clone() },
         Expr::Literal(Value::I64(1)));
     let dependent = Arc::new(dependent.filter(enabled).unwrap());
-    let doc = LogicalType::Struct(StructFields::from([("a".into(), keyword.clone()), ("z".into(), integer)]));
+    let doc = LogicalType::Struct(StructFields::from([("z".into(), integer), ("a".into(), keyword.clone())]));
     let output = field(3, "docs", LogicalType::list(doc).maybe());
 
     let context = query_context(QueryOptions::default());
@@ -861,9 +861,9 @@ async fn pull_many_keeps_document_field_order_offsets_and_array_custody() {
         assert_eq!(lists.value_offsets(), &offsets);
         assert_eq!((lists.is_valid(0), lists.is_valid(1), lists.is_valid(2)), (true, false, last == 1));
         let docs = lists.values().as_struct();
-        assert_eq!(docs.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["a", "z"]);
-        assert_eq!(rtdb_columnar::from_field(&docs.fields()[0]).unwrap(), keyword);
-        let actual = (0..docs.len()).map(|row| read_value(&docs.fields()[0], docs.column(0).as_ref(), row).unwrap()).collect::<Vec<_>>();
+        assert_eq!(docs.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["z", "a"]);
+        assert_eq!(rtdb_columnar::from_field(&docs.fields()[1]).unwrap(), keyword);
+        let actual = (0..docs.len()).map(|row| read_value(&docs.fields()[1], docs.column(1).as_ref(), row).unwrap()).collect::<Vec<_>>();
         assert_eq!(actual, expected);
         drop(retained);
         assert_eq!(context.memory.used_bytes(), baseline);
