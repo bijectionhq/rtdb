@@ -1561,6 +1561,24 @@ impl TransactionBuffer {
     pub fn has_pending_table(&self, table: &TableRef) -> bool { self.tables.contains_key(table) }
 
     pub fn pending_tables(&self) -> impl Iterator<Item = &TableRef> { self.tables.keys() }
+    /// The column types this transaction declares or puts into one table so far.
+    pub fn pending_put_types(&self, table: &TableRef) -> StructFields<LogicalType> {
+        let Some(pending) = self.tables.get(table) else { return StructFields::new(); };
+        let mut types = pending.declared.clone();
+        let mut join = |name: &String, ty: &LogicalType| {
+            let ty = types.get(name).map_or_else(|| ty.clone(), |prior| prior.join(ty));
+            types.insert(name.clone(), ty);
+        };
+        for event in &pending.events {
+            if let StoredOperation::Put(cells) = &event.operation {
+                for (name, value) in cells { join(name, &value.logical_type()); }
+            }
+        }
+        for run in &pending.batches {
+            for (name, ty) in run.batch.put_types() { join(name, ty); }
+        }
+        types
+    }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
         for (table, pending) in &self.tables {

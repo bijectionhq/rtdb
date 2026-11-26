@@ -576,6 +576,14 @@ impl TxResolver {
         if outcome.is_ok() && let Some(authority) = classic_authority {
             let mut tables = tx.buffer.pending_tables().chain(prepared_writes.iter().flat_map(|write| write.tables().keys()));
             outcome = tables.try_for_each(|table| authority.require_classic_write(table));
+            if outcome.is_ok() {
+                outcome = tx.buffer.pending_tables()
+                    .try_for_each(|table| authority.require_declared_columns(table, &tx.buffer.pending_put_types(table)));
+            }
+            if outcome.is_ok() {
+                outcome = prepared_writes.iter().flat_map(|write| write.tables())
+                    .try_for_each(|(table, write)| authority.require_declared_columns(table, write.column_types()));
+            }
         }
         let candidate = resolution_candidate::resolve_candidate(tx, prepared_writes, outcome);
         let (mut tx, prepared_writes, result) = match candidate {

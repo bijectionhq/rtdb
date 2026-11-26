@@ -16,9 +16,11 @@ mod custody;
 mod custody_placement;
 mod custody_release;
 mod custody_transfer;
+mod schema;
 mod scoped_hold;
 pub mod store;
 mod visibility;
+pub use schema::{DeclaredSchema, TEMPORAL_COLUMNS, TableSchema};
 pub use scoped_hold::{ScopedHold, ScopedHoldCommand};
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
 pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, ReviewedCustodyReservation};
@@ -87,7 +89,7 @@ pub struct GroupedCount {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchTable {
-    pub columns: StructFields<LogicalType>,
+    pub schema: TableSchema,
     pub indexes: BTreeMap<String, IndexDefinition>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ranked_indexes: BTreeMap<String, RankedIndexDeclaration>,
@@ -339,7 +341,7 @@ impl BranchIndex {
                 !definition.indexes.is_empty() || !definition.ranked_indexes.is_empty() || definition.ttl_micros.is_some()
                     || !definition.constraints.is_empty() || !definition.grouped_constraints.is_empty()
                     || definition.generation != 0 || definition.dropped || definition.visibility.is_some()
-                    || definition.single_label_per_tx
+                    || definition.single_label_per_tx || definition.schema.is_declared()
             }))
             || self.retained_images().any(|(_, table, _, image)| {
                 image.expires_at.is_some() || image.custody_group.is_some() || image.custody_payload.is_some()
@@ -649,6 +651,14 @@ impl BranchIndex {
 
     pub fn definition(&self, table: &TableRef, basis: Basis) -> Option<&BranchTable> {
         self.catalog.get(table)?.iter().rev().find(|(at, _)| *at <= basis).map(|(_, definition)| definition)
+    }
+
+    /// Admits the column types a Classic write puts into a table at the head.
+    pub fn require_declared_columns(&self, table: &TableRef, types: &StructFields<LogicalType>) -> Result<()> {
+        match self.definition(table, self.head.basis) {
+            Some(definition) if !definition.dropped => definition.schema.admit_types(types),
+            _ => Ok(()),
+        }
     }
 
     pub fn tables(&self, basis: Basis) -> impl Iterator<Item = (&TableRef, &BranchTable)> {

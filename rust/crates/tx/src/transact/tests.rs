@@ -553,10 +553,99 @@ fn declarations_and_branch_lifetimes_are_ordered_with_writes() {
 
     commit(&mut state, 6, &request(6, vec![Op::Declare { table: table(), change: Declaration::Drop }]));
     commit(&mut state, 7, &request(7, vec![
-        Op::Declare { table: table(), change: Declaration::Schema(StructFields::new()) },
+        Op::Declare { table: table(), change: Declaration::Schema(docs_schema()) },
         put(MAIN_BRANCH, 3, "c"),
     ]));
     assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 70), [3]);
+}
+
+fn utf8() -> LogicalType { LogicalType::Scalar(rtdb_types::ScalarType::Utf8) }
+fn int64() -> LogicalType { LogicalType::Scalar(rtdb_types::ScalarType::I64) }
+fn schema(fields: &[(&str, LogicalType)]) -> StructFields<LogicalType> {
+    fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect()
+}
+fn docs_schema() -> StructFields<LogicalType> { schema(&[("_id", int64()), ("key", utf8())]) }
+fn declare_schema(fields: StructFields<LogicalType>) -> Op { Op::Declare { table: table(), change: Declaration::Schema(fields) } }
+fn put_cells(id: EntityId, cells: &[(&str, Value)]) -> Op {
+    let cells = cells.iter().map(|(name, value)| ((*name).to_owned(), Cell::Value(value.clone()))).collect();
+    let row = Row { id, valid: None, cells, custody_group: None, protected_columns: Vec::new(), custody_payload: None };
+    Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent: false }
+}
+fn refusal(receipt: Receipt) -> String {
+    match receipt.outcome { Outcome::Refused { error } => error.code, outcome => panic!("expected a refusal, got {outcome:?}") }
+}
+
+#[test]
+fn a_schema_declaration_names_a_non_null_key_and_leaves_temporal_columns_to_rtdb() {
+    let mut state = TransactState::new(INCARNATION);
+    for (position, fields, code) in [
+        (1, schema(&[("key", utf8())]), "rtdb/schema-key"),
+        (2, schema(&[("_id", int64().maybe()), ("key", utf8())]), "rtdb/schema-key"),
+        (3, schema(&[("_id", LogicalType::Scalar(rtdb_types::ScalarType::F64))]), "rtdb/schema-key"),
+        (4, schema(&[("_id", int64()), ("_valid_from", int64())]), "rtdb/reserved-field"),
+        (5, schema(&[("_id", int64()), ("_system_to", int64())]), "rtdb/reserved-field"),
+    ] {
+        assert_eq!(refusal(commit(&mut state, position, &request(position as u8, vec![declare_schema(fields)]))), code);
+    }
+    assert!(state.index().definition(&table(), state.index().head().basis).is_none());
+    commit(&mut state, 6, &request(6, vec![declare_schema(docs_schema())]));
+    assert_eq!(refusal(commit(&mut state, 7, &request(7, vec![declare_schema(schema(&[("_id", utf8())]))]))), "rtdb/schema-key-change");
+    assert_eq!(refusal(commit(&mut state, 8, &request(8, vec![declare_schema(schema(&[("_id", int64()), ("key", utf8().maybe())]))]))),
+        "rtdb/schema-type-change");
+    assert_eq!(commit(&mut state, 9, &request(9, vec![declare_schema(schema(&[("_id", int64()), ("n", int64())]))])).outcome, Outcome::Then);
+    let definition = state.index().definition(&table(), state.index().head().basis).unwrap();
+    assert_eq!(definition.schema.columns(), schema(&[("_id", int64()), ("key", utf8()), ("n", int64())]));
+}
+
+#[test]
+fn closed_declared_tables_refuse_undeclared_columns_and_other_types_across_a_checkpoint() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![declare_schema(docs_schema())]));
+    let encoded = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&encoded, state.index().head()).unwrap();
+    assert!(state.index().definition(&table(), basis(1)).unwrap().schema.is_declared());
+    for (position, op, code) in [
+        (2, put_cells(EntityId::Integer(1), &[("key", Value::Utf8("a".into())), ("extra", Value::I64(1))]), "rtdb/undeclared-column"),
+        (3, put_cells(EntityId::Integer(1), &[("key", Value::I64(1))]), "rtdb/schema-type"),
+        (4, put_cells(EntityId::String("one".into()), &[("key", Value::Utf8("a".into()))]), "rtdb/schema-type"),
+    ] {
+        assert_eq!(refusal(commit(&mut state, position, &request(position as u8, vec![op]))), code);
+    }
+    assert_eq!(commit(&mut state, 5, &request(5, vec![put_cells(EntityId::Integer(1), &[("key", Value::Null)]), put(MAIN_BRANCH, 2, "b")])).outcome,
+        Outcome::Then);
+    assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 50), [1, 2]);
+    let encoded = state.encode_checkpoint().unwrap();
+    let restored = TransactState::decode_checkpoint(&encoded, state.index().head()).unwrap();
+    assert_eq!(restored.index().definition(&table(), basis(5)), state.index().definition(&table(), basis(5)));
+}
+
+#[test]
+fn undeclared_tables_accept_new_columns_and_a_first_declaration_must_admit_their_rows() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![put(MAIN_BRANCH, 1, "a"), put_cells(EntityId::Integer(2), &[("other", Value::I64(2))])]));
+    assert_eq!(visible(&state, MAIN_BRANCH, Layer::Merged, 10), [1, 2]);
+    assert_eq!(refusal(commit(&mut state, 2, &request(2, vec![declare_schema(docs_schema())]))), "rtdb/schema-history");
+    commit(&mut state, 3, &request(3, vec![declare_schema(schema(&[("_id", int64()), ("key", utf8()), ("other", int64())]))]));
+    assert!(state.index().definition(&table(), basis(3)).unwrap().schema.is_declared());
+}
+
+#[tokio::test]
+async fn an_empty_declared_table_resolves_its_key_and_temporal_columns() {
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot};
+    use rtdb_sql::PrepareOptions;
+    use rtdb_storage::{cache::BufferPool, object_store::MemoryStore};
+
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![declare_schema(docs_schema())]));
+    let memory = MemoryBudget::new(1 << 24);
+    let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+    let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(10)).unwrap();
+    let snapshot = rtdb_query::branch_snapshot(&view, &memory).unwrap();
+    let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    rtdb_sql::prepare_in("SELECT _id, key, _valid_from, _valid_to, _system_from, _system_to FROM docs", &catalog,
+        &PrepareOptions::default(), &memory).unwrap();
 }
 
 #[test]

@@ -249,6 +249,7 @@ impl Candidate<'_> {
         if cells.contains_key("_id") {
             return Err(Anomaly::incorrect("rtdb/reserved-field", "The put supplies its ID separately"));
         }
+        definition.schema.admit_key(&row.id)?;
         validate_cells(definition, &cells)?;
         cells.insert("_id".into(), row.id.as_value());
         let expires_at = definition.ttl_micros.map(|ttl| expiry(cut.system_time, ttl)).transpose()?;
@@ -354,6 +355,7 @@ impl Candidate<'_> {
                         if image.custody_group.is_some() {
                             return Err(Anomaly::unsupported("rtdb/custody-placement", "Publishing a protected copy requires its own custody placement"));
                         }
+                        definition.schema.admit_key(id)?;
                         validate_cells(definition, &image.cells)?;
                     }
                     effects.push((table.clone(), id.clone(), valid, image));
@@ -377,6 +379,22 @@ impl Candidate<'_> {
         Ok(definition)
     }
 
+    /// A table's first schema declaration must admit every row version it already holds.
+    fn require_history_conforms(&self, table: &TableRef, declared: &BranchTable) -> Result<()> {
+        for branch in self.index.active_names(self.terms().system_time) {
+            let view = self.view(branch, Layer::Merged)?;
+            for id in view.ids(table) {
+                for event in view.history(table, id) {
+                    let Some(image) = &event.image else { continue; };
+                    declared.schema.admit_key(id)
+                        .and_then(|()| validate_cells(declared, &image.cells))
+                        .map_err(|error| conflict("rtdb/schema-history", format!("Existing rows do not conform to the declared schema: {}", error.message.unwrap_or_default())))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn write_definition(&self, table: &TableRef) -> Result<BranchTable> {
         let definition = self.definition(table);
         if self.scope.is_some() && !definition.as_ref().is_ok_and(|def| def.visibility.is_some()) {
@@ -394,12 +412,14 @@ impl Candidate<'_> {
         }
         match change {
             Declaration::Schema(columns) => {
-                definition.dropped = false;
-                for (name, ty) in columns {
+                for name in columns.keys().filter(|name| *name != "_id") {
                     validate_column(name)?;
-                    let ty = definition.columns.get(name).map_or_else(|| ty.clone(), |prior| prior.join(ty));
-                    definition.columns.insert(name.clone(), ty);
                 }
+                let schema = definition.schema.declare(columns)?;
+                if !std::mem::take(&mut definition.dropped) && !definition.schema.is_declared() {
+                    self.require_history_conforms(table, &BranchTable { schema: schema.clone(), ..definition.clone() })?;
+                }
+                definition.schema = schema;
             }
             Declaration::Index(index) => {
                 if index.name.is_empty() {
@@ -606,11 +626,7 @@ fn validate_cells(definition: &BranchTable, cells: &StructFields<Value>) -> Resu
     for (name, cell) in cells {
         if name == "_id" { continue; }
         validate_column(name)?;
-        if let Some(ty) = definition.columns.get(name)
-            && !matches!(cell, Value::Null | Value::Undefined) && ty.join(&cell.logical_type()) != *ty
-        {
-            return Err(Anomaly::incorrect("rtdb/schema-type", format!("Invalid type for declared column {name}")));
-        }
+        definition.schema.admit_value(name, cell)?;
         if definition.indexes.values().any(|index| !index.is_compound() && index.column == *name) {
             validate_index_key(name, cell)?;
         }

@@ -9,7 +9,7 @@ use rtdb_directory::CheckpointTransferBootstrap;
 use rtdb_format::data::{StoredEvent, StoredOperation};
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, BranchEffect, BranchIndex, BranchTable},
+    branches::{BranchCut, BranchEffect, BranchIndex, BranchTable, TableSchema},
 };
 use rtdb_replication::RecoveredPartition;
 use rtdb_tx::transact::TransactState;
@@ -242,7 +242,7 @@ impl Projection {
                 index.apply(BranchEffect::Declare {
                     table,
                     definition: BranchTable {
-                        columns,
+                        schema: TableSchema::Open(columns),
                         ..Default::default()
                     },
                 })?;

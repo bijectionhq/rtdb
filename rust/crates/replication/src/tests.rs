@@ -1275,6 +1275,52 @@ async fn classic_source_cannot_write_a_canonically_labelled_relation() {
 }
 
 #[tokio::test]
+async fn classic_writes_into_a_closed_declared_table_are_refused_and_its_key_is_queryable_while_empty() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_tx::transact::{Declaration, Op, Outcome};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let driver = tokio::spawn(fixture.driver.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let table = TableRef::new("public", "docs");
+        let int64 = LogicalType::Scalar(ScalarType::I64);
+        let mut declare = serving_source_put(1);
+        declare.ops = vec![Op::Declare { table: table.clone(), change: Declaration::Schema(StructFields::from([
+            ("_id".into(), int64.clone()), ("n".into(), int64.clone()),
+        ])) }];
+        assert_eq!(serving.transact(declare, VerifiedClaims::default(), None, &cancellation).await.unwrap().outcome, Outcome::Then);
+        let physical = fixture.handle.serving_partition().unwrap();
+        assert_eq!(physical.column_types(&table).get("_id"), Some(&int64));
+
+        for (sql, code) in [
+            ("INSERT INTO docs (_id, n, extra) VALUES (1, 1, 'x')", Some("rtdb/undeclared-column")),
+            ("INSERT INTO docs (_id, n) VALUES (1, 'x')", Some("rtdb/schema-type")),
+            ("INSERT INTO docs (_id, n) VALUES ('one', 1)", Some("rtdb/schema-type")),
+            ("INSERT INTO intake (_id, anything) VALUES (1, 'open')", None),
+            ("INSERT INTO docs (_id, n) VALUES (1, 1)", None),
+        ] {
+            let command = SourceTransaction::new(vec![TxOp::Sql { sql: sql.into(), args: None }], SubmitOptions::default(), &fixture.memory).unwrap();
+            let source = fixture.handle.submit_source_encoded(command.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
+            let result = fixture.handle.await_tx(TxId(source.0), &cancellation).await.unwrap().unwrap();
+            assert_eq!(result.error().map(|error| error.code.as_str()), code, "{sql}");
+        }
+        let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::I64(2)), ("other".into(), Value::I64(2))])], &fixture.memory).unwrap();
+        let command = SourceTransaction::new(vec![TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to: None }],
+            SubmitOptions::default(), &fixture.memory).unwrap();
+        let source = fixture.handle.submit_source_encoded(command.encode().unwrap().into_bytes(), Timestamp(101)).await.unwrap();
+        let result = fixture.handle.await_tx(TxId(source.0), &cancellation).await.unwrap().unwrap();
+        assert_eq!(result.error().map(|error| error.code.as_str()), Some("rtdb/undeclared-column"));
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn queued_classic_sql_resolves_against_the_preceding_v1_write() {
     use rtdb_crypt::tokens::VerifiedClaims;
     use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};

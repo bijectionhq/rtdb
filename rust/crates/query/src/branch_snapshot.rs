@@ -127,7 +127,7 @@ fn snapshot(
         if basis == head.basis {
             for (table, definition) in view.tables() {
                 if !includes(table) { continue; }
-                let mut columns = definition.columns.clone();
+                let mut columns = definition.schema.columns();
                 if matches!(contents, Contents::FamilyReview(..)) {
                     columns.retain(|name, _| name == "_id");
                 }

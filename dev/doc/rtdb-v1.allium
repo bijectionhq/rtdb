@@ -171,6 +171,18 @@ surface StatelessDatabase {
         -- The authenticated observation binds the sample, selected cut, query fingerprint and Flight session.
         -- The query trailer reports the selected system time separately.
 
+    @guarantee DeclaredTableSchema
+        -- A table is open until it declares a schema, and declared from then until it is dropped.
+        -- An open table admits any column a write carries.
+        -- A schema declaration names a non-null _id field of type Utf8, keyword, Int64 or UUID.
+        -- It declares no temporal column: RTDB maintains _valid_from, _valid_to, _system_from and _system_to on every row.
+        -- A redeclaration keeps the _id type and each declared column's type, and may add columns; omitted columns stay declared.
+        -- A table's first declaration admits every row version the table already holds.
+        -- A query of a declared table resolves _id, the declared columns and the temporal columns before any row is written.
+        -- A declared table refuses a write, through Transact or a Classic source, that carries an undeclared column, a value of another type than its declared column, or an ID of another type than its _id.
+        -- A null value conforms to any declared column.
+        -- Checkpoints and followers retain whether a table is declared, its _id type and its declared columns.
+
     @guarantee OrderedIndexCatalog
         -- An ordered index declaration preserves its columns in the order sent by the caller.
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.

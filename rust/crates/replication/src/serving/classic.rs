@@ -24,10 +24,7 @@ fn declare(index: &mut BranchIndex, table: &TableRef, fields: &StructFields<Logi
     if definition.dropped {
         definition = BranchTable { generation: definition.generation, ..Default::default() };
     }
-    for (column, ty) in fields {
-        let ty = definition.columns.get(column).map_or_else(|| ty.clone(), |prior| prior.join(ty));
-        definition.columns.insert(column.clone(), ty);
-    }
+    definition.schema.widen(fields)?;
     index.apply(BranchEffect::Declare { table: table.clone(), definition })
 }
 
@@ -166,8 +163,9 @@ pub(crate) fn stage_source(snapshot: Snapshot, prior: &BranchIndex, source: Sour
                 }
             }
             BranchEffect::Declare { table, definition } => {
-                buffer.declare_table(table.clone(), definition.columns.keys().cloned())?;
-                let fields = definition.columns.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect::<Vec<_>>();
+                let columns = definition.schema.columns();
+                buffer.declare_table(table.clone(), columns.keys().cloned())?;
+                let fields = columns.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect::<Vec<_>>();
                 buffer.record_sql_declaration(table, &fields)?;
             }
             _ => (),
