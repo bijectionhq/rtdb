@@ -23,7 +23,8 @@ use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catal
 use crate::logs::{APPEND_CAPACITY, DecodedReplica, PartitionReplay, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
-use crate::recovery_promotion::{WriterActivation, writer_activation};
+use crate::image_digest::{AppliedImageDigest, applied_image_from_base};
+use crate::recovery_promotion::{WriterActivation, publish_installed_prefix, writer_activation};
 use crate::state::fail_pending;
 use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, SourceRequest};
 use crate::checkpoint_admin::{PinControl, ReleaseControl};
@@ -94,6 +95,54 @@ pub enum Role { Following, Leading(Term), Stopped }
 pub struct InstalledPrefix {
     pub replica: ReplicaPosition,
     pub source: SourcePosition,
+    /// Chained SHA-256 commitment over the certified checkpoint base and every
+    /// applied replica record's effects, control rows, authority rows, and receipts.
+    pub image_digest: [u8; 32],
+}
+
+fn chain_tx_image_digest<'a>(
+    prev: [u8; 32],
+    position: ReplicaPosition,
+    tx_id: i64,
+    system_time_micros: i64,
+    committed: bool,
+    source: SourcePosition,
+    tables: impl Iterator<Item = &'a str>,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&str> = tables.collect();
+    sorted.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"rtdb.replication.applied-image.tx.v1\0");
+    hasher.update(prev);
+    hasher.update(position.0.to_be_bytes());
+    hasher.update(tx_id.to_be_bytes());
+    hasher.update(system_time_micros.to_be_bytes());
+    hasher.update([u8::from(committed)]);
+    hasher.update(source.0.to_be_bytes());
+    hasher.update((sorted.len() as u64).to_be_bytes());
+    for name in sorted {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn chain_control_image_digest(
+    prev: [u8; 32],
+    position: ReplicaPosition,
+    tag: u8,
+    detail: &[u8],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"rtdb.replication.applied-image.control.v1\0");
+    hasher.update(prev);
+    hasher.update(position.0.to_be_bytes());
+    hasher.update([tag]);
+    hasher.update((detail.len() as u64).to_be_bytes());
+    hasher.update(detail);
+    hasher.finalize().into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -556,6 +605,7 @@ pub struct ReplicationDriver {
     compaction_replay_cutoff: Option<ReplicaPosition>,
     track_catalog_cut: bool,
     recognized_prefix: bool,
+    applied_image: AppliedImageDigest,
     installed: Option<InstalledPrefix>,
     first_erasure: Option<CommittedErasure>,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
@@ -608,9 +658,11 @@ impl ReplicationDriver {
         let recovered_confirmation = if config.enabled && config.may_lead {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
+        let base_digest = recovered.block.as_ref().map(checkpoint_digest).transpose()?.unwrap_or([0u8; 32]);
+        let applied_image = applied_image_from_base(read_position.0, base_digest);
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, applied_image, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
@@ -1000,7 +1052,11 @@ impl ReplicationDriver {
         if !self.logs.fences_writer_terms() { return self.start_claim(); }
         let holds_grant = self.config.may_lead && self.leader.is_none() && self.logs.holds_writer_grant().await?;
         if !crate::recovery_promotion::may_promote(
-            self.recognized_prefix, self.config.may_lead, self.leader.is_some(), holds_grant,
+            self.recognized_prefix,
+            self.applied_image.is_complete_at(self.read_position.0),
+            self.config.may_lead,
+            self.leader.is_some(),
+            holds_grant,
         ) { return Ok(()); }
         let term = self.fence.claim_term()?;
         if let Err(error) = self.promote_term(term).await {
@@ -1117,9 +1173,15 @@ impl ReplicationDriver {
         Ok(VecDeque::new())
     }
     fn activate_installed_writer(&mut self) {
+        let image_complete = self.applied_image.is_complete_at(self.read_position.0);
         if let Some(leader) = &mut self.leader {
-            leader.activation = leader.activation.installed(leader.confirmed, self.recognized_prefix,
-                self.read_position.0, self.installed.map(|prefix| prefix.replica.0));
+            leader.activation = leader.activation.installed(
+                leader.confirmed,
+                self.recognized_prefix,
+                image_complete,
+                self.read_position.0,
+                self.installed.map(|prefix| prefix.replica.0),
+            );
         }
     }
 
@@ -1143,9 +1205,11 @@ impl ReplicationDriver {
 
     fn update_installed_prefix(&mut self) -> Result<()> {
         let apply_deferred = self.leader.as_ref().is_some_and(|leader| !leader.held.is_empty());
-        if let Some(through) = crate::catalog_cut::completed_prefix(
+        let completed = crate::catalog_cut::completed_prefix(
             self.read_position.0, self.recognized_prefix, self.pending_block.is_some(), apply_deferred,
-        ) {
+        );
+        let image_complete = self.applied_image.is_complete_at(self.read_position.0);
+        if let Some(through) = publish_installed_prefix(self.recognized_prefix, completed, image_complete) {
             let through = ReplicaPosition(through);
             let checkpoint = self.partition.value();
             let progress = self.progress.current();
@@ -1170,7 +1234,11 @@ impl ReplicationDriver {
             }
             let source = progress.source_position;
             self.logs.record_source_applied(source);
-            self.installed = Some(InstalledPrefix { replica: through, source });
+            self.installed = Some(InstalledPrefix {
+                replica: through,
+                source,
+                image_digest: self.applied_image.applied_digest,
+            });
             if let Some(leader) = &mut self.leader
                 && let Some(reset) = leader.compactor_reset.as_ref()
                 && self.partition.value().table_catalog().block_index() == Some(reset.block)
@@ -1245,6 +1313,7 @@ impl ReplicationDriver {
                     return Err(invalid("The current writer cannot apply an unrecognized replica frame"));
                 }
                 self.recognized_prefix = false;
+                let _ = self.applied_image.observe_authenticated(position.0, [0xff; 32]);
                 self.read_position = position;
                 self.complete_trie_removals();
                 return Ok(());
@@ -1275,6 +1344,20 @@ impl ReplicationDriver {
             self.validate_own_readback(&record)?;
             if !self.confirm_recovered_block(&record).await? {
                 self.apply_admitted(record).await?;
+            } else {
+                let digest = chain_control_image_digest(self.applied_image.expected_digest, position, 2, &[]);
+                if !self.applied_image.observe_authenticated(position.0, digest)
+                    || !self.applied_image.record_applied(position.0, digest)
+                {
+                    return Err(invalid("Recovered block confirmation diverged from applied image digest"));
+                }
+            }
+        } else {
+            let digest = chain_control_image_digest(self.applied_image.expected_digest, position, 0, &[]);
+            if !self.applied_image.observe_authenticated(position.0, digest)
+                || !self.applied_image.record_applied(position.0, digest)
+            {
+                return Err(invalid("Voided replica record diverged from applied image digest"));
             }
         }
         self.require_transferred_debt(position)?;
@@ -1394,9 +1477,22 @@ impl ReplicationDriver {
         Ok(())
     }
 
+    fn record_control_image(&mut self, position: ReplicaPosition, tag: u8, detail: &[u8]) -> Result<()> {
+        let digest = chain_control_image_digest(self.applied_image.expected_digest, position, tag, detail);
+        if !self.applied_image.observe_authenticated(position.0, digest)
+            || !self.applied_image.record_applied(position.0, digest)
+        {
+            return Err(invalid("Applied control record diverged from authenticated image digest"));
+        }
+        Ok(())
+    }
+
     async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
         if matches!(&record.envelope.message, ReplicaBody::NoOp(message)
-            if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none() && message.serving_record.is_none()) { return Ok(()); }
+            if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none() && message.serving_record.is_none())
+        {
+            return self.record_control_image(record.metadata.position, 3, &[]);
+        }
         if let Some(leader) = &mut self.leader {
             if leader.resolution.is_some() {
                 let bytes = leader.held_bytes.checked_add(record.retained_bytes()).ok_or_else(|| invalid("Resolution read-back buffer size overflow"))?;
@@ -1436,6 +1532,8 @@ impl ReplicationDriver {
                 } else {
                     self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
                 }
+                let adopted_digest = self.partition.value().table_catalog().block().map(checkpoint_digest).transpose()?.unwrap_or([0u8; 32]);
+                self.record_control_image(record.metadata.position, 4, &adopted_digest)?;
                 self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
                 let pending = self.pending_block.take().ok_or_else(|| invalid("Adopted block disappeared"))?;
                 let mut held = pending.into_records();
@@ -1463,22 +1561,47 @@ impl ReplicationDriver {
                 self.observe_default_erasure_upload(&record)?;
             }
             if self.pending_block.is_some() && self.upload_for_installed_block(&record) {
+                self.record_control_image(record.metadata.position, 5, &[])?;
                 self.complete_control(&record);
                 continue;
             }
             if let Some(pending) = &mut self.pending_block { pending.hold(record)?; continue; }
-            if self.stale(&record) { self.complete_control(&record); continue; }
+            if self.stale(&record) {
+                self.record_control_image(record.metadata.position, 6, &[])?;
+                self.complete_control(&record);
+                continue;
+            }
             match &record.envelope.message {
                 ReplicaBody::ResolvedTx(message) => {
                     let placed = self.check_placed_terminal(record.envelope.term, message)?;
                     let leading = self.leader.is_some();
                     let own = own_readback_term(self.leader.as_ref().map(|leader| leader.term.0), record.envelope.term.0);
+                    let expected_tx_id = message.tx_id.unwrap_or_default();
+                    let expected_source = SourcePosition(crate::replay_progress::replayed_source(
+                        message.src_msg_id,
+                        self.config.external_source,
+                        self.progress.source_position().0,
+                        expected_tx_id,
+                    ));
+                    let expected_image = chain_tx_image_digest(
+                        self.applied_image.expected_digest,
+                        record.metadata.position,
+                        expected_tx_id,
+                        message.system_time_micros.unwrap_or_default(),
+                        message.committed.unwrap_or_default(),
+                        expected_source,
+                        message.table_data.keys().map(String::as_str),
+                    );
+                    if !self.applied_image.observe_authenticated(record.metadata.position.0, expected_image) {
+                        return Err(invalid("Authenticated transaction record regressed the applied image chain"));
+                    }
                     if own {
                         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
                         let head = leader.resolver_mut()?.take_head();
                         let (pending, expected) = leader.pending_tx_at(record.envelope.term_sequence).ok_or_else(|| readback_mismatch(message.tx_id))?;
                         let pending = Arc::clone(pending);
                         let expected = Arc::clone(expected);
+                        let prev_applied = self.applied_image.applied_digest;
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
                             let delta = confirmed_search_delta(pending.body.search_delta(), message.search_delta.as_ref());
@@ -1488,6 +1611,20 @@ impl ReplicationDriver {
                                 if let Some(operation) = head.db_op() { self.effects.apply_db_op(operation).await?; }
                             }
                             let result = Arc::new(head.result().clone());
+                            let applied_names: Vec<String> = head.writes().tables().keys()
+                                .map(|table| format!("{}/{}", table.schema, table.table)).collect();
+                            let applied_digest = chain_tx_image_digest(
+                                prev_applied,
+                                record.metadata.position,
+                                result.tx_key().tx_id.0,
+                                result.tx_key().system_time.0,
+                                result.committed(),
+                                head.source_position(),
+                                applied_names.iter().map(String::as_str),
+                            );
+                            if !self.applied_image.record_applied(record.metadata.position.0, applied_digest) {
+                                return Err(invalid("Applied transaction image omitted a control row, table write, or receipt"));
+                            }
                             self.progress.applied(Some(head.source_position()), Some(AppliedTransaction::new(Arc::clone(&result), head.placed_attempt())), head.external_token().map(<[u8]>::to_vec))?;
                             Ok(result)
                         }.await;
@@ -1522,6 +1659,20 @@ impl ReplicationDriver {
                             self.progress.source_position().0,
                             result.tx_key().tx_id.0,
                         ));
+                        let applied_names: Vec<String> = writes.tables().keys()
+                            .map(|table| format!("{}/{}", table.schema, table.table)).collect();
+                        let applied_digest = chain_tx_image_digest(
+                            self.applied_image.applied_digest,
+                            record.metadata.position,
+                            result.tx_key().tx_id.0,
+                            result.tx_key().system_time.0,
+                            result.committed(),
+                            source,
+                            applied_names.iter().map(String::as_str),
+                        );
+                        if !self.applied_image.record_applied(record.metadata.position.0, applied_digest) {
+                            return Err(invalid("Replayed transaction image omitted a control row, table write, or receipt"));
+                        }
                         self.progress.applied(Some(source), Some(AppliedTransaction::new(Arc::new(result), placed_attempt)), message.external_source_token.clone())?;
                     }
                     if placed {
@@ -1554,6 +1705,7 @@ impl ReplicationDriver {
                     {
                         self.partition.add_tries(&additions(&message.tries)?, record.metadata.timestamp)?;
                     }
+                    self.record_control_image(record.metadata.position, 7, &[])?;
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
@@ -1566,6 +1718,7 @@ impl ReplicationDriver {
                             self.partition.add_artefacts_at(&table, artefact_entries(&message.entries), record.metadata.timestamp);
                         }
                     }
+                    self.record_control_image(record.metadata.position, 8, &[])?;
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
@@ -1586,6 +1739,7 @@ impl ReplicationDriver {
                             for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
                         }
                     }
+                    self.record_control_image(record.metadata.position, 9, &[])?;
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
@@ -1595,6 +1749,7 @@ impl ReplicationDriver {
                     }
                     let prepared = self.partition.prepare_block()?;
                     self.pending_block = Some(PendingBlock::new(ReplicaRecord::clone(&record), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
+                    self.record_control_image(record.metadata.position, 10, &[])?;
                     if let Some(leader) = &mut self.leader { leader.cycle = BlockCycle::Cut; }
                     self.complete_control(&record);
                     if self.leader.is_some() { self.produce_pending()?; }
@@ -1602,6 +1757,7 @@ impl ReplicationDriver {
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => {
                     if self.apply_default_erasure_control(message, record.metadata.position).await? {
+                        self.record_control_image(record.metadata.position, 11, &[])?;
                         self.complete_control(&record);
                         continue;
                     }
@@ -1610,6 +1766,7 @@ impl ReplicationDriver {
                         let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
                         pin.check_predecessor(serving.incarnation(), &self.logs, record.metadata.position, self.progress.source_position())?;
                         pin.apply(self.logs.store().as_ref(), record.metadata.position, record.envelope.term, &self.resolve.memory).await?;
+                        self.record_control_image(record.metadata.position, 12, &[])?;
                         self.complete_control(&record);
                         continue;
                     }
@@ -1618,6 +1775,7 @@ impl ReplicationDriver {
                         let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
                         release.check_predecessor(serving.incarnation(), record.metadata.position)?;
                         release.apply(self.logs.store().as_ref(), record.metadata.position, record.envelope.term).await?;
+                        self.record_control_image(record.metadata.position, 13, &[])?;
                         self.complete_control(&record);
                         continue;
                     }
@@ -1710,6 +1868,7 @@ impl ReplicationDriver {
                         }
                         self.progress.applied(message.src_msg_id.map(SourcePosition), None, None)?;
                     }
+                    self.record_control_image(record.metadata.position, 14, &[])?;
                     self.complete_control(&record);
                     if released_checkpoint && self.deferred_cut && self.leader.as_ref().is_some_and(|leader| leader.cycle.accepting()) {
                         self.cut().await?;
@@ -1737,10 +1896,12 @@ impl ReplicationDriver {
                     } else if let Some(leader) = &mut self.leader && leader.term == record.envelope.term {
                         complete_record(&mut leader.pending, record.envelope.term_sequence, Err(trie_removal_unconfirmed()));
                     }
+                    self.record_control_image(record.metadata.position, 15, &[])?;
                 }
                 ReplicaBody::TablesRetired(message) => {
                     let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
                     self.partition.retire_tables(tables, Timestamp(message.as_of_micros.unwrap_or_default()));
+                    self.record_control_image(record.metadata.position, 16, &[])?;
                     self.complete_control(&record);
                 }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),

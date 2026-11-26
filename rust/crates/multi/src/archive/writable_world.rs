@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, NullArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, WorldForkReservation, now_ms};
+use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, WorldForkRequestLink, WorldForkReservation, now_ms};
 use rtdb_node::{AppliedReadFloor, NativeSession, OwnedReadSession, OwnedWorldRegistrationOutcome, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, OwnedWorldAssertion, PlacedAttemptScope, Result, StructFields,
@@ -20,7 +20,10 @@ use crate::admin::update_installation;
 
 mod fork_pin;
 mod held;
-use fork_pin::{ForkDisposition, ForkPin, ForkPinWrite, select_pin_write};
+use fork_pin::{
+    CertifiedSourceImage, ForkDecisionOutcome, ForkDecisionRecord, ForkDisposition, ForkPin,
+    ForkPinWrite, recover_pin_write, select_pin_write,
+};
 pub(crate) use held::{HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 
 fn now() -> Timestamp {
@@ -318,6 +321,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     ancestors.push(ancestor.clone());
     let binding = CheckpointWorldRetention {
         fork_reservation: Some(WorldForkReservation::Prepared),
+        fork_request_link: None,
         world: child, ancestors, owner: owner.clone(),
         capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
         schema_digest: retained.schema_digest, suffix: retained.suffix, basis: retained.basis,
@@ -548,6 +552,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     let pin = Uuid::from_bytes(world.pin.0);
     let retained = CheckpointWorldRetention {
         fork_reservation: None,
+        fork_request_link: None,
         ancestors,
         world: id,
         owner,
@@ -713,7 +718,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
             }
             _ => return Err(unavailable()),
         };
-        let binding = CheckpointWorldRetention { fork_reservation: None, world: child, until, mode, ..retained.clone() };
+        let binding = CheckpointWorldRetention { fork_reservation: None, fork_request_link: None, world: child, until, mode, ..retained.clone() };
         let mut registration = world_record(child, &binding, opened.record.schemas.clone());
         if !opened.record.can_retain_parent(&registration) { return Err(unavailable()); }
         registration.fork_lineage = opened.record.retained_child_lineage(&registration, opened.registered)?;
@@ -922,6 +927,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     }
     let retained = CheckpointWorldRetention {
         fork_reservation: None,
+        fork_request_link: None,
         ancestors: Vec::new(),
         world: id,
         owner,
@@ -997,7 +1003,34 @@ pub(crate) async fn fork_checkpoint_world_selected(
 fn same_fork_binding(existing: &CheckpointWorldRetention, requested: &CheckpointWorldRetention) -> bool {
     let mut requested = requested.clone();
     requested.fork_reservation = existing.fork_reservation;
+    requested.fork_request_link = existing.fork_request_link;
     existing == &requested
+}
+
+fn fork_request_link_for(
+    installation: &DeploymentRecord, pin: Uuid, token: Uuid, binding: &CheckpointWorldRetention,
+) -> WorldForkRequestLink {
+    let mut key_hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    key_hasher.update(b"rtdb.fork-pin.v8-request-key.v1\0");
+    key_hasher.update(&installation.incarnation.to_be_bytes());
+    key_hasher.update(&installation.log_epoch.to_be_bytes());
+    key_hasher.update(pin.as_bytes());
+    key_hasher.update(token.as_bytes());
+    let mut request_key = [0u8; 32];
+    request_key.copy_from_slice(key_hasher.finish().as_ref());
+
+    let mut digest_hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    digest_hasher.update(b"rtdb.fork-pin.v8-request-digest.v1\0");
+    digest_hasher.update(&request_key);
+    digest_hasher.update(binding.world.as_bytes());
+    digest_hasher.update(binding.owner.as_bytes());
+    digest_hasher.update(binding.capture.as_bytes());
+    digest_hasher.update(&binding.basis.tx_id.0.to_be_bytes());
+    digest_hasher.update(&binding.until.0.to_be_bytes());
+    let mut request_digest = [0u8; 32];
+    request_digest.copy_from_slice(digest_hasher.finish().as_ref());
+
+    WorldForkRequestLink { request_key, request_digest, retain_until: binding.until }
 }
 
 fn reserve_fork_pin(
@@ -1005,12 +1038,17 @@ fn reserve_fork_pin(
     reservation: WorldForkReservation, prepared: bool,
 ) -> Result<()> {
     let unavailable = OwnedWorld::unavailable;
+    let link = match reservation {
+        WorldForkReservation::Registering(token) => Some(fork_request_link_for(installation, pin, token, binding)),
+        WorldForkReservation::Prepared => None,
+    };
     if let Some(current) = installation.checkpoint_worlds.get_mut(&pin) {
         if !same_fork_binding(current, binding) { return Err(unavailable()); }
         return match current.fork_reservation {
             None => Ok(()),
             Some(WorldForkReservation::Prepared) if prepared => {
                 current.fork_reservation = Some(reservation);
+                current.fork_request_link = link;
                 Ok(())
             }
             Some(_) => Err(unavailable()),
@@ -1021,6 +1059,7 @@ fn reserve_fork_pin(
     }
     let mut binding = binding.clone();
     binding.fork_reservation = Some(reservation);
+    binding.fork_request_link = link;
     installation.checkpoint_worlds.insert(pin, binding);
     Ok(())
 }
@@ -1104,6 +1143,37 @@ fn settle_fork_pin(
         Some(ForkPinWrite::Publish(pin)) => {
             if let Some(binding) = current.checkpoint_worlds.get_mut(&Uuid::from_u128(pin)) {
                 binding.fork_reservation = None;
+                binding.fork_request_link = None;
+            }
+        }
+        Some(ForkPinWrite::Release(pin)) => { current.checkpoint_worlds.remove(&Uuid::from_u128(pin)); }
+        None => {}
+    }
+}
+
+/// Replacement-process pin reconciliation: reads the durable V8 decision record
+/// linked from `CheckpointWorldRetention::fork_request_link` and retries the
+/// exact directory Publish or Release compare-and-set once source confirmation
+/// and content-complete image apply cover the original transaction.
+pub(crate) fn reconcile_fork_pin_reservation(
+    current: &mut DeploymentRecord,
+    original: ForkPin,
+    expected: &CheckpointWorldRetention,
+    record: Option<&ForkDecisionRecord>,
+    source: CertifiedSourceImage,
+) {
+    let pin = Uuid::from_u128(original.pin);
+    let Some(binding) = current.checkpoint_worlds.get(&pin) else { return; };
+    let Some(WorldForkReservation::Registering(token)) = binding.fork_reservation else { return; };
+    let Some(link) = binding.fork_request_link else { return; };
+    let observed = fork_pin_key(current, pin, token);
+    match recover_pin_write(
+        original, observed, binding == expected, &link.request_key, &link.request_digest, record, source,
+    ) {
+        Some(ForkPinWrite::Publish(pin)) => {
+            if let Some(binding) = current.checkpoint_worlds.get_mut(&Uuid::from_u128(pin)) {
+                binding.fork_reservation = None;
+                binding.fork_request_link = None;
             }
         }
         Some(ForkPinWrite::Release(pin)) => { current.checkpoint_worlds.remove(&Uuid::from_u128(pin)); }
@@ -1470,7 +1540,7 @@ mod tests {
         let token = Uuid::new_v4();
         let reservation = WorldForkReservation::Registering(token);
         let binding = CheckpointWorldRetention {
-            fork_reservation: None, world: pin, ancestors: Vec::new(), owner: "owner".into(),
+            fork_reservation: None, fork_request_link: None, world: pin, ancestors: Vec::new(), owner: "owner".into(),
             capture: Uuid::new_v4(), manifest_sha256: "manifest".into(), schema_digest: [0; 32],
             suffix: None, basis: TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(1) },
             parent_publication: None, mode: WorldClockMode::Retained, until: Timestamp(100),
