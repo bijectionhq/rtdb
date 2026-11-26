@@ -222,6 +222,17 @@ impl IoRegion {
         Self::reading(view, self.run(move || work(&selection.0, &selection.1))).await
     }
 
+    /// Runs a short read of bytes the page cache already holds on the caller's thread, under the admission and lease
+    /// that [`Self::read`] would give it.
+    /// A closed region rejects the read, and the drain waits for it, as for blocking work.
+    pub(crate) fn read_inline<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let operation = self.admit()?;
+        let lease = operation.lease.clone();
+        let result = work();
+        drop(operation);
+        match lease { Some(lease) => lease.classify(result), None => result }
+    }
+
     pub(crate) fn admit_read<O, A>(&self, owner: Arc<O>, target: A) -> Result<IoAdmission>
     where
         O: Send + Sync + ?Sized + 'static,

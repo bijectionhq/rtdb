@@ -32,6 +32,7 @@ const APPEND_BATCH_TIME: Duration = Duration::from_millis(1);
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 const RECENT_FRAMES: usize = 256;
+const INLINE_READ_BYTES: usize = 64 * 1024;
 
 pub struct LocalLogOptions {
     pub maximum_message_bytes: usize,
@@ -700,6 +701,23 @@ fn open_at(path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile>
     Ok(file)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn read_prepared(held: Option<JournalFile>, path: &Path, lineage: Option<Uuid>, next: u64, maximum: usize, head: ReplayHead,
+    reservation: ReadReservation, keys: Option<&ClassicObjectKeys>,
+) -> Result<(LogRecord, u64, JournalFile)> {
+    let mut file = reopen_at(held, path, lineage, next)?;
+    let header = read_record_header(&mut file, path, maximum)?;
+    if header.replay_head() != head {
+        return Err(corrupt(path, next, "log replay head changed before delivery"));
+    }
+    if reservation.length() < head.allocation_bound {
+        return Err(Error::Task("log read reservation is too small".into()));
+    }
+    let record = read_record_body(&mut file, path, header, keys)?.retain(reservation)?;
+    let next = file.stream_position().map_err(|error| Error::io(path, error))?;
+    Ok((record, next, file))
+}
+
 #[async_trait]
 impl LogReplayTail for LocalTail {
     async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
@@ -728,22 +746,21 @@ impl LogReplayTail for LocalTail {
             return Err(Error::Task("log replay head exceeds the durable tip".into()));
         }
         let maximum = self.maximum;
-        let keys = self.keys.clone();
         let lineage = self.lineage;
         let held = self.held.take();
-        let (record, next, held) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
-            let mut file = reopen_at(held, path, lineage, next)?;
-            let header = read_record_header(&mut file, path, maximum)?;
-            if header.replay_head() != head {
-                return Err(corrupt(path, next, "log replay head changed before delivery"));
-            }
-            if reservation.length() < head.allocation_bound {
-                return Err(Error::Task("log read reservation is too small".into()));
-            }
-            let record = read_record_body(&mut file, path, header, keys.as_deref())?.retain(reservation)?;
-            let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))?;
-            Ok((record, next, file))
-        }).await?;
+        // A frame this process's writer has just written is read back from the page cache, which costs less than the
+        // hop to a blocking thread; opening a sealed frame reads its key slot, so that always takes the hop.
+        let cached = self.keys.is_none()
+            && self.recent.get(self.next).is_some_and(|frame| frame.payload_size <= INLINE_READ_BYTES);
+        let (record, next, held) = if cached {
+            let next = self.next;
+            self.reads.read_inline(|| read_prepared(held, &self.path, lineage, next, maximum, head, reservation, None))?
+        } else {
+            let keys = self.keys.clone();
+            self.reads.read(self.path.clone(), self.next, move |path, &next| {
+                read_prepared(held, path, lineage, next, maximum, head, reservation, keys.as_deref())
+            }).await?
+        };
         self.held = Some(held);
         self.after = record.metadata.offset;
         self.next = next;
@@ -1114,6 +1131,45 @@ mod tests {
 
         let (reopened, _driver) = LocalLog::open(&path, options())?;
         assert_eq!(replay_heads(&reopened, payloads.len()).await?, prepared);
+        Ok(())
+    }
+
+    async fn replay_payloads(log: &LocalLog, count: usize) -> Result<Vec<(LogMetadata, Bytes)>> {
+        let mut tail = log.tail(LogOffset(-1)).await?;
+        let replay = tail.replay().unwrap();
+        let mut records = Vec::new();
+        for _ in 0..count {
+            let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+            let short = ReadReservation::new(head.allocation_bound - 1, ());
+            assert!(matches!(replay.read_head(head, short).await, Err(Error::Task(_))));
+            let record = replay.read_head(head, ReadReservation::new(head.allocation_bound, ())).await?;
+            records.push((record.metadata, record.payload));
+        }
+        assert!(replay.poll_head(Duration::ZERO).await?.is_none());
+        Ok(records)
+    }
+
+    #[tokio::test]
+    async fn a_tail_delivers_just_written_frames_of_any_size_as_it_delivers_them_from_a_reopened_journal() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        let options = || LocalLogOptions { maximum_message_bytes: 4 * INLINE_READ_BYTES, queue_capacity: 4 };
+        let (log, driver) = LocalLog::open(&path, options())?;
+        let shutdown = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(shutdown.clone()));
+        let payloads = [Bytes::from_static(b"small"), Bytes::from(vec![7; INLINE_READ_BYTES + 1]), Bytes::new()];
+        let mut written = Vec::new();
+        for (time, payload) in payloads.iter().enumerate() {
+            let metadata = log.enqueue(payload.clone(), Timestamp(time as i64)).await?.durable().await?;
+            written.push((metadata, payload.clone()));
+        }
+        assert_eq!(replay_payloads(&log, payloads.len()).await?, written);
+        shutdown.cancel();
+        writer.await.unwrap()?;
+        drop(log);
+
+        let (reopened, _driver) = LocalLog::open(&path, options())?;
+        assert_eq!(replay_payloads(&reopened, payloads.len()).await?, written);
         Ok(())
     }
 
