@@ -81,6 +81,11 @@ The startup owner retains the resulting lease through server shutdown.
 `XTDB_JOIN_SPILL_THRESHOLD` sets the shared query option that disables join Bloom/IID pushdowns above the configured build-row count.
 The default is 100,000; an invalid signed-long spelling uses that default, and zero or negative values disable filters for nonempty builds.
 YAML, EDN, ingest, and packaged server startup use the same captured environment value.
+`defaultLocalErasure` and `defaultKafkaErasure` enroll fresh Default primaries for physical erasure; both default to `false`.
+Without the YAML key, each reads `RTDB_DEFAULT_LOCAL_ERASURE` or `RTDB_DEFAULT_KAFKA_ERASURE`, where exactly `1` enables it, `0` or empty disables it, and any other value is a configuration error.
+`defaultLocalErasure` applies only with `defaultV1Serving`; `defaultKafkaErasure` fails startup without native Kafka, `defaultV1Serving` and both original key vaults.
+`RTDB_APPLE_SYNC` selects the durable-write policy on Apple platforms for every `rtdb` and `rtdb-multi` command: absent, empty or `full` keeps `F_FULLFSYNC`, `fsync` selects plain `fsync`, and any other value fails startup.
+The binary validates and installs it once before dispatching the command; library code performs no lookup, and an embedding host that installs nothing gets `F_FULLFSYNC`.
 `-Djava.util.Arrays.useLegacyMergeSort=true` selects the legacy OpenJDK object sorter for this node's queries and transaction-time queries.
 The option may precede the command or appear among startup and maintenance options; repeated occurrences use the last value.
 Only case-insensitive `true` enables it, without whitespace trimming; an absent property, a bare `-Djava.util.Arrays.useLegacyMergeSort`, or another value selects TimSort.

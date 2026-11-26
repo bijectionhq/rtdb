@@ -37,6 +37,7 @@ fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
+    rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
     let command = cli::parse(std::env::args().skip(1), &|key| std::env::var(key).ok())?;
     match command {
         Command::Help => { print!("{}", cli::HELP); Ok(()) }

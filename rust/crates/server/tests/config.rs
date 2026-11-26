@@ -364,3 +364,46 @@ fn assignment_coordinates_come_from_operator_configuration() {
     assert!(decode(&format!("{oidc}\n    assignment: {{relation: bj_installation, rowId: authority, validAtMicros: 0}}")).is_err());
     assert!(decode(&format!("{oidc}\n    assignment: {{relation: public.bj_installation, rowId: authority}}")).is_err());
 }
+
+#[test]
+fn default_erasure_reads_yaml_then_its_historical_environment_variables() {
+    let off = decode("{}").unwrap().default_erasure;
+    assert_eq!((off.local, off.kafka), (false, false));
+    let on = decode("defaultLocalErasure: true\ndefaultKafkaErasure: true").unwrap().default_erasure;
+    assert_eq!((on.local, on.kafka), (true, true));
+    let environment = |name: &str| match name {
+        "RTDB_DEFAULT_LOCAL_ERASURE" => Some("1".into()),
+        "RTDB_DEFAULT_KAFKA_ERASURE" => Some("0".into()),
+        _ => None,
+    };
+    let from_environment = NodeConfiguration::from_yaml_with_environment("{}", &environment, false).unwrap().default_erasure;
+    assert_eq!((from_environment.local, from_environment.kafka), (true, false));
+    let overridden = NodeConfiguration::from_yaml_with_environment("defaultLocalErasure: false", &environment, false).unwrap().default_erasure;
+    assert!(!overridden.local);
+    for value in ["true", "yes", " 1", "2"] {
+        let environment = |name: &str| (name == "RTDB_DEFAULT_LOCAL_ERASURE").then(|| value.to_owned());
+        assert_eq!(NodeConfiguration::from_yaml_with_environment("{}", &environment, false).unwrap_err().code, "xtdb/invalid-node-config", "{value}");
+    }
+    assert!(decode("defaultKafkaErasure: 1").is_err());
+}
+
+#[test]
+fn configured_kafka_erasure_reaches_backend_resource_validation() {
+    let config = decode("defaultV1Serving: true\ndefaultKafkaErasure: true\nserver: null\nflightSql: null").unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(64 << 20);
+    let metrics = rtdb_metrics::Registry::new("fixture", std::sync::Arc::clone(&memory)).unwrap();
+    match rtdb_server::open_backend_resources(&config, &memory, &metrics) {
+        Err(error) => assert_eq!(error.code, "rtdb.server/kafka-erasure"),
+        Ok(_) => panic!("Kafka erasure without its key vaults opened"),
+    }
+}
+
+#[test]
+fn apple_sync_is_validated_and_installed_from_the_startup_environment() {
+    let typo = |name: &str| (name == rtdb_server::config::APPLE_SYNC_SETTING).then(|| "fsnyc".to_owned());
+    assert_eq!(rtdb_server::config::install_apple_sync(&typo).unwrap_err().code, "rtdb.storage/apple-sync");
+    assert_eq!(rtdb_server::config::install_apple_sync(&|_| None).unwrap(), rtdb_storage::AppleSync::Full);
+    assert_eq!(rtdb_storage::AppleSync::installed(), rtdb_storage::AppleSync::Full);
+    let weaker = |name: &str| (name == rtdb_server::config::APPLE_SYNC_SETTING).then(|| "fsync".to_owned());
+    assert!(rtdb_server::config::install_apple_sync(&weaker).is_err());
+}

@@ -10,34 +10,45 @@ pub enum AppleSync {
     Fsync,
 }
 
+static INSTALLED: std::sync::OnceLock<AppleSync> = std::sync::OnceLock::new();
+
 impl AppleSync {
-    /// `RTDB_APPLE_SYNC=fsync` selects `Fsync`; anything else, or nothing, keeps `Full`.
-    pub fn from_setting(setting: Option<&str>) -> Self {
+    /// Absent or blank keeps `Full`; trimmed, case-insensitive `full` or `fsync` selects a policy.
+    /// - Errors: any other value, so that a typo cannot choose a durability policy.
+    pub fn from_setting(setting: Option<&str>) -> rtdb_types::Result<Self> {
         match setting.map(str::trim) {
-            Some(value) if value.eq_ignore_ascii_case("fsync") => Self::Fsync,
-            _ => Self::Full,
+            None | Some("") => Ok(Self::Full),
+            Some(value) if value.eq_ignore_ascii_case("full") => Ok(Self::Full),
+            Some(value) if value.eq_ignore_ascii_case("fsync") => Ok(Self::Fsync),
+            Some(_) => Err(rtdb_types::Anomaly::incorrect("rtdb.storage/apple-sync", "The Apple sync policy must be 'full' or 'fsync'")),
         }
     }
 
-    pub fn configured() -> Self {
-        static CONFIGURED: std::sync::LazyLock<AppleSync> =
-            std::sync::LazyLock::new(|| AppleSync::from_setting(std::env::var("RTDB_APPLE_SYNC").ok().as_deref()));
-        *CONFIGURED
+    /// Installs the process's policy; a binary calls this from its validated startup configuration before any durable write.
+    /// - Errors: a policy different from one already installed. Reinstalling the same policy succeeds.
+    pub fn install(self) -> rtdb_types::Result<()> {
+        if *INSTALLED.get_or_init(|| self) == self { return Ok(()); }
+        Err(rtdb_types::Anomaly::incorrect("rtdb.storage/apple-sync", "A different Apple sync policy is already installed"))
     }
+
+    /// The installed policy, or `Full` when the process installed none.
+    pub fn installed() -> Self { INSTALLED.get().copied().unwrap_or(Self::Full) }
 }
 
 /// Flushes a file's data and metadata to stable storage, as the reference's `FileChannel.force(true)` does.
-/// On Apple platforms that is `F_FULLFSYNC`, as the JDK issues there, unless `RTDB_APPLE_SYNC=fsync` chose `fsync`;
-/// where the filesystem or file type does not support `F_FULLFSYNC`, it falls back to `fsync`.
+/// On Apple platforms that is `F_FULLFSYNC`, as the JDK issues there, unless the installed [`AppleSync`] is `Fsync`;
+/// where the filesystem or file type does not support `F_FULLFSYNC`, it falls back to `fsync` and reports that once per process.
 pub fn sync_file(file: &File) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
         // SAFETY: the descriptor is owned by `file`, which outlives both calls.
-        if AppleSync::configured() == AppleSync::Full {
+        if AppleSync::installed() == AppleSync::Full {
             if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != -1 { return Ok(()); }
             let error = std::io::Error::last_os_error();
             if !matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY)) { return Err(error); }
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| eprintln!("RTDB durable writes fall back from F_FULLFSYNC to fsync where it is unsupported: {error}"));
         }
         if unsafe { libc::fsync(file.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
@@ -66,10 +77,20 @@ mod tests {
     }
 
     #[test]
-    fn only_an_explicit_fsync_setting_weakens_apple_durability() {
-        assert_eq!(AppleSync::from_setting(None), AppleSync::Full);
-        assert_eq!(AppleSync::from_setting(Some("full")), AppleSync::Full);
-        assert_eq!(AppleSync::from_setting(Some("fsnyc")), AppleSync::Full);
-        assert_eq!(AppleSync::from_setting(Some(" FSYNC ")), AppleSync::Fsync);
+    fn only_a_known_setting_selects_apple_durability() {
+        assert_eq!(AppleSync::from_setting(None).unwrap(), AppleSync::Full);
+        assert_eq!(AppleSync::from_setting(Some(" ")).unwrap(), AppleSync::Full);
+        assert_eq!(AppleSync::from_setting(Some("Full")).unwrap(), AppleSync::Full);
+        assert_eq!(AppleSync::from_setting(Some(" FSYNC ")).unwrap(), AppleSync::Fsync);
+        assert_eq!(AppleSync::from_setting(Some("fsnyc")).unwrap_err().code, "rtdb.storage/apple-sync");
+    }
+
+    #[test]
+    fn an_installed_policy_is_fixed_for_the_process() {
+        AppleSync::Full.install().unwrap();
+        AppleSync::Full.install().unwrap();
+        assert_eq!(AppleSync::installed(), AppleSync::Full);
+        assert_eq!(AppleSync::Fsync.install().unwrap_err().code, "rtdb.storage/apple-sync");
+        assert_eq!(AppleSync::installed(), AppleSync::Full);
     }
 }

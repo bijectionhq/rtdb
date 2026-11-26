@@ -346,6 +346,7 @@ fn watch_parent(arguments: &Arguments, cancellation: &CancellationToken) {
 }
 
 async fn run(arguments: Vec<String>) -> Result<()> {
+    rtdb_server::config::install_apple_sync(&|key| std::env::var(key).ok())?;
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
     if command == "--build-info" {
         if !rest.is_empty() {

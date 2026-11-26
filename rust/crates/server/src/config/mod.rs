@@ -58,6 +58,14 @@ pub struct SearchSettings { pub enabled: bool, pub threads: usize, pub write_for
 pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration, pub reader_lease: Duration, pub reader_lease_margin: Duration }
 #[derive(Clone, Debug)]
 pub struct TracingSettings { pub enabled: bool, pub endpoint: String, pub service_name: String, pub query_tracing: bool, pub transaction_tracing: bool }
+/// Physical erasure enrolment for fresh Default primaries; both are off unless configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DefaultErasureSettings {
+    /// Enrols a fresh native Local primary for public v1 Erase; applies only with `defaultV1Serving`.
+    pub local: bool,
+    /// Enrols a fresh Default primary with Kafka logs and a Local object store; requires native Kafka and `defaultV1Serving`.
+    pub kafka: bool,
+}
 #[derive(Clone, Debug)]
 pub enum ModuleSettings { CloudWatch { namespace: String }, AzureMonitor { connection_string: Secret } }
 
@@ -88,6 +96,7 @@ pub struct NodeConfiguration {
     pub modules: Vec<ModuleSettings>,
     pub read_only_databases: bool,
     pub default_v1_serving: bool,
+    pub default_erasure: DefaultErasureSettings,
     pub ordered_index_arrow_references: bool,
     pub ordered_index_arrow_references_on_private_storage: bool,
     pub skipped_databases: BTreeSet<String>,
@@ -146,6 +155,10 @@ impl NodeConfiguration {
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
         let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").as_deref().and_then(join_threshold).unwrap_or(100_000);
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
+        let default_erasure = DefaultErasureSettings {
+            local: erasure_flag(&mut fields, "defaultLocalErasure", "RTDB_DEFAULT_LOCAL_ERASURE", environment)?,
+            kafka: erasure_flag(&mut fields, "defaultKafkaErasure", "RTDB_DEFAULT_KAFKA_ERASURE", environment)?,
+        };
         let references = fields.boolean("orderedIndexArrowReferences")?;
         let ordered_index_arrow_references = references.unwrap_or(false);
         let ordered_index_arrow_references_on_private_storage = references.is_none();
@@ -161,7 +174,7 @@ impl NodeConfiguration {
                 default_checkpoint_restore_directory: None,
                 health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -198,11 +211,35 @@ impl NodeConfiguration {
                 deployment_admin,
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory,
-                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)
     }
+}
+
+/// Reads an erasure switch from its YAML key, else from its environment variable.
+/// The variable keeps its historical spelling: exactly `1` enables, and `0` or empty disables.
+/// Any other value is rejected rather than read as off, since it once silently meant off and may have been meant as on.
+fn erasure_flag(fields: &mut YamlFields, key: &str, variable: &str, environment: &impl Fn(&str) -> Option<String>) -> Result<bool> {
+    if let Some(value) = fields.boolean(key)? { return Ok(value); }
+    match environment(variable).as_deref() {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(invalid(format!("{variable} must be 1 or 0"))),
+    }
+}
+
+/// The process setting that selects the Apple durable-write policy for every command of a binary.
+pub const APPLE_SYNC_SETTING: &str = "RTDB_APPLE_SYNC";
+
+/// Validates `RTDB_APPLE_SYNC` from the startup environment and installs it as the process's durability policy.
+/// - Errors: a value other than blank, `full` or `fsync`, or a policy different from one already installed.
+pub fn install_apple_sync(environment: &impl Fn(&str) -> Option<String>) -> Result<rtdb_storage::AppleSync> {
+    let policy = rtdb_storage::AppleSync::from_setting(environment(APPLE_SYNC_SETTING).as_deref())
+        .map_err(|error| error.with_context("setting", APPLE_SYNC_SETTING.into()))?;
+    policy.install()?;
+    Ok(policy)
 }
 
 fn join_threshold(value: &str) -> Option<i64> {

@@ -25,7 +25,7 @@ After both prefixes settle, it closes admission to earlier catalog cuts and wait
 The original vault closes per-object key slots before the provider unlinks their objects.
 The Local ledger persists the name digest and settlement cursor, so repeating an interrupted batch targets the same keys. [Local custody](../../rust/crates/storage/src/local_erasure.rs) · [Catalog tickets](../../rust/crates/storage/src/local_catalog.rs)
 
-Set `RTDB_DEFAULT_LOCAL_ERASURE=1` with `defaultV1Serving`, `RTDB_CLASSIC_KEY_VAULT` and `RTDB_V1_CHECKPOINT_KEY_VAULT` to enroll a fresh native Local primary for public v1 Erase.
+Set `defaultLocalErasure: true` (or `RTDB_DEFAULT_LOCAL_ERASURE=1` when the key is absent) with `defaultV1Serving`, `RTDB_CLASSIC_KEY_VAULT` and `RTDB_V1_CHECKPOINT_KEY_VAULT` to enroll a fresh native Local primary for public v1 Erase.
 The payload and journal directories and both private vaults must belong to the same original installation.
 The Local provider serializes enrollment with attachment, verifies that the payload and journal locations are pristine, and durably binds their directory and log identities to the checkpoint vault and database incarnation.
 The versioned storage marker requires this authority at reopen.
@@ -56,7 +56,7 @@ A later erasure skips a retired Local replica prefix only when its journal proof
 
 ## Sealed Kafka
 
-Set `RTDB_DEFAULT_KAFKA_ERASURE=1` with `defaultV1Serving`, `RTDB_CLASSIC_KEY_VAULT`, and `RTDB_V1_CHECKPOINT_KEY_VAULT` for a fresh Default primary with Kafka logs and a Local object store.
+Set `defaultKafkaErasure: true` (or `RTDB_DEFAULT_KAFKA_ERASURE=1` when the key is absent) with `defaultV1Serving`, `RTDB_CLASSIC_KEY_VAULT`, and `RTDB_V1_CHECKPOINT_KEY_VAULT` for a fresh Default primary with Kafka logs and a Local object store.
 The original writable node opens dedicated single-partition source and replica topics and enrolls each broker topic ID in its own role under the Local residence's Classic vault.
 The Local storage path and private checkpoint vault bind to the same enrollment.
 The first open creates the empty topics through the native Kafka provider with `autoCreateTopic` enabled.

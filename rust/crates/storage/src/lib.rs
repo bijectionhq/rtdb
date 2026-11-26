@@ -19,7 +19,7 @@ mod remote_version_step;
 pub use local_catalog::LocalRepairAnchor;
 pub use local_erasure::LocalErasureRecovery;
 mod durability;
-pub use durability::{sync_directory, sync_file};
+pub use durability::{AppleSync, sync_directory, sync_file};
 #[cfg(feature = "remote")]
 pub mod remote;
 
