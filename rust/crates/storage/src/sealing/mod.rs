@@ -9,6 +9,13 @@ pub use delivery::{DeliveryDeadline, DeliveryIo, InheritedRootRankCut, Inherited
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
 pub use classic::{ClassicKeyVault, ClassicObjectKeys, LocalErasureCustody, LocalErasureResidence, open_local_residence, KAFKA_LOG_SEAL_OVERHEAD, KafkaFrameKeys, KafkaPrefixRetirement};
 
+/// A tempdir that ClassicKeyVault::open accepts: tempfile creates directories with the default 0755.
+#[cfg(test)]
+pub(crate) fn private_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+}
+
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 
 use async_trait::async_trait;

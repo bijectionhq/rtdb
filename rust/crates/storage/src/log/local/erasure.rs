@@ -172,7 +172,7 @@ mod tests {
     async fn the_live_sealed_log_reopens_after_the_inclusive_erasure_cut() -> rtdb_types::Result<()>
     {
         let files = tempfile::tempdir().unwrap();
-        let keys = tempfile::tempdir().unwrap();
+        let keys = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(keys.path())?;
         let path = files.path().join("REPLICA_LOG");
         let io = IoRegion::new();

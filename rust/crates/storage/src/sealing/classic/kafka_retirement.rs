@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_armed_prefix_denies_replay_across_restart_and_retains_the_suffix() -> Result<()> {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(directory.path())?;
         let topic = Uuid::new_v4().into_bytes();
         let keys = vault.kafka_log_keys(topic, true, IoRegion::new())?;
@@ -400,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_slot_aliased_by_the_preserved_suffix_prevents_retirement() -> Result<()> {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(directory.path())?;
         let keys = vault.kafka_log_keys(Uuid::new_v4().into_bytes(), true, IoRegion::new())?;
         let publication = keys
@@ -416,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_and_terminal_require_exact_positions_and_the_completed_cut() -> Result<()> {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(directory.path())?;
         let topic = Uuid::new_v4().into_bytes();
         let owner = Uuid::new_v4().into_bytes();

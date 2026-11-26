@@ -147,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn references_survive_the_classic_floor_and_require_every_retired_position() -> Result<()>
     {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(directory.path())?;
         let topic = Uuid::new_v4().into_bytes();
         let keys = vault.kafka_log_keys(topic, true, IoRegion::new())?;

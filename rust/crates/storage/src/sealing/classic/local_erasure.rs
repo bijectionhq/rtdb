@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn kafka_residence_reopens_only_with_its_original_topic_pair_and_roles() -> rtdb_types::Result<()> {
         let base = tempfile::tempdir().unwrap();
-        let vault_dir = tempfile::tempdir().unwrap();
+        let vault_dir = crate::sealing::private_tempdir();
         let checkpoint = tempfile::tempdir().unwrap();
         let payload = base.path().join("v06");
         fs::create_dir(&payload).unwrap();

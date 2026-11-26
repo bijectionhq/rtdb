@@ -358,7 +358,7 @@ mod tests {
         use std::sync::Arc;
 
         let files = tempfile::tempdir().unwrap();
-        let vault_root = tempfile::tempdir().unwrap();
+        let vault_root = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(vault_root.path())?;
         let epoch = StorageEpoch(0);
         let open = || {

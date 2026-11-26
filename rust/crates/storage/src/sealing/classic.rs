@@ -752,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_confirmed_kafka_floor_retires_exact_recorded_publications() -> Result<()> {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(directory.path())?;
         let keys = vault.kafka_log_keys(Uuid::new_v4().into_bytes(), true, IoRegion::new())?;
         let earlier = keys.seal_kafka_record(Bytes::from_static(b"old")).await?;
@@ -770,8 +770,8 @@ mod tests {
 
     #[tokio::test]
     async fn kafka_frames_require_the_enrolled_topic_and_original_vault() -> Result<()> {
-        let original = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let original = crate::sealing::private_tempdir();
+        let other = crate::sealing::private_tempdir();
         let vault = ClassicKeyVault::open(original.path())?;
         let other = ClassicKeyVault::open(other.path())?;
         let topic = Uuid::new_v4().into_bytes();
