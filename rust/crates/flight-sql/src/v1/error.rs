@@ -124,7 +124,8 @@ pub(super) fn detail(native: Anomaly) -> Error {
         | "rtdb/default-serving-classic-history" | "rtdb/idempotency-key"
         | "rtdb/window-expired" | "rtdb/timed-transaction-refused"
         | "rtdb/funded-appointment"
-        | "rtdb/already-present" | REQUIREMENT_FAILED => {
+        | "rtdb/already-present" | "rtdb/count-constraint" | "rtdb/grouped-count-constraint"
+        | REQUIREMENT_FAILED => {
             native.code.as_str()
         }
         _ => code(category),
