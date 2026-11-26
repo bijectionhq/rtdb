@@ -281,7 +281,7 @@ impl HeldTextCorpus {
         let column = owned_text_column(Arc::clone(context), owner, relation, path).await?;
         let database = context.catalog.database(context.catalog.default_database())?;
         let [snapshot] = database.partitions.as_slice() else { return Err(corpus_limit()); };
-        if snapshot.system_time_cap() != Some(context.current_time.as_micros()?) {
+        if !crate::held_at_or_before(snapshot, context.current_time.as_micros()?) {
             return Err(corpus_limit());
         }
         let table = relation.table(owner);

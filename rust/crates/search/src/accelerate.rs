@@ -627,7 +627,7 @@ async fn covered_owned_corpus(
     let captured = context.catalog.database(database)?;
     let [snapshot] = captured.partitions.as_slice() else { return Err(uncovered_owned_search()); };
     let present = context.current_time.as_micros()?;
-    if snapshot.system_time_cap() != Some(present) {
+    if !crate::held_at_or_before(snapshot, present) {
         return Err(uncovered_owned_search());
     }
     let [column] = definition.columns.as_slice() else { return Err(uncovered_owned_search()); };

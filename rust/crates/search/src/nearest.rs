@@ -344,7 +344,7 @@ pub async fn owned_nearest_batch(
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(uncovered()); };
     let present = context.current_time.as_micros()?;
-    if snapshot.system_time_cap() != Some(present) { return Err(uncovered()); }
+    if !crate::held_at_or_before(snapshot, present) { return Err(uncovered()); }
     let valid = valid_at.unwrap_or(present);
     let mut window = NearestWindow::new(&context.memory, query.k)?;
     let mut approximated = false;

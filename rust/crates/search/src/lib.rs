@@ -26,3 +26,11 @@ pub use accelerate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, SearchAc
 pub use held_corpus::{HeldTextCorpus, TextShadows, owned_search_analyzer, owned_text_column};
 pub use nearest::{HeldVectorOverlay, NearestPartition, NearestQuery, owned_nearest_batch};
 pub use runtime::{SearchRuntime, Suspect};
+
+/// Whether a held owned read's one snapshot is capped exactly at its own transaction basis, no later than the read's clock.
+/// The read's clock is a receiver-clock reading taken after the basis was reserved, so it may trail it by any amount.
+pub(crate) fn held_at_or_before(snapshot: &rtdb_index::Snapshot, present: rtdb_types::Timestamp) -> bool {
+    snapshot.tx_basis().is_some_and(|basis| {
+        snapshot.system_time_cap() == Some(basis.system_time) && basis.system_time <= present
+    })
+}
