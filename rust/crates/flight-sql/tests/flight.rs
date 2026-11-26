@@ -1632,9 +1632,18 @@ async fn check_spatial_pages_at_the_original_cut() {
         vec![Arc::new(lists)],
         Some(NullBuffer::from(vec![true, true, false, true])),
     );
+    let mut absent = ListBuilder::new(StringBuilder::new());
+    for row in 0..4 {
+        if row == 2 {
+            absent.values().append_value("c_payload");
+            absent.values().append_value("c_compound");
+        }
+        absent.append(row == 2);
+    }
     let mut insert = relation.clone();
     ipc(&mut insert, [
         ("_id", Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef),
+        ("_absent", Arc::new(absent.finish())),
         ("location", Arc::new(BinaryArray::from_iter_values([point(1.0), point(2.0), point(1.0), point(1.0)]))),
         ("borough", Arc::new(BinaryArray::from_vec(vec![b"montrouge", b"montrouge", b"elsewhere", b"montrouge"]))),
         ("c_location", Arc::new(BinaryArray::from_iter_values(std::array::from_fn::<_, 4, _>(|_| canonical_point(1.0))))),
