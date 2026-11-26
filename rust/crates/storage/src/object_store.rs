@@ -221,6 +221,10 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
+    /// Whether a catalog registration admitted at one cut also stands for a later cut of the same storage version and
+    /// epochs, file inventory and checkpoint: what it retains covers what the later cut needs, and while it is held the
+    /// store's admission would decide the later cut the same.
+    fn catalog_registration_covers_later_cuts(&self) -> bool { false }
     /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.
     fn releases_receipt_l0(&self) -> bool { false }
     /// Records an installed retirement as a lower bound for new catalog captures.
@@ -866,6 +870,8 @@ impl ObjectStore for LocalStore {
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
+    // A ledger claim retains every cut its own does not cover and every path it lists, which is all a later cut of the same inventory needs.
+    fn catalog_registration_covers_later_cuts(&self) -> bool { true }
     fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {

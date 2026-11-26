@@ -506,6 +506,9 @@ impl ObjectStore for EncryptingStore {
     fn defers_trie_releases(&self) -> bool {
         self.inner.defers_trie_releases()
     }
+    fn catalog_registration_covers_later_cuts(&self) -> bool {
+        self.inner.catalog_registration_covers_later_cuts()
+    }
     fn releases_receipt_l0(&self) -> bool {
         self.inner.releases_receipt_l0()
     }

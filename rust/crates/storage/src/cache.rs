@@ -248,6 +248,7 @@ pub struct HeldCatalogRead {
 
 impl HeldCatalogRead {
     pub fn is_registered(&self) -> bool { self.registration.is_some() }
+    pub fn cut(&self) -> Option<rtdb_types::CatalogCut> { self.cut }
 
     fn covers(&self, cut: Option<rtdb_types::CatalogCut>) -> bool {
         match (self.cut, cut) {
@@ -427,11 +428,26 @@ impl BufferPool {
             issued.live.iter().rev().filter_map(Weak::upgrade).collect()
         };
         // Dropping a candidate can release its registration, so the choice is made outside the lock.
-        candidates.into_iter().find(|held| {
-            held.is_registered() && Arc::ptr_eq(&self.residence, &held.residence) && held.cut == cut
+        let shareable: Vec<_> = candidates.into_iter().filter(|held| {
+            held.is_registered() && Arc::ptr_eq(&self.residence, &held.residence)
                 && held.catalog_file_paths.as_deref() == paths && same_checkpoint(held)
                 && held.admitted.elapsed() < CATALOG_HOLD_SHARING
-        })
+        }).collect();
+        if let Some(exact) = shareable.iter().find(|held| held.cut == cut) { return Some(Arc::clone(exact)); }
+        let later = |held: &HeldCatalogRead| match (held.cut, cut) {
+            (Some(held), Some(cut)) => held.storage_version == cut.storage_version && held.storage_epoch == cut.storage_epoch
+                && held.replica_epoch == cut.replica_epoch && held.through <= cut.through,
+            _ => false,
+        };
+        if !self.store.catalog_registration_covers_later_cuts() { return None; }
+        let earlier = shareable.iter().find(|held| later(held))?;
+        // The reader keeps its own cut, which renewal re-admits; only the registration is shared.
+        let extended = Arc::new(HeldCatalogRead {
+            residence: Arc::clone(&earlier.residence), cut, registration: earlier.registration.clone(),
+            catalog_file_paths: earlier.catalog_file_paths.clone(), checkpoint: earlier.checkpoint, admitted: earlier.admitted,
+        });
+        self.issued_holds.lock().live.push(Arc::downgrade(&extended));
+        Some(extended)
     }
 
     fn remember_hold(&self, held: Arc<HeldCatalogRead>) -> Arc<HeldCatalogRead> {
