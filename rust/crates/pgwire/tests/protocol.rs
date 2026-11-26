@@ -1907,7 +1907,6 @@ async fn float_array_bind_round_trips_through_queries_and_dml() {
 }
 
 #[tokio::test]
-#[ignore = "R1 of the XTDB differential run: the bench build returned no row here; root cause not yet located"]
 async fn sql_execute_binds_an_untyped_id_parameter_as_the_integer_it_is_given() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
@@ -1918,6 +1917,40 @@ async fn sql_execute_binds_an_untyped_id_parameter_as_the_integer_it_is_given() 
     assert_eq!(rows(&client.query("SELECT v FROM docs WHERE _id = 2").await), [vec![Some(b"bob".to_vec())]]);
     assert_eq!(tags(&client.query("PREPARE by_cast AS SELECT v FROM docs WHERE _id = CAST($1 AS BIGINT)").await), b"CZ");
     assert_eq!(rows(&client.query("EXECUTE by_cast (2)").await), [vec![Some(b"bob".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn extended_sql_execute_binds_an_untyped_id_parameter_from_a_literal_or_an_int8_argument() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id, v) VALUES (1, 'ann'), (2, 'bob'), (3, 'cy')").await), b"CZ");
+    assert_eq!(tags(&client.query("UPDATE docs SET v = 'dee' WHERE _id = 3").await), b"CZ");
+    assert_eq!(tags(&client.query("PREPARE by_id AS SELECT v FROM docs WHERE _id = $1").await), b"CZ");
+
+    client.parse("", "EXECUTE by_id (2)", &[]).await;
+    client.bind("", "").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12DCZ", "{frames:?}");
+    assert_eq!(rows(&frames), [vec![Some(b"bob".to_vec())]]);
+
+    // An int8 argument in binary format, as a driver sends an integer for `EXECUTE by_id ($1)`.
+    client.parse("", "EXECUTE by_id ($1)", &[20]).await;
+    let mut bind = cstring("");
+    bind.extend_from_slice(&cstring(""));
+    bind.extend_from_slice(&[0, 1, 0, 1, 0, 1]);
+    bind.extend_from_slice(&8i32.to_be_bytes());
+    bind.extend_from_slice(&2i64.to_be_bytes());
+    bind.extend_from_slice(&[0, 0]);
+    client.send(b'B', &bind).await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12DCZ", "{frames:?}");
+    assert_eq!(rows(&frames), [vec![Some(b"bob".to_vec())]]);
     drop(client);
     running.stop().await;
 }
