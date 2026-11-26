@@ -2265,7 +2265,7 @@ async fn deferred_checkpoint_keeps_the_commits_between_its_cut_and_its_announcem
     commit_range(&mut writer, 4..=6, "while building").await;
     let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
     commit_range(&mut writer, 7..=8, "after the upload").await;
-    let manifest = writer.announce_checkpoint(prepared).await.unwrap();
+    let manifest = writer.announce_checkpoint(prepared).await.unwrap().manifest().unwrap();
 
     // The floor is the first record after the cut, an ordinary commit. The
     // checkpoint record that announces the base comes after the retained
@@ -2325,7 +2325,7 @@ async fn replay_installs_a_classic_floor_then_two_deferred_floors_in_a_row() {
     trace.capture(&writer, first_cut);
     commit_range(&mut writer, 5..=6, "between the first cut and its announcement").await;
     let first = writer.checkpoint_builder().build(first).await.unwrap();
-    writer.announce_checkpoint(first).await.unwrap();
+    writer.announce_checkpoint(first).await.unwrap().manifest().unwrap();
     assert_eq!(writer.retained_floor(), Some(Lsn(first_cut.0 + 1)));
 
     // The second cut follows the first announcement.
@@ -2337,7 +2337,7 @@ async fn replay_installs_a_classic_floor_then_two_deferred_floors_in_a_row() {
     assert!(second_cut > writer.state().base.as_ref().unwrap().announced);
     commit_range(&mut writer, 9..=10, "between the second cut and its announcement").await;
     let second = writer.checkpoint_builder().build(second).await.unwrap();
-    writer.announce_checkpoint(second).await.unwrap();
+    writer.announce_checkpoint(second).await.unwrap().manifest().unwrap();
     let floor = Lsn(second_cut.0 + 1);
     assert_eq!(writer.retained_floor(), Some(floor));
     // Every retained record is applied once: from the floor through the head.
@@ -2369,7 +2369,7 @@ async fn deferred_announcement_is_refused_after_a_key_rotation_or_a_new_writer()
     writer.rotate_clean_checkpoint(&[]).await.unwrap();
     let floor = writer.retained_floor();
     let head = writer.state().head;
-    assert_eq!(writer.announce_checkpoint(prepared).await.unwrap_err().code, "rtdb/checkpoint-invalidated");
+    assert_eq!(writer.announce_checkpoint(prepared).await.unwrap(), deferred::Announcement::Invalidated);
     assert_eq!((writer.retained_floor(), writer.state().head), (floor, head));
     // While the rotation awaits its retirement no capture is taken.
     assert!(writer.capture_checkpoint(1).await.unwrap().is_none());
@@ -2384,7 +2384,7 @@ async fn deferred_announcement_is_refused_after_a_key_rotation_or_a_new_writer()
     cluster.at(120);
     let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY))).with_deferred_checkpoints(true);
     assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
-    assert!(writer.announce_checkpoint(prepared).await.is_err());
+    assert!(!matches!(writer.announce_checkpoint(prepared).await, Ok(deferred::Announcement::Announced(_))));
     assert_eq!(successor.retained_floor(), Some(Lsn(1)));
     commit_range(&mut successor, 3..=3, "successor").await;
     assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_some());

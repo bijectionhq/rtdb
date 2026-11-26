@@ -379,7 +379,7 @@ impl MultiDatabase {
     ) -> Result<Receipt> {
         let result = self.transact_serial(request, scope).await;
         if result.is_err() {
-            let _ = self.recover_writer().await;
+            self.recover_after_failure().await;
         }
         self.project_receipt(result?, scope)
     }
@@ -631,7 +631,7 @@ impl MultiDatabase {
         if self.deferred_checkpoints {
             let Some(capture) = self.capture_checkpoint(limit).await? else { return Ok(None) };
             let prepared = self.checkpoint_builder().build(capture).await?;
-            return self.announce_checkpoint(prepared).await.map(Some);
+            return self.announce_checkpoint(prepared).await.map(deferred::Announcement::manifest);
         }
         self.checkpoint(Vec::new()).await.map(Some)
     }

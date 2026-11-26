@@ -14,7 +14,7 @@ use rtdb_crypt::Generation;
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_store::{ObjectStore, ReservedManifest};
 use rtdb_tx::transact::TransactState;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, Result};
 
 use super::{Lease, MultiDatabase, no_writer, timing};
 use crate::{
@@ -152,11 +152,11 @@ impl MultiDatabase {
         CheckpointBuilder { stream: self.stream.clone(), store: Arc::clone(&self.store) }
     }
 
-    /// Announces a prepared checkpoint and trims through its cut. Refused,
-    /// with `rtdb/checkpoint-invalidated`, when the writer epoch, key
-    /// generation or restored history changed since the capture, or an
-    /// erasure or key rotation started; the next bound check captures again.
-    pub async fn announce_checkpoint(&mut self, prepared: PreparedCheckpoint) -> Result<ObjectId> {
+    /// Announces a prepared checkpoint and trims through its cut. Returns
+    /// [`Announcement::Invalidated`] when the writer epoch, key generation or
+    /// restored history changed since the capture, or an erasure or key
+    /// rotation started; the next bound check captures again.
+    pub async fn announce_checkpoint(&mut self, prepared: PreparedCheckpoint) -> Result<Announcement> {
         let mut timing = timing::Phases::start();
         self.refresh().await?;
         let lease = self.authority()?;
@@ -175,7 +175,7 @@ impl MultiDatabase {
             || state.rotation.is_some()
             || !(prepared.through == state.head || state.announces_deferred(&checkpoint))
         {
-            return Err(checkpoint_invalidated());
+            return Ok(Announcement::Invalidated);
         }
         timing.mark("validate");
         self.append_control(lease, Record::Checkpoint(checkpoint.clone())).await?;
@@ -184,14 +184,25 @@ impl MultiDatabase {
         self.trim_to_base(lease, ReplayBase { announced, checkpoint }, prepared.lease.until).await?;
         timing.mark("trim");
         timing.report_phase("deferred_announce", self.options.database, 0, prepared.through);
-        Ok(prepared.manifest)
+        Ok(Announcement::Announced(prepared.manifest))
     }
 }
 
-pub(super) fn checkpoint_invalidated() -> Anomaly {
-    Anomaly::new(
-        AnomalyCategory::Busy,
-        "rtdb/checkpoint-invalidated",
-        "The writer changed since the checkpoint was captured; the next bound check captures again",
-    )
+/// How the announcement of a prepared checkpoint ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Announcement {
+    /// The checkpoint record committed and the journal was trimmed through its cut.
+    Announced(ObjectId),
+    /// The writer changed since the capture, so nothing was announced; its
+    /// manifest is unreachable and collected like any orphan.
+    Invalidated,
+}
+
+impl Announcement {
+    pub fn manifest(self) -> Option<ObjectId> {
+        match self {
+            Self::Announced(manifest) => Some(manifest),
+            Self::Invalidated => None,
+        }
+    }
 }

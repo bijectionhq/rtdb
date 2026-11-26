@@ -400,9 +400,9 @@ async fn run(
                 let mut guard = database.lock().await;
                 if !guard.deferred_checkpoints() {
                     let result = guard.checkpoint_retained_suffix(limit).await;
-                    let _ = reply.send(result);
+                    answer_checkpoint(reply, result);
                 } else if building {
-                    let _ = reply.send(Ok(None));
+                    answer_checkpoint(reply, Ok(None));
                 } else {
                     match guard.capture_checkpoint(limit).await {
                         Ok(Some(capture)) => {
@@ -416,27 +416,27 @@ async fn run(
                                 let prepared = tokio::spawn(async move { builder.build(capture).await })
                                     .await
                                     .unwrap_or_else(|error| Err(Anomaly::fault("rtdb/checkpoint-build", error.to_string())));
-                                if let Some(input) = announcements.upgrade() {
-                                    let _ = input.send(Command::AnnounceCheckpoint { prepared, reply }).await;
+                                let stopped = match announcements.upgrade() {
+                                    Some(input) => input.send(Command::AnnounceCheckpoint { prepared, reply }).await.is_err(),
+                                    None => true,
+                                };
+                                if stopped {
+                                    tracing::warn!("The writer pipeline stopped before announcing a built checkpoint; its manifest is collected as an orphan");
                                 }
                             });
                         }
-                        result => {
-                            let _ = reply.send(result.map(|_| None));
-                        }
+                        result => answer_checkpoint(reply, result.map(|_| None)),
                     }
                 }
             }
             Command::AnnounceCheckpoint { prepared, reply } => {
                 building = false;
                 let result = match prepared {
-                    Ok(prepared) => match database.lock().await.announce_checkpoint(prepared).await {
-                        Err(error) if error.code == "rtdb/checkpoint-invalidated" => Ok(None),
-                        result => result.map(Some),
-                    },
+                    Ok(prepared) => database.lock().await.announce_checkpoint(prepared).await
+                        .map(super::deferred::Announcement::manifest),
                     Err(error) => Err(error),
                 };
-                let _ = reply.send(result);
+                answer_checkpoint(reply, result);
             }
             Command::Export { pin, basis, until, reply } => {
                 let result = database.lock().await.export_ticket(pin, basis, until).await;
@@ -459,6 +459,14 @@ async fn run(
                 let _ = reply.send(result);
             }
         }
+    }
+}
+
+/// Answers a journal bound check. A deferred build outlives the request that
+/// started it, so a failure whose caller stopped waiting is logged, not lost.
+fn answer_checkpoint(reply: Reply<Option<rtdb_format::journal::ObjectId>>, result: Result<Option<rtdb_format::journal::ObjectId>>) {
+    if let Err(Err(error)) = reply.send(result) {
+        tracing::warn!(code = %error.code, message = error.message.as_deref().unwrap_or(""), "A checkpoint failed with no caller left to report it to");
     }
 }
 
@@ -696,9 +704,9 @@ async fn fail(
     }
     let mut database = database.lock().await;
     if database.writer.is_some() {
-        let _ = database.recover_writer().await;
-    } else {
-        let _ = database.refresh().await;
+        database.recover_after_failure().await;
+    } else if let Err(error) = database.refresh().await {
+        tracing::warn!(database = %database.options.database, code = %error.code, "Refresh after a failed write did not finish; the next read retries it");
     }
 }
 
@@ -801,7 +809,7 @@ impl MultiDatabase {
             let result = authority.append_funded(&write, decision_before, cutoff, admission).await;
             if let Err(error) = result {
                 let error = self.begin_write_recovery(error);
-                let _ = self.recover_writer().await;
+                self.recover_after_failure().await;
                 return Err(error);
             }
             self.publish_staged(lease, vec![write]).await
@@ -884,7 +892,7 @@ impl MultiDatabase {
     pub(super) async fn managed_workload(&mut self, request: workload::Request) -> Result<workload::Reply> {
         let result = self.managed_workload_serial(&request).await;
         if result.is_err() && self.writer.as_ref().is_some_and(|writer| writer.recovering) {
-            let _ = self.recover_writer().await;
+            self.recover_after_failure().await;
         }
         result
     }
@@ -1105,6 +1113,17 @@ impl MultiDatabase {
             writer.recovering = true;
         }
         interrupted(anomaly)
+    }
+
+    /// Recovers a writer that a failed write left recovering, without waiting
+    /// for the next tick. The failed write keeps its own error. A recovery
+    /// that does not finish leaves the writer recovering, or withdraws it, so
+    /// the next tick retries it and reports its error to the placement loop.
+    pub(super) async fn recover_after_failure(&mut self) {
+        if let Err(error) = self.recover_writer().await {
+            tracing::warn!(database = %self.options.database, code = %error.code,
+                message = error.message.as_deref().unwrap_or(""), "Writer recovery after a failed write did not finish");
+        }
     }
 
     pub(super) async fn recover_writer(&mut self) -> Result<()> {
