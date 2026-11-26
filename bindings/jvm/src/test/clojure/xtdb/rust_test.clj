@@ -73,7 +73,7 @@
     (let [day (java.time.LocalDate/parse "2025-01-02")
           uuid (java.util.UUID/fromString "2a8e228f-d18b-41be-998b-7d8d8658512e")]
       (xt/execute-tx node [[:put-docs :docs {:xt/id 1, :nested {:a-b (float -0.0) :missing nil :day day :uuid uuid}}]])
-      (let [[{"nested" nested}] (xt/q node "SELECT nested FROM docs" {:key-fn :snake-case-string})]
+      (let [[{nested "nested"}] (xt/q node "SELECT nested FROM docs" {:key-fn :snake-case-string})]
         (is (= {"a_b" (float -0.0), "day" day, "uuid" uuid} nested))
         (is (instance? Float (get nested "a_b")))
         (is (= Integer/MIN_VALUE (Float/floatToRawIntBits (get nested "a_b"))))))))
@@ -168,13 +168,13 @@
                      (.prepare statement)
                      (.bindTransit statement (#'rust/write-request [args]))
                      (with-open [^NativeRows rows (.executeRows statement)]
-                       (#'rust/read-rows (.next rows) (serde/read-key-fn :kebab-case-keyword))))]
+                       (vec (.readNext rows (#'rust/row-reader (serde/read-key-fn :kebab-case-keyword))))))]
       (with-redefs-fn {#'rust/write-request (fn [_] (throw (AssertionError. "Unexpected Transit request")))}
         (fn []
           (let [[row :as actual] (xt/q connection (into [sql] args))]
             (is (= expected actual))
             (is (= Long/MIN_VALUE (Double/doubleToRawLongBits (:f row))))
-            (is (= [1.25 nil 2.5] (:g row))))))))
+            (is (= [1.25 nil 2.5] (:g row)))))))))
 
 (deftest plan-q-can-bind-arguments-when-the-jvm-arrow-allocator-is-full
   (with-open [allocator (RootAllocator. 1)
