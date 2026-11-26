@@ -69,6 +69,38 @@ impl IndexBatch {
         }
         Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation) }))
     }
+    /// As `from_owned`, for `owned` holding the rows of `parts` in order with their event columns unchanged, such as their
+    /// concatenation or a copy with a column added: the parts' decoded headers and put types are taken rather than derived again.
+    /// An operation layout or row count that differs from the parts' is derived afresh.
+    fn from_owned_rows_of<'a>(owned: OwnedBatch, parts: impl Iterator<Item = &'a IndexBatch> + Clone) -> Result<Arc<Self>> {
+        let rows = owned.batch().num_rows();
+        let same_rows = parts.clone().try_fold(0usize, |count, part| count.checked_add(part.len())) == Some(rows);
+        let same_layout = {
+            let schema = owned.batch().schema_ref();
+            schema.index_of("op").is_ok_and(|index| {
+                let op = schema.field(index);
+                parts.clone().all(|part| {
+                    let schema = part.arrow().schema_ref();
+                    schema.index_of("op").is_ok_and(|index| schema.field(index) == op)
+                })
+            })
+        };
+        let Some(first) = parts.clone().next().filter(|_| same_rows && same_layout) else { return Self::from_owned(owned); };
+        let header_reservation = owned.reservation().budget().reserve(Self::header_bytes(rows)?)?;
+        let events = EventBatch::new(owned.batch().clone())?;
+        let mut system_times: Option<(Timestamp, Timestamp)> = None;
+        let mut headers = Vec::with_capacity(rows);
+        for part in parts {
+            headers.extend_from_slice(&part.headers.0);
+            if let Some((low, high)) = part.system_times {
+                system_times = Some(system_times.map_or((low, high), |(first, last)| (first.min(low), last.max(high))));
+            }
+        }
+        Ok(Arc::new(Self {
+            owned, events, put_types: first.put_types.clone(), put_field_types: first.put_field_types.clone(), system_times,
+            canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation),
+        }))
+    }
     pub fn from_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::Write, budget)
     }
@@ -606,13 +638,13 @@ impl LiveTable {
                 .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))
         })?;
         let mut reservation = budget.reserve(bound)?;
-        let merged = arrow_select::concat::concat_batches(schema, batches.map(IndexBatch::arrow)).map_err(invalid)?;
+        let merged = arrow_select::concat::concat_batches(schema, batches.clone().map(IndexBatch::arrow)).map_err(invalid)?;
         // Dense union legs can outgrow the initial bound even when the chunks have the same layout.
         let size = merged.get_array_memory_size();
         let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
         lease.grow_to(lease.bytes().max(size))?;
         lease.shrink_to(size)?;
-        IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)
+        IndexBatch::from_owned_rows_of(OwnedBatch::with_reservation(merged, reservation)?, batches)
     }
     pub fn ordered_events(&self) -> Result<Vec<EventRow<RowSource>>> {
         self.trie.sorted_rows(self)?.into_iter().map(|row| {
@@ -1043,7 +1075,8 @@ impl StagedWrite {
             if !batch.view().has_origin_column() {
                 let origins = (first..last).map(|ordinal| Some(rtdb_types::EventOrigin::at(commit, ordinal, block)));
                 let resolved = rtdb_format::data::append_origins(&batch.owned, origins, memory)?;
-                table.batch = Some(IndexBatch::from_owned(resolved)?);
+                let resolved = IndexBatch::from_owned_rows_of(resolved, std::iter::once(batch.as_ref()))?;
+                table.batch = Some(resolved);
             }
             first = last;
         }
@@ -1155,7 +1188,7 @@ impl PendingTable {
         let mut reservation = budget.reserve(bytes)?;
         let combined = arrow_select::concat::concat_batches(schema, runs.iter().map(|run| run.batch.arrow())).map_err(invalid)?;
         Arc::get_mut(&mut reservation).expect("write concatenation owns its reservation").shrink_to(combined.get_array_memory_size())?;
-        IndexBatch::from_owned(OwnedBatch::with_reservation(combined, reservation)?)
+        IndexBatch::from_owned_rows_of(OwnedBatch::with_reservation(combined, reservation)?, runs.iter().map(|run| run.batch.as_ref()))
     }
 
     fn copy_since(&self, written: WritePosition, budget: &Arc<MemoryBudget>) -> Result<Arc<IndexBatch>> {
@@ -1998,6 +2031,51 @@ fn foreign_id_aliases_cannot_attest_canonical_iids() {
     let batch = rtdb_format::data::owned_put_batch(docs, &headers, None, &memory).unwrap();
     let batch = IndexBatch::from_owned(batch).unwrap();
     assert_eq!(batch.has_canonical_iids(), None);
+}
+
+#[cfg(test)]
+#[test]
+fn batches_built_from_other_batches_rows_keep_the_headers_and_put_types_a_fresh_decode_gives() {
+    let memory = MemoryBudget::new(8 << 20);
+    let system_from = Timestamp(1);
+    let event = |id: i64, deleted: bool| StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(),
+        system_from, valid_time: Interval::ALL,
+        operation: if deleted { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([
+            ("_id".into(), Value::I64(id)), ("balance".into(), Value::I64(id * 10)), ("note".into(), Value::Utf8(format!("n{id}"))),
+        ])) },
+        recency: None,
+    };
+    let first = IndexBatch::copy_events(&[event(1, false), event(2, true)], &StructFields::new(), &memory).unwrap();
+    let second = IndexBatch::copy_events(&[event(3, false), event(4, true), event(5, false)], &StructFields::new(), &memory).unwrap();
+    assert_eq!(first.arrow().schema_ref(), second.arrow().schema_ref());
+    let same_as_fresh = |built: &IndexBatch| {
+        let fresh = IndexBatch::new(built.arrow().clone(), &memory).unwrap();
+        assert_eq!(built.arrow(), fresh.arrow());
+        assert_eq!(built.headers.0, fresh.headers.0);
+        assert_eq!(built.headers.1.bytes(), fresh.headers.1.bytes());
+        assert_eq!(built.put_types.iter().collect::<Vec<_>>(), fresh.put_types.iter().collect::<Vec<_>>());
+        assert_eq!(built.put_field_types, fresh.put_field_types);
+        assert_eq!(built.system_times, fresh.system_times);
+    };
+
+    let merged = LiveTable::concat_live_chunks(first.arrow().schema_ref(), [first.as_ref(), second.as_ref()].into_iter(), &memory).unwrap();
+    assert_eq!(merged.len(), 5);
+    same_as_fresh(merged.as_ref());
+
+    let other = IndexBatch::copy_events(&[event(6, true), event(7, true)], &StructFields::new(), &memory).unwrap();
+    assert_ne!(other.arrow().schema_ref(), first.arrow().schema_ref());
+    let mismatched = IndexBatch::from_owned_rows_of(first.owned.clone(), std::iter::once(other.as_ref())).unwrap();
+    same_as_fresh(mismatched.as_ref());
+
+    let table = TableRef::new("public", "docs");
+    let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: system_from };
+    let staged = StagedWrite::new(key, None, BlockIndex(0), BTreeMap::from([
+        (table.clone(), TableWrite::new(StructFields::new(), Some(Arc::clone(&second)))),
+    ])).unwrap().assign_event_origins(&memory).unwrap();
+    let originated = staged.tables()[&table].batch().unwrap();
+    assert!(originated.view().has_origin_column());
+    same_as_fresh(originated.as_ref());
 }
 
 /// `row_column_types` of the events' put documents, without collecting each document's types when they all match the first's.
