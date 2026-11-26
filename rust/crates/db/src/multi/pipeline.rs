@@ -96,7 +96,7 @@ impl Work {
     }
 
     fn batchable(&self) -> bool {
-        !self.request.uses_erasure() && (!self.request.ops.is_empty() || !self.request.otherwise.is_empty())
+        !self.request.uses_erasure() && !self.request.validates_only()
     }
 
     fn timed(&self) -> bool {
@@ -790,7 +790,7 @@ impl MultiDatabase {
             }
             None => pipeline.decide(request, now, features, claims),
         };
-        if request.ops.is_empty() && request.otherwise.is_empty() {
+        if request.validates_only() {
             let validation = match self.writer.as_mut().filter(|writer| !writer.recovering) {
                 Some(writer) => decide(&mut writer.pipeline)?,
                 None => decide(&mut self.new_pipeline()?)?,

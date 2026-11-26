@@ -47,6 +47,66 @@ fn visible(state: &TransactState, branch: &str, layer: Layer, at: i64) -> Vec<i6
     }).collect()
 }
 
+fn store_append(key: u8, since: u64, reads: Vec<KeyRange>, writes: Vec<StoreWrite>, window: Window) -> Transact {
+    Transact {
+        key: vec![key; 16], require: Vec::new(), window: Window::default(),
+        guards: reads.into_iter().map(|range| Guard::Unwritten { range, since: basis(since) }).collect(),
+        ops: vec![Op::Store(StoreAppend { writes, window })], otherwise: Vec::new(), requires: Vec::new(),
+        custody_request_digest: None, request_memory: None,
+    }
+}
+
+fn refused(state: &TransactState, request: &Transact, at: u64, now: i64) -> String {
+    match state.resolve(request, at, Timestamp(now), DEFAULT, &claims()) {
+        Err(error) => error.code,
+        Ok(_) => panic!("expected a refusal"),
+    }
+}
+
+#[test]
+fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
+    use rtdb_index::branches::store::{Projection, StoreRead};
+    let mut state = TransactState::new(INCARNATION);
+    let partition = vec![0u8, 1, b'p'];
+    let stamped = StoreWrite {
+        key: [partition.as_slice(), b"e", &[0; 16]].concat(), value: Some(vec![0; 16]), key_stamp: Some(4), value_stamp: Some(0),
+    };
+    let other = StoreWrite { key: [partition.as_slice(), b"o"].concat(), value: Some(b"v".to_vec()), key_stamp: None, value_stamp: None };
+    let everything = KeyRange { start: partition.clone(), end: None };
+
+    // Committed at its own sample; both placeholders hold the stamp.
+    let committed = plan(&state, &store_append(1, 0, Vec::new(), vec![stamped.clone()], Window::default()), 1, 100, DEFAULT);
+    let receipt = apply(&mut state, 1, committed.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.system_time, receipt.outcome), (basis(1), Timestamp(100), Outcome::Then));
+    let stamp = StoreStamp { micros: 100, version: 1 }.encode();
+    let read = StoreRead { range: everything.clone(), after: None, limit: 10, projection: Projection::Values, filter: None, reverse: false };
+    let page = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(100)).unwrap().store_page(&read).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(&page.entries[0].key[4..], stamp.as_slice());
+    assert_eq!(page.entries[0].value.as_deref(), Some(stamp.as_slice()));
+
+    // A sample at the head's time is waited out, never raised.
+    assert_eq!(refused(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 100), STORE_CLOCK_BEHIND);
+    // Outside the window nothing is decided.
+    let closed = Window { not_before: None, before: Some(Timestamp(150)) };
+    let unopened = Window { not_before: Some(Timestamp(300)), before: None };
+    assert_eq!(refused(&state, &store_append(3, 1, Vec::new(), vec![other.clone()], closed), 2, 200), STORE_OUTSIDE_LATE);
+    assert_eq!(refused(&state, &store_append(4, 1, Vec::new(), vec![other.clone()], unopened), 2, 200), STORE_OUTSIDE_EARLY);
+    // A misplaced placeholder is the request's error.
+    let inside = StoreWrite { key_stamp: Some(1), ..stamped.clone() };
+    assert_eq!(refused(&state, &store_append(5, 1, Vec::new(), vec![inside], Window::default()), 2, 200), "rtdb.store/invalid-stamp-placeholder");
+
+    // The reads are judged before the window: a conflict is recorded.
+    let conflicting = plan(&state, &store_append(6, 0, vec![everything.clone()], vec![other.clone()], closed), 2, 200, DEFAULT);
+    let receipt = apply(&mut state, 2, conflicting.record()).unwrap();
+    assert_eq!(receipt.outcome, Outcome::Otherwise { failed: vec![0] });
+    // A write-free append validates at the head and appends nothing.
+    let Resolution::Answer(validated) = state.resolve(&store_append(7, 2, vec![everything], Vec::new(), Window::default()), 3, Timestamp(300), DEFAULT, &claims()).unwrap() else {
+        panic!("a validation answers");
+    };
+    assert_eq!((validated.basis, validated.outcome), (basis(2), Outcome::Then));
+}
+
 #[test]
 fn put_and_delete_resolve_relative_intervals_at_the_receipt_time() {
     let mut state = TransactState::new(INCARNATION);

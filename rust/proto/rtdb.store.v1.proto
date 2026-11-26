@@ -3,7 +3,8 @@ syntax = "proto3";
 // Versioned ordered bytes: the whole store contract.
 // The store knows no labels, worlds, indexes or schemas. Its callers encode
 // them as keys and decide what a read covers; the store only orders bytes,
-// versions commits and checks range intersection.
+// versions and stamps commits, checks range intersection and judges an
+// append's clock window.
 //
 // Every request is a Flight DoAction on an unscoped database route; each reply
 // is one Flight result holding the encoded reply message.
@@ -14,6 +15,13 @@ syntax = "proto3";
 // A version is a commit position within one store incarnation. A restore or a
 // reset starts a new incarnation; a request naming another incarnation fails
 // with FAILED_PRECONDITION and the caller starts again from a fresh read.
+//
+// A stamp is what the store assigns a committing append under its ordering:
+// its version, and the writer's clock sampled at the ordering point, in
+// microseconds. Micros never decrease along versions and are never raised to
+// a predecessor's: a clock reading behind the last commit is waited out. Its
+// 16-byte encoding is the micros big-endian with the sign bit flipped, then
+// the version big-endian, so encoded stamps sort in commit order.
 package rtdb.store.v1;
 
 // A half-open key range [start, end). An absent end is unbounded.
@@ -53,6 +61,10 @@ message ReadRequest {
   // Evaluated before the projection; limit counts returned entries.
   // A filter never narrows what the read covers.
   optional bytes filter = 10;
+  // Descend by key: after resumes strictly before its key, limit counts from
+  // the range's end, and resume names the smallest key returned. A reverse
+  // read equals the ascending read at the same version reversed.
+  bool reverse = 11;
 }
 
 enum Projection {
@@ -80,6 +92,32 @@ message Write {
   bytes key = 1;
   // Absent deletes the key.
   optional bytes value = 2;
+  // The offset of 16 zero bytes in key that the store overwrites with the
+  // append's encoded stamp. It lies at or past the key's partition prefix
+  // (a big-endian u16 length, then that many bytes).
+  optional uint32 key_stamp = 3;
+  // The same, in value.
+  optional uint32 value_stamp = 4;
+}
+
+// The stamp's micros must lie in [not_before, before). Absent bounds are
+// unbounded.
+message Window {
+  optional int64 not_before = 1;
+  optional int64 before = 2;
+}
+
+message Stamp {
+  int64 micros = 1;
+  uint64 version = 2;
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  // Before not_before: the window has not opened.
+  SIDE_EARLY = 1;
+  // At or past before: the window has closed.
+  SIDE_LATE = 2;
 }
 
 message AppendRequest {
@@ -90,17 +128,29 @@ message AppendRequest {
   uint64 since = 3;
   // Fails when a write committed after since intersects any of these.
   repeated KeyRange reads = 4;
+  // A placeholder that lies outside its bytes, over non-zero bytes or inside
+  // the key's partition prefix, a value placeholder on a delete, and a
+  // stamped key that could land on another write's key (equal length and
+  // equal bytes outside both placeholders) fail with INVALID_ARGUMENT
+  // before anything is judged.
   repeated Write writes = 5;
+  // Judged after the reads, against the clock sample the stamp carries.
+  // Absent is unbounded; an empty window fails with INVALID_ARGUMENT.
+  optional Window window = 6;
 }
 
 message AppendReply {
   bytes incarnation = 1;
   oneof outcome {
-    // The new version. An append with no writes validates only, and returns
-    // the version it validated through.
-    uint64 committed = 2;
+    // Committed with this stamp; every placeholder received it.
+    Stamp committed = 2;
     // The index of the first read range a later write intersected.
     uint32 conflict = 3;
+    // An append with no writes validated its reads through this version.
+    uint64 validated = 4;
+    // The clock sample fell outside the window. Nothing was written and no
+    // receipt was kept: a retry under the same key is judged again.
+    Side outside = 5;
   }
 }
 

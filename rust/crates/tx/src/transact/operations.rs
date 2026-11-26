@@ -153,6 +153,7 @@ impl Candidate<'_> {
                     self.index.check_custody_response_admission(admission)?;
                 }
                 Op::ScopedHold(_) => return Err(invalid_scoped_hold()),
+                Op::Store(_) => return Err(store_append_shape()),
                 Op::NativeCustodyTransfer { custody, destination } => {
                     self.require_unrestricted()?;
                     self.push(BranchEffect::NativeCustodyTransfer { custody: custody.clone(), destination: *destination })?;

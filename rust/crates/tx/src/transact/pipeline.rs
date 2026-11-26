@@ -182,7 +182,7 @@ impl TransactPipeline {
         if funding.is_some_and(|(input, _)| input.is_appointment()) && !self.in_flight.is_empty() {
             return Err(pending_error());
         }
-        if funding.is_none() && workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty() {
+        if funding.is_none() && workload.is_none() && request.validates_only() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.
             let view = View {
                 index: &self.durable.index,

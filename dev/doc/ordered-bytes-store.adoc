@@ -10,6 +10,8 @@ The `rtdb.owned.*` and Bijection-specific `rtdb.v1.*` actions are retired onto t
 The wire is `rust/proto/rtdb.store.v1.proto`, served as Flight `DoAction` calls on an unscoped database route.
 
 `rtdb.store.v1.Read`:: Returns the live entries of each requested range, ascending by key, at one version.
+With `reverse`, each page descends by key: the limit counts from the range's end and a stopped page names its smallest key, before which the next page resumes.
+A reverse read equals the ascending read at the same version reversed, for every projection and filter, so "the latest at or before" is a one-entry read and no caller inverts its keys.
 All ranges of one request read the same version.
 A page stops at its limit and names the key to resume after.
 A projection selects what each entry returns of its value: the whole value, nothing, or one byte slice at a fixed offset.
@@ -22,8 +24,14 @@ With `arrow`, each page is one Arrow IPC stream with columns `key`, `written` an
 
 `rtdb.store.v1.Append`:: Commits its writes at a new version, unless a write committed after `since` intersects one of its read ranges.
 A refused append names the first such range and writes nothing.
-An append with no writes only validates.
-Its idempotency key makes a retry return the first outcome.
+Its reads are judged first; then the writer's clock, sampled at the ordering point, is judged against the append's window `[not_before, before)`.
+A sample outside it answers `outside` (early or late), writes nothing and keeps no receipt, so a retry under the same key is judged again.
+A committing append receives its stamp: the clock sample in microseconds and the commit's version.
+The store overwrites every stamp placeholder of the writes (16 zero bytes at a named offset of a key or value) with the stamp's encoding, micros big-endian with the sign bit flipped and then the version big-endian, so stamped keys sort in commit order.
+A key placeholder lies at or past the key's partition prefix (a big-endian `u16` length, then that many bytes).
+A placeholder out of bounds, over non-zero bytes or inside the prefix, a value placeholder on a delete, and a stamped key that could land on another write's key (equal length and equal bytes outside both placeholders) are request errors, decided before anything is ordered.
+An append with no writes only validates, and answers the version it validated through.
+Its idempotency key makes a retry return the first outcome, a committed one with its first stamp.
 
 `rtdb.store.v1.Watch`:: Reports the first version after `after` that wrote into one of its ranges, waiting up to a bounded time.
 It always reports how far it inspected, so a caller resumes from there.
@@ -37,12 +45,19 @@ It always reports how far it inspected, so a caller resumes from there.
   A write outside every read range never refuses an append.
   The host makes labels key partitions, so a write the reader's label does not admit lies outside the reader's ranges and never refuses it.
 * Validation and invalidation are the same matching: `Watch` reports exactly the versions that would refuse an `Append` reading the same ranges.
+  Conflicts are judged over the stamped keys.
+* Stamp micros never decrease along versions and are never raised to a predecessor's.
+  A sample at or behind the last commit's time (two commits in one microsecond, or a failover writer's clock) is waited out before the append is judged again.
+  So a stamp is seekable by time and by version alike, and whether an append is `outside` depends on the clock alone.
 
 == Mechanism
 
 The store is one relation, `store.entries`, on the main branch of the v1 branch index.
 An entry's id is its key bytes and its `v` cell holds the value.
-`Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }`, judged by the resolver over the same branch index every other guard reads.
+`Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }` and whose one operation is `Op::Store`, its writes and window.
+The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time.
+It fills the placeholders and applies the stamped writes as puts and deletes of `store.entries`.
+A sample at or behind the head's time refuses as `rtdb.store/clock-behind`, and the Flight action waits it out and retries.
 `Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.
 
 Scan pushdown, columnar projection and batching are mechanism under this contract.

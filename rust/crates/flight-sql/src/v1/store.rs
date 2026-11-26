@@ -1,18 +1,24 @@
 //! `rtdb.store.v1`: versioned ordered bytes with read, conditional append and watch.
 //!
 //! The three actions carry no caller semantics. A read returns ordered entries
-//! at one version; an append commits its writes only when no write committed
-//! after `since` intersects its read ranges; a watch reports the next version
-//! that wrote into its ranges.
+//! at one version, ascending or descending by key; an append commits its writes
+//! only when no write committed after `since` intersects its read ranges and
+//! the writer's clock at the ordering point lies in its window, and the
+//! resolver stamps it there (`rtdb_tx::transact::Op::Store`); a watch reports
+//! the next version that wrote into its ranges.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
 use prost::Message;
-use rtdb_index::branches::store::{KeyRange, MAX_PAGE_ENTRIES, Projection, StoreEntry, StoreRead, VALUE_COLUMN, ValueFilter, store_table};
+use rtdb_index::branches::store::{
+    KeyRange, MAX_PAGE_ENTRIES, Projection, StoreRead, StoreWrite, ValueFilter, check_placeholders, store_table,
+};
 use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
-use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Row, Transact, Window};
-use rtdb_types::{EntityId, StructFields, Value, rtdb_v1::{At, Basis, MAIN_BRANCH}};
+use rtdb_tx::transact::{
+    Guard, Op, Outcome, STORE_CLOCK_BEHIND, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
+};
+use rtdb_types::{EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
 use tonic::Status;
 
 use super::{MAX_CHANGE_GROUPS, MAX_WAIT, check_key, error};
@@ -22,6 +28,10 @@ pub(crate) const READ: &str = "rtdb.store.v1.Read";
 pub(crate) const APPEND: &str = "rtdb.store.v1.Append";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const ACTIONS: [&str; 3] = [READ, APPEND, WATCH];
+
+/// How long an append waits out a writer clock behind the store's last commit
+/// (a failover's clock, or two commits in one microsecond) before failing.
+const CLOCK_WAIT: Duration = Duration::from_secs(5);
 
 fn decode<M: Message + Default>(bytes: Bytes) -> Result<M, Status> {
     M::decode(bytes).map_err(|_| error::incorrect("Invalid protobuf request"))
@@ -98,7 +108,7 @@ impl Service {
         let mut read_at = None;
         for key_range in ranges(request.ranges)? {
             let after = request.after.clone().filter(|after| key_range.contains(after));
-            let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone() };
+            let read = StoreRead { range: key_range, after, limit, projection, filter: filter.clone(), reverse: request.reverse };
             let page = driver.read_store(read, at, self.0.node.now(), &call.cancellation).await.map_err(error::anomaly)?;
             // Every later range reads the cut the first one selected.
             at = At::Exactly(page.cut.basis);
@@ -123,57 +133,68 @@ impl Service {
         if request.incarnation.is_empty() {
             return Err(error::incorrect("An append states its incarnation"));
         }
-        let access = if request.writes.is_empty() { DatabaseAccess::Read } else { DatabaseAccess::Write };
+        let writes = request.writes.into_iter()
+            .map(|write| StoreWrite { key: write.key, value: write.value, key_stamp: write.key_stamp, value_stamp: write.value_stamp })
+            .collect::<Vec<_>>();
+        // Placeholder and window errors are the request's, decided before anything is ordered.
+        check_placeholders(&writes).map_err(error::anomaly)?;
+        let window = request.window.map_or(Window::default(), |window| Window {
+            not_before: window.not_before.map(Timestamp),
+            before: window.before.map(Timestamp),
+        });
+        if window.not_before.zip(window.before).is_some_and(|(start, end)| start >= end) {
+            return Err(error::incorrect("The append's window is empty"));
+        }
+        let validation = writes.is_empty();
+        let access = if validation { DatabaseAccess::Read } else { DatabaseAccess::Write };
         let (database, incarnation) = self.store_database(call, access, Some(&request.incarnation)).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let since = Basis::new(incarnation, request.since);
         let guards = ranges(request.reads)?.into_iter()
             .map(|range| Guard::Unwritten { range, since })
             .collect::<Vec<_>>();
-        let table = store_table();
-        let mut rows = Vec::new();
-        let mut deletes = Vec::new();
-        for write in request.writes {
-            let id = EntityId::Binary(write.key);
-            match write.value {
-                Some(value) => rows.push(Row {
-                    id,
-                    valid: None,
-                    cells: StructFields::from_iter([(VALUE_COLUMN.to_owned(), Cell::Value(Value::Binary(value)))]),
-                    custody_group: None,
-                    protected_columns: Vec::new(),
-                    custody_payload: None,
-                }),
-                None => deletes.push(id),
-            }
-        }
-        let mut ops = Vec::new();
-        if !rows.is_empty() {
-            ops.push(Op::Put { branch: MAIN_BRANCH.into(), table: table.clone(), rows, if_absent: false });
-        }
-        if !deletes.is_empty() {
-            ops.push(Op::Delete { branch: MAIN_BRANCH.into(), table, ids: deletes, valid: None });
-        }
         let transaction = Transact {
             key: request.key,
             require: Vec::new(),
             window: Window::default(),
             guards,
-            ops,
+            ops: vec![Op::Store(StoreAppend { writes, window })],
             otherwise: Vec::new(),
             requires: Vec::new(),
             custody_request_digest: None,
             request_memory: Some(call.request_reservation()),
         };
-        let receipt = driver.transact(transaction, &call.cancellation).await.map_err(error::anomaly)?;
-        self.check_attachment(call, &database)?;
-        let outcome = match receipt.outcome {
-            Outcome::Then => proto::append_reply::Outcome::Committed(receipt.basis.position()),
-            Outcome::Otherwise { failed } => {
-                let first = failed.first().copied().ok_or_else(|| Status::internal("A failed append names no read"))?;
-                proto::append_reply::Outcome::Conflict(u32::try_from(first).map_err(|_| Status::internal("Read index overflow"))?)
+        // The resolver never raises a commit's time to a predecessor's: a clock
+        // behind the last commit is waited out here, then judged again.
+        let deadline = tokio::time::Instant::now() + CLOCK_WAIT;
+        let decided = loop {
+            match driver.transact(transaction.clone(), &call.cancellation).await {
+                Err(behind) if behind.code == STORE_CLOCK_BEHIND && tokio::time::Instant::now() < deadline => {
+                    let micros = behind.context.get("retry_after_micros").and_then(|wait| wait.as_u64()).unwrap_or(1);
+                    if micros < 1_000 { tokio::task::yield_now().await; }
+                    else { tokio::time::sleep(Duration::from_micros(micros).min(MAX_WAIT)).await; }
+                }
+                decided => break decided,
             }
-            Outcome::Refused { error } => return Err(error::anomaly(error)),
+        };
+        let outcome = match decided {
+            Ok(receipt) => {
+                self.check_attachment(call, &database)?;
+                match receipt.outcome {
+                    Outcome::Then if validation => proto::append_reply::Outcome::Validated(receipt.basis.position()),
+                    Outcome::Then => proto::append_reply::Outcome::Committed(proto::Stamp {
+                        micros: receipt.system_time.0, version: receipt.basis.position(),
+                    }),
+                    Outcome::Otherwise { failed } => {
+                        let first = failed.first().copied().ok_or_else(|| Status::internal("A failed append names no read"))?;
+                        proto::append_reply::Outcome::Conflict(u32::try_from(first).map_err(|_| Status::internal("Read index overflow"))?)
+                    }
+                    Outcome::Refused { error } => return Err(error::anomaly(error)),
+                }
+            }
+            Err(outside) if outside.code == STORE_OUTSIDE_EARLY => proto::append_reply::Outcome::Outside(proto::Side::Early as i32),
+            Err(outside) if outside.code == STORE_OUTSIDE_LATE => proto::append_reply::Outcome::Outside(proto::Side::Late as i32),
+            Err(error) => return Err(error::anomaly(error)),
         };
         Ok(proto::AppendReply { incarnation: incarnation.to_vec(), outcome: Some(outcome) }.encode_to_vec())
     }

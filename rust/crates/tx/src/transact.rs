@@ -9,8 +9,9 @@ pub use rtdb_index::branches::{
     CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition,
     ReviewedCustodyReservation, Visibility,
     RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind, ScopedHoldCommand,
-    store::KeyRange,
+    store::{KeyRange, StoreWrite},
 };
+use rtdb_index::branches::store::{StoreStamp, VALUE_COLUMN, check_placeholders, stamp_writes, store_table};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
     Term, TimeUnit, Timestamp, Value,
@@ -61,6 +62,21 @@ pub struct Transact {
 }
 
 impl Transact {
+    /// The store append this request is, when its one operation is [`Op::Store`].
+    pub fn store_append(&self) -> Option<&StoreAppend> {
+        match self.ops.as_slice() {
+            [Op::Store(append)] => Some(append),
+            _ => None,
+        }
+    }
+
+    /// Whether the request writes nothing and only validates: no operations, or
+    /// a store append without writes.
+    pub fn validates_only(&self) -> bool {
+        self.otherwise.is_empty()
+            && (self.ops.is_empty() || self.store_append().is_some_and(|append| append.writes.is_empty()))
+    }
+
     pub fn claims(&self) -> impl Iterator<Item = &Claim> {
         self.requires.iter().chain(&self.guards).filter_map(|guard| match guard {
             Guard::Unchanged(claim) => Some(claim),
@@ -261,6 +277,30 @@ pub enum Op {
     ScopedHold(ScopedHoldCommand),
     #[serde(skip_deserializing)]
     NativeDependentCustody(NativeDependentCustodyOrder),
+    /// `rtdb.store.v1.Append`'s writes and window: the request's only operation,
+    /// resolved by [`TransactState::resolve_store`], never executed as an operation.
+    Store(StoreAppend),
+}
+
+/// A store append (`dev/doc/ordered-bytes-store.adoc`): its writes, with stamp
+/// placeholders the resolver fills at the ordering point, and its clock window,
+/// judged against the clock sample the stamp carries. No writes only validates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreAppend {
+    pub writes: Vec<StoreWrite>,
+    pub window: Window,
+}
+
+/// The writer's clock sample is behind the head: the caller waits it out and
+/// retries, so a commit's time is never raised to a predecessor's.
+pub const STORE_CLOCK_BEHIND: &str = "rtdb.store/clock-behind";
+/// The clock sample is before the store window's `not_before`.
+pub const STORE_OUTSIDE_EARLY: &str = "rtdb.store/outside-early";
+/// The clock sample is at or past the store window's `before`.
+pub const STORE_OUTSIDE_LATE: &str = "rtdb.store/outside-late";
+
+fn store_append_shape() -> Anomaly {
+    Anomaly::incorrect("rtdb.store/append-shape", "A store append carries only its store operation and read guards")
 }
 
 fn invalid_scoped_hold() -> Anomaly {
@@ -1094,6 +1134,13 @@ impl TransactState {
                 return Ok((Resolution::Answer(replay(&stored.receipt)), None));
             }
         }
+        if request.ops.iter().chain(&request.otherwise).any(|op| matches!(op, Op::Store(_))) {
+            let append = request.store_append().ok_or_else(store_append_shape)?;
+            if authority.is_some() || workload.is_some() || funded_request || hold.is_some() || receipt_namespace.is_some() {
+                return Err(store_append_shape());
+            }
+            return Self::resolve_store(view, request, append, position, now, claims, fingerprint, canonical_request);
+        }
         let funded = if let Some(input) = funding {
             if workload.is_some() { return Err(funding_invalid()); }
             match resolve_funding(&view, request, input, stored, authority)? {
@@ -1242,6 +1289,103 @@ impl TransactState {
             });
             Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
         }
+    }
+
+    /// `rtdb.store.v1.Append`, resolved at the ordering point. Its reads are judged
+    /// first. The writer's clock sample `now` is then judged against the window and,
+    /// for writes, is the commit's system time and its stamp's micros, with the
+    /// commit's position as the stamp's version. The sample is never raised to a
+    /// predecessor's: one at or behind the head refuses as
+    /// [`STORE_CLOCK_BEHIND`], and the caller waits it out. Outside the window
+    /// nothing is decided or recorded. A write-free append answers at the view's head.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_store(
+        view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
+        claims: &dyn ClaimVerifier, fingerprint: [u8; 32], canonical_request: Box<RawValue>,
+    ) -> Result<(Resolution, Option<BranchIndex>)> {
+        if !request.otherwise.is_empty() || !request.requires.is_empty() || !request.require.is_empty()
+            || request.window != Window::default() || request.custody_request_digest.is_some()
+            || !request.guards.iter().all(|guard| matches!(guard, Guard::Unwritten { .. }))
+        {
+            return Err(store_append_shape());
+        }
+        let Window { not_before, before } = append.window;
+        if not_before.zip(before).is_some_and(|(start, end)| start >= end) {
+            return Err(Anomaly::incorrect("rtdb.store/empty-window", "The store append's window is empty"));
+        }
+        check_placeholders(&append.writes)?;
+        if view.pending { return Err(pending_error()); }
+        let head = view.index.head();
+        let validation = append.writes.is_empty();
+        let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
+            key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
+        };
+
+        let guard_time = now.max(head.system_time);
+        let mut failed = Vec::new();
+        for (i, guard) in request.guards.iter().enumerate() {
+            if !guard.evaluate(view.index, guard_time, claims, None)? { failed.push(i); }
+        }
+        if !failed.is_empty() && validation {
+            return Ok((Resolution::Answer(receipt(head.basis, head.system_time, Outcome::Otherwise { failed })), None));
+        }
+
+        if failed.is_empty() {
+            // A commit's time is its own sample, past the head's; a validation's is at least the head's.
+            let floor = head.system_time.max(view.time_floor.unwrap_or(Timestamp::MIN));
+            if now < floor || (!validation && now == floor) {
+                return Err(Anomaly::new(AnomalyCategory::Busy, STORE_CLOCK_BEHIND, "The writer clock is behind the store's last commit")
+                    .with_context("retry_after_micros", floor.0.saturating_sub(now.0).saturating_add(1).into()));
+            }
+            if let Some(start) = not_before.filter(|start| now < *start) {
+                return Err(Anomaly::new(AnomalyCategory::Busy, STORE_OUTSIDE_EARLY, "The store append's window has not opened")
+                    .with_context("retry_after_micros", start.0.saturating_sub(now.0).into()));
+            }
+            if before.is_some_and(|end| now >= end) {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, STORE_OUTSIDE_LATE, "The store append's window has closed"));
+            }
+            if validation {
+                return Ok((Resolution::Answer(receipt(head.basis, head.system_time, Outcome::Then)), None));
+            }
+        }
+
+        if position <= head.basis.position() {
+            return Err(Anomaly::fault("rtdb/transaction-order", "The append must follow the applied prefix"));
+        }
+        // A refused append records its conflict, so a retry under its key replays it;
+        // it carries no stamp, so its system time is only the index's.
+        let system_time = if failed.is_empty() { now } else { now.max(head.system_time.next()?) };
+        let cut = BranchCut { basis: Basis::new(head.basis.incarnation(), position), system_time };
+        let mut index = view.index.clone();
+        index.advance(cut)?;
+        let (outcome, effects, after) = if failed.is_empty() {
+            let stamp = StoreStamp { micros: now.0, version: position };
+            let mut ops: Vec<Op> = Vec::new();
+            for (key, value) in stamp_writes(&append.writes, stamp)? {
+                let id = EntityId::Binary(key);
+                // Consecutive puts and deletes keep their order, so a later write of a key wins.
+                match (value, ops.last_mut()) {
+                    (Some(value), Some(Op::Put { rows, .. })) => rows.push(store_row(id, value)),
+                    (Some(value), _) => ops.push(Op::Put {
+                        branch: MAIN_BRANCH.into(), table: store_table(), rows: vec![store_row(id, value)], if_absent: false,
+                    }),
+                    (None, Some(Op::Delete { ids, .. })) => ids.push(id),
+                    (None, _) => ops.push(Op::Delete { branch: MAIN_BRANCH.into(), table: store_table(), ids: vec![id], valid: None }),
+                }
+            }
+            let mut then = Candidate::new(index, None);
+            then.execute(&ops, &request.key, None)?;
+            then.check_constraints()?;
+            (Outcome::Then, then.effects, then.index)
+        } else {
+            (Outcome::Otherwise { failed }, Vec::new(), index)
+        };
+        let record = TransactionRecord::Tx(ResolvedTransact {
+            fingerprint, receipt: receipt(cut.basis, cut.system_time, outcome), effects, before: None,
+            receipt_namespace: None, admitted_at: now, workload: None, workload_digest: None,
+            request: Some(canonical_request),
+        });
+        Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
     }
 
     fn decide(
@@ -1541,6 +1685,15 @@ fn pending_error() -> Anomaly {
 
 fn feature_required(feature: &str) -> Anomaly {
     Anomaly::unsupported("rtdb/feature-required", format!("Required feature {feature} is unavailable"))
+}
+
+/// One store entry: its key as a binary id and its value in the `v` cell.
+fn store_row(id: EntityId, value: Vec<u8>) -> Row {
+    Row {
+        id, valid: None,
+        cells: StructFields::from_iter([(VALUE_COLUMN.to_owned(), Cell::Value(Value::Binary(value)))]),
+        custody_group: None, protected_columns: Vec::new(), custody_payload: None,
+    }
 }
 
 fn replay(receipt: &Receipt) -> Receipt {

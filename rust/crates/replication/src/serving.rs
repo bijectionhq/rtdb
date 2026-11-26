@@ -364,7 +364,7 @@ impl<C> NativeRequest<C> {
     }
 
     fn is_validation(&self) -> bool {
-        self.funding.is_none() && self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
+        self.funding.is_none() && self.transaction.validates_only()
     }
 
     fn check_source_admission(&self, physical_erasure: bool, row_custody: bool) -> Result<()> {
