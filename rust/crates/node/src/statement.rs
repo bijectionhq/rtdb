@@ -399,12 +399,11 @@ impl PreparedSql {
         context.check_cancelled()?;
         if self.is_dml() { return Err(kind_error()); }
         if argument_types.len() != self.parameter_count() { return Err(parameter_error("Parameter field count differs from the prepared statement")); }
-        let mut options = self.0.options.clone();
-        options.default_timezone = context.timezone.clone();
-        if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
-        for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
-        let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref().filter(|plan| plan.options == options).map(|plan| (plan.lookups.clone(), plan.query.clone())));
+        let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref()
+            .filter(|plan| self.binds_to(&plan.options, &context.timezone, argument_types, execution))
+            .map(|plan| (plan.lookups.clone(), plan.query.clone())));
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
+        let options = self.bound_options(&context.timezone, argument_types, execution);
         if let Some(shared) = self.0.sharable.then(|| shared_plan(&self.0.source, context, &options)).transpose()?.flatten() {
             let query = shared.query.recharged(&context.memory)?;
             if let Ok(mut plan) = self.0.plan.lock() {
@@ -430,6 +429,31 @@ impl PreparedSql {
             *plan = Some(CachedPlan { options, lookups: Arc::new(lookups), query: kept });
         }
         Ok(query)
+    }
+
+    /// The options a query binds with: the prepared ones in `timezone`, each argument's type where none is declared,
+    /// and every parameter type in its execution form for an execution.
+    fn bound_options(&self, timezone: &str, argument_types: &[LogicalType], execution: bool) -> PrepareOptions {
+        let mut options = self.0.options.clone();
+        timezone.clone_into(&mut options.default_timezone);
+        if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
+        for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
+        options
+    }
+
+    /// Whether `bound` equals `bound_options(timezone, argument_types, execution)`, without building those.
+    fn binds_to(&self, bound: &PrepareOptions, timezone: &str, argument_types: &[LogicalType], execution: bool) -> bool {
+        let PrepareOptions { search_path, parameter_types, default_timezone, generate_series_end_exclusive } = bound;
+        let prepared = &self.0.options;
+        let bind = |ty: &LogicalType| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() };
+        let undeclared = (0..argument_types.len()).filter(|index| !prepared.parameter_types.contains_key(index)).count();
+        *search_path == prepared.search_path && default_timezone == timezone
+            && *generate_series_end_exclusive == prepared.generate_series_end_exclusive
+            && prepared.parameter_types.len().checked_add(undeclared) == Some(parameter_types.len())
+            && parameter_types.iter().all(|(index, bound)| match prepared.parameter_types.get(index) {
+                Some(declared) => bind(declared) == *bound,
+                None => argument_types.get(*index).is_some_and(|argument| bind(argument) == *bound),
+            })
     }
 
     fn check_signature(&self, actual: &Schema) -> Result<()> {
@@ -572,6 +596,50 @@ fn arrow_surface_preparation_reuses_the_first_plan_across_query_budgets() {
     drop(bound);
     assert_eq!(query_budget.used_bytes(), 0);
     assert!(statement_budget.used_bytes() > 0);
+}
+
+#[test]
+fn a_bound_plan_matches_exactly_the_options_its_arguments_bind_with() {
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::ScalarType;
+
+    let catalog = CatalogSnapshot::new("xtdb", [("xtdb".into(), DatabaseSnapshot {
+        partitions: vec![],
+        storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+    })].into_iter().collect(), false).unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let context = QueryContext::new(catalog, MemoryBudget::new(1 << 22), rtdb_types::Timestamp(0), "UTC", QueryOptions::default(), &cancellation).unwrap();
+    let (unsigned, signed, text) = (LogicalType::Scalar(ScalarType::U32), LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8));
+    let options = PrepareOptions { parameter_types: [(1, unsigned.clone())].into_iter().collect(), ..Default::default() };
+    let prepared = PreparedSql::prepare("SELECT $1 AS a, $2 AS b, $3 AS c", &context, options, ResultSignaturePolicy::Dynamic).unwrap();
+    let arguments = [vec![signed.clone(), unsigned.clone(), text.clone()], vec![unsigned.clone(), signed.clone(), text.clone()],
+        vec![text.clone(), unsigned.clone(), signed.clone()]];
+    let mut candidates = Vec::new();
+    for types in &arguments {
+        for execution in [false, true] {
+            for timezone in ["UTC", "Europe/Paris"] { candidates.push(prepared.bound_options(timezone, types, execution)); }
+        }
+    }
+    let mut searching = prepared.bound_options("UTC", &arguments[0], true);
+    searching.search_path.push("other".into());
+    candidates.push(searching);
+    let mut series = prepared.bound_options("UTC", &arguments[0], true);
+    series.generate_series_end_exclusive = !series.generate_series_end_exclusive;
+    candidates.push(series);
+    let mut extra = prepared.bound_options("UTC", &arguments[0], true);
+    extra.parameter_types.insert(3, text.clone());
+    candidates.push(extra);
+    for types in &arguments {
+        for execution in [false, true] {
+            for timezone in ["UTC", "Europe/Paris"] {
+                let expected = prepared.bound_options(timezone, types, execution);
+                for candidate in &candidates {
+                    assert_eq!(prepared.binds_to(candidate, timezone, types, execution), *candidate == expected);
+                }
+            }
+        }
+    }
 }
 
 #[test]
