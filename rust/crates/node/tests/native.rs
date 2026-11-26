@@ -3662,17 +3662,21 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
 async fn retained_prepared_statements_charge_only_their_own_bytes_after_their_queries_close() {
     let (node, driver) = running(options(), services()).await;
     let cancellation = CancellationToken::new();
-    let before = node.memory().used_bytes();
+    // The statements' own budget: the query budget each context reserves from. Its used bytes exclude the idle credit its
+    // thread shards hold, which the node root counts as used and which depends on the shard count and thread placement.
+    let keeper = node.query_memory();
+    let before = keeper.used_bytes();
     let mut retained = Vec::new();
     for index in 0..200 {
         let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
         let context = node.query_context("xtdb", &basis, &Authority, &cancellation).await.unwrap();
+        assert!(Arc::ptr_eq(&context.memory, &keeper), "a direct query context reserves from the node's query budget");
         let prepared = PreparedSql::prepare(&format!("SELECT {index} AS n"), &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
         let cursor = prepared.open_query(context, Vec::new()).await.unwrap();
         assert_eq!(rows(cursor).await.len(), 1);
         retained.push(prepared);
     }
-    let per_statement = node.memory().used_bytes().saturating_sub(before) / retained.len();
+    let per_statement = keeper.used_bytes().saturating_sub(before) / retained.len();
     assert!(per_statement < 32 << 10, "a retained statement pins {per_statement} bytes, not a query's credit");
     drop(retained);
     stop(&node, driver).await;
