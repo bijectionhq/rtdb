@@ -5099,17 +5099,17 @@ impl Column {
 /// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
 pub(crate) struct BatchExpressions {
     input: BoxBatchCursor, schema: Arc<rtdb_plan::Schema>, expressions: Arc<[rtdb_plan::Expr]>, clocked: Option<Arc<[rtdb_plan::Expr]>>,
-    cosine: Option<Vec<Option<crate::cosine::Projection>>>, admissions: Option<Arc<[crate::compiled::Admission]>>,
-    execution: crate::context::Execution, validate_input: bool,
+    cosine: Option<Vec<Option<crate::cosine::Projection>>>, functions: Option<Vec<Option<functions::Projection>>>,
+    admissions: Option<Arc<[crate::compiled::Admission]>>, execution: crate::context::Execution, validate_input: bool,
 }
 impl BatchExpressions {
     pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self {
-        Self { input, schema: Arc::new(schema), expressions: expressions.into(), clocked: None, cosine: None, admissions: None, execution, validate_input: false }
+        Self { input, schema: Arc::new(schema), expressions: expressions.into(), clocked: None, cosine: None, functions: None, admissions: None, execution, validate_input: false }
     }
     /// Computes a compiled plan's projections, sharing their admissions with every execution of that plan.
     pub(crate) fn admitted(input: BoxBatchCursor, projections: &crate::compiled::Projections, execution: crate::context::Execution) -> Self {
         Self { input, schema: Arc::clone(&projections.schema), expressions: Arc::clone(&projections.expressions), clocked: None, cosine: None,
-            admissions: Some(Arc::clone(&projections.admissions)), execution, validate_input: false }
+            functions: None, admissions: Some(Arc::clone(&projections.admissions)), execution, validate_input: false }
     }
     pub fn validating_input(mut self, validate: bool) -> Self {
         self.validate_input = validate;
@@ -5150,6 +5150,9 @@ impl BatchCursor for BatchExpressions {
             self.cosine = Some(clocked.iter().map(|expr| {
                 crate::cosine::Projection::bind(expr, &self.schema, &self.execution.parameters, &self.execution.context.memory)
             }).collect::<Result<_>>()?);
+        }
+        if self.functions.is_none() {
+            self.functions = Some(clocked.iter().map(|expr| functions::Projection::bind(expr, &self.schema)).collect());
         }
         let parameters = self.execution.parameters.evaluator();
         let memory = &self.execution.context.memory;
@@ -5270,7 +5273,8 @@ impl BatchCursor for BatchExpressions {
             }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
-            if let Some(column) = functions::column(kernel, &self.schema, &batch, parameters) {
+            if let Some(projection) = self.functions.as_ref().and_then(|items| items[index].as_ref())
+                && let Some(column) = projection.column(&self.schema, &batch, parameters, memory)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
                 lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
                 columns.push(column);

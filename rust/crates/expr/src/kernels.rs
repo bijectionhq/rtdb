@@ -11,23 +11,45 @@ pub fn extract_timestamps(field: &str, values: &TimestampMicrosecondArray, timez
     crate::temporal_functions::extract_timestamps(field, values, timezone)
 }
 
-/// A one-argument double function — the float math functions, `floor`, `ceil`/`ceiling` and `abs` — over doubles.
-/// An integer argument reaches these functions as the double nearest it.
-pub fn double_function(name: &str, values: &Float64Array) -> Option<Float64Array> {
-    Some(values.unary(double(name)?))
+pub use crate::functions::FloatMath;
+
+/// A scalar function with a column-at-a-time form, resolved once from its call's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Function { Extract, Round, Abs, Upper, Lower, Length, Substring, Floor, Ceil, Float(FloatMath) }
+
+impl Function {
+    /// The function a call of `name`, in any case and with hyphens or underscores, runs here.
+    pub fn resolve(name: &str) -> Option<Self> {
+        let name = crate::functions::canonical_name(name);
+        Some(match name.as_str() {
+            "extract" => Self::Extract,
+            "round" => Self::Round,
+            "abs" => Self::Abs,
+            "upper" => Self::Upper,
+            "lower" => Self::Lower,
+            "length" | "character_length" | "char_length" => Self::Length,
+            "substring" => Self::Substring,
+            "floor" => Self::Floor,
+            "ceil" | "ceiling" => Self::Ceil,
+            name => Self::Float(FloatMath::resolve(name)?),
+        })
+    }
+
+    /// The function of one double this is, if it is one: the float math of one argument, `floor`, `ceil` and `abs`.
+    /// An integer argument reaches these functions as the double nearest it.
+    pub fn double(self) -> Option<fn(f64) -> f64> {
+        match self {
+            Self::Floor => Some(f64::floor),
+            Self::Ceil => Some(f64::ceil),
+            Self::Abs => Some(f64::abs),
+            Self::Float(math) => math.unary(),
+            Self::Extract | Self::Round | Self::Upper | Self::Lower | Self::Length | Self::Substring => None,
+        }
+    }
 }
 
-pub fn is_double_function(name: &str) -> bool { double(name).is_some() }
-
-fn double(name: &str) -> Option<fn(f64) -> f64> {
-    let function: fn(f64) -> f64 = match name {
-        "floor" => f64::floor,
-        "ceil" | "ceiling" => f64::ceil,
-        "abs" => f64::abs,
-        name => crate::functions::unary_float_math(name)?,
-    };
-    Some(function)
-}
+/// `function` of each double.
+pub fn doubles(function: fn(f64) -> f64, values: &Float64Array) -> Float64Array { values.unary(function) }
 
 /// ROUND(cell, `scale`) over doubles.
 pub fn round_doubles(values: &Float64Array, scale: i64) -> Option<Float64Array> {
@@ -210,9 +232,12 @@ mod tests {
         let doubles = || cells.iter().map(|cell| cell.map_or(Value::Null, Value::F64));
         for name in ["sqrt", "exp", "ln", "log10", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "floor", "ceil", "ceiling", "abs"] {
             let expected = scalar(&call(name, vec![column.clone()]), &schema, doubles()).expect(name);
-            same(&expected, double_function(name, &values).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::F64)));
+            let function = Function::resolve(name).and_then(Function::double).expect(name);
+            same(&expected, super::doubles(function, &values).iter().map(|cell| cell.map_or(Value::Null, Value::F64)));
         }
-        assert!(double_function("power", &values).is_none());
+        for name in ["power", "log", "round", "upper", "extract"] {
+            assert!(Function::resolve(name).and_then(Function::double).is_none(), "{name}");
+        }
         for scale in [-400, -3, -1, 0, 1, 2, 5, 15, 300, 400] {
             let expr = call("round", vec![column.clone(), Expr::Literal(Value::I64(scale))]);
             let expected = scalar(&expr, &schema, doubles());
@@ -222,6 +247,24 @@ mod tests {
         }
         let expected = scalar(&call("round", vec![column.clone()]), &schema, doubles()).unwrap();
         same(&expected, round_doubles(&values, 0).unwrap().iter().map(|cell| cell.map_or(Value::Null, Value::F64)));
+    }
+
+    #[test]
+    fn function_names_resolve_in_every_spelling() {
+        assert_eq!(Function::resolve("CHARACTER-LENGTH"), Some(Function::Length));
+        assert_eq!(Function::resolve("Ceiling"), Some(Function::Ceil));
+        assert_eq!(Function::resolve("log10"), Some(Function::Float(FloatMath::Log10)));
+        assert_eq!(Function::resolve("coalesce"), None);
+    }
+
+    #[test]
+    fn rounding_keeps_non_finite_doubles() {
+        let values = Float64Array::from(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]);
+        for scale in [0, 3, -400] {
+            let rounded = round_doubles(&values, scale).expect("a non-finite double rounds to itself");
+            let bits: Vec<u64> = rounded.values().iter().map(|value| value.to_bits()).collect();
+            assert_eq!(bits, values.values().iter().map(|value| value.to_bits()).collect::<Vec<_>>(), "scale {scale}");
+        }
     }
 
     #[test]

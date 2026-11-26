@@ -228,6 +228,9 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 - Vectorised paths:
   - `columnar::kernel::truth`: comparisons, AND/OR/NOT, IS NULL, BETWEEN over plain I8–I64/F64/Utf8/Bool/µs-timestamp and dense unions of those.
   - `columnar::projection`: checked `+ - *`.
+  - `columnar::functions`: projected EXTRACT, ROUND, ABS, FLOOR/CEIL and the one-argument float math, UPPER/LOWER, LENGTH, SUBSTRING and searched CASE.
+    Each projection resolves its calls to `rtdb_expr::kernels::Function` once, and every vector it builds (literal copies, gathered selections, widened arguments, CASE inputs) is charged to the query's memory budget while it lives; a refusal fails the query rather than falling back.
+    A batch with any failing cell is still recomputed by the row evaluator.
   - `vector.rs`: lowers a subset of expressions to DataFusion `PhysicalExpr`, **rebuilt per batch**, with an extra pass to scan divisors for zero.
   - `rtdb_expr::evaluate_batch` exists but has no production caller.
 - Fallbacks: `BatchFilter` and `BatchExpressions` call `batch.rows()`, which materialises **every** column for every row, even when the expression reads one.

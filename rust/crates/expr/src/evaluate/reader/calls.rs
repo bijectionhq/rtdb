@@ -120,7 +120,7 @@ pub(super) fn call<'a>(expr: &'a Expr,name: &'a str,args: &'a [Expr],frame: &'a 
             return Ok(scalar(crate::vector::score_pair(left.vector()?, right.vector()?)?));
         }
         frame.context.reserve(name.len().checked_mul(8).and_then(|n|n.checked_add(256)).ok_or_else(overflow)?)?;
-        let name = name.to_lowercase().replace('-',"_");
+        let name = crate::functions::canonical_name(name);
         frame.context.reserve(args.iter().try_fold(0usize,|bytes,expr|bytes.checked_add(expression_type_bound(expr, frame.replacements)?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
         validate(expr, &name, args, frame)?;
         if name == "_id_eq_any" { return id_eq_any(&args[0], &args[1], frame).await; }

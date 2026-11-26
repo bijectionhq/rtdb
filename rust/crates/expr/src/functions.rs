@@ -40,7 +40,7 @@ pub async fn scalar_call_async(name: &str, args: &[Value], context: &EvalContext
 pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
     let bytes = args.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
     context.reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?;
-    let name = name.to_lowercase().replace('-', "_");
+    let name = canonical_name(name);
     if name == "cosine_distance" {
         let [left, right] = args else {
             return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "cosine_distance requires two arguments"));
@@ -257,41 +257,59 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             Ok(floating_value(x.abs(), &ty))
         }
         "mod" => crate::arithmetic(rtdb_plan::BinaryOp::Modulo, &args[0], &args[1]),
-        name if is_float_math(name) => {
+        name => {
+            let Some(math) = FloatMath::resolve(name) else {
+                return Err(Anomaly::unsupported("xtdb/unknown-function", format!("Unknown scalar function: {name}")));
+            };
             let x = number(&args[0]).ok_or_else(|| inapplicable(name, &[&args[0]]))?;
             let y = args.get(1).map(|value| number(value).ok_or_else(|| inapplicable(name, &[value]))).transpose()?;
-            float_math(name, x, y).map(Value::F64)
+            math.apply(x, y).map(Value::F64)
         }
-        _ => Err(Anomaly::unsupported("xtdb/unknown-function", format!("Unknown scalar function: {name}"))),
     }
 }
+
+/// The one spelling a function name is matched in: lower case, with underscores for hyphens.
+pub(crate) fn canonical_name(name: &str) -> String { name.to_lowercase().replace('-', "_") }
 
 /// The reference rounds a double as `floor(v + 0.5)` from zero up and `ceil(v - 0.5)` below zero, not to the nearest
 /// integer: the addition itself rounds, so 0.49999999999999994 becomes 1 and 2^52 + 1 becomes 2^52 + 2.
 fn reference_round(value: f64) -> f64 { if value >= 0.0 { (value + 0.5).floor() } else { (value - 0.5).ceil() } }
 
-pub(crate) fn is_float_math(name: &str) -> bool {
-    matches!(name, "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "sin" | "cos" | "tan"
-        | "sinh" | "cosh" | "tanh" | "double" | "asin" | "acos" | "atan")
-}
+/// The functions computing a double from one or two numbers read as doubles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatMath { Sqrt, Exp, Ln, Log, Log10, Power, Sin, Cos, Tan, Sinh, Cosh, Tanh, Double, Asin, Acos, Atan }
 
-pub(crate) fn float_math(name: &str, x: f64, y: Option<f64>) -> Result<f64> {
-    if let Some(function) = unary_float_math(name) { return Ok(function(x)); }
-    Ok(match name {
-        "log" => y.map_or_else(|| x.log10(), |y| y.log(x)), "power" => x.powf(y.ok_or_else(|| inapplicable(name, &[]))?),
-        _ => return Err(inapplicable(name, &[])),
-    })
-}
+impl FloatMath {
+    /// The function a canonically spelled name calls.
+    pub fn resolve(name: &str) -> Option<Self> {
+        Some(match name {
+            "sqrt" => Self::Sqrt, "exp" => Self::Exp, "ln" => Self::Ln, "log" => Self::Log, "log10" => Self::Log10,
+            "power" => Self::Power, "sin" => Self::Sin, "cos" => Self::Cos, "tan" => Self::Tan, "sinh" => Self::Sinh,
+            "cosh" => Self::Cosh, "tanh" => Self::Tanh, "double" => Self::Double, "asin" => Self::Asin, "acos" => Self::Acos,
+            "atan" => Self::Atan,
+            _ => return None,
+        })
+    }
 
-/// The float math functions of one argument, which ignore any second.
-pub(crate) fn unary_float_math(name: &str) -> Option<fn(f64) -> f64> {
-    let function: fn(f64) -> f64 = match name {
-        "sqrt" => f64::sqrt, "exp" => f64::exp, "ln" => f64::ln,
-        "log10" => f64::log10, "sinh" => f64::sinh, "cosh" => f64::cosh, "tanh" => f64::tanh, "double" => |x| x,
-        "sin" => f64::sin, "cos" => f64::cos, "tan" => f64::tan, "asin" => f64::asin, "acos" => f64::acos,
-        "atan" => f64::atan, _ => return None,
-    };
-    Some(function)
+    /// The function of one double, for every function but LOG and POWER, which read a second; any second is ignored.
+    pub fn unary(self) -> Option<fn(f64) -> f64> {
+        let function: fn(f64) -> f64 = match self {
+            Self::Sqrt => f64::sqrt, Self::Exp => f64::exp, Self::Ln => f64::ln, Self::Log10 => f64::log10,
+            Self::Sinh => f64::sinh, Self::Cosh => f64::cosh, Self::Tanh => f64::tanh, Self::Double => |x| x,
+            Self::Sin => f64::sin, Self::Cos => f64::cos, Self::Tan => f64::tan, Self::Asin => f64::asin,
+            Self::Acos => f64::acos, Self::Atan => f64::atan,
+            Self::Log | Self::Power => return None,
+        };
+        Some(function)
+    }
+
+    pub(crate) fn apply(self, x: f64, y: Option<f64>) -> Result<f64> {
+        if let Some(function) = self.unary() { return Ok(function(x)); }
+        Ok(match self {
+            Self::Log => y.map_or_else(|| x.log10(), |y| y.log(x)),
+            _ => x.powf(y.ok_or_else(|| inapplicable("power", &[]))?),
+        })
+    }
 }
 
 /// ROUND of a double to `scale` decimal places, half away from zero; a non-finite double rounds to itself.
@@ -301,4 +319,38 @@ pub(crate) fn round_float(x: f64, scale: i64) -> Result<f64> {
     let value = if scale >= 0 { x * factor } else { x / factor };
     if !value.is_finite() { return Err(overflow()); }
     Ok(if scale >= 0 { reference_round(value) / factor } else { reference_round(value) * factor })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// XTDB rounds a non-finite double to itself, with or without a scale: `floor(v + 0.5)` and `ceil(v - 0.5)` keep
+    /// NaN and the infinities, and the scaled form returns them before scaling.
+    #[test]
+    fn round_of_a_non_finite_double_is_that_double() {
+        let context = EvalContext::default();
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for args in [vec![Value::F64(x)], vec![Value::F64(x), Value::I64(2)], vec![Value::F64(x), Value::I64(-400)]] {
+                let Value::F64(rounded) = scalar_call("round", &args, &context).unwrap() else { panic!("ROUND of a double is a double") };
+                assert_eq!(rounded.to_bits(), x.to_bits(), "ROUND{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn round_of_a_finite_double_whose_scaling_overflows_raises() {
+        let context = EvalContext::default();
+        assert!(scalar_call("round", &[Value::F64(1e300), Value::I64(400)], &context).is_err());
+        assert!(scalar_call("round", &[Value::F64(0.0), Value::I64(400)], &context).is_err());
+    }
+
+    #[test]
+    fn float_math_names_resolve_in_either_spelling_and_case() {
+        let context = EvalContext::default();
+        assert_eq!(scalar_call("SQRT", &[Value::F64(4.0)], &context).unwrap(), Value::F64(2.0));
+        assert_eq!(scalar_call("power", &[Value::F64(2.0), Value::F64(3.0)], &context).unwrap(), Value::F64(8.0));
+        assert!(FloatMath::resolve("power").unwrap().unary().is_none());
+        assert!(FloatMath::resolve("floor").is_none());
+    }
 }

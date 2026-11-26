@@ -296,7 +296,7 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
             }
             Expr::Call { name,args,.. } => {
                 frame.context.reserve(name.len().checked_mul(8).and_then(|bytes|bytes.checked_add(256)).ok_or_else(overflow)?)?;
-                let name = name.to_lowercase().replace('-',"_");
+                let name = crate::functions::canonical_name(name);
                 calls::validate(expr, &name, args, frame)?;
                 match name.as_str() {
                     "coalesce" => coalesce(args,frame)?.await,
@@ -428,7 +428,7 @@ fn payload_truth(value: &EvalValue<'_>) -> Option<bool> {
     if is_null(value) { None } else { Some(!matches!(value,EvalValue::Scalar(Value::Bool(false)))) }
 }
 fn literal_argument(name: &str,index: usize) -> bool {
-    let name = name.to_lowercase().replace('-',"_");
+    let name = crate::functions::canonical_name(name);
     match name.as_str() {
         "round" => index == 1,"extract" | "date_trunc" => index == 0 || index == 2,
         "single_field_interval" | "multi_field_interval" => index != 0,
@@ -548,7 +548,7 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                 calls::apply(name,vec![input,scale.demand().await?],frame)?.await
             },frame);
         }
-        if crate::functions::is_float_math(&name) && matches!(arguments.len(), 1 | 2) {
+        if let Some(math) = crate::functions::FloatMath::resolve(&name) && matches!(arguments.len(), 1 | 2) {
             let second = if arguments.len() == 2 { arguments.pop() } else { None };
             let first = arguments.pop().expect("validated numeric argument");
             return deferred_output(ty, async move {
@@ -572,7 +572,7 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                     rtdb_plan::function_type(&name, &types[..count])?;
                     let x = numbers[0].and_then(NumericCell::as_f64).unwrap();
                     let y = numbers[1].and_then(NumericCell::as_f64);
-                    return crate::functions::float_math(&name, x, y).map(|value| Output::Number(NumericCell::F64(value)));
+                    return math.apply(x, y).map(|value| Output::Number(NumericCell::F64(value)));
                 }
                 let mut values = Vec::with_capacity(count);
                 values.push(left.into_value());
