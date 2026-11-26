@@ -354,11 +354,7 @@ fn read_authority(root: &Path, name: &str, id: Uuid) -> Result<Authority> {
 }
 
 fn journal_options(root: &Path) -> ServerOptions {
-    ServerOptions {
-        data_dir: root.join(JOURNAL),
-        fsync: true,
-        cache_bytes: ServerOptions::DEFAULT_CACHE_BYTES,
-    }
+    ServerOptions::new(root.join(JOURNAL), true, ServerOptions::DEFAULT_CACHE_BYTES)
 }
 
 fn digest(key: &[u8; 32]) -> String {

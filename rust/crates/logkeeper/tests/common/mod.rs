@@ -33,7 +33,7 @@ impl Server {
         let listener = socket.listen(1024).unwrap();
         let address = listener.local_addr().unwrap();
         let cancellation = CancellationToken::new();
-        let options = ServerOptions { data_dir: data_dir.to_path_buf(), fsync, cache_bytes };
+        let options = ServerOptions::new(data_dir.to_path_buf(), fsync, cache_bytes);
         // Opening before returning means the journal's JOURNAL_ID exists by the time a test reads it.
         let task = match PreparedJournal::open(options).await {
             Ok(journal) => tokio::spawn(journal.serve(listener, cancellation.clone())),

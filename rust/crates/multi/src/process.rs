@@ -407,11 +407,9 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
         let socket = TcpListener::bind(listen).await.map_err(io)?;
         Some(rtdb_logkeeper::AuthorityListener { socket, source: profile.source(), connections: profile.permits() })
     } else { None };
-    let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(rtdb_logkeeper::ServerOptions {
-        data_dir: settings.data_dir,
-        fsync: settings.fsync,
-        cache_bytes: settings.cache_bytes,
-    }).await?;
+    let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(rtdb_logkeeper::ServerOptions::new(
+        settings.data_dir, settings.fsync, settings.cache_bytes,
+    )).await?;
     if !uuid::Uuid::parse_str(&identity).is_ok_and(|id| !id.is_nil() && id.to_string() == identity) {
         return Err(Anomaly::incorrect("rtdb.multi/logkeeper-identity", "The retained journal member ID is invalid"));
     }
