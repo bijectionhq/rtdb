@@ -33,6 +33,8 @@ pub(crate) use prepared_landing::{PreparedLanding, is_landing as is_prepared_lan
 mod constraint_receipt;
 mod resolution_candidate;
 mod control_order;
+mod footprint_grant;
+mod footprint_grant_state;
 mod owned_flight_decision;
 use owned_flight_decision::{PrimaryResult, Publish, select_publication, stage_marker};
 mod schedule_order;
@@ -591,6 +593,44 @@ impl TxResolver {
                     .try_for_each(|(table, write)| authority.require_declared_columns(table, write.column_types()));
             }
         }
+        let ss8_debit = primary.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedFootprintGrant(crate::OwnedFootprintGrantOp::DebitOnConflict {
+                work_key,
+                work_age,
+                limit,
+            })) => Some((work_key.as_str(), *work_age, *limit)),
+            _ => None,
+        });
+        let ss8_carried = primary.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedFootprintGrant(crate::OwnedFootprintGrantOp::CarryGrant {
+                work_key,
+                holder_attempt,
+                ..
+            })) => Some((work_key.as_str(), *holder_attempt)),
+            _ => None,
+        });
+        if outcome.is_ok() {
+            let written_tables: BTreeSet<String> = tx
+                .buffer
+                .pending_tables()
+                .chain(prepared_writes.iter().flat_map(|write| write.tables().keys()))
+                .filter(|table| !footprint_grant_state::is_ss8_system_table(table))
+                .map(|table| format!("{}.{}", table.schema, table.table))
+                .collect();
+            let writer_kind = if has_owned_operations {
+                footprint_grant::WriterKind::Flight
+            } else {
+                footprint_grant::WriterKind::Sql
+            };
+            outcome = tx.check_ss8_writer_fence(writer_kind, &written_tables, ss8_carried).await;
+            if outcome.is_ok() {
+                if let Some((work_key, attempt)) = ss8_carried {
+                    outcome = tx.retire_ss8_work_on_commit(work_key, Some(attempt)).await;
+                } else if let Some((work_key, _, _)) = ss8_debit {
+                    outcome = tx.retire_ss8_work_on_commit(work_key, None).await;
+                }
+            }
+        }
         let candidate = resolution_candidate::resolve_candidate(tx, prepared_writes, outcome);
         let (mut tx, prepared_writes, result) = match candidate {
             Ok((original, writes)) => (original, writes, TransactionResult::Committed { tx_key: key }),
@@ -606,6 +646,12 @@ impl TxResolver {
             }
             Err(error) => return Err(error),
         };
+        if !result.committed()
+            && result.error().is_some_and(footprint_grant_state::is_definite_occ_conflict)
+            && let Some((work_key, work_age, limit)) = ss8_debit
+        {
+            tx.record_ss8_occ_debit(work_key, work_age, limit).await?;
+        }
         if let Some(receipt) = bounded_receipt { tx.write_bounded_receipt(receipt, receipt_time)?; }
         if !has_owned_operations { tx.retire_expired_receipts(clock).await?; }
         let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
@@ -1371,6 +1417,7 @@ impl<'a> OpenTransaction<'a> {
             },
             Operation::Public(TxOp::OwnedRequireSpatialPath { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedFootprintGrant(op)) => self.apply_ss8_grant_op(op).await,
             Operation::Public(TxOp::OwnedReplayResidue { relation, id, origin, valid }) =>
                 self.replay_owned_residue(relation, id, *origin, *valid).await,
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
@@ -4393,7 +4440,7 @@ fn document_table(operation: &Operation) -> Option<&TableRef> {
 }
 
 fn check_writer_table(table: &TableRef) -> Result<()> {
-    if is_replay_table(table) || *table == receipts_table() || is_bounded_receipts_table(table) || TableRef::owned_schema(&table.schema) {
+    if is_replay_table(table) || *table == receipts_table() || is_bounded_receipts_table(table) || footprint_grant_state::is_ss8_system_table(table) || TableRef::owned_schema(&table.schema) {
         check_table(table)?;
     }
     Ok(())

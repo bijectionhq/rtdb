@@ -200,6 +200,7 @@ impl DmlBuffer {
             TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. } => attempt.len() + 128,
             TxOp::OwnedCheckWorldPurge { relation, .. } => relation.name().len(),
             TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal => 0,
+            TxOp::OwnedFootprintGrant(op) => op.retained_bytes(),
             TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),
             TxOp::OwnedCheckRange { relation, region, .. } =>
                 relation.name().len() + region.as_ref().map_or(0, |region| region.retained_bytes()),
