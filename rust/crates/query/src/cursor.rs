@@ -9,7 +9,7 @@ use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::parameters::BoundParameters;
-use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, arrow_parameter_types, parameter_types};
+use crate::runtime_schema::{EmissionMode, Emissions, EmittedRelation, RuntimeSchema, arrow_parameter_types, parameter_types};
 
 /// A row and the lease charging it; a lease may be shared by the rows of one page, so the row records its own size.
 pub(crate) struct OwnedRow { pub values: Vec<Value>, _reservation: Arc<MemoryReservation>, _bytes: usize }
@@ -54,12 +54,13 @@ pub(crate) type BoxCursor = Box<dyn RowCursor>;
 
 #[derive(Clone)]
 pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>>,
-    emissions: Arc<crate::runtime_schema::Emissions> }
+    emissions: Arc<Emissions> }
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 
 impl PreparedQuery {
-    /// The same plan, its retained bytes charged to `memory` instead: a plan kept beyond one query moves its charge to its keeper.
+    /// The same plan, its retained bytes charged to `memory` instead.
+    /// The copy shares the original's emissions, which stay charged to the budget that held the original plan.
     pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if self._plan_reservation.as_ref().is_some_and(|reservation| Arc::ptr_eq(reservation.budget(), memory)) {
             return Ok(self.clone());
@@ -69,7 +70,7 @@ impl PreparedQuery {
             QueryOutput::Plan(plan) => QueryOutput::Plan(plan.recharged(memory)?),
             output => output.clone(),
         };
-        Ok(Self { output, _plan_reservation, emissions: Default::default(), ..self.clone() })
+        Ok(Self { output, _plan_reservation, ..self.clone() })
     }
     pub fn new(relation: Arc<Relation>) -> Result<Self> { Self::with_settings(relation, rtdb_plan::QuerySettings::default()) }
     /// Retains a validated relation with its existing operator shape.
@@ -77,7 +78,9 @@ impl PreparedQuery {
     /// Invalid relations, plan size overflow and budget exhaustion return an error.
     pub fn new_in(relation: Arc<Relation>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut query = Self::new(relation)?;
-        query._plan_reservation = Some(reserve_plan(&query.relation, &query.settings, memory)?);
+        let reservation = reserve_plan(&query.relation, &query.settings, memory)?;
+        query.emissions = Arc::new(Emissions::kept_by(Some(Arc::clone(reservation.budget()))));
+        query._plan_reservation = Some(reservation);
         Ok(query)
     }
 
@@ -85,7 +88,7 @@ impl PreparedQuery {
         relation.validate()?;
         let relation = crate::optimize::prepare(relation)?;
         let required_parameter_count = relation.parameter_count().max(settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, emissions: Default::default() })
+        Ok(Self { relation, settings: Arc::new(settings), output: QueryOutput::Rows, required_parameter_count, _plan_reservation: None, emissions: Arc::new(Emissions::kept_by(None)) })
     }
     /// Retains query metadata as well as the relation; SQL callers should use this constructor.
     pub fn from_prepared(prepared: rtdb_plan::PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -104,7 +107,8 @@ impl PreparedQuery {
         };
         relation.validate()?;
         let required_parameter_count = lexical_parameters.max(relation.parameter_count()).max(prepared.settings.parameter_count());
-        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), emissions: Default::default() })
+        let emissions = Arc::new(Emissions::kept_by(Some(Arc::clone(plan_reservation.budget()))));
+        Ok(Self { relation, settings: Arc::new(prepared.settings), output, required_parameter_count, _plan_reservation: Some(plan_reservation), emissions })
     }
     pub fn schema(&self) -> &Schema { match &self.output { QueryOutput::Rows => self.relation.schema(), QueryOutput::Plan(plan) => &plan.schema, QueryOutput::Analyze(schema) => schema } }
     pub fn relation(&self) -> &Arc<Relation> { &self.relation }
@@ -135,7 +139,7 @@ impl PreparedQuery {
     }
     /// This plan's emission, kept with the plan where its charge has a keeper.
     fn emit(&self, catalog: &crate::CatalogSnapshot, parameters: &[LogicalType], memory: &Arc<MemoryBudget>, mode: EmissionMode) -> Result<Arc<EmittedRelation>> {
-        self.emissions.emit(&self.relation, catalog, parameters, memory, self._plan_reservation.as_ref().map(|reservation| reservation.budget()), mode)
+        self.emissions.emit(&self.relation, catalog, parameters, memory, mode)
     }
     fn emit_result_schema(&self, context: &QueryContext, parameter_fields: &[LogicalType]) -> Result<Arc<RuntimeSchema>> {
         context.check_cancelled()?;
@@ -1251,6 +1255,44 @@ mod tests {
         drop(child);
         assert!(list_charge.upgrade().is_none());
         assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    fn empty_catalog() -> Result<crate::CatalogSnapshot> {
+        let database = crate::DatabaseSnapshot {
+            partitions: Vec::new(),
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        crate::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(), database)]), false)
+    }
+
+    fn parameter_values() -> Result<Arc<Relation>> {
+        let field = rtdb_plan::Field { id: rtdb_plan::ColumnId(0), name: "a".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64) };
+        Ok(Arc::new(Relation::new(Schema::new(vec![field])?, RelationNode::Values { rows: vec![vec![parameter]] })?))
+    }
+
+    #[test]
+    fn queries_recharged_from_a_statement_plan_emit_once_into_the_statement_budget() -> Result<()> {
+        let statement = MemoryBudget::new(1 << 24);
+        let kept = PreparedQuery::new_in(parameter_values()?, &statement)?;
+        let catalog = empty_catalog()?;
+        let integers = [LogicalType::Scalar(ScalarType::I64)];
+        let (first_query, second_query) = (MemoryBudget::new(1 << 24), MemoryBudget::new(1 << 24));
+        let (first, second) = (kept.recharged(&first_query)?, kept.recharged(&second_query)?);
+        assert!(Arc::ptr_eq(&first.emissions, &kept.emissions) && Arc::ptr_eq(&second.emissions, &kept.emissions));
+        let emitted = first.emit(&catalog, &integers, &first_query, EmissionMode::Execution)?;
+        let statement_bytes = statement.used_bytes();
+        let again = second.emit(&catalog, &integers, &second_query, EmissionMode::Execution)?;
+        assert!(Arc::ptr_eq(&emitted, &again));
+        assert_eq!(statement.used_bytes(), statement_bytes);
+        let plan_bytes = kept._plan_reservation.as_ref().unwrap().bytes();
+        assert_eq!((first_query.used_bytes(), second_query.used_bytes()), (plan_bytes, plan_bytes));
+        let fresh = EmittedRelation::emit(Arc::clone(kept.relation()), &catalog, &integers, &MemoryBudget::new(1 << 24), EmissionMode::Execution)?;
+        assert_eq!(emitted.schema(), fresh.schema());
+        drop((first, second, emitted, again));
+        assert_eq!((first_query.used_bytes(), second_query.used_bytes()), (0, 0));
         Ok(())
     }
 
