@@ -99,6 +99,8 @@ impl rtdb_node::ResourceFactory for HostedFixtureResources {
     async fn close(&self) -> Result<()> { self.0.close().await }
 }
 
+type FixtureResources = Box<dyn FnOnce(Arc<dyn Clock>) -> Arc<dyn rtdb_node::ResourceFactory> + Send>;
+
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
 impl Running {
     async fn start(password: Option<&str>, config: FlightConfig) -> Self { Self::start_with_placements(password, config, &[]).await }
@@ -114,14 +116,21 @@ impl Running {
     async fn start_with_fence(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>) -> Self {
         Self::start_with_resources(password, config, placements, tracer, options, read_fence, None).await
     }
-    async fn start_with_resources(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<Arc<dyn rtdb_node::ResourceFactory>>) -> Self {
+    async fn start_with_resources(password: Option<&str>, config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<Arc<dyn rtdb_node::ResourceFactory>>) -> Self {
+        let resources = resources.map(|resources| Box::new(move |_: Arc<dyn Clock>| resources) as FixtureResources);
+        Self::start_with_clocked_resources(password, config, placements, tracer, options, read_fence, resources).await
+    }
+    /// `resources` receives the node clock so that a local log stamps transactions on the same clock the node reads at.
+    async fn start_with_clocked_resources(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>, mut options: NodeOptions, read_fence: Option<Arc<dyn rtdb_node::ReadFence>>, resources: Option<FixtureResources>) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
-        let mut services = NodeServices { clock: node_clock, tracer, read_fence, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        let mut services = NodeServices { clock: node_clock.clone(), tracer, read_fence, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         if let Some(resources) = resources {
-            services.resources = resources;
+            services.resources = resources(node_clock.clone());
         } else if config.hosted_controls.is_some() {
             services.resources = Arc::new(HostedFixtureResources(rtdb_node::NativeResources::default()));
+        } else {
+            services.resources = Arc::new(rtdb_node::NativeResources::default().with_local_log_clock(node_clock.clone(), false));
         }
         options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         options.owned_relations = config.owned_native_actions;
