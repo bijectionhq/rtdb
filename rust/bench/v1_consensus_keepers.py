@@ -215,7 +215,7 @@ def checkpoint_environment(mode):
     checkpoint go to rtdb.log."""
     if mode not in CHECKPOINT_MODES:
         raise ValueError(f"unknown checkpoint mode {mode}")
-    env = dict(os.environ, RTDB_CHECKPOINT_TIMING="1")
+    env = dict(os.environ, XTDB_LOGGING_LEVEL_DB_CHECKPOINT="debug")
     env["RTDB_MULTI_BINARY_CHECKPOINTS"] = "0" if mode == "classic" else "1"
     env["RTDB_MULTI_DEFERRED_CHECKPOINTS"] = "1" if mode == "deferred" else "0"
     return env
