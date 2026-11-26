@@ -300,7 +300,14 @@ impl Snapshot {
         declarations
     }
 
-    pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> { self.column_types_for(table, self.column_names(table)) }
+    /// A table's column types; with only its applied segment live, they are joined once per segment and table catalog.
+    pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> {
+        let join = || self.column_types_for(table, self.column_names(table));
+        match self.durable.tables().get(table) {
+            Some(segment) if self.layered.get(table).is_none_or(Vec::is_empty) => segment.joined_column_types(&self.table_catalog, join),
+            _ => join(),
+        }
+    }
     pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> StructFields<LogicalType> {
         let sources: Vec<_> = self.durable.tables().get(table).into_iter().chain(self.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();
         let absent: Vec<_> = sources.iter().map(|types| absent_type(types)).collect();
@@ -390,6 +397,23 @@ mod owned_routing_tests {
         assert!(!(OwnedRoutingInventory { has_journal_tries: true, ..empty }).journal_exhausted());
         assert!(!(OwnedRoutingInventory { journal_events: 1, ..empty }).journal_exhausted());
     }
+}
+
+#[test]
+fn column_types_are_joined_again_under_another_table_catalog() {
+    let state = crate::PartitionState::empty(Default::default()).unwrap();
+    let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(10) };
+    let mut transaction = crate::live::TransactionBuffer::new(state.value().snapshot(), key, rtdb_columnar::MemoryBudget::new(1 << 24)).unwrap();
+    let table = TableRef::new("public", "docs");
+    transaction.put(table.clone(), StructFields::from([("_id".into(), rtdb_types::Value::I64(1)), ("v".into(), rtdb_types::Value::I64(2))]), rtdb_types::Interval::default()).unwrap();
+    state.apply(&transaction.stage().unwrap()).unwrap();
+    let applied = state.value().snapshot();
+    let types = applied.column_types(&table);
+    assert_eq!(types, applied.column_types_for(&table, applied.column_names(&table)));
+    assert!(types.get("v").is_some());
+    assert_eq!(state.value().snapshot().column_types(&table), types, "a later snapshot of the same segment reuses the join");
+    let other = Snapshot::new(Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()), Arc::clone(&applied.durable));
+    assert_eq!(other.column_types(&table), other.column_types_for(&table, other.column_names(&table)));
 }
 
 #[test]

@@ -263,7 +263,14 @@ pub struct LiveTable {
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
     located: LocatedLeaves,
+    joined_types: JoinedTypes,
 }
+
+/// This table's column types joined with a table catalog's contributed types, for the last catalog they were joined with.
+/// Both are replaced rather than changed, so a cloned table, about to become another version, starts empty.
+#[derive(Debug, Default)]
+struct JoinedTypes(std::sync::Mutex<Option<(std::sync::Weak<crate::catalog::TableCatalog>, StructFields<LogicalType>)>>);
+impl Clone for JoinedTypes { fn clone(&self) -> Self { Self::default() } }
 
 /// A trie leaf's rows in iid order, each located in its table's chunks with its header copied out.
 #[derive(Debug)]
@@ -277,12 +284,26 @@ impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), declared_columns: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), declared_columns: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default(), joined_types: JoinedTypes::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn row_count(&self) -> u32 { self.row_count }
     pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
+
+    /// The column types `join` computes for this table under `catalog`, reused while the catalog is the same one.
+    pub(crate) fn joined_column_types(&self, catalog: &Arc<crate::catalog::TableCatalog>, join: impl FnOnce() -> StructFields<LogicalType>)
+        -> StructFields<LogicalType> {
+        if let Ok(joined) = self.joined_types.0.lock()
+            && let Some((joined_with, types)) = joined.as_ref()
+            && std::ptr::eq(joined_with.as_ptr(), Arc::as_ptr(catalog))
+        {
+            return types.clone();
+        }
+        let types = join();
+        if let Ok(mut joined) = self.joined_types.0.lock() { *joined = Some((Arc::downgrade(catalog), types.clone())); }
+        types
+    }
     pub fn declared_columns(&self) -> &StructFields<LogicalType> { &self.declared_columns }
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
