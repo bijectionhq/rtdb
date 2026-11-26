@@ -96,12 +96,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
                 }
             }))
         };
-        match projected {
-            Ok(Some(operations)) => return Ok(Some(operations)),
-            Ok(None) => {}
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
-            Err(error) => return Err(error),
-        }
+        if let Some(operations) = projected? { return Ok(Some(operations)); }
     }
     let parameter_rows: Box<dyn Iterator<Item = Result<BoundArgumentRow<'_>>> + '_> = match args {
         Some(args) => Box::new(args.indexed_bound_rows().map(|row| row.map(|(_, row)| row))),
@@ -614,6 +609,38 @@ mod tests {
             else { panic!("Expected Arrow documents") };
         assert!(Arc::ptr_eq(documents.array().column(1), &shared));
         assert_eq!(projected.encode().unwrap().as_slice(), boxed.encode().unwrap().as_slice());
+    }
+
+    #[test]
+    fn static_insert_under_memory_pressure_refuses_instead_of_expanding_rows() {
+        use arrow_array::{StringArray, UInt64Array};
+        use arrow_schema::Field;
+        use rtdb_columnar::OwnedBatch;
+
+        let ample = MemoryBudget::new(1 << 24);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("bound_label", DataType::Utf8, true),
+            Field::new("bound_id", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["label", "other"])), Arc::new(UInt64Array::from(vec![1, 2]))]).unwrap();
+        let args = SqlArguments::from_arrow(OwnedBatch::new(batch, &ample).unwrap(), &ample).unwrap();
+        let labels = args.uniform_arrow_pages().unwrap()[0].column(0).clone();
+        let mut refused = false;
+        for limit in (1 << 10..=128 << 10).step_by(1 << 10) {
+            let memory = MemoryBudget::new(limit);
+            let submitted = prepare_submission(vec![TxOp::Sql {
+                sql: "INSERT INTO docs (_id, label) VALUES ($2, $1)".into(), args: Some(args.clone()),
+            }], SubmitOptions::default(), "xtdb", &memory);
+            match submitted {
+                Ok(submission) => {
+                    let [Operation::Public(TxOp::PutArrowDocs { documents, .. })] = submission.operations.as_slice()
+                        else { panic!("a {limit}-byte budget staged another representation") };
+                    assert!(Arc::ptr_eq(documents.array().column(1), &labels), "a {limit}-byte budget expanded the rows");
+                }
+                Err(error) => { assert_eq!(error.code, "rtdb/memory-budget-exceeded"); refused = true; }
+            }
+        }
+        assert!(refused, "the smallest budgets refuse the statement");
     }
 
     #[test]

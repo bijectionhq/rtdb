@@ -1489,12 +1489,11 @@ impl SqlArguments {
     pub fn from_packed_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut arguments = Self::from_rows(rows, memory)?;
         // These columns use the row encoder's exact source layout, including the null representation.
-        if let Ok(batch) = arguments.source_columnar_batch(memory) {
-            arguments.chunks = Arc::new(vec![(0, Arc::new(ArgumentChunk::Arrow {
-                batch, types: Arc::clone(&arguments.types), source_layout: SourceArgumentLayout::BuiltFromRows,
-                _reservation: Arc::clone(&arguments.schema_reservation),
-            }))]);
-        }
+        let batch = arguments.source_columnar_batch(memory)?;
+        arguments.chunks = Arc::new(vec![(0, Arc::new(ArgumentChunk::Arrow {
+            batch, types: Arc::clone(&arguments.types), source_layout: SourceArgumentLayout::BuiltFromRows,
+            _reservation: Arc::clone(&arguments.schema_reservation),
+        }))]);
         Ok(arguments)
     }
 
@@ -1982,6 +1981,20 @@ mod tests {
         assert!(memory.used_bytes() > 0);
         drop(retained); assert_eq!(memory.used_bytes(), 0);
     }
+    #[test]
+    fn packed_rows_under_memory_pressure_refuse_instead_of_keeping_rows() {
+        let rows = || (0..64).map(|id| vec![Value::I64(id), Value::Utf8(format!("label {id}"))]).collect::<Vec<_>>();
+        let mut refused = false;
+        for limit in (1 << 10..=64 << 10).step_by(1 << 10) {
+            match SqlArguments::from_packed_rows(rows(), &MemoryBudget::new(limit)) {
+                Ok(arguments) => assert!(arguments.built_from_rows(), "a {limit}-byte budget kept the rows"),
+                Err(error) => { assert_eq!(error.code, "rtdb/memory-budget-exceeded"); refused = true; }
+            }
+        }
+        assert!(refused, "the smallest budgets refuse the arguments");
+        assert!(SqlArguments::from_packed_rows(rows(), &MemoryBudget::new(1 << 24)).unwrap().built_from_rows());
+    }
+
     #[test]
     fn decoded_parameter_pages_reset_error_indices_but_coalesced_batches_continue() {
         let memory = MemoryBudget::new(1 << 20);
