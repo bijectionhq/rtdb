@@ -81,6 +81,7 @@ zeroize = "1.8"
 futures.workspace = true
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }
 fs2.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 stream-logkeeper = { workspace = true, features = ["consensus-testing"] }

@@ -405,6 +405,10 @@ fn node_and_ingest_options_keep_configuration_and_allocation_limits() {
     assert_eq!(options.allocation_limit_bytes, 2097152);
     let Command::Start(options) = parse(&["compactor", "-f", "node.yaml"]) else { panic!("expected compactor") };
     assert_eq!(options.mode, NodeMode::Compactor);
+    assert_eq!(options.allocation_limit_bytes, cli::default_memory_limit_bytes());
+    assert!(options.allocation_limit_bytes >= cli::MEMORY_LIMIT_FLOOR_BYTES);
+    let Command::Start(options) = cli::parse(["node".into(), "--memory-limit".into(), "1048576".into()], &|name| (name == "RTDB_MEMORY_LIMIT_BYTES").then(|| "2097152".into())).unwrap() else { panic!("expected start") };
+    assert_eq!(options.allocation_limit_bytes, 1048576);
     assert!(matches!(parse(&["node", "--help"]), Command::Help));
     assert!(cli::parse(["--memory-limit".into(), "0".into()], &|_| None).is_err());
 }

@@ -72,7 +72,7 @@ Classic installations require a separate migration that preserves their data and
 == Node configuration
 
 The node applies indexing enablement, skipped transaction IDs, trie limits, flush policy, compactor options, GC options and database membership from its startup settings.
-`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` controls the allocation ceiling shared by the cache and execution regions; the default is one GiB.
+`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` controls the allocation ceiling shared by the cache and execution regions; without either, it is half the physical or cgroup-limited memory, and at least one GiB.
 `ParsedConfiguration` owns startup settings and their allocation reservations until they transfer into the execution region.
 CLI and embedded startup reserve parser events before parsing, each expanded YAML alias value before construction, and environment values before copying.
 The data-only EDN adapter uses the same charged environment lookup and a bound on its input-derived syntax tree.

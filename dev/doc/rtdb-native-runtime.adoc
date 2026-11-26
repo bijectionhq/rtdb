@@ -9,7 +9,9 @@ The reviewed link:xtdb-rust-rewrite.md[migration design] remains the cutover con
 
 The `rtdb` binary assembles the native node, configured resource providers, authentication, pgwire, Flight SQL, health checks, metrics and tracing.
 `node --file PATH` selects a YAML or data-only EDN configuration.
-`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` sets the explicit allocation ceiling; the default is one GiB.
+`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` sets the explicit allocation ceiling, and the flag wins over the variable.
+Without either, the ceiling is half the physical memory, or of the container's cgroup memory limit when that is lower, and never less than one GiB.
+The memory cache takes its configured share of the ceiling and queries the rest, so the one-GiB floor keeps the 512 MiB execution budget of earlier releases.
 On Apple platforms durable writes flush the drive's write cache with `F_FULLFSYNC`, as the JDK does there; `RTDB_APPLE_SYNC=fsync` trades that for plain `fsync`, which is faster but can lose the last acknowledged writes on power loss.
 Library-internal HTTP, TLS and cloud SDK allocations still require whole-process measurement.
 See link:../../rust/crates/server/README.adoc[server configuration and lifecycle] for listener defaults and shutdown behavior.
