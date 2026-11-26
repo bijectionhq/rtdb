@@ -30,8 +30,8 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     async fn body(&mut self, tag: u8, limit: usize) -> Result<Frame> {
         let length = self.input.read_i32().await.map_err(network)?;
         let length = usize::try_from(length).ok().and_then(|n| n.checked_sub(4)).filter(|n| *n <= limit).ok_or_else(|| protocol("Invalid message length"))?;
-        let bound = length.checked_mul(16).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Message allocation exceeds addressable memory"))?;
-        let charge = self.memory.reserve(bound)?;
+        // The frame charges its body; a decoder charges whatever it builds from it.
+        let charge = self.memory.reserve(length)?;
         let mut body = vec![0; length]; self.input.read_exact(&mut body).await.map_err(network)?;
         Ok(Frame { tag, body, charge })
     }

@@ -376,7 +376,7 @@ impl ProtocolSession {
                 };
                 drop(charges);
                 let arguments = arguments.map(|batch| SqlArguments::from_canonical_arrow_row(batch, self.node.memory())).transpose()?;
-                let mut portal = self.bind(prepared, arguments, vec![Arc::clone(&frame.charge)], &result_formats).await?;
+                let mut portal = self.bind(prepared, arguments, Vec::new(), &result_formats).await?;
                 portal._bind_storage = Some(storage);
                 self.portals.insert(name.to_owned(), portal); writer.empty(b'2').await?;
             }
@@ -528,13 +528,13 @@ impl ProtocolSession {
 
     fn retain_prepared(&self, source: &str, mut oids: Vec<i32>, shape: PreparedShape) -> Result<Arc<Prepared>> {
         let PreparedShape { kind, columns, parameter_count } = shape;
+        let command = head(source);
         let oid_capacity = oids.capacity().max(parameter_count);
-        let column_bytes = columns.as_deref().unwrap_or_default().iter().try_fold(0usize, |bytes, column| bytes.checked_add(column.name.capacity()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Column descriptors are too large")))?;
-        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(parameter_count.checked_mul(256)?)).and_then(|n| n.checked_add(oid_capacity.checked_mul(std::mem::size_of::<i32>())?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
+        let reservation = self.node.memory().reserve(retained_prepared_bytes(source, &command, oid_capacity, columns.as_deref())?)?;
         oids.try_reserve_exact(parameter_count.saturating_sub(oids.len()))
             .map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
         oids.resize(parameter_count, 0);
-        Ok(Arc::new(Prepared { body: PreparedBody::Ordinary { source: source.into(), command: head(source), kind }, oids, columns, _reservation: reservation }))
+        Ok(Arc::new(Prepared { body: PreparedBody::Ordinary { source: source.into(), command, kind }, oids, columns, _reservation: reservation }))
     }
 
     fn retain_sql_prepare(&self, syntax: SqlPrepareSyntax, oids: Vec<i32>) -> Result<Arc<Prepared>> {
@@ -1087,6 +1087,18 @@ fn invalid_argument(error: Anomaly, index: usize, format: Format) -> Anomaly {
         .with_context("arg-idx", index.into()).with_context("arg-format", if format == Format::Binary { "binary" } else { "text" }.into())
 }
 fn item_format(formats: &[Format], count: usize, index: usize) -> Result<Format> { match formats.len() { 0 => Ok(Format::Text), 1 => Ok(formats[0]), length if length == count => Ok(formats[index]), _ => Err(protocol("Invalid format code count")) } }
+/// What an ordinary prepared statement retains beyond its `PreparedKind`, which
+/// charges its own plan or control statement.
+fn retained_prepared_bytes(source: &str, command: &str, oid_capacity: usize, columns: Option<&[Column]>) -> Result<usize> {
+    let too_large = || protocol("Prepared statement is too large");
+    let columns = columns.unwrap_or_default().iter().try_fold(0usize, |bytes, column| {
+        bytes.checked_add(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(column.name.capacity()))
+    }).ok_or_else(too_large)?;
+    [std::mem::size_of::<Prepared>(), source.len(), command.len(), columns]
+        .into_iter()
+        .try_fold(oid_capacity.checked_mul(std::mem::size_of::<i32>()).ok_or_else(too_large)?, |bytes, part| bytes.checked_add(part))
+        .ok_or_else(too_large)
+}
 fn head(source: &str) -> String { source.split_whitespace().next().unwrap_or_default().to_ascii_uppercase() }
 fn dml_tag(command: &str) -> &str { match command { "INSERT" => "INSERT 0 0", "UPDATE" => "UPDATE 0", "DELETE" => "DELETE 0", "PATCH" => "PATCH 0", "ERASE" => "ERASE 0", "CREATE" => "CREATE TABLE", command => command } }
 /// A portal's descriptors in its result formats, shared with the statement's when the formats leave them unchanged.
@@ -1978,7 +1990,7 @@ mod tests {
         body.extend_from_slice(&count.to_be_bytes());
         for _ in 0..count { body.extend_from_slice(&(-1i32).to_be_bytes()); }
         body.extend_from_slice(&0u16.to_be_bytes());
-        let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+        let charge = memory.reserve(body.len()).unwrap();
         let frame = Frame { tag: b'B', body, charge };
         let before = memory.used_bytes();
         let blocked = memory.reserve(memory.limit_bytes() - before - 1).unwrap();
@@ -2109,7 +2121,7 @@ mod tests {
         drop(environment);
         assert_eq!(writer_probe.used_bytes(), 0);
 
-        let statement_bytes = sql.len() * 128 + 8192;
+        let statement_bytes = retained_prepared_bytes(&sql, &head(&sql), 1, None).unwrap();
         let portal_peak = batch_bytes + control_bytes + statement_bytes + 8192;
         assert!(parse_probe.peak_bytes() < portal_peak);
         assert!(batch_bytes + writer_probe.peak_bytes() < portal_peak);
@@ -2118,7 +2130,7 @@ mod tests {
         let memory = Arc::clone(frontend.node.memory());
 
         let initial_timezone = frontend.session.state().effective_timezone().to_owned();
-        let frame_bytes = (source.len() + 1) * 16 + 8192;
+        let frame_bytes = source.len() + 1;
         let baseline = memory.used_bytes();
         let held = memory.reserve(memory.limit_bytes() - baseline - frame_bytes - portal_peak).unwrap();
         let mut input = vec![b'Q'];
@@ -2181,7 +2193,7 @@ mod tests {
             crate::wire::cstring(&mut body, "zone").unwrap();
             crate::wire::cstring(&mut body, replacement).unwrap();
             body.extend_from_slice(&0u16.to_be_bytes());
-            let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+            let charge = memory.reserve(body.len()).unwrap();
             Frame { tag: b'P', body, charge }
         };
         let frame = parse_frame();
@@ -2229,7 +2241,7 @@ mod tests {
         crate::wire::cstring(&mut body, "wire").unwrap();
         crate::wire::cstring(&mut body, &format!("PREPARE target AS {leaf}")).unwrap();
         body.extend_from_slice(&0u16.to_be_bytes());
-        let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+        let charge = memory.reserve(body.len()).unwrap();
         let frame_charge = Arc::downgrade(&charge);
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
         frontend.handle(Frame { tag: b'P', body, charge }, &mut writer).await.unwrap();
@@ -2245,7 +2257,7 @@ mod tests {
         drop(argument_scope);
         assert_eq!(memory.used_bytes(), retained);
 
-        let leaf_bytes = leaf.len() * 128 + 8192;
+        let leaf_bytes = retained_prepared_bytes(leaf, &head(leaf), 0, None).unwrap();
         let held = memory.reserve(memory.limit_bytes() - retained - arguments - leaf_bytes + 1).unwrap();
         let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
         let error = frontend.execute(&mut portal, 0, false, None, &mut writer).await.unwrap_err();
@@ -2261,13 +2273,65 @@ mod tests {
         frontend.portals.insert("portal".into(), portal);
         let mut body = vec![b'S'];
         crate::wire::cstring(&mut body, "wire").unwrap();
-        let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+        let charge = memory.reserve(body.len()).unwrap();
         frontend.handle(Frame { tag: b'C', body, charge }, &mut writer).await.unwrap();
         assert!(!frontend.portals.contains_key("portal"));
         assert!(!frontend.statements.contains_key("wire"));
         assert!(wrapper.upgrade().is_none());
         assert_eq!(writer.into_inner(), b"C\0\0\0\x0cPREPARE\0\x33\0\0\0\x04");
         frontend.close();
+        assert_eq!(memory.used_bytes(), baseline);
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_large_bind_holds_its_arguments_and_not_its_frame() {
+        let (mut frontend, driver) = test_frontend(false).await;
+        let memory = Arc::clone(frontend.node.memory());
+        let baseline = memory.used_bytes();
+        let prepared = frontend.prepare_client("SELECT $1 AS v", vec![25], None).await.unwrap();
+        frontend.register_statement(Cow::Borrowed("large"), prepared).unwrap();
+        let statement = memory.used_bytes();
+
+        let argument = vec![b'x'; 4 << 20];
+        let mut body = Vec::new();
+        crate::wire::cstring(&mut body, "").unwrap();
+        crate::wire::cstring(&mut body, "large").unwrap();
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&i32::try_from(argument.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&argument);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let mut input = vec![b'B'];
+        input.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        input.extend_from_slice(&body);
+        let mut reader = crate::wire::Reader::new(input.as_slice(), Arc::clone(&memory));
+        let frame = reader.read(body.len()).await.unwrap().unwrap();
+        assert_eq!(frame.charge.bytes(), body.len(), "a frame charges its body, not a multiple of it");
+        let frame_charge = Arc::downgrade(&frame.charge);
+        let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+        frontend.handle(frame, &mut writer).await.unwrap();
+        assert_eq!(writer.into_inner(), b"2\0\0\0\x04");
+        assert!(frame_charge.upgrade().is_none(), "the portal keeps its decoded arguments, not the Bind frame");
+        let portal = memory.used_bytes() - statement;
+        assert!(portal >= argument.len() && portal < 4 * argument.len(), "the portal charges about its argument: {portal}");
+        frontend.close();
+        assert_eq!(memory.used_bytes(), baseline);
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prepared_statement_charges_its_retained_text_not_a_multiple_of_it() {
+        let (mut frontend, driver) = test_frontend(false).await;
+        let memory = Arc::clone(frontend.node.memory());
+        let baseline = memory.used_bytes();
+        let sql = format!("SELECT 1 AS v /*{}*/", "x".repeat(1 << 20));
+        let prepared = frontend.prepare_client(&sql, Vec::new(), None).await.unwrap();
+        let retained = prepared._reservation.bytes();
+        assert!(retained >= sql.len() && retained < sql.len() + sql.len() / 2 + 4096, "{retained} for {} bytes of SQL", sql.len());
+        drop(prepared);
         assert_eq!(memory.used_bytes(), baseline);
         drop(frontend);
         driver.close_without_run().await.unwrap();
@@ -2364,7 +2428,7 @@ mod tests {
         let memory = Arc::clone(node.memory());
         let log = Arc::new(Mutex::new(Log::default()));
         let mut writer = Writer::new(Probe(Arc::clone(&log)), Arc::clone(&memory));
-        let frame = |tag: u8, body: Vec<u8>| { let charge = memory.reserve(body.len() * 16 + 8192).unwrap(); Frame { tag, body, charge } };
+        let frame = |tag: u8, body: Vec<u8>| { let charge = memory.reserve(body.len()).unwrap(); Frame { tag, body, charge } };
         let mut parse = Vec::new();
         crate::wire::cstring(&mut parse, "one").unwrap();
         crate::wire::cstring(&mut parse, "SELECT 1 AS n").unwrap();

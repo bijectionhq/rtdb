@@ -756,7 +756,7 @@ mod tests {
     }
 
     fn copy_data(memory: &Arc<MemoryBudget>, body: Vec<u8>) -> Frame {
-        let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+        let charge = memory.reserve(body.len()).unwrap();
         Frame { tag: b'd', body, charge }
     }
 
