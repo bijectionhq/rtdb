@@ -35,8 +35,8 @@ enum SpillSealing {
     Sealed,
 }
 
-/// The stream cipher a sealed spill file is encrypted with: positional, so a frame reads back from any offset and a
-/// rolled-back tail is rewritten in place, and length-preserving, so the spill quota counts the same bytes either way.
+/// The stream cipher a sealed spill file is encrypted with: positional, so a frame reads back from any offset, and
+/// length-preserving, so the spill quota counts the same bytes either way.
 type SpillCipher = ctr::Ctr128BE<aes::Aes128>;
 
 /// The key of one sealed spill file; each file has its own, so one counter sequence never encrypts two files.
@@ -80,14 +80,6 @@ impl Write for SpillSink {
     }
 
     fn flush(&mut self) -> std::io::Result<()> { self.file.flush() }
-}
-
-impl Seek for SpillSink {
-    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        let offset = self.file.seek(position)?;
-        if let Some((key, cipher)) = &mut self.cipher { *cipher = key.cipher_at(offset)?; }
-        Ok(offset)
-    }
 }
 
 /// A spill file as one of its readers sees it, decrypting what it reads when the file has a key.
@@ -297,18 +289,6 @@ impl SpillWriter {
         self.write_frame_with(Some(2), bytes.len() as u64, |file| file.write_all(bytes).map_err(io_error))
     }
 
-    /// Drops unpublished frames written after the supplied frame boundary.
-    pub fn discard_from(&mut self, offset: u64) -> Result<()> {
-        let bytes = self.position.checked_sub(offset).ok_or_else(|| invalid("invalid-spill", "Spill rollback exceeds its file"))?;
-        self.file.flush().map_err(io_error)?;
-        self.file.get_ref().file.set_len(offset).map_err(io_error)?;
-        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        self.position = offset;
-        self.retained.bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.retained.region.retained.fetch_sub(bytes, Ordering::AcqRel);
-        Ok(())
-    }
-
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
         Ok(self.retained)
@@ -432,31 +412,42 @@ impl SpillReader {
     }
 }
 
-/// Writes a page, halving it while its encoding does not fit the memory budget.
+/// Writes a page in spans each of whose encoding the memory budget can admit, so that no written frame is rolled back.
+/// A span's encoding is bounded by `ENCODING_FACTOR` times its share of the page's charges; a span of one row is written
+/// whatever the budget holds, and fails as any other allocation does.
 pub(crate) fn write_page(writer: &mut SpillWriter, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
-    let mut spans = vec![0..batch.len];
+    let rows = page_span_rows(batch.len, batch.working_set_bytes(memory)?, crate::runtime_schema::schema_bound(schema)?, memory)?;
+    if rows >= batch.len { return writer.write_columns(batch, schema, memory); }
     let positions = (0..schema.len()).collect::<Vec<_>>();
-    while let Some(span) = spans.pop() {
-        let start = writer.position()?;
-        let result = if span.len() == batch.len {
-            writer.write_columns(batch, schema, memory)
-        } else {
-            let bytes = span.len().checked_mul(std::mem::size_of::<(usize, usize)>())
-                .ok_or_else(|| invalid("row-size", "Spill page selection exceeds addressable memory"))?;
-            let _picks = memory.reserve(bytes)?;
-            let picks = span.clone().map(|row| (0, row)).collect::<Vec<_>>();
-            let slice = ColumnBatch::take_rows_with_custody(&[batch], &picks, &positions, true, memory)?;
-            writer.write_columns(&slice, schema, memory)
-        };
-        if let Err(error) = result {
-            if error.code != "rtdb/memory-budget-exceeded" || span.len() < 2 { return Err(error); }
-            writer.discard_from(start)?;
-            let mid = span.start + span.len() / 2;
-            spans.push(mid..span.end);
-            spans.push(span.start..mid);
-        }
+    for start in (0..batch.len).step_by(rows) {
+        let span = start..batch.len.min(start + rows);
+        let bytes = span.len().checked_mul(std::mem::size_of::<(usize, usize)>())
+            .ok_or_else(|| invalid("row-size", "Spill page selection exceeds addressable memory"))?;
+        let _picks = memory.reserve(bytes)?;
+        let picks = span.map(|row| (0, row)).collect::<Vec<_>>();
+        let slice = ColumnBatch::take_rows_with_custody(&[batch], &picks, &positions, true, memory)?;
+        writer.write_columns(&slice, schema, memory)?;
     }
     Ok(())
+}
+
+/// The encoding scratch of a spilled page, its copy for a span included, per byte of the page's charges.
+const ENCODING_FACTOR: usize = 8;
+
+/// The most rows of a page of `len` rows holding `page_bytes` whose encoding `memory` admits now, halving from the whole
+/// page; at least one.
+fn page_span_rows(len: usize, page_bytes: usize, schema_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<usize> {
+    let overflow = || invalid("row-size", "Spill page encoding bound exceeds addressable memory");
+    let fixed = schema_bytes.checked_mul(8).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
+    let mut rows = len.max(1);
+    while rows > 1 {
+        let share = u128::from(page_bytes as u64) * rows as u128 / len.max(1) as u128;
+        let bound = usize::try_from(share).ok().and_then(|share| share.checked_mul(ENCODING_FACTOR))
+            .and_then(|bytes| bytes.checked_add(fixed)).ok_or_else(overflow)?;
+        if memory.try_reserve(bound).is_some() { break; }
+        rows = rows.div_ceil(2);
+    }
+    Ok(rows)
 }
 
 /// Whether a hash operator at partitioning level `depth`, whose keys and per-key state hold `retained` bytes, should send
@@ -552,6 +543,18 @@ fn every_node_spills_without_limit_by_default_and_a_configured_limit_refuses_pas
     let limited = SpillRegion::new(1 << 10).unwrap();
     limited.reserve(1 << 10).unwrap();
     assert!(limited.reserve(1).unwrap_err().is(AnomalyKind::ConfigurationLimitExceeded));
+}
+
+#[test]
+fn a_spill_page_spans_what_the_budget_admits_and_never_less_than_a_row() {
+    let memory = MemoryBudget::new(1 << 20);
+    assert_eq!(page_span_rows(1024, 1 << 10, 64, &memory).unwrap(), 1024, "a page that fits is written whole");
+    let rows = page_span_rows(1024, 1 << 20, 64, &memory).unwrap();
+    assert!(rows < 1024 && rows > 1, "{rows}");
+    assert!(memory.try_reserve((1 << 20) / 1024 * rows * ENCODING_FACTOR).is_some());
+    assert_eq!(page_span_rows(1024, usize::MAX / 16, 64, &MemoryBudget::new(0)).unwrap(), 1);
+    assert_eq!(page_span_rows(0, 0, 64, &memory).unwrap(), 1);
+    assert_eq!(memory.used_bytes(), 0, "sizing holds nothing");
 }
 
 #[cfg(test)]
@@ -955,9 +958,6 @@ fn sealed_spill_files_hold_no_readable_rows_and_replay_from_any_offset() {
         writer.write_frame(b"first").unwrap();
         let start = writer.position().unwrap();
         writer.write_frame(&secret).unwrap();
-        let rollback = writer.position().unwrap();
-        writer.write_frame(b"rolled back").unwrap();
-        writer.discard_from(rollback).unwrap();
         writer.write_frame(&long).unwrap();
         let file = writer.finish().unwrap();
         let raw = std::fs::read(&*file.path).unwrap();

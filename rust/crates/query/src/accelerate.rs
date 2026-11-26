@@ -334,6 +334,24 @@ impl OrderedIidBuffer {
         growth.map_err(|error| crate::invalid("ordered-iid-capacity", error))
     }
 
+    /// Grows the buffer to hold `capacity`, as `reserve` does, or answers `false` and changes nothing where the budget has
+    /// no room for it.
+    fn try_reserve(&mut self, capacity: usize) -> Result<bool> {
+        let current = self.values.capacity();
+        if capacity <= current { return Ok(true); }
+        let retained = Self::reserved_bytes(capacity)?;
+        let peak = retained.checked_add(current * 16)
+            .ok_or_else(|| crate::invalid("ordered-iid-capacity", "Ordered IID growth exceeds addressable memory"))?;
+        let charge = Arc::get_mut(&mut self.reservation).expect("Ordered IID buffer owns its reservation");
+        let previous = charge.bytes();
+        let Some(mut growth) = charge.budget().try_reserve(peak.saturating_sub(previous)) else { return Ok(false); };
+        charge.absorb(Arc::get_mut(&mut growth).expect("a fresh reservation is unshared"))?;
+        let grown = self.values.try_reserve_exact(capacity - self.values.len());
+        charge.shrink_to(if grown.is_ok() { retained } else { previous })?;
+        grown.map_err(|error| crate::invalid("ordered-iid-capacity", error))?;
+        Ok(true)
+    }
+
     fn sort_distinct(&mut self) {
         self.values.sort_unstable();
         self.values.dedup();
@@ -358,10 +376,7 @@ impl OrderedIidBuffer {
         let capacity = self.values.capacity();
         if len > capacity {
             let preferred = len.max(capacity.saturating_mul(2)).min(limit);
-            if let Err(error) = self.reserve(preferred) {
-                if preferred == len || error.code != "rtdb/memory-budget-exceeded" { return Err(error); }
-                self.reserve(len)?;
-            }
+            if !self.try_reserve(preferred)? { self.reserve(len)?; }
         }
         self.values.resize(len, [0; 16]);
         let mut write = len;
