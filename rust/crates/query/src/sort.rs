@@ -82,6 +82,19 @@ impl KeyTypes {
     }
     fn validate(&self) -> Result<()> { for ty in &self.values { validate_order_type(ty)?; } Ok(()) }
 }
+/// Whether comparing keys of these types is a total preorder that never fails.
+/// Only then does the stable sort of a block's first rows and the remaining input place first what a stable sort of everything does.
+/// Interval comparisons can refuse months, and integers compare exactly among themselves but through doubles against inexact numbers.
+fn orders_consistently(types: &[LogicalType]) -> bool {
+    use rtdb_types::ScalarType as S;
+    types.iter().all(|ty| {
+        let legs = ty.legs();
+        let interval = legs.iter().any(|leg| matches!(leg, LogicalType::Scalar(S::Interval(_) | S::IntervalMonthDayMicro)));
+        let exact = legs.iter().any(|leg| matches!(leg, LogicalType::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64)));
+        let inexact = legs.iter().any(|leg| matches!(leg, LogicalType::Scalar(S::F16 | S::F32 | S::F64 | S::Decimal { .. })));
+        !interval && !(exact && inexact)
+    })
+}
 fn type_bytes(types: &Vec<LogicalType>) -> Result<usize> {
     let base = types.capacity().checked_mul(std::mem::size_of::<LogicalType>()).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?;
     types.iter().try_fold(base, |sum, ty| sum.checked_add(ty.retained_bytes()?).ok_or_else(size_error))

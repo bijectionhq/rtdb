@@ -673,6 +673,19 @@ impl BatchKeyIndex {
         })
     }
 
+    /// The key's hash, with the ordinal `identify` gave the key if the index holds it; the index is left unchanged.
+    pub fn lookup<'a>(
+        &mut self,
+        columns: impl Into<KeyColumns<'a>>,
+        row: usize,
+        projected: bool,
+        context: &QueryContext,
+    ) -> Result<(u32, Option<usize>)> {
+        let (hash, key) = Key::bind(columns, row, projected, context, self.hashing)?;
+        let found = self.find(hash, &key, false, context)?;
+        Ok((hash, found))
+    }
+
     pub fn insert_distinct_argument(
         &mut self, batch: &ColumnBatch, column: usize, row: usize, group: usize, projected: bool,
         retained_source: &mut Option<usize>, context: &QueryContext,

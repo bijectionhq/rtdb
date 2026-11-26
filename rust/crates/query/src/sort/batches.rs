@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::NativeOrder, select, size_error,
-    timsort,
+    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::NativeOrder, orders_consistently, select,
+    size_error, timsort,
 };
 
 pub(crate) struct BatchSort {
@@ -85,6 +85,15 @@ impl BatchSort {
         self
     }
 
+    /// Whether the block's comparator lets a limited sort drop rows outside its first `limit` before the input ends.
+    fn orders_consistently(&self, block: &Block, key_types: &KeyTypes) -> bool {
+        if block.native {
+            self.native.as_ref().is_some_and(NativeOrder::is_total)
+        } else {
+            orders_consistently(&key_types.values)
+        }
+    }
+
     async fn sort(&mut self, mut input: BoxBatchCursor) -> Result<Sorted> {
         let context = &self.plan.execution.context;
         let mut block = Block::new(&context.memory, self.native.is_some())?;
@@ -93,6 +102,10 @@ impl BatchSort {
         let mut logical_runs = 0;
         let mut logical_run_rows = 0;
         let mut total_rows = 0usize;
+        let limit = usize::try_from(self.plan.limit).unwrap_or(usize::MAX);
+        // A small limit keeps only its candidates between batches, so the block stays bounded whatever the input size.
+        let retained_rows = (limit != 0 && limit <= TOP_K_ROWS)
+            .then(|| limit.saturating_mul(2).max(context.options.batch_rows));
         while let Some(batch) = input.next_batch().await? {
             context.check_cancelled()?;
             if batch.len == 0 {
@@ -110,7 +123,9 @@ impl BatchSort {
             if !block.positions.is_empty()
                 && (block.charged().saturating_add(payload_bytes)
                     > context.options.sort_memory_bytes
-                    || block.positions.len().saturating_add(batch.len) > BLOCK_ROWS)
+                    || (retained_rows.is_none() || !self.orders_consistently(&block, &key_types))
+                        && block.positions.len().saturating_add(batch.len) > BLOCK_ROWS
+                    || ordering_pressure(&context.memory, block.positions.len().saturating_add(batch.len)))
             {
                 key_types.validate()?;
                 let full = std::mem::replace(
@@ -136,6 +151,30 @@ impl BatchSort {
                 &mut key_types,
                 &self.plan,
             )?;
+            if let Some(retained_rows) = retained_rows
+                && block.positions.len() >= retained_rows
+                && self.orders_consistently(&block, &key_types)
+            {
+                key_types.validate()?;
+                let full = std::mem::replace(
+                    &mut block,
+                    Block::new(&context.memory, self.native.is_some())?,
+                );
+                self.used_native |= full.native;
+                let mut candidates = full.order(&self.plan, &self.key_columns, self.native.as_ref(), self.projected)?;
+                while let Some(rows) = candidates.next(&self.plan, &self.projection, limit)? {
+                    let payload_bytes = rows.working_set_bytes(&context.memory)?;
+                    block.append(
+                        rows,
+                        payload_bytes,
+                        &self.key_columns,
+                        self.native.as_ref(),
+                        self.projected,
+                        &mut key_types,
+                        &self.plan,
+                    )?;
+                }
+            }
             tokio::task::consume_budget().await;
         }
         drop(input);
@@ -338,6 +377,17 @@ impl BatchCursor for BatchSort {
 enum Sorted {
     Memory(MemoryRun),
     Spill(SpillReader),
+}
+
+/// The largest limit the sort answers by keeping only its candidates; a larger one sorts blocks and spills them.
+const TOP_K_ROWS: usize = BLOCK_ROWS / 8;
+const ORDERING_HEADROOM_BYTES: usize = 256 << 10;
+
+/// Whether ordering a block of `rows` could exhaust the budget, so that the block spills before it grows.
+fn ordering_pressure(memory: &MemoryBudget, rows: usize) -> bool {
+    let needed = rows.saturating_mul(4 * size_of::<usize>() + size_of::<Option<Key>>())
+        .saturating_add(ORDERING_HEADROOM_BYTES);
+    memory.available_bytes() < needed
 }
 
 struct Block {
@@ -731,30 +781,7 @@ fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize
 }
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
-    let mut spans = vec![0..batch.len];
-    let context = &plan.execution.context;
-    let memory = &context.memory;
-    let positions = (0..plan.schema.len()).collect::<Vec<_>>();
-    while let Some(span) = spans.pop() {
-        let start = writer.position()?;
-        let result = if span.len() == batch.len {
-            writer.write_columns(&batch, &plan.schema, memory)
-        } else {
-            let bytes = span.len().checked_mul(size_of::<(usize, usize)>()).ok_or_else(size_error)?;
-            let _picks = memory.reserve(bytes)?;
-            let picks = span.clone().map(|row| (0, row)).collect::<Vec<_>>();
-            let slice = ColumnBatch::take_rows_with_custody(&[&batch], &picks, &positions, true, memory)?;
-            writer.write_columns(&slice, &plan.schema, memory)
-        };
-        if let Err(error) = result {
-            if error.code != "rtdb/memory-budget-exceeded" || span.len() < 2 { return Err(error); }
-            writer.discard_from(start)?;
-            let mid = span.start + span.len() / 2;
-            spans.push(mid..span.end);
-            spans.push(span.start..mid);
-        }
-    }
-    Ok(())
+    crate::spill::write_page(writer, &batch, &plan.schema, &plan.execution.context.memory)
 }
 
 fn read_semantic_page(

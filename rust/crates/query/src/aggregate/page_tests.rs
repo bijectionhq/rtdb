@@ -860,3 +860,76 @@ async fn arrow_wave4_numeric_aggregates_match_scalar_rows_and_float_bits() {
     }
     assert_eq!(context.memory.used_bytes(), baseline);
 }
+
+/// Nullable groups and arguments, with many groups, repeated arguments and rows of a group spread over every page.
+fn spread_pages() -> (Schema, Vec<Vec<Vec<Value>>>) {
+    let ty = LogicalType::Scalar(ScalarType::I64).maybe();
+    let schema = Schema::new(vec![field(0, ty.clone()), field(1, ty)]).unwrap();
+    let pages = (0..40_i64).map(|page| (0..50_i64).map(|row| {
+        let n = page * 50 + row;
+        let group = if n % 23 == 0 { Value::Null } else { Value::I64((n * 7919) % 613) };
+        vec![group, if n % 7 == 0 { Value::Null } else { Value::I64(n % 5) }]
+    }).collect()).collect();
+    (schema, pages)
+}
+
+fn spread_aggregates(schema: &Schema) -> (Vec<NamedExpr>, Vec<AggregateExpr>) {
+    let argument = schema.fields()[1].expression();
+    let nullable = LogicalType::Scalar(ScalarType::I64).maybe();
+    let groups = vec![NamedExpr { field: field(2, nullable.clone()), expr: schema.fields()[0].expression() }];
+    let aggregates = vec![
+        count(3, None),
+        AggregateExpr { function: AggregateFunction::Count, argument: Some(argument.clone()), ..count(4, None) },
+        AggregateExpr { field: field(5, nullable.clone()), function: AggregateFunction::Sum, argument: Some(argument.clone()), distinct: false, filter: None, order_by: vec![] },
+        AggregateExpr { field: field(6, nullable), function: AggregateFunction::Sum, argument: Some(argument.clone()), distinct: true, filter: None, order_by: vec![] },
+        AggregateExpr { field: field(7, LogicalType::list(argument.data_type())), function: AggregateFunction::ArrayAgg, argument: Some(argument), distinct: false, filter: None, order_by: vec![] },
+    ];
+    (groups, aggregates)
+}
+
+/// Every group's output row by its key, which identifies it whatever order the groups arrive in.
+async fn drain_groups(cursor: &mut AggregateCursor) -> BTreeMap<String, Vec<Value>> {
+    let mut groups = BTreeMap::new();
+    while let Some(page) = cursor.next_batch().await.unwrap() {
+        for row in 0..page.len {
+            let values = batch_row(&page, row);
+            assert!(groups.insert(format!("{:?}", values[0]), values).is_none(), "a group is emitted once");
+        }
+    }
+    groups
+}
+
+#[tokio::test]
+async fn grouping_past_its_hash_memory_spills_partitions_and_matches_the_in_memory_result() {
+    let (schema, pages) = spread_pages();
+    let (groups, aggregates) = spread_aggregates(&schema);
+    let reference = execution_with_options(QueryOptions { batch_rows: 50, ..Default::default() });
+    let (mut in_memory, _) = cursor(&reference, schema.clone(), pages.clone(), groups.clone(), aggregates.clone(), None);
+    let expected = drain_groups(&mut in_memory).await;
+    assert_eq!(expected.len(), 614);
+    assert_eq!(reference.context.spill_peak_bytes(), 0);
+
+    let spilling = execution_with_options(QueryOptions { batch_rows: 50, hash_memory_bytes: 1, ..Default::default() });
+    let baseline = spilling.context.memory.used_bytes();
+    let (mut spilled, _) = cursor(&spilling, schema, pages, groups, aggregates, None);
+    assert_eq!(drain_groups(&mut spilled).await, expected);
+    assert!(spilling.context.spill_peak_bytes() > 0);
+    drop(spilled);
+    assert_eq!(spilling.context.spill_bytes(), 0);
+    assert_eq!(spilling.context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn cancelling_a_spilled_grouping_deletes_its_pending_partitions() {
+    let (schema, pages) = spread_pages();
+    let (groups, aggregates) = spread_aggregates(&schema);
+    let execution = execution_with_options(QueryOptions { batch_rows: 50, hash_memory_bytes: 1, ..Default::default() });
+    let (mut spilled, _) = cursor(&execution, schema, pages, groups, aggregates, None);
+    let held = spilled.next_batch().await.unwrap().unwrap();
+    assert!(held.len < 614);
+    assert!(execution.context.spill_bytes() > 0);
+    execution.context.cancellation.cancel();
+    assert_eq!(spilled.next_batch().await.err().unwrap().code, "xtdb/query-cancelled");
+    drop((spilled, held));
+    assert_eq!(execution.context.spill_bytes(), 0);
+}

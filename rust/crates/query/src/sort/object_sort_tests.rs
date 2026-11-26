@@ -273,6 +273,109 @@ mod limited {
         }
     }
 
+    /// Pages of (key, ordinal) rows built only when pulled, so that the input never sits in the budget as a whole.
+    struct Generated { keys: Arc<[Value]>, key: Field, next: usize, cancel_after: Option<usize>, context: Arc<QueryContext> }
+    #[async_trait]
+    impl BatchCursor for Generated {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+            if self.next >= self.keys.len() { return Ok(None); }
+            if self.cancel_after.is_some_and(|rows| self.next >= rows) { self.context.cancellation.cancel(); }
+            let (start, end) = (self.next, (self.next + 64).min(self.keys.len()));
+            self.next = end;
+            let ordinal = field(1, "ordinal", LogicalType::Scalar(ScalarType::I64));
+            let ids = (start..end).map(|row| Value::I64(row as i64)).collect::<Vec<_>>();
+            let columns = [(&self.key, &self.keys[start..end]), (&ordinal, &ids[..])].into_iter().map(|(field, values)| Column::Arrow {
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                array: rtdb_columnar::copy_array(&field.data_type, values).unwrap(),
+                logical: Some(field.data_type.clone()),
+            }).collect();
+            ColumnBatch::settled(columns, end - start, self.context.memory.reserve(0)?).map(Some)
+        }
+    }
+
+    fn budgeted(budget: usize, sort_memory_bytes: usize, batch_rows: usize) -> Execution {
+        let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let options = QueryOptions { sort_memory_bytes, batch_rows, ..Default::default() };
+        let context = QueryContext::new(catalog, MemoryBudget::new(budget), Timestamp(0), "UTC", options, &CancellationToken::new()).unwrap();
+        Execution {
+            parameters: Arc::new(BoundParameters::infer(vec![], &context.memory).unwrap()),
+            outer: OuterRows::empty(&context.memory).unwrap(),
+            context, bindings: None, analysis: None,
+        }
+    }
+
+    async fn sorted_lazily(execution: &Execution, key: &Field, keys: &Arc<[Value]>, order: SortExpr, limit: u64, cancel_after: Option<usize>) -> Result<Vec<usize>> {
+        let schema = Schema::new(vec![key.clone(), field(1, "ordinal", LogicalType::Scalar(ScalarType::I64))]).unwrap();
+        let input = Generated { keys: Arc::clone(keys), key: key.clone(), next: 0, cancel_after, context: Arc::clone(&execution.context) };
+        let mut sort = batches::BatchSort::new(Box::new(input), schema, vec![order], execution.clone(), false, 0, limit)?;
+        let mut ids = Vec::new();
+        while let Some(batch) = sort.next_batch().await? {
+            for row in 0..batch.len {
+                let Value::I64(id) = batch.columns[1].value(row)? else { panic!("expected an ordinal") };
+                ids.push(id as usize);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Nullable keys with many duplicates, through the Arrow comparator (integers) and the scalar one (decimals).
+    fn key_cases(rows: i64) -> Vec<(Field, Arc<[Value]>)> {
+        let decimal = |value: i64| Value::Decimal(rtdb_types::DecimalValue::new(i128::from(value).to_be_bytes().to_vec(), 32, 1, 128).unwrap());
+        let cases: [(LogicalType, fn(i64) -> Value); 2] = [
+            (LogicalType::Scalar(ScalarType::I64).maybe(), Value::I64),
+            (LogicalType::Scalar(ScalarType::Decimal { precision: 32, scale: 1, bit_width: 128 }).maybe(), decimal),
+        ];
+        cases.into_iter().map(|(ty, make)| {
+            let keys: Arc<[Value]> = (0..rows).map(|row| if row % 41 == 0 { Value::Null } else { make((row * 7919) % 977) }).collect();
+            (field(0, "key", ty), keys)
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn a_limited_sort_keeps_only_its_candidates_whatever_the_input_size() {
+        for (key, keys) in key_cases(120_000) {
+            for (descending, nulls_first) in [(false, false), (true, true)] {
+                let order = SortExpr { expr: key.expression(), descending, nulls_first };
+                let full = sorted_lazily(&budgeted(1 << 28, 64 << 20, 1024), &key, &keys, order.clone(), u64::MAX, None).await.unwrap();
+                for limit in [1, 5, 100] {
+                    let execution = budgeted(1 << 28, 64 << 20, 128);
+                    let limited = sorted_lazily(&execution, &key, &keys, order.clone(), limit, None).await.unwrap();
+                    assert_eq!(limited, full[..limit as usize], "{:?}, desc {descending}, limit {limit}", key.data_type);
+                    assert!(execution.context.memory.peak_bytes() < 1 << 20, "peak {}", execution.context.memory.peak_bytes());
+                    assert_eq!(execution.context.spill_peak_bytes(), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_sort_spills_runs_when_its_budget_runs_low_and_matches_the_unlimited_sort() {
+        for (key, keys) in key_cases(100_000) {
+            for (descending, nulls_first) in [(false, true), (true, false)] {
+                let order = SortExpr { expr: key.expression(), descending, nulls_first };
+                let full = sorted_lazily(&budgeted(1 << 28, 64 << 20, 1024), &key, &keys, order.clone(), u64::MAX, None).await.unwrap();
+                let tight = budgeted(2 << 20, 64 << 20, 64);
+                let spilled = sorted_lazily(&tight, &key, &keys, order, u64::MAX, None).await.unwrap();
+                assert_eq!(spilled, full, "{:?}, desc {descending}", key.data_type);
+                assert!(tight.context.spill_peak_bytes() > 0);
+                assert_eq!(tight.context.spill_bytes(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_spilling_sort_deletes_its_runs() {
+        for (key, keys) in key_cases(20_000) {
+            let execution = budgeted(1 << 28, 1, 64);
+            let order = SortExpr { expr: key.expression(), descending: false, nulls_first: false };
+            let error = sorted_lazily(&execution, &key, &keys, order, u64::MAX, Some(10_000)).await.unwrap_err();
+            assert_eq!(error.code, "xtdb/query-cancelled");
+            assert!(execution.context.spill_peak_bytes() > 0);
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+
     #[tokio::test]
     async fn a_limited_sort_still_compares_intervals_with_months() {
         let key = field(0, "key", LogicalType::Scalar(ScalarType::Interval(rtdb_types::IntervalUnit::MonthDayNano)).maybe());

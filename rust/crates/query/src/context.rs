@@ -437,8 +437,12 @@ pub struct QueryOptions {
     pub batch_rows: usize,
     pub list_batch_rows: usize,
     pub sort_memory_bytes: usize,
+    /// Bytes a hash aggregation or DISTINCT may grow by before it sends rows of new keys to disk.
+    /// It also spills once the budget could not emit what it holds.
+    pub hash_memory_bytes: usize,
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
+    /// Disk bytes one query's spill files may hold at once; zero disables spilling.
     pub spill_limit_bytes: u64,
     pub materialized_spill_rows: usize,
     pub bypass_temporal_pruning: bool,
@@ -448,7 +452,7 @@ pub struct QueryOptions {
     pub object_sort: rtdb_types::ObjectSort,
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, materialized_spill_rows: 100_000, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
+    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, hash_memory_bytes: usize::MAX, join_build_rows: 100_000, spill_limit_bytes: crate::spill::default_spill_limit_bytes(), materialized_spill_rows: 100_000, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
 }
 
 #[derive(Clone)]

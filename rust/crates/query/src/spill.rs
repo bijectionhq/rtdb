@@ -16,7 +16,7 @@ use rtdb_types::Result;
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{
-    columnar::ColumnBatch,
+    columnar::{BatchCursor, ColumnBatch},
     fragment::{FragmentBytes, decode_batches, encode_batch},
     invalid,
 };
@@ -330,9 +330,168 @@ impl SpillReader {
     }
 }
 
+/// Writes a page, halving it while its encoding does not fit the memory budget.
+pub(crate) fn write_page(writer: &mut SpillWriter, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
+    let mut spans = vec![0..batch.len];
+    let positions = (0..schema.len()).collect::<Vec<_>>();
+    while let Some(span) = spans.pop() {
+        let start = writer.position()?;
+        let result = if span.len() == batch.len {
+            writer.write_columns(batch, schema, memory)
+        } else {
+            let bytes = span.len().checked_mul(std::mem::size_of::<(usize, usize)>())
+                .ok_or_else(|| invalid("row-size", "Spill page selection exceeds addressable memory"))?;
+            let _picks = memory.reserve(bytes)?;
+            let picks = span.clone().map(|row| (0, row)).collect::<Vec<_>>();
+            let slice = ColumnBatch::take_rows_with_custody(&[batch], &picks, &positions, true, memory)?;
+            writer.write_columns(&slice, schema, memory)
+        };
+        if let Err(error) = result {
+            if error.code != "rtdb/memory-budget-exceeded" || span.len() < 2 { return Err(error); }
+            writer.discard_from(start)?;
+            let mid = span.start + span.len() / 2;
+            spans.push(mid..span.end);
+            spans.push(span.start..mid);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a hash operator that has grown by `grown` bytes since its first page should send rows of new keys to disk:
+/// past its configured share, or once the budget could no longer admit the next page beside what emitting its state needs.
+pub(crate) fn hash_spill_due(context: &crate::QueryContext, grown: usize, batch: &ColumnBatch) -> Result<bool> {
+    if context.options.spill_limit_bytes == 0 { return Ok(false); }
+    if grown > context.options.hash_memory_bytes { return Ok(true); }
+    let headroom = batch.working_set_bytes(&context.memory)?.saturating_mul(2)
+        .saturating_add(batch.len.saturating_mul(256))
+        .saturating_add(grown / 2)
+        .saturating_add(256 << 10);
+    Ok(context.memory.available_bytes() < headroom)
+}
+
+/// Fan-out of one level of hash partitioning.
+pub(crate) const SPILL_PARTITIONS: usize = 16;
+/// Partitioning levels after which an operator holds what remains in memory: keys sharing a 32-bit hash never separate.
+pub(crate) const MAX_SPILL_DEPTH: u32 = 6;
+const WRITER_BUFFER_BYTES: usize = 8 << 10;
+
+/// Rows routed by key hash to one spill file per partition, so that every row of a key lands in one file, in input order.
+pub(crate) struct HashPartitions { writers: Vec<Option<SpillWriter>>, depth: u32, _buffers: Arc<MemoryReservation> }
+
+impl HashPartitions {
+    pub fn new(depth: u32, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let buffers = memory.reserve(SPILL_PARTITIONS * (WRITER_BUFFER_BYTES + 256))?;
+        Ok(Self { writers: (0..SPILL_PARTITIONS).map(|_| None).collect(), depth, _buffers: buffers })
+    }
+
+    /// Each level mixes the hash with its depth, so that one partition's keys spread again at the next level.
+    pub fn partition(&self, hash: u32) -> usize {
+        let mut mixed = hash ^ self.depth.wrapping_add(1).wrapping_mul(0x9e37_79b9);
+        mixed ^= mixed >> 16;
+        mixed = mixed.wrapping_mul(0x85eb_ca6b);
+        mixed ^= mixed >> 13;
+        mixed = mixed.wrapping_mul(0xc2b2_ae35);
+        mixed ^= mixed >> 16;
+        mixed as usize % SPILL_PARTITIONS
+    }
+
+    /// Appends each row to the partition `targets` names for it; a row without one stays with the caller.
+    pub fn write(&mut self, batch: &ColumnBatch, targets: &[Option<usize>], schema: &rtdb_plan::Schema, context: &crate::QueryContext) -> Result<()> {
+        if targets.len() != batch.len { return Err(invalid("invalid-spill", "Spill partition targets disagree with their page")); }
+        let memory = &context.memory;
+        let bytes = batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
+            .and_then(|bytes| bytes.checked_add(batch.columns.len().checked_mul(std::mem::size_of::<usize>())?))
+            .ok_or_else(|| invalid("row-size", "Spill partition selection exceeds addressable memory"))?;
+        let _picks = memory.reserve(bytes)?;
+        let positions = (0..batch.columns.len()).collect::<Vec<_>>();
+        for partition in 0..SPILL_PARTITIONS {
+            context.check_cancelled()?;
+            let rows = targets.iter().enumerate().filter(|(_, target)| **target == Some(partition))
+                .map(|(row, _)| (0, row)).collect::<Vec<_>>();
+            if rows.is_empty() { continue; }
+            let page = ColumnBatch::take_rows(&[batch], &rows, &positions, memory)?;
+            if self.writers[partition].is_none() { self.writers[partition] = Some(context.spill.create()?); }
+            let writer = self.writers[partition].as_mut().expect("the partition's writer is open");
+            write_page(writer, &page, schema, memory)?;
+        }
+        Ok(())
+    }
+
+    /// The partitions that received rows; dropping one deletes its file.
+    pub fn finish(self) -> Result<Vec<Arc<SpillFile>>> {
+        self.writers.into_iter().flatten().map(SpillWriter::finish).collect()
+    }
+}
+
+/// Replays the pages of one spill file, which is deleted once the replay is dropped.
+pub(crate) struct SpillReplay { reader: SpillReader, width: usize, context: Arc<crate::QueryContext> }
+
+impl SpillReplay {
+    pub fn new(file: Arc<SpillFile>, width: usize, context: &Arc<crate::QueryContext>) -> Result<Self> {
+        Ok(Self { reader: file.reader(Arc::clone(&context.memory))?, width, context: Arc::clone(context) })
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchCursor for SpillReplay {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        self.context.check_cancelled()?;
+        let page = self.reader.read_columns(self.width)?;
+        tokio::task::consume_budget().await;
+        Ok(page)
+    }
+}
+
+const SPILL_LIMIT_FLOOR_BYTES: u64 = 1 << 30;
+
+/// Half the free space on the spill directory's filesystem when the process first asks, and never below 1 GiB.
+pub(crate) fn default_spill_limit_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| spill_limit_for(free_bytes(&std::env::temp_dir())))
+}
+
+fn spill_limit_for(free: Option<u64>) -> u64 {
+    free.map_or(SPILL_LIMIT_FLOOR_BYTES, |free| (free / 2).max(SPILL_LIMIT_FLOOR_BYTES))
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stat` points to writable storage for one `statvfs`.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return None; }
+    // SAFETY: a successful `statvfs` initialised `stat`.
+    let stat = unsafe { stat.assume_init() };
+    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &std::path::Path) -> Option<u64> { None }
+
 fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("join-spill", error) }
 
 fn io_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { rtdb_types::Anomaly::fault("rtdb.query/spill-io", error.to_string()) }
+
+#[test]
+fn the_default_spill_limit_is_half_the_free_disk_and_never_below_the_floor() {
+    assert_eq!(spill_limit_for(None), SPILL_LIMIT_FLOOR_BYTES);
+    assert_eq!(spill_limit_for(Some(1 << 30)), SPILL_LIMIT_FLOOR_BYTES);
+    assert_eq!(spill_limit_for(Some(64 << 30)), 32 << 30);
+    assert!(default_spill_limit_bytes() >= SPILL_LIMIT_FLOOR_BYTES);
+}
+
+#[test]
+fn hash_partitions_separate_a_partitions_keys_at_the_next_level() {
+    let memory = MemoryBudget::new(1 << 20);
+    let (top, next) = (HashPartitions::new(0, &memory).unwrap(), HashPartitions::new(1, &memory).unwrap());
+    let hashes = (0..4096u32).map(|key| key.wrapping_mul(0x2545_f491)).collect::<Vec<_>>();
+    let first = hashes.iter().copied().filter(|&hash| top.partition(hash) == 0).collect::<Vec<_>>();
+    assert!(!first.is_empty());
+    let spread = first.iter().map(|&hash| next.partition(hash)).collect::<std::collections::BTreeSet<_>>();
+    assert!(spread.len() > SPILL_PARTITIONS / 2, "{spread:?}");
+}
 
 #[test]
 fn empty_spill_page_needs_only_its_output_reservation() {
