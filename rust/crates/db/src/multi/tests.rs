@@ -412,6 +412,7 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
         successor.tx_status(&timed.key).await.unwrap().basis,
         receipt.basis
     );
+    cluster.at(receipt.system_time.0);
     assert_eq!(
         text_at(&mut successor, MAIN_BRANCH, 1).await,
         Some(Value::Utf8("published".into()))
