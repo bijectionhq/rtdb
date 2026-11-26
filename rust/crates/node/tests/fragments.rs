@@ -224,6 +224,15 @@ async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head()
     let error = node.scan_fragment(&ahead, Duration::from_millis(50), &CancellationToken::new()).await.unwrap_err();
     assert_eq!(error.code, "rtdb.node/fragment-basis", "a basis this node has not reached is waited for, then refused");
 
+    let waiting = tokio::spawn({
+        let (node, ahead) = (node.clone(), ahead.clone());
+        async move { node.scan_fragment(&ahead, Duration::from_secs(30), &CancellationToken::new()).await }
+    });
+    execute(&mut session, put(&node, "users", vec![StructFields::from([("_id".to_owned(), Value::I64(999)), ("name".to_owned(), Value::Utf8("next".into()))])])).await;
+    let error = tokio::time::timeout(Duration::from_secs(10), waiting).await
+        .expect("the wait ends when the basis is applied, not at the catch-up deadline").unwrap().unwrap_err();
+    assert_eq!(error.code, "rtdb.query/fragment-basis", "the reader reached the basis and then compared its exact transaction key");
+
     // Every row changes, some are deleted and new ones arrive, after the basis.
     for table in ["orders", "items", "users"] {
         execute(&mut session, TxOp::Sql { sql: format!("UPDATE {table} SET later = 1"), args: None }).await;

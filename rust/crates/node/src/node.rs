@@ -909,12 +909,15 @@ impl Node {
         if !fragment.residence.as_ref().is_some_and(|expected| database.fragment_residence() == Some(expected)) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/fragment-residence", "The node's captured database is in another storage residence or replica epoch"));
         }
-        let deadline = tokio::time::Instant::now() + catch_up;
-        while database.partition.value().live().latest_completed_tx().is_none_or(|head| head.tx_id < fragment.basis.tx_id) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/fragment-basis", format!("{} did not reach the fragment's basis in time", database.name())));
-            }
-            cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
+        let basis = fragment.basis.tx_id;
+        let reached = || database.partition.value().live().latest_completed_tx().is_some_and(|head| head.tx_id >= basis);
+        let missed = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/fragment-basis", format!("{} did not reach the fragment's basis in time", database.name()));
+        if !reached() {
+            // The live index advances before progress publishes the transaction, so
+            // once `await_tx` returns the live index has reached the basis too.
+            let applied = tokio::time::timeout(catch_up, database.replication.await_tx(basis, cancellation));
+            cancellation.run_until_cancelled(applied).await.ok_or_else(cancelled)?.map_err(|_| missed())??;
+            if !reached() { return Err(missed()); }
         }
         let lease = self.catalog_read_lease(&database).await?;
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.tx_id));
