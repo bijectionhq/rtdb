@@ -6,15 +6,22 @@ use rtdb_types::{LogicalType as L, Result, ScalarType};
 
 use crate::{CatalogSnapshot, invalid};
 
+#[cfg(test)]
 pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value], mode: EmissionMode) -> Vec<L> {
-    declared_parameter_types(relation, values.len(), mode).into_iter().zip(values).map(|(declared, value)| {
-        declared.filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).unwrap_or_else(|| value.logical_type())
+    declared_value_types(&declared_parameter_types(relation, values.len(), mode), values)
+}
+
+/// Each value's type: the plan's `declared` parameter type, unless the value is a null that type cannot hold.
+pub(crate) fn declared_value_types(declared: &[Option<L>], values: &[rtdb_types::Value]) -> Vec<L> {
+    declared.iter().zip(values).map(|(declared, value)| {
+        declared.as_ref().filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).cloned().unwrap_or_else(|| value.logical_type())
     }).collect()
 }
 
-pub(crate) fn arrow_parameter_types(relation: &Relation, fields: &[L], mode: EmissionMode) -> Vec<L> {
-    declared_parameter_types(relation, fields.len(), mode).into_iter().zip(fields).map(|(declared, field)| {
-        declared.unwrap_or_else(|| mode.field_type(field))
+/// Each bound field's type: the plan's `declared` parameter type, or the field's own in `mode`.
+pub(crate) fn declared_field_types(declared: &[Option<L>], fields: &[L], mode: EmissionMode) -> Vec<L> {
+    declared.iter().zip(fields).map(|(declared, field)| {
+        declared.clone().unwrap_or_else(|| mode.field_type(field))
     }).collect()
 }
 
@@ -57,13 +64,35 @@ pub(crate) enum EmissionMode { ArrowFields, Execution }
 pub(crate) struct Emissions {
     keeper: Option<Arc<MemoryBudget>>,
     kept: std::sync::RwLock<Vec<(EmissionMode, Vec<L>, Arc<EmittedRelation>)>>,
+    declarations: std::sync::RwLock<Vec<Declarations>>,
 }
+
+struct Declarations { mode: EmissionMode, width: usize, types: Arc<[Option<L>]>, _reservation: Arc<MemoryReservation> }
 
 impl Emissions {
     const MAXIMUM: usize = 4;
 
     /// Emissions kept and charged to `keeper`, or, without one, emitted for each use alone.
-    pub(crate) fn kept_by(keeper: Option<Arc<MemoryBudget>>) -> Self { Self { keeper, kept: Default::default() } }
+    pub(crate) fn kept_by(keeper: Option<Arc<MemoryBudget>>) -> Self { Self { keeper, kept: Default::default(), declarations: Default::default() } }
+
+    /// The parameter types `relation` declares for `width` parameters, kept like its emissions where it has a keeper.
+    pub(crate) fn declared(&self, relation: &Relation, width: usize, mode: EmissionMode) -> Arc<[Option<L>]> {
+        let kept = |declarations: &[Declarations]| declarations.iter()
+            .find(|kept| kept.mode == mode && kept.width == width).map(|kept| Arc::clone(&kept.types));
+        if let Some(types) = kept(&self.declarations.read().unwrap_or_else(std::sync::PoisonError::into_inner)) { return types; }
+        let types: Arc<[Option<L>]> = declared_parameter_types(relation, width, mode).into();
+        let Some(keeper) = &self.keeper else { return types; };
+        let mut declarations = self.declarations.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(raced) = kept(&declarations) { return raced; }
+        if declarations.len() >= Self::MAXIMUM { return types; }
+        let bytes = || -> Result<usize> {
+            let bytes = types.iter().flatten().try_fold(multiply(width, std::mem::size_of::<Option<L>>())?, |bytes, ty| add(bytes, ty.retained_bytes()?))?;
+            add(bytes, 256)
+        };
+        let Ok(reservation) = bytes().and_then(|bytes| keeper.reserve(bytes)) else { return types; };
+        declarations.push(Declarations { mode, width, types: Arc::clone(&types), _reservation: reservation });
+        types
+    }
 
     /// `relation`'s emission, kept where these emissions have a keeper, or emitted in `memory` for this use alone.
     pub(crate) fn emit(&self, relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>,
@@ -604,5 +633,23 @@ mod emission_tests {
         assert!(query.used_bytes() > 0);
         drop(unkept);
         assert_eq!(query.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_plan_keeps_its_declared_parameter_types_charged_to_its_keeper() {
+        let field = Field { id: ColumnId(0), name: "a".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: L::Scalar(ScalarType::U32) };
+        let parameter = Expr::Parameter { index: 0, data_type: L::Scalar(ScalarType::U32) };
+        let relation = Relation::new(Schema::new(vec![field]).unwrap(), RelationNode::Values { rows: vec![vec![parameter]] }).unwrap();
+        let keeper = MemoryBudget::new(1 << 24);
+        let emissions = Emissions::kept_by(Some(Arc::clone(&keeper)));
+        let first = emissions.declared(&relation, 1, EmissionMode::Execution);
+        assert!(Arc::ptr_eq(&first, &emissions.declared(&relation, 1, EmissionMode::Execution)));
+        assert!(keeper.used_bytes() > 0);
+        for (width, mode) in [(1, EmissionMode::Execution), (3, EmissionMode::Execution), (1, EmissionMode::ArrowFields), (0, EmissionMode::Execution),
+            (2, EmissionMode::Execution), (2, EmissionMode::ArrowFields)] {
+            assert_eq!(&*emissions.declared(&relation, width, mode), declared_parameter_types(&relation, width, mode).as_slice());
+        }
+        let unkept = Emissions::kept_by(None);
+        assert!(!Arc::ptr_eq(&unkept.declared(&relation, 1, EmissionMode::Execution), &unkept.declared(&relation, 1, EmissionMode::Execution)));
     }
 }

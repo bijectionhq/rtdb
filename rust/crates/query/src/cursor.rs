@@ -9,7 +9,7 @@ use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::parameters::BoundParameters;
-use crate::runtime_schema::{EmissionMode, Emissions, EmittedRelation, RuntimeSchema, arrow_parameter_types, parameter_types};
+use crate::runtime_schema::{EmissionMode, Emissions, EmittedRelation, RuntimeSchema, declared_field_types, declared_value_types};
 
 /// A row and the lease charging it; a lease may be shared by the rows of one page, so the row records its own size.
 pub(crate) struct OwnedRow { pub values: Vec<Value>, _reservation: Arc<MemoryReservation>, _bytes: usize }
@@ -323,11 +323,11 @@ impl PreparedQuery {
             bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
         })?;
         let temporary = context.memory.reserve(bound)?;
-        let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
+        let schema = self.emit_result_schema(&context, &declared_value_types(&self.declared(parameters.len(), EmissionMode::ArrowFields), &parameters))?;
         parameters.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         let context = self.expose_snapshot_token(context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&parameters))?)?;
         self.open_bound(context, schema, text, batching, move |memory| {
-            let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
+            let types = declared_value_types(&self.declared(parameters.len(), EmissionMode::Execution), &parameters);
             let result = BoundParameters::new(parameters, types, memory);
             drop(temporary);
             result
@@ -341,11 +341,11 @@ impl PreparedQuery {
                 .ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
         })?;
         let temporary = context.memory.reserve(bound)?;
-        let execution_types = arrow_parameter_types(&self.relation, types, EmissionMode::Execution);
+        let execution_types = declared_field_types(&self.declared(types.len(), EmissionMode::Execution), types, EmissionMode::Execution);
         let mut parameters = BoundParameters::from_arrow(batch, row, execution_types, &context.memory)?;
         let context = context.reopen_sql_snapshot(&self.settings, parameters.evaluator()).await?;
         self.check_dependencies(&context)?;
-        let schema = self.emit_result_schema(&context, &arrow_parameter_types(&self.relation, types, EmissionMode::ArrowFields))?;
+        let schema = self.emit_result_schema(&context, &declared_field_types(&self.declared(types.len(), EmissionMode::ArrowFields), types, EmissionMode::ArrowFields))?;
         drop(temporary);
         let context = self.expose_snapshot_token(context.apply_settings(&self.settings, parameters.evaluator())?)?;
         parameters.use_execution_budget(&context.memory);
@@ -369,6 +369,8 @@ impl PreparedQuery {
         }
         Ok(context)
     }
+
+    fn declared(&self, width: usize, mode: EmissionMode) -> Arc<[Option<LogicalType>]> { self.emissions.declared(&self.relation, width, mode) }
 
     fn allocation_bound(&self) -> Result<usize> {
         if let Some(bound) = self.facts.allocation_bound.get() { return Ok(*bound); }
