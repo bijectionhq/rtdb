@@ -14,15 +14,16 @@ fn generation(number: u64) -> Generation {
 
 #[tokio::test]
 async fn custody_values_bind_the_member_and_remain_revoked_after_vault_reopen() {
-    let directory = tempfile::tempdir().unwrap();
-    FileKms::create_directory(directory.path()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let vault_path = root.path().join("vault");
+    FileKms::create_directory(&vault_path).unwrap();
     let incarnation = Uuid::from_u128(19);
     let group = [3; 16];
     let other_group = [4; 16];
     let binding = [5; 32];
     let other_binding = [6; 32];
-    let vault = CustodyVault::new(incarnation, Arc::new(FileKms::open(directory.path(), || 100).unwrap()));
-    let another_incarnation = CustodyVault::new(Uuid::from_u128(20), Arc::new(FileKms::open(directory.path(), || 100).unwrap()));
+    let vault = CustodyVault::new(incarnation, Arc::new(FileKms::open(&vault_path, || 100).unwrap()));
+    let another_incarnation = CustodyVault::new(Uuid::from_u128(20), Arc::new(FileKms::open(&vault_path, || 100).unwrap()));
     vault.create(group).await.unwrap();
     vault.create(other_group).await.unwrap();
     another_incarnation.create(group).await.unwrap();
@@ -37,7 +38,7 @@ async fn custody_values_bind_the_member_and_remain_revoked_after_vault_reopen() 
     vault.destroy(group).await.unwrap();
     drop(vault);
 
-    let reopened = CustodyVault::new(incarnation, Arc::new(FileKms::open(directory.path(), || 101).unwrap()));
+    let reopened = CustodyVault::new(incarnation, Arc::new(FileKms::open(&vault_path, || 101).unwrap()));
     assert_eq!(reopened.check_readable(group).await.unwrap_err(), erased_under_view());
     assert!(reopened.open(group, binding, &original).await.is_err());
     assert!(reopened.open(group, other_binding, &copy).await.is_err());
