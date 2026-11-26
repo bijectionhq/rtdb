@@ -1787,7 +1787,7 @@ async fn nothing_a_deployment_stores_is_readable_at_rest() {
     cell.node(0).agent.park("shop").await.unwrap();
     let data = cell.stop().await;
     let files = files_under(data.path());
-    assert!(files.iter().any(|file| file.to_string_lossy().contains("/blocks/")), "the park flushed a block");
+    assert!(files.iter().any(|file| file.to_string_lossy().contains("/~packs/b")), "the park flushed a block");
     for file in files {
         let bytes = std::fs::read(&file).unwrap();
         assert!(!bytes.windows(21).any(|window| window == b"plaintext-marker-zq81"), "{} holds the row in the clear", file.display());
@@ -2584,8 +2584,10 @@ async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let root = cell.data.path().join("objects");
     let objects: Vec<String> = files_under(&root.join(record.storage_prefix())).into_iter().map(|path| path.to_string_lossy().into_owned()).collect();
     assert_eq!(objects.iter().filter(|path| path.contains("/~packs/")).count(), 1, "{objects:#?}");
-    assert!(!objects.iter().any(|path| path.contains("/blocks/") || path.contains("/l00-")),
-        "block metadata and L0 files belong to the pack: {objects:#?}");
+    let v06 = format!("{}/v06/", record.storage_prefix());
+    assert!(!objects.iter().any(|path| (path.contains("/blocks/") || path.contains("/l00-"))
+            && !path.split_once(&v06).is_some_and(|(_, key)| rtdb_format::keys::is_receipt_l0_file(key))),
+        "block metadata and L0 files other than receipt L0 belong to the pack: {objects:#?}");
     let client = cell.connect("shop").await;
     assert_eq!(values(&client, "SELECT v FROM items").await, ["1"], "a packed block reads back after the park");
     drop(client);
