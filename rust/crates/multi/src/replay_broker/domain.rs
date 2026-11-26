@@ -1135,15 +1135,17 @@ mod tests {
         let mut state = State::new(Uuid::new_v4());
         let parent_key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
         let child_key = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).unwrap();
+        let parent_admission = Ed25519KeyPair::from_seed_unchecked(&[10; 32]).unwrap();
+        let child_admission = Ed25519KeyPair::from_seed_unchecked(&[11; 32]).unwrap();
         let parent = ordered_logkeeper::ordered::Placement {
             deployment: Uuid::new_v4(), incarnation: Uuid::new_v4(), group: Uuid::new_v4(), generation: 1,
         };
         let child = ordered_logkeeper::ordered::Placement { deployment: Uuid::new_v4(), ..parent };
-        for (placement, key) in [(parent, &parent_key), (child, &child_key)] {
+        for (placement, key, admission) in [(parent, &parent_key, &parent_admission), (child, &child_key, &child_admission)] {
             state.apply(&Action::Enroll {
                 generation: 1, root: placement.deployment,
                 enrollment: Root {
-                    history: installed_history(placement).unwrap(), admission_key: key.public_key().as_ref().try_into().unwrap(),
+                    history: installed_history(placement).unwrap(), admission_key: admission.public_key().as_ref().try_into().unwrap(),
                     verification_key: key.public_key().as_ref().try_into().unwrap(),
                 },
             }).unwrap();
@@ -1162,7 +1164,7 @@ mod tests {
         assert!(state.can_start_sql(parent.deployment));
 
         let mut intents = Vec::new();
-        for (placement, key, offset) in [(parent, &parent_key, 21), (child, &child_key, 37)] {
+        for (placement, key, offset) in [(parent, &parent_admission, 21), (child, &child_admission, 37)] {
             let intent = SqlIntent {
                 placement,
                 transaction: rtdb_types::TransactionKey {
