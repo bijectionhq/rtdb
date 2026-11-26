@@ -776,8 +776,8 @@ impl Context<'_> {
         let mut replacements = BTreeMap::new();
         let mut named_groups = Vec::new();
         let groups = groups.into_iter()
-            .map(|group| Ok(ordinal_projection(group, projection)?.or_else(|| alias_projection(group, projection, input.schema())).unwrap_or(group)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|group| alias_projection(group, projection, input.schema()).unwrap_or(group))
+            .collect::<Vec<_>>();
         for (index, &group) in groups.iter().enumerate() {
             let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
             if let Some(existing) = named_groups.iter().find(|named: &&NamedExpr| named.expr == expr) {
@@ -1660,11 +1660,4 @@ fn alias_projection<'a>(expr: &ast::Expr, projection: &'a [ast::SelectItem], inp
         ast::SelectItem::ExprWithAlias { expr, alias } if identifier(alias).normalized() == name.normalized() => Some(expr),
         _ => None,
     })
-}
-
-fn ordinal_projection<'a>(expr: &ast::Expr, projection: &'a [ast::SelectItem]) -> Result<Option<&'a ast::Expr>> {
-    match ordinal(expr)? {
-        Some(index) => match projection.get(index) { Some(ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }) => Ok(Some(expr)), _ => Err(error("GROUP BY position is out of range or names a wildcard")) },
-        None => Ok(None),
-    }
 }

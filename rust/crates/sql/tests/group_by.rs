@@ -64,3 +64,10 @@ async fn arithmetic_and_parentheses_nested_up_to_the_parser_limit_never_overflow
         }
     }
 }
+
+#[tokio::test]
+async fn an_integer_grouping_element_groups_by_the_constant() {
+    assert_eq!(query("SELECT COUNT(*) FROM (VALUES (1, 'a'), (2, 'b')) AS t (x, y) GROUP BY 1").await.unwrap(), [vec![V::I64(2)]]);
+    assert_eq!(query("SELECT 1, COUNT(*) FROM (VALUES (1, 'a'), (2, 'b')) AS t (x, y) GROUP BY 1").await.unwrap(), [vec![V::I64(1), V::I64(2)]]);
+    assert!(query("SELECT t.y, COUNT(*) FROM (VALUES (1, 'a'), (2, 'b')) AS t (x, y) GROUP BY 1").await.is_err());
+}

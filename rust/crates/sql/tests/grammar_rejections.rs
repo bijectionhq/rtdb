@@ -128,3 +128,10 @@ fn hex_quote_literals_are_outside_the_reference_grammar() {
     }
     prepare("SELECT X('00')", &Fixture, &PrepareOptions::default()).unwrap();
 }
+
+#[test]
+fn an_integer_grouping_element_is_a_constant_expression_not_an_output_position() {
+    prepare("SELECT COUNT(*) FROM docs GROUP BY 1", &Fixture, &PrepareOptions::default()).unwrap();
+    let error = rejection("SELECT a, COUNT(*) FROM docs GROUP BY 1");
+    assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"));
+}

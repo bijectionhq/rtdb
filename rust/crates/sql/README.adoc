@@ -155,7 +155,14 @@ Remaining Unsupported sites are native gaps for constructs the grammar admits, s
 The four standard isolation levels are accepted and ignored, as in the reference transaction-characteristics visitor.
 The reference lexer's only binary literal is `X('hex')`; sqlparser's `X'hex'` hexadecimal string is a grammar rejection.
 An odd-length `X('…')` body reports `Cannot parse binary string expr: X('…') - failed with message Odd number of characters.`, the reference planner's text.
+A GROUP BY element is an expression, as in the reference `ExpressionGroupingSet`: `GROUP BY 1` groups by the constant 1, not by the first output column.
 `tests/grammar_rejections.rs` covers a representative of each group.
+
+Some RTDB extensions deliberately accept SQL the reference rejects and are kept:
+
+* typed `CREATE TABLE` column lists (see above);
+* the `RTDB_SEARCH`, `RTDB_NEAREST` and `RTDB_HYBRID` table functions and the full-text, vector and spatial scalars;
+* scalar subqueries in an UPDATE's SET clause, which the reference planner rejects with `Subqueries are not allowed in this context` (see <<_subqueries,Subqueries>>).
 
 == Qualified columns
 
