@@ -87,6 +87,16 @@ impl CatalogLedger {
         result.await.map_err(|_| unavailable("Remote catalog admission ended"))?
     }
 
+    /// Admits another reader of a catalog whose ticket this process holds, as `retain` would admit it, without registering.
+    pub async fn readmit(self: &Arc<Self>, cut: Option<CatalogCut>) -> Result<()> {
+        let (state, _) = self.read().await?;
+        if cut.is_some_and(|cut| !well_formed(cut)) || state.floor.is_some_and(|floor| !cut.is_some_and(|cut| covers(cut, floor))) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
+                "The captured catalog precedes the remote collection floor or belongs to another journal"));
+        }
+        Ok(())
+    }
+
     pub async fn advance(self: &Arc<Self>, cut: CatalogCut, vault: Option<Arc<VaultPath>>) -> Result<bool> {
         Ok(self.close_admission(cut, &[None], vault).await?[0])
     }

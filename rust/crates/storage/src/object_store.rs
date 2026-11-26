@@ -219,12 +219,21 @@ pub trait ObjectStore: Send + Sync {
         -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.retain_catalog(cut).await
     }
+    /// Admits another reader of a catalog whose registration this process holds throughout the call, refusing it exactly
+    /// when a new registration of the same cut, paths and checkpoint would be refused, without registering again.
+    async fn readmit_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+    ) -> rtdb_types::Result<()> {
+        let registration = match (cut, checkpoint, paths) {
+            (Some(cut), Some(base), paths) => self.retain_anchored_catalog(cut, base, paths).await?,
+            (cut, _, Some(paths)) => self.retain_catalog_with_paths(cut, paths).await?,
+            (cut, _, None) => self.retain_catalog(cut).await?,
+        };
+        drop(registration);
+        Ok(())
+    }
     /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
-    /// Whether a catalog registration admitted at one cut also stands for a later cut of the same storage version and
-    /// epochs, file inventory and checkpoint: what it retains covers what the later cut needs, and while it is held the
-    /// store's admission would decide the later cut the same.
-    fn catalog_registration_covers_later_cuts(&self) -> bool { false }
     /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.
     fn releases_receipt_l0(&self) -> bool { false }
     /// Records an installed retirement as a lower bound for new catalog captures.
@@ -869,9 +878,14 @@ impl ObjectStore for LocalStore {
         }).await??)))
     }
 
+    async fn readmit_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, _paths: Option<Arc<[String]>>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+    ) -> rtdb_types::Result<()> {
+        let Some(ledger) = &self.catalog else { return Ok(()); };
+        self.io.read_inline(|| Ok(ledger.readmit(cut)))?
+    }
+
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
-    // A ledger claim retains every cut its own does not cover and every path it lists, which is all a later cut of the same inventory needs.
-    fn catalog_registration_covers_later_cuts(&self) -> bool { true }
     fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {

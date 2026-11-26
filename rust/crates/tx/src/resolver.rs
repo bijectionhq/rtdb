@@ -5100,14 +5100,7 @@ mod tests {
         assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
         assert!(cursor.next_batch().await.unwrap().is_none());
         drop(cursor);
-        // The pool may keep the catalog's registration for its hold-sharing window after the last reader drops.
-        let released = async {
-            while !writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(2), released).await
-            .expect("the catalog floor must advance once the cursor and the pool's sharing window have released the catalog");
+        assert!(writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap());
 
         let request = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &memory).unwrap();
         let error = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), request, &context).await

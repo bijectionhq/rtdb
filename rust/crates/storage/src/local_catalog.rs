@@ -69,13 +69,7 @@ impl LocalCatalogLedger {
     pub(crate) fn retain(&self, cut: Option<CatalogCut>, paths: Option<&[String]>) -> Result<tempfile::NamedTempFile> {
         let _gate = self.lock()?;
         let claim = CatalogHold::new(cut, paths);
-        if cut.is_some_and(|cut| cut.replica_epoch != self.replica_epoch || !well_formed(cut))
-            || self.floor()?.is_some_and(|floor| floor.replica_epoch >= self.replica_epoch
-                && !cut.is_some_and(|cut| covers(cut, floor)))
-        {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
-                "The captured catalog precedes the local collection floor or belongs to another journal"));
-        }
+        self.admit_floor(cut)?;
         if let Some(paths) = &claim.catalog_file_paths {
             for name in paths.iter().filter(|name| terminal_name(name)) {
                 if self.is_terminal(name)? {
@@ -90,6 +84,25 @@ impl LocalCatalogLedger {
         ticket.write_all(&serde_json::to_vec(&claim).map_err(invalid)?)
             .map_err(|error| Error::io(ticket.path(), error))?;
         Ok(ticket)
+    }
+
+    /// Admits another reader of a catalog whose ticket this process holds, as `retain` would admit it.
+    /// The held ticket keeps every path its claim names from turning terminal, so only the floor can have moved since; the
+    /// floor file is replaced by rename, so it reads whole without the gate, and the ticket already orders this read before
+    /// any later floor.
+    pub(crate) fn readmit(&self, cut: Option<CatalogCut>) -> Result<()> {
+        self.admit_floor(cut)
+    }
+
+    fn admit_floor(&self, cut: Option<CatalogCut>) -> Result<()> {
+        if cut.is_some_and(|cut| cut.replica_epoch != self.replica_epoch || !well_formed(cut))
+            || self.floor()?.is_some_and(|floor| floor.replica_epoch >= self.replica_epoch
+                && !cut.is_some_and(|cut| covers(cut, floor)))
+        {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
+                "The captured catalog precedes the local collection floor or belongs to another journal"));
+        }
+        Ok(())
     }
 
     pub(crate) fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {

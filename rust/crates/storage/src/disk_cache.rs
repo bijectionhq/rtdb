@@ -330,6 +330,11 @@ impl ObjectStore for DiskCachedStore {
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.remote.retain_anchored_catalog(cut, checkpoint, paths).await
     }
+    async fn readmit_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>, checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+    ) -> rtdb_types::Result<()> {
+        self.remote.readmit_catalog(cut, paths, checkpoint).await
+    }
     fn defers_trie_releases(&self) -> bool { self.remote.defers_trie_releases() }
     fn releases_receipt_l0(&self) -> bool { self.remote.releases_receipt_l0() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {

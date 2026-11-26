@@ -118,7 +118,7 @@ fn reader_tickets(root: &std::path::Path) -> usize {
 }
 
 #[tokio::test]
-async fn reads_of_one_catalog_share_a_storage_hold_that_lapses_after_its_readers() -> rtdb_types::Result<()> {
+async fn readers_of_one_catalog_version_share_one_registration_released_by_the_last_of_them() -> rtdb_types::Result<()> {
     let location = tempfile::tempdir().unwrap();
     let store: std::sync::Arc<dyn ObjectStore> =
         std::sync::Arc::new(LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
@@ -132,25 +132,64 @@ async fn reads_of_one_catalog_share_a_storage_hold_that_lapses_after_its_readers
     let concurrent = pool.hold_catalog(Some(cut)).await?;
     assert!(std::sync::Arc::ptr_eq(&first, &concurrent));
     assert_eq!(reader_tickets(location.path()), 1);
-    drop((first, concurrent));
+    drop(first);
+    assert_eq!(reader_tickets(location.path()), 1, "a remaining reader keeps the registration");
+    drop(concurrent);
+    assert_eq!(reader_tickets(location.path()), 0, "the last reader releases the registration at once");
 
     let consecutive = pool.hold_catalog(Some(cut)).await?;
-    assert_eq!(reader_tickets(location.path()), 1, "a read right after the last one reuses its hold");
+    assert_eq!(reader_tickets(location.path()), 1);
     let later = pool.hold_catalog(Some(CatalogCut { through: ReplicaPosition(2), ..cut })).await?;
     assert!(!std::sync::Arc::ptr_eq(&consecutive, &later));
-    assert_eq!(later.cut(), Some(CatalogCut { through: ReplicaPosition(2), ..cut }), "a later reader keeps its own cut");
-    assert_eq!(reader_tickets(location.path()), 1, "a later cut of the same catalog shares the local registration");
+    assert_eq!(later.cut(), Some(CatalogCut { through: ReplicaPosition(2), ..cut }));
+    assert_eq!(reader_tickets(location.path()), 2, "another catalog version registers on its own");
     let other_version = pool.hold_catalog(Some(CatalogCut { storage_version: StorageVersion(7), ..cut })).await?;
-    assert_eq!(reader_tickets(location.path()), 2, "another storage version is admitted on its own");
+    assert_eq!(reader_tickets(location.path()), 3);
     drop((consecutive, later, other_version));
-
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(reader_tickets(location.path()), 0, "an idle pool keeps no catalog held");
+    Ok(())
+}
 
-    let long_lived = pool.hold_catalog(Some(cut)).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let arriving = pool.hold_catalog(Some(cut)).await?;
-    assert!(!std::sync::Arc::ptr_eq(&long_lived, &arriving), "a reader after the sharing window is admitted afresh");
-    assert_eq!(reader_tickets(location.path()), 2);
+#[tokio::test]
+async fn a_shared_catalog_hold_blocks_the_floor_until_its_last_reader_and_readmits_each_new_reader() -> rtdb_types::Result<()> {
+    let location = tempfile::tempdir().unwrap();
+    let open = || LocalStore::open(location.path()).unwrap().with_catalog_ledger(StorageEpoch(0));
+    let reader: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(open());
+    let collector = open();
+    let pool = rtdb_storage::cache::BufferPool::new(reader, 1 << 20);
+    let selected = CatalogCut {
+        storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
+        through: ReplicaPosition(1),
+    };
+    let installed = CatalogCut { through: ReplicaPosition(2), ..selected };
+
+    let held = pool.hold_catalog(Some(selected)).await?;
+    assert!(!collector.advance_catalog_floor(installed).await?, "a held catalog blocks the floor");
+    let joined = pool.hold_catalog(Some(selected)).await?;
+    drop(held);
+    assert!(!collector.advance_catalog_floor(installed).await?, "the floor stays blocked while any reader holds the catalog");
+    drop(joined);
+    assert!(collector.advance_catalog_floor(installed).await?, "the floor advances as soon as the last reader drops");
+
+    let current = pool.hold_catalog(Some(installed)).await?;
+    let file = ObjectKey::new("tables/orders/data/l01-rc-b01.arrow")?;
+    collector.put(&file, Bytes::from_static(b"retired data")).await?;
+    let plan = serde_json::to_vec(&RetirementIntent {
+        selected: installed, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b01".into()],
+        files: vec![RetirementFile { key: file.to_string(), version: None, matches_publication: false, terminal_publication: None }],
+        after_reset: None,
+    }).unwrap();
+    let later = CatalogCut { through: ReplicaPosition(3), ..selected };
+    let receipt = ObjectKey::new(format!("{}/installed/{}", journal_directory(installed), intent_digest(&plan)))?;
+    let bytes = Bytes::from([later.through.0.to_be_bytes().as_slice(), &plan].concat());
+    collector.put(&receipt, bytes.clone()).await?;
+    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?, "the held catalog keeps the retired file");
+    assert!(collector.head(&file).await.is_ok());
+    assert_eq!(pool.hold_catalog(Some(installed)).await.err().unwrap().code, "rtdb.storage/catalog-not-current",
+        "a new reader of a held catalog is refused once the floor passes it, as a new registration would be");
+    assert_eq!(reader_tickets(location.path()), 1);
+    drop(current);
+    assert!(collector.release_trie_files(&receipt, bytes).await?);
+    assert!(matches!(collector.head(&file).await, Err(Error::MissingObject(_))));
     Ok(())
 }

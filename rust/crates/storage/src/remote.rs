@@ -235,6 +235,13 @@ impl ObjectStore for RemoteStore {
         ledger.retain(cut, self.classic_versions.as_ref().map(|_| paths), &self.io).await.map(Some)
     }
 
+    async fn readmit_catalog(
+        &self, cut: Option<rtdb_types::CatalogCut>, _paths: Option<Arc<[String]>>, _checkpoint: Option<rtdb_types::CatalogCheckpoint>,
+    ) -> rtdb_types::Result<()> {
+        let Some(ledger) = &self.catalog else { return Ok(()); };
+        ledger.readmit(cut).await
+    }
+
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
