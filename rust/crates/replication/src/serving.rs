@@ -32,13 +32,13 @@ pub(crate) use source::SourceRequest;
 
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_CHANGE_GROUPS: usize = 4096;
-const FRAME_VERSION: u8 = 2;
+pub(crate) const FRAME_VERSION: u8 = 2;
 pub(crate) const SHARED_CHECKPOINT: u8 = b'S';
-const SOURCE_DECISION_FRAME: u8 = 3;
-const SOURCE_REPLY_FRAME: u8 = 4;
-const SHARED_DECISION_FRAME: u8 = 5;
-const FUNDED_DECISION_FRAME: u8 = 6;
-const SHARED_FUNDED_DECISION_FRAME: u8 = 7;
+pub(crate) const SOURCE_DECISION_FRAME: u8 = 3;
+pub(crate) const SOURCE_REPLY_FRAME: u8 = 4;
+pub(crate) const SHARED_DECISION_FRAME: u8 = 5;
+pub(crate) const FUNDED_DECISION_FRAME: u8 = 10;
+pub(crate) const SHARED_FUNDED_DECISION_FRAME: u8 = 11;
 const SOURCE_DECISION_HEADER_BYTES: usize = FRAME_HEADER_BYTES + 8;
 const MAX_SOURCE_REPLIES: usize = 4096;
 const FRAME_HEADER_BYTES: usize = 9;
@@ -1182,6 +1182,16 @@ mod tests {
     use super::*;
 
     const INCARNATION: [u8; 16] = [7; 16];
+
+    #[test]
+    fn serving_record_frames_have_distinct_tags() {
+        let tags = [
+            1, FRAME_VERSION, SOURCE_DECISION_FRAME, SOURCE_REPLY_FRAME, SHARED_DECISION_FRAME, FUNDED_DECISION_FRAME,
+            SHARED_FUNDED_DECISION_FRAME, crate::checkpoint_admin::PIN_FRAME, crate::checkpoint_admin::RELEASE_FRAME,
+            crate::default_erasure::RETIREMENT_FRAME, crate::default_erasure::COMPLETED_FRAME,
+        ];
+        assert_eq!(tags.iter().collect::<std::collections::BTreeSet<_>>().len(), tags.len(), "{tags:?}");
+    }
 
     fn authority() -> NativeServingAuthority {
         NativeServingAuthority { incarnation: INCARNATION, checkpoints: None }

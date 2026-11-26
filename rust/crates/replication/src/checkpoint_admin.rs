@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::{BlockDiscovery, BlockStore, NativeServingAuthority, NativeServingHandle, PublishedCheckpoint, checkpoint_dependencies, serving::decode_checkpoint_image};
 
-const PIN_FRAME: u8 = 7;
-const RELEASE_FRAME: u8 = 8;
+pub(crate) const PIN_FRAME: u8 = 7;
+pub(crate) const RELEASE_FRAME: u8 = 8;
 const MAX_RECEIPT: usize = 2 << 10;
 const MAX_MANIFEST: usize = 4 << 20;
 const COPY_PAGE: u64 = 256 << 10;

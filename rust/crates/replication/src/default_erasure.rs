@@ -25,6 +25,8 @@ mod inventory;
 mod local_read;
 pub use local_read::{LocalDefaultErasureReadFence, LocalErasureRead};
 mod terminal;
+#[cfg(test)]
+pub(crate) use terminal::COMPLETED_FRAME;
 
 pub(crate) use terminal::ErasureCompleted;
 pub use terminal::{DefaultErasureReadCut, DefaultErasureReadFence};
@@ -32,7 +34,7 @@ pub use terminal::{DefaultErasureReadCut, DefaultErasureReadFence};
 use inventory::RetirementInventory;
 
 const REWRITE_IMAGE: u8 = b'E';
-const RETIREMENT_FRAME: u8 = 6;
+pub(crate) const RETIREMENT_FRAME: u8 = 6;
 const MAX_CONTROL_BYTES: usize = 2048;
 
 #[derive(Clone)]
