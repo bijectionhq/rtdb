@@ -15,20 +15,20 @@ use crate::config::{NodeConfiguration, RemoteConfig};
 /// - Errors: credential resolution and local disk-cache initialization can fail with a provider or configuration anomaly.
 pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBudget>, metrics: &Arc<Registry>) -> Result<(NativeResources, ExternalSources, Vec<rtdb_metrics::MetricRegistration>)> {
     let mut resources = NativeResources::default().with_local_log_clock(Arc::new(rtdb_node::SystemClock), config.local_log_uses_clock);
-    let classic_vault = std::env::var_os("RTDB_CLASSIC_KEY_VAULT")
-        .map(|path| rtdb_storage::sealing::ClassicKeyVault::open(std::path::Path::new(&path))).transpose()?;
+    let classic_vault = config.key_vaults.classic.as_deref()
+        .map(rtdb_storage::sealing::ClassicKeyVault::open).transpose()?;
     if let Some(vault) = &classic_vault {
         resources = resources.with_classic_key_vault(vault.clone());
     }
-    let token_vault = std::env::var_os("RTDB_V1_TOKEN_KEY_VAULT").map(std::path::PathBuf::from);
-    if let Some(path) = &token_vault {
+    let token_vault = config.key_vaults.v1_token.as_deref();
+    if let Some(path) = token_vault {
         use rtdb_node::Clock;
         let kms = rtdb_crypt::FileKms::open(path, || rtdb_node::SystemClock.now().0)?;
         resources = resources.with_token_kms(Arc::new(kms));
     }
     let local_erasure = config.default_v1_serving && config.default_erasure.local;
     let kafka_erasure = config.default_erasure.kafka;
-    let checkpoint_vault = std::env::var_os("RTDB_V1_CHECKPOINT_KEY_VAULT").map(std::path::PathBuf::from);
+    let checkpoint_vault = config.key_vaults.v1_checkpoint.as_deref();
     if kafka_erasure && (!cfg!(feature = "kafka") || !config.default_v1_serving || classic_vault.is_none() || checkpoint_vault.is_none()) {
         return Err(rtdb_types::Anomaly::incorrect("rtdb.server/kafka-erasure",
             "defaultKafkaErasure requires native Kafka, defaultV1Serving and both original key vaults"));
@@ -36,15 +36,15 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
     if let Some(path) = checkpoint_vault {
         use rtdb_node::Clock;
         if let Some(classic) = &classic_vault {
-            classic.require_separate_path(&path)?;
+            classic.require_separate_path(path)?;
         }
-        if let Some(token) = &token_vault {
+        if let Some(token) = token_vault {
             let canonical = |path: &std::path::Path| {
                 path.canonicalize().map_err(|error|
                     rtdb_types::Anomaly::incorrect("rtdb.server/key-vault", error.to_string()))
             };
             let token = canonical(token)?;
-            let checkpoint = canonical(&path)?;
+            let checkpoint = canonical(path)?;
             if token.starts_with(&checkpoint) || checkpoint.starts_with(&token) {
                 return Err(rtdb_types::Anomaly::incorrect(
                     "rtdb.server/key-vault",
@@ -52,7 +52,7 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
                 ));
             }
         }
-        let kms = rtdb_crypt::FileKms::open(&path, || rtdb_node::SystemClock.now().0)?;
+        let kms = rtdb_crypt::FileKms::open(path, || rtdb_node::SystemClock.now().0)?;
         resources = if local_erasure || kafka_erasure {
             resources.with_default_erasure_checkpoint_kms(kms, local_erasure, kafka_erasure)
         } else {

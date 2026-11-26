@@ -486,6 +486,11 @@ fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
     assert_eq!(request.base.sha256, [0xa1; 32]);
     assert_eq!(memory_bytes, 104857600);
     assert!(reclaim_receipts);
+    assert_eq!(request.classic_key_vault, None);
+    let environment = |name: &str| (name == "RTDB_CLASSIC_KEY_VAULT").then(|| "/vaults/classic".to_owned());
+    let Command::RetainRepairBase { request, .. } = cli::parse(["retain-repair-base", "source", "logs/REPLICA_LOG", "export", &base].map(str::to_owned), &environment).unwrap()
+    else { panic!("expected repair base retention") };
+    assert_eq!(request.classic_key_vault.as_deref(), Some(std::path::Path::new("/vaults/classic")));
     assert!(cli::parse(["retain-repair-base", "source", "logs/REPLICA_LOG", &base].map(str::to_owned), &|_| None).is_err());
 }
 

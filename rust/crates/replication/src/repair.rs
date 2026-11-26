@@ -75,6 +75,8 @@ pub struct RetainRepairBase {
     pub base_storage: PathBuf,
     pub replica_log: PathBuf,
     pub base: RepairCheckpoint,
+    /// The classic key vault that opens a sealed source, which the startup settings name.
+    pub classic_key_vault: Option<PathBuf>,
 }
 
 impl RetainRepairBase {
@@ -89,8 +91,7 @@ impl RetainRepairBase {
 
     async fn install_with_retention(&self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken, reclaim: bool) -> Result<ReplicaPosition> {
         cancelled(cancellation)?;
-        let vault = std::env::var_os("RTDB_CLASSIC_KEY_VAULT")
-            .map(|path| ClassicKeyVault::open(Path::new(&path))).transpose()?;
+        let vault = self.classic_key_vault.as_deref().map(ClassicKeyVault::open).transpose()?;
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
         let source_root = fs::canonicalize(self.source_storage.join(&root)).map_err(io)?;
         let base_root = fs::canonicalize(self.base_storage.join(&root)).map_err(io)?;

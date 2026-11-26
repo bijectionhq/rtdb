@@ -1,6 +1,6 @@
 use std::time::Duration;
 use rtdb_auth::{AuthConfig, Method};
-use rtdb_server::config::{NodeConfiguration, RemoteConfig, host_timezone_from, parse_duration};
+use rtdb_server::config::{KeyVaultSettings, NodeConfiguration, RemoteConfig, host_timezone_from, parse_duration};
 
 fn decode(yaml: &str) -> rtdb_types::Result<NodeConfiguration> { NodeConfiguration::from_yaml_with_environment(yaml, &|_| None, false) }
 
@@ -435,6 +435,31 @@ fn configured_kafka_erasure_reaches_backend_resource_validation() {
         Err(error) => assert_eq!(error.code, "rtdb.server/kafka-erasure"),
         Ok(_) => panic!("Kafka erasure without its key vaults opened"),
     }
+}
+
+#[test]
+fn key_vaults_are_captured_from_the_startup_environment() {
+    let environment = |name: &str| match name {
+        "RTDB_CLASSIC_KEY_VAULT" => Some("/vaults/classic".into()),
+        "RTDB_V1_TOKEN_KEY_VAULT" => Some("/vaults/token".into()),
+        "RTDB_V1_CHECKPOINT_KEY_VAULT" => Some("/vaults/checkpoint".into()),
+        _ => None,
+    };
+    let expected = KeyVaultSettings { classic: Some("/vaults/classic".into()), v1_token: Some("/vaults/token".into()), v1_checkpoint: Some("/vaults/checkpoint".into()) };
+    for ingest in [false, true] {
+        assert_eq!(NodeConfiguration::from_yaml_with_environment("", &environment, ingest).unwrap().key_vaults, expected);
+    }
+    assert_eq!(decode("").unwrap().key_vaults, KeyVaultSettings::default());
+}
+
+#[test]
+fn backend_resources_open_the_configured_classic_key_vault() {
+    let missing = tempfile::tempdir().unwrap().path().join("classic-vault");
+    let environment = |name: &str| (name == "RTDB_CLASSIC_KEY_VAULT").then(|| missing.to_str().unwrap().to_owned());
+    let config = NodeConfiguration::from_yaml_with_environment("server: null\nflightSql: null", &environment, false).unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(64 << 20);
+    let metrics = rtdb_metrics::Registry::new("fixture", std::sync::Arc::clone(&memory)).unwrap();
+    assert!(rtdb_server::open_backend_resources(&config, &memory, &metrics).is_err(), "a missing configured vault opened");
 }
 
 #[test]

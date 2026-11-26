@@ -2560,7 +2560,7 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     let trusted_base = export("base").await;
     let mut hold = RetainRepairBase {
         source_storage: source_storage.clone(), replica_log: replica_log.clone(),
-        base_storage: trusted_base.clone(), base: receipt(&base),
+        base_storage: trusted_base.clone(), base: receipt(&base), classic_key_vault: None,
     };
     hold.base.sha256[0] ^= 1;
     assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap_err().code, "rtdb.repair/invalid-checkpoint");
@@ -2723,6 +2723,7 @@ async fn retained_reset_recovers_compacted_base_and_missing_l0_suffix_in_place()
         source_storage: storage, replica_log: journal.join("REPLICA_LOG"),
         base_storage: detached.clone(),
         base: RepairCheckpoint { block: base.block_index(), sha256: base.publication_sha256().unwrap() },
+        classic_key_vault: None,
     }.install(rtdb_columnar::MemoryBudget::new(512 << 20), &cancel).await.unwrap();
 
     let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;

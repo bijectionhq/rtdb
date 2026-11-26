@@ -141,6 +141,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                 .map_err(|_| invalid("retain-repair-base requires storage, a replica log, an exported store, and one checkpoint receipt"))?;
             let request = rtdb_node::RetainRepairBase {
                 source_storage: source.into(), replica_log: replica.into(), base_storage: exported.into(), base: repair_checkpoint(&base)?,
+                classic_key_vault: environment("RTDB_CLASSIC_KEY_VAULT").map(PathBuf::from),
             };
             return Ok(Command::RetainRepairBase { request, memory_bytes, reclaim_receipts });
         }

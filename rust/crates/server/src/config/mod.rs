@@ -68,6 +68,22 @@ pub struct DefaultErasureSettings {
     /// Enrols a fresh Default primary with Kafka logs and a Local object store; requires native Kafka and `defaultV1Serving`.
     pub kafka: bool,
 }
+/// The original key vaults, captured from the startup environment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyVaultSettings {
+    /// `RTDB_CLASSIC_KEY_VAULT`: seals classic logs and objects.
+    pub classic: Option<PathBuf>,
+    /// `RTDB_V1_TOKEN_KEY_VAULT`: generates v1 serving tokens.
+    pub v1_token: Option<PathBuf>,
+    /// `RTDB_V1_CHECKPOINT_KEY_VAULT`: generates v1 checkpoint keys.
+    pub v1_checkpoint: Option<PathBuf>,
+}
+impl KeyVaultSettings {
+    fn decode(environment: &impl Fn(&str) -> Option<String>) -> Self {
+        let path = |name: &str| environment(name).map(PathBuf::from);
+        Self { classic: path("RTDB_CLASSIC_KEY_VAULT"), v1_token: path("RTDB_V1_TOKEN_KEY_VAULT"), v1_checkpoint: path("RTDB_V1_CHECKPOINT_KEY_VAULT") }
+    }
+}
 #[derive(Clone, Debug)]
 pub enum ModuleSettings { CloudWatch { namespace: String }, AzureMonitor { connection_string: Secret } }
 
@@ -101,6 +117,7 @@ pub struct NodeConfiguration {
     pub read_only_databases: bool,
     pub default_v1_serving: bool,
     pub default_erasure: DefaultErasureSettings,
+    pub key_vaults: KeyVaultSettings,
     pub ordered_index_arrow_references: bool,
     pub ordered_index_arrow_references_on_private_storage: bool,
     pub skipped_databases: BTreeSet<String>,
@@ -164,6 +181,7 @@ impl NodeConfiguration {
             .transpose()?.unwrap_or(100_000);
         let query_spill_limit_bytes = query_spill_limit(fields.take("query"), environment)?;
         let host_timezone = host_zone::host_timezone(environment)?;
+        let key_vaults = KeyVaultSettings::decode(environment);
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
         let default_erasure = DefaultErasureSettings {
             local: erasure_flag(&mut fields, "defaultLocalErasure", "RTDB_DEFAULT_LOCAL_ERASURE", environment)?,
@@ -184,7 +202,7 @@ impl NodeConfiguration {
                 default_checkpoint_restore_directory: None,
                 health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, host_timezone, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, default_erasure, key_vaults, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -221,7 +239,7 @@ impl NodeConfiguration {
                 deployment_admin,
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory,
-                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, host_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, host_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, default_erasure, key_vaults, query_spill_limit_bytes, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)
