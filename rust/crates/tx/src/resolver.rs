@@ -4142,11 +4142,13 @@ fn admit_sql_syntax(sql: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryR
 #[derive(Clone)]
 struct PlannedMutation { options: rtdb_sql::PrepareOptions, lookups: rtdb_plan::CatalogLookups, reads: bool, mutation: rtdb_sql::Mutation, query: Option<PreparedQuery> }
 
-/// Whether a mutation's input may read a table: anything but literal rows and the expressions over them may.
+/// Whether a mutation's input may read the transaction's own writes: anything but literal rows and the expressions over
+/// them may, and so may an expression that resolves a relation through the catalog.
 fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
     fn reads(relation: &rtdb_plan::Relation) -> bool {
         use rtdb_plan::RelationNode as N;
         !matches!(relation.node(), N::Values { .. } | N::LiteralPages { .. } | N::ArrowLiteralPages { .. } | N::Project { .. } | N::Extend { .. } | N::Rename { .. } | N::Filter { .. })
+            || relation.expressions().into_iter().any(rtdb_expr::requires_pg_catalog)
             || relation.children().into_iter().any(|child| reads(child))
     }
     match mutation {

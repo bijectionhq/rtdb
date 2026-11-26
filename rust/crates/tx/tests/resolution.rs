@@ -549,6 +549,24 @@ async fn arrow_replay_insert_batches_keep_replica_bytes_and_first_failure() {
 }
 
 #[tokio::test]
+async fn later_argument_rows_resolve_relation_names_against_the_transactions_own_tables() {
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let rows = vec![vec![Value::I64(1)], vec![Value::I64(2)], vec![Value::I64(3)]];
+    let insert = TxOp::Sql {
+        sql: "INSERT INTO docs (_id, made) VALUES (?, 'made_here'::regclass)".into(),
+        args: Some(SqlArguments::from_rows(rows, &context.memory).unwrap()),
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), request(vec![
+        sql("INSERT INTO made_here (_id) VALUES (1)"),
+        insert,
+        sql("ASSERT (SELECT COUNT(*) FROM docs WHERE made = 'made_here'::regclass) = 3"),
+    ], &context), &context).await.unwrap();
+    assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+}
+
+#[tokio::test]
 async fn arrow_replay_dynamic_insert_batches_independent_bindings_without_changing_replica_bytes() {
     use rtdb_format::{envelope::SourceMessage, ipc::write_stream};
 
