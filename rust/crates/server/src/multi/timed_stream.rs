@@ -49,8 +49,18 @@ pub(super) async fn connect(
     credentials: &Credentials,
     deadline: Duration,
 ) -> io::Result<StreamJournal> {
-    let Some(path) = std::env::var_os("RTDB_TIMED_ORIGINAL_TRUST_FILE") else {
+    let Some((trust, maximum_payload_bytes)) = installed_trust()? else {
         return StreamJournal::connect(url, credentials, deadline).await;
+    };
+    StreamJournal::connect_with_timed_original(url, credentials, deadline, trust, maximum_payload_bytes)
+        .await
+}
+
+/// The keeper trust in `RTDB_TIMED_ORIGINAL_TRUST_FILE`, shared by the stream
+/// Writer and consensus journals, with the optional timed payload limit.
+pub(super) fn installed_trust() -> io::Result<Option<(Arc<dyn TimedOriginalVerifier>, Option<usize>)>> {
+    let Some(path) = std::env::var_os("RTDB_TIMED_ORIGINAL_TRUST_FILE") else {
+        return Ok(None);
     };
     let path = Path::new(&path);
     if !path.is_absolute() {
@@ -80,14 +90,7 @@ pub(super) async fn connect(
     if keys.len() < 2 || config.maximum_payload_bytes == Some(0) {
         return Err(invalid_trust());
     }
-    StreamJournal::connect_with_timed_original(
-        url,
-        credentials,
-        deadline,
-        Arc::new(Trust(keys)),
-        config.maximum_payload_bytes,
-    )
-    .await
+    Ok(Some((Arc::new(Trust(keys)), config.maximum_payload_bytes)))
 }
 
 fn invalid_trust() -> io::Error {

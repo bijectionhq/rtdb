@@ -177,16 +177,16 @@ impl MultiRuntime {
             return Err(invalid("Multi development data belongs to another incarnation"));
         }
         let journal_path = path.join("journal");
-        let (journal, batch, writer_lock): (Arc<dyn Journal>, Option<Arc<dyn JournalBatchAppender>>, _) =
+        let (journal, batch, writer_lock, placement): (Arc<dyn Journal>, Option<Arc<dyn JournalBatchAppender>>, _, _) =
             match stream_journal {
                 Some(stream) => {
-                    let ((journal, batch), lock) = stream.open(&journal_path).await?;
-                    (journal, Some(batch), Some(lock))
+                    let (backend, lock) = stream.open(&journal_path).await?;
+                    (backend.journal, Some(backend.batch), Some(lock), backend.placement)
                 }
                 None => {
                     let journal = FileJournal::open(journal_path, Limits::default()).map_err(io_error)?;
                     let identity = Identity::from(format!("urn:rtdb:dev:{}", Uuid::new_v4()));
-                    (Arc::new(journal.handle(identity)), None, None)
+                    (Arc::new(journal.handle(identity)), None, None, None)
                 }
             };
         let io = IoRegion::new();
@@ -204,6 +204,7 @@ impl MultiRuntime {
         let backends = Backends {
             journal,
             batch,
+            placement,
             store,
             io,
             vault,
@@ -313,7 +314,7 @@ impl MultiRuntime {
                 &format!("RTDB_JOURNAL_{slot}_CA_CERTIFICATE"),
             )?,
         };
-        let (journal, batch) = connect_stream_journal(&journal_url, &credentials).await?;
+        let JournalBackend { journal, batch, placement } = connect_stream_journal(&journal_url, &credentials).await?;
         let io = IoRegion::new();
         let store = s3
             .open(
@@ -324,6 +325,7 @@ impl MultiRuntime {
             .await?;
         let backends = Backends {
             batch: follower.is_none().then_some(batch),
+            placement,
             journal,
             store,
             io,
@@ -967,6 +969,7 @@ impl MultiRuntime {
 
     async fn drive_databases(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
         let maintenance = stop.child_token();
+        let mut placement_due: Option<std::time::Instant> = None;
         let result = tokio::try_join!(
             async {
                 let result = drive_multi(stop, async || self.tick(node).await).await;
@@ -976,7 +979,19 @@ impl MultiRuntime {
             drive_multi(&maintenance, async || {
                 let databases = self.databases.read().expect("Multi serving catalog")
                     .values().cloned().collect::<Vec<_>>();
+                if let Some(placement) = &self.backends.placement
+                    && placement_due.is_none_or(|due| std::time::Instant::now() >= due)
+                {
+                    placement_due = Some(std::time::Instant::now() + PLACEMENT_INTERVAL);
+                    reconcile_placement(placement, &databases).await;
+                }
                 for driver in databases {
+                    match driver.maintain_journal_bound().await {
+                        Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
+                            eprintln!("Multi journal checkpoint deferred: {error}");
+                        }
+                        _ => (),
+                    }
                     match driver.maintain_ranked_catalog(&maintenance).await {
                         Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
                             eprintln!("Multi ranked catalogue publication deferred: {error}");
@@ -1193,6 +1208,7 @@ impl MultiRuntime {
 struct Backends {
     journal: Arc<dyn Journal>,
     batch: Option<Arc<dyn JournalBatchAppender>>,
+    placement: Option<PlacementSource>,
     store: Arc<dyn ObjectStore>,
     io: Arc<IoRegion>,
     vault: PathBuf,
@@ -1293,6 +1309,28 @@ async fn open_database(
         Err(error) => return Err(Anomaly::fault("rtdb/multi-open", error.to_string())),
     }
     Ok(database)
+}
+
+/// Re-reads the consensus journal configuration and moves each written
+/// stream one voter toward its placement.
+async fn reconcile_placement(placement: &PlacementSource, databases: &[Arc<MultiServing>]) {
+    match JournalConfig::read(&placement.config).and_then(|config| placement.journal.update_placement(&config)) {
+        Ok(()) => (),
+        Err(error) => {
+            eprintln!("Multi journal placement deferred: {error}");
+            return;
+        }
+    }
+    for driver in databases {
+        let Some(stream) = driver.written_stream().await.map(StreamId) else { continue };
+        match placement.journal.reconcile_placement(stream).await {
+            Ok(Some(configuration)) => eprintln!(
+                "Multi journal placement moved stream {:032x} to revision {}", stream.0, configuration.revision,
+            ),
+            Ok(None) => (),
+            Err(error) => eprintln!("Multi journal placement deferred: {error}"),
+        }
+    }
 }
 
 async fn drive_multi(
@@ -1401,7 +1439,21 @@ fn retryable(error: &Anomaly) -> bool {
         )
 }
 
-type JournalBackend = (Arc<dyn Journal>, Arc<dyn JournalBatchAppender>);
+struct JournalBackend {
+    journal: Arc<dyn Journal>,
+    batch: Arc<dyn JournalBatchAppender>,
+    placement: Option<PlacementSource>,
+}
+
+/// A consensus journal whose eligible keepers and draining list come from
+/// its configuration file. The writer re-reads it and moves its streams.
+#[derive(Clone)]
+struct PlacementSource {
+    journal: Arc<ConsensusJournal>,
+    config: PathBuf,
+}
+
+const PLACEMENT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Opens the Logkeeper journal named by `url`. A `logkeeper-consensus://`
 /// URL selects keeper-hosted consensus streams. Any other URL opens the
@@ -1409,15 +1461,24 @@ type JournalBackend = (Arc<dyn Journal>, Arc<dyn JournalBatchAppender>);
 async fn connect_stream_journal(url: &str, credentials: &Credentials) -> Result<JournalBackend> {
     let unavailable = |error: io::Error| Anomaly::new(AnomalyCategory::Unavailable, "rtdb/journal-connect", error.to_string());
     if let Some(journal) = rtdb_stream_journal::connect_consensus(url, credentials) {
-        let journal = Arc::new(journal.map_err(unavailable)?);
-        return Ok((journal.clone(), Arc::new(ConsensusJournalBatch(journal))));
+        let mut journal = journal.map_err(unavailable)?;
+        if let Some((trust, maximum_payload_bytes)) = timed_stream::installed_trust().map_err(unavailable)? {
+            journal = journal.with_timed_original(trust, maximum_payload_bytes);
+        }
+        let journal = Arc::new(journal);
+        let config = PathBuf::from(url.strip_prefix(CONSENSUS_SCHEME).expect("consensus URL"));
+        return Ok(JournalBackend {
+            journal: journal.clone(),
+            batch: Arc::new(ConsensusJournalBatch(journal.clone())),
+            placement: Some(PlacementSource { journal, config }),
+        });
     }
     let journal = Arc::new(timed_stream::connect(url, credentials, Duration::from_secs(5)).await.map_err(unavailable)?);
-    Ok((journal.clone(), Arc::new(StreamJournalBatch(journal))))
+    Ok(JournalBackend { journal: journal.clone(), batch: Arc::new(StreamJournalBatch(journal)), placement: None })
 }
 
-/// Consensus streams commit a group one record at a time and have no timed
-/// original proofs, so funded appends stay unsupported on this journal.
+/// Consensus streams commit groups as keeper batches. With installed keeper
+/// trust they also prove timed originals for funded appends.
 struct ConsensusJournalBatch(Arc<ConsensusJournal>);
 
 impl JournalBatchAppender for ConsensusJournalBatch {
@@ -1428,6 +1489,28 @@ impl JournalBatchAppender for ConsensusJournalBatch {
         records: Vec<(journal_contract::Lsn, bytes::Bytes)>,
     ) -> journal_contract::BoxFuture<'_, journal_contract::Result<journal_contract::Lsn>> {
         Box::pin(self.0.append_batch(stream, epoch, records))
+    }
+
+    fn maximum_timed_original_bytes(&self) -> Option<usize> {
+        self.0.maximum_timed_original_bytes()
+    }
+
+    fn append_timed_original(
+        &self, original: rtdb_db::TimedOriginal, payload: bytes::Bytes,
+    ) -> journal_contract::BoxFuture<'_, journal_contract::Result<rtdb_db::TimedOriginalProof>> {
+        Box::pin(async move {
+            let proof = self.0.append_timed_original(timed_stream::request(original), payload).await?;
+            timed_stream::proof(original, proof)
+        })
+    }
+
+    fn prove_timed_original(
+        &self, original: rtdb_db::TimedOriginal,
+    ) -> journal_contract::BoxFuture<'_, journal_contract::Result<rtdb_db::TimedOriginalProof>> {
+        Box::pin(async move {
+            let proof = self.0.prove_timed_original(timed_stream::request(original)).await?;
+            timed_stream::proof(original, proof)
+        })
     }
 }
 
@@ -1822,6 +1905,7 @@ mod tests {
         let backends = Backends {
             journal: Arc::new(journal.handle(Identity::from_static("urn:rtdb:test:follower"))),
             batch: None,
+            placement: None,
             store: Arc::new(LocalStore::open_in(data.path().join("objects"), io.clone()).unwrap()),
             io,
             vault,
@@ -1930,6 +2014,151 @@ mod tests {
                 }
             }
         }
+        keepers.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn consensus_batch_proves_funded_timed_originals() {
+        use sha2::Digest as _;
+        use stream_logkeeper::stream::consensus::testing::LocalCluster;
+
+        const PRINCIPAL: &str = "urn:logkeeper:client:rtdb-funded";
+        let mut keepers = LocalCluster::start_timed(&[PRINCIPAL]).await.unwrap();
+        let journal = keepers
+            .journal(PRINCIPAL, &keepers.journal_config(1 << 20, 4096))
+            .unwrap()
+            .with_timed_original(keepers.timed_verifier(), Some(2048));
+        let journal = Arc::new(journal);
+        let batch = ConsensusJournalBatch(journal.clone());
+        assert_eq!(batch.maximum_timed_original_bytes(), Some(2048));
+        let stream = StreamId(91);
+        journal.create(stream).await.unwrap();
+        journal.seal(stream, journal_contract::Epoch(1)).await.unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+        let payload = bytes::Bytes::from_static(b"funded original");
+        let original = rtdb_db::TimedOriginal {
+            stream,
+            epoch: journal_contract::Epoch(1),
+            at: journal_contract::Lsn(1),
+            payload_sha256: sha2::Sha256::digest(&payload).into(),
+            cutoff: rtdb_types::TimedJournalCutoff::new(rtdb_types::Timestamp(now + 60_000_000), [9; 32]).unwrap(),
+        };
+        let proof = batch.append_timed_original(original, payload.clone()).await.unwrap();
+        assert_eq!(proof.original, original);
+        assert!(0 < proof.quorum_sync_at.0 && proof.quorum_sync_at < original.cutoff.before());
+        assert_ne!(proof.evidence_sha256, [0; 32]);
+        // An identical retry and a reopened proof return the same evidence.
+        assert_eq!(batch.append_timed_original(original, payload.clone()).await.unwrap(), proof);
+        assert_eq!(batch.prove_timed_original(original).await.unwrap(), proof);
+        // Readers see only the payload.
+        let page = journal.read(stream, journal_contract::Lsn(1), 4, Duration::ZERO).await.unwrap();
+        assert_eq!(page.records, vec![(journal_contract::Lsn(1), payload)]);
+        // Without keeper trust a consensus journal has no timed capacity.
+        let plain = keepers.journal(PRINCIPAL, &keepers.journal_config(1 << 20, 4096)).unwrap();
+        assert_eq!(ConsensusJournalBatch(Arc::new(plain)).maximum_timed_original_bytes(), None);
+        keepers.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn multi_dev_moves_its_stream_off_a_draining_keeper() {
+        std::thread::Builder::new()
+            .stack_size(rtdb_node::WORKER_STACK_BYTES)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(draining_development_writer());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The development writer places its stream over four keepers, then
+    /// moves it off a keeper that its configuration marks as draining.
+    async fn draining_development_writer() {
+        use stream_logkeeper::stream::consensus::testing::LocalCluster;
+
+        const PRINCIPAL: &str = "urn:logkeeper:client:rtdb-dev";
+        let mut keepers = LocalCluster::start(&[PRINCIPAL]).await.unwrap();
+        let config_file = tempfile::tempdir().unwrap();
+        let path = config_file.path().join("journal.json");
+        let mut placement = keepers.placement_config(8 << 30, 4 << 20);
+        let write = |config: &stream_logkeeper::stream::consensus::JournalConfig| {
+            fs::write(&path, serde_json::to_vec(&serde_json::json!({
+                "keepers": config.keepers,
+                "catalog": config.catalog,
+                "placement": config.placement,
+                "draining": config.draining,
+                "quota_bytes": config.quota_bytes,
+                "max_record_bytes": config.max_record_bytes,
+            })).unwrap()).unwrap();
+        };
+        write(&placement);
+        let url = format!("{CONSENSUS_SCHEME}{}", path.display());
+        let credentials = keepers.credentials(PRINCIPAL).unwrap();
+        let observer = keepers.journal(PRINCIPAL, &placement).unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let limit = 256 << 20;
+        let incarnation = Uuid::from_u128(7);
+        let stream = StreamId(incarnation.as_u128());
+        let mut config = NodeConfiguration::from_yaml_with_environment("", &|_| None, false).unwrap();
+        config.flight_sql = None;
+        let memory = MemoryBudget::new(config.node_options(limit).unwrap().execution_memory_bytes);
+        let journal = DevelopmentStreamJournal::new(&url, credentials).unwrap();
+        let runtime = MultiRuntime::development_with_incarnation(
+            data.path(), &mut config, memory.clone(), Some(incarnation), Some(journal),
+        ).await.unwrap();
+        let (handle, driver) = crate::ServerDriver::open_with_multi(config, limit, memory, &runtime).await.unwrap();
+        let server = tokio::spawn(driver.run());
+        let stop = CancellationToken::new();
+        let scenario = async {
+            runtime.await_development_writer(handle.node(), incarnation).await.unwrap();
+
+            let before = observer.client().configuration(stream).await.unwrap();
+            let drained = before.voters[0];
+            placement.draining.insert(drained);
+            write(&placement);
+            let moved = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let current = observer.client().configuration(stream).await.unwrap();
+                    if !current.voters.contains(&drained) {
+                        return current;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }).await.expect("the writer moves its stream off the draining keeper");
+            assert!(moved.revision > before.revision);
+            assert_eq!(moved.voters.iter().filter(|voter| before.voters.contains(voter)).count(), 2);
+
+            keepers.stop(drained).await.unwrap();
+            let attachment = handle.node().catalog().database(DEVELOPMENT_DATABASE).unwrap();
+            let serving = attachment.serving_driver().unwrap();
+            let receipt = serving.transact(Transact {
+                custody_request_digest: None,
+                request_memory: None,
+                key: vec![31; 16],
+                require: vec![rtdb_tx::transact::ROW_CUSTODY.into()],
+                window: Default::default(),
+                guards: vec![],
+                requires: vec![],
+                otherwise: vec![],
+                ops: vec![Op::CreateCustodyGroup { group: [37; 16] }],
+            }, &stop).await.unwrap();
+            assert_eq!(receipt.outcome, Outcome::Then);
+            drop(attachment);
+        };
+        tokio::select! {
+            () = scenario => (),
+            result = runtime.drive(handle.node(), &stop) => panic!("Multi stopped during the drain: {result:?}"),
+        }
+        handle.shutdown();
+        server.await.unwrap().unwrap();
+        drop(handle);
+        runtime.close().await;
         keepers.shutdown().await.unwrap();
     }
 
