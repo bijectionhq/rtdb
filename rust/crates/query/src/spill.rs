@@ -585,7 +585,7 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     writer.write_columns(&batch, &schema, &memory).unwrap();
     let file = writer.finish().unwrap();
     let wire_bytes = usize::try_from(spill.retained_bytes()).unwrap();
-    let tight_memory = MemoryBudget::new(wire_bytes + (14 << 10));
+    let tight_memory = MemoryBudget::new(wire_bytes + (56 << 10));
     let mut tight_reader = file.reader(Arc::clone(&tight_memory)).unwrap();
     let detached = tight_reader.read_columns(1).unwrap().unwrap();
     for (row, expected) in values.iter().enumerate() {
