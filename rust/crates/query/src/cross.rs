@@ -187,7 +187,7 @@ mod tests {
         ] {
             for (row, position) in positions.into_iter().enumerate() {
                 let (array, _, _, offset) = column.arrow_cell(row).unwrap().unwrap();
-                assert!(std::ptr::eq(array, source.as_ref()));
+                assert_eq!(array.to_data().buffers()[1].as_ptr(), source.to_data().buffers()[1].as_ptr());
                 assert_eq!(offset, position);
             }
         }

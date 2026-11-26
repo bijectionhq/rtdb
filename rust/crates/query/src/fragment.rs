@@ -1351,7 +1351,7 @@ mod tests {
 
         let source_memory = MemoryBudget::new(16 << 20);
         let memory = MemoryBudget::new(256 << 10);
-        let logical = LogicalType::List { kind: ListKind::List, element: Box::new(LogicalType::Scalar(ScalarType::Utf8)) };
+        let logical = LogicalType::List { kind: ListKind::List, element: Box::new(LogicalType::Scalar(ScalarType::Utf8)) }.maybe();
         let field = rtdb_columnar::to_field("items", &logical).unwrap()
             .with_metadata([("unit".into(), "item".into())].into());
         let DataType::List(item) = field.data_type() else { unreachable!() };

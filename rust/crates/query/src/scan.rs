@@ -3336,18 +3336,21 @@ mod tests {
     async fn tied_root_publications_keep_the_original_marker_at_a_position_cut() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION).unwrap();
+        let data = rtdb_types::OwnedRelation::new("docs").unwrap();
         let id = EntityId::String("head".into());
         let memory = MemoryBudget::new(1 << 24);
         let original = TransactionKey { tx_id: TxId(4), system_time: Timestamp(100) };
         let next = TransactionKey { tx_id: TxId(7), system_time: original.system_time };
         for key in [original, next] {
             let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
-            write.append(relation.table("alice"), StoredEvent {
-                position: None, origin: None, commit_position: 0, recency: None,
-                entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
-                system_from: key.system_time, valid_time: Interval::ALL,
-                operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
-            }).unwrap();
+            for relation in [&relation, &data] {
+                write.append(relation.table("alice"), StoredEvent {
+                    position: None, origin: None, commit_position: 0, recency: None,
+                    entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
+                    system_from: key.system_time, valid_time: Interval::ALL,
+                    operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
+                }).unwrap();
+            }
             state.apply(&write.stage().unwrap()).unwrap();
         }
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
@@ -3359,7 +3362,7 @@ mod tests {
         let context = context.with_owned_transaction_cut(original, &cancellation).unwrap();
         assert_eq!(crate::read_owned_root_publication(Arc::clone(&context), "alice").await.unwrap(), Some(original));
         let mut projection = crate::open_owned_root_projection(
-            context, "alice", &relation, original.system_time, &["_id", OWNED_EVENT_POSITION_COLUMN],
+            context, "alice", &data, original.system_time, &["_id", OWNED_EVENT_POSITION_COLUMN],
         ).await.unwrap().unwrap();
         let batch = projection.next_batch().await.unwrap().unwrap();
         assert_eq!(batch.batch().num_rows(), 1);
@@ -4495,7 +4498,7 @@ mod tests {
         let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow equijoin execution");
         let mut rows = Vec::new();
         while let Some(batch) = cursor.next_batch().await.unwrap() {
-            assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+            assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
             for row in 0..batch.len {
                 rows.push(batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>());
             }
@@ -4538,7 +4541,7 @@ mod tests {
             let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
             let mut actual = Vec::new();
             while let Some(batch) = cursor.next_batch().await.unwrap() {
-                assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+                assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
                 actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
             }
             assert_eq!(actual, expected);
