@@ -655,7 +655,7 @@ pub(super) async fn open_owned_snapshot(
     let database = &stage.intent.name;
     authority.confirm(database).await?;
     let options = NodeOptions::default();
-    let memory = options.query.query_memory(&MemoryBudget::new(options.execution_memory_bytes));
+    let memory = MemoryBudget::new(options.execution_memory_bytes);
     let storage = Arc::new(BufferPool::with_metadata_budget(
         store.clone(), CacheBudget::new(options.cache_bytes), memory.clone(),
     ));

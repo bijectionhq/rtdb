@@ -317,7 +317,7 @@ impl Node {
         let compaction_slots = (matches!(options.membership, Membership::Placed) && options.compaction_threads > 0)
             .then(|| Arc::new(Semaphore::new(options.compaction_threads.min(Semaphore::MAX_PERMITS))));
         services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
-        let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
+        let factory = Arc::new(DatabaseFactory { query_memory: memory.credited(), memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, compaction_relay: services.compaction_relay, world_constraints: services.world_constraints, compaction_slots, clock: services.clock, decision_clock: services.decision_clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
@@ -358,7 +358,11 @@ impl Node {
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
     /// The budget a query or a result stream reserves from, as the node's query options shape it.
-    pub fn query_memory(&self) -> Arc<MemoryBudget> { self.factory.options.query.query_memory(&self.factory.memory) }
+    pub fn query_memory(&self) -> Arc<MemoryBudget> { Arc::clone(&self.factory.query_memory) }
+    /// The budget a query reserves from when its session reserves from `memory`.
+    fn query_memory_for(&self, memory: &Arc<MemoryBudget>) -> Arc<MemoryBudget> {
+        if Arc::ptr_eq(memory, &self.factory.memory) { self.query_memory() } else { Arc::clone(memory) }
+    }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
     pub fn hold_active_call(&self, database: &Database) -> Option<Box<dyn Send + Sync>> {
         self.read_fence.as_ref()?.hold_active_call(database)
@@ -772,7 +776,7 @@ impl Node {
         if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
         let memory = match cut {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
-            _ => self.factory.options.query.query_memory(&self.factory.memory),
+            _ => Arc::clone(&self.factory.query_memory),
         };
         let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, self.run.query_owner())?
             .with_shared_plans(Arc::clone(&self.shared_plans));
@@ -4280,7 +4284,7 @@ impl NativeSession {
             OwnedReadBasis::Applied { floor, ref preparation } => {
                 applied_preparation = preparation.clone();
                 floor_to_check = Some(floor);
-                applied_memory = node.factory.options.query.query_memory(&self.service.memory);
+                applied_memory = node.query_memory_for(&self.service.memory);
                 let admission = match applied_preparation.as_deref() {
                     Some(preparation) => AppliedCatalogAdmission::PreparedAudience(preparation),
                     None => self.service.audience_storage.as_ref().map_or(

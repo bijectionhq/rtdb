@@ -325,7 +325,7 @@ where
                         .collect::<Result<_>>()?,
                     cipher: Arc::clone(&cipher),
                 });
-                let memory = resources.node.query.query_memory(resources.memory);
+                let memory = Arc::clone(resources.memory);
                 let storage = Arc::new(BufferPool::with_metadata_budget(
                     store.clone(),
                     resources.cache,

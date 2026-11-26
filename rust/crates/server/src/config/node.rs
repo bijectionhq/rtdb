@@ -32,9 +32,6 @@ impl NodeConfiguration {
         options.query.join_build_rows = self.join_build_rows;
         options.query.generate_series_end_exclusive = self.generate_series_end_exclusive;
         options.query.object_sort = self.object_sort;
-        // Queries a network listener serves run many at once and contend on the node's budget, so each admits its many
-        // small reservations a quantum at a time; an embedded node keeps exact admission.
-        if self.server.is_some() || self.flight_sql.is_some() { options.query.memory_quantum = 256 << 10; }
         options.cache_bytes = cache_bytes;
         options.execution_memory_bytes = execution_memory_bytes;
         options.trie = rtdb_trie::TrieConfig::new(self.indexer.log_limit, self.indexer.page_limit)?;

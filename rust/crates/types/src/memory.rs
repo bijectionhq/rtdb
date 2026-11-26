@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex, Weak, atomic::{AtomicUsize, Ordering}};
 
 use crate::{Anomaly, Result};
 
@@ -11,17 +11,60 @@ pub struct MemoryBudget {
     peak_bytes: AtomicUsize,
     parent: Option<Arc<MemoryBudget>>,
     funding: Option<Arc<MemoryReservation>>,
-    /// For a quantized budget, the bytes its parent has admitted for it, which cover its used bytes in whole quanta.
-    quantized: Option<Quantized>,
+    /// Bytes this budget and its ancestors have admitted ahead of use, which small reservations draw on per thread.
+    credit: Option<Credit>,
+    /// On a budget without a parent, the credited budgets beneath it, whose unspent credit a refused admission reclaims.
+    credited: Mutex<Vec<Weak<MemoryBudget>>>,
 }
 
+/// The largest reservation a credited budget admits from a thread's credit, and the batch in which a thread refills it.
+const CREDIT_BATCH: usize = 8 << 10;
+/// The most unspent credit one shard keeps after a release; the excess goes back to the budget and its ancestors.
+const CREDIT_KEPT: usize = 2 * CREDIT_BATCH;
+
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct CreditShard(AtomicUsize);
+
+/// Per-thread shards of admitted but unreserved bytes, each on its own cache line.
 #[derive(Debug)]
-struct Quantized { quantum: usize, granted: std::sync::Mutex<usize> }
+struct Credit { shards: Box<[CreditShard]> }
+
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+thread_local! { static SHARD: usize = NEXT_SHARD.fetch_add(1, Ordering::Relaxed); }
+
+impl Credit {
+    fn new() -> Self {
+        let shards = std::thread::available_parallelism().map_or(8, |threads| threads.get()).clamp(1, 64).next_power_of_two();
+        Self { shards: (0..shards).map(|_| CreditShard::default()).collect() }
+    }
+
+    fn shard(&self) -> &AtomicUsize {
+        let index = SHARD.try_with(|shard| *shard).unwrap_or(0) & (self.shards.len() - 1);
+        &self.shards[index].0
+    }
+
+    fn take(shard: &AtomicUsize, bytes: usize) -> bool {
+        shard.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |credit| credit.checked_sub(bytes)).is_ok()
+    }
+
+    fn outstanding(&self) -> usize {
+        self.shards.iter().fold(0usize, |total, shard| total.saturating_add(shard.0.load(Ordering::Acquire)))
+    }
+
+    fn drain(&self) -> usize {
+        self.shards.iter().fold(0usize, |total, shard| total.saturating_add(shard.0.swap(0, Ordering::AcqRel)))
+    }
+}
 
 impl MemoryBudget {
+    fn with_parts(limit_bytes: usize, parent: Option<Arc<Self>>, funding: Option<Arc<MemoryReservation>>, credit: Option<Credit>) -> Arc<Self> {
+        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent, funding, credit, credited: Mutex::new(Vec::new()) })
+    }
+
     /// Creates a root budget with a byte limit; zero permits only zero-byte reservations.
     pub fn new(limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: None, funding: None, quantized: None })
+        Self::with_parts(limit_bytes, None, None, None)
     }
 
     /// Tracks a region's retained and peak bytes while charging every reservation to the shared parent limit.
@@ -33,29 +76,31 @@ impl MemoryBudget {
     /// Opens a child with its own byte ceiling and the parent's existing admission limits.
     /// The effective ceiling cannot exceed this budget's byte limit.
     pub fn scope_with_limit(self: &Arc<Self>, limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: limit_bytes.min(self.limit_bytes), used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)), funding: None, quantized: None })
+        Self::with_parts(limit_bytes.min(self.limit_bytes), Some(Arc::clone(self)), None, None)
     }
 
-    /// A child that admits its reservations against this budget a `quantum` of bytes at a time, so that its many small
-    /// reservations touch this budget, and the ancestors it shares with other children, only once per quantum.
-    /// This budget sees whole quanta: up to two quanta more than the child uses, which it returns as it frees them.
-    pub fn quantized(self: &Arc<Self>, quantum: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: self.limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)), funding: None,
-            quantized: Some(Quantized { quantum: quantum.max(1), granted: std::sync::Mutex::new(0) }) })
+    /// A child for reservations made from many threads at once.
+    /// Each thread admits a reservation of at most `CREDIT_BATCH` bytes from credit its shard holds, which this child and its
+    /// ancestors admitted `CREDIT_BATCH` bytes at a time, so such a reservation writes no counter other threads write.
+    /// Unspent credit counts as used on this child's ancestors and in its `peak_bytes`, but not in its `used_bytes`.
+    /// A shard keeps at most `CREDIT_KEPT` bytes once its thread releases, so idle credit is bounded by the shard count, not by
+    /// the number of sessions.
+    /// A reservation refused anywhere under the same root reclaims all unspent credit there and is tried once more, so credit
+    /// refuses nothing that would fit, except the bytes other threads take as credit in between.
+    pub fn credited(self: &Arc<Self>) -> Arc<Self> {
+        let child = Self::with_parts(self.limit_bytes, Some(Arc::clone(self)), None, Some(Credit::new()));
+        if let Ok(mut credited) = self.root().credited.lock() {
+            credited.retain(|budget| budget.strong_count() > 0);
+            credited.push(Arc::downgrade(&child));
+        }
+        child
     }
 
     /// Pays for a separate budget in full before it can admit work.
     /// Retained reservations keep the funding alive, even after the owner closes.
     pub fn prepay(self: &Arc<Self>, bytes: usize) -> Result<Arc<Self>> {
         let funding = self.reserve(bytes)?;
-        Ok(Arc::new(Self {
-            limit_bytes: bytes,
-            used_bytes: AtomicUsize::new(0),
-            peak_bytes: AtomicUsize::new(0),
-            parent: None,
-            funding: Some(funding),
-            quantized: None,
-        }))
+        Ok(Self::with_parts(bytes, None, Some(funding), None))
     }
 
     pub fn is_prepaid(&self) -> bool { self.funding.is_some() }
@@ -77,7 +122,7 @@ impl MemoryBudget {
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
-        self.acquire_chain(bytes)?;
+        self.admit(bytes)?;
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: Box::default() }))
     }
 
@@ -88,30 +133,57 @@ impl MemoryBudget {
         let bytes = backing.len().checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())
             .and_then(|slots| bytes.checked_add(slots))
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-size", "Combined reservation exceeds addressable memory"))?;
-        self.acquire_chain(bytes)?;
+        self.admit(bytes)?;
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: backing.collect() }))
+    }
+
+    fn root(&self) -> &Self {
+        let mut root = self;
+        while let Some(parent) = &root.parent { root = parent; }
+        root
+    }
+
+    /// Admits bytes through the chain; if a limit refuses them, reclaims the root's unspent credit and tries once more.
+    fn admit(&self, bytes: usize) -> Result<()> {
+        match self.acquire_chain(bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if self.root().reclaim_credit() => self.acquire_chain(bytes).map_err(|_| error),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns every credited descendant's unspent credit to its ancestors; true if there was any.
+    fn reclaim_credit(&self) -> bool {
+        let credited: Vec<Arc<Self>> = match self.credited.lock() {
+            Ok(credited) => credited.iter().filter_map(Weak::upgrade).collect(),
+            Err(_) => return false,
+        };
+        let mut reclaimed = false;
+        for budget in &credited {
+            let Some(credit) = &budget.credit else { continue };
+            let drained = credit.drain();
+            if drained > 0 {
+                budget.release_direct(drained);
+                reclaimed = true;
+            }
+        }
+        reclaimed
     }
 
     /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
     fn acquire_chain(&self, bytes: usize) -> Result<()> {
-        if let (Some(quantized), Some(parent)) = (&self.quantized, &self.parent) {
-            let mut granted = quantized.granted.lock().map_err(|_| Anomaly::fault("rtdb/memory-budget-poisoned", "A quantized budget's grant is poisoned"))?;
-            self.acquire(bytes)?;
-            let used = self.used_bytes.load(Ordering::Acquire);
-            if used > *granted {
-                let quanta = (used - *granted).div_ceil(quantized.quantum);
-                let next_grant = quanta.checked_mul(quantized.quantum).and_then(|more| (*granted).checked_add(more))
-                    .ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Quantized grant exceeds range"));
-                match next_grant.and_then(|next| parent.acquire_chain(next - *granted).map(|()| next)) {
-                    Ok(next) => *granted = next,
-                    Err(error) => {
-                        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                        return Err(error);
-                    }
-                }
+        if let Some(credit) = &self.credit && bytes <= CREDIT_BATCH {
+            let shard = credit.shard();
+            if Credit::take(shard, bytes) { return Ok(()); }
+            if self.acquire_direct(bytes + CREDIT_BATCH).is_ok() {
+                shard.fetch_add(CREDIT_BATCH, Ordering::AcqRel);
+                return Ok(());
             }
-            return Ok(());
         }
+        self.acquire_direct(bytes)
+    }
+
+    fn acquire_direct(&self, bytes: usize) -> Result<()> {
         if let Some(parent) = &self.parent { parent.acquire_chain(bytes)?; }
         if let Err(error) = self.acquire(bytes) {
             if let Some(parent) = &self.parent { parent.release_chain(bytes); }
@@ -121,16 +193,19 @@ impl MemoryBudget {
     }
 
     fn release_chain(&self, bytes: usize) {
-        if let (Some(quantized), Some(parent)) = (&self.quantized, &self.parent) {
-            let Ok(mut granted) = quantized.granted.lock() else { self.used_bytes.fetch_sub(bytes, Ordering::AcqRel); return };
-            let used = self.used_bytes.fetch_sub(bytes, Ordering::AcqRel) - bytes;
-            let keep = used.div_ceil(quantized.quantum).saturating_add(1).saturating_mul(quantized.quantum);
-            if *granted > keep.saturating_add(quantized.quantum) {
-                parent.release_chain(*granted - keep);
-                *granted = keep;
+        if let Some(credit) = &self.credit && bytes <= CREDIT_BATCH {
+            let shard = credit.shard();
+            if shard.fetch_add(bytes, Ordering::AcqRel) + bytes > CREDIT_KEPT
+                && let Ok(kept) = shard.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |credit| (credit > CREDIT_BATCH).then_some(CREDIT_BATCH))
+            {
+                self.release_direct(kept - CREDIT_BATCH);
             }
             return;
         }
+        self.release_direct(bytes);
+    }
+
+    fn release_direct(&self, bytes: usize) {
         self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
         if let Some(parent) = &self.parent { parent.release_chain(bytes); }
     }
@@ -156,7 +231,7 @@ impl MemoryBudget {
                 .ok_or_else(|| Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {} with {current} retained", self.limit_bytes)))?;
             match self.used_bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
-                    self.peak_bytes.fetch_max(next, Ordering::Relaxed);
+                    if next > self.peak_bytes.load(Ordering::Relaxed) { self.peak_bytes.fetch_max(next, Ordering::Relaxed); }
                     return Ok(());
                 }
                 Err(actual) => current = actual,
@@ -164,17 +239,24 @@ impl MemoryBudget {
         }
     }
 
-    pub fn used_bytes(&self) -> usize { self.used_bytes.load(Ordering::Acquire) }
+    /// Bytes retained by reservations on this budget and its descendants, excluding this budget's own unspent credit.
+    pub fn used_bytes(&self) -> usize {
+        let used = self.used_bytes.load(Ordering::Acquire);
+        self.credit.as_ref().map_or(used, |credit| used.saturating_sub(credit.outstanding()))
+    }
     pub fn peak_bytes(&self) -> usize { self.peak_bytes.load(Ordering::Relaxed) }
     pub fn limit_bytes(&self) -> usize { self.limit_bytes }
 
     /// Estimates the bytes available under this limit and all ancestor limits.
     /// A subsequent reservation still checks the shared limits.
+    /// Unspent credit on this chain counts as available, since a refused reservation reclaims it.
     pub fn available_bytes(&self) -> usize {
         let mut available = self.limit_bytes.saturating_sub(self.used_bytes());
+        let mut credit = self.credit.as_ref().map_or(0, Credit::outstanding);
         let mut budget = self;
         while let Some(parent) = &budget.parent {
-            available = available.min(parent.limit_bytes.saturating_sub(parent.used_bytes()));
+            available = available.min(parent.limit_bytes.saturating_sub(parent.used_bytes().saturating_sub(credit)));
+            credit = credit.saturating_add(parent.credit.as_ref().map_or(0, Credit::outstanding));
             budget = parent;
         }
         available
@@ -183,9 +265,9 @@ impl MemoryBudget {
 
 impl Drop for MemoryBudget {
     fn drop(&mut self) {
-        if let (Some(quantized), Some(parent)) = (&mut self.quantized, &self.parent) {
-            let granted = quantized.granted.get_mut().map(|granted| std::mem::take(granted)).unwrap_or(0);
-            if granted > 0 { parent.release_chain(granted); }
+        if let (Some(credit), Some(parent)) = (&self.credit, &self.parent) {
+            let unspent = credit.drain();
+            if unspent > 0 { parent.release_chain(unspent); }
         }
     }
 }
@@ -210,7 +292,7 @@ impl MemoryReservation {
     pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
         let additional = bytes.checked_sub(self.bytes)
             .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-shrink", "Reservation growth requires at least the held bytes"))?;
-        self.budget.acquire_chain(additional)?;
+        self.budget.admit(additional)?;
         self.bytes = bytes;
         Ok(())
     }
@@ -263,7 +345,7 @@ impl Drop for MemoryReservation {
 #[test]
 fn ordered_index_snapshot_budget_shares_only_ordinary_equal_limit_scopes() {
     let root = MemoryBudget::new(8192);
-    let request = root.scope().quantized(4096).scope();
+    let request = root.scope().credited().scope();
     assert!(Arc::ptr_eq(&root, request.snapshot_budget().unwrap()));
     assert!(root.scope_with_limit(4096).scope().snapshot_budget().is_none());
     assert!(root.prepay(4096).unwrap().scope().snapshot_budget().is_none());

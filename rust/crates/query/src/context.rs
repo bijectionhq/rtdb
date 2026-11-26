@@ -439,17 +439,9 @@ pub struct QueryOptions {
     pub generate_series_end_exclusive: bool,
     /// Stable object-index algorithm for sort runs and complete percentile groups.
     pub object_sort: rtdb_types::ObjectSort,
-    /// The bytes a query admits against the node's budget at a time; zero admits each reservation as it is made.
-    pub memory_quantum: usize,
-}
-impl QueryOptions {
-    /// The budget a query reserves from: `node` itself, or a child admitting against it `memory_quantum` bytes at a time.
-    pub fn query_memory(&self, node: &Arc<MemoryBudget>) -> Arc<MemoryBudget> {
-        if self.memory_quantum == 0 { Arc::clone(node) } else { node.quantized(self.memory_quantum) }
-    }
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, materialized_spill_rows: 100_000, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default(), memory_quantum: 0 } }
+    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, materialized_spill_rows: 100_000, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
 }
 
 #[derive(Clone)]
