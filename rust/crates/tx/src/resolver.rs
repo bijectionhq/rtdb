@@ -871,6 +871,10 @@ impl<'a> OpenTransaction<'a> {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
+    /// Whether `snapshot()` would contain `table`, without materializing the transaction's pending writes into it.
+    fn sees_table(&self, table: &TableRef) -> bool {
+        self.buffer.has_pending_table(table) || self.buffer.base_snapshot().contains_table(table)
+    }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;
         check_writer_table(&table)?;
@@ -6294,6 +6298,43 @@ mod tests {
         let mut buffer = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
         stage_mutation_tombstones(&mut buffer, &table, &page, MutationKind::Erase, key.system_time, &memory)?;
         assert_eq!(buffer.stage()?.tables()[&table].batch().unwrap().len(), 64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receipt_retention_without_receipt_tables_skips_and_sees_what_the_transaction_snapshot_sees() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 26);
+        let context = ResolveContext {
+            decision_clock: None, write_event_origins: false, placed_receipt_retirement: true,
+            owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(), cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let key = TransactionKey { tx_id: TxId(64), system_time: Timestamp(10) };
+        let items = TableRef::new("public", "items");
+        let receipts = receipts_table();
+        let tables = [
+            items.clone(), receipts.clone(), crate::bounded_retry::bounded_receipts_table(),
+            crate::replay_submission::replay_table(), TableRef::new("xt", rtdb_types::PLACED_ATTEMPT_OUTCOME_TABLE),
+        ];
+        let base = rtdb_index::PartitionState::empty(Default::default())?;
+        let options = SubmitOptions::default();
+        let mut tx = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+        tx.buffer.put(items.clone(), StructFields::from([("_id".into(), Value::I64(1))]), Interval::new(Timestamp(10), Timestamp::MAX)?)?;
+        for table in &tables { assert_eq!(tx.sees_table(table), tx.snapshot()?.contains_table(table), "{table:?}"); }
+        assert!(tx.sees_table(&items) && !tx.sees_table(&receipts));
+
+        let clock = tx.observe_retention_clock(Timestamp(10), None).await?;
+        tx.retire_expired_receipts(clock).await?;
+        tx.retire_placed_outcomes(clock).await?;
+        assert!(tables[1..].iter().all(|table| !tx.buffer.has_pending_table(table)));
+
+        tx.buffer.put(receipts.clone(), StructFields::from([("_id".into(), Value::Utf8("0/key".into()))]), Interval::new(Timestamp(0), Timestamp(5))?)?;
+        for table in &tables { assert_eq!(tx.sees_table(table), tx.snapshot()?.contains_table(table), "{table:?}"); }
+        tx.retire_expired_receipts(clock).await?;
         Ok(())
     }
 
