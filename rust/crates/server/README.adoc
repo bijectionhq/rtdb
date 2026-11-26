@@ -10,6 +10,7 @@ Routes correspond to `xtdb.healthz`: the index, metrics, started/alive/ready che
 The finish-block database query parameter retains the reference's raw matching semantics.
 The node captures startup replica targets once and evaluates liveness against current membership.
 The Prometheus renderer exports counters, gauges and timer observations from the same metric provider used by SQL catalogs; rendered byte slices keep their memory reservation alive.
+Each family is written once under Micrometer's `# HELP` and `# TYPE` lines, with a timer or distribution summary's maximum as its own `_max` gauge family.
 
 `ServerDriver::open` decodes passive settings into a node, authenticator, provider registry, shared metrics registry, pgwire listeners, Flight SQL listener and health listener.
 Every bind completes before a driver starts.

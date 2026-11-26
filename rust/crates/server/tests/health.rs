@@ -72,7 +72,7 @@ fn prometheus_names_escaping_units_and_payload_lifetime() {
     assert!(text.contains("query_timer_seconds_sum{node_id=\"line\\n\\\"\\\\\"} 1.000000001\n"));
     for quantile in ["0.75", "0.85", "0.95", "0.98", "0.99", "0.999"] { assert!(text.contains(&format!("quantile=\"{quantile}\""))); }
     assert!(text.contains("commit_lag{quantile=\"0.5\"} 1.25\n"));
-    assert!(text.contains("commit_lag_count 2\ncommit_lag_sum 3.25\ncommit_lag_max 2\n"));
+    assert!(text.contains("commit_lag_count 2\ncommit_lag_sum 3.25\n# HELP commit_lag_max  \n# TYPE commit_lag_max gauge\ncommit_lag_max 2\n"));
     assert!(text.contains("allocator_memory_bytes 42\n"));
     assert!(text.contains("block_upload_seconds 7\n"));
     assert!(!text.contains("block_upload_seconds_seconds"));
@@ -82,4 +82,24 @@ fn prometheus_names_escaping_units_and_payload_lifetime() {
     drop(retained);
     assert_eq!(memory.used_bytes(), 0);
     assert!(prometheus::render(&metrics, &MemoryBudget::new(100)).is_err());
+}
+
+#[test]
+fn prometheus_families_carry_help_and_type_and_group_their_series() {
+    let memory = MemoryBudget::new(1_000_000);
+    let db = |name: &str| BTreeMap::from([("db".into(), name.into())]);
+    let metrics = vec![
+        CatalogMetric::Gauge { name: "xtdb.log.leader".into(), tags: db("a"), unit: None, value: 1.0 },
+        CatalogMetric::Counter { name: "tx.error".into(), tags: BTreeMap::new(), count: 2.0 },
+        CatalogMetric::Gauge { name: "xtdb.log.leader".into(), tags: db("b"), unit: None, value: 0.0 },
+        CatalogMetric::Timer { name: "query.timer".into(), tags: BTreeMap::new(), count: 1, total_ns: 2e9, mean_ns: None, max_ns: Some(2_000_000_000), p75_ns: None, p95_ns: None, p99_ns: None, p999_ns: None, percentiles_ns: [2e9; 6] },
+    ];
+    let bytes = prometheus::render(&metrics, &memory).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.starts_with("# HELP xtdb_log_leader  \n# TYPE xtdb_log_leader gauge\nxtdb_log_leader{db=\"a\"} 1\nxtdb_log_leader{db=\"b\"} 0\n"), "{text}");
+    assert!(text.contains("# HELP tx_error_total  \n# TYPE tx_error_total counter\ntx_error_total 2\n"), "{text}");
+    assert!(text.contains("# TYPE query_timer_seconds summary\nquery_timer_seconds{quantile=\"0.75\"} 2\n"), "{text}");
+    assert!(text.contains("query_timer_seconds_count 1\nquery_timer_seconds_sum 2\n# HELP query_timer_seconds_max  \n# TYPE query_timer_seconds_max gauge\nquery_timer_seconds_max 2\n"), "{text}");
+    assert_eq!(text.matches("# TYPE ").count(), 4);
+    assert_eq!(text.matches("# HELP ").count(), 4);
 }
