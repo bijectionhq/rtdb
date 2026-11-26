@@ -1875,6 +1875,7 @@ impl ReplicationDriver {
                     }
                 }
                 ReplicaBody::TriesDeleted(message) => {
+                    let position = record.metadata.position;
                     if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff) {
                         let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
                         let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
@@ -1896,7 +1897,7 @@ impl ReplicationDriver {
                     } else if let Some(leader) = &mut self.leader && leader.term == record.envelope.term {
                         complete_record(&mut leader.pending, record.envelope.term_sequence, Err(trie_removal_unconfirmed()));
                     }
-                    self.record_control_image(record.metadata.position, 15, &[])?;
+                    self.record_control_image(position, 15, &[])?;
                 }
                 ReplicaBody::TablesRetired(message) => {
                     let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
