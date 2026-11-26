@@ -5,6 +5,7 @@ use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_server::config::{ConfigurationEnvironment, EnvironmentValue, ParsedConfiguration, ParsedYamlDocument};
 use rtdb_types::{Anomaly, Result};
+use rtdb_types::AnomalyKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -143,7 +144,7 @@ pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8]
             if !parsed.warnings().is_empty() { report.gap("ignored-edn-options", "configuration", "The production decoder reported ignored configuration keys; none are accepted for cutover."); }
             resolved::describe(parsed.configuration(), &mut report);
         }
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Err(error),
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Err(error),
         Err(_) => report.gap("production-decoder-rejected", "configuration", "The bounded production decoder rejected the configuration or its environment; diagnostic values are withheld to protect secrets."),
     }
     report.environment_lookups = std::mem::take(&mut *environment.requested.borrow_mut());

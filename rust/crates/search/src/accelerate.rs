@@ -19,6 +19,7 @@ use rtdb_query::{IidScope, MatchAnswers, PreparedSearchQuery, QueryContext, Scan
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TableRef, TemporalBounds, Timestamp};
+use rtdb_types::AnomalyKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::{KIND, SearchDefinition, SearchFile, rank_cutoff::RankKey, runtime::{Suspect, TrieFile}};
@@ -67,8 +68,7 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, recency: i64
 }
 
 fn optional_build_refused(error: &Anomaly) -> bool {
-    matches!(error.code.as_str(),
-        "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit" | "rtdb.search/input-order")
+    error.is(AnomalyKind::ResourceExhausted) || error.code == "rtdb.search/input-order"
 }
 
 #[async_trait]
@@ -152,7 +152,7 @@ impl ScanAccelerator for SearchAccelerator {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     match self.runtime.match_set_for_scan(request.database, trie, column, query, request.iid_scope(), request.memory) {
                         Ok(set) => entry.insert(set),
-                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => continue,
+                        Err(error) if error.is(AnomalyKind::ResourceExhausted) => continue,
                         Err(error) => return Err(error),
                     }
                 }

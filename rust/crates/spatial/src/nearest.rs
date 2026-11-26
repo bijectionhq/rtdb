@@ -10,6 +10,7 @@ use rtdb_columnar::{
 };
 use rtdb_query::{OwnedSpatialScan, QueryContext, open_owned_spatial_scan};
 use rtdb_types::{Anomaly, Iid, OwnedRelation, Result, Timestamp};
+use rtdb_types::AnomalyKind;
 
 use crate::{
     NearestPosition, Page, PageOrder, Predicate, PreparedRegion, Projection, Request, kernel,
@@ -419,7 +420,7 @@ impl RankingBuilder {
         if fixed + preferred > memory.bytes()
             && let Err(error) = memory.grow_to(fixed + preferred)
         {
-            if preferred == minimum || error.code != "rtdb/memory-budget-exceeded" {
+            if preferred == minimum || !error.is(AnomalyKind::ResourceExhausted) {
                 return Err(error);
             }
             memory.grow_to(fixed + minimum)?;

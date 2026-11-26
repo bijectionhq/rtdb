@@ -7,6 +7,7 @@ use arrow_array::{Array, RecordBatch, StructArray, cast::AsArray, types::{Int64T
 use rtdb_columnar::EntityIdRef;
 use rtdb_text::{Query, RankScorer, stored_length};
 use rtdb_types::{Iid, MemoryBudget, MemoryReservation, Result, TemporalBounds};
+use rtdb_types::AnomalyKind;
 
 use super::{corrupt, meets, layout::{PageRef, Table, table}, paged::{self, Frequencies, PostingBlock},
     rank_tree::{self, RankLeaf, RankNode, RankWindow}, tree_file::{DOCUMENT, DOCUMENT_ROWS, POSTING, TreeFile}};
@@ -63,7 +64,7 @@ impl LeafCache {
 
     fn admit<T>(&mut self, allocate: impl Fn(&Arc<MemoryBudget>) -> Result<T>) -> Result<T> {
         match allocate(&self.memory) {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" && !self.entries.is_empty() => {
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) && !self.entries.is_empty() => {
                 self.entries.clear();
                 allocate(&self.memory)
             }

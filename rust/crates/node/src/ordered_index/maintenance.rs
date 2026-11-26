@@ -17,6 +17,7 @@ use rtdb_maintenance::{
 use rtdb_replication::{PartitionLogs, RetainedTableReplay};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, Iid, PhysicalObjectVersion, Result, TableRef, Timestamp, WorldShadow};
+use rtdb_types::AnomalyKind;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -502,7 +503,7 @@ async fn flushed_changes(
         match read_replay_ranges(store, &tree.memory, source, &columns, cancellation, |batch| add(&mut changes, batch)).await {
             Ok(Some(rows)) => return Ok((rows, changes)),
             Ok(None) => (),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
             Err(error) => return Err(error),
         }
     }

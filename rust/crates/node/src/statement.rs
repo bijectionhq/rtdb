@@ -5,7 +5,7 @@ use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNo
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema, SharedPlan, SharedPlanKey};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, LogicalType, MemoryBudget, PgType, Result, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResultSignaturePolicy { Dynamic, Exact, PostgreSql }
@@ -239,7 +239,7 @@ impl PreparedSql {
         } else {
             match arguments.select(&Selection::Indices(vec![0])) {
                 Ok(row) => row,
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => arguments.slice(0, 1)?,
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) => arguments.slice(0, 1)?,
                 Err(error) => return Err(error),
             }
         };
@@ -366,7 +366,7 @@ impl PreparedSql {
             query.execute_parameter_projection(context, arguments, types, Some(self.source())).await
         }.await;
         match projection {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
             result => result,
         }
     }
@@ -421,7 +421,7 @@ impl PreparedSql {
             Ok::<_, Anomaly>((query, recording.finish()))
         };
         let (kept, lookups) = match plan_in(budget) {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" && !Arc::ptr_eq(budget, &context.memory) => {
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) && !Arc::ptr_eq(budget, &context.memory) => {
                 return Ok(plan_in(&context.memory)?.0);
             }
             result => result?,

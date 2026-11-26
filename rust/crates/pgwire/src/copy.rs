@@ -12,6 +12,7 @@ use rtdb_pg_codec::Format;
 use rtdb_plan::{CopyFormat, CopyOutFormat, Identifier};
 use rtdb_tx::{ArrowDocuments, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef};
+use rtdb_types::AnomalyKind;
 use tokio_util::sync::CancellationToken;
 use crate::error::{cancelled, protocol};
 use crate::wire::{Frame, Writer};
@@ -403,7 +404,7 @@ impl CopyInput {
                             };
                             return Ok(ArrowCopy { table, batches, _decoder: decoder, _input: input });
                         }
-                        Err(error) if !extended || error.code != "rtdb/memory-budget-exceeded" => return Err(error),
+                        Err(error) if !extended || !error.is(AnomalyKind::ResourceExhausted) => return Err(error),
                         Err(_) => {}
                     }
                 }

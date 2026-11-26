@@ -1,5 +1,6 @@
 
 use rtdb_format::keys::TrieKey;
+use rtdb_types::AnomalyKind;
 use rtdb_format::{log::proto::{SearchRun, TermDirectoryRoot}, term_directory};
 use rtdb_plan::ColumnId;
 use rtdb_query::ObjectPageStore;
@@ -139,7 +140,7 @@ impl LogicalCoverage<'_> {
             Some(Ok(routes)) => Ok(Some(routes)),
             Some(Err(error)) if error.category == AnomalyCategory::Interrupted => Err(error),
             Some(Err(error)) => {
-                if error.code != "rtdb/memory-budget-exceeded" {
+                if !error.is(AnomalyKind::ResourceExhausted) {
                     runtime.report_term_directory(request.database, &definition.table, &id, definition.version);
                 }
                 Ok(None)

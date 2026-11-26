@@ -9,6 +9,7 @@ use rtdb_index::{PartitionValue, Snapshot, TrieCatalog};
 use rtdb_maintenance::{ArtefactDefinition, ArtefactPublisher, HistoryCoverage, HistoryRead, HistoryRow, SnapshotSource, input::download};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey};
 use rtdb_types::{AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, Interval, Result, StorageEpoch, StorageVersion, TableRef, Timestamp};
+use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -470,7 +471,7 @@ impl SearchBuilder {
                 Ok::<_, rtdb_types::Anomaly>((tree.encode(false), digest, source_rows, has_erases, summaries, forward))
             };
             match build(forward_owner, indexing) {
-                Err(error) if forward_owner.is_some() && error.code == "rtdb/memory-budget-exceeded" && !token.is_cancelled() => {
+                Err(error) if forward_owner.is_some() && error.is(AnomalyKind::ResourceExhausted) && !token.is_cancelled() => {
                     build(None, budget.reserve(indexing_allowance(size))?)
                 }
                 result => result,

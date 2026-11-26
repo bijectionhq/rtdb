@@ -12,6 +12,7 @@ use rtdb_index::{CatalogTrie, Snapshot, TrieState, branches::RankedIndexDeclarat
 use rtdb_query::{CandidateIids, IidScope, OrderedIidBuffer, QueryContext, visit_projected_data_events};
 use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease}};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TableRef, TemporalBounds};
+use rtdb_types::AnomalyKind;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -239,7 +240,7 @@ fn rank_block(block: &Block, cut: Cut<'_>, probe: &[f32], scope: Option<IidScope
 
 fn refused_read_memory(error: &Anomaly) -> bool {
     error.category != AnomalyCategory::Interrupted
-        && matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit")
+        && error.is(AnomalyKind::ResourceExhausted)
 }
 
 enum SourceKind { Generation { key: ObjectKey, locator: Locator }, Frontier { data: ObjectKey } }
@@ -486,8 +487,8 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, bounds: Temp
 
 /// The approximate route is optional: a refused budget or an unreadable generation hands the read to the exact route.
 pub fn declined(error: &Anomaly) -> bool {
-    error.category != AnomalyCategory::Interrupted && matches!(error.code.as_str(),
-        "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit" | "rtdb.storage/missing-object" | "rtdb.vector/corrupt-generation")
+    error.category != AnomalyCategory::Interrupted && (error.is(AnomalyKind::ResourceExhausted)
+        || matches!(error.code.as_str(), "rtdb.storage/missing-object" | "rtdb.vector/corrupt-generation"))
 }
 
 #[cfg(test)]

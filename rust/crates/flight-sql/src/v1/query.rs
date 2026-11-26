@@ -22,6 +22,7 @@ use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::{QuerySou
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::transact::CustodyGroupId;
 use rtdb_types::{LogicalType, TableRef, Timestamp, Value, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
+use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -974,7 +975,7 @@ impl Parameters {
         match result {
             Err(error)
                 if error.code == "rtdb.query/column-plan"
-                    || (!skip_row_admission && error.code == "rtdb/memory-budget-exceeded") =>
+                    || (!skip_row_admission && error.is(AnomalyKind::ResourceExhausted)) =>
             {
                 Ok(None)
             }

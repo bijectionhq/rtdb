@@ -1,4 +1,5 @@
 use rtdb_types::{OrderedSet, StructFields};
+use rtdb_types::AnomalyKind;
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock, Weak};
@@ -803,7 +804,7 @@ impl BlockPages<'_> {
             });
             match result {
                 Ok(batch) => return Ok(batch),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
                 Err(error) => return Err(error),
             }
         }
@@ -811,7 +812,7 @@ impl BlockPages<'_> {
             match self.copy_relayout(rows) {
                 Ok(Some(batch)) => return Ok(batch),
                 Ok(None) => (),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
                 Err(error) => return Err(error),
             }
         }

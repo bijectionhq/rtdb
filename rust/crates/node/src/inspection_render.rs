@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::transit::TransitValue;
 use rtdb_tx::OperationValue;
-use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, AnomalyKind, DecimalValue, Result, TimeUnit, Value};
 
 pub(crate) fn quoted(text: &str) -> String { serde_json::to_string(text).expect("string serialization") }
 pub(crate) fn map(fields: impl IntoIterator<Item = (&'static str, String)>) -> String {
@@ -30,7 +30,7 @@ pub(crate) fn operations(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Ope
         if status.is_err() { writer = None; }
     });
     match decoded {
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Err(error),
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Err(error),
         Err(_) => return Ok(OperationText(None)),
         Ok(()) => {}
     }

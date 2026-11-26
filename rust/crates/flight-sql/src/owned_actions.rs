@@ -29,6 +29,7 @@ use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation,
     SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -1025,7 +1026,7 @@ fn spatial_filters_unavailable() -> Status { Status::internal("Owned spatial fil
 fn spatial_memory_refusal(error: &Status) -> bool {
     error.metadata().get_bin("xtdb-anomaly-bin").and_then(|value| value.to_bytes().ok())
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|anomaly| anomaly["code"] == "rtdb/memory-budget-exceeded")
+        .is_some_and(|anomaly| anomaly["code"].as_str().and_then(AnomalyKind::from_wire_code) == Some(AnomalyKind::ResourceExhausted))
 }
 
 fn spatial_reply_ids(
@@ -3772,7 +3773,7 @@ impl Service {
                     let result = held.snapshot.next_spatial_probe(&retained, after, limit, observe, &columns, probe).await;
                     drop(retained);
                     match result {
-                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                        Err(error) if error.is(AnomalyKind::ResourceExhausted) => {
                             filter.query.discard_probe_matches()?;
                             None
                         }

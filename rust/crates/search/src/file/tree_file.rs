@@ -9,6 +9,7 @@ use arrow_buffer::{Buffer, MutableBuffer};
 use bytes::Bytes;
 use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
+use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
@@ -423,7 +424,7 @@ impl TreeLocator {
         let expected = self.page.metadata as usize + self.page.body as usize;
         let mut reservation = match memory.reserve(expected + hex.len() / 2) {
             Ok(reservation) => reservation,
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Ok(None),
             Err(error) => return Err(error),
         };
         audience_work::decode_bytes(expected)?;
@@ -539,7 +540,7 @@ impl TreeFile {
             let wire = locator.page.metadata as usize + locator.page.body as usize;
             match reader.authenticated_page(page, wire) {
                 Ok(root) => root,
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => reader.page(locator.page, PageKind::Root).await?,
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) => reader.page(locator.page, PageKind::Root).await?,
                 Err(error) => return Err(error),
             }
         } else if let Some(bytes) = &locator.inline_root {

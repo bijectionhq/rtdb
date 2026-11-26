@@ -30,6 +30,7 @@ use arrow_schema::Schema;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, shared_allocation_size, shared_batches_allocation_size};
 use rtdb_text::{Corpus, Query, RankScorer, Scorer, stored_length};
 use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp};
+use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 
 use crate::rank_windows::document_range;
@@ -400,7 +401,7 @@ impl SearchFile {
                 let size = shared_allocation_size(&page)?;
                 match retained.reserve(size) {
                     Ok(charge) => pages.push((page, charge)),
-                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => break,
+                    Err(error) if error.is(AnomalyKind::ResourceExhausted) => break,
                     Err(error) => return Err(error),
                 }
             }

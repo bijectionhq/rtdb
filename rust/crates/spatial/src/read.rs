@@ -13,6 +13,7 @@ use rtdb_plan::Catalog;
 use rtdb_query::{CandidateIids, QueryContext};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
+use rtdb_types::AnomalyKind;
 
 use crate::{
     Predicate, Projection, definition,
@@ -539,7 +540,7 @@ async fn read_page(
         Arc::clone(&context), owner, relation, path, region, &request, projection, probe, true, &mut None,
     ).await;
     let result = match result {
-        Err(error) if probe.is_some_and(|probe| !probe.fields.is_empty()) && error.code == "rtdb/memory-budget-exceeded" =>
+        Err(error) if probe.is_some_and(|probe| !probe.fields.is_empty()) && error.is(AnomalyKind::ResourceExhausted) =>
             read_page_capturing(context, owner, relation, path, region, &request, projection, probe, false, &mut None).await,
         result => result,
     };
@@ -559,7 +560,7 @@ pub async fn open_probe(
     let (page, columns) = match read_page_capturing(
         Arc::clone(&context), owner, relation, path, region, &request, projection, Some(probe), true, &mut retained,
     ).await {
-        Err(error) if error.code == "rtdb/memory-budget-exceeded"
+        Err(error) if error.is(AnomalyKind::ResourceExhausted)
             && (retained.take().is_some() || !probe.fields.is_empty()) =>
         {
             return read_page_capturing(context, owner, relation, path, region, &request, projection, Some(probe), false, &mut None)
@@ -787,7 +788,7 @@ impl PreparedRange {
             &self.columns, &selection, end < self.matches.len(), probe, true,
         ).await;
         match result {
-            Err(error) if probe.is_some_and(|probe| !probe.fields.is_empty()) && error.code == "rtdb/memory-budget-exceeded" =>
+            Err(error) if probe.is_some_and(|probe| !probe.fields.is_empty()) && error.is(AnomalyKind::ResourceExhausted) =>
                 super::nearest::gather_range(context, owner, &self.relation, self.valid_at, projection,
                     &self.columns, &selection, end < self.matches.len(), probe, false).await,
             result => result,

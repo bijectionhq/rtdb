@@ -22,6 +22,7 @@ use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, Tempor
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, Instant, LogicalType, Result, ScalarType, TableRef, Value};
+use rtdb_types::AnomalyKind;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -197,7 +198,7 @@ impl DefinitionCache {
         let loaded = entry.get_or_try_init(|| async { load.await.map(Arc::new) });
         match cancellation.run_until_cancelled(loaded).await.ok_or_else(maintenance::cancelled)? {
             Ok(definitions) => Ok(Some(Arc::clone(definitions))),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
             Err(error) => Err(error),
         }
     }

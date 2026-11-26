@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use rtdb_types::AnomalyKind;
 
 use arrow_flight::{Action, Result as ActionResult};
 use arrow_array::RecordBatch;
@@ -319,7 +320,7 @@ fn append_exact_record(
         Ok(Some(spans)) => spans,
         Ok(None) => return Ok(false),
         // The caller already holds the original encoder's grant for the fallback.
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(false),
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Ok(false),
         Err(error) => return Err(status(error)),
     };
     let (metadata, body_len) = spans.framed_metadata().map_err(status)?;

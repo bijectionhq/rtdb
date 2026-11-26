@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
 use rtdb_types::{MemoryBudget, MemoryReservation, Result};
+use rtdb_types::AnomalyKind;
 use tokio::sync::OnceCell;
 
 use super::{corrupt, fault, layout::{AuthenticatedPage, PageRef, Table, Writer, schema, table}};
@@ -247,7 +248,7 @@ impl PageCache {
         loop {
             let error = match memory.reserve(bytes) {
                 Ok(charge) => return Ok(charge),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" && bytes <= memory.limit_bytes() => error,
+                Err(error) if error.is(AnomalyKind::ResourceExhausted) && bytes <= memory.limit_bytes() => error,
                 Err(error) => return Err(error),
             };
             let mut state = self.state.lock();

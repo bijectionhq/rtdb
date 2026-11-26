@@ -4,6 +4,7 @@ use arrow_array::{Array, FixedSizeBinaryArray, LargeBinaryArray, UInt32Array};
 use arrow_buffer::{Buffer, OffsetBuffer};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
 use rtdb_types::{Iid, Result};
+use rtdb_types::AnomalyKind;
 
 use crate::postings::work_limit;
 
@@ -83,7 +84,7 @@ impl MatchBuilder {
         if fixed + preferred > reservation.bytes()
             && let Err(error) = reservation.grow_to(fixed + preferred)
         {
-            if preferred == minimum || error.code != "rtdb/memory-budget-exceeded" {
+            if preferred == minimum || !error.is(AnomalyKind::ResourceExhausted) {
                 return Err(error);
             }
             reservation.grow_to(fixed + minimum)?;
