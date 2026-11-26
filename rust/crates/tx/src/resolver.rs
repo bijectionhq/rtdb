@@ -2661,11 +2661,8 @@ impl<'a> OpenTransaction<'a> {
                                 rtdb_query::verify_owned_revealed_range(&context, &base, owner, relation, *basis, *frontier, head, revealed).await,
                             _ => Ok(exact),
                         }
-                    }.await.unwrap_or(false);
-                    if !exact {
-                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range",
-                            "The observed owned relation changed before ordering"));
-                    }
+                    }.await;
+                    require_unchanged_range(exact)?;
                 }
                 continue;
             }
@@ -4916,9 +4913,31 @@ fn tx_key_context(key: TransactionKey) -> Result<serde_json::Value> {
 
 fn overflow() -> Anomaly { Anomaly::fault("rtdb.tx/overflow", "Transaction position or allocation exceeded its range") }
 
+/// Only a completed evaluation that cannot show the range unchanged is a stale-range conflict.
+fn require_unchanged_range(verified: Result<bool>) -> Result<()> {
+    if verified? { return Ok(()); }
+    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range", "The observed owned relation changed before ordering"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_validation_reports_a_stale_range_only_for_a_completed_negative_evaluation() {
+        assert!(require_unchanged_range(Ok(true)).is_ok());
+        let stale = require_unchanged_range(Ok(false)).unwrap_err();
+        assert_eq!((stale.category, stale.code.as_str()), (AnomalyCategory::Conflict, "rtdb.owned/stale-range"));
+
+        let exhausted = rtdb_types::MemoryBudget::new(0).reserve(1).err().expect("an empty budget refuses a byte");
+        for failure in [
+            Anomaly::new(AnomalyCategory::Interrupted, "xtdb/cancelled", "cancelled"),
+            Anomaly::fault("rtdb.storage/io", "read failed"),
+            exhausted,
+        ] {
+            assert_eq!(require_unchanged_range(Err(failure.clone())).unwrap_err(), failure);
+        }
+    }
 
     #[test]
     fn owned_put_projection_reuses_the_fields_and_float_buffer_for_repeated_presence() {
