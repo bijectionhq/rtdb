@@ -141,7 +141,7 @@ impl PreparedSql {
                         let prepared = parsed.bind(&recording, &options)?;
                         let inferred = prepared.parameter_types.clone();
                         notices = prepared.notices.clone();
-                        (PreparedQuery::from_prepared(prepared, &context.memory)?, inferred, recording.finish().map(Arc::new))
+                        (PreparedQuery::from_prepared_in(prepared, &context.catalog, &context.memory)?, inferred, recording.finish().map(Arc::new))
                     }
                 };
                 for (index, ty) in &inferred {
@@ -498,7 +498,7 @@ fn plan_for_sharing(source: &str, context: &QueryContext, options: &PrepareOptio
     if !matches!(&prepared.statement, Statement::Query(_)) { return Ok(None); }
     let inferred = prepared.parameter_types.clone();
     let notices = std::mem::take(&mut prepared.notices);
-    let query = PreparedQuery::from_prepared(prepared, budget)?;
+    let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, budget)?;
     Ok(recording.finish().map(|lookups| (Arc::new(lookups), query, inferred, notices)))
 }
 
@@ -517,13 +517,13 @@ pub(crate) async fn prepare_query_at_snapshot(
     let parsed = one_statement(source, &memory)?;
     let context = context.reopen_sql_snapshot(&parsed.snapshot_selector()?, rtdb_expr::Parameters::Values(arguments)).await?;
     let prepared = parsed.bind(&context.catalog, options)?;
-    Ok((PreparedQuery::from_prepared(prepared, &memory)?, context))
+    Ok((PreparedQuery::from_prepared_in(prepared, &context.catalog, &memory)?, context))
 }
 
 pub(crate) fn prepare_query(source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<PreparedQuery> {
     let _syntax = admit_sql_syntax(source, &context.memory)?;
     let prepared = rtdb_sql::prepare_in(source, &context.catalog, options, &context.memory)?;
-    PreparedQuery::from_prepared(prepared, &context.memory)
+    PreparedQuery::from_prepared_in(prepared, &context.catalog, &context.memory)
 }
 
 fn admit_sql_syntax(source: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {

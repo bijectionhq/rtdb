@@ -64,7 +64,7 @@ async fn operators(sql: &str, context: &Arc<QueryContext>) -> Vec<(Value, Value)
 #[tokio::test]
 async fn xtdb_api_test_explain_analyze_covers_the_whole_plan_including_apply_dependents() {
     let context = context();
-    let query = "SELECT a.x FROM (VALUES (1), (2)) AS a(x) WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1)) AS b(y) WHERE b.y = a.x)";
+    let query = "SELECT a.x, (SELECT b.y FROM (VALUES (1)) AS b(y) WHERE b.y = a.x) AS y FROM (VALUES (1), (2)) AS a(x)";
     let explained = operators(&format!("EXPLAIN {query}"), &context).await;
     assert!(explained.iter().any(|(_, op)| matches!(op, Value::Keyword(op) if op.as_str().contains("apply-"))), "{explained:?}");
     assert_eq!(explained, operators(&format!("EXPLAIN ANALYZE {query}"), &context).await);

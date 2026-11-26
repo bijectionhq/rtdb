@@ -93,6 +93,14 @@ impl PreparedQuery {
     }
     /// Retains query metadata as well as the relation; SQL callers should use this constructor.
     pub fn from_prepared(prepared: rtdb_plan::PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::from_prepared_with(prepared, None, memory)
+    }
+    /// As `from_prepared`, ordering inner joins by the row counts `catalog` holds for the tables they scan.
+    /// The plan, EXPLAIN's included, keeps that order for as long as it is retained.
+    pub fn from_prepared_in(prepared: rtdb_plan::PreparedStatement, catalog: &crate::CatalogSnapshot, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::from_prepared_with(prepared, Some(catalog), memory)
+    }
+    fn from_prepared_with(prepared: rtdb_plan::PreparedStatement, catalog: Option<&crate::CatalogSnapshot>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let lexical_parameters = prepared.parameter_types.keys().next_back().map(|index| index.checked_add(1).ok_or_else(|| invalid("parameter-count", "Prepared parameter count overflow"))).transpose()?.unwrap_or(0);
         let (relation, mode) = match prepared.statement {
             rtdb_plan::Statement::Query(relation) => (relation, None),
@@ -100,7 +108,10 @@ impl PreparedQuery {
             _ => return Err(invalid("not-a-query", "Statement does not produce a query result")),
         };
         let plan_reservation = reserve_plan(&relation, &prepared.settings, memory)?;
-        let relation = crate::optimize::prepare(relation)?;
+        let relation = match catalog {
+            Some(catalog) => crate::optimize::prepare_with_statistics(relation, catalog)?,
+            None => crate::optimize::prepare(relation)?,
+        };
         let output = match mode {
             None => QueryOutput::Rows,
             Some(rtdb_plan::ExplainMode::Plan) => QueryOutput::Plan(crate::explain::ExplainPlan::new(&relation, memory)?),

@@ -2,9 +2,131 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, JoinKind, NamedExpr, Relation, RelationNode, Schema, WindowFunction};
 use rtdb_types::Result;
 
+mod decorrelate;
+#[cfg(test)]
+mod decorrelate_tests;
+
 pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     let mut ids = Ids::after(&relation)?;
+    let relation = if decorrelates() { decorrelate::decorrelate(relation, &mut ids)? } else { relation };
     prepare_with(relation, &mut ids)
+}
+
+/// As `prepare`, then ordering each run of inner joins by the row counts `statistics` gives its inputs.
+pub(crate) fn prepare_with_statistics(relation: Arc<Relation>, statistics: &dyn TableStatistics) -> Result<Arc<Relation>> {
+    order_joins(prepare(relation)?, statistics)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether `prepare` rewrites applies into joins, so that a test can run one plan both ways.
+    static DECORRELATES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+fn decorrelates() -> bool { DECORRELATES.with(std::cell::Cell::get) }
+
+#[cfg(not(test))]
+fn decorrelates() -> bool { true }
+
+/// The row counts of the tables a plan scans, which order its joins.
+pub(crate) trait TableStatistics {
+    /// The rows `table` holds, or `None` where nothing is known of it.
+    fn row_count(&self, table: &rtdb_plan::QualifiedTable) -> Option<u64>;
+}
+
+/// Each partition's flushed rows, from its table catalog, and its live rows.
+impl TableStatistics for crate::CatalogSnapshot {
+    fn row_count(&self, table: &rtdb_plan::QualifiedTable) -> Option<u64> {
+        let partitions = &self.database(&table.database).ok()?.partitions;
+        if partitions.is_empty() { return None; }
+        let mut rows = 0u64;
+        for partition in partitions {
+            let flushed = partition.table_catalog().metadata(&table.table).map(|meta| meta.row_count);
+            let live = partition.iter_segments(&table.table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
+            if flushed.is_none() && live == 0 { return None; }
+            rows = rows.checked_add(u64::try_from(flushed.unwrap_or(0)).ok()?)?.checked_add(u64::try_from(live).ok()?)?;
+        }
+        Some(rows)
+    }
+}
+
+/// The rows a join input holds as the reference's planner estimates them: a scan's table row count, carried through the
+/// operators that keep or only narrow their input's rows, and `None` elsewhere.
+fn estimated_rows(relation: &Relation, statistics: &dyn TableStatistics) -> Option<u64> {
+    match relation.node() {
+        RelationNode::Scan(scan) => statistics.row_count(&scan.table.name),
+        RelationNode::Values { rows } => u64::try_from(rows.len()).ok(),
+        RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. } => estimated_rows(input, statistics),
+        RelationNode::Let { body, .. } => estimated_rows(body, statistics),
+        RelationNode::Reference { binding } => estimated_rows(&binding.relation, statistics),
+        _ => None,
+    }
+}
+
+/// Reorders each run of inner joins in the plan, dependent plans included, by its inputs' estimated rows.
+fn order_joins(relation: Arc<Relation>, statistics: &dyn TableStatistics) -> Result<Arc<Relation>> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+        if inner(&relation) { return reorder_by(order_within_leaves(&relation, statistics)?, Some(statistics)); }
+        with_children(&relation, |child| order_joins(Arc::clone(child), statistics))
+    })
+}
+
+fn order_within_leaves(relation: &Arc<Relation>, statistics: &dyn TableStatistics) -> Result<Arc<Relation>> {
+    let RelationNode::Join { left, right, kind: kind @ (JoinKind::Inner | JoinKind::Cross), condition } = relation.node() else {
+        return order_joins(Arc::clone(relation), statistics);
+    };
+    let (ordered_left, ordered_right) = (order_within_leaves(left, statistics)?, order_within_leaves(right, statistics)?);
+    if Arc::ptr_eq(&ordered_left, left) && Arc::ptr_eq(&ordered_right, right) { return Ok(Arc::clone(relation)); }
+    Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Join { left: ordered_left, right: ordered_right, kind: *kind, condition: condition.clone() })?))
+}
+
+/// The relation with each child replaced by `f` of it, or the relation itself where no child changed; `f` keeps each
+/// child's schema.
+/// A `Let` keeps its binding, which the references in its body share.
+fn with_children(relation: &Arc<Relation>, mut f: impl FnMut(&Arc<Relation>) -> Result<Arc<Relation>>) -> Result<Arc<Relation>> {
+    let mut changed = false;
+    let mut map = |child: &Arc<Relation>| -> Result<Arc<Relation>> {
+        let mapped = f(child)?;
+        changed |= !Arc::ptr_eq(&mapped, child);
+        Ok(mapped)
+    };
+    let node = match relation.node() {
+        RelationNode::Values { .. } | RelationNode::LiteralPages { .. } | RelationNode::ArrowLiteralPages { .. } | RelationNode::List { .. }
+        | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => return Ok(Arc::clone(relation)),
+        RelationNode::Ordinality { input, field, scope } => RelationNode::Ordinality { input: map(input)?, field: field.clone(), scope: *scope },
+        RelationNode::Project { input, expressions } => RelationNode::Project { input: map(input)?, expressions: expressions.clone() },
+        RelationNode::Extend { input, expressions } => RelationNode::Extend { input: map(input)?, expressions: expressions.clone() },
+        RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: map(input)?, prefix: prefix.clone(), expressions: expressions.clone() },
+        RelationNode::Let { binding, body } => RelationNode::Let { binding: Arc::clone(binding), body: map(body)? },
+        RelationNode::Filter { input, predicate } => RelationNode::Filter { input: map(input)?, predicate: predicate.clone() },
+        RelationNode::Join { left, right, kind, condition } => RelationNode::Join { left: map(left)?, right: map(right)?, kind: *kind, condition: condition.clone() },
+        RelationNode::Apply { input, dependent, arguments, kind, output } => RelationNode::Apply {
+            input: map(input)?, dependent: map(dependent)?, arguments: arguments.clone(), kind: *kind, output: output.clone(),
+        },
+        RelationNode::Mark { input, dependent, arguments, condition, comparison, output } => RelationNode::Mark {
+            input: map(input)?, dependent: map(dependent)?, arguments: arguments.clone(), condition: condition.clone(), comparison: comparison.clone(), output: output.clone(),
+        },
+        RelationNode::Aggregate { input, groups, aggregates } => RelationNode::Aggregate { input: map(input)?, groups: groups.clone(), aggregates: aggregates.clone() },
+        RelationNode::Window { input, partition_by, order_by, expressions } => RelationNode::Window {
+            input: map(input)?, partition_by: partition_by.clone(), order_by: order_by.clone(), expressions: expressions.clone(),
+        },
+        RelationNode::Sort { input, order_by } => RelationNode::Sort { input: map(input)?, order_by: order_by.clone() },
+        RelationNode::SortLimit { input, order_by, offset, fetch } => RelationNode::SortLimit {
+            input: map(input)?, order_by: order_by.clone(), offset: offset.clone(), fetch: fetch.clone(),
+        },
+        RelationNode::Limit { input, offset, fetch } => RelationNode::Limit { input: map(input)?, offset: offset.clone(), fetch: fetch.clone() },
+        RelationNode::Distinct { input } => RelationNode::Distinct { input: map(input)? },
+        RelationNode::Set { left, right, operator, all } => RelationNode::Set { left: map(left)?, right: map(right)?, operator: *operator, all: *all },
+        RelationNode::Unnest { input, expr, element, ordinality, outer } => RelationNode::Unnest {
+            input: map(input)?, expr: expr.clone(), element: element.clone(), ordinality: ordinality.clone(), outer: *outer,
+        },
+        RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => RelationNode::PatchGaps {
+            input: map(input)?, iid: *iid, valid_from: *valid_from, valid_to: *valid_to, document: *document, from: from.clone(), to: to.clone(),
+        },
+    };
+    if !changed { return Ok(Arc::clone(relation)); }
+    Ok(Arc::new(Relation::new(relation.schema().clone(), node)?))
 }
 
 fn prepare_with(relation: Arc<Relation>, ids: &mut Ids) -> Result<Arc<Relation>> {
@@ -562,10 +684,14 @@ fn reorder_selected(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     Ok(Arc::new(Relation::new(relation.schema().clone(), node)?))
 }
 
+fn reorder(relation: Arc<Relation>) -> Result<Arc<Relation>> { reorder_by(relation, None) }
+
 /// Joins each relation to the plan built so far as soon as a condition connects them, rather than in FROM order.
 /// Relations keep their written order otherwise, which is the reference's order when no relation has row-count statistics.
+/// With `statistics`, the relations with an estimate come first, fewest rows first, and the rest after them in their
+/// written order, as the reference's mega-join sorts its inputs.
 /// Disconnected groups are crossed last, the final join taking the conditions none of them could.
-fn reorder(relation: Arc<Relation>) -> Result<Arc<Relation>> {
+fn reorder_by(relation: Arc<Relation>, statistics: Option<&dyn TableStatistics>) -> Result<Arc<Relation>> {
     fn flatten(relation: &Arc<Relation>, leaves: &mut Vec<Arc<Relation>>, conditions: &mut Vec<Expr>) {
         match relation.node() {
             RelationNode::Join { left, right, kind: JoinKind::Inner | JoinKind::Cross, condition } => {
@@ -582,7 +708,16 @@ fn reorder(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     }
     let (mut leaves, mut conditions) = (Vec::new(), Vec::new());
     flatten(&relation, &mut leaves, &mut conditions);
-    if leaves.len() < 3 { return Ok(relation); }
+    match statistics {
+        None => if leaves.len() < 3 { return Ok(relation); },
+        Some(statistics) => {
+            let estimates: Vec<Option<u64>> = leaves.iter().map(|leaf| estimated_rows(leaf, statistics)).collect();
+            let mut order: Vec<usize> = (0..leaves.len()).collect();
+            order.sort_by_key(|&index| (estimates[index].is_none(), estimates[index]));
+            if order.iter().enumerate().all(|(position, &index)| position == index) { return Ok(relation); }
+            leaves = order.into_iter().map(|index| Arc::clone(&leaves[index])).collect();
+        }
+    }
     let ids = |relation: &Relation| relation.schema().ids();
     let mut conditions: Vec<(BTreeSet<ColumnId>, Expr)> = conditions.into_iter().map(|condition| (condition.referenced_columns(), condition)).collect();
     let mut remaining: std::collections::VecDeque<Arc<Relation>> = leaves.into();
@@ -939,8 +1074,14 @@ mod tests {
             input: Arc::new(Relation::unit()), dependent: filtered,
             arguments: vec![(0, Expr::Literal(Value::I64(1)))], kind: ApplyKind::Inner, output: None,
         }).unwrap());
-        let prepared = prepare(applied).unwrap();
-        let RelationNode::Apply { dependent, .. } = prepared.node() else { panic!("Expected captured application") };
+        let prepared = prepare(Arc::clone(&applied)).unwrap();
+        let RelationNode::Join { right, .. } = prepared.node() else { panic!("Expected the application decorrelated into a join: {prepared:?}") };
+        assert!(matches!(right.node(), RelationNode::Unnest { input, .. } if matches!(input.node(), RelationNode::Filter { .. })));
+        DECORRELATES.with(|enabled| enabled.set(false));
+        let captured = prepare(applied);
+        DECORRELATES.with(|enabled| enabled.set(true));
+        let captured = captured.unwrap();
+        let RelationNode::Apply { dependent, .. } = captured.node() else { panic!("Expected captured application") };
         assert!(matches!(dependent.node(), RelationNode::Unnest { input, .. } if matches!(input.node(), RelationNode::Filter { .. })));
     }
 
