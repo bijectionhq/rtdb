@@ -2554,3 +2554,22 @@ async fn futures_copy(cluster: &Cluster, ids: &[ObjectId]) -> Vec<(ObjectId, Byt
     }
     saved
 }
+
+#[tokio::test]
+async fn an_entry_another_writer_appends_wakes_an_applied_watch_before_any_refresh() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    writer.transact(&put(1, 1, "first")).await.unwrap();
+    follower.fresh_index().await.unwrap();
+
+    let mut watch = follower.watch_applied();
+    watch.mark_seen();
+    let mut waiting = Box::pin(watch.changed(tokio::time::Instant::now() + Duration::from_secs(60)));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err(), "nothing is left to apply");
+    writer.transact(&put(2, 2, "second")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the other writer's entry wakes the watch").unwrap();
+}

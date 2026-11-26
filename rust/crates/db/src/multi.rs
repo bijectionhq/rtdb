@@ -36,6 +36,33 @@ use rotation::ArmedRotation;
 pub use rotation::RotationReceipt;
 pub use retirement::DeploymentRetirement;
 
+/// Wakes a waiter when its residence applies a new journal position, or when the journal holds an entry the residence has not applied, such as one another writer appended.
+/// It never holds the residence, so the waiter reads afresh after each wake.
+pub struct AppliedWatch {
+    applied: tokio::sync::watch::Receiver<u64>,
+    stream: Stream,
+}
+
+impl AppliedWatch {
+    /// Marks the residence's current applied position seen.
+    pub fn mark_seen(&mut self) {
+        let _ = self.applied.borrow_and_update();
+    }
+
+    /// Returns at `until`, or once the residence applies a position not marked seen, or once the journal holds an entry past the residence's applied position.
+    pub async fn changed(&mut self, until: tokio::time::Instant) -> Result<()> {
+        let applied = Lsn(*self.applied.borrow());
+        let wait = until.saturating_duration_since(tokio::time::Instant::now());
+        tokio::select! {
+            changed = self.applied.changed() => changed.map_err(|_| Anomaly::new(
+                AnomalyCategory::Unavailable, "rtdb/residence-closed", "The database residence closed",
+            )),
+            held = self.stream.holds_after(applied, wait) => held.map(drop),
+            _ = tokio::time::sleep_until(until) => Ok(()),
+        }
+    }
+}
+
 pub struct MultiOptions {
     pub database: Uuid,
     pub node: IpAddr,
@@ -545,10 +572,9 @@ impl MultiDatabase {
         self.committed.as_ref().map(|state| state.generation)
     }
 
-    /// The journal position this residence has applied, marked changed
-    /// whenever it moves.
-    pub fn watch_applied(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.applied.subscribe()
+    /// Watches the journal position this residence has applied, and the journal past it.
+    pub fn watch_applied(&self) -> AppliedWatch {
+        AppliedWatch { applied: self.applied.subscribe(), stream: self.stream.clone() }
     }
 
     fn install_committed(&mut self, state: Committed) {

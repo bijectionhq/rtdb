@@ -311,9 +311,9 @@ pub trait ServingDriver: Send + Sync {
         Err(workload::denied())
     }
 
-    /// Subscribes to the journal position this attachment has applied; a long
+    /// Watches the journal position this attachment has applied, and the journal past it; a long
     /// poll over `changes_workload_root` waits on it between pages.
-    async fn watch_applied(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+    async fn watch_applied(&self) -> Option<rtdb_db::AppliedWatch> {
         None
     }
 

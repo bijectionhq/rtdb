@@ -588,7 +588,7 @@ impl ServingDriver for MultiServing {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut applied = self.database.lock().await.watch_applied();
             loop {
-                let _ = applied.borrow_and_update();
+                applied.mark_seen();
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
                 index.require_local_custody()?;
                 let vault = index.has_custody_groups().then(|| self.tokens.custody_vault());
@@ -602,7 +602,7 @@ impl ServingDriver for MultiServing {
                         return Ok(view);
                     }
                     Err(error) if error.code == "rtdb/basis-ahead" && Instant::now() < deadline => {
-                        applied_change(&mut applied, deadline).await?;
+                        applied.changed(deadline).await?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -742,7 +742,7 @@ impl ServingDriver for MultiServing {
             let start = Instant::now();
             let mut applied = self.database.lock().await.watch_applied();
             loop {
-                let _ = applied.borrow_and_update();
+                applied.mark_seen();
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
                 index.require_local_custody()?;
                 let mut page = scope.changes(&index, &request)?;
@@ -755,7 +755,7 @@ impl ServingDriver for MultiServing {
                     }
                     return Ok(page);
                 }
-                applied_change(&mut applied, Instant::now() + remaining).await?;
+                applied.changed(Instant::now() + remaining).await?;
             }
         }).await.ok_or_else(interrupted)?
     }
@@ -866,7 +866,7 @@ impl ServingDriver for MultiServing {
         }).await.ok_or_else(interrupted)?
     }
 
-    async fn watch_applied(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+    async fn watch_applied(&self) -> Option<rtdb_db::AppliedWatch> {
         Some(self.database.lock().await.watch_applied())
     }
 
@@ -1016,7 +1016,7 @@ impl ServingDriver for MultiServing {
                 let start = Instant::now();
                 let mut applied = self.database.lock().await.watch_applied();
                 loop {
-                    let _ = applied.borrow_and_update();
+                    applied.mark_seen();
                     let mut database = self.database.lock().await;
                     let history = database.fresh_history().await?;
                     history.index.require_local_custody()?;
@@ -1031,7 +1031,7 @@ impl ServingDriver for MultiServing {
                         };
                     }
                     drop(database);
-                    applied_change(&mut applied, Instant::now() + remaining).await?;
+                    applied.changed(Instant::now() + remaining).await?;
                 }
             })
             .await
@@ -1180,15 +1180,6 @@ fn changes_page(
 
 fn matches_table(request: &Changes, table: &TableRef) -> bool {
     request.tables.is_empty() || request.tables.contains(table)
-}
-
-/// Waits, without holding the database, until the residence applies a journal
-/// position `applied` has not seen, or until `until`.
-async fn applied_change(applied: &mut tokio::sync::watch::Receiver<u64>, until: Instant) -> Result<()> {
-    match tokio::time::timeout_at(until, applied.changed()).await {
-        Ok(changed) => changed.map_err(|_| interrupted()),
-        Err(_) => Ok(()),
-    }
 }
 
 fn interrupted() -> Anomaly {

@@ -1036,7 +1036,7 @@ impl Service {
                 let started = tokio::time::Instant::now();
                 let mut applied = driver.watch_applied().await;
                 let (page, cut) = loop {
-                    if let Some(applied) = &mut applied { let _ = applied.borrow_and_update(); }
+                    if let Some(applied) = &mut applied { applied.mark_seen(); }
                     let (admitted, cut) = self.workload_root_cut(&call).await?;
                     if !Arc::ptr_eq(&admitted, &database) || cut.custody_groups.is_some() {
                         return Err(error::unavailable("The Original Changes attachment is unavailable"));
@@ -1048,10 +1048,10 @@ impl Service {
                     let Some(applied) = applied.as_mut().filter(|_| !answered) else {
                         break (page, cut);
                     };
-                    let change = tokio::time::timeout(remaining, applied.changed());
+                    let change = applied.changed(tokio::time::Instant::now() + remaining);
                     let changed = call.cancellation.run_until_cancelled(change)
                         .await.ok_or_else(crate::error::cancelled).map_err(error::map_status)?;
-                    if let Ok(Err(_)) = changed {
+                    if changed.is_err() {
                         return Err(error::unavailable("The Original Changes attachment is unavailable"));
                     }
                 };

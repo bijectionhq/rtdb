@@ -127,6 +127,16 @@ impl Stream {
             .await
     }
 
+    /// Waits up to `wait` for a committed record after `applied`.
+    /// A reader below the retained floor, or behind an operator recovery, also has a record to apply.
+    pub(crate) async fn holds_after(&self, applied: Lsn, wait: Duration) -> Result<bool> {
+        match self.journal.read(self.id(), Lsn(applied.0 + 1), 1, wait).await {
+            Ok(page) => Ok(!page.records.is_empty()),
+            Err(JournalError::Trimmed { .. } | JournalError::Recovered { .. }) => Ok(true),
+            Err(error) => Err(journal_error(error)),
+        }
+    }
+
     pub(crate) async fn trim(&self, epoch: Epoch, through: Lsn) -> journal_contract::Result<()> {
         self.journal.trim(self.id(), epoch, through).await
     }
