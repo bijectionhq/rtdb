@@ -59,7 +59,7 @@ pub(crate) fn fits_precision(coefficient: i256, bound: Option<i256>) -> bool {
 }
 
 pub(crate) fn precision_error() -> Anomaly {
-    Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision")
+    Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision").with_kind(rtdb_types::AnomalyKind::NumericValueOutOfRange)
 }
 
 /// Rebuilds a schema's fields bottom-up, preserving container layouts and schema metadata.

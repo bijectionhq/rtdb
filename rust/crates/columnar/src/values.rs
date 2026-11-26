@@ -1301,7 +1301,9 @@ mod tests {
         let actual = build_array(&min.logical_type(), &[min.clone()]).unwrap().to_data();
         assert_eq!(actual.buffers()[0].as_slice(), i256::MIN.to_le_bytes());
         let too_wide = Value::Decimal(DecimalValue::new(i256::MIN.to_be_bytes().to_vec(), 76, 0, 256).unwrap());
-        assert_eq!(build_array(&too_wide.logical_type(), &[too_wide]).unwrap_err().code, "rtdb/decimal-precision");
+        let refused = build_array(&too_wide.logical_type(), &[too_wide]).unwrap_err();
+        assert_eq!(refused.code, "rtdb/decimal-precision");
+        assert!(refused.is(rtdb_types::AnomalyKind::NumericValueOutOfRange));
     }
 
     #[test]

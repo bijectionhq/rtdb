@@ -799,7 +799,7 @@ fn text_utf8(value: &str,context: &EvalContext<'_>) -> Result<JavaString> {
 fn retain_units(units: &[u16],context: &EvalContext<'_>) -> Result<JavaString> {
     match context.allocation { Some(scope) => JavaString::copy_utf16(units,scope.memory_budget()),None => JavaString::copy_utf16_untracked(units) }
 }
-fn allocation_error() -> Anomaly { Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate host pattern text") }
+fn allocation_error() -> Anomaly { Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate host pattern text").with_kind(rtdb_types::AnomalyKind::ResourceExhausted) }
 fn reserve_text(length: usize,context: &EvalContext<'_>) -> Result<()> {
     if length > 16 * 1024 * 1024 { return Err(limit()); }
     context.reserve(length.checked_mul(2).and_then(|size|size.checked_add(64)).ok_or_else(limit)?)
@@ -807,7 +807,7 @@ fn reserve_text(length: usize,context: &EvalContext<'_>) -> Result<()> {
 fn arity(length: usize,min: usize,max: usize) -> Result<()> { if (min..=max).contains(&length) { Ok(()) } else { Err(error("Host form has the wrong number of arguments")) } }
 fn error(message: &str) -> Anomaly { Anomaly::fault("xtdb.error/unknown",message) }
 fn unsupported(message: &str) -> Anomaly { Anomaly::unsupported("rtdb.expr/regex-host-form",message) }
-fn limit() -> Anomaly { Anomaly::incorrect("rtdb.expr/regex-host-limit","Host pattern exceeds its instruction, depth or temporary text limit") }
+fn limit() -> Anomaly { Anomaly::incorrect("rtdb.expr/regex-host-limit","Host pattern exceeds its instruction, depth or temporary text limit").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {
@@ -1081,7 +1081,9 @@ mod tests {
         assert_eq!(text_bytes(JavaText::from_utf16(&[0xd83d])).unwrap(),3);
         assert_eq!(text_bytes(JavaText::from_utf16(&[0xd83d,0xde00])).unwrap(),4);
         assert!(reserve_text(16 * 1024 * 1024,&context).is_ok());
-        assert_eq!(reserve_text(16 * 1024 * 1024 + 1,&context).unwrap_err().code,"rtdb.expr/regex-host-limit");
+        let refused = reserve_text(16 * 1024 * 1024 + 1,&context).unwrap_err();
+        assert_eq!(refused.code,"rtdb.expr/regex-host-limit");
+        assert!(refused.is(rtdb_types::AnomalyKind::ProgramLimitExceeded));
         let source = JavaString::copy_utf8_untracked(&"a".repeat(8 * 1024 * 1024 + 1)).unwrap();
         let args = vec![HostValue::Text(source.clone()),HostValue::Text(source.clone()),HostValue::Function(Function::Identity)];
         assert_eq!(Function::Str.apply(args,&context).err().unwrap().message.as_deref(),Some("Host object string rendering is not implemented for this value"));

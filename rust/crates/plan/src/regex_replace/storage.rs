@@ -78,7 +78,7 @@ pub(super) fn add(a: usize, b: usize) -> Result<usize> { a.checked_add(b).ok_or_
 pub(super) fn array_bytes<T>(count: usize) -> Result<usize> {
     Layout::array::<T>(count).map(|layout| layout.size()).map_err(|_| super::size_error())
 }
-pub(super) fn allocation_error(cause: std::collections::TryReserveError) -> Anomaly { Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()) }
+pub(super) fn allocation_error(cause: std::collections::TryReserveError) -> Anomaly { Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted) }
 pub(super) fn owner_bytes() -> Result<usize> {
     let layout = Layout::new::<[AtomicUsize; 2]>().extend(Layout::new::<FormStorage>()).map_err(|_| super::size_error())?.0.pad_to_align();
     add(layout.size(), 256)

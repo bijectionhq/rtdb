@@ -310,7 +310,7 @@ pub fn parse_statement_batch_with_frontend_response<'input>(
     let bytes = Layout::array::<BatchStatement<'_>>(count).map_err(|_| batch_size())?.size();
     let storage = memory.reserve(bytes.checked_add(256).ok_or_else(batch_size)?)?;
     let mut statements = Vec::new();
-    statements.try_reserve_exact(count).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+    statements.try_reserve_exact(count).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
     let (mut starts, mut ends) = (SourceOffsets::new(source), SourceOffsets::new(source));
     let forms = FormAllocation::Tracked(memory);
     let mut next = 0;

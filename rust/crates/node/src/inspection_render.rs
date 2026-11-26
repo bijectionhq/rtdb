@@ -105,7 +105,7 @@ impl CellWriter {
                 result => (preferred, result?),
             };
             self.text.try_reserve_exact(capacity - self.text.len())
-                .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+                .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
             self.reservation = reservation;
         }
         self.text.push_str(value);

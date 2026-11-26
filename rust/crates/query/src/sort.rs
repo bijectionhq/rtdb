@@ -47,7 +47,7 @@ pub(crate) fn sort_ordinals(len: usize, context: &crate::QueryContext, mut compa
     }
     Ok(Indices { values: indices,_reservation: reservation })
 }
-fn size_error() -> rtdb_types::Anomaly { invalid("sort-size", "Sort state exceeds addressable memory") }
+fn size_error() -> rtdb_types::Anomaly { invalid("sort-size", "Sort state exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 /// The declared key types joined with every key observed; `seen` holds key-type tuples already joined, which change nothing.
 struct KeyTypes { values: Vec<LogicalType>, seen: Vec<Vec<LogicalType>>, _reservation: Arc<MemoryReservation> }

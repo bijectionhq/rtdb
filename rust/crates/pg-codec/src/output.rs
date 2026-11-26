@@ -5,7 +5,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::temporal_text::{TimestampText, date_text, interval_text, nanos};
 use rtdb_format::transit::TransitValue;
 use rtdb_types::format_iso_duration as duration_text;
-use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, AnomalyKind, PgType, Result, TimeUnit, Value};
 use crate::{EncodedValue, binary::{PG_EPOCH_DAYS, PG_EPOCH_MICROS}, invalid, size_error};
 
 mod arrow;
@@ -117,8 +117,8 @@ pub fn integer_in_range(ty: PgType, integer: i128) -> Result<()> {
         _ => i64::try_from(integer).is_ok(),
     };
     if fits { return Ok(()); }
-    Err(Anomaly::incorrect("xtdb/numeric-value-out-of-range", format!("{} out of range: {integer}", ty.format_name()))
-        .with_context("sql-state", "22003".into()))
+    Err(Anomaly::incorrect("rtdb.pgwire/integer-out-of-range", format!("{} out of range: {integer}", ty.format_name()))
+        .with_kind(AnomalyKind::NumericValueOutOfRange))
 }
 
 fn integer_bytes(ty: PgType, format: Format, integer: i128) -> Result<Vec<u8>> {

@@ -152,7 +152,7 @@ fn work_accounting_equals_utf8_bytes_and_does_not_price_surrogates_as_replacemen
     assert_eq!(work_bytes(JavaText::from_utf16(&[0xd800, 0xd800])).unwrap(), 6);
     let input = vec![0xd800; PATTERN_BYTES / 3 + 1];
     let error = compile_text(JavaText::from_utf16(&input), JavaText::from_utf8(""), &EvalContext::default()).err().unwrap();
-    assert!(matches!(error, CompileFailure::Resource(error) if error.code == "rtdb.expr/regex-limit"));
+    assert!(matches!(error, CompileFailure::Resource(error) if error.code == "rtdb.expr/regex-limit" && error.is(rtdb_types::AnomalyKind::ProgramLimitExceeded)));
 }
 
 #[test]

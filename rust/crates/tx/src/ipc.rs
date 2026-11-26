@@ -33,7 +33,7 @@ impl Output {
         let (capacity, reservation) = reserve_growth(&self.reservation, capacity, required)?;
         let additional = capacity - self.len();
         self.data.try_reserve_exact(additional)
-            .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+            .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
         self.reservation = reservation;
         Ok(())
     }
@@ -139,7 +139,7 @@ impl Write for DigestOutput<'_> {
             };
             let count = (end - self.prefix.len()).min(bytes.len());
             self.prefix.try_reserve_exact(count).map_err(|error| {
-                io::Error::other(Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))
+                io::Error::other(Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))
             })?;
             let (prefix, rest) = bytes.split_at(count);
             self.prefix.extend_from_slice(prefix);

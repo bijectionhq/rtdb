@@ -20,7 +20,7 @@ impl<'source> Walk<'_, 'source> {
                 FormAllocation::Tracked(memory) => Some(Arc::try_unwrap(memory.reserve(bytes)?).expect("new scratch reservation is unique")),
             };
             let mut next = Vec::new();
-            next.try_reserve_exact(capacity).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+            next.try_reserve_exact(capacity).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
             next.append(&mut self.events);
             drop(std::mem::replace(&mut self.events, next));
             self.reservation = reservation;

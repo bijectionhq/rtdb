@@ -69,7 +69,7 @@ fn growth<T>(values: &Vec<T>) -> Result<Option<(usize, usize)>> {
     Ok(Some((next, add(mul(mul(next, size_of::<T>())?, 16)?, 256)?)))
 }
 fn grow<T>(values: &mut Vec<T>, next: Option<(usize, usize)>) -> Result<()> {
-    if let Some((capacity, _)) = next { values.try_reserve_exact(capacity - values.len()).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?; }
+    if let Some((capacity, _)) = next { values.try_reserve_exact(capacity - values.len()).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()).with_kind(crate::AnomalyKind::ResourceExhausted))?; }
     Ok(())
 }
 

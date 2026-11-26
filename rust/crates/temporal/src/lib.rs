@@ -230,8 +230,8 @@ impl AdmittedCeiling {
         let reservation = memory.reserve(bytes)?;
         let mut valid = Vec::new();
         let mut system = Vec::new();
-        valid.try_reserve_exact(valid_capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
-        system.try_reserve_exact(capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+        valid.try_reserve_exact(valid_capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
+        system.try_reserve_exact(capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
         valid.extend_from_slice(valid_times);
         system.extend_from_slice(system_time_ceilings);
         Ok(Some(Self { ceiling: Ceiling { valid_times: valid, system_time_ceilings: system }, capacity, _reservation: reservation }))
@@ -344,7 +344,7 @@ impl<R> ResolvedRows<R> {
                 .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
             let reservation = memory.reserve(bytes)?;
             self.rows.try_reserve_exact(capacity - self.rows.len())
-                .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+                .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
             self.capacity = capacity;
             self._reservation = Some(reservation);
         }

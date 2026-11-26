@@ -102,7 +102,7 @@ fn push(out: &mut Vec<Value>, value: Value, context: &EvalContext<'_>) -> Result
         let capacity = out.capacity().saturating_mul(2).max(16).min(i32::MAX as usize);
         let additional = capacity - out.capacity();
         context.reserve(additional.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-        out.try_reserve_exact(additional).map_err(|_|Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate temporal series"))?;
+        out.try_reserve_exact(additional).map_err(|_|Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate temporal series").with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
     }
     out.push(value);
     Ok(())
@@ -115,7 +115,7 @@ impl GeneratedSeries {
             Self::Integer(series) => {
                 context.reserve(series.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
                 let mut out = Vec::new();
-                out.try_reserve_exact(series.len()).map_err(|_|Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate integer series"))?;
+                out.try_reserve_exact(series.len()).map_err(|_|Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate integer series").with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
                 out.extend((0..series.len()).map(|index|series.nth(index)));
                 Ok(Value::list(out))
             }

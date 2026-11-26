@@ -668,7 +668,7 @@ pub(crate) fn replace(args: &[Value], context: &EvalContext<'_>) -> Result<Value
     compile_replacement(text(&args[1])?,text(&args[2])?,args.get(3).map(text).transpose()?.unwrap_or(""),context)?.replace(source,context)
 }
 
-fn limit(message: &str) -> Anomaly { Anomaly::incorrect("rtdb.expr/regex-limit", message) }
+fn limit(message: &str) -> Anomaly { Anomaly::incorrect("rtdb.expr/regex-limit", message).with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 fn unsupported(message: &str) -> Anomaly { Anomaly::unsupported("rtdb.expr/regex-feature", message) }
 fn regex_error(error: fancy_regex::Error) -> Anomaly {
     match &error { fancy_regex::Error::RuntimeError(fancy_regex::RuntimeError::GraphemeBoundaryStart) => Anomaly::fault("xtdb.error/unknown", error.to_string()), fancy_regex::Error::RuntimeError(_) | fancy_regex::Error::CompileError(fancy_regex::CompileError::PatternSizeOverflow) => limit(&error.to_string()), fancy_regex::Error::CompileError(fancy_regex::CompileError::LookBehindNotConst) => illegal("Look-behind group does not have an obvious maximum length"), _ => illegal(&error.to_string()) }

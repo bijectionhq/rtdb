@@ -53,7 +53,15 @@ During extended Parse, the node's memory budget covers the temporary tokens used
 A directly prepared control retains its estimated parsing and binding allowance while a statement registration or bound portal holds it.
 A bound portal retains the body selected at Bind when a later Parse replaces the statement name.
 Executing the wrapper prepares its immediate child in the current session context.
-An error of kind `ResourceExhausted`, whatever its category or code, reports SQLSTATE `53200`.
+An error's SQLSTATE comes from an explicit state it carries, then from its `AnomalyKind`, then from upstream's `ex->pgw-err` table by category and code.
+The kinds mark conditions upstream XTDB has no error for, and report PostgreSQL's state for them, whatever their category or code:
+
+* `ResourceExhausted` (a memory budget, byte limit or allocator had no room) reports `53200`.
+* `ConfigurationLimitExceeded` (an operator-configured limit, such as the query spill cap) reports `53400`.
+* `ProgramLimitExceeded` (a fixed implementation limit, such as a compiled pattern's size) reports `54000`.
+* `NumericValueOutOfRange` (a number that does not fit its type, such as an integer cell wider than its PostgreSQL type) reports `22003`.
+
+An error without a kind keeps upstream's state, so an upstream `incorrect` code outside the table still reports `08P01`, as XTDB does.
 Planning warnings use severity `WARNING` and SQLSTATE `01000` and are sent in occurrence order before ParseComplete, simple-query results, or SQL `PREPARE` completion.
 A nested SQL `PREPARE` emits its terminal child's planning warnings when execution reaches that child.
 Planning warnings are sent once per preparation.

@@ -111,7 +111,7 @@ pub(super) fn message_size(sizes: impl IntoIterator<Item = usize>) -> Result<usi
 pub(super) fn message_buffer(capacity: usize) -> Result<String, PredictionError> {
     let mut buffer = String::new();
     buffer.try_reserve_exact(capacity).map_err(|error| {
-        PredictionError::Admission(Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))
+        PredictionError::Admission(Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))
     })?;
     Ok(buffer)
 }

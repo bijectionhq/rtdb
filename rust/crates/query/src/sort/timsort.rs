@@ -247,7 +247,7 @@ impl<C: FnMut(usize,usize) -> Result<Ordering>> TimSort<'_,C> {
     }
 }
 
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.query/sort-size","TimSort row count exceeds the JVM array domain") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.query/sort-size","TimSort row count exceeds the JVM array domain").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 fn contract_error() -> Anomaly { Anomaly::fault("xtdb.error/unknown","Comparison method violates its general contract!") }
 
 #[cfg(test)]

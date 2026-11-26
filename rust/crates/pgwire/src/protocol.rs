@@ -339,7 +339,7 @@ impl ProtocolSession {
                 let mut columns = Vec::<arrow_array::ArrayRef>::new();
                 let mut charges = Vec::new();
                 for reserve in [fields.try_reserve_exact(count), columns.try_reserve_exact(count), charges.try_reserve_exact(charge_slots)] {
-                    reserve.map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+                    reserve.map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
                 }
                 for index in 0..count {
                     let length = input.integer()?;
@@ -532,7 +532,7 @@ impl ProtocolSession {
         let oid_capacity = oids.capacity().max(parameter_count);
         let reservation = self.node.memory().reserve(retained_prepared_bytes(source, &command, oid_capacity, columns.as_deref())?)?;
         oids.try_reserve_exact(parameter_count.saturating_sub(oids.len()))
-            .map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+            .map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
         oids.resize(parameter_count, 0);
         Ok(Arc::new(Prepared { body: PreparedBody::Ordinary { source: source.into(), command, kind }, oids, columns, _reservation: reservation }))
     }
@@ -1505,7 +1505,7 @@ mod tests {
                     assert_eq!(decoded, integer, "{ty:?} {format:?}");
                 } else {
                     let error = direct.unwrap_err();
-                    assert_eq!(error.code, "xtdb/numeric-value-out-of-range");
+                    assert_eq!(error.code, "rtdb.pgwire/integer-out-of-range");
                     assert_eq!(crate::error::state(&error), "22003");
                     assert_eq!(codec.unwrap_err(), error);
                 }

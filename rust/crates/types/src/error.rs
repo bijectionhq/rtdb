@@ -22,15 +22,26 @@ pub enum AnomalyCategory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AnomalyKind {
-    /// A memory budget or byte limit had no room for the work.
+    /// A memory budget, byte limit or allocator had no room for the work.
     ResourceExhausted,
+    /// The work outgrew a limit the operator configured, such as the query spill cap.
+    ConfigurationLimitExceeded,
+    /// The work outgrew a fixed limit of the implementation, such as the size a compiled pattern may reach.
+    ProgramLimitExceeded,
+    /// A number did not fit the type it was to be stored or sent as.
+    NumericValueOutOfRange,
 }
 
 impl AnomalyKind {
     /// The kind of an anomaly read from a format that carries only its code, such as XTDB's Transit errors.
+    /// Every code listed here is raised only with its kind, so the code alone recovers it.
     pub fn from_wire_code(code: &str) -> Option<Self> {
         match code {
-            "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit" => Some(Self::ResourceExhausted),
+            "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit"
+            | "rtdb/allocation-failed" | "rtdb.expr/allocation-failed" => Some(Self::ResourceExhausted),
+            "rtdb.query/spill-limit" => Some(Self::ConfigurationLimitExceeded),
+            "rtdb.expr/regex-limit" | "rtdb.expr/regex-host-limit" | "rtdb.query/sort-size" => Some(Self::ProgramLimitExceeded),
+            "rtdb/decimal-precision" | "rtdb.pgwire/integer-out-of-range" => Some(Self::NumericValueOutOfRange),
             _ => None,
         }
     }
@@ -157,7 +168,22 @@ mod tests {
     fn wire_codes_of_exhausted_limits_decode_to_their_kind() {
         assert_eq!(AnomalyKind::from_wire_code("rtdb/memory-budget-exceeded"), Some(AnomalyKind::ResourceExhausted));
         assert_eq!(AnomalyKind::from_wire_code("rtdb.storage/memory-limit"), Some(AnomalyKind::ResourceExhausted));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/allocation-failed"), Some(AnomalyKind::ResourceExhausted));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.query/spill-limit"), Some(AnomalyKind::ConfigurationLimitExceeded));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.expr/regex-limit"), Some(AnomalyKind::ProgramLimitExceeded));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb/decimal-precision"), Some(AnomalyKind::NumericValueOutOfRange));
+        assert_eq!(AnomalyKind::from_wire_code("rtdb.pgwire/integer-out-of-range"), Some(AnomalyKind::NumericValueOutOfRange));
         assert_eq!(AnomalyKind::from_wire_code("xtdb/sql-error"), None);
+        assert_eq!(AnomalyKind::from_wire_code("xtdb.expression/overflow-error"), None);
+    }
+
+    #[test]
+    fn every_kind_serialises_under_its_kebab_case_name() {
+        for (kind, name) in [(AnomalyKind::ResourceExhausted, "resource-exhausted"), (AnomalyKind::ConfigurationLimitExceeded, "configuration-limit-exceeded"),
+            (AnomalyKind::ProgramLimitExceeded, "program-limit-exceeded"), (AnomalyKind::NumericValueOutOfRange, "numeric-value-out-of-range")] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+            assert_eq!(serde_json::from_value::<AnomalyKind>(name.into()).unwrap(), kind);
+        }
     }
 
     #[test]

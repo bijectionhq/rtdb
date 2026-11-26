@@ -337,7 +337,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
             self.work.reserve(layout.size()).map_err(PredictionError::Admission)?;
             let mut replacement = Vec::new();
             replacement.try_reserve_exact(capacity).map_err(|_| PredictionError::Admission(
-                Anomaly::incorrect("rtdb/allocation-failed", "Unable to allocate parser context children")))?;
+                Anomaly::incorrect("rtdb/allocation-failed", "Unable to allocate parser context children").with_kind(rtdb_types::AnomalyKind::ResourceExhausted)))?;
             replacement.append(children);
             *children = replacement;
         }

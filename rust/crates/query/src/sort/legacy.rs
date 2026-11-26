@@ -42,7 +42,7 @@ fn merge(source: &mut [usize],destination: &mut [usize],low: usize,high: usize,c
     }
     Ok(())
 }
-fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.query/sort-size","Legacy merge sort row count exceeds the JVM array domain") }
+fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.query/sort-size","Legacy merge sort row count exceeds the JVM array domain").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
 
 #[cfg(test)]
 mod tests {

@@ -13,7 +13,7 @@ use arrow_schema::{ArrowError, SchemaRef};
 use ctr::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::RecordSpans;
-use rtdb_types::Result;
+use rtdb_types::{Anomaly, AnomalyKind, Result};
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
 use crate::{
@@ -145,7 +145,7 @@ impl SpillRegion {
 /// The spill quota refusing more bytes: SQLSTATE 53400, which PostgreSQL reports when a query's temporary files
 /// exceed `temp_file_limit`.
 fn spill_limit(message: &str) -> rtdb_types::Anomaly {
-    invalid("spill-limit", message).with_kind(rtdb_types::AnomalyKind::ResourceExhausted).with_context("sql-state", "53400".into())
+    invalid("spill-limit", message).with_kind(rtdb_types::AnomalyKind::ConfigurationLimitExceeded)
 }
 
 pub(crate) struct SpillFile { path: TempPath, key: Option<SpillKey>, region: Arc<SpillRegion>, bytes: AtomicU64 }
@@ -283,12 +283,12 @@ impl SpillWriter {
                 let schema_bytes = crate::runtime_schema::schema_bound(schema)?;
                 match self.write_arrow(Some(1), &record, schema_bytes, memory, "spill-columns") {
                     Ok(()) => return Ok(()),
-                    Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => (),
+                    Err(error) if error.is(AnomalyKind::ResourceExhausted) || error.is(AnomalyKind::ConfigurationLimitExceeded) => (),
                     Err(error) => return Err(error),
                 }
             }
             Ok(None) => (),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
             Err(error) => return Err(error),
         }
         let mut fragments = FragmentBytes::new(memory)?;
@@ -729,6 +729,7 @@ fn single_join_spill_matches_the_encoded_record_with_only_span_scratch() {
     assert_eq!(writer.position().unwrap(), size);
     let error = writer.write_single_join_record(batch, &scratch).unwrap_err();
     assert_eq!(error.code, "rtdb.query/spill-limit");
+    assert!(error.is(AnomalyKind::ConfigurationLimitExceeded));
     assert_eq!(writer.position().unwrap(), size + 9);
     assert_eq!(spill.retained_bytes(), size + 9);
     assert_eq!(scratch.used_bytes(), 0);
@@ -778,6 +779,13 @@ fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() 
     drop((reader, batch));
     assert_eq!(spill.retained_bytes(), 0);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn a_disabled_spill_refuses_its_first_file_as_a_configured_limit() {
+    let error = Arc::new(SpillRegion::new(0).unwrap()).create().err().unwrap();
+    assert_eq!(error.code, "rtdb.query/spill-limit");
+    assert!(error.is(AnomalyKind::ConfigurationLimitExceeded));
 }
 
 #[test]

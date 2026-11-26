@@ -43,7 +43,7 @@ pub(crate) fn validate_coefficient(bytes: &[u8], precision: i32, bit_width: u16)
     physical_digits(bit_width)?;
     if bytes.len() != usize::from(bit_width / 8) { return Err(overflow()); }
     if precision <= 0 || digits(&BigInt::from_signed_bytes_be(bytes)) > precision as usize {
-        return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
+        return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision").with_kind(rtdb_types::AnomalyKind::NumericValueOutOfRange));
     }
     Ok(())
 }

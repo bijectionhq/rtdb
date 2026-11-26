@@ -63,7 +63,7 @@ impl SplitTokens {
                 let bytes = layout.size().checked_add(256).ok_or_else(token_array_size)?;
                 let replacement_reservation = memory.reserve(bytes)?;
                 let mut replacement = Vec::new();
-                replacement.try_reserve_exact(capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+                replacement.try_reserve_exact(capacity).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
                 replacement.append(values);
                 drop(std::mem::replace(values, replacement));
                 *reservation = Some(replacement_reservation);
@@ -99,7 +99,7 @@ fn collect_split_ranges(source: &str, tokens: &mut Vec<TokenWithSpan>, memory: &
     let bytes = layout.size().checked_add(256).ok_or_else(split_size)?;
     let reservation = memory.reserve(bytes)?;
     let mut spans = Vec::new();
-    spans.try_reserve_exact(count).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+    spans.try_reserve_exact(count).map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()).with_kind(rtdb_types::AnomalyKind::ResourceExhausted))?;
     for span in SpanBoundaryCursor::new(tokens.drain(..)) {
         spans.push(crate::parse::source_span(source, span));
     }
