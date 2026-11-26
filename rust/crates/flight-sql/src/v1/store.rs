@@ -7,9 +7,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use arrow_array::{ArrayRef, BinaryArray, RecordBatch, UInt64Array};
-use arrow_ipc::writer::StreamWriter;
-
 use bytes::Bytes;
 use prost::Message;
 use rtdb_index::branches::store::{KeyRange, MAX_PAGE_ENTRIES, Projection, StoreEntry, StoreRead, VALUE_COLUMN, ValueFilter, store_table};
@@ -42,22 +39,6 @@ fn ranges(ranges: Vec<proto::KeyRange>) -> Result<Vec<KeyRange>, Status> {
 
 fn incarnation(bytes: &[u8]) -> Result<[u8; 16], Status> {
     bytes.try_into().map_err(|_| error::incorrect("A store incarnation has 16 bytes"))
-}
-
-/// One page as an Arrow IPC stream: `key` Binary, `written` UInt64 and
-/// nullable `value` Binary.
-fn arrow_page(entries: Vec<StoreEntry>) -> Result<Vec<u8>, Status> {
-    let keys = BinaryArray::from_iter_values(entries.iter().map(|entry| entry.key.as_slice()));
-    let written = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.written.position()));
-    let values = BinaryArray::from_iter(entries.iter().map(|entry| entry.value.as_deref()));
-    let batch = RecordBatch::try_from_iter([
-        ("key", Arc::new(keys) as ArrayRef),
-        ("written", Arc::new(written) as ArrayRef),
-        ("value", Arc::new(values) as ArrayRef),
-    ]).map_err(crate::error::arrow)?;
-    let mut writer = StreamWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(crate::error::arrow)?;
-    writer.write(&batch).map_err(crate::error::arrow)?;
-    writer.into_inner().map_err(crate::error::arrow)
 }
 
 impl Service {
@@ -122,16 +103,11 @@ impl Service {
             // Every later range reads the cut the first one selected.
             at = At::Exactly(page.cut.basis);
             read_at = Some(page.cut.basis.position());
-            pages.push(if request.arrow {
-                proto::RangePage { entries: Vec::new(), resume: page.resume, arrow_ipc: arrow_page(page.entries)? }
-            } else {
-                proto::RangePage {
-                    entries: page.entries.into_iter().map(|entry| proto::Entry {
-                        key: entry.key, value: entry.value, written: entry.written.position(),
-                    }).collect(),
-                    resume: page.resume,
-                    arrow_ipc: Default::default(),
-                }
+            pages.push(proto::RangePage {
+                entries: page.entries.into_iter().map(|entry| proto::Entry {
+                    key: entry.key, value: entry.value, written: entry.written.position(),
+                }).collect(),
+                resume: page.resume,
             });
         }
         self.check_attachment(call, &database)?;

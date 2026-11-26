@@ -47,8 +47,7 @@ message ReadRequest {
   // each value, clipped to its length.
   uint32 slice_start = 7;
   uint32 slice_len = 8;
-  // Return each page as one Arrow IPC stream instead of entries.
-  bool arrow = 9;
+  reserved 9;
   // Return only entries whose whole value passes this filter, in the wire form
   // of Bijection's ValueFilter (vendor/bijection-store-filter).
   // Evaluated before the projection; limit counts returned entries.
@@ -66,9 +65,7 @@ message RangePage {
   repeated Entry entries = 1;
   // Present when the limit stopped this range: resume after this key.
   optional bytes resume = 2;
-  // With `arrow`: one Arrow IPC stream with columns `key` Binary,
-  // `written` UInt64 and nullable `value` Binary; entries is then empty.
-  bytes arrow_ipc = 3;
+  reserved 3;
 }
 
 message ReadReply {

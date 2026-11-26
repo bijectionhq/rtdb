@@ -108,9 +108,9 @@ pub fn invalid_store_value() -> Anomaly {
     Anomaly::fault("rtdb.store/invalid-entry", "A store entry must hold a binary id and a binary value")
 }
 
-fn value_of(event: &BranchEvent) -> Result<Vec<u8>> {
+fn value_of(event: &BranchEvent) -> Result<&[u8]> {
     match event.image.as_ref().and_then(|image| image.cells.get(VALUE_COLUMN)) {
-        Some(Value::Binary(value)) => Ok(value.clone()),
+        Some(Value::Binary(value)) => Ok(value),
         _ => Err(invalid_store_value()),
     }
 }
@@ -146,7 +146,7 @@ impl BranchView<'_> {
             let written = event.written_basis().ok_or_else(invalid_store_value)?;
             let value = match (read.projection, whole) {
                 (Projection::Keys, _) | (_, None) => None,
-                (projection, Some(whole)) => projection.apply(&whole),
+                (projection, Some(whole)) => projection.apply(whole),
             };
             entries.push(StoreEntry { key: key.clone(), value, written });
         }
