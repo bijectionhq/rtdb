@@ -224,8 +224,14 @@ impl Store {
                     return Outcome::Now(failed("invalid quorum installation proof"));
                 }
                 let key = self.journal.signer.public_key();
-                let replay = proof.certificate.votes.iter().any(|vote| vote.key.as_ref() == key)
-                    || self.holds_decision_payload(&proof.certificate).await;
+                let replay = if proof.certificate.votes.iter().any(|vote| vote.key.as_ref() == key) {
+                    true
+                } else {
+                    match self.holds_decision_payload(&proof.certificate).await {
+                        Ok(held) => held,
+                        Err(error) => return Outcome::Now(failed(error)),
+                    }
+                };
                 (proof.certificate.statement.scope.stream.clone(), Box::new(move |state| state.expose_certificate(proof, replay)))
             }
             RequestBody::Seal(seal) => {
@@ -471,35 +477,40 @@ impl Store {
         digest.bytes().as_slice() == transfer.digest.as_ref()
     }
 
+    /// Whether this journal holds the certificate's exact cut, read a digest page at a time.
     /// A repaired journal can establish replay from the exact digest. A copy
     /// remains ineligible to supply an original vote for a timed decision.
-    async fn holds_decision_payload(&self, certificate: &DecisionCertificate) -> bool {
-        let Ok(_permit) = self.digest_pages.try_acquire() else { return false; };
+    /// An `Err` means the cut could not be checked now, which is not a "no".
+    async fn holds_decision_payload(&self, certificate: &DecisionCertificate) -> Result<bool, String> {
+        let Ok(_permit) = self.digest_pages.try_acquire() else { return Err("decision proof capacity exhausted".into()); };
         let statement = &certificate.statement;
         let cut = &statement.prefix;
-        let Some(slot) = self.existing(&statement.scope.stream) else { return false; };
-        let first = cut.predecessor + 1;
-        let selection = {
-            let state = slot.state.lock();
-            if !state.admits_decision(statement) || first <= state.trim || cut.through > state.last() {
-                return false;
-            }
-            self.select(&state, first, cut.through, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES)
-        };
-        let journal = Arc::clone(&self.journal);
         let predecessor = <[u8; 32]>::try_from(cut.predecessor_digest.as_ref()).expect("validated decision digest");
-        let digest = cut.digest.clone();
-        let through = cut.through;
-        tokio::task::spawn_blocking(move || {
-            let Ok(entries) = journal.resolve(selection) else { return false; };
-            if entries.entries.len() as i64 != through - first + 1 { return false; }
-            let mut chain = RetainedChain::from_bytes(predecessor);
-            for (index, entry) in entries.entries.iter().enumerate() {
-                if entry.lsn != first + index as i64 { return false; }
+        let mut chain = RetainedChain::from_bytes(predecessor);
+        let mut next = cut.predecessor + 1;
+        while next <= cut.through {
+            let Some(slot) = self.existing(&statement.scope.stream) else { return Ok(false); };
+            let selection = {
+                let state = slot.state.lock();
+                if !state.admits_decision(statement) || next <= state.trim || cut.through > state.last() {
+                    return Ok(false);
+                }
+                self.select(&state, next, cut.through, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES)
+            };
+            let journal = Arc::clone(&self.journal);
+            let entries = match tokio::task::spawn_blocking(move || journal.resolve(selection)).await {
+                Ok(Ok(entries)) => entries.entries,
+                Ok(Err(error)) => return Err(format!("reading the decision payload failed: {error}")),
+                Err(error) => return Err(format!("reading the decision payload failed: {error}")),
+            };
+            if entries.is_empty() { return Ok(false); }
+            for entry in &entries {
+                if entry.lsn != next { return Ok(false); }
                 chain.append(entry);
+                next += 1;
             }
-            digest.as_ref() == chain.bytes()
-        }).await.unwrap_or(false)
+        }
+        Ok(cut.digest.as_ref() == chain.bytes())
     }
 
     pub async fn vote_decision(&self, request: DecisionVoteRequest) -> ResponseBody {
@@ -724,6 +735,57 @@ mod tests {
     use crate::protocol::{Check, DropStream, Overwrite};
     use crate::server::state::Event;
     use bytes::Bytes;
+
+    fn certified_stream(store: &Store, entries: usize) -> DecisionCertificate {
+        use crate::decision::{DecisionPrefix, DecisionScope, DecisionStatement};
+        let key = rtdb_storage::attestation::SigningKey::open(&rtdb_storage::attestation::SigningKey::generate().unwrap()).unwrap();
+        let scope = DecisionScope {
+            stream: "decided".into(), epoch: 1, quorum: 1,
+            journals: vec![crate::attestation::journal_id(&key.public_key()).to_string()],
+        };
+        let entries: Vec<Entry> = (0..entries as i64).map(|lsn| Entry {
+            lsn, epoch: 1, timestamp: lsn, guarded: false, guarded_before: None, timed_origin: None, payload: Bytes::from(lsn.to_string()),
+        }).collect();
+        let predecessor = [3; 32];
+        let mut chain = RetainedChain::from_bytes(predecessor);
+        for entry in &entries { chain.append(entry); }
+        let prefix = DecisionPrefix {
+            predecessor: -1, predecessor_digest: Bytes::copy_from_slice(&predecessor),
+            through: entries.len() as i64 - 1, digest: Bytes::copy_from_slice(&chain.bytes()), guarded: false, guarded_before: None,
+        };
+        let ensemble = scope.ensemble().unwrap();
+        let slot = store.slot("decided");
+        let mut state = slot.state.lock();
+        state.seal(1);
+        assert!(matches!(state.overwrite(1, 0, entries, true, -1).reply, ResponseBody::Accepted(_)));
+        assert!(matches!(state.activate(1, ensemble, true).reply, ResponseBody::Accepted(_)));
+        DecisionCertificate { statement: DecisionStatement { scope, prefix }, votes: Vec::new() }
+    }
+
+    #[tokio::test]
+    async fn a_held_cut_longer_than_one_digest_page_is_eligible_for_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), false, 0, None).unwrap();
+        let store = Store::new(Arc::new(journal), recovered, mpsc::unbounded_channel().0);
+        let certificate = certified_stream(&store, DIGEST_PAGE_ENTRIES + 7);
+        assert_eq!(store.holds_decision_payload(&certificate).await, Ok(true));
+
+        let mut foreign = certificate;
+        foreign.statement.prefix.digest = Bytes::from_static(&[9; 32]);
+        assert_eq!(store.holds_decision_payload(&foreign).await, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn a_cut_that_cannot_be_checked_now_is_an_error_not_a_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), false, 0, None).unwrap();
+        let store = Store::new(Arc::new(journal), recovered, mpsc::unbounded_channel().0);
+        let certificate = certified_stream(&store, 3);
+        let busy = store.digest_pages.try_acquire_many(CONCURRENT_DIGEST_PAGES as u32).unwrap();
+        assert!(store.holds_decision_payload(&certificate).await.is_err());
+        drop(busy);
+        assert_eq!(store.holds_decision_payload(&certificate).await, Ok(true));
+    }
 
     #[tokio::test]
     async fn a_full_journal_queue_delays_the_decision_until_capacity_is_available() {
