@@ -1,20 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/bijection-geometry", "vendor/bijection-store-derive", "vendor/bijection-store-filter", "vendor/bijection-store-judge", "vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser", "vendor/datafusion-common", "vendor/datafusion-doc", "vendor/datafusion-execution", "vendor/datafusion-expr", "vendor/datafusion-expr-common", "vendor/datafusion-functions", "vendor/datafusion-functions-aggregate-common", "vendor/datafusion-functions-window-common", "vendor/datafusion-macros", "vendor/datafusion-physical-expr", "vendor/datafusion-physical-expr-common"]
+exclude = ["vendor/bijection-geometry", "vendor/bijection-store-derive", "vendor/bijection-store-filter", "vendor/bijection-store-judge", "vendor/apache-avro", "vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src", "vendor/sqlparser"]
 
 [patch.crates-io]
-datafusion-common = { path = "vendor/datafusion-common" }
-datafusion-doc = { path = "vendor/datafusion-doc" }
-datafusion-execution = { path = "vendor/datafusion-execution" }
-datafusion-expr = { path = "vendor/datafusion-expr" }
-datafusion-expr-common = { path = "vendor/datafusion-expr-common" }
-datafusion-functions = { path = "vendor/datafusion-functions" }
-datafusion-functions-aggregate-common = { path = "vendor/datafusion-functions-aggregate-common" }
-datafusion-functions-window-common = { path = "vendor/datafusion-functions-window-common" }
-datafusion-macros = { path = "vendor/datafusion-macros" }
-datafusion-physical-expr = { path = "vendor/datafusion-physical-expr" }
-datafusion-physical-expr-common = { path = "vendor/datafusion-physical-expr-common" }
 rustls = { path = "vendor/rustls" }
 openssl-src = { path = "vendor/openssl-src" }
 
@@ -78,10 +67,6 @@ arrow-buffer = "=58.4.1"
 arrow-data = { version = "=58.4.1", features = ["ffi"] }
 arrow-schema = { version = "=58.4.1", features = ["ffi", "serde"] }
 arrow-select = "=58.4.1"
-datafusion-common = { version = "=54.2.0", default-features = false }
-datafusion-expr = { version = "=54.2.0", default-features = false }
-datafusion-physical-expr = { version = "=54.2.0", default-features = false }
-datafusion-functions = { version = "=54.2.0", default-features = false, features = ["math_expressions", "string_expressions", "unicode_expressions"] }
 arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
 async-trait = "0.1"
 memmap2 = "=0.9.12"
