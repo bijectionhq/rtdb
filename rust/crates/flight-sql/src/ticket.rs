@@ -10,14 +10,15 @@ use tonic::Status;
 
 use crate::{error::{invalid, status}, state::Owner, wire};
 
-const VERSION: &[u8] = b"RTDBFT\x04";
+const VERSION: &[u8] = b"RTDBFT\x05";
 const MAC_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
 const RUN: u8 = 1;
 const INSPECT: u8 = 2;
 
 /// A self-contained query ticket; nothing about an issued ticket is retained by the server.
-/// A run ticket is unsigned and redeemable by any session, as the reference's `QueryTicket.Run` is; an inspection is signed for its session.
+/// A run ticket is unsigned and redeemable by any session, and after a restart, as the reference's `QueryTicket.Run` is: it names its databases
+/// by name and basis alone. An inspection is signed for its session, and so dies with it.
 pub(crate) enum Ticket {
     Run(QueryRun),
     Inspect(Inspection),
@@ -52,16 +53,8 @@ pub(crate) struct TicketBasis {
 pub(crate) enum Cut {
     /// A restored SQL snapshot, which the token names.
     Snapshot(String),
-    /// Each database's cut; a database absent from the map sees no transaction.
-    Visible(BTreeMap<String, Visible>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Visible {
-    /// The `Database::attachment` the cut was taken from; another attachment under the same name has another history.
-    pub attachment: u64,
-    /// The last visible system time; `None` sees no transaction.
-    pub through: Option<Timestamp>,
+    /// Each database's last visible system time, by name; `None`, or a database absent from the map, sees no transaction.
+    Visible(BTreeMap<String, Option<Timestamp>>),
 }
 
 impl TicketBasis {
@@ -70,7 +63,7 @@ impl TicketBasis {
         let (snapshot, resume_token) = match &self.cut {
             Cut::Snapshot(token) => (TimeBasis::default(), Some(token.clone())),
             Cut::Visible(visible) => (TimeBasis { databases: databases.into_iter().chain(visible.keys().cloned()).map(|name| {
-                let time = visible.get(&name).and_then(|visible| visible.through).unwrap_or(Timestamp::MIN);
+                let time = visible.get(&name).copied().flatten().unwrap_or(Timestamp::MIN);
                 (name, vec![Some(Instant::from(time))])
             }).collect() }, None),
         };
@@ -133,7 +126,7 @@ impl Ticket {
             Self::Run(run) => {
                 let cut = match &run.basis.cut {
                     Cut::Snapshot(token) => token.len(),
-                    Cut::Visible(databases) => databases.keys().try_fold(0usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 32)?))?,
+                    Cut::Visible(databases) => databases.keys().try_fold(0usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 16)?))?,
                 };
                 [run.database.len(), run.sql.len(), strings(&run.search_path)?, run.basis.timezone.len(), cut, run.params.as_ref().map_or(0, Bytes::len)]
                     .into_iter().try_fold(0usize, wire::add)?
@@ -174,10 +167,9 @@ impl Ticket {
                     Cut::Visible(databases) => {
                         bytes.push(1);
                         put_len(&mut bytes, databases.len())?;
-                        for (name, visible) in databases {
+                        for (name, through) in databases {
                             put_string(&mut bytes, name)?;
-                            bytes.extend_from_slice(&visible.attachment.to_be_bytes());
-                            put_time(&mut bytes, visible.through);
+                            put_time(&mut bytes, *through);
                         }
                     }
                 }
@@ -229,9 +221,7 @@ impl Ticket {
                     let mut databases = BTreeMap::new();
                     for _ in 0..count {
                         let name = take_string(&mut body)?;
-                        need(&body, 8)?;
-                        let attachment = body.get_u64();
-                        databases.insert(name, Visible { attachment, through: take_time(&mut body)? });
+                        databases.insert(name, take_time(&mut body)?);
                     }
                     Cut::Visible(databases)
                 } else {
@@ -344,10 +334,7 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let owner = Owner::Authenticated(Uuid::from_bytes([7; 16]));
         let signer = binding("session", owner, b"key");
-        let cut = Cut::Visible(BTreeMap::from([
-            ("empty".to_owned(), Visible { attachment: 3, through: None }),
-            ("xtdb".to_owned(), Visible { attachment: u64::MAX, through: Some(Timestamp(1_234_567)) }),
-        ]));
+        let cut = Cut::Visible(BTreeMap::from([("empty".to_owned(), None), ("xtdb".to_owned(), Some(Timestamp(1_234_567)))]));
         let params = Bytes::from_static(b"\xff\x00\x83\x59");
         {
             let encoded = run(cut, Some(params.clone())).encode(&signer, &memory).unwrap();
@@ -356,7 +343,7 @@ mod tests {
             assert_eq!(decoded.search_path, ["public", "other"]);
             assert_eq!(decoded.params, Some(params));
             let Cut::Visible(cut) = &decoded.basis.cut else { panic!("visible cut") };
-            assert_eq!((cut["empty"], cut["xtdb"]), (Visible { attachment: 3, through: None }, Visible { attachment: u64::MAX, through: Some(Timestamp(1_234_567)) }));
+            assert_eq!((cut["empty"], cut["xtdb"]), (None, Some(Timestamp(1_234_567))));
             let basis = decoded.basis.query_basis(BTreeSet::from(["attached".to_owned()]));
             assert_eq!(basis.current_time, Instant::new(-1, 999_999_999).unwrap());
             assert_eq!((basis.timezone.as_str(), basis.snapshot_time, basis.has_await_floor, basis.resume_token), ("Europe/Paris", Some(Timestamp(-1)), true, None));
@@ -386,7 +373,7 @@ mod tests {
         let mut trailing = encoded.to_vec();
         trailing.push(0);
         assert!(Ticket::decode(&Bytes::from(trailing), &signer).is_err());
-        assert!(Ticket::decode(&Bytes::from_static(b"RTDBFT\x03"), &signer).is_err());
+        assert!(Ticket::decode(&Bytes::from_static(b"RTDBFT\x04\x01"), &signer).is_err(), "a ticket naming process-local attachments is refused");
     }
 
     #[test]

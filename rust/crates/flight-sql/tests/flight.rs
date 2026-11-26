@@ -3319,5 +3319,28 @@ async fn do_action_decodes_bodies_within_the_message_limit_and_refuses_bodies_pa
     running.stop().await;
 }
 
+#[tokio::test]
+async fn run_tickets_redeem_on_a_restarted_server_at_their_basis_while_inspection_tickets_do_not() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id) VALUES (1)", None).await;
+    let run = client.info("SELECT COUNT(*) AS n FROM docs", None).await;
+    let inspection = client.info("SHOW search_path", None).await;
+    client.update("INSERT INTO docs (_id) VALUES (2)", None).await;
+
+    // A second server on the node has a fresh ticket key and no sessions, as a restarted one does.
+    let auth = Authenticator::open(AuthConfig::SingleRootUser { password: None }, MemoryBudget::new(64 << 20), Arc::new(TickClock(AtomicI64::new(1_000_000))), Arc::new(NoHttp)).await.unwrap();
+    let config = FlightConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    let (restarted, driver) = ServerDriver::bind_with_clock(config, running.node.clone(), auth, Arc::new(ManualClock(AtomicI64::new(0)))).await.unwrap();
+    let restarted_task = tokio::spawn(driver.run());
+    let mut later = Client::connect(&restarted, None).await;
+    assert_eq!(integer(&later.redeem(&run).await[0], 0, 0), 1, "the run ticket reads at the basis it was described at");
+    let ticket = inspection.endpoint[0].ticket.clone().unwrap();
+    assert_eq!(later.client.do_get(later.request(ticket)).await.unwrap_err().code(), tonic::Code::NotFound);
+    restarted.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), restarted_task).await.unwrap().unwrap().unwrap();
+    running.stop().await;
+}
+
 #[path = "flight/v1_contract.rs"]
 mod v1_contract;

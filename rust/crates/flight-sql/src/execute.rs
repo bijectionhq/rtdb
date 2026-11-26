@@ -10,7 +10,7 @@ use rtdb_tx::SqlArguments;
 use rtdb_types::{LogicalType, Timestamp};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Response, Status};
-use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis, Visible}, wire};
+use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis}, wire};
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize, pub plan: Option<PreparedSql> }
 
@@ -54,40 +54,18 @@ async fn open_query(prepared: &PreparedSql, context: Arc<QueryContext>, params: 
     prepared.open_query_columns_typed(context, Vec::new(), &[]).await.map_err(status)
 }
 
-/// Each database's last visible system time in a captured catalog, so that a later read can be capped to the same cut.
-/// `attachments` were read before `context` was opened; an attachment that changed in between cannot be named for the cut.
-fn visible_cut(context: &QueryContext, attachments: &BTreeMap<String, u64>, node: &rtdb_node::Node, memory: &Arc<MemoryBudget>) -> Result<(BTreeMap<String, Visible>, Arc<MemoryReservation>), Status> {
+/// Each database's last visible system time in a captured catalog, by name, so that a later read, after a restart too, can be capped to the same cut.
+fn visible_cut(context: &QueryContext, memory: &Arc<MemoryBudget>) -> Result<(BTreeMap<String, Option<Timestamp>>, Arc<MemoryReservation>), Status> {
     let bytes = context.catalog.database_names().try_fold(256usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 96)?))?;
     let charge = memory.reserve(bytes).map_err(status)?;
     let cut = context.catalog.database_names().map(|name| {
-        let attachment = attachments.get(name).copied()
-            .filter(|attachment| node.catalog().database(name).is_ok_and(|current| current.attachment() == *attachment))
-            .ok_or_else(|| Status::unavailable("A database was attached or replaced while the query was described"))?;
         let database = context.catalog.database(name).map_err(status)?;
         let through = database.partitions.first().and_then(|snapshot| snapshot.tx_basis().map(|head| {
             snapshot.system_time_cap().map_or(head.system_time, |cap| cap.min(head.system_time))
         }));
-        Ok((name.to_owned(), Visible { attachment, through }))
+        Ok((name.to_owned(), through))
     }).collect::<Result<_, Status>>()?;
     Ok((cut, charge))
-}
-
-fn attachments(node: &rtdb_node::Node) -> BTreeMap<String, u64> {
-    node.catalog().open_databases().into_iter().map(|(name, database)| (name, database.attachment())).collect()
-}
-
-/// A cut names the attachment it was taken from; a database replaced since then under the same name has an unrelated history.
-/// Checked before the cut is opened, so that a replacement reads as unknown rather than as a basis beyond its head, and again after, for one that raced the opening.
-fn check_attachments<'a>(names: impl Iterator<Item = &'a str>, cut: &Cut, node: &rtdb_node::Node) -> Result<(), Status> {
-    let Cut::Visible(cut) = cut else { return Ok(()) };
-    for name in names {
-        if let Some(visible) = cut.get(name)
-            && node.catalog().database(name).is_ok_and(|current| current.attachment() != visible.attachment)
-        {
-            return Err(Status::not_found("The query ticket's database was replaced"));
-        }
-    }
-    Ok(())
 }
 
 impl Service {
@@ -170,7 +148,6 @@ impl Service {
                 execute_prepared_update(&mut native, &prepared, arguments).await?;
                 return self.empty_update_info();
             }
-            let attachments = attachments(&self.0.node);
             let (basis, context) = Box::pin(native.read_context(&token)).await.map_err(status)?;
             let types = match &params {
                 Some(params) => params.query_types(self.memory()).await?,
@@ -181,7 +158,7 @@ impl Service {
             context.reading(async { Ok(()) }).await.map_err(status)?;
             let cut = match &basis.resume_token {
                 Some(token) => Cut::Snapshot(token.clone()),
-                None => { let (cut, charge) = visible_cut(&context, &attachments, &self.0.node, self.memory())?; cut_charge = Some(charge); Cut::Visible(cut) }
+                None => { let (cut, charge) = visible_cut(&context, self.memory())?; cut_charge = Some(charge); Cut::Visible(cut) }
             };
             let params = params.filter(|params| params.batch().num_columns() != 0)
                 .map(|params| wire::parameter_ipc(params.batch(), self.memory())).transpose()?.flatten();
@@ -228,9 +205,7 @@ impl Service {
             }
             (Ticket::Run(run), None) => {
                 let databases = self.0.node.catalog().database_names();
-                check_attachments(databases.iter().map(String::as_str), &run.basis.cut, &self.0.node)?;
                 let context = Box::pin(native.query_context_at(&run.basis.query_basis(databases), &token)).await.map_err(status)?;
-                check_attachments(context.catalog.database_names(), &run.basis.cut, &self.0.node)?;
                 drop(native);
                 let prepared = PreparedSql::prepare(sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("invalid ticket")); }
