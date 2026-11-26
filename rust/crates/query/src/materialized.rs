@@ -97,7 +97,7 @@ impl ReplayBinding {
 
     async fn write(&self, mut input: BoxBatchCursor, schema: Schema) -> Result<Replay> {
         let memory = &self.context.memory;
-        let max_bytes = (memory.available_bytes() / 4).min(64 << 20);
+        let options = &self.context.options;
         let mut buffered = BufferedReplay { pages: Vec::new(), reservation: memory.reserve(0)? };
         let mut rows = 0usize;
         let mut bytes = 0usize;
@@ -109,8 +109,7 @@ impl ReplayBinding {
                 Err(error) => return Err(error),
             };
             bytes = bytes.saturating_add(retained).saturating_add(std::mem::size_of::<ColumnBatch>());
-            let spill = if rows > self.context.options.materialized_spill_rows || bytes > max_bytes
-                || bytes > memory.available_bytes() {
+            let spill = if rows > options.materialized_spill_rows || bytes > options.materialized_memory_bytes {
                 Some(batch)
             } else {
                 buffered.try_push(batch)?
@@ -288,6 +287,23 @@ mod tests {
         assert!(matches!(page.columns[0], crate::columnar::Column::Arrow { .. }));
         assert_eq!(page.columns[0].value(0).unwrap(), value);
         assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_binding_spills_past_its_configured_bytes_and_not_for_what_else_holds_its_budget() {
+        for (materialized_memory_bytes, crowded, spills) in [(1, false, true), (64 << 20, true, false)] {
+            let context = context_with_options(QueryOptions { materialized_memory_bytes, ..Default::default() });
+            let definition = definition();
+            let _other = crowded.then(|| context.memory.reserve(context.memory.available_bytes() - (1 << 20)).unwrap());
+            let pages = VecDeque::from(vec![vec![1, 2]; 64]);
+            let input = Box::new(Pages { pages, polls: Arc::new(AtomicUsize::new(0)), memory: Arc::clone(&context.memory) });
+            let scope = BindingScope::columns(Arc::clone(&definition), input, definition.relation.schema().clone(), None, Arc::clone(&context)).unwrap();
+            let mut reader = scope.open_columns(&definition).await.unwrap();
+            assert_eq!(context.spill_bytes() > 0, spills, "{materialized_memory_bytes}");
+            let mut rows = 0;
+            while let Some(page) = reader.next_batch().await.unwrap() { rows += page.len; }
+            assert_eq!(rows, 128);
+        }
     }
 
     #[tokio::test]

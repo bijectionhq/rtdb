@@ -906,10 +906,10 @@ impl crate::columnar::BatchCursor for BatchDistinct {
             let memory = &context.memory;
             let baseline = *self.baseline.get_or_insert_with(|| memory.used_bytes());
             // Spilling starts only once a key is held, so that each partitioning level makes progress.
-            if self.overflow.is_none() && self.seen.len() != 0 && self.depth < crate::spill::MAX_SPILL_DEPTH
-                && crate::spill::hash_spill_due(context, memory.used_bytes().saturating_sub(baseline), &batch)?
+            if self.overflow.is_none() && self.seen.len() != 0
+                && crate::spill::hash_spill_due(&context.options, self.depth, memory.used_bytes().saturating_sub(baseline))
             {
-                self.overflow = Some(crate::spill::HashPartitions::new(self.depth, memory)?);
+                self.overflow = Some(crate::spill::HashPartitions::new(self.depth, context)?);
             }
             if let Some(partitions) = &mut self.overflow {
                 validate_distinct_types(self.schema.schema())?;

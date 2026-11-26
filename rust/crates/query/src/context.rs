@@ -436,15 +436,24 @@ impl rtdb_expr::PgCatalogLookup for CatalogSnapshot {
 pub struct QueryOptions {
     pub batch_rows: usize,
     pub list_batch_rows: usize,
+    /// Bytes a sort may hold, ordering scratch included, before it spills its block as a sorted run.
     pub sort_memory_bytes: usize,
+    /// The largest limit a sort answers by keeping only its candidates; a larger one sorts blocks and spills them.
+    pub top_k_rows: usize,
     /// Bytes a hash aggregation or DISTINCT may grow by before it sends rows of new keys to disk.
-    /// It also spills once the budget could not emit what it holds.
     pub hash_memory_bytes: usize,
+    /// Fan-out of one level of hash partitioning; at least two, so that each level separates keys.
+    pub spill_partitions: usize,
+    /// Hash partitioning levels after which an operator holds what remains in memory: keys sharing a 32-bit hash never
+    /// separate, so this bounds the levels hash collisions alone would add.
+    pub max_spill_depth: u32,
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
     /// Disk bytes one query's spill files may hold at once; zero disables spilling.
     pub spill_limit_bytes: u64,
     pub materialized_spill_rows: usize,
+    /// Bytes a materialized binding may buffer before it writes its pages to disk instead.
+    pub materialized_memory_bytes: usize,
     pub bypass_temporal_pruning: bool,
     /// SQL GENERATE_SERIES excludes its endpoint when the process compatibility setting is enabled.
     pub generate_series_end_exclusive: bool,
@@ -452,7 +461,14 @@ pub struct QueryOptions {
     pub object_sort: rtdb_types::ObjectSort,
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, hash_memory_bytes: usize::MAX, join_build_rows: 100_000, spill_limit_bytes: crate::spill::default_spill_limit_bytes(), materialized_spill_rows: 100_000, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
+    fn default() -> Self {
+        Self {
+            batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 << 20, top_k_rows: 12_800, hash_memory_bytes: 64 << 20,
+            spill_partitions: 16, max_spill_depth: 6, join_build_rows: 100_000, spill_limit_bytes: 1 << 30, materialized_spill_rows: 100_000,
+            materialized_memory_bytes: 64 << 20, bypass_temporal_pruning: false, generate_series_end_exclusive: false,
+            object_sort: rtdb_types::ObjectSort::default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -496,6 +512,7 @@ impl QueryContext {
         if options.batch_rows == 0 || options.list_batch_rows == 0 || options.sort_memory_bytes == 0 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
+        if options.spill_partitions < 2 { return Err(invalid("invalid-options", "Spill partitions must be at least two")); }
         if catalog.databases.values().any(|database| database.storage.object_store().local_erasure_custody().is_some()) {
             options.spill_limit_bytes = 0;
         }

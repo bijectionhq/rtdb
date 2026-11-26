@@ -312,10 +312,10 @@ impl AggregateCursor {
             if batch.len == 0 { continue; }
             let baseline = *baseline.get_or_insert_with(|| memory.used_bytes());
             // Spilling starts only once a group is held, so that each partitioning level makes progress.
-            if overflow.is_none() && index.len() != 0 && self.depth < crate::spill::MAX_SPILL_DEPTH
-                && crate::spill::hash_spill_due(context, memory.used_bytes().saturating_sub(baseline), &batch)?
+            if overflow.is_none() && index.len() != 0
+                && crate::spill::hash_spill_due(&context.options, self.depth, memory.used_bytes().saturating_sub(baseline))
             {
-                overflow = Some(crate::spill::HashPartitions::new(self.depth, memory)?);
+                overflow = Some(crate::spill::HashPartitions::new(self.depth, context)?);
             }
             let _mapping = memory.reserve(batch.len.checked_mul(std::mem::size_of::<usize>() + std::mem::size_of::<Option<usize>>())
                 .ok_or_else(|| invalid("aggregate-size", "Group mapping exceeds addressable memory"))?)?;

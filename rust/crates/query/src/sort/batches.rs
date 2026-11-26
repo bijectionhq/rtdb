@@ -104,7 +104,7 @@ impl BatchSort {
         let mut total_rows = 0usize;
         let limit = usize::try_from(self.plan.limit).unwrap_or(usize::MAX);
         // A small limit keeps only its candidates between batches, so the block stays bounded whatever the input size.
-        let retained_rows = (limit != 0 && limit <= TOP_K_ROWS)
+        let retained_rows = (limit != 0 && limit <= context.options.top_k_rows)
             .then(|| limit.saturating_mul(2).max(context.options.batch_rows));
         while let Some(batch) = input.next_batch().await? {
             context.check_cancelled()?;
@@ -120,12 +120,12 @@ impl BatchSort {
                 }
             }
             let payload_bytes = batch.working_set_bytes(&context.memory)?;
+            let rows = block.positions.len().saturating_add(batch.len);
             if !block.positions.is_empty()
-                && (block.charged().saturating_add(payload_bytes)
+                && (block.charged().saturating_add(payload_bytes).saturating_add(ordering_bytes(rows))
                     > context.options.sort_memory_bytes
                     || (retained_rows.is_none() || !self.orders_consistently(&block, &key_types))
-                        && block.positions.len().saturating_add(batch.len) > BLOCK_ROWS
-                    || ordering_pressure(&context.memory, block.positions.len().saturating_add(batch.len)))
+                        && rows > BLOCK_ROWS)
             {
                 key_types.validate()?;
                 let full = std::mem::replace(
@@ -379,15 +379,10 @@ enum Sorted {
     Spill(SpillReader),
 }
 
-/// The largest limit the sort answers by keeping only its candidates; a larger one sorts blocks and spills them.
-const TOP_K_ROWS: usize = BLOCK_ROWS / 8;
-const ORDERING_HEADROOM_BYTES: usize = 256 << 10;
-
-/// Whether ordering a block of `rows` could exhaust the budget, so that the block spills before it grows.
-fn ordering_pressure(memory: &MemoryBudget, rows: usize) -> bool {
-    let needed = rows.saturating_mul(4 * size_of::<usize>() + size_of::<Option<Key>>())
-        .saturating_add(ORDERING_HEADROOM_BYTES);
-    memory.available_bytes() < needed
+/// The scratch ordering a block of `rows` takes beside the block itself, which counts against the sort's share so that a
+/// block spills before ordering it could outgrow that share.
+fn ordering_bytes(rows: usize) -> usize {
+    rows.saturating_mul(4 * size_of::<usize>() + size_of::<Option<Key>>())
 }
 
 struct Block {

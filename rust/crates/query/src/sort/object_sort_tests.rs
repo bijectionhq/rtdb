@@ -350,17 +350,32 @@ mod limited {
     }
 
     #[tokio::test]
-    async fn a_full_sort_spills_runs_when_its_budget_runs_low_and_matches_the_unlimited_sort() {
+    async fn a_full_sort_spills_runs_past_its_share_under_a_tight_budget_and_matches_the_unlimited_sort() {
         for (key, keys) in key_cases(100_000) {
             for (descending, nulls_first) in [(false, true), (true, false)] {
                 let order = SortExpr { expr: key.expression(), descending, nulls_first };
                 let full = sorted_lazily(&budgeted(1 << 28, 64 << 20, 1024), &key, &keys, order.clone(), u64::MAX, None).await.unwrap();
-                let tight = budgeted(2 << 20, 64 << 20, 64);
+                let tight = budgeted(2 << 20, 1 << 20, 64);
                 let spilled = sorted_lazily(&tight, &key, &keys, order, u64::MAX, None).await.unwrap();
                 assert_eq!(spilled, full, "{:?}, desc {descending}", key.data_type);
                 assert!(tight.context.spill_peak_bytes() > 0);
                 assert_eq!(tight.context.spill_bytes(), 0);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sort_within_its_share_stays_in_memory_however_little_its_budget_has_free() {
+        for (key, keys) in key_cases(20_000) {
+            let order = SortExpr { expr: key.expression(), descending: false, nulls_first: true };
+            let roomy = budgeted(1 << 28, 64 << 20, 1024);
+            let full = sorted_lazily(&roomy, &key, &keys, order.clone(), u64::MAX, None).await.unwrap();
+            assert_eq!(roomy.context.spill_peak_bytes(), 0);
+            let crowded = budgeted(1 << 28, 64 << 20, 1024);
+            let free = roomy.context.memory.peak_bytes() + (64 << 10);
+            let _other = crowded.context.memory.reserve(crowded.context.memory.available_bytes() - free).unwrap();
+            assert_eq!(sorted_lazily(&crowded, &key, &keys, order, u64::MAX, None).await.unwrap(), full, "{:?}", key.data_type);
+            assert_eq!(crowded.context.spill_peak_bytes(), 0, "{:?}", key.data_type);
         }
     }
 

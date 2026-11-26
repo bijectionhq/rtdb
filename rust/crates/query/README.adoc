@@ -218,7 +218,8 @@ PULL-many returns null for zero rows and a one-element list for a single empty d
 
 The executor is row-oriented and does not establish vectorized execution or expected production throughput.
 Keyless joins, anti-join candidate scans, spill-backed membership checks, and repeated group scans can be quadratic or worse across several grouping and aggregate operations.
-Sort spills its record backing when `sort_memory_bytes` is reached; semantic run and output-page boundaries remain determined by complete input callbacks.
+Sort spills its record backing when its block and the scratch to order it reach `sort_memory_bytes`; semantic run and output-page boundaries remain determined by complete input callbacks.
+Spill decisions read only the operator's configured share in `QueryOptions` (`sort_memory_bytes`, `hash_memory_bytes`, `materialized_memory_bytes`, `top_k_rows`, `spill_partitions`, `max_spill_depth`), never the budget's free bytes.
 There is no parallel partition scheduling or coordinated scan-page spilling.
 A single large output row, aggregate array, or set of overlapping active pages can exhaust the configured memory budget and return an error.
 
