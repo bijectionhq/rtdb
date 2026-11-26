@@ -344,7 +344,7 @@ impl PartitionState {
         let captured = self.value();
         let built = captured.live.apply(write).and_then(|mut live| {
             live.search = None;
-            Ok((live, captured.table_catalog.with_entries_for(write.tables().keys().cloned())?))
+            Ok((live, with_entries_for(&captured.table_catalog, write.tables().keys())?))
         });
         let Ok((live, table_catalog)) = built else { return self.apply_locked(write); };
         let mut value = self.value.write();
@@ -354,7 +354,7 @@ impl PartitionState {
         }
         let mut next = value.as_ref().clone();
         next.live = Arc::new(live);
-        next.table_catalog = Arc::new(table_catalog);
+        next.table_catalog = table_catalog;
         *value = Arc::new(next);
         Ok(())
     }
@@ -366,10 +366,10 @@ impl PartitionState {
         }
         let mut live = value.live.apply(write)?;
         live.search = None;
-        let table_catalog = value.table_catalog.with_entries_for(write.tables().keys().cloned())?;
+        let table_catalog = with_entries_for(&value.table_catalog, write.tables().keys())?;
         let mut next = value.as_ref().clone();
         next.live = Arc::new(live);
-        next.table_catalog = Arc::new(table_catalog);
+        next.table_catalog = table_catalog;
         *value = Arc::new(next);
         Ok(())
     }
@@ -382,7 +382,7 @@ impl PartitionState {
         let written: Vec<_> = write.tables().keys().cloned().collect();
         let mut next = captured.as_ref().clone();
         next.live = Arc::new(captured.live.apply(write)?);
-        next.table_catalog = Arc::new(captured.table_catalog.with_entries_for(written.iter().cloned())?);
+        next.table_catalog = with_entries_for(&captured.table_catalog, written.iter())?;
         Ok(PreparedWrite { predecessor: Arc::clone(&captured.live), next, written })
     }
 
@@ -393,7 +393,7 @@ impl PartitionState {
         }
         Arc::make_mut(&mut prepared.next.live).search = search;
         let mut next = value.as_ref().clone();
-        next.table_catalog = Arc::new(value.table_catalog.with_entries_for(prepared.written)?);
+        next.table_catalog = with_entries_for(&value.table_catalog, prepared.written.iter())?;
         next.live = prepared.next.live;
         *value = Arc::new(next);
         Ok(())
@@ -539,6 +539,13 @@ impl PartitionState {
             catalog_publication });
         Ok(())
     }
+}
+
+/// `catalog` with entries for `tables`, sharing it when every table already has one: a catalog is replaced rather than
+/// changed, and its identity keys the memos built from it.
+fn with_entries_for<'a>(catalog: &Arc<TableCatalog>, tables: impl Iterator<Item = &'a TableRef> + Clone) -> Result<Arc<TableCatalog>> {
+    if tables.clone().all(|table| catalog.entry(table).is_some()) { return Ok(Arc::clone(catalog)); }
+    catalog.with_entries_for(tables.cloned()).map(Arc::new)
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-partition-transition", message.to_string()) }

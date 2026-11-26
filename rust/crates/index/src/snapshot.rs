@@ -323,7 +323,9 @@ impl Snapshot {
         let mut next = self.clone();
         next.memos = Default::default();
         for (table, segment) in segments { next.layered.entry(table.clone()).or_default().push(Arc::clone(segment)); }
-        next.table_catalog = Arc::new(next.table_catalog.with_entries_for(segments.keys().cloned())?);
+        if segments.keys().any(|table| next.table_catalog.entry(table).is_none()) {
+            next.table_catalog = Arc::new(next.table_catalog.with_entries_for(segments.keys().cloned())?);
+        }
         next.basis = Some(tx_key);
         next.system_time_cap = Some(tx_key.system_time);
         Ok(next)

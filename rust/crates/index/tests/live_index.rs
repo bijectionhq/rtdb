@@ -137,6 +137,37 @@ fn an_applied_write_installs_once_and_a_rejected_one_leaves_the_partition_unchan
 }
 
 #[test]
+fn writes_to_registered_tables_share_the_table_catalog_and_a_new_table_registers_once() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let seeded = Arc::clone(state.value().table_catalog());
+    assert!(seeded.entry(&table()).is_none());
+
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
+    tx.put(table(), document(0, 0), Interval::ALL).unwrap();
+    let pending = tx.snapshot().unwrap();
+    assert!(pending.table_catalog().entry(&table()).is_some());
+    assert!(!std::ptr::eq(pending.table_catalog(), seeded.as_ref()));
+    state.apply(&tx.stage().unwrap()).unwrap();
+    let registered = Arc::clone(state.value().table_catalog());
+    let entry = registered.entry(&table()).cloned().unwrap();
+    assert_eq!(registered.entries().count(), seeded.entries().count() + 1);
+
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(1), Arc::clone(&budget)).unwrap();
+    tx.put(table(), document(1, 1), Interval::ALL).unwrap();
+    assert!(std::ptr::eq(tx.snapshot().unwrap().table_catalog(), registered.as_ref()));
+    state.apply(&tx.stage().unwrap()).unwrap();
+    assert!(Arc::ptr_eq(state.value().table_catalog(), &registered));
+    assert_eq!(state.value().table_catalog().entry(&table()), Some(&entry));
+
+    let prepared = state.prepare_write(&stage(&state, &budget, 2)).unwrap();
+    assert!(std::ptr::eq(prepared.snapshot().table_catalog(), registered.as_ref()));
+    state.install_write(prepared, None).unwrap();
+    assert!(Arc::ptr_eq(state.value().table_catalog(), &registered));
+    assert_eq!(rows(&state.open_snapshot(None)), 3);
+}
+
+#[test]
 fn cached_snapshot_rebuilds_only_when_a_newer_basis_is_demanded() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
