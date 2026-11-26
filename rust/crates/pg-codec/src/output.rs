@@ -56,7 +56,7 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
     let bytes = match ty {
         PgType::Int2 | PgType::Int4 | PgType::Int8 => {
             let integer = rtdb_expr::integer(value).ok_or_else(|| incompatible(ty, value))?;
-            integer_bytes(ty, format, integer)
+            integer_bytes(ty, format, integer)?
         }
         PgType::Float4 | PgType::Float8 => {
             let number = rtdb_expr::number(value).ok_or_else(|| incompatible(ty, value))?;
@@ -109,13 +109,26 @@ fn write_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Option<
     }
 }
 
-fn integer_bytes(ty: PgType, format: Format, integer: i128) -> Vec<u8> {
-    if format == Format::Text { return integer.to_string().into_bytes(); }
-    match ty {
+/// Refuses an integer outside the width of the PostgreSQL integer type it is written as, in either format.
+pub fn integer_in_range(ty: PgType, integer: i128) -> Result<()> {
+    let fits = match ty {
+        PgType::Int2 => i16::try_from(integer).is_ok(),
+        PgType::Int4 => i32::try_from(integer).is_ok(),
+        _ => i64::try_from(integer).is_ok(),
+    };
+    if fits { return Ok(()); }
+    Err(Anomaly::incorrect("xtdb/numeric-value-out-of-range", format!("{} out of range: {integer}", ty.format_name()))
+        .with_context("sql-state", "22003".into()))
+}
+
+fn integer_bytes(ty: PgType, format: Format, integer: i128) -> Result<Vec<u8>> {
+    integer_in_range(ty, integer)?;
+    if format == Format::Text { return Ok(integer.to_string().into_bytes()); }
+    Ok(match ty {
         PgType::Int2 => (integer as i16).to_be_bytes().to_vec(),
         PgType::Int4 => (integer as i32).to_be_bytes().to_vec(),
         _ => (integer as i64).to_be_bytes().to_vec(),
-    }
+    })
 }
 
 fn date_binary(days: i64) -> Result<[u8; 4]> {
@@ -237,13 +250,14 @@ fn write_array_payload<'a, T>(
                 write_bytes(output, &(-1i32).to_be_bytes())?;
             }
             (Format::Text, ArrayElement::Null) => write_bytes(output, b"NULL")?,
-            (Format::Binary, ArrayElement::Integer(value)) if element == PgType::Int4 => {
-                write_binary_array_element(output, &(value as i32).to_be_bytes())?;
+            (format, ArrayElement::Integer(value)) => {
+                integer_in_range(element, value)?;
+                match format {
+                    Format::Binary if element == PgType::Int4 => write_binary_array_element(output, &(value as i32).to_be_bytes())?,
+                    Format::Binary => write_binary_array_element(output, &(value as i64).to_be_bytes())?,
+                    Format::Text => write!(output, "{value}").map_err(write_error)?,
+                }
             }
-            (Format::Binary, ArrayElement::Integer(value)) => {
-                write_binary_array_element(output, &(value as i64).to_be_bytes())?;
-            }
-            (Format::Text, ArrayElement::Integer(value)) => write!(output, "{value}").map_err(write_error)?,
             (Format::Binary, ArrayElement::Float4(value)) => {
                 write_binary_array_element(output, &value.to_be_bytes())?;
             }

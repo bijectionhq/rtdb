@@ -6,7 +6,7 @@ mod output;
 mod text;
 
 pub use binary::read_source_binary_column;
-pub use output::{ArrowWrite, Format, SessionEnvironment, encode, encode_arrow, encode_error, encode_timestamp, encode_value, to_transit, write_arrow_cell};
+pub use output::{ArrowWrite, Format, SessionEnvironment, encode, encode_arrow, encode_error, encode_timestamp, encode_value, integer_in_range, to_transit, write_arrow_cell};
 pub use text::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction, visit_transit_sequence, from_transit, read_source_text_column, read_text, read_text_column, read_vector_column};
 pub use text::{WalArrayRow, WalListColumn, WalListRow, read_wal_array};
 pub use text::{read_snapshot_transit_column, read_tstzrange, text_value_reader, tstzrange_field};

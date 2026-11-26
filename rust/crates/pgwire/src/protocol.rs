@@ -1171,6 +1171,7 @@ fn direct_primitive(ty: PgType, format: Format, field: &arrow_schema::Field, arr
                 DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
                 _ => array.as_primitive::<Int64Type>().value(row),
             };
+            rtdb_pg_codec::integer_in_range(ty, i128::from(value))?;
             if binary {
                 match ty {
                     PgType::Int2 => out.cell(&(value as i16).to_be_bytes())?,
@@ -1453,6 +1454,51 @@ mod tests {
             assert!(direct_cell(PgType::Int8, Format::Text, ArrowCell { field: &field, array: array.as_ref(), row }, &environment, &memory, &mut output).unwrap());
         }
         assert_eq!(&output.bytes, b"\0\0\0\x017\0\0\0\x02-5");
+    }
+
+    #[test]
+    fn integer_cells_outside_the_declared_width_are_refused_not_wrapped() {
+        use rtdb_types::{LogicalType, ScalarType};
+
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::Scalar(ScalarType::I64);
+        let field = rtdb_columnar::to_field("result", &logical).unwrap();
+        let cases = [
+            (PgType::Int2, i64::from(i16::MIN), true), (PgType::Int2, i64::from(i16::MAX), true),
+            (PgType::Int2, i64::from(i16::MIN) - 1, false), (PgType::Int2, i64::from(i16::MAX) + 1, false),
+            (PgType::Int4, i64::from(i32::MIN), true), (PgType::Int4, i64::from(i32::MAX), true),
+            (PgType::Int4, i64::from(i32::MIN) - 1, false), (PgType::Int4, i64::from(i32::MAX) + 1, false),
+            (PgType::Int8, i64::MIN, true), (PgType::Int8, i64::MAX, true),
+        ];
+        for (ty, integer, fits) in cases {
+            let value = Value::I64(integer);
+            let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+            for format in [Format::Text, Format::Binary] {
+                let mut actual = DataRow::new(&memory).unwrap();
+                let direct = direct_cell(ty, format, ArrowCell { field: &field, array: array.as_ref(), row: 0 }, &environment, &memory, &mut actual);
+                let codec = rtdb_pg_codec::encode_value(ty, format, &value, &environment);
+                if fits {
+                    let payload = codec.unwrap();
+                    assert!(direct.unwrap());
+                    assert_eq!(&actual.bytes[4..], payload.as_slice());
+                    let decoded = match format {
+                        Format::Text => std::str::from_utf8(&payload).unwrap().parse::<i64>().unwrap(),
+                        Format::Binary => match payload.len() {
+                            2 => i64::from(i16::from_be_bytes(payload.try_into().unwrap())),
+                            4 => i64::from(i32::from_be_bytes(payload.try_into().unwrap())),
+                            _ => i64::from_be_bytes(payload.try_into().unwrap()),
+                        },
+                    };
+                    assert_eq!(decoded, integer, "{ty:?} {format:?}");
+                } else {
+                    let error = direct.unwrap_err();
+                    assert_eq!(error.code, "xtdb/numeric-value-out-of-range");
+                    assert_eq!(crate::error::state(&error), "22003");
+                    assert_eq!(codec.unwrap_err(), error);
+                }
+            }
+        }
     }
 
     #[test]
