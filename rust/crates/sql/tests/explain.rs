@@ -191,7 +191,8 @@ async fn api_test_explain_analyze_counts_production_pages_and_subtracts_direct_c
         assert_eq!(row["page_count"], Value::I64(1));
         assert_eq!(row["row_count"], Value::I64(3));
         assert!(matches!(row["time_to_first_page"], Value::Duration { .. }));
-        assert!(matches!(row["peak_memory_bytes"], Value::I64(value) if value > 0));
+        let own_allocation = row["op"] == op("table");
+        assert!(matches!(row["peak_memory_bytes"], Value::I64(value) if value > 0 || !own_allocation && value == 0), "{row:?}");
         let children = rows[index + 1..].iter().take_while(|child| depth(child) > depth(row)).filter(|child| depth(child) == depth(row) + 2);
         assert_eq!(duration(&row["self_time"]), duration(&row["total_time"]) - children.map(|child| duration(&child["total_time"])).sum::<i64>());
     }
