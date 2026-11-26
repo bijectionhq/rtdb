@@ -157,6 +157,7 @@ impl Cluster {
             Arc::new(move || Timestamp(time.load(Ordering::SeqCst))),
         )
         .unwrap()
+        .with_binary_checkpoints(true)
     }
 }
 
@@ -2146,4 +2147,104 @@ async fn multi_driver_checkpoints_once_the_retained_journal_suffix_reaches_its_b
     assert_eq!(follower.checkpoint_retained_suffix(1).await.unwrap(), None);
     cluster.at(50);
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 4).await, Some(Value::Utf8("bounded".into())));
+}
+
+/// The replayed state a writer keeps must equal what a fresh process replays.
+fn assert_same_replay(kept: &MultiDatabase, fresh: &MultiDatabase) {
+    let (kept, fresh) = (kept.state(), fresh.state());
+    assert_eq!((kept.floor, kept.head, kept.epoch, kept.generation), (fresh.floor, fresh.head, fresh.epoch, fresh.generation));
+    assert_eq!((kept.lease, kept.released, kept.records.len()), (fresh.lease, fresh.released, fresh.records.len()));
+    assert_eq!(kept.base.as_ref().map(|base| (base.announced, base.checkpoint.clone())),
+        fresh.base.as_ref().map(|base| (base.announced, base.checkpoint.clone())));
+    assert_eq!(kept.effects.len(), fresh.effects.len());
+    assert_eq!(kept.transactions.encode_checkpoint().unwrap(), fresh.transactions.encode_checkpoint().unwrap());
+}
+
+
+
+async fn commit_range(writer: &mut MultiDatabase, ids: std::ops::RangeInclusive<i64>, text: &str) {
+    for id in ids {
+        writer.transact(&put(id as u8, id, text)).await.unwrap();
+    }
+}
+
+async fn assert_texts(node: &mut MultiDatabase, expected: &[(i64, &str)]) {
+    for (id, text) in expected {
+        assert_eq!(text_at(node, MAIN_BRANCH, *id).await, Some(Value::Utf8((*text).into())), "row {id}");
+    }
+}
+
+
+
+
+
+
+
+#[tokio::test]
+async fn binary_checkpoints_replay_over_json_checkpoints_and_the_reverse() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY))).with_binary_checkpoints(false);
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    commit_range(&mut writer, 1..=2, "json").await;
+    let json = writer.checkpoint(Vec::new()).await.unwrap();
+    let image = read_manifest(cluster.store.as_ref(), cluster.kms.as_ref(), json).await.unwrap();
+    assert_eq!(image.contents().payload[24] & 8, 0);
+    cluster.at(50);
+    let mut reader = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY))).with_binary_checkpoints(true);
+    assert_eq!(reader.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_texts(&mut reader, &[(1, "json"), (2, "json")]).await;
+    assert_same_replay(&writer, &reader);
+
+    let mut writer = writer.with_binary_checkpoints(true);
+    commit_range(&mut writer, 3..=3, "binary").await;
+    let binary = writer.checkpoint(Vec::new()).await.unwrap();
+    let image = read_manifest(cluster.store.as_ref(), cluster.kms.as_ref(), binary).await.unwrap();
+    assert_eq!(image.contents().payload[24] & 8, 8);
+    assert!(image.contents().payload.len() < 25 + writer.state().transactions.encode_checkpoint().unwrap().len());
+    cluster.at(60);
+    let mut reader = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY))).with_binary_checkpoints(false);
+    assert_eq!(reader.tick(&live(1)).await.unwrap(), Role::Follower);
+    assert_texts(&mut reader, &[(1, "json"), (3, "binary")]).await;
+    assert_same_replay(&writer, &reader);
+}
+
+#[tokio::test]
+async fn reachability_reads_each_checkpoint_manifest_once() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    commit_range(&mut writer, 1..=2, "pinned").await;
+    let first = writer.checkpoint(Vec::new()).await.unwrap();
+    let pin = writer.pin_checkpoint(first, None).await.unwrap();
+    commit_range(&mut writer, 3..=3, "later").await;
+    writer.checkpoint(Vec::new()).await.unwrap();
+    // The writer resolves the closure from its own summaries: the objects
+    // can disappear from the store without changing it.
+    let manifests: Vec<_> = writer.state().records.iter().filter_map(|record| match record {
+        Record::Checkpoint(checkpoint) => Some(checkpoint.manifest),
+        _ => None,
+    }).chain(writer.state().base.as_ref().map(|base| base.checkpoint.manifest)).collect();
+    let saved = futures_copy(&cluster, &manifests).await;
+    for id in &manifests {
+        cluster.store.delete(&ObjectKey::new(id.to_string()).unwrap()).await.unwrap();
+    }
+    let lease = writer.authority().unwrap();
+    let closure = writer.reachability(lease).await.unwrap();
+    assert!(closure.pins().any(|held| *held == pin));
+    assert!(manifests.iter().all(|id| closure.contains(*id)));
+    for (id, bytes) in saved {
+        cluster.store.put(&ObjectKey::new(id.to_string()).unwrap(), bytes).await.unwrap();
+    }
+}
+
+async fn futures_copy(cluster: &Cluster, ids: &[ObjectId]) -> Vec<(ObjectId, Bytes)> {
+    let mut saved = Vec::new();
+    for id in ids {
+        saved.push((*id, cluster.store.get(&ObjectKey::new(id.to_string()).unwrap()).await.unwrap()));
+    }
+    saved
 }

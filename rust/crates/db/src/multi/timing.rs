@@ -30,10 +30,16 @@ impl Phases {
     }
 
     pub(super) fn report(&self, database: Uuid, payload: usize, through: Lsn) {
+        self.report_phase("checkpoint", database, payload, through);
+    }
+
+    /// `kind` names the step: a whole `checkpoint`, or the `deferred_build`
+    /// and `deferred_announce` halves of a deferred one.
+    pub(super) fn report_phase(&self, kind: &str, database: Uuid, payload: usize, through: Lsn) {
         let Some(started) = self.started else { return };
         let phases = self.phases.iter().map(|(name, ms)| format!("\"{name}\":{ms:.3}")).collect::<Vec<_>>().join(",");
         eprintln!(
-            "{{\"checkpoint_timing\":{{\"database\":\"{database}\",\"through\":{},\"payload_bytes\":{payload},\"total_ms\":{:.3},{phases}}}}}",
+            "{{\"checkpoint_timing\":{{\"kind\":\"{kind}\",\"database\":\"{database}\",\"through\":{},\"payload_bytes\":{payload},\"total_ms\":{:.3},{phases}}}}}",
             through.0, started.elapsed().as_secs_f64() * 1e3,
         );
     }

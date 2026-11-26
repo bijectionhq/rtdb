@@ -75,6 +75,7 @@ pub(crate) struct Stream {
     journal: Arc<dyn Journal>,
     pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
     pub(crate) kms: Arc<dyn Kms>,
+    pub(crate) manifests: Arc<crate::replay::ManifestCache>,
 }
 
 pub(crate) struct Entry {
@@ -90,6 +91,7 @@ impl Stream {
             journal,
             batch: None,
             kms,
+            manifests: Arc::default(),
         }
     }
 

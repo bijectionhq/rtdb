@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     journal::{Entry, JournalBatchAppender, Stream, journal_error, next},
     placement::preferred,
-    replay::{ChangeHistory, Committed, JournalCoordinates, ReplayError},
+    replay::{ChangeHistory, Committed, JournalCoordinates, ReplayBase, ReplayError},
 };
 
 mod classic_migration;
@@ -80,6 +80,7 @@ pub struct MultiDatabase {
     last_allocated: Epoch,
     competing_seal: Option<Lease>,
     assigned_follower: Weak<()>,
+    binary_checkpoints: bool,
 }
 
 impl MultiDatabase {
@@ -117,6 +118,7 @@ impl MultiDatabase {
             last_allocated: Epoch(0),
             competing_seal: None,
             assigned_follower: Weak::new(),
+            binary_checkpoints: false,
         })
     }
 
@@ -137,6 +139,13 @@ impl MultiDatabase {
     }
 
     pub fn supports_row_custody(&self) -> bool { self.row_custody }
+
+    /// Writes checkpoint transaction state in CBOR instead of JSON. Enable
+    /// only once every reader of the stream installs binary checkpoints.
+    pub fn with_binary_checkpoints(mut self, enabled: bool) -> Self {
+        self.binary_checkpoints = enabled;
+        self
+    }
 
     pub async fn finish_token_rotation(&mut self, generation: u64, unreadable_by: i64) -> Result<()> {
         self.refresh().await?;
@@ -596,11 +605,12 @@ impl MultiDatabase {
         let manifest = Manifest {
             files,
             pins: closure.pins().cloned().collect(),
-            payload: Committed::checkpoint_payload(
+            payload: Committed::checkpoint_payload_in(
                 self.durable_transactions(),
                 lease.until,
                 false,
                 self.state().coordinates,
+                self.binary_checkpoints,
             )?,
         };
         timing.mark("payload");
@@ -613,6 +623,7 @@ impl MultiDatabase {
             .await?;
         timing.mark("seal");
         image.put(self.store.as_ref()).await?;
+        self.stream.manifests.insert(image.manifest_summary(&manifest, Generation { database: self.options.database, number: generation })?);
         timing.mark("put");
         let checkpoint = Checkpoint {
             manifest: image.id(),
@@ -620,10 +631,11 @@ impl MultiDatabase {
             key_generation: generation,
             restore: false,
         };
-        self.append_control(lease, Record::Checkpoint(checkpoint))
+        self.append_control(lease, Record::Checkpoint(checkpoint.clone()))
             .await?;
         timing.mark("append");
-        self.trim(lease, through).await?;
+        let announced = self.state().head;
+        self.trim_to_base(lease, ReplayBase { announced, checkpoint }, lease.until).await?;
         timing.mark("trim");
         timing.report(self.options.database, manifest.payload.len(), through);
         Ok(image.id())
@@ -755,6 +767,22 @@ impl MultiDatabase {
         self.state()
             .reachability(&self.stream, self.store.as_ref(), lease.epoch)
             .await
+    }
+
+    /// Trims through the cut of a checkpoint this writer announced, then keeps
+    /// its replayed state over the new floor instead of replaying the
+    /// checkpoint again.
+    async fn trim_to_base(&mut self, lease: Lease, base: ReplayBase, until: i64) -> Result<()> {
+        self.require_authority(lease)?;
+        match self.stream.trim(lease.epoch, Lsn(base.checkpoint.through)).await {
+            Ok(()) => {
+                if let Some(state) = self.committed.as_mut() {
+                    state.advance_floor(base, until, lease.epoch);
+                }
+                self.refresh().await
+            }
+            Err(error) => Err(self.mutation_failed(error)),
+        }
     }
 
     async fn trim(&mut self, lease: Lease, through: Lsn) -> Result<()> {

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 use journal_contract::{Epoch, JournalError, Lsn};
 use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record};
@@ -13,6 +16,8 @@ use crate::journal::{Entry, Stream, journal_error, journal_shortened, next};
 const ROTATING_CHECKPOINT: u8 = 1;
 const RESTORED_HISTORY: u8 = 2;
 const CHECKPOINT_SOURCE: u8 = 4;
+/// The transaction state is CBOR rather than JSON. Readers accept both.
+const BINARY_STATE: u8 = 8;
 
 pub struct AppliedEffects {
     pub cut: BranchCut,
@@ -101,9 +106,44 @@ impl ReplayError {
     }
 }
 
+/// Verified manifest summaries without their checkpoint payloads, by object.
+/// Manifests are immutable and named by their ciphertext digest, so a summary
+/// never goes stale. Reachability reads them instead of the object store.
+#[derive(Default)]
+pub(crate) struct ManifestCache(Mutex<BTreeMap<ObjectId, Arc<VerifiedManifest>>>);
+
+/// Summaries kept before the cache starts over. Each holds only object
+/// identities and pins.
+const CACHED_MANIFESTS: usize = 16_384;
+
+impl ManifestCache {
+    fn get(&self, id: ObjectId) -> Option<Arc<VerifiedManifest>> {
+        self.0.lock().expect("manifest cache").get(&id).cloned()
+    }
+
+    pub(crate) fn insert(&self, manifest: VerifiedManifest) -> Arc<VerifiedManifest> {
+        let manifest = Arc::new(manifest);
+        let mut cache = self.0.lock().expect("manifest cache");
+        if cache.len() >= CACHED_MANIFESTS {
+            cache.clear();
+        }
+        cache.insert(manifest.id(), Arc::clone(&manifest));
+        manifest
+    }
+}
+
+/// The checkpoint a replay installed before its first retained record, and
+/// the position of the record that announced it, the floor.
+#[derive(Clone)]
+pub(crate) struct ReplayBase {
+    pub(crate) announced: Lsn,
+    pub(crate) checkpoint: Checkpoint,
+}
+
 pub(crate) struct Committed {
     pub(crate) transactions: TransactState,
     pub(crate) floor: Lsn,
+    pub(crate) base: Option<ReplayBase>,
     pub(crate) head: Lsn,
     pub(crate) epoch: Epoch,
     pub(crate) generation: u64,
@@ -121,6 +161,7 @@ impl Committed {
         Self {
             transactions: TransactState::new(*stream.database.as_bytes()),
             floor,
+            base: None,
             head: Lsn(floor.0 - 1),
             epoch: Epoch(0),
             generation: 1,
@@ -213,11 +254,18 @@ impl Committed {
         }
     }
 
+    /// A suffix that starts after LSN 1 replays over a checkpoint of the
+    /// records before its floor. Until one is installed, no record applies.
+    fn awaiting_base(&self) -> bool {
+        self.records.is_empty() && self.base.is_none() && self.floor != Lsn(1)
+    }
+
     pub(crate) async fn apply_entry(
         &mut self, stream: &Stream, store: &dyn ObjectStore, lsn: Lsn, entry: Entry,
     ) -> Result<Option<Receipt>> {
         if let Record::Checkpoint(checkpoint) = &entry.record {
-            if self.records.is_empty() || checkpoint.restore {
+            let first = self.records.is_empty() && self.base.is_none();
+            if first || checkpoint.restore {
                 if checkpoint.restore && (self.transactions.index().head().basis.position() != 0
                     || self.coordinates.origin.is_some() || self.rotation.is_some()
                     || checkpoint.key_generation != self.generation
@@ -227,8 +275,11 @@ impl Committed {
                 }
                 self.install_checkpoint(stream, store, lsn, entry.epoch, checkpoint).await?;
                 self.generation = checkpoint.key_generation;
+                if first {
+                    self.base = Some(ReplayBase { announced: lsn, checkpoint: checkpoint.clone() });
+                }
             }
-        } else if self.records.is_empty() && self.floor != Lsn(1) {
+        } else if self.awaiting_base() {
             return Err(invalid("The retained floor does not name a checkpoint"));
         }
         self.apply(lsn, entry)
@@ -457,6 +508,7 @@ impl Committed {
                 "The manifest does not belong to the retained checkpoint",
             ));
         }
+        stream.manifests.insert(image.summary());
         let (header, mut bytes) = image
             .contents()
             .payload
@@ -466,7 +518,7 @@ impl Committed {
         let system_time = Timestamp(i64::from_be_bytes(header[8..16].try_into().unwrap()));
         let until = i64::from_be_bytes(header[16..24].try_into().unwrap());
         let flags = header[24];
-        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE) != 0
+        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE | BINARY_STATE) != 0
             || flags & CHECKPOINT_SOURCE != 0 && flags & RESTORED_HISTORY == 0
         {
             return Err(invalid("The checkpoint has an unknown generation marker"));
@@ -521,7 +573,11 @@ impl Committed {
             basis: Basis::new(*stream.database.as_bytes(), position),
             system_time,
         };
-        self.transactions = TransactState::decode_checkpoint(bytes, expected)?;
+        self.transactions = if flags & BINARY_STATE != 0 {
+            TransactState::decode_binary_checkpoint(bytes, expected)?
+        } else {
+            TransactState::decode_checkpoint(bytes, expected)?
+        };
         self.lease = Some((epoch, until));
         Ok(())
     }
@@ -532,10 +588,23 @@ impl Committed {
         rotating: bool,
         coordinates: JournalCoordinates,
     ) -> Result<Vec<u8>> {
+        Self::checkpoint_payload_in(transactions, until, rotating, coordinates, false)
+    }
+
+    /// The checkpoint payload with the transaction state in CBOR when
+    /// `binary`, which only readers that know [`BINARY_STATE`] install.
+    pub(crate) fn checkpoint_payload_in(
+        transactions: &TransactState,
+        until: i64,
+        rotating: bool,
+        coordinates: JournalCoordinates,
+        binary: bool,
+    ) -> Result<Vec<u8>> {
         let cut = transactions.index().head();
-        let bytes = transactions.encode_checkpoint()?;
+        let bytes = if binary { transactions.encode_binary_checkpoint()? } else { transactions.encode_checkpoint()? };
         let source = coordinates.origin.and_then(|origin| origin.source);
         let flags = if rotating { ROTATING_CHECKPOINT } else { 0 }
+            | if binary { BINARY_STATE } else { 0 }
             | if coordinates.origin.is_some() { RESTORED_HISTORY } else { 0 }
             | if source.is_some() { CHECKPOINT_SOURCE } else { 0 };
         let extra = coordinates.origin.map_or(0, |_| 48) + source.map_or(0, |_| 48);
@@ -564,45 +633,92 @@ impl Committed {
         store: &dyn ObjectStore,
         epoch: Epoch,
     ) -> Result<Reachability> {
-        let mut roots = BTreeSet::new();
-        let mut checkpoints = BTreeSet::new();
-        for record in &self.records {
-            match record {
-                Record::Tx { objects, .. } => roots.extend(
-                    objects
-                        .iter()
-                        .copied()
-                        .filter(|id| id.kind == ObjectKind::Manifest),
-                ),
-                Record::Checkpoint(checkpoint) => {
-                    roots.insert(checkpoint.manifest);
-                    checkpoints.insert(checkpoint.manifest);
-                }
-                Record::RankedCatalog(catalog) => {
-                    roots.insert(catalog.manifest);
-                }
-                Record::Pin(pin) => {
-                    roots.insert(pin.manifest);
-                }
-                _ => {}
-            }
-        }
-        let mut manifests = BTreeMap::<ObjectId, VerifiedManifest>::new();
-        while let Some(id) = roots.pop_first() {
-            if manifests.contains_key(&id) {
-                continue;
-            }
-            if id.database != stream.database || id.epoch > epoch.0 {
-                return Err(invalid("A manifest is outside the writer scope"));
-            }
-            let manifest = read_manifest(store, stream.kms.as_ref(), id).await?;
-            if checkpoints.contains(&id) {
-                roots.extend(manifest.contents().pins.iter().map(|pin| pin.manifest));
-            }
-            manifests.insert(id, manifest);
-        }
-        Reachability::from_records(stream.database, epoch.0, &self.records, manifests.values())
+        let base = self.base.as_ref().map(|base| &base.checkpoint);
+        closure(stream, store, epoch, base, &self.records).await
     }
+
+    /// Drops the records before `floor` after this writer trimmed through a
+    /// checkpoint it announced, without reading the journal or the manifest
+    /// again. The result is the state a fresh replay from `floor` installs:
+    /// the transaction state is unchanged, and the lease, release and rotation
+    /// are those the base installs unless a retained record set them.
+    pub(crate) fn advance_floor(&mut self, base: ReplayBase, until: i64, epoch: Epoch) -> bool {
+        let floor = Lsn(base.checkpoint.through + 1);
+        if floor <= self.floor || floor > next(self.head).unwrap_or(self.head) || base.announced < floor
+            || base.announced > self.head || self.rotation.is_some() || self.retired.is_some()
+            || base.checkpoint.restore || base.checkpoint.key_generation != self.generation
+            || !matches!(self.records.get((base.announced.0 - self.floor.0) as usize),
+                Some(Record::Checkpoint(announced)) if *announced == base.checkpoint)
+        {
+            return false;
+        }
+        let Ok(position) = self.coordinates.position(floor) else { return false };
+        self.records.drain(..(floor.0 - self.floor.0) as usize);
+        self.effects.retain(|group| group.cut.basis.position() >= position);
+        self.floor = floor;
+        self.base = Some(base);
+        if !self.records.iter().any(|record| matches!(record, Record::Lease { .. })) {
+            self.lease = Some((epoch, until));
+        }
+        if !self.records.iter().any(|record| matches!(record, Record::WriterRelease { .. })) {
+            self.released = None;
+        }
+        true
+    }
+}
+
+async fn closure(
+    stream: &Stream,
+    store: &dyn ObjectStore,
+    epoch: Epoch,
+    base: Option<&Checkpoint>,
+    records: &[Record],
+) -> Result<Reachability> {
+    let mut roots = BTreeSet::new();
+    let mut checkpoints = BTreeSet::new();
+    if let Some(checkpoint) = base {
+        roots.insert(checkpoint.manifest);
+        checkpoints.insert(checkpoint.manifest);
+    }
+    for record in records {
+        match record {
+            Record::Tx { objects, .. } => roots.extend(
+                objects
+                    .iter()
+                    .copied()
+                    .filter(|id| id.kind == ObjectKind::Manifest),
+            ),
+            Record::Checkpoint(checkpoint) => {
+                roots.insert(checkpoint.manifest);
+                checkpoints.insert(checkpoint.manifest);
+            }
+            Record::RankedCatalog(catalog) => {
+                roots.insert(catalog.manifest);
+            }
+            Record::Pin(pin) => {
+                roots.insert(pin.manifest);
+            }
+            _ => {}
+        }
+    }
+    let mut manifests = BTreeMap::<ObjectId, Arc<VerifiedManifest>>::new();
+    while let Some(id) = roots.pop_first() {
+        if manifests.contains_key(&id) {
+            continue;
+        }
+        if id.database != stream.database || id.epoch > epoch.0 {
+            return Err(invalid("A manifest is outside the writer scope"));
+        }
+        let manifest = match stream.manifests.get(id) {
+            Some(manifest) => manifest,
+            None => stream.manifests.insert(read_manifest(store, stream.kms.as_ref(), id).await?.summary()),
+        };
+        if checkpoints.contains(&id) {
+            roots.extend(manifest.contents().pins.iter().map(|pin| pin.manifest));
+        }
+        manifests.insert(id, manifest);
+    }
+    Reachability::from_retained(stream.database, epoch.0, base, records, manifests.values().map(Arc::as_ref))
 }
 
 async fn find_clean_checkpoint(stream: &Stream, head: Lsn) -> Result<Option<Lsn>> {

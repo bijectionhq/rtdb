@@ -81,7 +81,7 @@ impl MultiDatabase {
         let generation = plan.next_generation();
         self.stream.kms.create(generation).await?;
         let payload =
-            Committed::checkpoint_payload(self.durable_transactions(), lease.until, true, self.state().coordinates)?;
+            Committed::checkpoint_payload_in(self.durable_transactions(), lease.until, true, self.state().coordinates, self.binary_checkpoints)?;
         let kms = self.stream.kms.as_ref();
         let store = self.store.as_ref();
         let objects = &mut self.writer.as_mut().ok_or_else(no_writer)?.objects;
