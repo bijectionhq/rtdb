@@ -28,14 +28,14 @@ struct CatalogColumns {
 }
 
 impl CatalogColumns {
-    fn new(scan: &Scan, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    fn new(scan: &Scan, catalog: &crate::context::CatalogSnapshot, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let bound = scan.columns.iter().try_fold(256, |bytes, field| {
             let layout = checked(scale(field.name.len(), 4)?, scale(field.data_type.retained_bytes()?, 8)?)?;
             checked(bytes, checked(1024, layout)?)
         })?;
         let reservation = memory.reserve(bound)?;
         let fields = scan.columns.iter().map(|field| {
-            let field = rtdb_columnar::to_field(&field.name, &field.data_type)?;
+            let field = rtdb_columnar::to_field(&field.name, &catalog.runtime_scan_type(&scan.table, field))?;
             let builder: Option<Box<dyn ArrayBuilder>> = match field.data_type() {
                 arrow_schema::DataType::Map(entries, _) => {
                     let arrow_schema::DataType::Struct(fields) = entries.data_type() else { unreachable!() };
@@ -178,7 +178,7 @@ impl CatalogPages<'_> {
         self.context.check_cancelled_at(self.page.as_ref().map_or(0, |page| page.rows))?;
         let page = match &mut self.page {
             Some(page) => page,
-            slot @ None => slot.insert(CatalogColumns::new(self.scan, &self.context.memory)?),
+            slot @ None => slot.insert(CatalogColumns::new(self.scan, &self.context.catalog, &self.context.memory)?),
         };
         page.push(cell)?;
         if page.rows == self.context.options.batch_rows { self.finish() } else { Ok(None) }
@@ -811,8 +811,8 @@ mod tests {
     #[test]
     fn catalog_columns_append_only_projected_cells() {
         let scan = system_scan("pg_catalog", "pg_namespace", &["oid"]);
-        let memory = MemoryBudget::new(1 << 16);
-        let mut columns = CatalogColumns::new(&scan, &memory).unwrap();
+        let context = test_context(16, 1 << 16);
+        let mut columns = CatalogColumns::new(&scan, &context.catalog, &context.memory).unwrap();
         columns.push(|name| match name {
             "oid" => Ok(Cell::I32(7)),
             _ => Err(catalog_layout()),
@@ -851,7 +851,7 @@ mod tests {
             &[pg_name_oid("information_schema"), pg_name_oid("pg_catalog")]);
         let Column::Arrow { array, field, .. } = &first.columns[1] else { panic!("expected Arrow column") };
         assert!(field.is_nullable());
-        assert_eq!(array.null_count(), first.len);
+        assert_eq!(array.logical_null_count(), first.len);
 
         let second = pages.next().await.unwrap().unwrap();
         assert_eq!(second.len, 2);
