@@ -4017,8 +4017,7 @@ impl<'a> OpenTransaction<'a> {
             if array.len() > 1
                 && let Ok(headers) = (0..array.len()).map(header).collect::<Result<Vec<_>>>()
                 && let Ok(true) = self.insert_batch_is_absent(table, &headers).await
-                && let Ok(batch) = rtdb_format::data::owned_put_batch(Arc::clone(&content), &headers, documents.source_bytes(), &memory)
-                && self.buffer.append_batch(table, batch).is_ok()
+                && self.buffer.append_put_documents(table, Arc::clone(&content), headers, documents.source_bytes()).is_ok()
             {
                 return Ok(());
             }
@@ -4028,14 +4027,12 @@ impl<'a> OpenTransaction<'a> {
                 if let Some(cursor) = self.scan_insert_intervals(table, [event.iid].into(), event.valid_time, &["_iid"]).await? {
                     require_empty_insert(cursor).await?;
                 }
-                let batch = rtdb_format::data::owned_put_batch(content.slice(row, 1), &[event], documents.source_bytes(), &memory)?;
-                self.buffer.append_batch(table, batch)?;
+                self.buffer.append_put_documents(table, content.slice(row, 1), vec![event], documents.source_bytes())?;
             }
             return Ok(());
         }
         let headers = (0..array.len()).map(header).collect::<Result<Vec<_>>>()?;
-        let batch = rtdb_format::data::owned_put_batch(content, &headers, documents.source_bytes(), &memory)?;
-        self.buffer.append_batch(table, batch)
+        self.buffer.append_put_documents(table, content, headers, documents.source_bytes())
     }
     async fn check_replay_marker(&self, replay: &ReplaySubmission, observed: Timestamp) -> Result<()> {
         if observed >= replay.not_after() {

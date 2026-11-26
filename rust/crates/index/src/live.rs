@@ -48,6 +48,22 @@ impl IndexBatch {
     /// As `from_owned`, with the headers charged to a reservation the caller already holds for `header_bytes`.
     pub fn from_owned_with_headers(owned: OwnedBatch, header_reservation: Arc<MemoryReservation>) -> Result<Arc<Self>> {
         let events = EventBatch::new(owned.batch().clone())?;
+        let headers = (0..events.len()).map(|row| events.header(row)).collect::<Result<Vec<_>>>()?;
+        Self::with_decoded_headers(owned, events, headers, header_reservation)
+    }
+    /// As `from_owned`, for `owned` written from events whose headers are `headers`, in row order: the writer stores each
+    /// header's fields as they are, so decoding them again gives the same headers.
+    fn from_written_headers(owned: OwnedBatch, headers: Vec<EventHeader>) -> Result<Arc<Self>> {
+        let header_reservation = owned.reservation().budget().reserve(Self::header_bytes(headers.len())?)?;
+        let events = EventBatch::new(owned.batch().clone())?;
+        debug_assert!(headers.len() == events.len()
+            && headers.iter().enumerate().all(|(row, header)| events.header(row).is_ok_and(|decoded| decoded == *header)));
+        Self::with_decoded_headers(owned, events, headers, header_reservation)
+    }
+    fn with_decoded_headers(
+        owned: OwnedBatch, events: EventBatch, headers: Vec<EventHeader>, header_reservation: Arc<MemoryReservation>,
+    ) -> Result<Arc<Self>> {
+        if headers.len() != events.len() { return Err(invalid("Event headers and rows disagree")); }
         let schema = owned.batch().schema();
         let index = schema.index_of("op").map_err(invalid)?;
         let ty = from_field(schema.field(index))?;
@@ -59,14 +75,8 @@ impl IndexBatch {
             },
             _ => Vec::new(),
         };
-        let mut system_times: Option<(Timestamp, Timestamp)> = None;
-        let mut headers = Vec::with_capacity(events.len());
-        for row in 0..events.len() {
-            let header = events.header(row)?;
-            let time = header.system_from;
-            system_times = Some(system_times.map_or((time, time), |(first, last)| (first.min(time), last.max(time))));
-            headers.push(header);
-        }
+        let system_times = headers.iter().map(|header| header.system_from)
+            .fold(None, |times: Option<(Timestamp, Timestamp)>, time| Some(times.map_or((time, time), |(first, last)| (first.min(time), last.max(time)))));
         Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new(), headers: (headers.into_boxed_slice(), header_reservation) }))
     }
     /// As `from_owned`, for `owned` holding the rows of `parts` in order with their event columns unchanged, such as their
@@ -130,7 +140,8 @@ impl IndexBatch {
         let has_put = captured || rows.is_some() || !declared.is_empty();
         let fields = match rows { Some(rows) => declare_column_types(&rows, declared), None => declared.clone() };
         let copy = !matches!(mode, EventBuild::Write);
-        Self::from_owned(owned_event_batch(events, has_put.then_some(fields), copy, budget)?)
+        let owned = owned_event_batch(events, has_put.then_some(fields), copy, budget)?;
+        Self::from_written_headers(owned, events.iter().map(StoredEvent::header).collect())
     }
     fn has_system_time(&self, system_time: Timestamp) -> bool {
         self.system_times.is_none_or(|times| times == (system_time, system_time))
@@ -1630,7 +1641,7 @@ impl TransactionBuffer {
         let _key = self.budget.reserve(key.len().checked_add(4096).ok_or_else(|| invalid("Owned key is too large"))?)?;
         let keys = arrow_array::BinaryArray::from_iter_values([key]);
         let batch = keyed_put_batch(content, &[header], keys, source_bytes, &self.budget)?;
-        self.append_batch_inner(table, batch, None)?;
+        self.append_batch_inner(table, batch, None, Some(vec![header]))?;
         if let Some(position) = position { self.consume_owned_position(position); }
         Ok(position.and_then(NonZeroU32::new))
     }
@@ -1646,20 +1657,36 @@ impl TransactionBuffer {
         self.append_unpositioned_batch(table, batch, Some(declarations))
     }
 
+    /// Stages Arrow put documents under the headers they were resolved with, building the staged rows from both at once.
+    pub fn append_put_documents(
+        &mut self, table: &TableRef, documents: arrow_array::ArrayRef, headers: Vec<EventHeader>, source_bytes: Option<usize>,
+    ) -> Result<()> {
+        self.require_unpositioned(table)?;
+        let batch = rtdb_format::data::owned_put_batch(documents, &headers, source_bytes, &self.budget)?;
+        self.append_batch_inner(table, batch, None, Some(headers))
+    }
+
     fn append_unpositioned_batch(
         &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
     ) -> Result<()> {
+        self.require_unpositioned(table)?;
+        self.append_batch_inner(table, batch, assembled_declarations, None)
+    }
+
+    fn require_unpositioned(&self, table: &TableRef) -> Result<()> {
         if table.is_owned_event_data() && (self.retains_owned_positions()
             || matches!(self.owned_positions, Some(OwnedCommitPositions::WorldCarriers(_)))
                 && Self::positions_world_carrier(table))
         {
             return Err(invalid("An ordered landing stages governed events in assertion order"));
         }
-        self.append_batch_inner(table, batch, assembled_declarations)
+        Ok(())
     }
 
+    /// `written_headers` are the headers `batch` was written from, in row order, where the caller has them.
     fn append_batch_inner(
         &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
+        written_headers: Option<Vec<EventHeader>>,
     ) -> Result<()> {
         let rows = batch.batch().num_rows();
         if rows == 0 { return Ok(()); }
@@ -1668,8 +1695,16 @@ impl TransactionBuffer {
         }
         let start = self.next_event_ordinal;
         let end = start.checked_add(rows as u64).ok_or_else(|| invalid("Event ordinal exhausted"))?;
-        let positions = (start..end).map(|ordinal| EventPosition { transaction: self.tx_key.tx_id, ordinal });
-        let batch = IndexBatch::from_owned(rtdb_format::data::append_event_positions(&batch, positions, &self.budget)?)?;
+        let transaction = self.tx_key.tx_id;
+        let positions = (start..end).map(move |ordinal| EventPosition { transaction, ordinal });
+        let positioned = rtdb_format::data::append_event_positions(&batch, positions.clone(), &self.budget)?;
+        let batch = match written_headers {
+            Some(mut headers) if headers.len() == rows => {
+                for (header, position) in headers.iter_mut().zip(positions) { header.position = Some(position); }
+                IndexBatch::from_written_headers(positioned, headers)?
+            }
+            _ => IndexBatch::from_owned(positioned)?,
+        };
         if !batch.has_system_time(self.tx_key.system_time) {
             return Err(invalid("Transaction batch has another system time"));
         }
@@ -2647,5 +2682,60 @@ mod chunk_tests {
         assert!(chunks.len() <= 16, "{} chunks", chunks.len());
         assert_eq!(live.live_batch_bytes(), memory.used_bytes() as u64);
         assert_eq!(live.next_block().unwrap().live_batch_bytes(), 0);
+    }
+
+    #[test]
+    fn batches_staged_with_their_written_headers_match_a_fresh_decode_and_the_batch_path() {
+        let memory = MemoryBudget::new(16 << 20);
+        let system_from = Timestamp(7);
+        let events = (0..6i64).map(|id| {
+            let operation = match id % 3 {
+                0 => StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::Utf8(format!("v{id}")))])),
+                1 => StoredOperation::Delete,
+                _ => StoredOperation::Erase,
+            };
+            let valid_time = if matches!(operation, StoredOperation::Erase) || id % 2 == 0 { Interval::ALL } else { Interval::new(Timestamp(id), Timestamp(100)).unwrap() };
+            StoredEvent {
+                position: Some(EventPosition { transaction: rtdb_types::TxId(3), ordinal: id as u64 }),
+                origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from,
+                valid_time, operation, recency: None,
+            }
+        }).collect::<Vec<_>>();
+        let fresh = |batch: &IndexBatch| IndexBatch::new(batch.arrow().clone(), &memory).unwrap();
+        for batch in [
+            IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap(),
+            IndexBatch::from_events(&events, &StructFields::new(), &memory).unwrap(),
+        ] {
+            let decoded = fresh(batch.as_ref());
+            assert_eq!(batch.headers.0, decoded.headers.0);
+            assert_eq!(batch.headers.1.bytes(), decoded.headers.1.bytes());
+            assert_eq!(batch.system_times, decoded.system_times);
+            assert_eq!(batch.put_field_types, decoded.put_field_types);
+        }
+
+        let table = TableRef::new("public", "docs");
+        let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: system_from };
+        let partition = crate::PartitionState::empty(Default::default()).unwrap();
+        let documents = |ids: std::ops::Range<i64>| -> arrow_array::ArrayRef {
+            let ids = arrow_array::Int64Array::from_iter_values(ids);
+            Arc::new(StructArray::try_new(vec![Field::new("_id", DataType::Int64, false)].into(), vec![Arc::new(ids) as ArrayRef], None).unwrap())
+        };
+        let headers = |ids: std::ops::Range<i64>| ids.map(|id| EventHeader {
+            position: None, commit_position: 0, iid: EntityId::Integer(id).iid(), system_from,
+            valid_time: Interval::new(Timestamp(id), Timestamp::MAX).unwrap(), op: EventOp::Put,
+        }).collect::<Vec<_>>();
+        let mut written = TransactionBuffer::new(partition.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+        let mut decoded = TransactionBuffer::new(partition.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+        for ids in [0..3, 3..4] {
+            written.append_put_documents(&table, documents(ids.clone()), headers(ids.clone()), None).unwrap();
+            let batch = rtdb_format::data::owned_put_batch(documents(ids.clone()), &headers(ids), None, &memory).unwrap();
+            decoded.append_batch(&table, batch).unwrap();
+        }
+        let (written, decoded) = (written.stage().unwrap(), decoded.stage().unwrap());
+        let (written, decoded) = (written.tables()[&table].batch().unwrap(), decoded.tables()[&table].batch().unwrap());
+        assert_eq!(written.arrow(), decoded.arrow());
+        assert_eq!(written.headers.0, decoded.headers.0);
+        assert_eq!(written.headers.0, fresh(written.as_ref()).headers.0);
+        assert_eq!(written.headers.0.iter().map(|header| header.position.unwrap().ordinal).collect::<Vec<_>>(), [0, 1, 2, 3]);
     }
 }
