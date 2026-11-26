@@ -3326,8 +3326,12 @@ async fn default_sealed_local_erase_waits_for_the_original_generation_and_resume
 
     tokio::time::timeout(Duration::from_secs(30), async {
         let files = tempfile::tempdir().unwrap();
-        let classic_vault = tempfile::tempdir().unwrap();
-        let checkpoint_vault = tempfile::tempdir().unwrap();
+        let private = || {
+            use std::os::unix::fs::PermissionsExt;
+            tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+        };
+        let classic_vault = private();
+        let checkpoint_vault = private();
         let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let runtime = || {
             let clock_for_keys = Arc::clone(&clock);
