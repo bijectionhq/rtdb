@@ -449,6 +449,17 @@ pub(crate) struct OpenedDatabase {
 }
 
 impl DatabaseFactory {
+    pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
+        let objects = database.object_store();
+        if let Some(lease) = objects.catalog_delivery_lease().await? {
+            return Ok(Some(lease));
+        }
+        if !self.options.replication.enabled || objects.defers_trie_releases() {
+            return Ok(None);
+        }
+        database.read_lease(&self.clock, &self.options.garbage).await.map(Some)
+    }
+
     pub fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         self.resources.validate(name, configuration)?;
         if self.options.replication.enabled && self.options.replication.may_lead && !self.options.read_only && configuration.mode.unwrap_or(0) != 1 {

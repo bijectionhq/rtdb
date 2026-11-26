@@ -4262,6 +4262,45 @@ async fn a_placed_catalog_starts_empty_and_holds_exactly_what_is_attached_and_de
 }
 
 #[tokio::test]
+async fn every_reader_of_one_catalog_version_shares_its_open_databases_until_membership_changes() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    node.database_or_attach("shop".into(), DatabaseConfig::default()).await.unwrap().unwrap();
+    let first = node.catalog().open_database_map();
+    assert!(Arc::ptr_eq(&first, &node.catalog().open_database_map()), "readers of one version share its open databases");
+    assert_eq!(first.keys().cloned().collect::<Vec<_>>(), ["shop"]);
+
+    node.database_or_attach("blog".into(), DatabaseConfig::default()).await.unwrap().unwrap();
+    let attached = node.catalog().open_database_map();
+    assert_eq!(attached.keys().cloned().collect::<Vec<_>>(), ["blog", "shop"]);
+    assert_eq!(first.keys().cloned().collect::<Vec<_>>(), ["shop"], "an earlier reader keeps the version it read");
+
+    node.detach_local("shop".into()).await.unwrap();
+    assert_eq!(node.catalog().open_database_map().keys().cloned().collect::<Vec<_>>(), ["blog"]);
+    assert_eq!(node.catalog().open_databases().keys().cloned().collect::<Vec<_>>(), ["blog"]);
+    drop((first, attached));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn queries_share_one_credited_budget_that_never_holds_back_the_node_limit() {
+    let (node, driver) = running(options(), services()).await;
+    assert!(Arc::ptr_eq(&node.query_memory(), &node.query_memory()));
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    for _ in 0..50 {
+        assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    }
+    let available = node.memory().available_bytes();
+    let whole = node.memory().reserve(available).expect("unspent query credit is reclaimed for a reservation that fits");
+    assert!(node.memory().reserve(1).is_err());
+    drop(whole);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_session_on_a_placed_node_sees_its_own_database_and_no_other() {
     let mut config = options();
     config.membership = Membership::Placed;

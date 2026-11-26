@@ -311,7 +311,6 @@ impl Node {
         }
         options.default_timezone = rtdb_expr::normalize_timezone(&options.default_timezone)?;
         let catalog = DatabaseCatalog::new(options.membership.clone());
-        let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let read_fence = services.read_fence.clone();
         let scan_fragmenter = services.scan_fragmenter.clone();
         let compaction_slots = (matches!(options.membership, Membership::Placed) && options.compaction_threads > 0)
@@ -324,7 +323,10 @@ impl Node {
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
         let shared_plans = Arc::new(rtdb_query::SharedPlans::new(&factory.memory));
-        let node = Self { catalog, factory, commands, run: Arc::new(NodeRun::new()), runtime, read_fence, scan_fragmenter, placement_slots,
+        let run = Arc::new(NodeRun::new());
+        let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics,
+            catalog: Arc::clone(&catalog), factory: Arc::clone(&factory), owner: run.token.clone() });
+        let node = Self { catalog, factory, commands, run, runtime, read_fence, scan_fragmenter, placement_slots,
             sql_snapshots: Arc::default(), outcome_queries: Default::default(), shared_plans };
         node.sql_snapshots.start(node.run.token.clone());
         let mut initial = Vec::new();
@@ -420,6 +422,11 @@ impl Node {
     fn ensure_open(&self) -> Result<()> { if self.run.ended() { Err(closed()) } else { Ok(()) } }
 
     async fn admit(&self, database: &str, access: DatabaseAccess, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<()> {
+        self.admit_attached(database, access, identity, cancellation).await.map(|_| ())
+    }
+
+    /// Admits as `admit` does, returning the database attached under that name when admission looked it up.
+    async fn admit_attached(&self, database: &str, access: DatabaseAccess, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Option<Arc<Database>>> {
         self.ensure_open()?;
         // Revalidation is usually ready at once; only a pending one waits under the node's and the caller's cancellation.
         let mut revalidation = std::pin::pin!(identity.revalidate(self.now()));
@@ -429,14 +436,16 @@ impl Node {
         }
         if cancellation.is_cancelled() { return Err(cancelled()); }
         self.ensure_open()?;
+        let local = self.catalog.database(database).ok();
         // A placed node may stop holding a session's database at any moment; the command is refused before anything runs, so the gateway may resend it to the new holder.
-        if matches!(self.factory.options.membership, Membership::Placed) && self.catalog.database(database).is_err() {
+        if matches!(self.factory.options.membership, Membership::Placed) && local.is_none() {
             return Err(lost_placement(database));
         }
-        if let Ok(local) = self.catalog.database(database) {
-            require_ordinary_attachment(&local)?;
+        if let Some(local) = &local {
+            require_ordinary_attachment(local)?;
         }
-        identity.authorize_database(database, access)
+        identity.authorize_database(database, access)?;
+        Ok(local)
     }
 
     pub fn session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>) -> Result<NativeSession> {
@@ -470,9 +479,9 @@ impl Node {
     }
     pub fn snapshot_basis(&self) -> Result<TimeBasis> {
         self.ensure_open()?;
-        Ok(TimeBasis { databases: self.catalog.open_databases().into_iter().map(|(name, database)| {
+        Ok(TimeBasis { databases: self.catalog.open_database_map().iter().map(|(name, database)| {
             let key = database.partition.value().live().latest_completed_tx();
-            (name, vec![key.map(|key| key.system_time.into())])
+            (name.clone(), vec![key.map(|key| key.system_time.into())])
         }).collect() })
     }
     pub fn latest_completed_transactions(&self) -> Result<BTreeMap<String, Vec<Option<TransactionKey>>>> {
@@ -572,6 +581,15 @@ impl Node {
         tokio::time::timeout(timeout, work).await.map_err(|_| timeout_error())?
     }
 
+    /// As `attached_database`, reusing the database admission found under that name with no suspension since.
+    fn admitted_database(&self, admitted: Option<Arc<Database>>, database: &str, placement: Option<&Weak<Database>>) -> Result<Arc<Database>> {
+        let Some(current) = admitted else { return self.attached_database(database, placement) };
+        if placement.is_some_and(|expected| !std::ptr::eq(expected.as_ptr(), Arc::as_ptr(&current))) {
+            return Err(lost_placement(database));
+        }
+        Ok(current)
+    }
+
     fn attached_database(&self, database: &str, placement: Option<&Weak<Database>>) -> Result<Arc<Database>> {
         let current = self.catalog.database(database).map_err(|error| if self.catalog.is_placed() { lost_placement(database) } else { error })?;
         if placement.is_some_and(|expected| !std::ptr::eq(expected.as_ptr(), Arc::as_ptr(&current))) {
@@ -644,9 +662,9 @@ impl Node {
     }
 
     async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cut: CatalogReadCut<'_>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        let admitted = self.admit_attached(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
-        let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
+        let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.admitted_database(admitted, database, placement)).transpose()?;
         let replica_capture = basis.replica_capture.as_ref();
         if let Some(capture) = replica_capture {
             let same_attachment = held.as_ref().is_some_and(|database| {
@@ -654,6 +672,7 @@ impl Node {
             });
             if !same_attachment { return Err(lost_placement(database)); }
         }
+        let mut confirmed = false;
         let hosted_fence = match cut {
             CatalogReadCut::HostedApplied { history, admission, .. } => {
                 self.ensure_indexing()?;
@@ -661,12 +680,16 @@ impl Node {
                 Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, admission))
             }
             CatalogReadCut::Current | CatalogReadCut::Single | CatalogReadCut::Reserved(_) => {
-                if replica_capture.is_none() && let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+                if replica_capture.is_none() && let Some(fence) = &self.read_fence {
+                    fence.confirm(database).await?;
+                    confirmed = true;
+                }
                 None
             }
         };
         let audience = hosted_fence.is_some_and(|(_, _, admission)| !matches!(admission, AppliedCatalogAdmission::Ordinary));
-        if let Some(previous) = &held {
+        // Only a suspension since admission can have changed the attachment.
+        if confirmed && let Some(previous) = &held {
             let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
             if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
         }
@@ -676,8 +699,12 @@ impl Node {
         let mut snapshots = BTreeMap::new();
         let mut lease: Option<Arc<rtdb_storage::ReadLease>> = None;
         let mut applied = None;
-        let classic = if held.is_some() { BTreeMap::new() } else { self.catalog.open_databases() };
-        for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
+        // Collected before the loop: an iterator borrowing the map across its awaits would keep the future from being `Send`.
+        let databases: Vec<(String, Arc<Database>)> = match held {
+            Some(held) => vec![(database.to_owned(), held)],
+            None => self.catalog.open_database_map().iter().map(|(name, database)| (name.clone(), Arc::clone(database))).collect(),
+        };
+        for (name, database) in databases {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let database_lease = match cut {
                 CatalogReadCut::HostedApplied { .. } => database.object_store().catalog_delivery_lease().await?,
@@ -768,7 +795,7 @@ impl Node {
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory));
         if !matches!(cut, CatalogReadCut::Single) {
-            catalog = catalog.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
+            catalog = catalog.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(Arc::clone(&self.runtime), cancellation.clone())));
         }
         let archive_history = self.read_fence.as_ref().is_some_and(|fence| fence.archive_history(database));
         if archive_history { catalog = catalog.with_archive_history(); }
@@ -854,14 +881,7 @@ impl Node {
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
-        let objects = database.object_store();
-        if let Some(lease) = objects.catalog_delivery_lease().await? {
-            return Ok(Some(lease));
-        }
-        if !self.factory.options.replication.enabled || objects.defers_trie_releases() {
-            return Ok(None);
-        }
-        database.read_lease(&self.factory.clock, &self.factory.options.garbage).await.map(Some)
+        self.factory.catalog_read_lease(database).await
     }
 
     /// Waits for this node's copy to reach the delegated fragment's transaction basis.

@@ -26,8 +26,22 @@ enum DriverLifetime { Running, Joined }
 #[derive(Clone)]
 enum Entry { Open { database: Arc<Database>, driver: DriverLifetime }, Skipped(DatabaseConfig), Detaching(Arc<Database>) }
 
+/// The open databases of a set, by name.
+pub type OpenDatabases = BTreeMap<String, Arc<Database>>;
+
 #[derive(Clone, Default)]
-struct DatabaseSet { entries: BTreeMap<String, Entry> }
+struct DatabaseSet { entries: BTreeMap<String, Entry>, open: Arc<OpenDatabases> }
+
+impl DatabaseSet {
+    /// Publishes the set with its open databases derived once for every reader of this version.
+    fn publish(mut self) -> Arc<Self> {
+        self.open = Arc::new(self.entries.iter().filter_map(|(name, entry)| match entry {
+            Entry::Open { database, .. } => Some((name.clone(), Arc::clone(database))),
+            _ => None,
+        }).collect());
+        Arc::new(self)
+    }
+}
 
 pub struct DatabaseCatalog {
     value: RwLock<Arc<DatabaseSet>>,
@@ -131,9 +145,9 @@ impl DatabaseCatalog {
             _ => Err(Anomaly::incorrect("xtdb/unknown-db", format!("Unknown database: {name}")).with_context("db-name", name.into())),
         }
     }
-    pub fn open_databases(&self) -> BTreeMap<String, Arc<Database>> {
-        self.value.read().entries.iter().filter_map(|(name, entry)| match entry { Entry::Open { database, .. } => Some((name.clone(), Arc::clone(database))), _ => None }).collect()
-    }
+    pub fn open_databases(&self) -> OpenDatabases { self.open_database_map().as_ref().clone() }
+    /// The open databases of the current catalog version, shared with every other reader of that version.
+    pub fn open_database_map(&self) -> Arc<OpenDatabases> { Arc::clone(&self.value.read().open) }
     /// Captures open database owners under one catalog read and reserves the result container before allocation.
     /// Returned database owners and the reservation remain live through every clone of the snapshot.
     pub fn open_database_snapshot(&self, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<rtdb_plan::CatalogRows<Arc<Database>>> {
@@ -209,7 +223,7 @@ impl DatabaseCatalog {
         if value.entries.contains_key(&name) { return Err(Anomaly::fault("rtdb.node/catalog-writer", "Database name was inserted outside the catalog owner's order")); }
         let mut next = value.as_ref().clone();
         next.entries.insert(name, entry);
-        *value = Arc::new(next);
+        *value = next.publish();
         Ok(())
     }
     pub(crate) fn begin_detach(&self, name: &str) -> Result<Option<Arc<Database>>> {
@@ -231,7 +245,7 @@ impl DatabaseCatalog {
             Some(Entry::Skipped(_)) => (None, false),
             _ => return Err(no_database(name)),
         };
-        *value = Arc::new(next);
+        *value = next.publish();
         drop(value);
         if let Some(database) = &cancel { database.cancel(); }
         Ok(if drain { cancel } else { None })
@@ -246,7 +260,7 @@ impl DatabaseCatalog {
             }
             _ => return false,
         }
-        *value = Arc::new(next);
+        *value = next.publish();
         false
     }
     pub(crate) fn teardown_finished(&self, database: &Arc<Database>) {
@@ -254,7 +268,7 @@ impl DatabaseCatalog {
         if !matches!(value.entries.get(database.name()), Some(Entry::Detaching(detaching)) if Arc::ptr_eq(detaching, database)) { return; }
         let mut next = value.as_ref().clone();
         next.entries.remove(database.name());
-        *value = Arc::new(next);
+        *value = next.publish();
     }
     pub(crate) fn held_databases(&self) -> Vec<Arc<Database>> {
         self.value.read().entries.values().filter_map(|entry| match entry {
