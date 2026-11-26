@@ -17,7 +17,7 @@ use rtdb_server::{PlacedOptions, ServerDriver, ServerHandle, config::NodeConfigu
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker;
 
 use crate::agent::{AgentOptions, NodeAgent};
@@ -66,6 +66,8 @@ pub struct RunningNode {
     lease_cancellation: CancellationToken,
     storage_regions: TaskTracker,
     tasks: JoinSet<Result<()>>,
+    // Dropping the JoinSet aborts the async tasks but cannot abort the receiver clock's blocking thread, which would then hold the caller's runtime shutdown forever.
+    _stop_clock_on_drop: DropGuard,
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
@@ -247,7 +249,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()),
         cancellation.clone(), pgwire_address, relay_limit, pgwire.watch_status(),
     ));
-    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, tasks })
+    let _stop_clock_on_drop = lease_cancellation.clone().drop_guard();
+    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, tasks, _stop_clock_on_drop })
 }
 
 impl RunningNode {
