@@ -52,12 +52,11 @@ impl AppliedWatch {
     /// Returns at `until`, or once the residence applies a position not marked seen, or once the journal holds an entry past the residence's applied position.
     pub async fn changed(&mut self, until: tokio::time::Instant) -> Result<()> {
         let applied = Lsn(*self.applied.borrow());
-        let wait = until.saturating_duration_since(tokio::time::Instant::now());
         tokio::select! {
             changed = self.applied.changed() => changed.map_err(|_| Anomaly::new(
                 AnomalyCategory::Unavailable, "rtdb/residence-closed", "The database residence closed",
             )),
-            held = self.stream.holds_after(applied, wait) => held.map(drop),
+            held = self.stream.wait_after(applied, until) => held,
             _ = tokio::time::sleep_until(until) => Ok(()),
         }
     }

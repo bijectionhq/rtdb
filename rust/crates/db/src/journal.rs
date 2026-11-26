@@ -76,6 +76,32 @@ pub(crate) struct Stream {
     pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
     pub(crate) kms: Arc<dyn Kms>,
     pub(crate) manifests: Arc<crate::replay::ManifestCache>,
+    tail: Arc<TailPoll>,
+}
+
+/// One journal long poll shared by every waiter of a stream: the first waiter
+/// polls, the others wait for what it finds, and one of them takes over when
+/// it ends without news.
+#[derive(Default)]
+struct TailPoll {
+    polling: tokio::sync::Mutex<()>,
+    /// A position the last poll found committed, published to the waiters.
+    found: tokio::sync::watch::Sender<u64>,
+    ended: tokio::sync::Notify,
+}
+
+/// The running poll. Ending it, including by dropping its waiter, frees the
+/// poll before waking the waiters, so a woken waiter can take it over.
+struct Polling<'a> {
+    guard: Option<tokio::sync::MutexGuard<'a, ()>>,
+    ended: &'a tokio::sync::Notify,
+}
+
+impl Drop for Polling<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.ended.notify_waiters();
+    }
 }
 
 pub(crate) struct Entry {
@@ -92,6 +118,7 @@ impl Stream {
             batch: None,
             kms,
             manifests: Arc::default(),
+            tail: Arc::default(),
         }
     }
 
@@ -127,9 +154,41 @@ impl Stream {
             .await
     }
 
+    /// Waits until `until` for a committed record after `applied`, sharing one
+    /// journal long poll among this stream's concurrent waiters.
+    pub(crate) async fn wait_after(&self, applied: Lsn, until: tokio::time::Instant) -> Result<()> {
+        let tail = &*self.tail;
+        let mut found = tail.found.subscribe();
+        // Only a poll that ends after this wait began counts: an older find
+        // may predate a recovery that shortened the journal.
+        found.mark_unchanged();
+        loop {
+            let ended = tail.ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            if let Ok(guard) = tail.polling.try_lock() {
+                let _polling = Polling { guard: Some(guard), ended: &tail.ended };
+                let wait = until.saturating_duration_since(tokio::time::Instant::now());
+                if self.holds_after(applied, wait).await? {
+                    tail.found.send_replace(applied.0 + 1);
+                }
+                return Ok(());
+            }
+            tokio::select! {
+                _ = found.changed() => {
+                    if *found.borrow_and_update() > applied.0 {
+                        return Ok(());
+                    }
+                }
+                _ = &mut ended => {}
+                _ = tokio::time::sleep_until(until) => return Ok(()),
+            }
+        }
+    }
+
     /// Waits up to `wait` for a committed record after `applied`.
     /// A reader below the retained floor, or behind an operator recovery, also has a record to apply.
-    pub(crate) async fn holds_after(&self, applied: Lsn, wait: Duration) -> Result<bool> {
+    async fn holds_after(&self, applied: Lsn, wait: Duration) -> Result<bool> {
         match self.journal.read(self.id(), Lsn(applied.0 + 1), 1, wait).await {
             Ok(page) => Ok(!page.records.is_empty()),
             Err(JournalError::Trimmed { .. } | JournalError::Recovered { .. }) => Ok(true),

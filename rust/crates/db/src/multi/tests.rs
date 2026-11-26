@@ -1,5 +1,5 @@
 use std::{
-    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -2571,4 +2571,71 @@ async fn an_entry_another_writer_appends_wakes_an_applied_watch_before_any_refre
     assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err(), "nothing is left to apply");
     writer.transact(&put(2, 2, "second")).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), waiting).await.expect("the other writer's entry wakes the watch").unwrap();
+}
+
+/// Counts the reads that wait for new records.
+struct LongPolls {
+    inner: Arc<dyn Journal>,
+    count: AtomicUsize,
+}
+
+impl Journal for LongPolls {
+    fn create(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
+        self.inner.create(stream)
+    }
+
+    fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.inner.seal(stream, epoch)
+    }
+
+    fn append(&self, stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.inner.append(stream, epoch, at, payload)
+    }
+
+    fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> BoxFuture<'_, journal_contract::Result<Page>> {
+        if !wait.is_zero() {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.read(stream, from, max, wait)
+    }
+
+    fn head(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
+        self.inner.head(stream)
+    }
+
+    fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, journal_contract::Result<()>> {
+        self.inner.trim(stream, epoch, through)
+    }
+
+    fn delete(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<()>> {
+        self.inner.delete(stream)
+    }
+}
+
+#[tokio::test]
+async fn applied_watch_waiters_share_one_journal_long_poll() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    let polls = Arc::new(LongPolls { inner: Arc::new(journal.handle(NODE_2_IDENTITY)), count: AtomicUsize::new(0) });
+    let mut follower = cluster.node(2, polls.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    writer.transact(&put(1, 1, "first")).await.unwrap();
+    follower.fresh_index().await.unwrap();
+
+    let until = tokio::time::Instant::now() + Duration::from_secs(60);
+    let waiters: Vec<_> = (0..4).map(|_| {
+        let mut watch = follower.watch_applied();
+        watch.mark_seen();
+        tokio::spawn(async move { watch.changed(until).await })
+    }).collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(waiters.iter().all(|waiter| !waiter.is_finished()), "nothing is left to apply");
+    writer.transact(&put(2, 2, "second")).await.unwrap();
+    for waiter in waiters {
+        tokio::time::timeout(Duration::from_secs(10), waiter).await.expect("the entry wakes every waiter").unwrap().unwrap();
+    }
+    // A woken waiter that re-checks before its refresh lands may poll once more, but never one poll per waiter.
+    assert!(polls.count.load(Ordering::SeqCst) < 4, "the waiters shared their long polls");
 }
