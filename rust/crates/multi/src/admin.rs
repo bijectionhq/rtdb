@@ -3102,7 +3102,7 @@ mod tests {
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &source,
                 super::ForkDestination { name: "child", org: None, hosted_task: None, broker: Some(&broker) }, None, Vec::new(), 4 << 20)).await.unwrap();
-        assert_eq!(keys.existing(&child.key_id()).await.unwrap(), key);
+        assert_ne!(keys.existing(&child.key_id()).await.unwrap(), key, "a fork seals under its own key");
         let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
 
         let mut deleting = updated.clone();
