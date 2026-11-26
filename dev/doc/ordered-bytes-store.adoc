@@ -138,6 +138,12 @@ The transaction buffer positions every staged event (`EventPosition { transactio
 * Every world fork cut names its basis by position, a historical (as-of time) one included: a historical hold's cut is the publication its session selected (`OwnedReadSession::historical_publication`), and `OwnedForkCut::positioned_basis` always answers a `TransactionKey`, whose system time is only a coordinate (`OwnedForkCut::basis`).
   Checkpoints, suffix captures and suffix pins match it by position (`matches_fork_checkpoint`, `copy_fork_suffix`, `OwnedForkCut::matches_basis`, the agent's `SuffixCut`), so a checkpoint between two tied transactions is never selected.
 
+== The tie rule beyond the store (T7)
+
+Every transaction time that shares a log with store appends follows the store's rule: it never goes back, ties are admitted, and positions order them.
+
+* A Multi workload is judged at the time it commits at, `now.max(head.system_time)`, as `TransactState` commits it (`db/src/multi/pipeline.rs`: `check_managed_appointment`, the classic placement path, `managed_workload_serial`), never one tick past the head.
+
 == Verification obligations (T7)
 
 * V9′: `TransactState::resolve_store`'s clock decision equals `judge::admit(head, last, sample, not_before, before, write_free)` with no comparison of the sample against the last stamp beyond `admit`'s own regression check.

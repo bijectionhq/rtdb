@@ -736,7 +736,9 @@ impl MultiDatabase {
 
     fn check_managed_appointment(&self, epoch: Epoch, appointment: &workload::ManagedAppointment, at: Timestamp) -> Result<()> {
         let state = self.durable_transactions();
-        let now = self.append_authority(epoch)?.upper().max(state.index().head().system_time.next()?).max(at);
+        // Judged at the time the workload commits at (`TransactState` takes
+        // `now.max(head)`): ties are admitted, so never a tick past the head (T7).
+        let now = self.append_authority(epoch)?.upper().max(state.index().head().system_time).max(at);
         appointment.check_current(state, now)
     }
 
@@ -910,7 +912,7 @@ impl MultiDatabase {
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;
         let claims = self.tokens.verify_claims_in(std::iter::empty(), None).await;
-        let decision_time = now.max(self.durable_transactions().index().head().system_time.next()?);
+        let decision_time = now.max(self.durable_transactions().index().head().system_time);
         let (transaction, admission) = placement.prepare(self.durable_transactions(), decision_time)?;
         let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
             .decide_workload(&transaction, now, FEATURES, &claims, &admission)?;
@@ -940,7 +942,9 @@ impl MultiDatabase {
         let now = (self.clock)();
         let upper = self.append_authority(lease.epoch)?.upper();
         let state = self.durable_transactions();
-        let decision_time = now.max(state.index().head().system_time.next()?);
+        // The workload's commit time (`TransactState`: `now.max(head)`); ties
+        // are admitted and positions order them (T7).
+        let decision_time = now.max(state.index().head().system_time);
         request.check_expiry(upper.max(decision_time))?;
         let (mut transaction, admission) = match request.prepare(state, decision_time)? {
             workload::Prepared::Answer(reply) => return Ok(reply),
