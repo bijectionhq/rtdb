@@ -2597,7 +2597,10 @@ async fn binary_owned_flight_retains_identity_order_and_the_scalar_batch_refusal
     use rtdb_format::ipc::write_arrow_stream;
 
     fn request(prefix: &[u8], columns: Vec<(&str, ArrayRef)>) -> Bytes {
-        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        nullable_request(prefix, columns.into_iter().map(|(name, column)| { let nullable = column.null_count() > 0; (name, column, nullable) }).collect())
+    }
+    fn nullable_request(prefix: &[u8], columns: Vec<(&str, ArrayRef, bool)>) -> Bytes {
+        let batch = RecordBatch::try_from_iter_with_nullable(columns).unwrap();
         let mut body = prefix.to_vec();
         body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
         body.into()
@@ -2642,9 +2645,9 @@ async fn binary_owned_flight_retains_identity_order_and_the_scalar_batch_refusal
     let hold = opened.slice(..16);
     let system = i64::from_be_bytes(opened[16..24].try_into().unwrap());
     let prefix = [hold.as_ref(), relation.as_slice()].concat();
-    let point = |id: ArrayRef| vec![("_id", id), ("valid_micros", Arc::new(Int64Array::from(vec![Some(system)])))];
+    let point = |id: ArrayRef| vec![("_id", id, false), ("valid_micros", Arc::new(Int64Array::from(vec![Some(system)])) as ArrayRef, true)];
     let scalar_point = "rtdb.owned.ReadHeldPoint.v2";
-    let binary_point = request(&prefix, point(Arc::new(BinaryArray::from_iter_values([low]))));
+    let binary_point = nullable_request(&prefix, point(Arc::new(BinaryArray::from_iter_values([low]))));
     let reply = client.action(scalar_point, binary_point.clone()).await.unwrap().remove(0).body;
     let mut stream = StreamReader::try_new(reply.as_ref(), None).unwrap();
     let original_position = stream.schema().metadata()["rtdb.owned.event_position"].clone();
@@ -2652,10 +2655,10 @@ async fn binary_owned_flight_retains_identity_order_and_the_scalar_batch_refusal
     let ids = row.column_by_name("_id").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(ids.value(0), low);
 
-    let text_point = request(&prefix, point(Arc::new(StringArray::from(vec!["00ff"]))));
+    let text_point = nullable_request(&prefix, point(Arc::new(StringArray::from(vec!["00ff"]))));
     let text = client.action(scalar_point, text_point).await.unwrap().remove(0).body;
     assert!(StreamReader::try_new(text.as_ref(), None).unwrap().next().is_none());
-    let historical = request(&[hold.as_ref(), &system.to_be_bytes(), relation.as_slice()].concat(),
+    let historical = nullable_request(&[hold.as_ref(), &system.to_be_bytes(), relation.as_slice()].concat(),
         point(Arc::new(BinaryArray::from_iter_values([low]))));
     let historical = client.action("rtdb.owned.ReadHeldHistoricalPoint.v1", historical).await.unwrap().remove(0).body;
     let history = StreamReader::try_new(historical.as_ref(), None).unwrap();
