@@ -4,7 +4,7 @@ pub(crate) mod local;
 mod memory;
 mod read_only;
 
-pub use local::{LocalLog, LocalLogDriver, LocalLogOptions, LocalLogSyncs};
+pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 

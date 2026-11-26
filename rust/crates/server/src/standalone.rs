@@ -486,7 +486,6 @@ async fn initialize_journal(path: &Path) -> Result<Uuid> {
         Arc::new(JournalTimestamp),
         IoRegion::new(),
         None,
-        rtdb_storage::log::LocalLogSyncs::new(),
     )?;
     drop(driver);
     log.close_and_wait().await;

@@ -187,7 +187,6 @@ mod tests {
                 Arc::new(SuppliedTimestamp),
                 Arc::clone(&io),
                 Some(slots),
-                LocalLogSyncs::new(),
             )?)
         };
         let (log, driver) = open(true)?;

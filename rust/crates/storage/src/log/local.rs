@@ -10,7 +10,7 @@ use std::io::{self, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -64,49 +64,6 @@ pub struct LocalLogDriver {
     queue: mpsc::Receiver<Queued>,
     progress: Arc<Progress>,
     recent: Arc<RecentFrames>,
-    syncs: Arc<LocalLogSyncs>,
-    /// A moving average of recent batch sizes: above one, appenders are concurrent and a batch may wait to share its sync.
-    recent_batch: f64,
-}
-
-/// The longest a batch waits for another log's sync to complete.
-const APPEND_LINGER_LIMIT: Duration = Duration::from_millis(10);
-
-/// The syncs in flight across local logs that share one drive; whoever opens those logs shares one value between them.
-/// A full sync flushes the whole drive cache, and the drive runs them one at a time, so a batch whose sync would queue
-/// behind another's loses nothing by taking the frames that arrive until that one completes.
-pub struct LocalLogSyncs(watch::Sender<SyncCount>);
-
-#[derive(Clone, Copy, Default)]
-struct SyncCount { in_flight: usize, completed: u64 }
-
-impl Default for LocalLogSyncs {
-    fn default() -> Self { Self(watch::channel(SyncCount::default()).0) }
-}
-
-impl LocalLogSyncs {
-    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
-
-    fn begin(self: &Arc<Self>) -> SyncInFlight {
-        self.0.send_modify(|count| count.in_flight += 1);
-        SyncInFlight(Arc::clone(self))
-    }
-
-    /// Completes when any sync completes, or at once when none is in flight.
-    async fn settled(&self) {
-        let mut counts = self.0.subscribe();
-        let start = *counts.borrow_and_update();
-        if start.in_flight == 0 { return; }
-        let _ = counts.wait_for(|count| count.completed != start.completed).await;
-    }
-}
-
-struct SyncInFlight(Arc<LocalLogSyncs>);
-
-impl Drop for SyncInFlight {
-    fn drop(&mut self) {
-        self.0.0.send_modify(|count| { count.in_flight -= 1; count.completed += 1; });
-    }
 }
 
 struct Writer { file: JournalFile, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource>, keys: Option<Arc<ClassicObjectKeys>> }
@@ -322,26 +279,25 @@ impl LocalLog {
 
     /// Uses a caller-owned reader I/O region; the caller closes that region after consumers and the writer join.
     pub fn open_with_timestamp_source_in(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>, reads: Arc<IoRegion>) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_with_key_slots(path, options, timestamps, reads, None, LocalLogSyncs::new())
+        Self::open_with_key_slots(path, options, timestamps, reads, None)
     }
 
-    /// `syncs` is shared with the other logs on the same drive, whose syncs this log's batches may wait to follow.
     pub fn open_with_key_slots(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, syncs: Arc<LocalLogSyncs>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false, syncs)
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false)
     }
 
     /// Durably binds a native replica journal's lineage, preserving any existing record offsets.
     /// The returned driver has the same run/cancel/join obligation as [`Self::open`].
     pub fn open_replica(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, syncs: Arc<LocalLogSyncs>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true, syncs)
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true)
     }
 
     fn open_journal(path: &Path, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
-        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool, syncs: Arc<LocalLogSyncs>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
         let path = Arc::new(path.to_path_buf());
         let _operation = reads.admit_read(path.clone(), ())?;
@@ -375,8 +331,7 @@ impl LocalLog {
         let (send, queue) = mpsc::channel(options.queue_capacity);
         let log = Arc::new(Self { path: path.clone(), lineage: file.lineage(), queue: send, progress: progress.clone(),
             maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads, recent: recent.clone() });
-        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent,
-            syncs, recent_batch: 1.0 }))
+        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress, recent }))
     }
 
     /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
@@ -491,16 +446,10 @@ impl LocalLogDriver {
             };
             let mut writer = self.writer.take().ok_or_else(|| Error::Closed("local writer unavailable".into()))?;
             let sealed = writer.keys.is_some();
-            let (mut records, mut deferred) = self.ready_batch(first, sealed, Instant::now() + APPEND_BATCH_TIME);
-            if deferred.is_none() && self.recent_batch >= 1.5 {
-                deferred = self.linger(&mut records, sealed).await;
-            }
-            self.recent_batch = self.recent_batch * 0.75 + records.len() as f64 * 0.25;
+            let (records, deferred) = self.ready_batch(first, sealed, Instant::now() + APPEND_BATCH_TIME);
             next = deferred;
-            let in_flight = self.syncs.begin();
             let joined = tokio::task::spawn_blocking(move || {
                 let result = writer.append(&records);
-                drop(in_flight);
                 (writer, records, result)
             }).await;
             let (writer, records, result) = match joined {
@@ -545,27 +494,6 @@ impl LocalLogDriver {
             bytes += size;
         }
         (records, None)
-    }
-
-    /// Takes further frames into this batch while another log's sync is in flight, returning a frame that would overflow it.
-    /// With no sync in flight the batch syncs at once: a timed wait would leave the drive idle.
-    async fn linger(&mut self, records: &mut Vec<Queued>, sealed: bool) -> Option<Queued> {
-        let mut bytes: usize = records.iter().map(|record| record.frame_bytes(sealed)).sum();
-        let syncs = Arc::clone(&self.syncs);
-        let settled = tokio::time::timeout(APPEND_LINGER_LIMIT, async move { syncs.settled().await });
-        tokio::pin!(settled);
-        while bytes < APPEND_BATCH_BYTES {
-            let record = tokio::select! {
-                biased;
-                record = self.queue.recv() => match record { Some(record) => record, None => return None },
-                _ = &mut settled => return None,
-            };
-            let size = record.frame_bytes(sealed);
-            if size > APPEND_BATCH_BYTES - bytes { return Some(record); }
-            records.push(record);
-            bytes += size;
-        }
-        None
     }
 
     fn reject_pending(&mut self, deferred: Option<Queued>, reason: String) {
@@ -824,7 +752,7 @@ mod tests {
     fn replica_options() -> LocalLogOptions { LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 } }
 
     fn open_replica(path: &Path) -> Result<(Arc<LocalLog>, LocalLogDriver)> {
-        LocalLog::open_replica(path, replica_options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None, LocalLogSyncs::new())
+        LocalLog::open_replica(path, replica_options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None)
     }
 
     #[test]
@@ -1023,7 +951,7 @@ mod tests {
         let slots = vault.log_keys(&path, true, Arc::clone(&io))?;
         let (log, driver) = LocalLog::open_with_key_slots(
             &path, LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 },
-            Arc::new(SuppliedTimestamp), Arc::clone(&io), Some(slots), LocalLogSyncs::new(),
+            Arc::new(SuppliedTimestamp), Arc::clone(&io), Some(slots),
         )?;
         let shutdown = CancellationToken::new();
         let writer = tokio::spawn(driver.run(shutdown.clone()));
@@ -1093,88 +1021,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_logs_opened_with_one_sync_set_wait_on_each_others_syncs() -> Result<()> {
+    async fn a_batch_takes_only_the_frames_already_queued_and_does_not_wait_for_more() -> Result<()> {
         let directory = tempfile::tempdir().unwrap();
-        let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 16 };
-        let open = |name: &str, syncs: &Arc<LocalLogSyncs>| LocalLog::open_with_key_slots(
-            directory.path().join(name), options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None, Arc::clone(syncs),
-        );
-        let drive = LocalLogSyncs::new();
-        let (_source_log, source) = open("LOG", &drive)?;
-        let (replica_log, mut replica) = open("REPLICA_LOG", &drive)?;
-        let (stranger_log, mut stranger) = open("OTHER_LOG", &LocalLogSyncs::new())?;
-        let _syncing = source.syncs.begin();
-
-        let _first = stranger_log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
-        let mut records = vec![stranger.queue.try_recv().unwrap()];
-        let started = Instant::now();
-        assert!(stranger.linger(&mut records, false).await.is_none());
-        assert!(started.elapsed() < APPEND_LINGER_LIMIT, "a log on another sync set syncs at once");
-
-        let _first = replica_log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
-        let mut records = vec![replica.queue.try_recv().unwrap()];
-        let started = Instant::now();
-        assert!(replica.linger(&mut records, false).await.is_none());
-        assert!(started.elapsed() >= APPEND_LINGER_LIMIT, "a log on the same sync set waits for the source's sync");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn concurrent_appenders_share_a_sync_with_frames_arriving_while_another_log_syncs() -> Result<()> {
-        let (_directory, log, mut driver) = isolated_driver(16)?;
-        let other = driver.syncs.begin();
+        let (log, mut driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 16 })?;
         let _first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
-        let mut records = vec![driver.queue.try_recv().unwrap()];
-        let late = {
-            let log = log.clone();
-            tokio::spawn(async move {
-                let late = log.enqueue(Bytes::from_static(b"late"), Timestamp(2)).await;
-                drop(other);
-                late
-            })
-        };
-        assert!(driver.linger(&mut records, false).await.is_none());
-        let _late = late.await.unwrap()?;
-        assert_eq!(records.iter().map(|record| record.timestamp.0).collect::<Vec<_>>(), [1, 2]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_batch_syncs_at_once_when_no_other_log_is_syncing() -> Result<()> {
-        let (_directory, log, mut driver) = isolated_driver(16)?;
-        let _first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
-        let mut records = vec![driver.queue.try_recv().unwrap()];
-        assert!(driver.linger(&mut records, false).await.is_none());
-        assert_eq!(records.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_batch_waits_for_another_logs_sync_no_longer_than_the_linger_limit() -> Result<()> {
-        let (_directory, log, mut driver) = isolated_driver(16)?;
-        let _stuck = driver.syncs.begin();
-        let _first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
-        let mut records = vec![driver.queue.try_recv().unwrap()];
+        let first = driver.queue.try_recv().unwrap();
         let started = Instant::now();
-        assert!(driver.linger(&mut records, false).await.is_none());
-        assert!(started.elapsed() >= APPEND_LINGER_LIMIT);
-        assert_eq!(records.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn an_append_counts_its_sync_in_flight_only_until_it_is_durable() -> Result<()> {
-        let (_directory, log, driver) = isolated_driver(4)?;
-        let syncs = Arc::clone(&driver.syncs);
-        let shutdown = CancellationToken::new();
-        let writer = tokio::spawn(driver.run(shutdown.clone()));
-        for time in 0..3 {
-            log.enqueue(Bytes::from_static(b"frame"), Timestamp(time)).await?.durable().await?;
-            let count = *syncs.0.borrow();
-            assert_eq!((count.in_flight, count.completed), (0, time as u64 + 1));
-        }
-        shutdown.cancel();
-        writer.await.unwrap()?;
+        let (batch, deferred) = driver.ready_batch(first, false, Instant::now() + Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1), "a lone frame syncs at once, as upstream's LocalLog takes what is queued");
+        assert_eq!(batch.len(), 1);
+        assert!(deferred.is_none());
         Ok(())
     }
 
