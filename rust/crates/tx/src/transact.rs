@@ -339,7 +339,7 @@ pub struct StoreAppend {
     pub writes: Vec<StoreWrite>,
     #[serde(default)]
     pub bounds: Vec<StoreBound>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub derives: Vec<Vec<u8>>,
     pub window: Window,
 }
