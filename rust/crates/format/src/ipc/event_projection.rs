@@ -103,17 +103,17 @@ impl EventProjection {
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(invalid)
     }
 
+    /// `None` where only the full decoder reads the page.
     pub(super) fn decode(
         &self, source: &SchemaRef, message: arrow_ipc::Message<'_>, body: &Buffer, native: bool,
-    ) -> Option<RecordBatch> {
-        let batch = message.header_as_record_batch()?;
+    ) -> Result<Option<RecordBatch>> {
+        let Some(batch) = message.header_as_record_batch() else { return Ok(None) };
         let version = message.version();
-        let plan = projection::prepare(body, batch, source, version,
-            |index, _| self.fields[index].selection(), Preparation::ReadPreparedFile, |_| Ok(()))
-            .ok()??;
+        let Some(plan) = projection::prepare(body, batch, source, version,
+            |index, _| self.fields[index].selection(), Preparation::ReadPreparedFile, |_| Ok(()))?
+            .filter(|plan| !plan.declines(native)) else { return Ok(None) };
         let indices = (self.indices.len() != source.fields().len()).then_some(self.indices.as_slice());
-        plan.decode(native, source, indices, |_| Ok(Arc::clone(&self.schema)),
-            Some(&self.descriptors)).ok()
+        plan.decode(native, source, indices, |_| Ok(Arc::clone(&self.schema)), Some(&self.descriptors)).map(Some)
     }
 }
 
@@ -153,7 +153,8 @@ mod tests {
         let (header, body) = super::super::block_message(block, &encoded).unwrap();
         let message = arrow_ipc::root_as_message(&encoded[header]).unwrap();
         let page = file.pages.event_projection.as_ref().unwrap().decode(&file.pages.decoded_schema, message, &encoded.slice(body), true)
-            .expect("projection must decode before falling back to full-page reads");
+            .expect("projection must decode before falling back to full-page reads")
+            .expect("a plain event layout is projected rather than declined");
         assert_eq!(page.schema(), file.schema());
         drop(file);
         let start = buffer.as_ptr() as usize;

@@ -325,7 +325,7 @@ impl ArrowFile {
             ProjectionAttempt::Selected(batch, charge) => (batch, charge, "rtdb.event.projected/selected", None),
             ProjectionAttempt::Fallback(reason) => {
                 let charge = memory.reserve(self.pages.full_page_decode_bound(page, &wire)?)?;
-                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Decode the full page after projection planning declines or projected decoding fails.
+                // arrow-flow: rtdb.event.projected/full-page retained-ipc decoded-page decode event-page candidate decode_page | Decode the full page after projection planning declines.
                 let batch = self.pages.decode_page(page, wire)?;
                 (batch, charge, "rtdb.event.projected/full-page", Some(reason))
             }
@@ -371,14 +371,12 @@ enum ProjectionAttempt<G> {
 
 enum ProjectionFallback {
     PlanDeclined,
-    DecodeFailed,
 }
 
 impl ProjectionFallback {
     fn label(self) -> &'static str {
         match self {
             Self::PlanDeclined => "plan-declined",
-            Self::DecodeFailed => "decode-failed",
         }
     }
 }
@@ -391,8 +389,10 @@ impl PageDecoder {
         let source_schema = Arc::new(crate::ipc_decimal::decode(ipc_schema)?);
         let decoded = decoded_schema::adapt(&source_schema)?;
         let schema = if let Some(projection) = &projection { Arc::new(decoded.project(projection).map_err(invalid)?) } else { Arc::clone(&decoded) };
-        // SAFETY: persisted blocks come from the database's Arrow writer. The reference writer's undefined union
-        // cells use type ID -1. Decode checks each block's framing and repairs those cells before validating the page.
+        // SAFETY: the reference writer's undefined union cells use type ID -1, which arrow-rs validation rejects.
+        // This decoder is private to `load_dictionary` and `decode_prepared`, and no batch leaves `decode_prepared`
+        // before `undefined::reinstate` has rewritten those cells and run `validate_full` over every column, dictionary
+        // values included; `corrupt_persisted_pages_fail_full_decode_validation` checks that.
         let mut decoder = unsafe { FileDecoder::new(Arc::clone(&decoded), footer.version()).with_skip_validation(true) };
         if let Some(projection) = projection { decoder = decoder.with_projection(projection); }
         let blocks: Vec<_> = footer.recordBatches().ok_or_else(|| invalid("Arrow footer has no record-batch inventory"))?.iter().copied().collect();
@@ -473,17 +473,16 @@ impl PageDecoder {
 
     pub fn decode_iid_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
         let iid = self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
-        match self.decode_projected_page(page, &bytes, PageProjection::Iid) {
-            Ok(batch) => Ok(batch),
-            Err(_) => self.decode_page(page, bytes)?.project(&[iid]).map_err(invalid),
+        match self.decode_projected_page(page, &bytes, PageProjection::Iid)? {
+            Some(batch) => Ok(batch),
+            None => self.decode_page(page, bytes)?.project(&[iid]).map_err(invalid),
         }
     }
 
     pub fn decode_event_page(&self, page: usize, bytes: Buffer, put_columns: &[String]) -> Result<RecordBatch> {
-        match self.decode_projected_page(page, &bytes, PageProjection::PutColumns(put_columns)) {
-            Ok(batch) => Ok(batch),
-            // Reference dense unions can use undefined type IDs that the projected decoder cannot read.
-            Err(_) => self.decode_page(page, bytes),
+        match self.decode_projected_page(page, &bytes, PageProjection::PutColumns(put_columns))? {
+            Some(batch) => Ok(batch),
+            None => self.decode_page(page, bytes),
         }
     }
 
@@ -512,10 +511,9 @@ impl PageDecoder {
         let (header, body_start) = block_message(block, &bytes)?;
         let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
         if (message.version() == self.version || self.version == arrow_ipc::MetadataVersion::V1)
-            && let Some(batch) = projection.decode(&self.decoded_schema, message, &bytes.slice(body_start), Arc::ptr_eq(&self.schema, &self.decoded_schema)) {
+            && let Some(batch) = projection.decode(&self.decoded_schema, message, &bytes.slice(body_start), Arc::ptr_eq(&self.schema, &self.decoded_schema))? {
             return Ok(batch);
         }
-        // Reference-writer undefined unions need normalization by the full decoder.
         projection.select_decoded(&self.decode_prepared(block, bytes)?)
     }
 
@@ -541,25 +539,29 @@ impl PageDecoder {
         let (batch, version, body) = self.projected_block(page, bytes)?;
         let body = bytes.slice(body);
         let Some(plan) = projection::prepare(&body, batch, &self.decoded_schema, version,
-            |_, field| selection.field(field), projection::Preparation::Measure, &mut reserve)? else {
+            |_, field| selection.field(field), projection::Preparation::Measure, &mut reserve)?
+            .filter(|plan| !plan.declines(self.native(version))) else {
             return Ok(ProjectionAttempt::Fallback(ProjectionFallback::PlanDeclined));
         };
         let charge = reserve(plan.bound)?;
         let _workspace = (plan.workspace != 0).then(|| reserve(plan.workspace)).transpose()?;
-        Ok(match self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice())) {
-            Ok(batch) => ProjectionAttempt::Selected(batch, charge),
-            Err(_) => ProjectionAttempt::Fallback(ProjectionFallback::DecodeFailed),
-        })
+        let batch = self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice()))?;
+        Ok(ProjectionAttempt::Selected(batch, charge))
     }
 
-    fn decode_projected_page(&self, page: usize, bytes: &Buffer, selection: PageProjection<'_>) -> Result<RecordBatch> {
+    /// `None` where only the full decoder reads the page.
+    fn decode_projected_page(&self, page: usize, bytes: &Buffer, selection: PageProjection<'_>) -> Result<Option<RecordBatch>> {
         let indices = self.projection_indices(selection)?;
         let (batch, version, body) = self.projected_block(page, bytes)?;
         let body = bytes.slice(body);
-        let plan = projection::prepare(&body, batch, &self.decoded_schema, version,
+        let Some(plan) = projection::prepare(&body, batch, &self.decoded_schema, version,
             |_, field| selection.field(field), projection::Preparation::ReadPage, |_| Ok(()))?
-            .ok_or_else(|| invalid("Arrow schema and field-node inventory disagree"))?;
-        self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice()))
+            .filter(|plan| !plan.declines(self.native(version))) else { return Ok(None) };
+        self.decode_projection(&plan, version, selection, indices.as_ref().map(|indices| indices.as_slice())).map(Some)
+    }
+
+    fn native(&self, version: arrow_ipc::MetadataVersion) -> bool {
+        version == self.version || self.version == arrow_ipc::MetadataVersion::V1
     }
 
     fn projection_indices(&self, selection: PageProjection<'_>) -> Result<Option<[usize; 1]>> {
@@ -572,8 +574,7 @@ impl PageDecoder {
         &self, plan: &projection::Plan<'_, G>, version: arrow_ipc::MetadataVersion,
         selection: PageProjection<'_>, indices: Option<&[usize]>,
     ) -> Result<RecordBatch> {
-        let native = version == self.version || self.version == arrow_ipc::MetadataVersion::V1;
-        plan.decode(native, &self.decoded_schema, indices,
+        plan.decode(self.native(version), &self.decoded_schema, indices,
             |nested| selection.output_schema(&self.decoded_schema, nested), None)
     }
 
@@ -2339,7 +2340,31 @@ fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {
 }
 
 #[test]
-fn projected_page_fallback_distinguishes_planning_and_decode() {
+fn corrupt_persisted_pages_fail_full_decode_validation() {
+    use arrow_array::StringArray;
+    use arrow_ipc::writer::FileWriter;
+
+    let batch = RecordBatch::try_from_iter([("_iid", Arc::new(StringArray::from(vec!["ab", "cd"])) as ArrayRef)]).unwrap();
+    let mut writer = FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
+    writer.write(&batch).unwrap();
+    let mut bytes = writer.into_inner().unwrap();
+    let offsets: Vec<u8> = [0i32, 2, 4].iter().flat_map(|offset| offset.to_le_bytes()).collect();
+    let at = bytes.windows(offsets.len()).position(|window| window == offsets.as_slice()).unwrap();
+    // The last offset now points past the two-row values buffer; only full validation notices.
+    bytes[at + 8..at + 12].copy_from_slice(&4096i32.to_le_bytes());
+    let bytes = Buffer::from(bytes);
+    let layout = inspect_file(&mut Cursor::new(bytes.as_slice())).unwrap();
+    let file = ArrowFile::from_inspected_buffer(bytes.clone(), None, layout).unwrap();
+    let range = file.pages.page_range(0).unwrap();
+    let wire = bytes.slice_with_length(range.start as usize, (range.end - range.start) as usize);
+
+    assert!(file.pages.decode_page(0, wire.clone()).is_err());
+    assert!(file.pages.decode_iid_page(0, wire.clone()).is_err(), "a corrupt projected page must not be retried in full");
+    assert!(file.pages.decode_event_page(0, wire, &[]).is_err());
+}
+
+#[test]
+fn projected_page_declines_dictionaries_and_mismatched_schemas_before_decode() {
     use arrow_array::{builder::StringDictionaryBuilder, types::Int8Type};
     use arrow_ipc::writer::FileWriter;
 
@@ -2355,8 +2380,9 @@ fn projected_page_fallback_distinguishes_planning_and_decode() {
     let wire = bytes.slice_with_length(range.start as usize, (range.end - range.start) as usize);
     let memory = MemoryBudget::new(1 << 20);
 
+    // The projected decoder has no dictionaries, so a selected dictionary column is declined before decode.
     let attempt = file.pages.decode_projected_buffer_reserved(0, &wire, PageProjection::Iid, |size| memory.reserve(size)).unwrap();
-    assert!(matches!(attempt, ProjectionAttempt::Fallback(ProjectionFallback::DecodeFailed)));
+    assert!(matches!(attempt, ProjectionAttempt::Fallback(ProjectionFallback::PlanDeclined)));
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(file.read_page(0).unwrap(), batch);
 

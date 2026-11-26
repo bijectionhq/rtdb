@@ -171,7 +171,8 @@ pub(super) fn prepare<'a, 'selection, G>(
         return Err(error);
     }
     let base = base?;
-    if selection.is_err() || layout.position != inventory || (layout.retained.unknown_null_counts && invalid_null_count) {
+    if selection.is_err() || layout.position != inventory || (layout.retained.unknown_null_counts && invalid_null_count)
+        || layout.retained.requires_full_decoder {
         return Ok(None);
     }
     let inventory = layout.retained;
@@ -254,10 +255,17 @@ struct Inventory<'a> {
     nested: bool,
     unknown_null_counts: bool,
     native_incompatible: bool,
+    /// A selected dictionary, or a selected union that may hold the reference's undefined cells.
+    requires_full_decoder: bool,
     bound: usize,
 }
 
 impl<G> Plan<'_, G> {
+    /// Unknown null counts are normalized only in a page written under the footer's metadata version.
+    pub(super) fn declines(&self, native_version: bool) -> bool {
+        self.inventory.unknown_null_counts && !native_version
+    }
+
     pub(super) fn decode(
         &self,
         native_version: bool,
@@ -472,6 +480,20 @@ impl<'a, 'b> Layout<'a, 'b> {
         Ok(())
     }
 
+    /// The reference marks a union cell its row lacks with type id -1, which only the full decoder repairs.
+    /// Compressed type ids cannot be inspected before decode, so they may hold such cells.
+    fn may_hold_undefined_cells(&self, type_ids: usize, rows: i64) -> Result<bool> {
+        let Some(buffers) = self.batch.buffers() else { return Ok(false) };
+        let rows = usize::try_from(rows).map_err(invalid)?;
+        let (span, _, decompresses) = decoded_buffer_span(buffers.get(type_ids), self.body.len(), self.compressed, |start| {
+            compressed_buffer_length(self.body, start)
+        })?;
+        if decompresses { return Ok(true); }
+        let start = if self.compressed && !span.is_empty() { span.start + 8 } else { span.start };
+        let ids = self.body.get(start..span.end).ok_or_else(|| invalid("Arrow union type ids exceed their buffer"))?;
+        Ok(ids.iter().take(rows).any(|id| (*id as i8) < 0))
+    }
+
     fn field(&mut self, field: &FieldRef, selection: Selection<'_>) -> Result<()> {
         if self.wire_error.is_some() {
             return Ok(());
@@ -538,6 +560,9 @@ impl<'a, 'b> Layout<'a, 'b> {
             return Ok(());
         }
         if keep {
+            self.retained.requires_full_decoder |= matches!(field.data_type(), DataType::Dictionary(..))
+                || (matches!(physical, DataType::Union(..))
+                    && self.may_hold_undefined_cells(start.buffer + usize::from(self.version < MetadataVersion::V5), node.length())?);
             if self.measure {
                 let mut descriptor = field_metadata_bound(field)?;
                 if let DataType::Timestamp(_, Some(zone)) = field.data_type() {
