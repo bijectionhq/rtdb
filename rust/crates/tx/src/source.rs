@@ -4461,42 +4461,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_union_tags_keep_input_owned_when_normalization_cannot_reserve() {
-        let memory = MemoryBudget::new(384 * 1024);
+    fn an_arrow_upload_encodes_the_same_source_bytes_under_any_budget_that_admits_it() {
         let legs = UnionFields::try_new([3, 8], [Field::new("left", DataType::Binary, false), Field::new("right", DataType::Binary, false)]).unwrap();
         let left = vec![1; 64 * 1024];
         let right = vec![2; 64 * 1024];
         let array = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), vec![
-            Arc::new(arrow_array::BinaryArray::from(vec![left.as_slice()])),
+            Arc::new(arrow_array::BinaryArray::from(vec![left.as_slice()])) as ArrayRef,
             Arc::new(arrow_array::BinaryArray::from(vec![right.as_slice()])),
         ]).unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("v", array.data_type().clone(), false)]));
-        let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(), &memory).unwrap();
-
-        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
-
-        assert!(Arc::ptr_eq(documents.array().column(0), batch.batch().column(0)));
-    }
-
-    #[test]
-    fn optional_union_copy_does_not_displace_document_schema_admission() {
-        let mut fields = (0..96).map(|index| Field::new(format!("v{index}"), DataType::Int64, false)).collect::<Vec<_>>();
-        let mut columns = vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as ArrayRef; fields.len()];
-        let legs = UnionFields::try_new([3, 8], [Field::new("a", DataType::Binary, false), Field::new("b", DataType::Binary, false)]).unwrap();
-        let payload = vec![0u8; 8 * 1024];
-        let child = || Arc::new(arrow_array::BinaryArray::from(vec![payload.as_slice()])) as ArrayRef;
-        let union = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), vec![child(), child()]).unwrap();
-        fields.push(Field::new("payload", union.data_type().clone(), false));
-        columns.push(Arc::new(union));
-        let schema = Arc::new(Schema::new(fields));
-        let bound = rtdb_format::ipc::schema_translation_bound(&schema).unwrap();
-        let batch = RecordBatch::try_new(schema, columns).unwrap();
-        let memory = MemoryBudget::new(batch.get_array_memory_size() + 2 * bound);
-        let batch = OwnedBatch::new(batch, &memory).unwrap();
-
-        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
-
-        assert!(Arc::ptr_eq(documents.array().column(96), batch.batch().column(96)));
+        let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("v", array.data_type().clone(), false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])), Arc::new(array)]).unwrap();
+        let encode = |limit: usize| -> Result<Vec<u8>> {
+            let memory = MemoryBudget::new(limit);
+            let owned = OwnedBatch::new(batch.clone(), &memory)?;
+            let documents = ArrowDocuments::from_batch(&owned, &memory)?.expect("a binary union is an Arrow document");
+            let (_, column) = document_column(documents.array(), "v").unwrap();
+            assert_eq!(column.data_type(), &DataType::Binary, "duplicate tags of one layout always normalize to that layout");
+            let operation = TxOp::PutArrowDocs { table: TableRef::new("public", "docs"), documents };
+            Ok(SourceTransaction::new(vec![operation], SubmitOptions::default(), &memory)?.encode()?.as_slice().to_vec())
+        };
+        let ample = encode(64 << 20).unwrap();
+        let mut refused = false;
+        for limit in (256 * 1024..=4 << 20).step_by(64 * 1024) {
+            match encode(limit) {
+                Ok(bytes) => assert_eq!(bytes, ample, "a {limit}-byte budget changed the source bytes"),
+                Err(error) => { assert_eq!(error.code, "rtdb/memory-budget-exceeded"); refused = true; }
+            }
+        }
+        assert!(refused, "the smallest budgets refuse the upload instead of choosing another layout");
     }
 
     #[test]

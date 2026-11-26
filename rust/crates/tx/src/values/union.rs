@@ -18,7 +18,7 @@ pub(super) fn normalize(input: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<
     let mut sources: Vec<Child> = Vec::with_capacity(fields.len());
     for (tag, field) in fields.iter() {
         let original = union.child(tag);
-        let Some(array) = normalized_document_array(original, memory, true)? else { return Ok(None); };
+        let Some(array) = normalized_document_array(original, memory)? else { return Ok(None); };
         changed |= !Arc::ptr_eq(&array, original);
         let field = normalized_field(field, &array);
         let field = if !matches!(field.data_type(), DataType::Null | DataType::Union(..)) && array.null_count() != 0 {

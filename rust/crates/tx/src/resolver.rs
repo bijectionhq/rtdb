@@ -1203,12 +1203,7 @@ impl<'a> OpenTransaction<'a> {
         let batch = page.batch();
         if batch.num_rows() == 0 { return Ok(()); }
         let memory = &self.context.memory;
-        match mutation_put_batch(page, system_time, memory) {
-            Ok(Some(put)) => return self.buffer.append_batch(table, put),
-            Ok(None) => (),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
-            Err(error) => return Err(error),
-        }
+        if let Some(put) = mutation_put_batch(page, system_time, memory)? { return self.buffer.append_batch(table, put); }
 
         let iids = mutation_column(batch, "_iid")?;
         let from = mutation_column(batch, "_valid_from")?;
@@ -1221,12 +1216,13 @@ impl<'a> OpenTransaction<'a> {
             iid: iids.iid(row)?, system_from: system_time,
             valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
         });
-        if matches!(documents.data_type(), DataType::Union(..))
-            && let Ok(Some((put, declarations))) = mutation_layout_batch(documents.as_ref(), &read_header, memory) {
-            match self.buffer.append_assembled_put_batch(table, put, &declarations) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
-                Err(error) => return Err(error),
+        if matches!(documents.data_type(), DataType::Union(..)) {
+            match mutation_layout_batch(documents.as_ref(), &read_header, memory) {
+                Ok(Some((put, declarations))) => return self.buffer.append_assembled_put_batch(table, put, &declarations),
+                Ok(None) => (),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Err(error),
+                // The per-document path below reports the first row's own error.
+                Err(_) => (),
             }
         }
         let mut start = 0;
@@ -1239,15 +1235,11 @@ impl<'a> OpenTransaction<'a> {
             let gathered_end = if end == start + 1 {
                 alternating_document_run(documents.as_ref(), start, document)
             } else { end };
-            if gathered_end > start + 1 {
-                let staged = mutation_run_batch(documents.as_ref(), document, start..gathered_end, &read_header, memory)
-                    .and_then(|batch| batch.map(|batch| self.buffer.append_batch(table, batch)).transpose());
-                match staged {
-                    Ok(Some(())) => { start = gathered_end; continue; }
-                    Ok(None) => {}
-                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
-                    Err(error) => return Err(error),
-                }
+            if gathered_end > start + 1
+                && let Some(batch) = mutation_run_batch(documents.as_ref(), document, start..gathered_end, &read_header, memory)? {
+                self.buffer.append_batch(table, batch)?;
+                start = gathered_end;
+                continue;
             }
             for row in start..end {
                 let header = read_header(row)?;
@@ -6073,6 +6065,77 @@ mod tests {
         let (source, _) = mutation_document(&large, 0).unwrap();
         assert!(mutation_run_batch(&large, source, 0..rows, read_header, &memory).unwrap().is_none());
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn staged_mutation_puts_have_the_same_bytes_under_any_budget_that_admits_them() -> Result<()> {
+        use arrow_array::{FixedSizeBinaryArray, Float64Array, StructArray, TimestampMicrosecondArray, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields};
+
+        let doc = |value: Value, marker: Option<i64>| {
+            let ty = value.logical_type();
+            let data = rtdb_columnar::copy_array(&ty, &[value]).unwrap();
+            let mut fields = vec![rtdb_columnar::to_field("vector", &ty).unwrap(), Field::new("tag", DataType::Float64, true)];
+            let mut columns = vec![data, Arc::new(Float64Array::from(vec![Some(1.0)])) as ArrayRef];
+            if let Some(marker) = marker {
+                fields.push(Field::new("marker", DataType::Int64, false));
+                columns.push(Arc::new(arrow_array::Int64Array::from(vec![marker])));
+            }
+            StructArray::new(fields.into(), columns, None)
+        };
+        let a = doc(Value::list(vec![Value::F32(-0.0), Value::Null]), None);
+        let b = doc(Value::list(vec![Value::F64(3.0), Value::Null]), Some(42));
+        let legs = UnionFields::try_new([3, 5], [
+            Field::new("first", a.data_type().clone(), false), Field::new("second", b.data_type().clone(), false),
+        ]).unwrap();
+        let documents = UnionArray::try_new(legs, ScalarBuffer::from(vec![3, 5, 3, 5]), Some(ScalarBuffer::from(vec![0; 4])), vec![
+            Arc::new(a), Arc::new(b),
+        ]).unwrap();
+        let times = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
+        let schema = Arc::new(Schema::new(vec![Field::new("_iid", DataType::FixedSizeBinary(16), false),
+            Field::new("_valid_from", times.clone(), true), Field::new("_valid_to", times, true),
+            Field::new("doc", documents.data_type().clone(), false),
+        ]));
+        let page = RecordBatch::try_new(schema, vec![
+            Arc::new(FixedSizeBinaryArray::try_from_iter((1_u8..=4).map(|id| [id; 16])).unwrap()),
+            Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>; 4]).with_timezone("UTC")),
+            Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>; 4]).with_timezone("UTC")),
+            Arc::new(documents),
+        ]).unwrap();
+        let table = TableRef::new("public", "vectors");
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let encoding = MemoryBudget::new(1 << 24);
+        let staged = |limit: usize| -> Result<Vec<u8>> {
+            let memory = MemoryBudget::new(limit);
+            let context = ResolveContext {
+                decision_clock: None, write_event_origins: false, placed_receipt_retirement: false,
+                owned_witness_scope: None, world_constraints: None, database: "xtdb".into(),
+                storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+                memory: Arc::clone(&memory), query_options: QueryOptions::default(),
+                scan_accelerators: Default::default(), cancellation: CancellationToken::new(),
+                default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+                execution_observer: None, tracer: None,
+            };
+            let base = rtdb_index::PartitionState::empty(Default::default())?;
+            let options = SubmitOptions::default();
+            let mut tx = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+            let page = OwnedBatch::new(page.clone(), &memory)?;
+            tx.stage_mutation_puts(&table, &page, key.system_time)?;
+            let writes = tx.buffer.stage()?;
+            let batch = writes.tables()[&table].batch().expect("the page stages puts").arrow();
+            Ok(crate::ipc::encode(batch.schema_ref(), [batch], &encoding)?.as_slice().to_vec())
+        };
+        let ample = staged(1 << 24)?;
+        let mut refused = false;
+        for limit in (16 << 10..=1 << 20).step_by(8 << 10) {
+            match staged(limit) {
+                Ok(bytes) => assert_eq!(bytes, ample, "a {limit}-byte budget changed the staged bytes"),
+                Err(error) => { assert_eq!(error.code, "rtdb/memory-budget-exceeded"); refused = true; }
+            }
+        }
+        assert!(refused, "the smallest budgets refuse the page instead of staging another layout");
+        Ok(())
     }
 
     #[test]

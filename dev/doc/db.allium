@@ -608,7 +608,8 @@ variant TxMessage : SourceMessage {
     -- Differently typed columns can share a dense union in the source message and retain their Arrow representation on replay.
     -- Union children can be compatible nested containers such as lists and structs.
     -- Null and missing values use that union's null leg.
-    -- When the allocation budget allows, uploaded union tags for the same value layout share a canonical Arrow child, including signed execution aliases.
+    -- Uploaded union tags for the same value layout share a canonical Arrow child, including signed execution aliases.
+    -- The source encoding is a function of the submitted data alone: an upload the allocation budget cannot normalize is refused, never encoded in another layout.
     -- A normalized union with one value layout uses that Arrow type and its validity bitmap.
     -- A historical native keyed submission can carry an optional guard envelope with a submission clock sample and guard position.
     -- Current ordinary keyed submissions carry the key in metadata and omit the historical guard envelope.

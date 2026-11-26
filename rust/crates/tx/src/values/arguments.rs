@@ -112,7 +112,7 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
 
 fn normalize_float_argument(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
     let DataType::List(field) = array.data_type() else {
-        return normalized_document_array(array, memory, true);
+        return normalized_document_array(array, memory);
     };
     let source = array.as_list::<i32>();
     let Some(values) = normalize_float_argument(source.values(), memory)? else { return Ok(None); };

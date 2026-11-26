@@ -281,7 +281,7 @@ impl ArrowDocuments {
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows));
         let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
-        Self::prepare_columns(&batch, &schema, memory, true)?
+        Self::prepare_columns(&batch, &schema, memory)?
             .ok_or_else(|| Anomaly::incorrect("rtdb.tx/document-schema", "Arrow upload cannot be aligned to a document layout"))
             .map(Some)
     }
@@ -317,7 +317,7 @@ impl ArrowDocuments {
             let array = if ty == LogicalType::Null {
                 Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
             } else {
-                let Some(array) = normalized_document_array(&array, memory, true)? else { return Ok(None); };
+                let Some(array) = normalized_document_array(&array, memory)? else { return Ok(None); };
                 let Ok(array) = ingest_layout(array, target.data_type()) else { return Ok(None); };
                 array
             };
@@ -343,13 +343,7 @@ impl ArrowDocuments {
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
         let names = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
         if names.len() != schema.fields().len() { return Ok(None); }
-        match Self::prepare_columns(batch, &schema, memory, true) {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
-                if !schema.fields().iter().all(|field| Self::compatible(field, false)) { return Ok(None); }
-                Self::prepare_columns(batch, &schema, memory, false)
-            }
-            result => result,
-        }
+        Self::prepare_columns(batch, &schema, memory)
     }
 
     pub(crate) fn from_scalar_mutation_page(content: &StructArray, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
@@ -363,7 +357,7 @@ impl ArrowDocuments {
         Self::from_record_batch(&batch, memory)
     }
 
-    fn prepare_columns(batch: &RecordBatch, schema: &Schema, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<Self>> {
+    fn prepare_columns(batch: &RecordBatch, schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let mut fields = Vec::with_capacity(schema.fields().len());
         let mut columns = Vec::with_capacity(schema.fields().len());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
@@ -375,7 +369,7 @@ impl ArrowDocuments {
             } else if uuid_field(field) && nulls != 0 {
                 canonical_nullable_uuid(array, memory)?
             } else {
-                let Some(array) = normalized_document_array(array, memory, normalize_unions)? else { return Ok(None); };
+                let Some(array) = normalized_document_array(array, memory)? else { return Ok(None); };
                 array
             };
             fields.push(normalized_field(&field.as_ref().clone().with_nullable(nulls != 0), &array));
@@ -1159,7 +1153,7 @@ fn nested_ingest_compacts_list_offsets_and_uses_the_canonical_source_layout() {
     assert_eq!(encoded(arrow_operation).as_slice(), encoded(row_operation).as_slice());
 }
 
-fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<ArrayRef>> {
+fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
     Ok(Some(match array.data_type() {
         DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
         DataType::UInt16 => signed_column::<UInt16Type, Int16Type>(array.as_ref()),
@@ -1167,7 +1161,7 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
         DataType::UInt64 => signed_column::<UInt64Type, Int64Type>(array.as_ref()),
         DataType::Struct(fields) => {
             let source = array.as_struct();
-            let children = source.columns().iter().map(|child| normalized_document_array(child, memory, normalize_unions)).collect::<Result<Vec<_>>>()?;
+            let children = source.columns().iter().map(|child| normalized_document_array(child, memory)).collect::<Result<Vec<_>>>()?;
             let Some(children) = children.into_iter().collect::<Option<Vec<_>>>() else { return Ok(None); };
             if source.columns().iter().zip(&children).all(|(source, child)| Arc::ptr_eq(source, child)) { return Ok(Some(Arc::clone(array))); }
             let fields = fields.iter().zip(&children).map(|(field, child)| normalized_field(field, child)).collect::<Fields>();
@@ -1178,7 +1172,7 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
         }
         DataType::List(field) => {
             let source = array.as_list::<i32>();
-            let Some(values) = normalized_document_array(source.values(), memory, normalize_unions)? else { return Ok(None); };
+            let Some(values) = normalized_document_array(source.values(), memory)? else { return Ok(None); };
             if Arc::ptr_eq(source.values(), &values) { return Ok(Some(Arc::clone(array))); }
             let field = normalized_field(field, &values);
             match ListArray::try_new(Arc::new(field), source.offsets().clone(), values, source.nulls().cloned()) {
@@ -1188,7 +1182,7 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
         }
         DataType::FixedSizeList(field, width) => {
             let source = array.as_fixed_size_list();
-            let Some(values) = normalized_document_array(source.values(), memory, normalize_unions)? else { return Ok(None); };
+            let Some(values) = normalized_document_array(source.values(), memory)? else { return Ok(None); };
             if Arc::ptr_eq(source.values(), &values) { return Ok(Some(Arc::clone(array))); }
             let field = Arc::new(normalized_field(field, &values));
             let result = source.to_data().into_builder().data_type(DataType::FixedSizeList(field, *width))
@@ -1201,7 +1195,7 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
         DataType::Map(field, sorted) => {
             let source = array.as_map();
             let entries = Arc::new(source.entries().clone()) as ArrayRef;
-            let Some(values) = normalized_document_array(&entries, memory, normalize_unions)? else { return Ok(None); };
+            let Some(values) = normalized_document_array(&entries, memory)? else { return Ok(None); };
             if Arc::ptr_eq(&values, &entries) { return Ok(Some(Arc::clone(array))); }
             let field = Arc::new(normalized_field(field, &values));
             let result = source.to_data().into_builder().data_type(DataType::Map(field, *sorted))
@@ -1220,9 +1214,9 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
             let (_, expanded) = rtdb_columnar::relayout_arrow_column(Arc::clone(array), &source, &target)?;
             let owned = memory.reserve(expanded.get_array_memory_size())?;
             let expanded = rtdb_columnar::retain_array(expanded, &owned)?;
-            return normalized_document_array(&expanded, memory, normalize_unions);
+            return normalized_document_array(&expanded, memory);
         }
-        DataType::Union(_, arrow_schema::UnionMode::Dense) if normalize_unions => return union::normalize(array, memory),
+        DataType::Union(_, arrow_schema::UnionMode::Dense) => return union::normalize(array, memory),
         _ => Arc::clone(array),
     }))
 }
