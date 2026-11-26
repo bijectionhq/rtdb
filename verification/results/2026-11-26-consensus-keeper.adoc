@@ -70,6 +70,39 @@ The same comparison at `1e8a0df`, with every acknowledged commit verified:
 |64 |248 |6,635 |5,790 |9.3 / 18.0
 |===
 
+=== Qualification and comparison at `718af8c`
+
+Logkeeper `718af8c` adds OpenRaft 0.10.1, pre-vote, quorum-loss step-down, leadership hand-off at shutdown, keeper status, leader-driven repair of dead voters after `repair_after_secs` (600 s), capacity-aware placement, parking of idle streams after `park_after_secs` (600 s), bounded peer connections and self-retirement of removed copies.
+The process qualification passed every phase:
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+|Phase |Clients |Commits/s |p50 ms |p99 ms |Keys verified
+
+|Steady |1 |563 |1.7 |4.4 |3,101
+|Steady |4 |1,148 |3.2 |7.5 |6,300
+|Steady |16 |3,613 |4.2 |10.7 |19,825
+|One voter killed with SIGKILL 5 s into a 15 s phase |4 |1,195 |2.9 |14.3 |18,479
+|The killed voter restarted from its media |4 |1,143 |3.0 |16.5 |6,286
+|Recheck after the voter restart, then after an RTDB SIGKILL and reopen |– |– |– |– |53,991
+|Commits after the RTDB reopen |4 |1,123 |3.3 |11.0 |6,155
+|Every keeper stopped and restarted with RTDB running, then recheck |– |– |– |– |60,146
+|Commits after the keeper restart |4 |978 |3.3 |15.7 |5,434
+|Final recheck |– |– |– |– |65,580
+|===
+
+The comparison, with every acknowledged commit verified:
+
+[cols="1,1,1,1,1",options="header"]
+|===
+|Clients |File journal commits/s |Stream Writer commits/s |Consensus commits/s |Consensus p50 / p99 ms
+
+|1 |204 |501 |574 |1.6 / 4.3
+|4 |251 |1,247 |1,123 |3.2 / 12.1
+|16 |252 |4,466 |3,246 |4.3 / 19.9
+|64 |249 |6,595 |5,781 |9.3 / 18.1
+|===
+
 === First run, before keeper batches, at `749260e`
 
 [cols="2,1,1,1,1,1",options="header"]
