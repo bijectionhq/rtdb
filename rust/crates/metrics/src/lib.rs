@@ -25,7 +25,27 @@ impl Counters {
         for counter in [&mut self.query_errors, &mut self.transaction_errors, &mut self.collection_errors, &mut self.durable_commit_clock_invalid, &mut self.staged_commit_clock_invalid].into_iter().chain(self.kafka_warnings.iter_mut()).chain(self.connections.iter_mut()) { counter.poll(now, closing); }
     }
 }
-struct State { timers: Vec<histogram::Timer>, counters: Counters }
+const SAMPLE_SHARDS: usize = 16;
+const SHARD_SAMPLES: usize = 256;
+#[derive(Clone, Copy)]
+struct Sample { timer: usize, elapsed: Duration, now_ms: i64 }
+/// Durations recorded on the threads sharing this shard and not yet applied to the timers.
+#[repr(align(128))]
+struct Shard(Mutex<Vec<Sample>>);
+static NEXT_SHARD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn shard_index() -> usize {
+    thread_local! { static SHARD: usize = NEXT_SHARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SAMPLE_SHARDS; }
+    SHARD.with(|shard| *shard)
+}
+struct State { timers: Vec<histogram::Timer>, counters: Counters, pending: Vec<Sample> }
+impl State {
+    /// Applies every shard's samples in the order of their clock readings, as a lock taken per sample would have.
+    fn absorb(&mut self, shards: &[Shard]) {
+        for shard in shards { self.pending.extend(shard.0.lock().drain(..)); }
+        self.pending.sort_unstable_by_key(|sample| sample.now_ms);
+        for sample in self.pending.drain(..) { self.timers[sample.timer].record(sample.elapsed, sample.now_ms); }
+    }
+}
 struct Provider { value: Arc<dyn CatalogMetrics>, _reservation: Arc<MemoryReservation> }
 #[derive(Default)]
 struct Providers { next: u64, entries: BTreeMap<u64, Provider> }
@@ -36,6 +56,7 @@ pub struct Registry {
     node_id: String,
     memory: Arc<MemoryBudget>,
     state: Mutex<State>,
+    shards: Box<[Shard]>,
     _reservation: Arc<MemoryReservation>,
     providers: Arc<Mutex<Providers>>,
     #[cfg(feature = "kafka")]
@@ -45,10 +66,12 @@ impl Registry {
     /// Registry allocations and returned catalog snapshots share the supplied execution budget.
     /// Callbacks allocate no metric names or labels; source registrations retain their own charges until removed.
     pub fn new(node_id: &str, memory: Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * histogram::Timer::RETAINED_BYTES).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        let samples = (2 * SAMPLE_SHARDS * SHARD_SAMPLES * std::mem::size_of::<Sample>()).checked_add(SAMPLE_SHARDS * std::mem::size_of::<Shard>()).ok_or_else(overflow)?;
+        let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * histogram::Timer::RETAINED_BYTES).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(samples)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
-            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] } }), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
+            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), durable_commit_clock_invalid: step::Counter::new(now), staged_commit_clock_invalid: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] }, pending: Vec::with_capacity(SAMPLE_SHARDS * SHARD_SAMPLES) }),
+            shards: (0..SAMPLE_SHARDS).map(|_| Shard(Mutex::new(Vec::with_capacity(SHARD_SAMPLES)))).collect(), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
             #[cfg(feature = "kafka")]
             sources: Arc::new(Mutex::new(kafka::Sources::default())),
         }))
@@ -69,7 +92,14 @@ impl Registry {
 impl ExecutionObserver for Registry {
     fn record_duration(&self, timer: ExecutionTimer, elapsed: Duration) {
         let index = match timer { ExecutionTimer::Query => 0, ExecutionTimer::TxAwait => 1, ExecutionTimer::TxSubmit => 2, ExecutionTimer::TxExecute => 3, ExecutionTimer::PgwireTransaction => 4, ExecutionTimer::TxOp => 5, ExecutionTimer::CompactorJob => 6, ExecutionTimer::DurableCommitLag => 7, ExecutionTimer::StagedCommitLag => 8 };
-        self.state.lock().timers[index].record(elapsed, wall_time_millis());
+        let sample = Sample { timer: index, elapsed, now_ms: wall_time_millis() };
+        let shard = &self.shards[shard_index()];
+        loop {
+            let mut pending = shard.0.lock();
+            if pending.len() < SHARD_SAMPLES { pending.push(sample); return; }
+            drop(pending);
+            self.state.lock().absorb(&self.shards);
+        }
     }
     fn record_error(&self, error: ExecutionError) {
         let mut state = self.state.lock();
@@ -122,6 +152,7 @@ impl Registry {
         let allocated = self.memory.used_bytes();
         let mut rows = Vec::with_capacity(count);
         let mut state = self.state.lock();
+        state.absorb(&self.shards);
         let now = wall_time_millis();
         for (timer, value) in TIMERS.into_iter().zip(&mut state.timers) {
             let snapshot = if step { value.step_snapshot(now) } else { value.snapshot(now) };
@@ -169,7 +200,7 @@ impl CatalogMetrics for Registry {
         self.metric_rows(&provided, false)
     }
     fn roll_step(&self, now_ms: i64, closing: bool) {
-        { let mut state = self.state.lock(); for timer in &mut state.timers { timer.roll_step(now_ms, closing); } state.counters.roll(now_ms, closing); }
+        { let mut state = self.state.lock(); state.absorb(&self.shards); for timer in &mut state.timers { timer.roll_step(now_ms, closing); } state.counters.roll(now_ms, closing); }
         #[cfg(feature = "kafka")]
         self.sources.lock().roll_step(now_ms, closing);
         for provider in self.providers.lock().entries.values() { provider.value.roll_step(now_ms, closing); }
@@ -200,6 +231,26 @@ mod tests {
             drop(registry);
             assert_eq!(memory.used_bytes(), 0);
         }).unwrap().join().unwrap();
+    }
+    #[test]
+    fn durations_recorded_across_threads_report_as_one_serial_timer() {
+        let registry = Registry::new("node-1", MemoryBudget::new(1 << 24)).unwrap();
+        let now = wall_time_millis();
+        let mut serial = histogram::Timer::new(now);
+        let durations: Vec<_> = (0..4 * SAMPLE_SHARDS * SHARD_SAMPLES).map(|index| Duration::from_nanos(1024 + (index as u64 * 37) % 1024)).collect();
+        for elapsed in &durations { serial.record(*elapsed, now); }
+        std::thread::scope(|scope| {
+            for chunk in durations.chunks(durations.len() / 24 + 1) {
+                let registry = &registry;
+                scope.spawn(move || for elapsed in chunk { registry.record_duration(ExecutionTimer::Query, *elapsed); });
+            }
+        });
+        let expected = serial.snapshot(wall_time_millis());
+        let rows = registry.metrics().unwrap();
+        let Some(CatalogMetric::Timer { count, total_ns, percentiles_ns, max_ns, mean_ns, .. }) = rows.rows().iter().find(|row| row.name() == "query.timer") else { panic!("query timer"); };
+        assert_eq!((*count, *total_ns, *max_ns, *mean_ns), (expected.count, expected.total, Some(expected.maximum), Some(expected.mean)));
+        assert_eq!(percentiles_ns.as_slice(), expected.percentiles.as_slice());
+        assert!(registry.shards.iter().all(|shard| { let pending = shard.0.lock(); pending.is_empty() && pending.capacity() == SHARD_SAMPLES }));
     }
     #[test]
     fn the_processor_count_is_a_gauge() {
