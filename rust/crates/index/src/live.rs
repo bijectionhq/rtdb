@@ -1758,7 +1758,9 @@ fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index
     }).collect::<Vec<_>>();
     let batches = (0..32).map(|_| IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap()).collect::<Vec<_>>();
     assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 32_768);
-    assert!(memory.used_bytes() < 4 << 20);
+    // The decoded headers stay charged with their batch; the Arrow columns and schema fit well inside 2.5 MiB without builder scratch.
+    let headers = 32 * IndexBatch::header_bytes(1024).unwrap();
+    assert!(memory.used_bytes() < headers + (5 << 19), "{} bytes retained", memory.used_bytes());
     let arrow = batches[0].arrow().clone();
     drop(batches);
     assert_ne!(memory.used_bytes(), 0);
