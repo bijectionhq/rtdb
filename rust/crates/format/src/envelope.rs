@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, PlacedAttempt, Result, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::stage_journal::{InvalidStageJournal, checked_journal_fields};
-use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_SUFFIX};
+use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
 
 mod decoder;
 mod decoder_leaves;
@@ -11,7 +11,7 @@ mod detached;
 mod extension;
 mod wire;
 pub use decoder::{ReplicaEnvelope, ReplicaFrame, SourceMessage, decode_replica_outcome_attempt, encode_replica_outcome_attempt};
-pub use extension::{replica_uses_extension, source_uses_extension};
+pub use extension::{block_uses_extension, replica_uses_extension, source_uses_extension, table_block_uses_extension, tx_uses_extension};
 use wire::{skip_wire, wire_key};
 
 const ADMITTED_OFFLOAD_STORAGE: i32 = -1;
@@ -125,7 +125,11 @@ pub enum ReplicaPeekBody<'a> {
 impl<'a> ReplicaPeek<'a> {
     /// Projects the common wire shapes. Other shapes go through the full decoder, including malformed records.
     pub fn read(bytes: &'a [u8]) -> Option<Self> {
-        let (&PROTOBUF_LOG_HEADER, mut wire) = bytes.split_first()? else { return None; };
+        let mut wire = match bytes.split_first()? {
+            (&PROTOBUF_LOG_HEADER, wire) => wire,
+            (&RTDB_EXTENSION_LOG_HEADER, framed) => framed.strip_prefix(XTDB_REFUSAL_PREFIX.as_slice())?,
+            _ => return None,
+        };
         let mut term = Term(0);
         let mut term_sequence = None;
         let mut body = None;
@@ -240,9 +244,8 @@ impl ReplicaFrame {
         let Some(&header) = bytes.first() else { return Err(invalid("Empty replica message")); };
         let body = match header {
             PROTOBUF_LOG_HEADER => bytes.slice(1..),
-            RTDB_EXTENSION_LOG_HEADER if bytes.len() > XTDB_REFUSAL_SUFFIX.len() && bytes.ends_with(&XTDB_REFUSAL_SUFFIX) =>
-                bytes.slice(1..bytes.len() - XTDB_REFUSAL_SUFFIX.len()),
-            RTDB_EXTENSION_LOG_HEADER => return Err(invalid("RTDB extension replica record is missing its XTDB refusal suffix")),
+            RTDB_EXTENSION_LOG_HEADER if bytes[1..].starts_with(&XTDB_REFUSAL_PREFIX) => bytes.slice(1 + XTDB_REFUSAL_PREFIX.len()..),
+            RTDB_EXTENSION_LOG_HEADER => return Err(invalid("RTDB extension replica record is missing its XTDB refusal prefix")),
             _ => return Err(decoder_leaves::unknown_header(header, "replica")),
         };
         let message = crate::log::proto::ReplicaLogMessage::decode(body).map_err(|error| invalid(error.to_string()))?;
@@ -266,9 +269,9 @@ impl ReplicaEnvelope {
     }
 
     fn framed_len(message: &ReplicaBody, term: u64, sequence: Option<u64>) -> usize {
-        let suffix = if replica_uses_extension(message) { XTDB_REFUSAL_SUFFIX.len() } else { 0 };
-        1 + message.encoded_len() + 1 + varint_length(term)
-            + sequence.map_or(0, |sequence| 1 + varint_length(sequence)) + suffix
+        let prefix = if replica_uses_extension(message) { XTDB_REFUSAL_PREFIX.len() } else { 0 };
+        1 + prefix + message.encoded_len() + 1 + varint_length(term)
+            + sequence.map_or(0, |sequence| 1 + varint_length(sequence))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
@@ -281,13 +284,16 @@ impl ReplicaEnvelope {
 
     pub fn encode_body(term: Term, sequence: Option<TermSequence>, message: &ReplicaBody, output: &mut impl BufMut) {
         let extension = replica_uses_extension(message);
-        output.put_u8(if extension { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER });
+        if extension {
+            output.put_u8(RTDB_EXTENSION_LOG_HEADER);
+            output.put_slice(&XTDB_REFUSAL_PREFIX);
+        } else {
+            output.put_u8(PROTOBUF_LOG_HEADER);
+        }
         // Prost sorts the oneof by its smallest tag, ahead of both term fields.
         message.encode(output);
         int64::encode(7, &term.0, output);
         if let Some(sequence) = sequence { int64::encode(9, &sequence.0, output); }
-        // Last on the wire, so that XTDB takes this oneof member over the record's own.
-        if extension { output.put_slice(&XTDB_REFUSAL_SUFFIX); }
     }
 
     pub fn with_sequence(mut self, sequence: TermSequence) -> Self {

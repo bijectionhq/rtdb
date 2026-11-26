@@ -30,11 +30,12 @@ pub(super) fn decode_replica(bytes: &[u8]) -> Result<(Option<i64>, Option<i64>, 
 }
 
 pub(super) fn encode_replica(term: i64, sequence: Option<i64>, message: &ReplicaBody) -> Vec<u8> {
-    let mut encoded = headered(&ReplicaLogMessage { message: Some(message.clone()), term_id: Some(term), term_seq: sequence });
-    if super::replica_uses_extension(message) {
-        encoded[0] = crate::RTDB_EXTENSION_LOG_HEADER;
-        encoded.extend_from_slice(&crate::XTDB_REFUSAL_SUFFIX);
-    }
+    let wire = ReplicaLogMessage { message: Some(message.clone()), term_id: Some(term), term_seq: sequence };
+    if !super::replica_uses_extension(message) { return headered(&wire); }
+    let mut encoded = Vec::with_capacity(1 + crate::XTDB_REFUSAL_PREFIX.len() + wire.encoded_len());
+    encoded.push(crate::RTDB_EXTENSION_LOG_HEADER);
+    encoded.extend_from_slice(&crate::XTDB_REFUSAL_PREFIX);
+    wire.encode(&mut encoded).expect("a Vec can hold the advertised encoded protobuf length");
     encoded
 }
 
@@ -49,10 +50,6 @@ pub(super) fn encode_attempt(attempt: PlacedAttempt) -> [u8; 96] { attempt.encod
 
 pub(super) fn strip_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     bytes.strip_prefix(prefix)
-}
-
-pub(super) fn strip_suffix<'a>(bytes: &'a [u8], suffix: &[u8]) -> Option<&'a [u8]> {
-    bytes.strip_suffix(suffix)
 }
 
 pub(super) fn join_bytes(prefix: &[u8], body: &[u8]) -> Vec<u8> {

@@ -1,10 +1,10 @@
 use super::{PlacedAttempt, ReplicaBody, SourceBody, Term, TermSequence, invalid};
 use super::decoder_leaves::{
     Result, check_stage, decode_attempt, decode_replica, decode_source, encode_attempt, encode_replica, encode_source, join_bytes,
-    legacy_source, SourceBytes, split_header, strip_prefix, strip_suffix, unknown_header,
+    legacy_source, SourceBytes, split_header, strip_prefix, unknown_header,
 };
 use super::wire::scan_external_payload;
-use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_SUFFIX};
+use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
@@ -99,23 +99,23 @@ fn replica_payload(bytes: &[u8]) -> Result<&[u8]> {
     let (header, payload) = split_header(bytes).ok_or_else(|| invalid("Empty replica message"))?;
     if header == PROTOBUF_LOG_HEADER { return Ok(payload); }
     if header != RTDB_EXTENSION_LOG_HEADER { return Err(unknown_header(header, "replica")); }
-    match strip_suffix(payload, &XTDB_REFUSAL_SUFFIX) {
+    match strip_prefix(payload, &XTDB_REFUSAL_PREFIX) {
         Some(body) => {
             #[cfg(verus_keep_ghost)]
             proof! {
-                assert(bytes@.skip(bytes@.len() - XTDB_REFUSAL_SUFFIX@.len()) =~= payload@.skip(payload@.len() - XTDB_REFUSAL_SUFFIX@.len()));
-                assert(body@ =~= bytes@.subrange(1, bytes@.len() - XTDB_REFUSAL_SUFFIX@.len()));
+                assert(bytes@.subrange(1, 1 + XTDB_REFUSAL_PREFIX@.len()) =~= payload@.take(XTDB_REFUSAL_PREFIX@.len() as int));
+                assert(body@ =~= bytes@.skip(1 + XTDB_REFUSAL_PREFIX@.len()));
             }
             Ok(body)
         }
         None => {
             #[cfg(verus_keep_ghost)]
             proof! {
-                if payload@.len() >= XTDB_REFUSAL_SUFFIX@.len() {
-                    assert(bytes@.skip(bytes@.len() - XTDB_REFUSAL_SUFFIX@.len()) =~= payload@.skip(payload@.len() - XTDB_REFUSAL_SUFFIX@.len()));
+                if payload@.len() >= XTDB_REFUSAL_PREFIX@.len() {
+                    assert(bytes@.subrange(1, 1 + XTDB_REFUSAL_PREFIX@.len()) =~= payload@.take(XTDB_REFUSAL_PREFIX@.len() as int));
                 }
             }
-            Err(invalid("RTDB extension replica record is missing its XTDB refusal suffix"))
+            Err(invalid("RTDB extension replica record is missing its XTDB refusal prefix"))
         }
     }
 }

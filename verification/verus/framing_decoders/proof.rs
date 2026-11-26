@@ -31,7 +31,7 @@ mod decoder_leaves;
 
 #[path = "../../../rust/crates/format/src/envelope/log_headers.rs"]
 mod log_headers;
-use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_SUFFIX};
+use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER, RTDB_EXTENSION_LOG_HEADER, XTDB_REFUSAL_PREFIX};
 
 #[derive(Clone, Copy)]
 pub struct Term(i64);

@@ -481,6 +481,8 @@ impl SourceTransaction {
             bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec().into()),
         };
+        // `source_uses_extension` classifies these fields; an operations layout the reference does not write is RTDB-only too.
+        let extension = rtdb_format::envelope::tx_uses_extension(&tx) || !rtdb_format::ipc::is_reference_layout(batch.batch().schema_ref());
         let tail_len = tx.encoded_len();
         let ops_prefix_len = key_len(TX_OPS_TAG) + encoded_len_varint(ops_len as u64);
         let tx_len = ops_len.checked_add(ops_prefix_len)
@@ -494,8 +496,7 @@ impl SourceTransaction {
 
         // Prost writes tx_ops first. Right-align the actual prefix so the IPC stays in place.
         let mut header = &mut encoded[start..SOURCE_PREFIX_SPACE];
-        // Each guard is one of the fields `source_uses_extension` classifies; XTDB would apply the transaction without it.
-        header.put_u8(if self.guard.is_some() { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER });
+        header.put_u8(if extension { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER });
         encode_key(SOURCE_TX_TAG, WireType::LengthDelimited, &mut header);
         encode_varint(tx_len as u64, &mut header);
         encode_key(TX_OPS_TAG, WireType::LengthDelimited, &mut header);
@@ -3424,8 +3425,8 @@ mod tests {
             let base_charge = memory.used_bytes();
             let actual = source.encode().unwrap();
             assert_eq!(actual.as_slice(), expected.as_slice());
-            let header = if source.guard.is_some() { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER };
-            assert_eq!(actual.as_slice()[0], header, "a guarded transaction is framed for XTDB to refuse");
+            let header = if source.guard.is_some() || source.placed_seed.is_some() { RTDB_EXTENSION_LOG_HEADER } else { PROTOBUF_LOG_HEADER };
+            assert_eq!(actual.as_slice()[0], header, "a guarded or placed transaction is framed for XTDB to refuse");
             let address = actual.as_slice().as_ptr();
             let bytes = actual.into_bytes();
             assert_eq!(bytes.as_ptr(), address);

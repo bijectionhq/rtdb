@@ -2086,6 +2086,10 @@ pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<I
     }
 }
 
+/// Whether every field of `schema` has a layout the reference writes: dictionaries, views, list views and run-end encoding do not,
+/// so a log record carrying them is RTDB-only.
+pub fn is_reference_layout(schema: &Schema) -> bool { java_stream::supports(schema) }
+
 /// arrow-rs's stream, decimal-patched and rewritten into the Java layout as it passes, for the layouts `java_stream` leaves out.
 fn write_rewritten_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
     let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);

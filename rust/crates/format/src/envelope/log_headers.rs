@@ -3,17 +3,15 @@ pub const LEGACY_TX_HEADER: u8 = 0xff;
 pub const LEGACY_FLUSH_HEADER: u8 = 2;
 
 /// Frames a log record that uses a feature XTDB does not implement.
-/// XTDB rejects a source record with this header; a replica record also ends with [XTDB_REFUSAL_SUFFIX].
+/// XTDB rejects a source record with this header; a replica record also starts its body with [XTDB_REFUSAL_PREFIX].
 /// Behavioural spec: dev/doc/db.allium (XtdbRefusesRtdbExtensionRecords).
 pub const RTDB_EXTENSION_LOG_HEADER: u8 = 4;
 
-/// The storage version named by [XTDB_REFUSAL_SUFFIX]: ASCII "RTDB", which no XTDB release writes.
-pub const RTDB_EXTENSION_STORAGE_VERSION: i32 = 0x5254_4442;
-
-/// `oversized_message { storage_version: RTDB_EXTENSION_STORAGE_VERSION }`, field 8 of `ReplicaLogMessage`.
-/// XTDB ignores the replica header byte, and the last oneof member on the wire wins, so XTDB reads an extension replica
-/// record as an oversized message of a storage version it does not have, which it refuses rather than skips.
-pub const XTDB_REFUSAL_SUFFIX: [u8; 8] = [0x42, 0x06, 0x08, 0xc2, 0x88, 0xd1, 0x92, 0x05];
+/// A protobuf tag of field number 0, which every protobuf parser rejects before reading any field.
+/// XTDB ignores the replica header byte and parses from the next one, so it fails on an extension replica record with
+/// `InvalidProtocolBufferException: Protocol message contained an invalid tag (zero).`; the same prefix on a block file
+/// fails XTDB's `Block.parseFrom` and `TableBlock.parseFrom`. No encoded protobuf message starts with this byte.
+pub const XTDB_REFUSAL_PREFIX: [u8; 1] = [0];
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;

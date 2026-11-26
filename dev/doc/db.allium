@@ -2123,28 +2123,37 @@ contract CompactorReset {
 }
 
 contract XtdbRefusesRtdbExtensionRecords {
-    -- A log record that uses a feature XTDB does not implement is framed so that an XTDB node replaying the log fails on it, instead of skipping it or applying it without that feature.
-    -- A record that uses no such feature keeps XTDB's framing byte for byte.
+    -- A log record or block file that uses a feature XTDB does not implement is framed so that an XTDB node reading it fails on it, instead of skipping it or applying it without that feature.
+    -- A record or file that uses no such feature keeps XTDB's framing byte for byte.
+    -- Every field the fork adds to a message XTDB shares is either framed or an annotation XTDB loses nothing by ignoring; a format test fails on a field that is neither.
 
     @invariant ExtensionSourceRecords
-        -- The source framing header is 4 (RTDB_EXTENSION_LOG_HEADER) for a ServingTransactMessage, for a TxMessage carrying an idempotency, replay or bounded-retry guard, and for a TriesAddedMessage naming a trie of a naming epoch above 0.
+        -- The source framing header is 4 (RTDB_EXTENSION_LOG_HEADER) for a ServingTransactMessage, an ArtefactsAddedMessage, an ArtefactsRemovedMessage,
+        -- a TxMessage carrying an idempotency, replay or bounded-retry guard or a placed attempt seed, or whose operations use a layout the reference does not write (dictionary, view, list view, run-end),
+        -- and a TriesAddedMessage naming a trie of a naming epoch above 0, of an RTDB-only table, or carrying artefacts.
         -- Its protobuf body is the one the plain header (3) would carry.
-        -- XTDB's source decoder accepts only the headers 0xff, 2 and 3, and fails on any other.
+        -- XTDB's source decoder accepts only the headers 0xff, 2 and 3, and fails on any other with "Unknown message type: 4".
 
     @invariant ExtensionReplicaRecords
-        -- The replica framing header is 4 for a table retirement (TablesRetired), for a TriesAddedMessage naming a trie of a naming epoch above 0, for a TriesDeletedMessage naming such a trie or an L0 trie, and for a BlockUploadedMessage carrying a naming_epoch or naming such a trie.
-        -- The protobuf body is followed by XTDB_REFUSAL_SUFFIX, an oversized_message member naming storage version 0x52544442 (ASCII "RTDB").
-        -- XTDB ignores the replica header byte and keeps the last oneof member on the wire, so it reads the record as an OversizedMessage of a storage version it does not have, and fails on it before fencing or applying it.
-        -- An RTDB reader requires the suffix after header 4, strips it, and reads the body the plain header would carry.
+        -- The replica framing header is 4, followed by XTDB_REFUSAL_PREFIX (one zero byte), for a TablesRetired, an ArtefactsAdded or ArtefactsRemoved,
+        -- a ResolvedTxMessage carrying a placed attempt, acceptance stage, search delta or placed slot terminal, or writing an RTDB-only table,
+        -- a NoOp carrying a placed slot reservation, serving record or clock lease, a TriesAddedMessage or BlockUploadedMessage naming a trie of a naming epoch above 0, of an RTDB-only table or carrying artefacts,
+        -- a TriesDeletedMessage naming such a trie, an L0 trie or an RTDB-only table, a BlockUploadedMessage carrying a naming epoch above 0, and an OversizedMessage bound to an object publication.
+        -- XTDB ignores the replica header byte and parses the protobuf from the next byte; a zero tag fails every protobuf parser before it reads a field,
+        -- so XTDB fails with "InvalidProtocolBufferException: Protocol message contained an invalid tag (zero)." before fencing or applying the record.
+        -- An RTDB reader requires the prefix after header 4, strips it, and reads the body the plain header would carry.
 
-    @invariant RefusalReachesAnOpeningNode
-        -- Once a compactor reset or recovery has started a later naming epoch, every block's upload record carries that epoch.
-        -- An XTDB node opening the store at such a block fails on that block's upload record, which follows the block's boundary in the replica log.
+    @invariant ExtensionBlockFiles
+        -- A block catalog carrying a naming epoch above 0, a serving checkpoint, or a table entry of an RTDB-only table, and a table block carrying search runs, term or entity directories, a relation retirement, or a trie of a naming epoch above 0 or carrying artefacts,
+        -- is stored with XTDB_REFUSAL_PREFIX before its protobuf, so XTDB's Block.parseFrom and TableBlock.parseFrom fail with the same invalid-tag error when a node opens the store or follows a block upload.
+        -- An RTDB reader strips a leading zero byte, which no encoded protobuf message starts with; digests cover the stored bytes, prefix included.
 
-    @invariant PlainRecordsStayPlain
-        -- Every other record keeps header 3 and no suffix, including a ResolvedTxMessage carrying RTDB fields, a TxMessage carrying only a placed attempt seed, and the artefact records.
-        -- Storage keys and block files are unchanged; only log framing marks the extension.
-        -- RTDB readers accept either framing for every kind, so records written before this framing existed still replay.
+    @invariant RtdbOnlyTables
+        -- The engine's transaction-metadata tables (xt/idempotency_receipts, xt/bounded_retry_receipts, xt/rtdb_replay_keys, the placed attempt outcomes) and the owned rtdb_owned_* schemas are RTDB-only tables.
+
+    @invariant AnnotationsStayPlain
+        -- BlockUploaded.catalog_sha256, TrieDetails.published_files, OversizedMessage.payload_sha256 and Block.table_block_manifest are digests or object versions of files XTDB reads by their keys, so they frame nothing.
+        -- RTDB readers accept either framing for every kind, so records and files written before this framing existed still replay.
 }
 
 contract OrderedIndexReplay {

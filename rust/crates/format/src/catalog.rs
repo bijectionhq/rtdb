@@ -59,7 +59,7 @@ impl PartialEq for BlockCatalog { fn eq(&self, other: &Self) -> bool { self.wire
 
 impl BlockCatalog {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut catalog = Self::from_proto(pb::Block::decode(bytes).map_err(invalid)?)?;
+        let mut catalog = Self::from_proto(pb::Block::decode(unframed(bytes)).map_err(invalid)?)?;
         catalog.publication_sha256 = Some(publication_digest(bytes));
         Ok(catalog)
     }
@@ -88,7 +88,8 @@ impl BlockCatalog {
         Ok(catalog)
     }
 
-    pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }
+    /// A catalog that records an RTDB-only feature starts with [crate::XTDB_REFUSAL_PREFIX], which XTDB's parser rejects.
+    pub fn encode(&self) -> Vec<u8> { framed(&*self.wire, crate::envelope::block_uses_extension(&self.wire)) }
     /// Binds the catalog to the exact bytes that the writer will publish.
     pub fn encode_for_publication(&mut self) -> Vec<u8> {
         let bytes = self.encode();
@@ -244,7 +245,7 @@ pub fn schema_declarations(
 
 impl TableBlock {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let wire = pb::TableBlock::decode(bytes).map_err(invalid)?;
+        let wire = pb::TableBlock::decode(unframed(bytes)).map_err(invalid)?;
         if wire.row_count.unwrap_or_default() < 0 { return Err(invalid("Table row count is negative")); }
         Ok(Self { wire: Arc::new(wire), charge: None })
     }
@@ -288,8 +289,12 @@ impl TableBlock {
         }
     }
 
-    pub fn encoded_len(&self) -> usize { self.wire.encoded_len() }
-    pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }
+    pub fn encoded_len(&self) -> usize { self.extension_prefix_len() + self.wire.encoded_len() }
+    /// A table block that records an RTDB-only feature starts with [crate::XTDB_REFUSAL_PREFIX], which XTDB's parser rejects.
+    pub fn encode(&self) -> Vec<u8> { framed(&*self.wire, self.extension_prefix_len() > 0) }
+    fn extension_prefix_len(&self) -> usize {
+        if crate::envelope::table_block_uses_extension(&self.wire) { crate::XTDB_REFUSAL_PREFIX.len() } else { 0 }
+    }
     pub fn as_proto(&self) -> &pb::TableBlock { &self.wire }
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
@@ -374,6 +379,19 @@ impl TableBlock {
             self.wire.column_name_to_hll.iter().map(|(name, hll)| (name.clone(), hll.as_slice())).collect()
         }
     }
+}
+
+/// No encoded protobuf message starts with the refusal prefix, so a file that does is a framed one.
+fn unframed(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(crate::XTDB_REFUSAL_PREFIX.as_slice()).unwrap_or(bytes)
+}
+
+fn framed(message: &impl Message, extension: bool) -> Vec<u8> {
+    let prefix: &[u8] = if extension { &crate::XTDB_REFUSAL_PREFIX } else { &[] };
+    let mut bytes = Vec::with_capacity(prefix.len() + message.encoded_len());
+    bytes.extend_from_slice(prefix);
+    message.encode(&mut bytes).expect("a Vec can hold the advertised encoded protobuf length");
+    bytes
 }
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
