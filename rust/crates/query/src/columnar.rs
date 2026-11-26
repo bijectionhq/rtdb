@@ -3973,6 +3973,14 @@ mod kernel {
                     _ => return None,
                 };
                 let (left, right) = (Operand::of(left, schema, batch, parameters)?, Operand::of(right, schema, batch, parameters)?);
+                // An integer column against an integer constant compares the values in place.
+                match (&left, &right) {
+                    (Operand::Cells(Cells::Int(array)), Operand::Constant(Some(Cell::Int(constant)))) =>
+                        return Some((0..rows).map(|row| (!array.is_null(row)).then(|| accept(array.value(row).cmp(constant)))).collect()),
+                    (Operand::Constant(Some(Cell::Int(constant))), Operand::Cells(Cells::Int(array))) =>
+                        return Some((0..rows).map(|row| (!array.is_null(row)).then(|| accept(constant.cmp(&array.value(row))))).collect()),
+                    _ => {}
+                }
                 (0..rows).map(|row| match (left.get(row).ok()?, right.get(row).ok()?) {
                     (Some(a), Some(b)) => order(a, b, equality_only).ok().map(|ordering| Some(accept(ordering))),
                     _ => Some(None),
@@ -6229,4 +6237,43 @@ fn vector_coalesce_uses_arrow_validity_and_retains_both_layouts() {
         assert_eq!(column.value(row).unwrap(), expected);
     }
     assert_eq!(column.value(2).unwrap(), Value::Null);
+}
+
+#[cfg(test)]
+mod integer_comparison_tests {
+    use super::*;
+    use rtdb_plan::{BinaryOp, ColumnId, Expr, Schema};
+    use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
+
+    #[tokio::test]
+    async fn an_integer_column_compared_with_a_constant_keeps_nulls_unknown_either_way_round() {
+        let memory = MemoryBudget::new(1 << 18);
+        let ty = LogicalType::Scalar(ScalarType::I64).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("n", &ty).unwrap());
+        let array: arrow_array::ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(1), None, Some(5), Some(9)]));
+        let batch = ColumnBatch::settled(vec![Column::Arrow { field, array, logical: Some(ty.clone()) }], 4, memory.reserve(0).unwrap()).unwrap();
+        let schema = Schema::new(vec![rtdb_plan::Field { id: ColumnId(0), name: "n".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty }]).unwrap();
+        let database = crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(),
+            &tokio_util::sync::CancellationToken::new()).unwrap();
+        let execution = crate::context::Execution {
+            context, parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: crate::context::OuterRows::empty(&memory).unwrap(), bindings: None, analysis: None,
+        };
+        let column = schema.fields()[0].expression();
+        let five = Expr::Literal(Value::I64(5));
+        for (predicate, expected) in [
+            (Expr::binary(BinaryOp::GtEq, column.clone(), five.clone()), [Some(false), None, Some(true), Some(true)]),
+            (Expr::binary(BinaryOp::Lt, five.clone(), column.clone()), [Some(false), None, Some(false), Some(true)]),
+            (Expr::binary(BinaryOp::Eq, column.clone(), five.clone()), [Some(false), None, Some(true), Some(false)]),
+            (Expr::binary(BinaryOp::NotEq, five, column), [Some(true), None, Some(false), Some(true)]),
+        ] {
+            let (truths, _charge) = predicate_truth(&batch, &predicate, &schema, &execution).await.unwrap();
+            assert_eq!(truths, expected, "{predicate:?}");
+        }
+    }
 }
