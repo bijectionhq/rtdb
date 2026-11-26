@@ -3871,13 +3871,17 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
         cell.node(holder).agent.flush("shop").await.unwrap();
     }
     client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
-    let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
-    let servers = record.ensemble.iter().map(|id| members[id].address.clone().into()).collect();
-    let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig { write_quorum: 2, servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 }, Default::default()).await.unwrap();
     use rtdb_storage::log::Log;
-    assert!(matches!(reader.read_range(rtdb_storage::log::LogOffset(0), rtdb_storage::log::LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })), "the stream is trimmed below the published blocks");
+    let record = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+            let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
+            let servers = record.ensemble.iter().map(|id| members[id].address.clone().into()).collect();
+            let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig { write_quorum: 2, servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 }, Default::default()).await.unwrap();
+            if matches!(reader.read_range(rtdb_storage::log::LogOffset(0), rtdb_storage::log::LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })) { break record; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("the stream is trimmed below the published blocks");
     assert_eq!(record.checkpoint.map(|checkpoint| checkpoint.block), Some(2), "the directory names the last published block, which a cold start starts from");
     let anchor = *record.replica_anchor.unwrap();
     assert_eq!(anchor.interval, [0, record.checkpoint.unwrap().boundary - 1]);
