@@ -423,7 +423,7 @@ mod tests {
         let spans = RecordSpans::concat(&pages, STREAM_ALIGNMENT, &memory).unwrap().unwrap();
         let mut stream = Vec::new();
         spans.write_java_stream(batch.schema_ref(), &mut stream).unwrap();
-        let expected = super::super::write_stream(batch.schema_ref(), &[combined]).unwrap();
+        let expected = super::super::write_stream_to(batch.schema_ref(), [&combined], Vec::new()).unwrap();
         assert_eq!(stream, expected);
     }
 }
