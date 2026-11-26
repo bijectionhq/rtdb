@@ -81,12 +81,24 @@ pub struct ReplicationConfig {
     pub idle_heartbeat: bool,
     /// How long a node that may lead waits on an empty replica read before claiming, in place of the randomized election wait.
     pub claim_wait: Option<Duration>,
+    /// Names this node's directory under `crashes/` when a leader's document write fails.
+    pub node_id: String,
+}
+impl ReplicationConfig {
+    /// The reference's `IndexerConfig` defaults, which the server configuration also falls back to.
+    pub const DEFAULT_ROWS_PER_BLOCK: u64 = 102_400;
+    pub const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+    /// The reference's node identity default: `XTDB_NODE_ID`, else the first group of a random UUID.
+    pub fn default_node_id() -> String {
+        std::env::var("XTDB_NODE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or_default().to_owned())
+    }
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: 100_000, assertion_interval: Duration::from_millis(100), flush_timeout: Duration::from_secs(4 * 60 * 60),
+        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: Self::DEFAULT_ROWS_PER_BLOCK, assertion_interval: Duration::from_millis(100), flush_timeout: Self::DEFAULT_FLUSH_TIMEOUT,
             pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64,
-            idle_heartbeat: true, claim_wait: None }
+            idle_heartbeat: true, claim_wait: None, node_id: Self::default_node_id() }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2317,6 +2329,7 @@ impl ReplicationDriver {
         let clock = Arc::clone(&self.clock);
         let maximum_inline_bytes = self.logs.replica_guarded_append_limit();
         let maximum_timed_original_bytes = self.logs.replica_timed_original_append_limit();
+        let node_id = self.config.node_id.clone();
         leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
             let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
             let result = match work {
@@ -2329,8 +2342,14 @@ impl ReplicationDriver {
                         Ok::<_, Anomaly>(())
                     }.await;
                     match prepared {
-                        Ok(_) => resolver.resolve_source_with_authority(durable, position, log_time, request, &context,
-                            Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes }), classic_authority.as_ref()).await,
+                        Ok(_) => {
+                            let result = resolver.resolve_source_with_authority(durable, position, log_time, request, &context,
+                                Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes }), classic_authority.as_ref()).await;
+                            if let Err(error) = &result && crate::crash_log::applies(error) {
+                                crate::crash_log::write(&**context.storage.object_store(), &node_id, clock(), error, &context.memory).await;
+                            }
+                            result
+                        }
                         Err(error) if error.is_caller_error() => resolver.resolve_source_abort(
                             durable, position, log_time, reservation.map(|slot| slot.attempt), &context, error, false,
                         ).await,

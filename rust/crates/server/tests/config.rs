@@ -116,6 +116,16 @@ fn default_image_config_starts_without_a_password_and_takes_xtdb_password_like_u
 }
 
 #[test]
+fn embedded_node_defaults_are_the_server_defaults() {
+    let config = decode("{}").unwrap();
+    let embedded = rtdb_node::NodeOptions::default();
+    assert_eq!(embedded.replication.rows_per_block, config.indexer.rows_per_block);
+    assert_eq!(embedded.replication.flush_timeout, config.indexer.flush_duration);
+    assert_eq!(config.compactor.threads, rtdb_node::NodeOptions::default_compaction_threads(|_| None));
+    assert_eq!(config.node_options(1 << 30).unwrap().replication.node_id, config.node_id);
+}
+
+#[test]
 fn startup_defaults_match_the_pinned_factories() {
     let config = decode("{}").unwrap();
     assert_eq!(config.server.unwrap().port, 0);

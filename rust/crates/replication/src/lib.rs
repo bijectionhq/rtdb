@@ -7,6 +7,7 @@ mod blocks;
 mod checkpoint_admin;
 mod catalog_cut;
 mod checkpoint_discovery;
+mod crash_log;
 mod replay_floor;
 mod driver;
 mod default_erasure;

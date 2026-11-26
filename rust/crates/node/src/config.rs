@@ -45,6 +45,14 @@ pub struct NodeOptions {
 impl NodeOptions {
     /// The fixed UTC offset used when no node time zone is configured.
     pub const DEFAULT_TIMEZONE: &str = "Z";
+
+    /// The reference's `CompactorConfig` default, which the server configuration also falls back to: a parseable `XTDB_COMPACTOR_THREADS`, else half the available processors and at least one.
+    pub fn default_compaction_threads(environment: impl Fn(&str) -> Option<String>) -> usize {
+        match environment("XTDB_COMPACTOR_THREADS").and_then(|value| value.parse::<i32>().ok()) {
+            Some(threads) => threads.max(0) as usize,
+            None => (std::thread::available_parallelism().map_or(1, usize::from) / 2).max(1),
+        }
+    }
 }
 
 impl Default for NodeOptions {
@@ -52,7 +60,8 @@ impl Default for NodeOptions {
         Self { membership: Membership::Durable { primary: Default::default(), skipped: Default::default() }, read_only: false, default_v1_serving: false, owned_relations: false,
             default_timezone: Self::DEFAULT_TIMEZONE.into(), execution_memory_bytes: 512 * 1024 * 1024, cache_bytes: 256 * 1024 * 1024,
             command_capacity: 64, file_size_target: 100 * 1024 * 1024, trie: TrieConfig::default(), query: QueryOptions::default(),
-            replication: ReplicationConfig::default(), compaction: MergeConfig::default(), compaction_threads: 2,
+            replication: ReplicationConfig::default(), compaction: MergeConfig::default(),
+            compaction_threads: Self::default_compaction_threads(|name| std::env::var(name).ok()),
             garbage: GarbageConfig::default(), automatic_compaction: true, automatic_gc: true,
             artefact_threads: 1, automatic_artefacts: true, scan_acceleration: true, ordered_index_arrow_references: false,
             ordered_index_arrow_references_on_private_storage: true }
@@ -115,3 +124,27 @@ pub trait ExternalSourceFactory: Send + Sync {
 }
 
 pub type ExternalSources = BTreeMap<String, Arc<dyn ExternalSourceFactory>>;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::NodeOptions;
+
+    #[test]
+    fn embedded_defaults_are_the_reference_library_defaults() {
+        let options = NodeOptions::default();
+        assert_eq!(options.replication.rows_per_block, 102_400);
+        assert_eq!(options.replication.flush_timeout, Duration::from_secs(15 * 60));
+        assert_eq!(options.compaction_threads, NodeOptions::default_compaction_threads(|name| std::env::var(name).ok()));
+    }
+
+    #[test]
+    fn compaction_threads_default_to_the_environment_else_half_the_processors() {
+        let half = (std::thread::available_parallelism().map_or(1, usize::from) / 2).max(1);
+        assert_eq!(NodeOptions::default_compaction_threads(|_| None), half);
+        assert_eq!(NodeOptions::default_compaction_threads(|name| (name == "XTDB_COMPACTOR_THREADS").then(|| "7".to_owned())), 7);
+        assert_eq!(NodeOptions::default_compaction_threads(|_| Some("-3".to_owned())), 0);
+        assert_eq!(NodeOptions::default_compaction_threads(|_| Some("many".to_owned())), half);
+    }
+}

@@ -11,6 +11,8 @@ use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, time::Duration};
 use rtdb_auth::{AuthConfig, Secret};
 use rtdb_format::{config::{Yaml, YamlFields, default_database_config, decode_database_value, decode_log, decode_storage, parse_yaml, resolve_env_vars, scalar_string}, database::proto::DatabaseConfig};
 use rtdb_types::{Anomaly, Result, SourcePosition};
+use rtdb_node::NodeOptions;
+use rtdb_replication::ReplicationConfig;
 
 pub use remotes::RemoteConfig;
 pub use crate::custody_provider::Settings as CustodyProviderSettings;
@@ -369,8 +371,8 @@ fn indexer(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "indexer")?;
     let log_limit = positive(integer(&mut fields, "logLimit", 64)?, "logLimit")?;
     let page_limit = positive(integer(&mut fields, "pageLimit", 1024)?, "pageLimit")?;
-    let rows_per_block = positive(integer(&mut fields, "rowsPerBlock", 102400)?, "rowsPerBlock")? as u64;
-    let flush_duration = duration(&mut fields, "flushDuration", 15 * 60)?;
+    let rows_per_block = positive(integer(&mut fields, "rowsPerBlock", ReplicationConfig::DEFAULT_ROWS_PER_BLOCK as i64)?, "rowsPerBlock")? as u64;
+    let flush_duration = duration(&mut fields, "flushDuration", ReplicationConfig::DEFAULT_FLUSH_TIMEOUT.as_secs())?;
     let skip_transactions = match fields.sequence("skipTxs")? {
         Some(values) => values.iter().map(|value| scalar_string(value, "skipTxs")?.parse::<i64>().map(SourcePosition).map_err(|_| invalid("skipTxs must contain message IDs"))).collect::<Result<_>>()?,
         None => environment("XTDB_SKIP_TXS").into_iter().flat_map(|value| value.split(',').map(str::trim).map(str::to_owned).collect::<Vec<_>>()).map(|value| value.parse::<i64>().map(SourcePosition).map_err(|_| invalid("XTDB_SKIP_TXS must contain message IDs"))).collect::<Result<_>>()?,
@@ -381,8 +383,7 @@ fn indexer(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -
 }
 fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<CompactorSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "compactor")?;
-    let default_threads = environment("XTDB_COMPACTOR_THREADS").and_then(|value| value.parse::<i32>().ok()).unwrap_or_else(|| (std::thread::available_parallelism().map_or(1, usize::from) / 2).max(1) as i32);
-    let threads = fields.integer("threads")?.unwrap_or(default_threads).max(0) as usize;
+    let threads = fields.integer("threads")?.map_or_else(|| NodeOptions::default_compaction_threads(environment), |threads| threads.max(0) as usize);
     let opt_in_221 = fields.boolean("optIn221")?.unwrap_or_else(|| env_boolean(environment, "XTDB_COMPACTOR_221_OPT_IN"));
     let scan_tie_order_from_naming_epoch = fields.integer("scanTieOrderFromNamingEpoch")?
         .map(|epoch| u64::try_from(epoch).ok().and_then(std::num::NonZeroU64::new)

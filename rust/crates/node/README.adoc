@@ -17,6 +17,7 @@ Each call can append a fresh reservation, including a retry after an unknown out
 The reservation changes transaction bookkeeping only and marks its `xt.txs` metadata with `rtdb_present_reservation`.
 
 `NodeOptions::owned_relations` enables the native owner-scoped relation API.
+`NodeOptions::default` uses the server's fallbacks: the reference's block-cut defaults from `ReplicationConfig`, and `NodeOptions::default_compaction_threads`, which reads `XTDB_COMPACTOR_THREADS` and otherwise uses half the available processors.
 Enable this mode only on an installation where every serving and replay member supports the owned relation format.
 `TxOp::OwnedInsertDocs` resolves create-only writes in the authenticated principal's namespace.
 `NativeSession::open_owned_point` reads a single entity in that namespace at a store-reserved present.

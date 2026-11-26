@@ -8,6 +8,13 @@ The leader accepts an exclusive compactor-reset command against a captured trie 
 The driver publishes a normal block boundary after replacing the catalog and acknowledges the reset only after adopting that block.
 Term loss fails the reset receipt, so the maintenance caller cannot delete compacted files on that receipt.
 
+`ReplicationConfig::default` cuts blocks at the reference library defaults, 102,400 rows or 15 minutes, and the server configuration falls back to the same constants.
+
+A leader's put, delete or erase that fails with an error that is not the caller's writes `crashes/<node-id>/<instant truncated to seconds>/crash.edn` to the database's object store before the failure stops ingestion, as the reference's `CrashLogger` does.
+The EDN map holds the failed operation's `:table`, `:tx-key` and `:tx-op-idx`, a `:msg`, and the anomaly as `#xt/error`.
+The reference's live-table, open-transaction and transaction-operation Arrow and trie dumps are not written.
+A failure to write the log is reported on standard error and never replaces the original error.
+
 Disabled indexing retains source submission and recovered state while the driver waits for shutdown without consuming either log.
 An operator-selected skipped transaction saves its source payload under the pinned `skipped-txs` key before staging an aborted `xt.txs` row.
 The abort uses the source position and smoothed system time, then follows ordinary append, read-back and apply ordering.
