@@ -623,6 +623,30 @@ async fn ssl_decline_can_continue_to_startup_and_oversized_preauth_frame_is_reje
 }
 
 #[tokio::test]
+async fn startup_inspection_routes_by_the_first_bytes_however_slow_the_sender_or_many_the_inspections() {
+    let config = ServerConfig { gateway_session_state: true, ..Default::default() };
+    let capacity = config.maximum_connections + config.pending_connections;
+    let running = Running::start(config, None).await;
+    let address = running.server.address();
+    let mut silent = Vec::new();
+    for _ in 0..capacity - 4 { silent.push(TcpStream::connect(address).await.unwrap()); }
+
+    let mut probe = TcpStream::connect(address).await.unwrap();
+    probe.write_all(&rtdb_pgwire::SERVING_PROBE[..3]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    probe.write_all(&rtdb_pgwire::SERVING_PROBE[3..]).await.unwrap();
+    let mut reply = [0; 4];
+    tokio::time::timeout(Duration::from_secs(10), probe.read_exact(&mut reply)).await.unwrap().unwrap();
+    assert_eq!(reply, rtdb_pgwire::SERVING_REPLY);
+
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SELECT 1").await).last(), Some(&b'Z'), "inspected PostgreSQL bytes are replayed to the connection");
+    drop(silent);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn shutdown_joins_connections_waiting_for_authentication_and_extended_sync() {
     let config = ServerConfig { drain_timeout: Duration::from_millis(1), ..Default::default() };
     let running = Running::start(config, None).await;

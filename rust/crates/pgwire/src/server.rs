@@ -15,31 +15,64 @@ use crate::{ServerConfig, error::network};
 pub const SERVING_PROBE: [u8; 8] = *b"RTDB\0\0\0\x01";
 pub const SERVING_STARTUP: [u8; 8] = *b"RTDB\0\0\0\x02";
 pub const SERVING_REPLY: [u8; 4] = *b"RTOK";
-const STARTUP_INSPECTIONS: usize = 64;
-const STARTUP_INSPECTION_TIMEOUT: Duration = Duration::from_millis(100);
-
-async fn inspect_startup(mut stream: TcpStream, address: SocketAddr) -> Option<(TcpStream, SocketAddr)> {
+/// Decides the protocol from the connection's first bytes. A serving probe or
+/// startup is eight bytes and every PostgreSQL first message is at least eight,
+/// so reading until eight bytes or the first byte matching neither prefix never
+/// waits on bytes the client holds back. PostgreSQL bytes read here are
+/// replayed to the connection. Inspection runs inside the startup deadline.
+async fn inspect_startup(mut stream: TcpStream, address: SocketAddr, deadline: Duration) -> Option<(Rewound, SocketAddr)> {
     let inspect = async {
         let mut bytes = [0; SERVING_PROBE.len()];
-        loop {
-            let read = stream.peek(&mut bytes).await?;
-            if read == 0 { return Ok::<_, std::io::Error>(true); }
-            if bytes[..read] != SERVING_PROBE[..read] && bytes[..read] != SERVING_STARTUP[..read] {
-                return Ok(false);
+        let mut filled = 0;
+        while filled < bytes.len() {
+            let read = stream.read(&mut bytes[filled..]).await?;
+            if read == 0 { return Ok::<_, std::io::Error>(None); }
+            filled += read;
+            if bytes[..filled] != SERVING_PROBE[..filled] && bytes[..filled] != SERVING_STARTUP[..filled] {
+                return Ok(Some(bytes[..filled].to_vec()));
             }
-            if read == SERVING_PROBE.len() {
-                let probe_only = bytes == SERVING_PROBE;
-                stream.read_exact(&mut bytes).await?;
-                stream.set_nodelay(true)?;
-                stream.write_all(&SERVING_REPLY).await?;
-                return Ok(probe_only);
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        stream.set_nodelay(true)?;
+        stream.write_all(&SERVING_REPLY).await?;
+        Ok((bytes == SERVING_STARTUP).then(Vec::new))
     };
-    match tokio::time::timeout(STARTUP_INSPECTION_TIMEOUT, inspect).await {
-        Ok(Ok(true) | Err(_)) => None,
-        _ => Some((stream, address)),
+    match tokio::time::timeout(deadline, inspect).await {
+        Ok(Ok(Some(prefix))) => Some((Rewound { prefix, offset: 0, stream }, address)),
+        Ok(Ok(None) | Err(_)) | Err(_) => None,
+    }
+}
+
+/// A TCP stream whose first bytes, already read by startup inspection, are
+/// read again before the socket's own.
+pub(crate) struct Rewound { prefix: Vec<u8>, offset: usize, stream: TcpStream }
+impl Rewound {
+    fn new(stream: TcpStream) -> Self { Self { prefix: Vec::new(), offset: 0, stream } }
+}
+impl tokio::io::AsyncRead for Rewound {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset < this.prefix.len() {
+            let count = buf.remaining().min(this.prefix.len() - this.offset);
+            buf.put_slice(&this.prefix[this.offset..this.offset + count]);
+            this.offset += count;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut this.stream), cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for Rewound {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.get_mut().stream), cx, buf)
+    }
+    fn poll_write_vectored(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write_vectored(std::pin::Pin::new(&mut self.get_mut().stream), cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool { tokio::io::AsyncWrite::is_write_vectored(&self.stream) }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.get_mut().stream), cx)
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.get_mut().stream), cx)
     }
 }
 
@@ -107,18 +140,26 @@ impl ServerDriver {
                     if let Some(Err(error)) = completion { failure = Some(Anomaly::fault("xtdb.pgwire/connection-task", error.to_string())); break; }
                     None
                 },
-                inspection = inspections.join_next(), if !inspections.is_empty() => inspection.and_then(|result| result.ok()).flatten(),
+                inspection = inspections.join_next(), if !inspections.is_empty() => match inspection {
+                    Some(Err(error)) => { failure = Some(Anomaly::fault("xtdb.pgwire/startup-inspection", error.to_string())); break; }
+                    Some(Ok(inspected)) => inspected,
+                    None => None,
+                },
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, address)) => {
                         state.accepted_connections = state.accepted_connections.saturating_add(1);
-                        if self.config.gateway_session_state && inspections.len() < STARTUP_INSPECTIONS {
-                            inspections.spawn(inspect_startup(stream, address));
+                        // An inspecting connection holds a pending place, so inspection
+                        // is bounded by the same capacity that refuses connections.
+                        let pending_places = pending.len() + inspections.len();
+                        if !self.config.gateway_session_state {
+                            Some((Rewound::new(stream), address))
+                        } else if tasks.len() + pending_places < self.config.maximum_connections.saturating_add(self.config.pending_connections) {
+                            inspections.spawn(inspect_startup(stream, address, self.config.authentication_timeout));
                             None
                         } else {
-                            if self.config.gateway_session_state {
-                                state.startup_probe_overflows = state.startup_probe_overflows.saturating_add(1);
-                            }
-                            Some((stream, address))
+                            state.refused_connections = state.refused_connections.saturating_add(1);
+                            if let Some(observer) = self.node.execution_observer() { observer.connection_event(rtdb_plan::ConnectionEvent::Refused); }
+                            None
                         }
                     }
                     Err(error) => { failure = Some(network(error)); break; },
@@ -126,7 +167,7 @@ impl ServerDriver {
             };
             if let Some((stream, address)) = connection {
                 if tasks.len() < self.config.maximum_connections || pending.len() < self.config.pending_connections {
-                    if let Err(error) = stream.set_nodelay(true) { failure = Some(network(error)); break; }
+                    if let Err(error) = stream.stream.set_nodelay(true) { failure = Some(network(error)); break; }
                     pending.push_back((stream, address));
                 } else {
                     state.refused_connections = state.refused_connections.saturating_add(1);
