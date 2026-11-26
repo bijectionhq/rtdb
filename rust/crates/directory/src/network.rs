@@ -2,7 +2,8 @@
 //!
 //! The protocol is newline-delimited JSON: each request carries an id, each response names the request it answers, and responses come back in completion order.
 //! An `Anomaly` crosses the wire whole, so a server-side Conflict is a Conflict at the client.
-//! A subscription to the server's change feed has a connection of its own: every current deployment record, then each change as it applies, until the connection closes.
+//! A subscription to the server's change feed has a connection of its own, chosen by its first line: every current deployment record, then each change as it applies, until the connection closes.
+//! A connection that opened with a request carries only requests and their replies, so a subscriber that stops reading never holds up replies.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -23,10 +25,22 @@ use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, ForkP
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
-/// The most lines a connection queues for its writer; a producer waits for room.
-const QUEUED_LINES: usize = 1024;
-/// The most requests a server connection dispatches at once; the reader waits for one to finish.
-const CONNECTION_REQUESTS: usize = 1024;
+
+/// How a server serves its connections.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeOptions {
+    /// The most requests one connection has dispatched and not yet replied to; its reader waits for one to finish.
+    /// Each dispatched request queues exactly one reply before it finishes, so this also bounds the replies a connection queues for its writer.
+    pub connection_requests: usize,
+}
+
+impl ServeOptions {
+    pub const DEFAULT_CONNECTION_REQUESTS: usize = 1024;
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self { Self { connection_requests: Self::DEFAULT_CONNECTION_REQUESTS } }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,12 +169,19 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, line: &mu
 /// Serves `directory` on `listener` until `cancellation` fires, then waits for the requests already being answered.
 /// Requests on one connection are answered concurrently.
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, cancellation: CancellationToken) -> Result<()> {
+    serve_with(listener, directory, ServeOptions::default(), cancellation).await
+}
+
+pub async fn serve_with(listener: TcpListener, directory: Arc<dyn Directory>, options: ServeOptions, cancellation: CancellationToken) -> Result<()> {
+    if options.connection_requests == 0 || options.connection_requests > Semaphore::MAX_PERMITS {
+        return Err(Anomaly::incorrect("rtdb.directory/connection-requests", "A directory connection must admit at least one request"));
+    }
     let tracker = TaskTracker::new();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => { tracker.spawn(serve_connection(stream, directory.clone(), cancellation.clone(), tracker.clone())); }
+                Ok((stream, _)) => { tracker.spawn(serve_connection(stream, directory.clone(), options, cancellation.clone(), tracker.clone())); }
                 // Typically descriptor exhaustion, which clears as connections close.
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             },
@@ -171,11 +192,35 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, cancell
     Ok(())
 }
 
-async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, cancellation: CancellationToken, tracker: TaskTracker) {
+/// The first line decides what the connection carries: a subscription is served on it alone, anything else makes it a request connection.
+async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, options: ServeOptions, cancellation: CancellationToken, tracker: TaskTracker) {
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
-    let (responses, mut outgoing) = mpsc::channel::<String>(QUEUED_LINES);
-    let requests = Arc::new(Semaphore::new(CONNECTION_REQUESTS));
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let more = tokio::select! {
+        _ = cancellation.cancelled() => return,
+        more = read_line(&mut reader, &mut line) => more,
+    };
+    if !matches!(more, Ok(true)) { return; }
+    if let Ok(Incoming::Subscribe(Subscribe { id, subscribe: Feed::Deployments })) = serde_json::from_str::<Incoming>(&line) {
+        // A subscriber sends nothing after subscribing, so its end of stream, or any line, ends the subscription.
+        tokio::select! {
+            _ = forward_changes(directory, id, BufWriter::new(write_half), cancellation) => {}
+            _ = read_line(&mut reader, &mut line) => {}
+        }
+        return;
+    }
+    serve_requests(reader, line, write_half, directory, options, cancellation, tracker).await;
+}
+
+/// Answers requests concurrently, `first` being the line already read.
+async fn serve_requests(
+    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>, first: String, write_half: OwnedWriteHalf,
+    directory: Arc<dyn Directory>, options: ServeOptions, cancellation: CancellationToken, tracker: TaskTracker,
+) {
+    let (responses, mut outgoing) = mpsc::channel::<String>(options.connection_requests);
+    let requests = Arc::new(Semaphore::new(options.connection_requests));
     let writer_cancellation = cancellation.clone();
     tracker.spawn(async move {
         let mut writer = BufWriter::new(write_half);
@@ -189,62 +234,69 @@ async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, canc
         }
     });
 
-    let connection_closed = cancellation.child_token();
-    let _closes_subscriptions = connection_closed.clone().drop_guard();
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let mut line = first;
     loop {
+        let refusal = match serde_json::from_str::<Incoming>(&line) {
+            Ok(Incoming::Request(request)) => {
+                let admitted = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    admitted = Arc::clone(&requests).acquire_owned() => admitted,
+                };
+                let Ok(admitted) = admitted else { return };
+                let (directory, responses) = (directory.clone(), responses.clone());
+                tracker.spawn(async move {
+                    let _admitted = admitted;
+                    let result = dispatch(directory.as_ref(), request.op).await;
+                    let _ = responses.send(encode(&Response { id: request.id, result })).await;
+                });
+                None
+            }
+            Ok(Incoming::Subscribe(Subscribe { id, .. })) => Some((id, Anomaly::incorrect("rtdb.directory/subscription-on-request-connection",
+                "A subscription must be the first line of a connection of its own"))),
+            Err(error) => {
+                let Ok(RequestId { id }) = serde_json::from_str(&line) else { return };
+                Some((id, Anomaly::incorrect("rtdb.directory/malformed-request", format!("Malformed directory request: {error}"))))
+            }
+        };
+        if let Some((id, refusal)) = refusal {
+            let refused = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                sent = responses.send(encode(&Response { id, result: Err(refusal) })) => sent,
+            };
+            if refused.is_err() { return; }
+        }
         let more = tokio::select! {
             _ = cancellation.cancelled() => return,
             more = read_line(&mut reader, &mut line) => more,
         };
         if !matches!(more, Ok(true)) { return; }
-        let request = match serde_json::from_str::<Incoming>(&line) {
-            Ok(Incoming::Request(request)) => request,
-            Ok(Incoming::Subscribe(Subscribe { id, subscribe: Feed::Deployments })) => {
-                tracker.spawn(forward_changes(directory.clone(), id, responses.clone(), connection_closed.clone()));
-                continue;
-            }
-            Err(error) => {
-                let Ok(RequestId { id }) = serde_json::from_str(&line) else { return };
-                let refusal = Anomaly::incorrect("rtdb.directory/malformed-request", format!("Malformed directory request: {error}"));
-                let refused = tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    sent = responses.send(encode(&Response { id, result: Err(refusal) })) => sent,
-                };
-                if refused.is_err() { return; }
-                continue;
-            }
-        };
-        let admitted = tokio::select! {
-            _ = cancellation.cancelled() => return,
-            admitted = Arc::clone(&requests).acquire_owned() => admitted,
-        };
-        let Ok(admitted) = admitted else { return };
-        let (directory, responses) = (directory.clone(), responses.clone());
-        tracker.spawn(async move {
-            let _admitted = admitted;
-            let result = dispatch(directory.as_ref(), request.op).await;
-            let _ = responses.send(encode(&Response { id: request.id, result })).await;
-        });
     }
 }
 
-/// Sends every current deployment record, then each change, until the connection closes or the feed lags.
+/// Writes every current deployment record, then each change, until the connection closes or the feed lags.
 /// Subscribing before the snapshot means no change between the two is lost; one that arrives older than the snapshot is dropped by the subscriber's `ChangeFeed`.
-/// A subscriber that reads more slowly than changes apply holds its sends, so the feed lags and the subscription ends with `changes-lost`.
-async fn forward_changes(directory: Arc<dyn Directory>, id: u64, responses: mpsc::Sender<String>, closed: CancellationToken) {
-    let send = async |result: Result<DeploymentRecord>| tokio::select! {
-        _ = closed.cancelled() => false,
-        sent = responses.send(encode(&Changed { id, result })) => sent.is_ok(),
+/// A subscriber that reads more slowly than changes apply holds the writes, so the feed lags and the subscription ends with `changes-lost`.
+async fn forward_changes(directory: Arc<dyn Directory>, id: u64, mut writer: BufWriter<OwnedWriteHalf>, closed: CancellationToken) {
+    let mut send = async |result: Result<DeploymentRecord>, flush: bool| {
+        let line = encode(&Changed { id, result });
+        let written = async { writer.write_all(line.as_bytes()).await?; if flush { writer.flush().await?; } std::io::Result::Ok(()) };
+        tokio::select! {
+            _ = closed.cancelled() => false,
+            written = written => written.is_ok(),
+        }
     };
     let Some(mut changes) = directory.deployment_changes() else {
-        send(Err(Anomaly::unsupported("rtdb.directory/no-change-feed", "This directory has no change feed"))).await;
+        send(Err(Anomaly::unsupported("rtdb.directory/no-change-feed", "This directory has no change feed")), true).await;
         return;
     };
     match directory.deployments().await {
-        Ok(records) => for record in records { if !send(Ok(record)).await { return; } },
-        Err(error) => { send(Err(error)).await; return; }
+        Ok(records) => {
+            let last = records.len();
+            for (index, record) in records.into_iter().enumerate() {
+                if !send(Ok(record), index + 1 == last).await { return; }
+            }
+        }
+        Err(error) => { send(Err(error), true).await; return; }
     }
     loop {
         let change = tokio::select! {
@@ -252,12 +304,12 @@ async fn forward_changes(directory: Arc<dyn Directory>, id: u64, responses: mpsc
             change = changes.recv() => change,
         };
         let sent = match change {
-            Ok(record) => send(Ok(record)).await,
+            Ok(record) => send(Ok(record), true).await,
             Err(broadcast::error::RecvError::Lagged(missed)) => {
-                send(Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.directory/changes-lost", format!("The subscriber fell {missed} changes behind")))).await;
+                send(Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.directory/changes-lost", format!("The subscriber fell {missed} changes behind"))), true).await;
                 return;
             }
-            Err(broadcast::error::RecvError::Closed) => { send(Err(unavailable("rtdb.directory/feed-closed", "The directory's change feed ended"))).await; return; }
+            Err(broadcast::error::RecvError::Closed) => { send(Err(unavailable("rtdb.directory/feed-closed", "The directory's change feed ended")), true).await; return; }
         };
         if !sent { return; }
     }
@@ -290,7 +342,7 @@ impl Connection {
             .map_err(|error| unavailable("rtdb.directory/connect", format!("Cannot reach the directory at {address}: {error}")).with_context("address", address.into()))?;
         let _ = stream.set_nodelay(true);
         let (read_half, write_half) = stream.into_split();
-        let (outgoing, mut lines) = mpsc::channel::<String>(QUEUED_LINES);
+        let (outgoing, mut lines) = mpsc::channel::<String>(ServeOptions::DEFAULT_CONNECTION_REQUESTS);
         let connection = Arc::new(Self { outgoing, pending: Mutex::new(HashMap::new()), closed });
 
         let writer_closed = connection.closed.clone();
@@ -742,8 +794,39 @@ mod tests {
             }
             false
         }).await.unwrap();
-        assert!(lost, "a subscriber more than the queue and the feed behind is told it lost changes");
+        assert!(lost, "a subscriber more than the socket and the feed behind is told it lost changes");
         served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_request_connection_refuses_a_subscription_and_keeps_answering_requests() {
+        let directory = MemoryDirectory::new();
+        let served = served(directory.clone()).await;
+        let created = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut client = TcpStream::connect(&served.address).await.unwrap();
+        client.write_all(b"{\"id\":1,\"op\":\"deployments\"}\n{\"id\":2,\"subscribe\":\"deployments\"}\n{\"id\":3,\"op\":\"deployments\"}\n").await.unwrap();
+        let mut lines = BufReader::new(client).lines();
+        let mut replies = HashMap::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while replies.len() < 3 {
+                let line = lines.next_line().await.unwrap().expect("the connection stays open");
+                let response: Response = serde_json::from_str(&line).expect("only replies arrive on a request connection");
+                replies.insert(response.id, response.result);
+            }
+        }).await.unwrap();
+        let refused = replies.remove(&2).unwrap().unwrap_err();
+        assert_eq!(refused.code, "rtdb.directory/subscription-on-request-connection");
+        for id in [1, 3] {
+            assert!(matches!(replies.remove(&id), Some(Ok(Reply::Deployments(records))) if records == [created.clone()]));
+        }
+        served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_server_refuses_a_connection_window_of_no_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = serve_with(listener, MemoryDirectory::new(), ServeOptions { connection_requests: 0 }, CancellationToken::new()).await.unwrap_err();
+        assert_eq!(refused.category, AnomalyCategory::Incorrect);
     }
 
     #[tokio::test]

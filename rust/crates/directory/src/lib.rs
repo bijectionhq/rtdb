@@ -38,7 +38,7 @@ use writer_handoff::require_writer_handoff_update;
 pub use policy::{claim, effective_holder, park, suspend_holding};
 pub use watch::watch_deployment;
 #[cfg(feature = "network")]
-pub use network::{serve, RemoteDirectory};
+pub use network::{serve, serve_with, RemoteDirectory, ServeOptions};
 #[cfg(feature = "dynamodb")]
 pub use dynamo::{DynamoDirectory, DynamoTables};
 
