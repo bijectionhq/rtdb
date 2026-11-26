@@ -1054,8 +1054,9 @@ mod tests {
         });
         holds.keys.key(&config.key_id).await.unwrap();
         let replica = SealedLog::for_serving(provider.clone(), &config, holds.clone()).await.unwrap();
+        let entry = ReplicaEnvelope { term: Term(1), term_sequence: None, message: ReplicaBody::NoOp(Default::default()) };
         for _ in 0..7 {
-            replica.enqueue(Bytes::from_static(b"entry"), Timestamp(0)).await.unwrap().durable().await.unwrap();
+            replica.enqueue(Bytes::from(entry.encode()), Timestamp(0)).await.unwrap().durable().await.unwrap();
         }
         assert!(replica.recovery_tail(LogOffset(3)).await.unwrap().is_some());
 
