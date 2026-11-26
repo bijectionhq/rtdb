@@ -159,7 +159,7 @@ impl Default for AuthConfig {
 
 enum Authentication {
     SingleRootUser { password: Option<Secret> },
-    UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants },
+    UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants, passwords: password::PasswordAdmission },
     OpenIdConnect(Arc<oidc::Provider>),
     ManagedWorkloadOidc(managed_workload_oidc::ManagedWorkloadOidc),
 }
@@ -189,7 +189,10 @@ impl Authenticator {
     pub async fn open(config: AuthConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
         let authentication = match config {
             AuthConfig::SingleRootUser { password } => Authentication::SingleRootUser { password },
-            AuthConfig::UserList { users, rules, grants } => Authentication::UserList { users, rules, grants },
+            AuthConfig::UserList { users, rules, grants } => {
+                let passwords = password::PasswordAdmission::new(users.values())?;
+                Authentication::UserList { users, rules, grants, passwords }
+            }
             AuthConfig::OpenIdConnect(config) => Authentication::OpenIdConnect(oidc::Provider::open(config, Arc::clone(&memory), clock, http).await?),
             AuthConfig::ManagedWorkloadOidc(_) => return Err(Anomaly::incorrect(
                 "rtdb.auth/managed-workload-oidc-config", "Managed workload issuers require separate native HTTPS transports",
@@ -232,9 +235,9 @@ impl Authenticator {
                 });
                 if matches { self.principal(Some(user)) } else { Err(password_failed(user)) }
             }
-            Authentication::UserList { users, .. } => {
+            Authentication::UserList { users, passwords, .. } => {
                 if let Some(hash) = users.get(user) {
-                    if hash.verify(password, &self.memory)? { return self.principal(Some(user)); }
+                    if passwords.verify(hash, password).await? { return self.principal(Some(user)); }
                 }
                 Err(password_failed(user))
             }

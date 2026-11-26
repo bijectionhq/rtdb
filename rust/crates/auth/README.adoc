@@ -49,6 +49,8 @@ Configuration cloning and caller-returned `known_users()` copies remain outside 
 Password algorithms use https://docs.rs/argon2/0.5.3/argon2/[RustCrypto Argon2] and https://docs.rs/bcrypt/0.19.3/bcrypt/[bcrypt].
 Argon2id derivation uses version 19, 64 MiB, three iterations, one lane, a random 16-byte salt, and a 32-byte result.
 Bcrypt derivation uses cost 12 and a random salt.
-Password verification is caller-driven CPU work; the server must account for authentication concurrency when sizing its execution resources.
+A configured-user login verifies its password on the blocking pool, on memory of its own rather than the node's query budget, so a login's Argon2id memory never takes room from queries.
+At most one verification per available core runs at a time, and a later login waits for a turn.
+That memory is sized when the authenticator opens, for that many verifications of the costliest configured Argon2id hash, so an admitted verification always has room.
 Tests retain the upstream rule-order, wrong-password, trusted-principal, stored-hash, concurrent-refresh, refresh-rotation, and device-polling observations.
 Network integration, OIDC provider interoperability, malformed-hash edge cases, and cryptographic-library compatibility remain unexecuted.

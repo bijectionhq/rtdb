@@ -108,6 +108,19 @@ fn stored_hashes_round_trip_reject_malformed_and_keep_the_algorithm_tag() {
 }
 
 #[tokio::test]
+async fn concurrent_argon2_logins_leave_the_query_budget_alone() {
+    let hash = PasswordHash::argon2id("secret", &MemoryBudget::new(64 << 20)).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let config = AuthConfig::UserList { users: BTreeMap::from([("alice".into(), hash)]), rules: vec![MethodRule::any(Method::Password)], grants: Default::default() };
+    let auth = Authenticator::open(config, Arc::clone(&memory), Arc::new(SystemClock), Arc::new(NoHttp)).await.unwrap();
+    let (first, second, wrong) = tokio::join!(auth.verify_password("alice", "secret"), auth.verify_password("alice", "secret"), auth.verify_password("alice", "wrong"));
+    assert_eq!(first.unwrap().user_id(), Some("alice"));
+    assert_eq!(second.unwrap().user_id(), Some("alice"));
+    assert_eq!(wrong.err().unwrap().code, "xtdb.authn/failed");
+    assert!(memory.peak_bytes() < 1 << 20);
+}
+
+#[tokio::test]
 async fn configured_users_keep_trusted_embedded_and_unsupported_oauth_contracts() {
     let auth = open(AuthConfig::UserList { users: BTreeMap::from([("alice".into(), PasswordHash::bcrypt("secret").unwrap())]), rules: vec![MethodRule::any(Method::Password)], grants: Default::default() }).await;
     assert_eq!(auth.known_users(), vec!["alice"]);
