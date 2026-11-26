@@ -158,7 +158,6 @@ impl Cluster {
         )
         .unwrap()
         .with_binary_checkpoints(true)
-        .with_deferred_checkpoints(std::env::var("RTDB_MULTI_DEFERRED_CHECKPOINTS").as_deref() == Ok("1"))
     }
 }
 

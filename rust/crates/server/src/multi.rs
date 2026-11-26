@@ -210,7 +210,7 @@ impl MultiRuntime {
             vault,
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
-            checkpoints: CheckpointMode::from_environment()?,
+            checkpoints: config.multi_checkpoints,
             _journal_lock: writer_lock,
         };
         Self::open(
@@ -333,7 +333,7 @@ impl MultiRuntime {
             vault,
             node,
             peers,
-            checkpoints: CheckpointMode::from_environment()?,
+            checkpoints: config.multi_checkpoints,
             _journal_lock: Some(Arc::new(lock)),
         };
         let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
@@ -1216,33 +1216,8 @@ struct Backends {
     vault: PathBuf,
     node: IpAddr,
     peers: Option<String>,
-    checkpoints: CheckpointMode,
+    checkpoints: crate::config::MultiCheckpointSettings,
     _journal_lock: Option<Arc<File>>,
-}
-
-/// How writers checkpoint their journals. Both modes write checkpoints that
-/// only this release's replay reads, so a deployment enables them once every
-/// node runs it: `RTDB_MULTI_DEFERRED_CHECKPOINTS=1` takes journal-bound
-/// checkpoints off the commit path, and `RTDB_MULTI_BINARY_CHECKPOINTS=1`
-/// writes their transaction state in CBOR.
-#[derive(Clone, Copy, Debug, Default)]
-struct CheckpointMode {
-    deferred: bool,
-    binary: bool,
-}
-
-impl CheckpointMode {
-    fn from_environment() -> Result<Self> {
-        let flag = |name: &str| match std::env::var(name).as_deref() {
-            Err(_) | Ok("" | "0" | "false") => Ok(false),
-            Ok("1" | "true") => Ok(true),
-            Ok(_) => Err(invalid(format!("{name} must be 1, true, 0 or false"))),
-        };
-        Ok(Self {
-            deferred: flag("RTDB_MULTI_DEFERRED_CHECKPOINTS")?,
-            binary: flag("RTDB_MULTI_BINARY_CHECKPOINTS")?,
-        })
-    }
 }
 
 fn assignment_peer_profile(auth: &AuthConfig) -> Option<peer::WorkloadProfile> {
@@ -1942,7 +1917,7 @@ mod tests {
             vault,
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
-            checkpoints: CheckpointMode::default(),
+            checkpoints: crate::config::MultiCheckpointSettings::default(),
             _journal_lock: None,
         };
         let incarnation = Uuid::from_u128(1);

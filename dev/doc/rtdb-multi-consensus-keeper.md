@@ -73,17 +73,20 @@ never a sealed writer epoch, and Multi always seals epoch one or later.
   streams. The stream Writer is limited only by its byte quota.
 - **Checkpoints off the commit path.** By default that checkpoint runs under
   the database lock, so commits wait for it. With
-  `RTDB_MULTI_DEFERRED_CHECKPOINTS=1` the writer captures the state under the
+  `multiCheckpoints: {deferred: true}` the writer captures the state under the
   lock, builds and uploads the manifest without it, then announces a
   checkpoint whose cut precedes the announcement and trims only through the
   cut. Replay installs the first retained checkpoint whose cut is the record
   before the floor and applies every retained record from the floor.
-  `RTDB_MULTI_BINARY_CHECKPOINTS=1` writes the checkpoint's transaction state
+  `multiCheckpoints: {binary: true}` writes the checkpoint's transaction state
   in CBOR instead of JSON. Readers of this release install both kinds, and
   JSON checkpoints keep replaying. An older reader refuses a deferred floor
   and a binary checkpoint, so enable both only once every node of a
-  deployment runs this release. `RTDB_CHECKPOINT_TIMING=1` prints the phase
-  timings of each checkpoint on stderr. The benches take
+  deployment runs this release. The variables
+  `RTDB_MULTI_DEFERRED_CHECKPOINTS` and `RTDB_MULTI_BINARY_CHECKPOINTS` still
+  set a mode the configuration leaves out, with a deprecation warning. The
+  phase timings of each checkpoint are a debug event, logged with
+  `XTDB_LOGGING_LEVEL_DB_CHECKPOINT=debug`. The benches take
   `--checkpoints classic|binary|deferred`, default `deferred`.
 
 ## Qualification
