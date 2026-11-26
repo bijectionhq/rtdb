@@ -74,6 +74,7 @@ URI percent decoding and stored Unix Path rendering share that decoder without c
 `MemoryBudget` owns a finite byte limit with atomic retained and peak counters.
 Child scopes charge the same ancestor limits while retaining their own counters.
 A `MemoryReservation` keeps its budget chain alive until the final shared lease drops.
+`reserve` reports a refusal as an anomaly of kind `ResourceExhausted`; `try_reserve` returns `None` instead, for callers that choose another plan when memory is short, and builds no error.
 `MemoryBudget::reservation_lease_count` exposes the number of reservation controls a successful reserve creates across that immutable chain, including zero-byte reservations.
 The read-only query allocates nothing and changes no counters; callers can combine an explicit per-control native allowance with payload demand before admission.
 It does not specify allocator-exact control sizes or change the requested-byte accounting contract.

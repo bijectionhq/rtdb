@@ -204,6 +204,23 @@ fn moving_a_charge_does_not_require_headroom() {
 }
 
 #[test]
+fn try_reserve_admits_what_fits_and_refuses_the_rest_without_retaining_anything() {
+    let root = MemoryBudget::new(100);
+    let child = root.scope_with_limit(60);
+    let held = child.try_reserve(60).expect("the child's whole limit fits");
+    assert_eq!((child.used_bytes(), root.used_bytes()), (60, 60));
+    assert!(child.try_reserve(1).is_none(), "the child's own limit refuses");
+    let sibling = root.scope();
+    let other = sibling.try_reserve(40).expect("the rest of the root fits");
+    assert!(sibling.try_reserve(1).is_none(), "the shared root refuses");
+    assert!(root.try_reserve(usize::MAX).is_none(), "an overflowing size is refused");
+    assert_eq!((child.used_bytes(), sibling.used_bytes(), root.used_bytes()), (60, 40, 100));
+    drop((held, other));
+    assert_eq!(root.used_bytes(), 0);
+    assert_eq!(root.try_reserve(100).expect("released bytes fit again").bytes(), 100);
+}
+
+#[test]
 fn every_refusal_by_a_budget_is_resource_exhaustion() {
     let root = MemoryBudget::new(100);
     let leaf = root.scope_with_limit(50).scope();
@@ -233,7 +250,7 @@ fn idle_children_report_nothing_used_and_hold_nothing_back() {
     assert_eq!(root.available_bytes(), limit);
     assert_eq!(child.available_bytes(), limit);
     let whole = root.reserve(limit).unwrap();
-    assert!(child.reserve(1).is_err());
+    assert!(child.try_reserve(1).is_none());
     drop(whole);
 }
 
@@ -253,7 +270,7 @@ fn concurrent_reservations_through_a_shared_child_never_exceed_the_limit_and_lea
             start.wait();
             for step in 0..20_000usize {
                 let bytes = 1 + (step * 7919 + thread * 104_729) % 12_000;
-                if let Ok(reservation) = scope.reserve(bytes) {
+                if let Some(reservation) = scope.try_reserve(bytes) {
                     let total = live.fetch_add(bytes, Ordering::SeqCst) + bytes;
                     assert!(total <= limit, "{total} retained bytes exceed the {limit} byte limit");
                     held.push(reservation);

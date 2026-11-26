@@ -13,6 +13,17 @@ pub struct MemoryBudget {
     funding: Option<Arc<MemoryReservation>>,
 }
 
+/// The limit that had no room for a reservation, as it stood when it refused.
+#[derive(Clone, Copy, Debug)]
+struct Refusal { bytes: usize, limit: usize, retained: usize }
+
+impl From<Refusal> for Anomaly {
+    fn from(Refusal { bytes, limit, retained }: Refusal) -> Self {
+        Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {limit} with {retained} retained"))
+            .with_kind(AnomalyKind::ResourceExhausted)
+    }
+}
+
 impl MemoryBudget {
     fn with_parts(limit_bytes: usize, parent: Option<Arc<Self>>, funding: Option<Arc<MemoryReservation>>) -> Arc<Self> {
         Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent, funding })
@@ -62,7 +73,18 @@ impl MemoryBudget {
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error of kind `ResourceExhausted`.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.admit(bytes)?;
-        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: Box::default() }))
+        Ok(self.lease(bytes))
+    }
+
+    /// Reserves bytes if this budget and every ancestor have room for them, and returns `None` otherwise.
+    /// A refusal leaves every budget's retained bytes as they were; ancestor peaks may record the temporary admission.
+    pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Arc<MemoryReservation>> {
+        self.admit(bytes).ok()?;
+        Some(self.lease(bytes))
+    }
+
+    fn lease(self: &Arc<Self>, bytes: usize) -> Arc<MemoryReservation> {
+        Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, backing: Box::default() })
     }
 
     /// Admits new storage that also depends on already funded allocations.
@@ -77,11 +99,11 @@ impl MemoryBudget {
     }
 
     /// Admits bytes at the root first and at this budget last, releasing the ancestors' admission if this one refuses.
-    fn admit(&self, bytes: usize) -> Result<()> {
+    fn admit(&self, bytes: usize) -> std::result::Result<(), Refusal> {
         if let Some(parent) = &self.parent { parent.admit(bytes)?; }
-        if let Err(error) = self.acquire(bytes) {
+        if let Err(refusal) = self.acquire(bytes) {
             if let Some(parent) = &self.parent { parent.release(bytes); }
-            return Err(error);
+            return Err(refusal);
         }
         Ok(())
     }
@@ -105,12 +127,11 @@ impl MemoryBudget {
         Ok(count)
     }
 
-    fn acquire(&self, bytes: usize) -> Result<()> {
+    fn acquire(&self, bytes: usize) -> std::result::Result<(), Refusal> {
         let mut current = self.used_bytes.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(bytes).filter(|next| *next <= self.limit_bytes)
-                .ok_or_else(|| Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {} with {current} retained", self.limit_bytes))
-                    .with_kind(AnomalyKind::ResourceExhausted))?;
+                .ok_or(Refusal { bytes, limit: self.limit_bytes, retained: current })?;
             match self.used_bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
                     if next > self.peak_bytes.load(Ordering::Relaxed) { self.peak_bytes.fetch_max(next, Ordering::Relaxed); }
