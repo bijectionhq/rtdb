@@ -1,7 +1,8 @@
 //! Rewrites applies into joins where the dependent plan's correlation lifts into a join condition, porting the
 //! decorrelation rules of the reference's logical plan (`xtdb.logical-plan`).
 //!
-//! Every rewrite keeps the schema of the relation it replaces, and falls back to the apply wherever it can't.
+//! Every rewrite keeps the schema of the relation it replaces.
+//! A rule answers `Ok(None)` where it does not apply, which keeps the apply; an error building a rewrite fails the plan.
 
 use std::sync::Arc;
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, JoinKind, NamedExpr, OrdinalityScope, Relation, RelationNode, Schema, UnaryOp};
@@ -119,12 +120,7 @@ fn apply(input: Arc<Relation>, dependent: Arc<Relation>, arguments: &[(usize, Ex
             _ => Ok(None),
         }
     };
-    Ok(settle(attempt, applied))
-}
-
-/// A rewrite that could not be built leaves the apply as it was.
-fn settle(attempt: Result<Option<Arc<Relation>>>, original: Arc<Relation>) -> Arc<Relation> {
-    attempt.ok().flatten().unwrap_or(original)
+    Ok(attempt?.unwrap_or(applied))
 }
 
 /// Rule 1: `R A⊗ E = R ⊗ E` where E reads no parameter bound from R.
@@ -278,7 +274,7 @@ fn filter_over_at(input: Arc<Relation>, conjuncts: Vec<Expr>, ids: &mut Ids) -> 
                     ApplyKind::Scalar => quantified_join(&outer, &dependent, &correlation, output, negated),
                     _ => Ok(None),
                 };
-                if let Ok(Some(joined)) = attempt {
+                if let Some(joined) = attempt? {
                     kept.remove(position);
                     return finish(joined, kept);
                 }

@@ -299,3 +299,10 @@ fn relations_without_estimates_keep_the_written_order() {
     let relation = select(crossed, Expr::binary(BinaryOp::And, equals(a.expression(), b.expression()), equals(b.expression(), c.expression())));
     assert_eq!(prepare_with_statistics(Arc::clone(&relation), &Unknown).unwrap(), prepare(relation).unwrap());
 }
+
+#[test]
+fn an_error_building_a_rewrite_fails_the_plan_rather_than_keeping_the_apply() {
+    let count = typed(12, "count", int());
+    let relation = scalar(aggregate(customer_orders(), vec![counted(count, AggregateFunction::CountStar, None, None)]), by_customer());
+    assert_eq!(decorrelate::decorrelate(relation, &mut Ids(u32::MAX)).unwrap_err(), exhausted());
+}
