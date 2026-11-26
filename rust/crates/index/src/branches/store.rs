@@ -20,7 +20,7 @@ pub use store_filter::ValueFilter;
 
 /// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
 /// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "d8edd58771bd1fede395f4f40d4fad5bc7cdd3440b3435ff293ba26e4de4ebac";
+pub const DERIVE_DIGEST: &str = "f32ef11e46334005f4f30a59fb6e5b589058edf1c3377a72b05a218baa8a393c";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
@@ -352,9 +352,9 @@ pub fn resolve_derives(
                 if let Some(in_append) = pending_manifests.remove(&derive.manifest_prefix) {
                     stored.extend(in_append);
                 }
-                let (emitted, next_ordinal) = store_derive::purge(&derive.manifest_prefix, &stored, stamp_bytes, ordinal);
-                ordinal = next_ordinal;
-                for write in emitted {
+                // The row's whole derived history goes, at every stamp; the
+                // purge emits only deletes (Bijection erase-derive).
+                for write in store_derive::purge(&derive.manifest_prefix, &stored) {
                     out.push((write.key, write.value));
                 }
                 purged_prefixes.insert(derive.manifest_prefix.clone());

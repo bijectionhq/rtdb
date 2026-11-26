@@ -41,6 +41,18 @@
 //! boundary at the stamp, a field placed as `now + d`). Each is escaped for
 //! the segments enclosing it, so a filled key sorts where its value does.
 //!
+//! A row's line also keeps the exact inventory of every key it ever
+//! emitted (each manifest version's `written_keys`): markers, singles,
+//! statistics deltas and unretained edged records. Erasure purges that whole
+//! history ([`purge`], erase-derive): every one of those keys is deleted at
+//! every stamp it was written, so no read at any cut, before the erasure or
+//! after it, counts or reveals the erased row through a derived key. Only an
+//! `Edged { retain: true }` contribution (`onErase: "retain"`) survives. A
+//! compaction base that already folded some of those keys in is re-derived
+//! without them by the engine in the same commit
+//! (`owned_relations::owned::OwnedStore::rebase_without`), from the line as
+//! of the base's cut ([`line_through`]).
+//!
 //! The function is pure, total and deterministic: [`apply`] and [`purge`]
 //! return a result for every input, and a malformed derive is a request error
 //! [`check`] decides before ordering. Every emitted key lies at the
@@ -69,6 +81,7 @@ pub const DERIVE_ORDINAL_BASE: u64 = 1u64 << 48;
 
 /// Encoded width of a store stamp (micros big-endian with flipped sign bit,
 /// then version big-endian).
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub const STAMP_BYTES: usize = 16;
 
 /// A stored key's place is its partition prefix (a big-endian `u16` length,
@@ -91,7 +104,8 @@ pub const OPEN_END: i64 = i64::MAX;
 
 /// A half-open valid-time interval `[from, to)` on the `i64` axis. An empty
 /// one (`from >= to`) changes nothing.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct ValidInterval {
     pub from: i64,
     pub to: i64,
@@ -99,7 +113,8 @@ pub struct ValidInterval {
 
 /// How a derive's valid interval is resolved once the store assigns the
 /// append's stamp.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub enum DeriveInterval {
     /// Explicit half-open interval `[from, to)` with `from < to`.
     Fixed { from: i64, to: i64 },
@@ -112,7 +127,8 @@ pub enum DeriveInterval {
 
 /// How an entry's identity key carries the append's commit stamp (for
 /// `t.accepted()` fields indexed by a path).
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub enum KeyStamp {
     /// Overwrite 16 zero bytes at `offset` in `identity` with the raw stamp.
     Raw(u32),
@@ -150,7 +166,8 @@ pub struct KeyInstant {
 }
 
 /// The kind of one derived entry on a row's derived line.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub enum EntryKind {
     /// Path, posting, vector or spatial marker:
     /// enter writes `identity ‖ stamp ‖ ordinal → enter_value`;
@@ -164,7 +181,8 @@ pub enum EntryKind {
     /// `[from, to)` writes `identity ‖ ordered(from) ‖ stamp ‖ ordinal →
     /// enter_value` and, when `to` is not [`OPEN_END`], `identity ‖
     /// ordered(to) ‖ stamp ‖ ordinal → leave_value`. `retain`: a purge
-    /// (erasure) keeps the contribution (`onErase: "retain"`).
+    /// (erasure) keeps the contribution across history (`onErase:
+    /// "retain"`), so its records are kept out of the purge inventory.
     Edged { retain: bool },
     /// Single-key derived entry (expiry index):
     /// enter writes `identity ‖ stamp ‖ ordinal → enter_value` (when
@@ -173,7 +191,8 @@ pub enum EntryKind {
 }
 
 /// One derived entry planned by the writer for the new image.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct DeriveEntry {
     pub kind: EntryKind,
     /// Key prefix (or full key for an unstamped `Single`), confined to the
@@ -194,14 +213,16 @@ pub struct DeriveEntry {
 /// One fallback level where a previous derived line may live:
 /// `(manifest_prefix, through_stamp)`. `through` is `None` for the target
 /// world's own live overlay, or `Some(fork_stamp)` for an inherited level.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct DeriveLevel {
     pub prefix: Vec<u8>,
     pub through: Option<[u8; STAMP_BYTES]>,
 }
 
 /// What a [`Derive`] write does to the row's derived line.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub enum DeriveMode {
     /// Replace `interval` on the derived line with `entries`, emitting only
     /// changed entries plus the new manifest version.
@@ -209,15 +230,18 @@ pub enum DeriveMode {
         interval: DeriveInterval,
         entries: Vec<DeriveEntry>,
     },
-    /// Purge (`Erase`, `Expire`, a hold's last lift): retract the live
-    /// statistics and every unretained edged contribution, delete every
-    /// concrete `Marker` and `Single` key recorded across all manifest
-    /// versions, and delete the manifests.
+    /// Purge (`Erase`, `Expire`): delete every key the row's line ever
+    /// emitted, recorded across all manifest versions (markers, singles,
+    /// statistics deltas and unretained edged records, at every stamp), and
+    /// delete the manifests. Nothing is retracted at the purge's stamp: the
+    /// row's whole derived history goes, so a read at any cut sums and finds
+    /// exactly what it would had the row never been written (erase-derive).
     Purge,
 }
 
 /// One derived write of a store append (`fact_store::persistence::Derive`).
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct Derive {
     /// The target row's derived-line prefix: `row(partition, world) ‖ DERIVED`.
     pub manifest_prefix: Vec<u8>,
@@ -227,7 +251,8 @@ pub struct Derive {
 }
 
 /// One segment stored in a row's derived-line manifest.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct Segment {
     pub from: i64,
     pub to: i64,
@@ -240,7 +265,8 @@ pub struct Segment {
 }
 
 /// One stored manifest version under `manifest_prefix ‖ stamp ‖ ordinal`.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct Manifest {
     /// The row's derived line: an interval map of derived entries.
     pub segments: Vec<Segment>,
@@ -248,8 +274,11 @@ pub struct Manifest {
     /// (`i64::MIN` for an empty line): a `Boundary` entry is live while its
     /// segment reaches it.
     pub horizon: i64,
-    /// Concrete `Marker` and `Single` keys emitted by this step (the exact
-    /// inventory `Purge` deletes, so no erased value survives in any index).
+    /// Every concrete key this step emitted: `Marker` enters and leaves,
+    /// `Single` keys, `Boundary` deltas and unretained `Edged` records (the
+    /// exact inventory `Purge` deletes across history, so no erased value or
+    /// contribution survives in any index, statistic or aggregate at any
+    /// cut). Retained `Edged` records are never listed: they outlive erasure.
     pub written_keys: Vec<Vec<u8>>,
 }
 
@@ -261,7 +290,8 @@ impl Manifest {
 }
 
 /// One concrete key-value write emitted by [`apply`] or [`purge`].
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct EmittedWrite {
     pub key: Vec<u8>,
     /// `None` deletes `key`.
@@ -271,7 +301,8 @@ pub struct EmittedWrite {
 /// The output of [`apply`]: concrete writes to apply (in order), the new
 /// manifest to store at `manifest_prefix ‖ stamp ‖ ordinal`, and the next
 /// unused ordinal.
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct Applied {
     pub writes: Vec<EmittedWrite>,
     pub manifest: Manifest,
@@ -279,7 +310,8 @@ pub struct Applied {
 }
 
 /// A validation or codec refusal on a [`Derive`] or [`Manifest`].
-#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug, PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
 pub struct DeriveError {
     pub message: &'static str,
 }
@@ -448,7 +480,7 @@ pub fn covers_interval(intervals: &[(i64, i64)], from: i64, to: i64) -> bool {
     #[cfg_attr(verus_keep_ghost, verus_spec(invariant
         from <= covered,
         forall|t: i64| in_interval(t, from, covered) ==> point_covered(intervals@, t),
-        decreases (to as int) - (covered as int),
+        decreases if covered < to { (to as int) - (covered as int) } else { 0 },
     ))]
     while covered < to {
         let mut next = covered;
@@ -511,6 +543,11 @@ pub fn partition_prefix_len(key: &[u8]) -> Option<usize> {
         return None;
     }
     let len = ((key[0] as usize) << 8) | (key[1] as usize);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        let (high, low) = (key@[0], key@[1]);
+        assert(((high as usize) << 8usize) | (low as usize) <= 0xffffusize) by (bit_vector);
+    }
     if key.len() < 2 + len {
         return None;
     }
@@ -602,6 +639,13 @@ pub fn same_prefix(a: &[u8], b: &[u8], len: usize) -> bool {
     true
 }
 
+/// `value`'s big-endian bytes. vstd does not specify `u64::to_be_bytes`;
+/// the keys below only copy these bytes, so the type is the whole contract.
+#[cfg_attr(verus_keep_ghost, verifier::external_body)]
+fn be_bytes(value: u64) -> [u8; 8] {
+    value.to_be_bytes()
+}
+
 /// Build a stamped derived key `identity ‖ stamp ‖ ordinal.to_be_bytes()`,
 /// preserving `identity` (and therefore its partition and world prefix).
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
@@ -611,8 +655,8 @@ pub fn same_prefix(a: &[u8], b: &[u8], len: usize) -> bool {
         prefix_eq(out@, identity@, identity@.len() as int),
 ))]
 pub fn stamped_key(identity: &[u8], stamp: &[u8], ordinal: u64) -> Vec<u8> {
-    let ord = ordinal.to_be_bytes();
-    let mut out = Vec::with_capacity(identity.len() + 24);
+    let ord = be_bytes(ordinal);
+    let mut out = Vec::with_capacity(identity.len().saturating_add(24));
     let mut i = 0usize;
     #[cfg_attr(verus_keep_ghost, verus_spec(invariant
         i <= identity@.len(),
@@ -659,7 +703,7 @@ pub fn stamped_key(identity: &[u8], stamp: &[u8], ordinal: u64) -> Vec<u8> {
         prefix_eq(out@, identity@, identity@.len() as int),
 ))]
 pub fn edged_key(identity: &[u8], edge: i64, stamp: &[u8], ordinal: u64) -> Vec<u8> {
-    let mut edged = Vec::with_capacity(identity.len() + EDGE_BYTES);
+    let mut edged = Vec::with_capacity(identity.len().saturating_add(EDGE_BYTES));
     let mut i = 0usize;
     #[cfg_attr(verus_keep_ghost, verus_spec(invariant
         i <= identity@.len(),
@@ -671,7 +715,7 @@ pub fn edged_key(identity: &[u8], edge: i64, stamp: &[u8], ordinal: u64) -> Vec<
         edged.push(identity[i]);
         i += 1;
     }
-    let bytes = ordered(edge).to_be_bytes();
+    let bytes = be_bytes(ordered(edge));
     let mut e = 0usize;
     #[cfg_attr(verus_keep_ghost, verus_spec(invariant
         e <= 8,
@@ -869,6 +913,15 @@ fn put(key: Vec<u8>, value: Vec<u8>) -> EmittedWrite {
     EmittedWrite { key, value: Some(value) }
 }
 
+/// List an emitted edged record in the purge inventory, unless its entry is
+/// retained (`onErase: "retain"`), whose records outlive erasure.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn record(written_keys: &mut Vec<Vec<u8>>, retain: bool, key: &[u8]) {
+    if !retain {
+        written_keys.push(key.to_vec());
+    }
+}
+
 /// The `Boundary` entries live on a line: those of segments reaching its
 /// horizon, as `(identity, enter, leave)`.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
@@ -991,14 +1044,18 @@ pub fn apply(
             },
             // The live set's difference, below.
             EntryKind::Boundary => {},
-            EntryKind::Edged { .. } => {
+            EntryKind::Edged { retain } => {
                 let overlap_from = segment.from.max(interval.from);
                 let overlap_to = segment.to.min(interval.to);
-                writes.push(put(edged_key(&segment.identity, overlap_from, &stamp, ordinal), segment.leave_value.clone()));
+                let key = edged_key(&segment.identity, overlap_from, &stamp, ordinal);
                 ordinal = ordinal.wrapping_add(1);
+                record(&mut written_keys, retain, &key);
+                writes.push(put(key, segment.leave_value.clone()));
                 if overlap_to != OPEN_END {
-                    writes.push(put(edged_key(&segment.identity, overlap_to, &stamp, ordinal), segment.enter_value.clone()));
+                    let key = edged_key(&segment.identity, overlap_to, &stamp, ordinal);
                     ordinal = ordinal.wrapping_add(1);
+                    record(&mut written_keys, retain, &key);
+                    writes.push(put(key, segment.enter_value.clone()));
                 }
             },
             EntryKind::Single { .. } => {
@@ -1034,12 +1091,16 @@ pub fn apply(
                 writes.push(put(key, entry.enter_value.clone()));
             },
             EntryKind::Boundary => {},
-            EntryKind::Edged { .. } => {
-                writes.push(put(edged_key(&entry.identity, entry.from, &stamp, ordinal), entry.enter_value.clone()));
+            EntryKind::Edged { retain } => {
+                let key = edged_key(&entry.identity, entry.from, &stamp, ordinal);
                 ordinal = ordinal.wrapping_add(1);
+                record(&mut written_keys, retain, &key);
+                writes.push(put(key, entry.enter_value.clone()));
                 if entry.to != OPEN_END {
-                    writes.push(put(edged_key(&entry.identity, entry.to, &stamp, ordinal), entry.leave_value.clone()));
+                    let key = edged_key(&entry.identity, entry.to, &stamp, ordinal);
                     ordinal = ordinal.wrapping_add(1);
+                    record(&mut written_keys, retain, &key);
+                    writes.push(put(key, entry.leave_value.clone()));
                 }
             },
             EntryKind::Single { stamped: true } => {
@@ -1068,12 +1129,16 @@ pub fn apply(
             after.remove(index);
             continue;
         }
-        writes.push(put(stamped_key(&identity, &stamp, ordinal), leave));
+        let key = stamped_key(&identity, &stamp, ordinal);
         ordinal = ordinal.wrapping_add(1);
+        written_keys.push(key.clone());
+        writes.push(put(key, leave));
     }
     for (identity, enter, _) in after {
-        writes.push(put(stamped_key(&identity, &stamp, ordinal), enter));
+        let key = stamped_key(&identity, &stamp, ordinal);
         ordinal = ordinal.wrapping_add(1);
+        written_keys.push(key.clone());
+        writes.push(put(key, enter));
     }
 
     Applied {
@@ -1086,51 +1151,22 @@ pub fn apply(
 /// Apply one `DeriveMode::Purge` step across all manifest versions stored under
 /// `manifest_prefix` (supplied in ascending stamp order, newest last). Total.
 ///
-/// Emits:
-/// - the leave of every live `Boundary` entry of the latest manifest, so
-///   counted search statistics stay exact across erasure;
-/// - the retraction of every unretained `Edged` segment of the latest
-///   manifest (`onErase: "retain"` keeps its contribution);
-/// - a delete of every concrete `Marker` and `Single` key recorded in any
-///   manifest version (so no index key carries an erased value);
-/// - a delete of every manifest key itself (so a later write finds no line).
+/// Emits a delete of every key any manifest version recorded as written
+/// (markers, singles, statistics deltas and unretained edged records, at
+/// every stamp: the row's whole derived history), and of every manifest key
+/// itself (so a later write finds no line), each once and confined to the
+/// manifest's place. Nothing is retracted at the purge's own stamp: with
+/// every delta and record of the row gone, a read at any cut sums exactly
+/// the other rows' contributions (Lean `purge_is_recount_without`), and no
+/// key anywhere still carries an erased value or contribution. A key a
+/// compaction already folded into a base is gone already; its base is
+/// re-derived by the engine in the same commit ([`line_through`]).
 #[cfg_attr(verus_keep_ghost, verifier::external)]
-pub fn purge(
-    manifest_prefix: &[u8],
-    stored_manifests: &[(Vec<u8>, Manifest)],
-    stamp: [u8; STAMP_BYTES],
-    ordinal: u64,
-) -> (Vec<EmittedWrite>, u64) {
-    let mut ordinal = ordinal;
+pub fn purge(manifest_prefix: &[u8], stored_manifests: &[(Vec<u8>, Manifest)]) -> Vec<EmittedWrite> {
     if place_bounds(manifest_prefix).is_none() {
-        return (Vec::new(), ordinal);
+        return Vec::new();
     }
     let mut writes = Vec::new();
-    // 1. Retract the latest line's live statistics and edged contributions.
-    if let Some((_, latest)) = stored_manifests.last() {
-        for segment in &latest.segments {
-            if !same_place(&segment.identity, manifest_prefix) {
-                continue;
-            }
-            match segment.kind {
-                EntryKind::Boundary if segment.to == latest.horizon => {
-                    writes.push(put(stamped_key(&segment.identity, &stamp, ordinal), segment.leave_value.clone()));
-                    ordinal = ordinal.wrapping_add(1);
-                },
-                EntryKind::Edged { retain: false } => {
-                    writes.push(put(edged_key(&segment.identity, segment.from, &stamp, ordinal), segment.leave_value.clone()));
-                    ordinal = ordinal.wrapping_add(1);
-                    if segment.to != OPEN_END {
-                        writes.push(put(edged_key(&segment.identity, segment.to, &stamp, ordinal), segment.enter_value.clone()));
-                        ordinal = ordinal.wrapping_add(1);
-                    }
-                },
-                _ => {},
-            }
-        }
-    }
-    // 2. Delete every concrete Marker or Single key ever emitted for this
-    //    row, and every manifest key itself (once each, confined to the place).
     let mut deleted = std::collections::BTreeSet::<Vec<u8>>::new();
     for (manifest_key, manifest) in stored_manifests {
         for key in &manifest.written_keys {
@@ -1142,7 +1178,27 @@ pub fn purge(
             writes.push(EmittedWrite { key: manifest_key.clone(), value: None });
         }
     }
-    (writes, ordinal)
+    writes
+}
+
+/// The row's derived line as of the store stamp `through`: the newest of its
+/// stored manifest versions (`(key, manifest)`, keys `manifest_prefix ‖ stamp
+/// ‖ ordinal`, in ascending key order) stamped at or below it, if any. A
+/// compaction base at `through` folded in exactly what this line held: an
+/// edged entry's records sum, per edge, to its segments' coverage jumps (P9),
+/// and a statistics delta log to its live boundaries. The engine subtracts
+/// that from the base when the row is purged.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn line_through<'a>(manifest_prefix: &[u8], stored_manifests: &'a [(Vec<u8>, Manifest)], through: &[u8; STAMP_BYTES]) -> Option<&'a Manifest> {
+    stored_manifests
+        .iter()
+        .filter(|(key, _)| {
+            key.strip_prefix(manifest_prefix)
+                .and_then(|rest| rest.get(..STAMP_BYTES))
+                .is_some_and(|stamp| stamp <= &through[..])
+        })
+        .map(|(_, manifest)| manifest)
+        .next_back()
 }
 
 // ---------------------------------------------------------------- Binary codec
@@ -1472,10 +1528,48 @@ mod tests {
         assert_eq!(second.writes[1].value, Some(vec![1]), "enter marker for b");
         let m1 = stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE);
         let m2 = stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE);
-        let (purged, _) = purge(&prefix(), &[(m1, first.manifest), (m2, second.manifest)], stamp(30, 3), DERIVE_ORDINAL_BASE);
+        let purged = purge(&prefix(), &[(m1, first.manifest), (m2, second.manifest)]);
         // Three concrete markers (enter a, leave a, enter b) and two manifests.
         assert_eq!(purged.len(), 5);
         assert!(purged.iter().all(|write| write.value.is_none()));
+    }
+
+    #[test]
+    fn purge_deletes_the_rows_whole_counted_history_but_retained_records() {
+        let stats = |n: u8| entry(EntryKind::Boundary, PERSISTENCE, b"stats", &[n], &[0x80 | n]);
+        let edged = |v: u8| entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg", &[v], &[0x80 | v]);
+        let kept = |v: u8| entry(EntryKind::Edged { retain: true }, PERSISTENCE, b"kept", &[v], &[0x80 | v]);
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: OPEN_END }, &[stats(1), edged(1), kept(1)], stamp(10, 1), DERIVE_ORDINAL_BASE);
+        let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: OPEN_END }, &[stats(2), edged(2), kept(2)], stamp(20, 2), DERIVE_ORDINAL_BASE);
+        let emitted: Vec<Vec<u8>> = first.writes.iter().chain(&second.writes).map(|write| write.key.clone()).collect();
+        let retained: Vec<Vec<u8>> = emitted.iter().filter(|key| key.windows(4).any(|w| w == b"kept")).cloned().collect();
+        assert!(!retained.is_empty(), "the retained entry wrote its records");
+        let m1 = stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100);
+        let m2 = stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE + 100);
+        let purged: Vec<Vec<u8>> = purge(&prefix(), &[(m1.clone(), first.manifest), (m2.clone(), second.manifest)]).into_iter().map(|write| {
+            assert!(write.value.is_none(), "a purge only deletes: nothing is retracted at its stamp");
+            write.key
+        }).collect();
+        for key in &emitted {
+            assert_eq!(purged.contains(key), !retained.contains(key), "every unretained key the line emitted, at either stamp, is deleted");
+        }
+        assert!(purged.contains(&m1) && purged.contains(&m2), "and every manifest version");
+    }
+
+    #[test]
+    fn the_line_through_a_cut_is_its_newest_version_at_or_below_it() {
+        let a = entry(EntryKind::Marker, INDEX, b"idx_a", &[1], &[]);
+        let b = entry(EntryKind::Marker, INDEX, b"idx_b", &[1], &[]);
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: OPEN_END }, &[a], stamp(10, 1), DERIVE_ORDINAL_BASE);
+        let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: OPEN_END }, &[b], stamp(20, 2), DERIVE_ORDINAL_BASE);
+        let stored = [
+            (stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE), first.manifest.clone()),
+            (stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE), second.manifest.clone()),
+        ];
+        assert_eq!(line_through(&prefix(), &stored, &stamp(5, 0)), None);
+        assert_eq!(line_through(&prefix(), &stored, &stamp(10, 1)), Some(&first.manifest));
+        assert_eq!(line_through(&prefix(), &stored, &stamp(15, 9)), Some(&first.manifest));
+        assert_eq!(line_through(&prefix(), &stored, &stamp(30, 3)), Some(&second.manifest));
     }
 
     #[test]
