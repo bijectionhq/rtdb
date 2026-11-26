@@ -1,0 +1,52 @@
+{
+  "summary": "V9′ (T7): rtdb.store.v1.Append's clock decision is the vendored Bijection judge::admit; ties commit in version order and a hidden last stamp at or below the sample changes nothing.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "judge",
+    "--verify-module",
+    "store_clock",
+    "--verify-root"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "tie_refusal": {
+      "defect": "The resolver refuses a sample equal to the last stamp's micros (the strict rule MP-port-2 shipped).",
+      "breaks": "V9′, Lean T7.4/T7.5: a hidden commit at T expires a public append sampled at T with before = T+1",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/transact/store_clock.rs",
+          "find": "    store_judge::admit(head, last, now, not_before, before, write_free)\n",
+          "replace": "    if !write_free && last == Some(now) {\n        return Admitted::Regressed;\n    }\n    store_judge::admit(head, last, now, not_before, before, write_free)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/transact/store_clock.rs",
+          "function": "judge_store_clock",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "raised_to_head": {
+      "defect": "The resolver raises a sample at the last stamp to the next microsecond.",
+      "breaks": "V9′: a stamp's micros depend on another append's time",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/transact/store_clock.rs",
+          "find": "    store_judge::admit(head, last, now, not_before, before, write_free)\n",
+          "replace": "    let now = if last == Some(now) { now.saturating_add(1) } else { now };\n    store_judge::admit(head, last, now, not_before, before, write_free)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/transact/store_clock.rs",
+          "function": "judge_store_clock",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}
