@@ -446,6 +446,7 @@ pub struct QueryOptions {
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
     /// Disk bytes one query's spill files may hold at once; zero disables spilling.
+    /// [`QueryOptions::UNLIMITED_SPILL`], the default, sets no limit, as XTDB sets none; a node may configure one.
     pub spill_limit_bytes: u64,
     pub materialized_spill_rows: usize,
     /// Bytes a materialized binding may buffer before it writes its pages to disk instead.
@@ -456,11 +457,15 @@ pub struct QueryOptions {
     /// Stable object-index algorithm for sort runs and complete percentile groups.
     pub object_sort: rtdb_types::ObjectSort,
 }
+impl QueryOptions {
+    /// The spill limit that refuses no bytes: every node's default, embedded or server.
+    pub const UNLIMITED_SPILL: u64 = u64::MAX;
+}
 impl Default for QueryOptions {
     fn default() -> Self {
         Self {
             batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 << 20, top_k_rows: 12_800, hash_memory_bytes: 64 << 20,
-            spill_partitions: 16, max_spill_depth: 6, join_build_rows: 100_000, spill_limit_bytes: 1 << 30, materialized_spill_rows: 100_000,
+            spill_partitions: 16, max_spill_depth: 6, join_build_rows: 100_000, spill_limit_bytes: Self::UNLIMITED_SPILL, materialized_spill_rows: 100_000,
             materialized_memory_bytes: 64 << 20, bypass_temporal_pruning: false, generate_series_end_exclusive: false,
             object_sort: rtdb_types::ObjectSort::default(),
         }

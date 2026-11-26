@@ -539,46 +539,19 @@ impl BatchCursor for SpillReplay {
     }
 }
 
-impl crate::QueryOptions {
-    /// Half the free space on the filesystem of the directory queries spill to, at the moment of the call, and never
-    /// below the default `spill_limit_bytes`.
-    /// A node's startup configuration calls it; the default options never read the disk.
-    pub fn spill_limit_from_free_disk() -> u64 { spill_limit_for(free_bytes(&std::env::temp_dir())) }
-}
-
-fn spill_limit_for(free: Option<u64>) -> u64 {
-    let floor = crate::QueryOptions::default().spill_limit_bytes;
-    free.map_or(floor, |free| (free / 2).max(floor))
-}
-
-#[cfg(unix)]
-#[allow(clippy::unnecessary_cast)]
-fn free_bytes(path: &std::path::Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `stat` points to writable storage for one `statvfs`.
-    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return None; }
-    // SAFETY: a successful `statvfs` initialised `stat`.
-    let stat = unsafe { stat.assume_init() };
-    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
-}
-
-#[cfg(not(unix))]
-fn free_bytes(_path: &std::path::Path) -> Option<u64> { None }
-
 fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("join-spill", error) }
 
 fn io_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { rtdb_types::Anomaly::fault("rtdb.query/spill-io", error.to_string()) }
 
 #[test]
-fn the_free_disk_spill_limit_is_half_the_free_disk_and_never_below_the_default() {
-    let floor = crate::QueryOptions::default().spill_limit_bytes;
-    assert_eq!(floor, 1 << 30);
-    assert_eq!(spill_limit_for(None), floor);
-    assert_eq!(spill_limit_for(Some(1 << 30)), floor);
-    assert_eq!(spill_limit_for(Some(64 << 30)), 32 << 30);
-    assert!(crate::QueryOptions::spill_limit_from_free_disk() >= floor);
+fn every_node_spills_without_limit_by_default_and_a_configured_limit_refuses_past_it() {
+    assert_eq!(crate::QueryOptions::default().spill_limit_bytes, crate::QueryOptions::UNLIMITED_SPILL);
+    let unlimited = SpillRegion::new(crate::QueryOptions::UNLIMITED_SPILL).unwrap();
+    unlimited.reserve(1 << 40).unwrap();
+    unlimited.reserve(1 << 40).unwrap();
+    let limited = SpillRegion::new(1 << 10).unwrap();
+    limited.reserve(1 << 10).unwrap();
+    assert!(limited.reserve(1).unwrap_err().is(AnomalyKind::ConfigurationLimitExceeded));
 }
 
 #[cfg(test)]

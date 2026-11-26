@@ -30,7 +30,8 @@ Executions made from the same context share its memory budget and spill quota.
 `QueryCursor` owns the operator tree and advances it on the caller's coroutine.
 Dropping a cursor releases its operator state and spill files.
 A context over a store under local erasure custody encrypts each spill file under a key made for that file and held only in memory; other contexts spill as written.
-A spill the quota refuses fails with `rtdb.query/spill-limit`, of kind `ResourceExhausted`, reported as SQLSTATE `53400` as PostgreSQL reports an exceeded `temp_file_limit`.
+The spill quota is unlimited by default, as XTDB has none; a node may configure one (`QueryOptions::spill_limit_bytes`).
+A spill a configured quota refuses fails with `rtdb.query/spill-limit`, of kind `ConfigurationLimitExceeded`, reported as SQLSTATE `53400` as PostgreSQL reports an exceeded `temp_file_limit`.
 For eligible Arrow queries, UNION ALL forwards its inputs' batches, preserving duplicates and input order.
 A sort over input columns retains the batches and orders their row positions using the SQL key comparator.
 Compatible signed integers, UTF-8 strings and UTC microsecond timestamps compare directly from Arrow buffers.

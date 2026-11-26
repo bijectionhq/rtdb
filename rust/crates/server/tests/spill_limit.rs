@@ -7,9 +7,8 @@ fn spill_limit(yaml: &str, environment: &impl Fn(&str) -> Option<String>, ingest
 #[test]
 fn spill_limit_environment_reaches_node_query_options() {
     assert_eq!(QUERY_SPILL_LIMIT_SETTING, "RTDB_QUERY_SPILL_LIMIT_BYTES");
-    let floor = rtdb_query::QueryOptions::default().spill_limit_bytes;
     for ingest in [false, true] {
-        assert!(spill_limit("", &|_: &str| None, ingest).unwrap() >= floor, "the default is read from the free disk");
+        assert_eq!(spill_limit("", &|_: &str| None, ingest).unwrap(), rtdb_query::QueryOptions::UNLIMITED_SPILL, "no limit unless configured");
     }
     for (text, expected) in [("0", 0), (" 2048 ", 2048), ("18446744073709551615", u64::MAX)] {
         let env = |key: &str| (key == QUERY_SPILL_LIMIT_SETTING).then(|| text.to_owned());
@@ -26,7 +25,7 @@ fn spill_limit_environment_reaches_node_query_options() {
 #[test]
 fn the_xtdb_spelling_of_the_spill_limit_is_not_read() {
     let env = |key: &str| (key == "XTDB_QUERY_SPILL_LIMIT_BYTES").then(|| "2048".to_owned());
-    assert!(spill_limit("", &env, false).unwrap() >= rtdb_query::QueryOptions::default().spill_limit_bytes);
+    assert_eq!(spill_limit("", &env, false).unwrap(), rtdb_query::QueryOptions::UNLIMITED_SPILL);
 }
 
 #[test]

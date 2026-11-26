@@ -97,7 +97,8 @@ Without the YAML key, each reads `RTDB_DEFAULT_LOCAL_ERASURE` or `RTDB_DEFAULT_K
 The binary validates and installs it once before dispatching the command; library code performs no lookup, and an embedding host that installs nothing gets `F_FULLFSYNC`.
 `query.spillLimitBytes`, or `RTDB_QUERY_SPILL_LIMIT_BYTES` when the YAML sets none, caps the bytes one query's spill files may hold at once, and zero disables spilling.
 XTDB has no such setting, so it carries the RTDB prefix; the earlier `XTDB_QUERY_SPILL_LIMIT_BYTES` spelling is no longer read.
-Without either, the cap is half the free space on the temporary directory's filesystem when the node's options are built at startup, and at least one GiB; a value that is not a non-negative integer, or another key in the `query` section, fails startup.
+Without either, a query's spill is unlimited, as in XTDB, for server and embedded nodes alike; a configured limit is an opt-in, and a query that passes it fails with SQLSTATE 53400 (`rtdb.query/spill-limit`, `ConfigurationLimitExceeded`), as PostgreSQL's `temp_file_limit` does.
+A value that is not a non-negative integer, or another key in the `query` section, fails startup.
 Each spilling operator decides from its configured share of memory, never from what the budget has free.
 Sorts spill sorted runs once their block, ordering scratch included, passes `sort_memory_bytes`, and merge them; hash aggregation and DISTINCT send rows of keys they do not yet hold to hash partitions on disk once they grow past `hash_memory_bytes` (64 MiB by default), then process each partition in turn.
 A sort with a small `LIMIT` keeps only its candidate rows, whatever the input size.

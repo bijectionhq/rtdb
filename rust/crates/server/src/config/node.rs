@@ -34,7 +34,7 @@ impl NodeConfiguration {
         options.ordered_index_arrow_references_on_private_storage = self.ordered_index_arrow_references_on_private_storage;
         options.default_timezone = self.node_timezone().to_owned();
         options.query.join_build_rows = self.join_build_rows;
-        options.query.spill_limit_bytes = self.query_spill_limit_bytes.unwrap_or_else(rtdb_query::QueryOptions::spill_limit_from_free_disk);
+        if let Some(limit) = self.query_spill_limit_bytes { options.query.spill_limit_bytes = limit; }
         options.query.generate_series_end_exclusive = self.generate_series_end_exclusive;
         options.query.object_sort = self.object_sort;
         options.cache_bytes = cache_bytes;
