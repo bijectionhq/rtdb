@@ -1056,15 +1056,16 @@ mod tests {
     fn only_audience_closes_can_dispatch_without_a_current_attachment() {
         for action in [CLOSE_SESSION, CLOSE_OWNED_READ_V1] {
             assert!(matches!(CallKind::action(true, action), CallKind::AudienceCleanup));
-            assert!(matches!(CallKind::action(false, action), CallKind::Action));
         }
+        assert!(matches!(CallKind::action(false, CLOSE_SESSION), CallKind::Action));
+        assert!(matches!(CallKind::action(false, CLOSE_OWNED_READ_V1), CallKind::OwnedAction));
         for action in [
             crate::owned_actions::PREPARE_APPLIED_READ_V3,
             crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5,
             crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6,
-            "closesession",
         ] {
-            assert!(matches!(CallKind::action(true, action), CallKind::Action));
+            assert!(matches!(CallKind::action(true, action), CallKind::OwnedAction));
         }
+        assert!(matches!(CallKind::action(true, "closesession"), CallKind::Action));
     }
 }
