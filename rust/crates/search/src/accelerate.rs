@@ -931,12 +931,17 @@ async fn rank_owned_artefacts<'a>(
                         let candidate = &mut pending[index];
                         if candidate.verified.is_some() { return Err(uncovered_owned_search()); }
                         let revision = rtdb_query::owned_row_revision_for(batch, row, candidate.id, &context.memory)?;
+                        // The winning row's event is named by its position: a
+                        // tied transaction's event shares its time (T7).
+                        let position = rtdb_query::owned_row_event_position(batch, row)?;
                         let at = covered.bounds.valid_time.lower().0;
                         let mut same_run = false;
                         let mut overlapping = 0;
                         for entry in file.rows_for_key(&candidate.run.iid, candidate.key.as_slice()) {
                             let (entry, event) = entry?;
-                            if event.system_from == revision.0 && event.valid_from <= at && at < event.valid_to {
+                            if event.position == Some(position) && event.system_from == revision.0
+                                && event.valid_from <= at && at < event.valid_to
+                            {
                                 overlapping += 1;
                                 same_run |= event.op == EventOp::Put
                                     && file.run_of(&covered.column, entry) == Some(Some(candidate.run.doc));

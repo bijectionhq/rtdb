@@ -1,11 +1,14 @@
 //! Ordered purge floors use complete typed identities. A digest is a bounded
 //! bucket locator, never an identity or permission to purge another handle.
+//! A floor names the purging transaction by its position, with its system
+//! time: tied transactions share the time, and only the position attributes
+//! a floor to its own transaction (T7).
 use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_plan::Catalog;
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, StructFields, Timestamp, Value,
-    OWNED_CHANGE_GROUP_BYTES,
+    Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, StructFields, Timestamp,
+    TransactionKey, TxId, Value, OWNED_CHANGE_GROUP_BYTES,
 };
 
 use crate::{QueryContext, owned_relation::open_owned_table_point, owned_row_revision};
@@ -15,11 +18,11 @@ const COVERAGE: EntityId = EntityId::Uuid([0; 16]);
 
 pub struct OwnedPurgeBucket {
     id: EntityId,
-    entries: BTreeMap<Vec<u8>, Timestamp>,
+    entries: BTreeMap<Vec<u8>, TransactionKey>,
 }
 
 impl OwnedPurgeBucket {
-    pub fn advance(&mut self, identity: &EntityId, at: Timestamp) -> Result<StructFields<Value>> {
+    pub fn advance(&mut self, identity: &EntityId, at: TransactionKey) -> Result<StructFields<Value>> {
         let handle = complete_handle(identity)?;
         if !self.entries.contains_key(&handle) && self.entries.len() == MAX_BUCKET {
             return Err(Anomaly::new(
@@ -32,7 +35,7 @@ impl OwnedPurgeBucket {
             || self
                 .entries
                 .get(&handle)
-                .is_some_and(|previous| *previous >= at)
+                .is_some_and(|previous| previous.tx_id >= at.tx_id || previous.system_time > at.system_time)
         {
             return Err(uncovered());
         }
@@ -47,7 +50,8 @@ impl OwnedPurgeBucket {
                         .map(|(handle, at)| {
                             Value::Struct(StructFields::from([
                                 ("handle".into(), Value::Binary(handle.clone())),
-                                ("at".into(), Value::I64(at.0)),
+                                ("at".into(), Value::I64(at.system_time.0)),
+                                ("tx".into(), Value::I64(at.tx_id.0)),
                             ]))
                         })
                         .collect(),
@@ -74,7 +78,7 @@ pub async fn owned_purge_floor(
     if bucket.entries.is_empty() || exceeds_handle_bound(id) {
         return Ok(None);
     }
-    Ok(bucket.entries.get(&id.handle_bytes()).copied())
+    Ok(bucket.entries.get(&id.handle_bytes()).map(|floor| floor.system_time))
 }
 
 pub async fn read_owned_purge_bucket(
@@ -127,15 +131,16 @@ pub async fn read_owned_purge_bucket(
             let Value::Struct(entry) = floor.as_ref() else {
                 return Err(uncovered());
             };
-            let (Some(Value::Binary(handle)), Some(Value::I64(time))) =
-                (entry.get("handle"), entry.get("at"))
+            let (Some(Value::Binary(handle)), Some(Value::I64(time)), Some(Value::I64(tx))) =
+                (entry.get("handle"), entry.get("at"), entry.get("tx"))
             else {
                 return Err(uncovered());
             };
-            if entry.len() != 2 {
+            if entry.len() != 3 {
                 return Err(uncovered());
             }
             if handle.len() > OWNED_CHANGE_GROUP_BYTES
+                || *tx < 0
                 || Timestamp(*time) > revision
                 || entries
                     .last_key_value()
@@ -147,7 +152,7 @@ pub async fn read_owned_purge_bucket(
             if bucket_id(&exact) != id {
                 return Err(uncovered());
             }
-            entries.insert(handle.clone(), Timestamp(*time));
+            entries.insert(handle.clone(), TransactionKey { tx_id: TxId(*tx), system_time: Timestamp(*time) });
         }
     }
     Ok(OwnedPurgeBucket { id, entries })

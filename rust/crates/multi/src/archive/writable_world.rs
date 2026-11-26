@@ -61,7 +61,10 @@ fn admit_capture(
     }
     match parent.suffix {
         Some(suffix) if replica_suffix::accepted(record, &point, &manifest, suffix)?.basis == parent.basis => Ok(()),
-        None if point.checkpoint.system_time == parent.basis.system_time.0 => Ok(()),
+        // The capture's checkpoint is the parent's basis by position: a tied
+        // transaction shares the time (T7).
+        None if checkpoint_source_tx(record, point.checkpoint) == Some(parent.basis.tx_id)
+            && point.checkpoint.system_time == parent.basis.system_time.0 => Ok(()),
         _ => Err(OwnedWorld::unavailable()),
     }
 }

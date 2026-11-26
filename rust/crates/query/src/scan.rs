@@ -2503,8 +2503,10 @@ impl PartitionScan {
             if let Some(cut) = transaction_cut && !rtdb_temporal::event_applies_at_cut(&head.header, cut)? {
                 continue;
             }
+            // The masked commit is named by its position: a tied commit
+            // shares its time and stays visible (T7).
             if position_mask.is_some_and(|(commit, from)| {
-                head.header.system_from == commit
+                head.header.written_in(commit)
                     && head.header.commit_position >= from
                     && head.header.op != EventOp::Erase
             }) { continue; }
@@ -3591,7 +3593,8 @@ mod tests {
         ] {
             let mut result = crate::open_owned_point_with_position_mask(
                 Arc::clone(&context), "alice", &relation, &id,
-                Interval::at(Timestamp(valid)).unwrap(), Timestamp(system), (Timestamp(100), first_masked),
+                Interval::at(Timestamp(valid)).unwrap(), Timestamp(system),
+                (TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) }, first_masked),
             ).await.unwrap().unwrap();
             let batch = result.next_batch().await.unwrap().unwrap();
             let batch = batch.batch();
@@ -3607,7 +3610,8 @@ mod tests {
         ] {
             let mut result = crate::open_owned_valid_during_with_position_mask(
                 Arc::clone(&context), "alice", &relation, &id,
-                Interval::from_micros(5, 28).unwrap(), Timestamp(system), (Timestamp(100), 2),
+                Interval::from_micros(5, 28).unwrap(), Timestamp(system),
+                (TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) }, 2),
             ).await.unwrap().unwrap();
             let mut slices = Vec::new();
             while let Some(page) = result.next_batch().await.unwrap() {

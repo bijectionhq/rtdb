@@ -6,7 +6,9 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
 use rtdb_storage::{cache::{BufferPool, CatalogAdmission}, sealing::{PlaintextDelivery, PlaintextView}};
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, TransactionKey, Value};
+#[cfg(test)]
+use rtdb_types::Timestamp;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -56,7 +58,8 @@ pub struct CatalogSnapshot {
     /// Derived from `databases` and `owned_relation`; reset by every change to either.
     relation_names: Arc<Mutex<Option<Arc<RelationNames>>>>,
     owned_relation: Option<(QualifiedTable, OwnedSelection)>,
-    pub(crate) owned_position_mask: Option<(Timestamp, u32)>,
+    /// The masked commit, named by its position (T7), and its first masked commit position.
+    pub(crate) owned_position_mask: Option<(TransactionKey, u32)>,
     pub(crate) owned_transaction_cut: Option<rtdb_types::TxId>,
     owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,

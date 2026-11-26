@@ -233,7 +233,9 @@ pub async fn open_owned_artefact_candidates(
     }
     let iids = by_iid.keys().copied().collect();
     let selection = OwnedSelection::Artefacts(Arc::new(OwnedArtefactKeys { by_iid, _reservation: reservation }));
-    let mut columns = vec!["_iid", "_id"];
+    // A candidate names its winning event by position, which a tied
+    // transaction's event never shares (T7).
+    let mut columns = vec!["_iid", "_id", rtdb_types::OWNED_EVENT_POSITION_COLUMN];
     if !columns.contains(&column) { columns.push(column); }
     open_owned_table_selection(context, relation.table(owner), iids, selection, Some(valid), Some(&columns), false, false, false).await
 }
@@ -318,7 +320,7 @@ pub async fn open_owned_point_at_system(
 #[doc(hidden)]
 pub async fn open_owned_point_with_position_mask(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
-    valid: Interval, system: Timestamp, mask: (Timestamp, u32),
+    valid: Interval, system: Timestamp, mask: (TransactionKey, u32),
 ) -> Result<Option<QueryCursor>> {
     if !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
     let context = owned_context_at_position(context, system, mask)?;
@@ -329,7 +331,7 @@ pub async fn open_owned_point_with_position_mask(
 #[doc(hidden)]
 pub async fn open_owned_valid_during_with_position_mask(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
-    valid: Interval, system: Timestamp, mask: (Timestamp, u32),
+    valid: Interval, system: Timestamp, mask: (TransactionKey, u32),
 ) -> Result<Option<QueryCursor>> {
     if owner.is_empty() || !relation.is_root_data() || valid.is_empty() {
         return Err(address_unavailable());
@@ -341,7 +343,7 @@ pub async fn open_owned_valid_during_with_position_mask(
 }
 
 fn owned_context_at_position(
-    context: Arc<QueryContext>, system: Timestamp, mask: (Timestamp, u32),
+    context: Arc<QueryContext>, system: Timestamp, mask: (TransactionKey, u32),
 ) -> Result<Arc<QueryContext>> {
     let mut context = owned_context_at_system(context, system)?;
     Arc::make_mut(&mut context).catalog.owned_position_mask = Some(mask);

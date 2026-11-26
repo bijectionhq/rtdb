@@ -976,12 +976,13 @@ fn audience_point_admitted(
                 || id.strip_prefix("fact_partition_head:") == Some(projection.name())))
 }
 
-fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status> {
-    let (commit, rest) = body.split_first_chunk::<8>()
-        .ok_or_else(|| invalid("Owned position read has no masked commit"))?;
+/// `[commit position: i64 BE][commit system time: i64 BE][first masked: u32 BE]`.
+/// The masked commit is named by its position (T7): a tied commit shares its time.
+fn split_position_mask(body: &[u8]) -> Result<((TransactionKey, u32), &[u8]), Status> {
+    let (commit, rest) = split_world_publication(body)?;
     let (from, rest) = rest.split_first_chunk::<4>()
         .ok_or_else(|| invalid("Owned position read has no mask position"))?;
-    Ok(((Timestamp(i64::from_be_bytes(*commit)), u32::from_be_bytes(*from)), rest))
+    Ok(((commit, u32::from_be_bytes(*from)), rest))
 }
 
 fn decode_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
@@ -5435,10 +5436,10 @@ impl Service {
         } else {
             (None, rest)
         };
+        // An exact Root fork names its publication by position and time (T7).
         let (exact_basis, rest) = if held_publication || retained_publication {
-            let (basis, rest) = rest.split_first_chunk::<8>()
-                .ok_or_else(|| invalid("Exact Root fork has no publication"))?;
-            (Some(Timestamp(i64::from_be_bytes(*basis))), rest)
+            let (publication, rest) = split_world_publication(rest)?;
+            (Some(publication), rest)
         } else {
             (None, rest)
         };

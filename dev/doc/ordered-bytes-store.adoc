@@ -115,18 +115,24 @@ Scan pushdown, columnar projection and batching are mechanism under this contrac
 The host's contract suite (`fact_store::persistence::contract` in Bijection) runs one case list against this store and against its reference store.
 Each must return what an unpushed read followed by host-side filtering returns.
 
-== Remaining position cutover (T7)
+== Positions name transactions in Default (T7)
 
-Ties reach the shared Default partition now. These sites still identify a transaction's events by system time and must name them by position (`EventPosition { transaction, ordinal }`, carried on every Default event) before tied transactions there are distinguished:
+Ties reach the shared Default partition, so a transaction is named by its position, `TransactionKey.tx_id`, with its system time as a non-decreasing coordinate.
+The transaction buffer positions every staged event (`EventPosition { transaction, ordinal }`, `TransactionBuffer::stage_event`), and block pages and data files carry `_event_position` whenever a live table holds positioned events.
+`EventHeader::written_in(key)` is the one test that an event belongs to a transaction: its position names the transaction and its system time is the transaction's.
 
-* the Default live stage writes `position: None` for classic events (`rust/crates/index/src/live.rs`, `put`, `delete`, `erase_iid`), and the data files carry no `EVENT_POSITION_FIELD` for them (`rust/crates/format/src/data.rs`);
-* classic recovery refuses a second committed transaction at one system time and matches events to their transaction by `system_from` (`rust/crates/multi/src/archive/reader/classic_migration/application.rs`, `observe_transaction`, `observe_event`);
-* replica and replay decoders require `system_from == key.system_time` per transaction (`rust/crates/tx/src/replica.rs`, `rust/crates/tx/src/replica/worlds.rs`, `rust/crates/tx/src/hosted_control/replay_rank.rs`, `rust/crates/tx/src/resolver/relation_adoption.rs`);
-* event-to-transaction matching and position masks compare `system_from` (`rust/crates/index/src/event_revision.rs`, `rust/crates/query/src/scan.rs` position mask, `rust/crates/search/src/accelerate.rs`);
-* compaction groups an entity's versions by `system_from` (`rust/crates/maintenance/src/merge.rs`, `SameTimeState`), so two tied transactions writing one entity need a position tiebreak;
-* the owned wire and archive name a commit by its system time (`rust/crates/node/src/node/owned_changes.rs`, `rust/crates/multi/src/archive/writable_world*.rs`).
+* Replica and replay decoders check each event of a transaction's write with `written_in` (`tx/src/replica.rs`, `tx/src/replica/worlds.rs`, `tx/src/hosted_control/replay_rank.rs`); relation adoption already compares the event position's transaction.
+* An ordered purge floor names its transaction: each `floors` entry is `{ handle, at, tx }`. A tied transaction may purge a handle again at the same time, and a replay attributes a floor to itself by `tx`, never by `at` (`query/src/owned_purge.rs`, `verify_purge_floors`). `owned_purge_floor` still answers the floor's system time, which bounds historical reads.
+* The owned position mask names its commit by `TransactionKey` (`QueryContext::owned_position_mask`, `open_owned_*_with_position_mask`); `ReadHeldPositionPoint.v1` and `ReadHeldPositionValidDuring.v1` carry `[tx_id: i64 BE][system time: i64 BE][first masked: u32 BE]`.
+* An exact Root fork (`PublishWorldCut` clock modes 10 and 12) names its publication by `[tx_id: i64 BE][system time: i64 BE]` and reads it at its own position cut (`fork_root_publication_at`).
+* Search acceleration matches a candidate's winning event by its position (`_rtdb_owned_event_position`), not by its system time.
+* Classic migration admits a second committed transaction at the cut's system time, and `before` is strict by position with non-decreasing time. An unpositioned literal event whose system time two transactions share is ambiguous and needs event translation (`literal_history`).
+* A capture with no replica suffix matches its parent basis by the checkpoint's source position as well as its time (`admit_capture`).
+* A hosted observation admits a head that ties the present at a later position.
+* Already position-exact: the live stage's commit-position check (`validate_append`), compaction's row heap (`(iid, system_from, position order, ...)`; an erase's same-time grouping only places rows conservatively), owned change edges (`ChangeEdgeOrder::Publication`; a time projection refuses an unexamined tie), and exact publication reads (`with_owned_transaction_cut`).
+* As-of reads stay time reads: a world clock reading at system time `T`, an accepted held group at `T` and the classic Changes cursor read the state after every transaction stamped at or before `T`, ties included, and never name one transaction.
 
-Until then classic migration refuses a second committed transaction at one system time as invalid (`observe_transaction`), and the other sites above can attribute a tied transaction's events to its twin.
+Remaining: a historical (as-of time) world fork with no positioned basis still matches a checkpoint by its system time (`matches_fork_checkpoint`), so a checkpoint between two tied transactions could be selected. The historical session should resolve its cut to the last position at or before its time.
 
 == Verification obligations (T7)
 

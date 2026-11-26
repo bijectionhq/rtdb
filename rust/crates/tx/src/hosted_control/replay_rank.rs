@@ -95,7 +95,7 @@ pub(crate) fn verify(
             } else {
                 std::str::from_utf8(address).is_ok()
             };
-            if header.system_from != key.system_time || !shape || *tag != if binary { 4 } else { 0 } {
+            if !header.written_in(key) || !shape || *tag != if binary { 4 } else { 0 } {
                 return Err(replay_invalid());
             }
             let mut hash = Sha256::new();
@@ -244,7 +244,7 @@ fn verify_purge_floors(
         let expected = erases.get(&relation).ok_or_else(replay_invalid)?;
         for index in 0..batch.len() {
             let header = batch.header(index)?;
-            if header.system_from != key.system_time || header.valid_time != Interval::ALL {
+            if !header.written_in(key) || header.valid_time != Interval::ALL {
                 return Err(replay_invalid());
             }
             let _row = memory.reserve(batch.view().borrow_event(index)?.document_allocation_bound()?)?;
@@ -271,7 +271,8 @@ fn verify_purge_floors(
             let mut current_floor = false;
             for floor in floors {
                 let Value::Struct(floor) = floor else { return Err(replay_invalid()); };
-                let (Some(Value::Binary(handle)), Some(Value::I64(at))) = (floor.get("handle"), floor.get("at"))
+                let (Some(Value::Binary(handle)), Some(Value::I64(at)), Some(Value::I64(tx))) =
+                    (floor.get("handle"), floor.get("at"), floor.get("tx"))
                     else { return Err(replay_invalid()); };
                 let Some(address) = handle.strip_prefix(&[4]).filter(|address| is_rank_row_address(address))
                     else { return Err(replay_invalid()); };
@@ -280,8 +281,15 @@ fn verify_purge_floors(
                 digest.update(address);
                 let mut expected_bucket: [u8; 16] = digest.finalize()[..16].try_into().map_err(|_| replay_invalid())?;
                 expected_bucket[0] |= 0x80;
-                if bucket != expected_bucket || *at <= 0 || *at > key.system_time.0 { return Err(replay_invalid()); }
-                if Timestamp(*at) == key.system_time {
+                if bucket != expected_bucket || *at <= 0 || *at > key.system_time.0
+                    || *tx < 0 || *tx > key.tx_id.0
+                {
+                    return Err(replay_invalid());
+                }
+                // A floor is this transaction's by its position: a tied
+                // transaction's floor shares the time but names its own (T7).
+                if *tx == key.tx_id.0 {
+                    if Timestamp(*at) != key.system_time { return Err(replay_invalid()); }
                     let handle = expected.get(handle.as_slice()).copied().ok_or_else(replay_invalid)?;
                     covered_floors.entry(relation).or_default().insert(handle);
                     current_floor = true;
@@ -396,6 +404,7 @@ mod tests {
                     ("_id".into(), Value::Uuid(bucket)),
                     ("floors".into(), Value::list(vec![Value::Struct(StructFields::from([
                         ("handle".into(), Value::Binary(retained)), ("at".into(), Value::I64(key.system_time.0)),
+                        ("tx".into(), Value::I64(key.tx_id.0)),
                     ]))])),
                 ]), Interval::ALL)?;
             }

@@ -1844,16 +1844,18 @@ impl OwnedReadSession {
     }
 
     /// Certify an exact original publication for a new Held or retained world.
+    /// The publication is named by its position: a tied publication shares
+    /// its time, so it is read at its own position cut (T7).
     pub async fn fork_root_publication_at(
-        &self, scope: rtdb_types::PlacedAttemptScope, basis: Timestamp, mode: WorldClockRequest,
+        &self, scope: rtdb_types::PlacedAttemptScope, requested: TransactionKey, mode: WorldClockRequest,
     ) -> Result<OwnedForkCut> {
         let mut cut = self.fork_publication_cut(scope).await?;
-        if basis > cut.basis() {
+        if requested.system_time > cut.basis() || requested.tx_id > cut.issued_on.tx_id {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        let context = self.context.with_owned_system_cut(basis, &self.context.cancellation)?;
+        let context = self.context.with_owned_transaction_cut(requested, &self.context.cancellation)?;
         let publication = rtdb_query::read_owned_root_publication(context, &self.owner).await?
-            .filter(|publication| publication.system_time == basis && publication.tx_id <= cut.issued_on.tx_id)
+            .filter(|publication| *publication == requested)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
         self.check()?;
         cut.basis = publication.system_time;
@@ -2558,9 +2560,9 @@ impl OwnedReadSession {
 
     pub async fn open_historical_position_point(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
-        system: Timestamp, valid: Timestamp, mask: (Timestamp, u32),
+        system: Timestamp, valid: Timestamp, mask: (TransactionKey, u32),
     ) -> Result<Option<QueryCursor>> {
-        let context = self.position_read_context(relation, id, system, mask.0).await?;
+        let context = self.position_read_context(relation, id, system, mask.0.system_time).await?;
         let valid = rtdb_types::Interval::new(valid, valid.next()?)?;
         rtdb_query::open_owned_point_with_position_mask(context, &self.owner, relation, id, valid, system, mask).await
     }
@@ -2571,9 +2573,9 @@ impl OwnedReadSession {
         id: &rtdb_types::EntityId,
         valid: rtdb_types::Interval,
         system: Timestamp,
-        mask: (Timestamp, u32),
+        mask: (TransactionKey, u32),
     ) -> Result<OwnedValidHistory<'a>> {
-        let context = self.position_read_context(relation, id, system, mask.0).await?;
+        let context = self.position_read_context(relation, id, system, mask.0.system_time).await?;
         let cursor = rtdb_query::open_owned_valid_during_with_position_mask(
             context, &self.owner, relation, id, valid, system, mask,
         ).await?;

@@ -284,7 +284,7 @@ fn check_adoption_publication(tables: &BTreeMap<TableRef, TableWrite>, key: Tran
         bytes.checked_add(batch.arrow().get_array_memory_size()).ok_or_else(invalid)
     })?;
     if bytes > 256 * 1024 || attempts.is_empty()
-        || adoption.len() != 1 || !adoption.view().header(0).is_ok_and(|header| header.system_from == key.system_time)
+        || adoption.len() != 1 || !adoption.view().header(0).is_ok_and(|header| header.written_in(key))
         || [TableRef::new("public", "bj_fact_root_owner"), TableRef::new("public", "bj_relation_declarations")]
             .iter().any(|table| tables.get(table).is_none_or(|write| write.row_count() == 0))
     {
@@ -392,7 +392,7 @@ fn verify_archive_replay(
         if let Some(batch) = write.batch() {
             for index in 0..batch.len() {
                 let event = batch.header(index)?;
-                if event.system_from != key.system_time {
+                if !event.written_in(key) {
                     return Err(mismatch());
                 }
                 if event.commit_position != 0 {
@@ -445,7 +445,7 @@ fn read_placed_outcome(
     let expected = Value::Utf8(attempt.outcome_key()).entity_id()?.iid();
     for row in 0..outcome.len() {
         let header = outcome.header(row)?;
-        if header.system_from != key.system_time || header.commit_position != 0 { return Err(mismatch()); }
+        if !header.written_in(key) || header.commit_position != 0 { return Err(mismatch()); }
         if retirement && header.op == EventOp::Erase
             && header.valid_time == Interval::ALL && header.iid != expected && retired.insert(header.iid)
         {
@@ -541,7 +541,7 @@ fn verify_hosted_controls(
         for index in 0..batch.len() {
             let row = batch.header(index)?;
             if row.op != EventOp::Put
-                || row.system_from != key.system_time
+                || !row.written_in(key)
                 || row.valid_time != valid
             {
                 return Err(mismatch());

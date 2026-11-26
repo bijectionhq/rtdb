@@ -3094,7 +3094,7 @@ impl<'a> OpenTransaction<'a> {
         let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
         self.record_owned_change(relation, id.clone(), kind, Interval::ALL, position, fixed)?;
         let floors = relation.purge_floor_table(owner);
-        self.buffer.put(floors.clone(), bucket.advance(id, ordered.system_time)?, Interval::ALL)?;
+        self.buffer.put(floors.clone(), bucket.advance(id, ordered)?, Interval::ALL)?;
         if first_erase {
             let markers = relation.purge_table(owner);
             let through = self.snapshot()?.relation_event_frontier(&markers)?

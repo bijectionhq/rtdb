@@ -360,7 +360,7 @@ pub(super) fn verify(
                 purge_floors.insert(relation);
                 for index in 0..batch.len() {
                     let header = batch.header(index)?;
-                    if header.op != EventOp::Put || header.system_from != key.system_time
+                    if header.op != EventOp::Put || !header.written_in(key)
                         || header.valid_time != Interval::ALL
                     {
                         return Err(mismatch());
@@ -501,7 +501,7 @@ fn event_headers(batch: &IndexBatch, key: TransactionKey, allows_delete: bool, a
     let mut erased = false;
     for index in 0..batch.len() {
         let header = batch.header(index)?;
-        if header.system_from != key.system_time
+        if !header.written_in(key)
             || !(header.op == EventOp::Put || allows_delete && header.op == EventOp::Delete
                 || allows_erase && header.op == EventOp::Erase && header.valid_time == Interval::ALL)
         {
@@ -530,7 +530,7 @@ fn records_with_limit(
     for index in 0..batch.len() {
         let event = batch.view().read_event(index)?;
         let StoredOperation::Put(row) = event.operation else { return Err(mismatch()); };
-        if event.system_from != key.system_time || event.valid_time != Interval::ALL { return Err(mismatch()); }
+        if !batch.header(index)?.written_in(key) || event.valid_time != Interval::ALL { return Err(mismatch()); }
         inspect(&row)?;
     }
     Ok(())

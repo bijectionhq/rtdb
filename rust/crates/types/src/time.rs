@@ -276,6 +276,15 @@ impl EventHeader {
     pub fn version(self) -> RowVersion {
         RowVersion { iid: self.iid, system_from: self.system_from, position: self.position, commit_position: self.commit_position }
     }
+
+    /// Whether `key`'s transaction wrote this event: its position names that
+    /// transaction, and its system time is that transaction's. Tied
+    /// transactions share a system time, so only the position tells one from
+    /// its twin (T7). The transaction buffer positions every staged event.
+    pub fn written_in(self, key: crate::TransactionKey) -> bool {
+        self.position.is_some_and(|position| position.transaction == key.tx_id)
+            && self.system_from == key.system_time
+    }
 }
 
 /// A version's logical identity within a table and transaction history.
