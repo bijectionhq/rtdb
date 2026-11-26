@@ -56,11 +56,11 @@ fn character_length_forms_select_the_pinned_scalar_and_projection_label() {
 #[tokio::test]
 async fn character_length_units_count_unicode_and_preserve_nulls_and_binary_octets() {
     let rows = query("SELECT CHAR_LENGTH('aé😀' USING CHARACTERS), CHARACTER_LENGTH('aé😀' USING OCTETS), \
-        CHARACTER_LENGTH(NULL USING CHARACTERS), CHAR_LENGTH(NULL USING OCTETS), CHAR_LENGTH(X'00FF' USING OCTETS), \
+        CHARACTER_LENGTH(NULL USING CHARACTERS), CHAR_LENGTH(NULL USING OCTETS), CHAR_LENGTH(X('00FF') USING OCTETS), \
         CHAR_LENGTH(CAST(CHARACTER_LENGTH('é😀' USING OCTETS) AS TEXT) USING CHARACTERS)")
         .await.unwrap();
     assert_eq!(rows, [vec![V::I32(3), V::I32(7), V::Null, V::Null, V::I32(2), V::I32(1)]]);
-    let error = query("SELECT CHAR_LENGTH(X'00FF' USING CHARACTERS)").await.unwrap_err();
+    let error = query("SELECT CHAR_LENGTH(X('00FF') USING CHARACTERS)").await.unwrap_err();
     assert_eq!(error.code, "xtdb.expression/function-type-mismatch");
 }
 
@@ -113,17 +113,17 @@ fn character_length_units_preserve_syntax_and_later_binding_errors() {
 
 #[tokio::test]
 async fn sql_concat_stringifies_arguments_and_treats_null_as_empty_text() {
-    assert_eq!(query("SELECT CONCAT('a',NULL),CONCAT('a',1) AS test_output_2,CONCAT(1) AS test_output_3,CONCAT(NULL) AS test_output_4,CONCAT(X'0102',TRUE) AS test_output_5").await.unwrap(),
+    assert_eq!(query("SELECT CONCAT('a',NULL),CONCAT('a',1) AS test_output_2,CONCAT(1) AS test_output_3,CONCAT(NULL) AS test_output_4,CONCAT(X('0102'),TRUE) AS test_output_5").await.unwrap(),
         [vec![text("a"), text("a1"), text("1"), text(""), text("\\x0102true")]]);
-    assert_eq!(query("SELECT 'a'||NULL,X'01'||X'02'").await.unwrap(), [vec![V::Null, V::Binary(vec![1, 2])]]);
+    assert_eq!(query("SELECT 'a'||NULL,X('01')||X('02')").await.unwrap(), [vec![V::Null, V::Binary(vec![1, 2])]]);
     for sql in ["SELECT CONCAT()", "SELECT STR()"] { assert!(prepare(sql, &context().catalog, &PrepareOptions::default()).is_err(), "{sql}"); }
 }
 
 #[tokio::test]
 async fn stringutil_sql_overlay_position_units_and_binary_functions() {
     assert_eq!(query("SELECT POSITION('é' IN 'a😀éz'),POSITION('é' IN 'a😀éz' USING OCTETS) AS test_output_2,POSITION('é' IN 'a😀éz' USING CHARACTERS) AS test_output_3").await.unwrap(), [vec![V::I32(3), V::I32(6), V::I32(3)]]);
-    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING 'zz' FROM 2),OVERLAY('abcdef' PLACING 'zz' FROM 2 FOR 3) AS test_output_2,SUBSTRING(X'010203' FROM 2 FOR 1),TRIM(X'00' FROM X'000100')").await.unwrap(), [vec![text("azzdef"), text("azzef"), V::Binary(vec![2]), V::Binary(vec![1])]]);
-    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING LOWER('ZZ') FROM 2 FOR 1),X'01'||X'02'").await.unwrap(), [vec![text("azzcdef"), V::Binary(vec![1, 2])]]);
+    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING 'zz' FROM 2),OVERLAY('abcdef' PLACING 'zz' FROM 2 FOR 3) AS test_output_2,SUBSTRING(X('010203') FROM 2 FOR 1),TRIM(X('00') FROM X('000100'))").await.unwrap(), [vec![text("azzdef"), text("azzef"), V::Binary(vec![2]), V::Binary(vec![1])]]);
+    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING LOWER('ZZ') FROM 2 FOR 1),X('01')||X('02')").await.unwrap(), [vec![text("azzcdef"), V::Binary(vec![1, 2])]]);
 }
 
 #[tokio::test]
@@ -132,7 +132,7 @@ async fn substring_and_overlay_parse_units_without_changing_character_positions(
         [vec![text("😀é"), text("😀éz")]]);
     assert_eq!(query("SELECT OVERLAY('a😀éz' PLACING 'Q' FROM 3 FOR 1 USING OCTETS) AS overlay_octets, OVERLAY('a😀éz' PLACING 'Q' FROM 3 USING octets) AS overlay_default").await.unwrap(),
         [vec![text("a😀Qz"), text("a😀Qz")]]);
-    assert_eq!(query("SELECT SUBSTRING(NULL FROM 1 USING OCTETS) AS sub_null, SUBSTRING(X'010203' FROM 2 FOR 1 USING CHARACTERS) AS sub_bytes").await.unwrap(),
+    assert_eq!(query("SELECT SUBSTRING(NULL FROM 1 USING OCTETS) AS sub_null, SUBSTRING(X('010203') FROM 2 FOR 1 USING CHARACTERS) AS sub_bytes").await.unwrap(),
         [vec![V::Null, V::Binary(vec![2])]]);
 }
 
@@ -217,7 +217,7 @@ async fn substring_without_from_preserves_operand_precedence_and_units() {
     let rows = query("SELECT SUBSTRING('abcdef' 2), SUBSTRING('abcdef' 2 FOR 2), \
         SUBSTRING('abcdef' 1 + 1 2 * 1), SUBSTRING(LOWER ('ABCDEF') (2) (1 + 1)), \
         SUBSTRING(LOWER ('ABCDEF')), SUBSTRING('abcdef' 2 - 1), \
-        SUBSTRING('a😀éz' 2 2 USING octets), SUBSTRING(X'010203' 2 USING CHARACTERS), \
+        SUBSTRING('a😀éz' 2 2 USING octets), SUBSTRING(X('010203') 2 USING CHARACTERS), \
         SUBSTRING(NULL 2 FOR 1)")
         .await.unwrap();
     assert_eq!(
@@ -331,12 +331,17 @@ fn position_retry_exhaustion_is_a_public_sql_error() {
 }
 
 #[tokio::test]
-async fn contiguous_x_quote_is_a_binary_literal_and_a_spaced_one_is_a_call() {
+async fn contiguous_x_paren_quote_is_a_binary_literal_a_spaced_one_is_a_call_and_x_quote_is_rejected() {
     assert_eq!(query("SELECT X('00f0') AS v, x('5C') AS w, X('') AS e").await.unwrap(), [vec![V::Binary(vec![0x00, 0xf0]), V::Binary(vec![0x5c]), V::Binary(vec![])]]);
     let odd = query("SELECT X('0') AS v").await.unwrap_err();
-    assert_eq!(odd.message.as_deref(), Some("Cannot parse binary hex string: X('0') - failed with message Odd number of characters."));
+    assert_eq!(odd.message.as_deref(), Some("Cannot parse binary string expr: X('0') - failed with message Odd number of characters."));
     for call in ["SELECT X ('00') AS v", "SELECT X('GG') AS v", "SELECT \"X\"('00') AS v"] {
         assert!(query(call).await.unwrap_err().message.unwrap().starts_with("Unknown function: "), "{call}");
+    }
+    for quoted in ["SELECT X'00f0' AS v", "SELECT x'5C' AS w", "SELECT X'0' AS v", "SELECT X'' AS e"] {
+        let error = query(quoted).await.unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error", "{quoted}");
+        assert!(error.message.unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{quoted}");
     }
 }
 

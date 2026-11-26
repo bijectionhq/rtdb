@@ -186,7 +186,7 @@ flightSql:
 def prepare(pg, port, workload):
     with sql_connection(pg) as conn:
         conn.execute(f"""INSERT INTO bj_installation RECORDS {{_id: 'authority', kind: 'hosted',
-            incarnation: X'{INSTALLATION.hex}', writer: '{WRITER.hex()}',
+            incarnation: X('{INSTALLATION.hex}'), writer: '{WRITER.hex()}',
             _valid_from: TIMESTAMP '1970-01-01Z'}}""")
         conn.execute("""INSERT INTO bj_commit_bench RECORDS {_id: 'setup', value: 0,
             _valid_from: TIMESTAMP '1970-01-01Z'}""")

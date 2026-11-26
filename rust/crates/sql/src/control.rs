@@ -460,7 +460,7 @@ fn is_literal(expression: &ast::Expr) -> bool {
     let signed_number = |expression: &ast::Expr| matches!(expression, ast::Expr::Value(value) if matches!(value.value, ast::Value::Number(..)));
     match expression {
         ast::Expr::Value(value) => character_string(&value.value)
-            || matches!(value.value, ast::Value::Null | ast::Value::Boolean(_) | ast::Value::Number(..) | ast::Value::HexStringLiteral(_)),
+            || matches!(value.value, ast::Value::Null | ast::Value::Boolean(_) | ast::Value::Number(..)),
         ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus | ast::UnaryOperator::Minus, expr } => signed_number(expr),
         ast::Expr::TypedString(value) => typed_literal(value),
         ast::Expr::Interval(interval) => {

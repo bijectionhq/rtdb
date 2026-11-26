@@ -1661,7 +1661,7 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
     error(status, v1::AnomalyCategory::Unsupported, "rtdb/unsupported");
 
     for (anchor, expected) in [(0, vec![1, 2]), (1, vec![2]), (2, vec![])] {
-        let point = "X'00010100000000000000000000000000000000000000'";
+        let point = "X('00010100000000000000000000000000000000000000')";
         let mut request = input(&format!(
             "WITH MATERIALIZED distances AS (
                  SELECT _id, _rtdb_written_basis, body,

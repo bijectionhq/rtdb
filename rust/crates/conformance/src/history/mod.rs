@@ -388,7 +388,7 @@ mod join_iid_tests {
             ),
             (
                 "SELECT l.build_key, r._id, r.label
-                 FROM (VALUES (X'627974652d6b6579')) AS l(build_key) JOIN keyword_ids r ON l.build_key = r._id",
+                 FROM (VALUES (X('627974652d6b6579'))) AS l(build_key) JOIN keyword_ids r ON l.build_key = r._id",
                 vec![vec![Value::Binary(b"byte-key".to_vec()), keyword("byte-key"), text("second")]],
             ),
             (

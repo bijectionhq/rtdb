@@ -1407,7 +1407,7 @@ async fn check_hosted_effect_positions() {
         ..FlightConfig::default()
     }, &["application"]).await;
     let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
-    client.update("INSERT INTO bj_installation RECORDS {_id: 'authority', kind: 'hosted', incarnation: X'07070707070707070707070707070707', writer: '11111111111111111111111111111111', _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+    client.update("INSERT INTO bj_installation RECORDS {_id: 'authority', kind: 'hosted', incarnation: X('07070707070707070707070707070707'), writer: '11111111111111111111111111111111', _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
     client.update("INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', revision: 1, _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
     let clock = |batches: &[RecordBatch]| batches[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
     let claim = clock(&client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await);
@@ -2339,8 +2339,8 @@ async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
     let mut owner = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
     let mut other = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
     for sql in [
-        "INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(0 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}",
-        "INSERT INTO bj_relation_declarations RECORDS {_id: 'retired', table_name: 'retired', world: CAST(-1 AS BIGINT), declaration: X'02', names: [], _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(0 AS BIGINT), declaration: X('01'), names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_relation_declarations RECORDS {_id: 'retired', table_name: 'retired', world: CAST(-1 AS BIGINT), declaration: X('02'), names: [], _valid_from: TIMESTAMP '1970-01-01Z'}",
     ] {
         owner.update(sql, None).await;
     }
@@ -2355,7 +2355,7 @@ async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
     assert_eq!(replica.action(action, request(7)).await.unwrap_err().code(), tonic::Code::NotFound);
     assert_eq!(replica.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     assert_eq!(owner.action(action, request(0)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
-    owner.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(-1 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+    owner.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', table_name: 'original', world: CAST(-1 AS BIGINT), declaration: X('01'), names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
 
     let reply = owner.action(action, request(7)).await.unwrap();
     let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
@@ -2376,7 +2376,7 @@ async fn held_root_catalog_keeps_its_cut_and_excludes_retired_declarations() {
     owner.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(&next[0].body[..16])).await.unwrap();
 
     let records = (0..129).map(|row| {
-        format!("{{_id: 'row_{row}', table_name: 'table_{row}', world: CAST(0 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}}")
+        format!("{{_id: 'row_{row}', table_name: 'table_{row}', world: CAST(0 AS BIGINT), declaration: X('01'), names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}}")
     }).collect::<Vec<_>>().join(", ");
     owner.update(&format!("INSERT INTO bj_relation_declarations RECORDS {records}"), None).await;
     let overflow = owner.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
@@ -2423,8 +2423,8 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
     let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
     client.update("INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', revision: 1, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
     client.update("INSERT INTO bj_fact_root_program RECORDS {_id: 'active', application_schema: 'old', _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
-    client.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', declaration: X'01', history_days: 7, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
-    let authority_claim = |writer| format!("INSERT INTO bj_installation RECORDS {{_id: 'authority', kind: 'hosted', incarnation: X'07070707070707070707070707070707', writer: '{writer}', _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}}");
+    client.update("INSERT INTO bj_relation_declarations RECORDS {_id: 'original', declaration: X('01'), history_days: 7, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
+    let authority_claim = |writer| format!("INSERT INTO bj_installation RECORDS {{_id: 'authority', kind: 'hosted', incarnation: X('07070707070707070707070707070707'), writer: '{writer}', _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}}");
     client.update(&authority_claim("11111111111111111111111111111111"), None).await;
     let clock = |batches: &[RecordBatch]| batches[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
     let first_claim = clock(&client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await);
@@ -2593,9 +2593,9 @@ async fn serve_spatial_pair() {
     for statement in [
         "CREATE TABLE bj_fact_root_program (_id TEXT, generation BIGINT, artifact TEXT, closure_digest BYTEA, closure TEXT, application_schema TEXT, source_reference TEXT, environment_contract TEXT)",
         "INSERT INTO bj_installation RECORDS {_id: 'authority', _valid_from: TIMESTAMP '1970-01-01Z'}",
-        "INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', layout_digest: X'01', _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', layout_digest: X('01'), _valid_from: TIMESTAMP '1970-01-01Z'}",
         "INSERT INTO bj_fact_root_program RECORDS {_id: 'active', generation: 1, application_schema: 'original', _valid_from: TIMESTAMP '1970-01-01Z'}",
-        "INSERT INTO bj_relation_declarations RECORDS {_id: 'paired', table_name: 'paired_places', world: CAST(0 AS BIGINT), declaration: X'01', names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}",
+        "INSERT INTO bj_relation_declarations RECORDS {_id: 'paired', table_name: 'paired_places', world: CAST(0 AS BIGINT), declaration: X('01'), names: ['location'], _valid_from: TIMESTAMP '1970-01-01Z'}",
     ] {
         client.update(statement, None).await;
     }
@@ -2836,7 +2836,7 @@ async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_complet
         ..FlightConfig::default()
     }, &["application"], None, NodeOptions::default(), Some(Arc::new(FixtureSourceFence))).await;
     let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
-    client.update("INSERT INTO bj_installation RECORDS {_id: 'authority', kind: 'hosted', incarnation: X'07070707070707070707070707070707', writer: '11111111111111111111111111111111', _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+    client.update("INSERT INTO bj_installation RECORDS {_id: 'authority', kind: 'hosted', incarnation: X('07070707070707070707070707070707'), writer: '11111111111111111111111111111111', _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
     client.update("CREATE TABLE bj_rtdb_restore_hold (_id TEXT, binding BYTEA)", None).await;
     let claim = client.query("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").await[0]
         .column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
@@ -2931,7 +2931,7 @@ async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_complet
 
     let mut another = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
     assert!(another.action(ACTION, request(&hold, INVENTORY, &prefix, after(None), 1)).await.is_err());
-    client.update("INSERT INTO bj_rtdb_restore_hold RECORDS {_id: 'archive-source-fence.v1', binding: X'01', _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
+    client.update("INSERT INTO bj_rtdb_restore_hold RECORDS {_id: 'archive-source-fence.v1', binding: X('01'), _valid_from: TIMESTAMP '1970-01-01Z'}", None).await;
     assert!(client.action(ACTION, request(&hold, INVENTORY, &prefix, after(None), 1)).await.is_err());
     client.action("rtdb.owned.CloseRead.v1", hold).await.unwrap();
     let fenced = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap().remove(0).body.slice(..16);

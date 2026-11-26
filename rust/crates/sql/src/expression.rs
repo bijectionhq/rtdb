@@ -519,7 +519,7 @@ fn binary_string_literal(function: &ast::Function) -> Option<Result<Value>> {
         && value.span.end.line == value.span.start.line && value.span.end.column == value.span.start.column + body.len() as u64 + 2;
     if !contiguous || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
     if body.len() % 2 != 0 {
-        return Some(Err(error(format!("Cannot parse binary hex string: {}('{body}') - failed with message Odd number of characters.", name.value))));
+        return Some(Err(error(format!("Cannot parse binary string expr: {}('{body}') - failed with message Odd number of characters.", name.value))));
     }
     Some(Ok(Value::Binary((0..body.len()).step_by(2).map(|index| u8::from_str_radix(&body[index..index + 2], 16).expect("hex digits")).collect())))
 }

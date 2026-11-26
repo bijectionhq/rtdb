@@ -151,6 +151,8 @@ Constructs the grammar admits keep the pinned visitor's outcome.
 Its `err/unsupported` codes are reproduced exactly; window names, window frames, a second window function and CTE column aliases, which the visitor rejects with a raw JVM exception or assertion, are Unsupported `xtdb/sql-unsupported` with the visitor's message.
 Remaining Unsupported sites are native gaps for constructs the grammar admits, such as ranks, NTILE and aggregate windows, DISTINCT on aggregates without a reference distinct factory, schema-qualified wildcards and TIME WITH TIME ZONE casts.
 The four standard isolation levels are accepted and ignored, as in the reference transaction-characteristics visitor.
+The reference lexer's only binary literal is `X('hex')`; sqlparser's `X'hex'` hexadecimal string is a grammar rejection.
+An odd-length `X('…')` body reports `Cannot parse binary string expr: X('…') - failed with message Odd number of characters.`, the reference planner's text.
 `tests/grammar_rejections.rs` covers a representative of each group.
 
 == Qualified columns
@@ -339,6 +341,7 @@ Compilation, execution, differential assertions, and exact diagnostic matching r
 
 `parse_control` recognizes BEGIN and START TRANSACTION characteristics, SET TRANSACTION, COMMIT modes, ROLLBACK, session settings, SHOW, SQL PREPARE and EXECUTE, COPY input, and database attachment controls.
 Control parsing retains expression syntax for scalar binding independently of a live database catalog.
+Session parameter values admit no `X'hex'` literal.
 The parser checks the literal positions in session settings and transaction ASYNC options before collecting the command.
 Binding compiles the final transaction options in option order and resolves a CLOCK_TIME timestamp literal at that stage.
 `split_statements` separates statements by tokenizer spans before classification, preserving semicolons inside strings and comments.

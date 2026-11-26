@@ -188,11 +188,11 @@ async fn copy_to_arrow_stream_uses_the_original_read_transaction() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut writer = Client::connect(&running.server, None).await;
     let mut reader = Client::connect(&running.server, None).await;
-    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (1, X'6162')").await), b"CZ");
+    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (1, X('6162'))").await), b"CZ");
     assert_eq!(tags(&reader.query("BEGIN READ ONLY").await), b"CZ");
     let first = reader.query("SELECT COUNT(*) FROM payloads").await;
     assert_eq!(rows(&first), [vec![Some(b"1".to_vec())]]);
-    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (2, X'6364')").await), b"CZ");
+    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (2, X('6364'))").await), b"CZ");
 
     reader.parse("arrow", "COPY (SELECT val FROM (
         SELECT 0::BIGINT AS probe, _id, val FROM payloads WHERE _id <= 1

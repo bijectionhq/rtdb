@@ -5197,7 +5197,7 @@ async fn an_ordered_sql_write_can_encode_its_own_revision_exactly() {
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let ordered = index_sql(&mut session,
         "INSERT INTO revisions (_id, value) VALUES (1,
-            OVERLAY(X'6162' PLACING EPOCH_NANOS_BE(CURRENT_TIMESTAMP) FROM 2 FOR 0))").await;
+            OVERLAY(X('6162') PLACING EPOCH_NANOS_BE(CURRENT_TIMESTAMP) FROM 2 FOR 0))").await;
     let word = (u64::try_from(ordered.0).unwrap() * 1_000).to_be_bytes();
     let expected = [b"a".as_slice(), &word, b"b"].concat();
     assert_eq!(rows(session.query_sql("SELECT value FROM revisions", vec![]).await.unwrap()).await,
@@ -5244,10 +5244,10 @@ async fn arrow_probe_unions_sort_stably_in_memory_and_in_spill_runs() {
         let (node, driver) = running(config, services).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         index_sql(&mut session, "INSERT INTO histories RECORDS
-            {_id: 1, world: 1, key: 'b', idx: 0, value: X'42'},
-            {_id: 2, world: 1, key: 'a', idx: 0, value: X'4c'},
-            {_id: 3, world: 2, key: 'a', idx: 0, value: X'52'},
-            {_id: 4, world: 2, key: 'b', idx: 0, value: X'4e'}").await;
+            {_id: 1, world: 1, key: 'b', idx: 0, value: X('42')},
+            {_id: 2, world: 1, key: 'a', idx: 0, value: X('4c')},
+            {_id: 3, world: 2, key: 'a', idx: 0, value: X('52')},
+            {_id: 4, world: 2, key: 'b', idx: 0, value: X('4e')}").await;
         let payloads = "SELECT key, value FROM (
             SELECT 0::BIGINT AS probe, key, value, _system_from, idx FROM histories WHERE world = 1
             UNION ALL
