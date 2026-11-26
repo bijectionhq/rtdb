@@ -909,6 +909,25 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
 }
 
 #[tokio::test]
+async fn multi_driver_refuses_the_writer_role_until_a_journal_recovery_is_acknowledged() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, gate.clone());
+    writer.create().await.unwrap();
+    // A recovered stream refuses every seal until an administrator
+    // acknowledges the recovery, so the node stays a follower and says why.
+    *gate.recovered.lock().unwrap() = Some(Lsn(0));
+    let refused = writer.tick(&live(1)).await.unwrap_err();
+    assert_eq!(refused.code, "rtdb/journal-recovered");
+    assert!(refused.message.as_deref().unwrap_or("").contains("acknowledge"));
+    assert_eq!(writer.role(), Role::Follower);
+    *gate.recovered.lock().unwrap() = None;
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    writer.transact(&put(1, 1, "after recovery")).await.unwrap();
+}
+
+#[tokio::test]
 async fn multi_driver_replacement_refuses_a_timed_tx_after_its_reply_is_lost() {
     let journal = journals().await;
     let cluster = Cluster::new();
@@ -1258,6 +1277,7 @@ struct GateJournal {
     inner: Arc<dyn Journal>,
     arm: AtomicBool,
     block_seal: AtomicBool,
+    recovered: std::sync::Mutex<Option<Lsn>>,
     block_trim: AtomicBool,
     entered: Notify,
     release: Notify,
@@ -1269,6 +1289,7 @@ impl GateJournal {
             inner,
             arm: AtomicBool::new(false),
             block_seal: AtomicBool::new(false),
+            recovered: std::sync::Mutex::new(None),
             block_trim: AtomicBool::new(false),
             entered: Notify::new(),
             release: Notify::new(),
@@ -1282,7 +1303,9 @@ impl Journal for GateJournal {
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
-        if self.block_seal.load(Ordering::SeqCst) {
+        if let Some(head) = *self.recovered.lock().unwrap() {
+            Box::pin(async move { Err(JournalError::Recovered { head }) })
+        } else if self.block_seal.load(Ordering::SeqCst) {
             Box::pin(async { Err(JournalError::Unavailable) })
         } else {
             self.inner.seal(stream, epoch)

@@ -8,7 +8,7 @@ use rtdb_tx::transact::{Receipt, TransactState, TransactionRecord};
 use rtdb_types::{Anomaly, Result, Timestamp, rtdb_v1::Basis};
 use uuid::Uuid;
 
-use crate::journal::{Entry, Stream, journal_error, next};
+use crate::journal::{Entry, Stream, journal_error, journal_shortened, next};
 
 const ROTATING_CHECKPOINT: u8 = 1;
 const RESTORED_HISTORY: u8 = 2;
@@ -130,6 +130,9 @@ impl Committed {
         end: Lsn,
         mut previous: Option<Self>,
     ) -> Result<Self> {
+        if let Some(state) = previous.as_ref().filter(|state| state.head > end) {
+            return Err(journal_shortened(end, state.head));
+        }
         let mut from = next(previous.as_ref().map_or(Lsn(0), |state| state.head))?;
         loop {
             let page = match stream.read(from).await {

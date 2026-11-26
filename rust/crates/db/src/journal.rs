@@ -211,7 +211,32 @@ fn invalid_entry() -> Anomaly {
     )
 }
 
+/// The journal head is behind what this process already replayed: the stream
+/// was recovered after losing two of its three voters, and the records after
+/// `head` through `replayed` are lost.
+pub(crate) fn journal_shortened(head: Lsn, replayed: Lsn) -> Anomaly {
+    Anomaly::fault(
+        "rtdb/journal-shortened",
+        format!(
+            "The journal ends at {} but this process replayed through {}; journal records {} through {} were lost in a recovery",
+            head.0,
+            replayed.0,
+            head.0.saturating_add(1),
+            replayed.0
+        ),
+    )
+}
+
 pub(crate) fn journal_error(error: JournalError) -> Anomaly {
+    if let JournalError::Recovered { head } = error {
+        return Anomaly::fault(
+            "rtdb/journal-recovered",
+            format!(
+                "The journal was recovered after losing two of its three voters and ends at {}; commits acknowledged after it may be lost. An administrator must acknowledge the recovery before writes resume",
+                head.0
+            ),
+        );
+    }
     let (category, code) = match error {
         JournalError::Fenced { .. } => (AnomalyCategory::Unavailable, "rtdb/writer-fenced"),
         JournalError::Conflict { .. } => (AnomalyCategory::Conflict, "rtdb/journal-conflict"),
@@ -224,6 +249,7 @@ pub(crate) fn journal_error(error: JournalError) -> Anomaly {
             (AnomalyCategory::NotFound, "rtdb/unknown-database")
         }
         JournalError::Unavailable => (AnomalyCategory::Unavailable, "rtdb/journal-unavailable"),
+        JournalError::Recovered { .. } => unreachable!("handled above"),
     };
     Anomaly::new(category, code, error.to_string())
 }
@@ -231,6 +257,16 @@ pub(crate) fn journal_error(error: JournalError) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_and_shortened_journals_name_the_loss() {
+        let recovered = journal_error(JournalError::Recovered { head: Lsn(41) });
+        assert_eq!(recovered.code, "rtdb/journal-recovered");
+        assert!(recovered.message.unwrap().contains("ends at 41"));
+        let shortened = journal_shortened(Lsn(41), Lsn(50));
+        assert_eq!(shortened.code, "rtdb/journal-shortened");
+        assert!(shortened.message.unwrap().contains("42 through 50"));
+    }
 
     #[test]
     fn timed_original_proof_requires_exact_sealed_bytes_and_an_exclusive_quorum_sample() {

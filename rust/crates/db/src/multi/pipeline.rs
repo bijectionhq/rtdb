@@ -1075,10 +1075,13 @@ impl MultiDatabase {
             self.withdraw_writer();
             return Ok(());
         }
-        if state.epoch > lease.epoch
-            || acknowledged.0.saturating_add(1) < state.floor.0
-            || head < acknowledged
-        {
+        if head < acknowledged {
+            // The writer acknowledged commits the recovered journal no longer
+            // holds; withdraw with the lost range instead of retrying.
+            self.withdraw_writer();
+            return Err(crate::journal::journal_shortened(head, acknowledged));
+        }
+        if state.epoch > lease.epoch || acknowledged.0.saturating_add(1) < state.floor.0 {
             self.withdraw_writer();
             return Err(no_writer());
         }

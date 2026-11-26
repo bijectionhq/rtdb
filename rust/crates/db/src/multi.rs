@@ -864,8 +864,17 @@ impl MultiDatabase {
 
     async fn catch_up(&mut self, end: Lsn) -> Result<()> {
         let previous = self.committed.take();
-        self.committed =
-            Some(Committed::read_through(&self.stream, self.store.as_ref(), end, previous).await?);
+        let replayed = match Committed::read_through(&self.stream, self.store.as_ref(), end, previous).await {
+            // Only an acknowledged recovery lets a seal return a head below
+            // what this process replayed. Report the lost range once, then
+            // continue from the recovered journal.
+            Err(error) if error.code == "rtdb/journal-shortened" => {
+                eprintln!("Multi database {}: {}", self.options.database, error.message.as_deref().unwrap_or(""));
+                Committed::read_through(&self.stream, self.store.as_ref(), end, None).await?
+            }
+            result => result?,
+        };
+        self.committed = Some(replayed);
         Ok(())
     }
 
