@@ -3307,7 +3307,7 @@ async fn prepared_control_uses_the_first_uploaded_arrow_parameter_row() {
 }
 
 #[tokio::test]
-async fn do_action_decodes_bodies_past_its_starting_buffer_and_refuses_bodies_past_the_message_limit() {
+async fn do_action_decodes_bodies_within_the_message_limit_and_refuses_bodies_past_it() {
     let running = Running::start(None, FlightConfig { maximum_message_bytes: 64 * 1024, ..Default::default() }).await;
     let mut client = Client::connect(&running.server, None).await;
     let handle = client.begin().await;
