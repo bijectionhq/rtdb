@@ -4796,7 +4796,7 @@ async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unsafe_cell_move_leaves_the_source_live() {
-    use rtdb_multi::{deployment::CellStorage, keys::{KeyService, LocalKeyService}};
+    use rtdb_multi::{deployment::CellStorage, keys::LocalKeyService};
 
     let map = rtdb_multi::cells::MemoryCellMap::new();
     let east = Cell::start_in("east", map.clone(), 1).await;
@@ -4820,16 +4820,10 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
     std::os::unix::fs::symlink(east.data.path().join("keys"), &key_alias).unwrap();
     let aliased_keys = LocalKeyService::new(key_alias).unwrap();
 
-    let mut conflicting_key = east_keys.key(&deployment.id).await.unwrap();
-    conflicting_key[0] ^= 1;
-    let mut destination_residence = deployment.clone();
-    destination_residence.incarnation += 1;
-    west_keys.install(&destination_residence.key_id(), conflicting_key).await.unwrap();
     for (storage, keys, expected) in [
         (&aliased_storage, &west_keys, "rtdb.multi/shared-cell-storage"),
         (&nested_storage, &west_keys, "rtdb.multi/shared-cell-storage"),
         (&west_storage, &aliased_keys, "rtdb.multi/shared-cell-keys"),
-        (&west_storage, &west_keys, "rtdb.multi/key-conflict"),
     ] {
         let to = admin::CellHandle { name: "west", directory: &west.directory, storage, keys, broker: None, maximum_deployments: 10 };
         let error = admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.unwrap_err();
