@@ -5,7 +5,7 @@ use arrow_buffer::OffsetBuffer;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_plan::{ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema};
 use rtdb_query::QueryContext;
-use rtdb_types::{Anomaly, Result, TableRef};
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, Result, TableRef};
 
 use crate::{SqlArguments, values::BoundArgumentRow};
 
@@ -13,6 +13,14 @@ use super::{
     HOSTED_CAPACITY_DECLARATIONS, OpenTransaction, check_table, execute, mutation_put_batches, overflow,
     plain_scalar_field, scalar_mutation_put_field,
 };
+
+/// How the batched argument-table path ended: it wrote every row, or the statement's output has a shape only the
+/// row-by-row path writes the way XTDB does, and nothing was written.
+#[derive(Debug, PartialEq, Eq)]
+enum ArgumentTable {
+    Applied,
+    Unsupported,
+}
 
 impl OpenTransaction<'_> {
     pub(super) async fn execute_sql_arguments(&mut self, sql: &str, arguments: &SqlArguments) -> Result<()> {
@@ -41,7 +49,8 @@ impl OpenTransaction<'_> {
                 && input.parameter_count() == page.batch().num_columns()
                 && let Some(maximum) = row_local_max_column(input)
                 && let Some(argument_column) = maximum.checked_add(1).map(ColumnId)
-                && self
+            {
+                match self
                     .try_argument_table(
                         &table.table,
                         input,
@@ -51,9 +60,14 @@ impl OpenTransaction<'_> {
                         page.batch(),
                     )
                     .await
-                    .unwrap_or(false)
-            {
-                return Ok(());
+                {
+                    Ok(ArgumentTable::Applied) => return Ok(()),
+                    Ok(ArgumentTable::Unsupported) => {}
+                    // The batch cannot tell which argument row failed; the row-by-row path raises the same error
+                    // with that row's `arg-idx`, as XTDB reports it.
+                    Err(error) if raised_by_a_row(&error) => {}
+                    Err(error) => return Err(error.with_context("sql", sql.into())),
+                }
             }
             self.execute_mutation(mutation, query, context, Some(first), Some(syntax))
                 .await
@@ -76,7 +90,7 @@ impl OpenTransaction<'_> {
         context: Arc<QueryContext>,
         syntax: Arc<MemoryReservation>,
         page: &RecordBatch,
-    ) -> Result<bool> {
+    ) -> Result<ArgumentTable> {
         check_table(table)?;
 
         let memory = &context.memory;
@@ -86,7 +100,8 @@ impl OpenTransaction<'_> {
             .checked_add(plan_bytes)
             .and_then(|size| size.checked_add(4096))
             .ok_or_else(overflow)?;
-        let reservation = memory.reserve(bound)?;
+        // The batched path copies the page; when the copy does not fit, the row-by-row path still can.
+        let Some(reservation) = memory.try_reserve(bound) else { return Ok(ArgumentTable::Unsupported); };
         let fields = page
             .schema_ref()
             .fields()
@@ -144,13 +159,13 @@ impl OpenTransaction<'_> {
         };
         let mut cursor = execute(plan, Arc::clone(&context), Some(binding), Some(syntax)).await?;
         let first = loop {
-            let Some(output) = cursor.next_batch().await? else { return Ok(true); };
+            let Some(output) = cursor.next_batch().await? else { return Ok(ArgumentTable::Applied); };
             if output.batch().num_rows() != 0 {
                 break output;
             }
         };
         let Some(first_doc) = argument_put_document(first.batch()) else {
-            return Ok(false);
+            return Ok(ArgumentTable::Unsupported);
         };
         // The serial writer's declarations differ between a null-only row and a populated row.
         if !first_doc.fields().iter().all(|field| scalar_mutation_put_field(field))
@@ -159,7 +174,7 @@ impl OpenTransaction<'_> {
                 .iter()
                 .any(|column| column.null_count() != 0 && column.null_count() != column.len())
         {
-            return Ok(false);
+            return Ok(ArgumentTable::Unsupported);
         }
 
         let mut inventory = None;
@@ -169,33 +184,40 @@ impl OpenTransaction<'_> {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let Some(doc) = argument_put_document(batch) else { return Ok(false); };
+            let Some(doc) = argument_put_document(batch) else { return Ok(ArgumentTable::Unsupported); };
             if batch.schema_ref() != first.batch().schema_ref()
                 || !doc.columns().iter().zip(first_doc.columns()).all(|(column, initial)| {
                     let expected_nulls = if initial.null_count() == 0 { 0 } else { column.len() };
                     column.null_count() == expected_nulls
                 })
             {
-                return Ok(false);
+                return Ok(ArgumentTable::Unsupported);
             }
             if inventory.is_none() {
                 let bytes = page.num_rows().checked_mul(std::mem::size_of::<OwnedBatch>() * 2)
                     .ok_or_else(overflow)?;
-                inventory = Some(memory.reserve(bytes)?);
+                let Some(reserved) = memory.try_reserve(bytes) else { return Ok(ArgumentTable::Unsupported); };
+                inventory = Some(reserved);
             }
             rest.push(output);
         }
         drop(cursor);
         drop(parameter);
         let Some(put) = mutation_put_batches(first.batch(), &rest, self.tx_key().system_time, memory)? else {
-            return Ok(false);
+            return Ok(ArgumentTable::Unsupported);
         };
         drop(rest);
         drop(inventory);
         drop(first);
         self.buffer.append_batch(table, put)?;
-        Ok(true)
+        Ok(ArgumentTable::Applied)
     }
+}
+
+/// Whether `error` is one an argument row's own values raise, rather than cancellation, exhaustion or a fault.
+fn raised_by_a_row(error: &Anomaly) -> bool {
+    matches!(error.category, AnomalyCategory::Incorrect | AnomalyCategory::Unsupported)
+        && error.kind != Some(AnomalyKind::ResourceExhausted)
 }
 
 fn argument_put_document(batch: &RecordBatch) -> Option<&StructArray> {
@@ -274,4 +296,20 @@ fn bind_argument_table(input: &Relation, source: &Arc<Relation>, element: &Field
         }
         _ => unreachable!("The argument table requires a row-local plan"),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_row_error_runs_the_statement_again_row_by_row() {
+        assert!(raised_by_a_row(&Anomaly::incorrect("xtdb.expression/division-by-zero", "division by zero")));
+        assert!(raised_by_a_row(&Anomaly::new(AnomalyCategory::Unsupported, "rtdb.test/unsupported", "unsupported")));
+        let mut exhausted = Anomaly::incorrect("rtdb/memory-budget-exceeded", "no room");
+        exhausted.kind = Some(AnomalyKind::ResourceExhausted);
+        assert!(!raised_by_a_row(&exhausted));
+        assert!(!raised_by_a_row(&Anomaly::new(AnomalyCategory::Interrupted, "rtdb/cancelled", "cancelled")));
+        assert!(!raised_by_a_row(&Anomaly::fault("rtdb.tx/mutation-schema", "bad schema")));
+    }
 }
