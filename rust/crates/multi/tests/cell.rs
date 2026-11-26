@@ -3219,6 +3219,57 @@ async fn an_evacuated_logkeeper_is_decommissioned_only_once_no_deployment_retain
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_logkeeper_is_balanced_off_released_and_decommissioned_while_its_deployment_keeps_serving() {
+    let mut cell = Cell::start_durable(1).await;
+    cell.add_logkeeper().await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let leaving = cell.directory.deployment(&deployment.id).await.unwrap().unwrap().ensemble[0].clone();
+    admin::drain(cell.directory.as_ref(), &leaving).await.unwrap();
+    let refused = admin::release_journal_copy(cell.directory.as_ref(), &deployment.id, &leaving).await.unwrap_err();
+    assert_eq!(refused.code, "rtdb.multi/journal-copy-dependent", "a serving journal's copy stays");
+
+    assert_eq!(admin::balance_journals(cell.directory.as_ref(), 8).await.unwrap(), 1);
+    cell.node(0).agent.park("shop").await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+    let moved = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(!moved.ensemble.contains(&leaving));
+    assert!(moved.ensemble_handoff.as_ref().is_some_and(|handoff| handoff.source.contains(&leaving)), "the claim records the handoff off the drained journal");
+    assert_eq!(admin::certify_logkeeper_decommissions(cell.directory.as_ref()).await.unwrap(), 0, "the copy keeps the journal in custody");
+
+    let refused = admin::release_journal_copy(cell.directory.as_ref(), &deployment.id, &leaving).await.unwrap_err();
+    assert!(refused.message.as_deref().is_some_and(|message| message.ends_with("CheckpointDecision")), "the checkpoint's decision counted the drained journal's vote: {refused:?}");
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    for _ in 0..50 {
+        let current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        if current.checkpoint.is_some_and(|checkpoint| moved.checkpoint.is_none_or(|before| checkpoint.boundary > before.boundary)) { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(admin::release_journal_copies(cell.directory.as_ref(), 8).await.unwrap(), 1);
+    let released = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(!released.replica_journals.iter().chain(&released.log_copy_servers).any(|journal| journal.journal() == Some(leaving.as_str())));
+    assert!(released.journal_releases.iter().any(|release| release.journal == leaving));
+    assert_eq!(admin::certify_logkeeper_decommissions(cell.directory.as_ref()).await.unwrap(), 1);
+    let retired = admin::decommission_logkeeper(cell.directory.as_ref(), &leaving).await.unwrap();
+    assert_eq!(retired.state, rtdb_directory::MemberState::Retired);
+
+    let client = connect_eventually(&cell, "shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders ORDER BY _id").await, ["10", "20", "30"]);
+    drop(client);
+    cell.node(0).agent.park("shop").await.unwrap();
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders ORDER BY _id").await, ["10", "20", "30"], "the deployment recovers without the decommissioned journal");
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletion_drops_a_recorded_copy_outside_the_current_ensemble() {
     use rtdb_multi::logs::{DirectoryRecorder, EnsembleRecorder};
     use rtdb_storage::log::{Log, LogOffset};

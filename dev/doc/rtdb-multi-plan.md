@@ -590,7 +590,9 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    Each member carries an eligibility epoch that moves on with every change to its state or decommission, and every deployment write that newly names a logkeeper commits only while that logkeeper is uncertified at the epoch the directory observed: atomically under the local directory's lock, and as a DynamoDB condition check in the same transaction.
    A placement, repair or fork planned before a certificate therefore cannot land after it, and the decommission's last check sees every reference.
    A logkeeper still referenced, or never certified, is refused.
-   A journal placement leaves the evacuated journal in the deployment's copy custody, so the journal becomes eligible only once each deployment it ever served has finished disposal; releasing a live deployment's retained copy remains open.
+   A journal placement leaves the evacuated journal in the deployment's copy custody until a release: the claim that applies the placement records the handoff certificate's source, destination and copied interval with the new ensemble, and `rtdb-multi release-journal-copy` or the controller's journal balance pass then retires the deployment's stream on the drained journal and drops it from the record under a release certificate.
+   A release is refused while the journal still serves, before a recorded handoff installed the current ensemble, or while a pending placement, move, transfer, writer handoff, recovery, replay hold, unapplied trim, suffix pin, staged fork, checkpoint decision, deletion or installed-journal reservation still depends on the copy.
+   So drain, balance, release and decommission retire a logkeeper while its deployments keep serving.
 
    An installed ordered journal route supplies the node's exact worker enrollment and the gateway's read-only journal identity.
    On that route the journal owns nominations, the writer fence, append reconciliation, fresh read markers and checkpoint publication.

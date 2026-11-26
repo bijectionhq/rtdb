@@ -30,7 +30,12 @@ impl Mentions {
             }
         }
         let mut strings = BTreeSet::new();
-        let value = serde_json::to_value(record).expect("a deployment record serializes");
+        let mut value = serde_json::to_value(record).expect("a deployment record serializes");
+        // Evidence of a handoff or a release names journals the record no longer retains; the ensemble names the handoff's destination.
+        if let Value::Object(fields) = &mut value {
+            fields.remove("journal_releases");
+            fields.remove("ensemble_handoff");
+        }
         collect(value, &mut strings);
         Self(strings)
     }

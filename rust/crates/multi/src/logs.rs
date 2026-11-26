@@ -206,6 +206,11 @@ impl EnsembleRecorder for DirectoryRecorder {
             }
             let mut next = current.clone();
             next.ensemble = ensemble.clone();
+            let identities = |journals: &[String]| journals.iter().cloned().map(rtdb_directory::MemberId).collect();
+            next.ensemble_handoff = Some(rtdb_directory::EnsembleHandoff {
+                epoch, source: identities(&handoff.source.journals), destination: identities(&handoff.destination.journals),
+                first: handoff.first, through: handoff.through, checkpoint_boundary: current.checkpoint.map(|checkpoint| checkpoint.boundary),
+            });
             if next.journal_placement.as_ref().is_some_and(|placement| placement.reached_by(&ensemble)) {
                 next.journal_placement = None;
             }

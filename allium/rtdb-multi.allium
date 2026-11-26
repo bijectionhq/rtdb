@@ -819,6 +819,7 @@ contract LogService {
         -- A journal verifies that a bound operation addresses its identity before acting.
         -- A failed or different identity contributes no vote to recovery, append, repair, read confirmation or retention.
         -- Copy reservation and disposal retain journal identities for the full inventory, including members that have left the serving ensemble.
+        -- A live deployment's retained copy leaves that inventory only under JournalCopyLeavesCustodyOnlyByRelease.
         -- A legacy address inventory requires verified custody recorded at the inspected directory version before it authorizes a cell transfer or retirement.
 
     @invariant LocalJournalHasProcessBoundTransport
@@ -1159,6 +1160,28 @@ value JournalPlacement {
     destination: List<MemberId>
 }
 
+value EnsembleHandoff {
+    -- The destination holds the source's retained history from first through through, and the checkpoint covers what precedes first.
+    epoch: Epoch
+    source: List<MemberId>
+    destination: List<MemberId>
+    first: Integer
+    through: Integer
+    checkpoint_boundary: Integer?
+}
+
+value JournalCopyRelease {
+    -- A retained copy that left a live deployment's custody with nothing depending on it.
+    journal: MemberId
+    address: String
+    incarnation: Integer
+    -- The writer epoch at which the copy's stream was retired on the journal.
+    epoch: Epoch
+    journal_epoch: Integer
+    handoff: EnsembleHandoff
+    released_at: Timestamp
+}
+
 value DecommissionCertificate {
     -- No deployment record retained custody of this journal when the directory was read.
     journal: MemberId
@@ -1212,6 +1235,10 @@ entity DeploymentRecord {
     loglets: List<Loglet>
     -- Cleared in the directory change that records the destination as the ensemble.
     journal_placement: JournalPlacement?
+    -- Recorded in that same change: the handoff certificate's source, destination and copied interval.
+    ensemble_handoff: EnsembleHandoff?
+    -- Retained copies released from copy custody while the deployment lived.
+    journal_releases: List<JournalCopyRelease>
     checkpoint: Checkpoint?
     replica_anchor: CertifiedReplicaPrefix?
     replica_replays: Set<ReplicaReplayHold>
@@ -2689,9 +2716,42 @@ rule JournalReferenceRequiresCurrentEligibility {
         Directory.cas(written.id, stored.version, change: written)
 }
 
+rule JournalCopyLeavesCustodyOnlyByRelease {
+    -- `rtdb-multi release-journal-copy` releases one copy, and the controller's journal balance pass releases copies on draining journals that deployments have moved off.
+    -- The release retires the deployment's stream on the journal at the current writer epoch, so the copy holds no payload a later disposal or erasure would have to reach.
+    -- It then drops every endpoint naming the journal from replica_journals and log_copy_servers, appending the release certificate in the same conditional write.
+    -- A release that loses that write reads the record again and repeats every check.
+    -- Releasing a copy already released returns the record unchanged.
+    -- RetainsCustody and JournalReferenceRequiresCurrentEligibility skip ensemble_handoff and journal_releases, which name journals the record no longer retains.
+    when: JournalCopyReleaseRequested(record, member)
+
+    requires: member.role = log_server and member.state = draining
+    requires: member.eligibility_epoch is unchanged from the release's first observation
+    requires: RetainsCopy(record, member) and member.id not in record.ensemble
+    -- Every acknowledged entry is durable in the current journals or the checkpoint.
+    requires: record.ensemble_handoff != null and record.ensemble_handoff.destination = Sorted(record.ensemble)
+    requires: record.ensemble_handoff.checkpoint_boundary = null or record.checkpoint.boundary >= record.ensemble_handoff.checkpoint_boundary
+    -- Nothing else depends on the copy.
+    requires: not NamesJournal(WithoutCopy(record, member), member)
+    requires: record.checkpoint_decision = null or member.id not in record.checkpoint_decision.journals
+    requires: record.journal_placement = null and record.active_move = null and record.writer_handoffs = [] and record.cell_transfer = null and no checkpoint transfer is in flight
+    requires: no pending checkpoint recovery, serving replay capture, staged checkpoint, replica replay region, unapplied payload trim or checkpoint suffix pin
+    requires: record.fork_stage = null and no staged fork names record as its parent
+    requires: record.lifecycle in {live, quarantined} and record.deletion_record = null and record.disposal = null
+    requires: record is not in installed-journal custody
+
+    ensures:
+        Logkeeper.retire(member, record.replica_stream, record.epoch)
+        Directory.cas(record.id, record.version, change: {
+            replica_journals: record.replica_journals without member,
+            log_copy_servers: record.log_copy_servers without member,
+            journal_releases: record.journal_releases + [JournalCopyRelease(journal: member.id, epoch: record.epoch, handoff: record.ensemble_handoff)]
+        })
+}
+
 rule LogkeeperDecommissionRequiresNoCustody {
     -- `rtdb-multi decommission-logkeeper` retires a logkeeper only under a certificate for its own identity and address, issued while it was draining.
-    -- It reads the deployment records again and refuses while any retains custody of the journal, so every journal a record references, including one a journal placement moved it off, stays a member until the record finishes disposal.
+    -- It reads the deployment records again and refuses while any retains custody of the journal, so every journal a record references, including one a journal placement moved it off, stays a member until the record finishes disposal or releases the copy.
     -- The retirement is conditional on the member still draining under the same certificate, at the eligibility epoch the certificate was written at.
     -- JournalReferenceRequiresCurrentEligibility keeps any record from gaining the journal once it is certified, so this check sees every reference a record can hold when the retirement lands.
     -- The process serving the journal loses its lease, after which the journal's storage may be destroyed.

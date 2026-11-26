@@ -26,6 +26,8 @@ pub(crate) use holder::observe_holder_record;
 mod holder_handoff;
 mod decommission;
 pub use decommission::{certify_logkeeper_decommissions, decommission_logkeeper};
+mod release;
+pub use release::{release_journal_copies, release_journal_copy};
 mod journals;
 pub use journals::{balance_journals, place_journals};
 
@@ -2633,6 +2635,7 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
                 }
                 if options.journal_moves > 0 {
                     let _ = balance_journals(directory.as_ref(), options.journal_moves).await;
+                    let _ = release_journal_copies(directory.as_ref(), options.journal_moves).await;
                 }
                 let _ = certify_logkeeper_decommissions(directory.as_ref()).await;
             }

@@ -28,7 +28,7 @@ pub mod dynamo;
 
 pub use feed::ChangeFeed;
 mod journal_admission;
-pub use journal_admission::{JournalObservation, epoch_follows, fenced_journals};
+pub use journal_admission::{CopyDependent, CopyObservation, JournalObservation, copy_dependent, epoch_follows, fenced_journals};
 mod journal_fence;
 pub use journal_fence::{journal_fence, may_add_journal_references};
 use journal_fence::require_epoch_follows;
@@ -104,6 +104,34 @@ pub struct MemberRecord {
     #[serde(default)]
     pub eligibility_epoch: u64,
     pub version: Version,
+}
+
+/// A handoff certificate's attestation, kept with the ensemble it installed: the destination holds the source's retained history from `first` through `through`, and the checkpoint covers what precedes `first`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnsembleHandoff {
+    pub epoch: u64,
+    /// Journal identities, sorted.
+    pub source: Vec<MemberId>,
+    pub destination: Vec<MemberId>,
+    pub first: i64,
+    pub through: i64,
+    pub checkpoint_boundary: Option<i64>,
+}
+
+/// Evidence that a live deployment's retained copy on one journal left its custody with nothing depending on it.
+/// It is written in the same conditional write that drops the journal from the record's copy custody.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalCopyRelease {
+    pub journal: MemberId,
+    pub address: String,
+    pub incarnation: u64,
+    /// The writer epoch at which the copy's stream was retired on the journal.
+    pub epoch: u64,
+    /// The journal's eligibility epoch when the release observed it draining.
+    pub journal_epoch: u64,
+    /// The handoff whose destination, the current ensemble, holds every acknowledged entry the checkpoint does not.
+    pub handoff: EnsembleHandoff,
+    pub released_at_ms: i64,
 }
 
 /// A draining logkeeper's way out of the cell, which only a certificate of no remaining custody opens.
@@ -418,6 +446,13 @@ pub struct DeploymentRecord {
     /// Serving and archive receipts for earlier stays in this same cell.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub retired_residences: BTreeMap<u64, RetiredResidence>,
+    /// The certified handoff that installed the current ensemble, recorded in the same write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble_handoff: Option<EnsembleHandoff>,
+    /// Retained journal copies that left this live deployment's custody (`JournalCopyLeavesCustodyOnlyByRelease`).
+    /// Journal matching skips this and the handoff, which are evidence about journals rather than custody of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub journal_releases: Vec<JournalCopyRelease>,
     pub checkpoint_recovery: Option<Box<CheckpointRecovery>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving_replay_capture: Option<uuid::Uuid>,
@@ -1338,7 +1373,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), classic_catalog_drain: None, classic_flight: None, catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, journal_placement: None, writer_handoffs: Vec::new(), log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
-            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
+            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), ensemble_handoff: None, journal_releases: Vec::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
 

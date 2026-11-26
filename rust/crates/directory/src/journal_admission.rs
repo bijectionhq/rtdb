@@ -1,4 +1,4 @@
-//! The pure decisions behind the journal reference fence, checked by Verus (`verification/verus/journal_custody`).
+//! The pure decisions behind the journal reference fence and journal copy release, checked by Verus (`verification/verus/journal_custody`).
 
 #![allow(unexpected_cfgs)]
 
@@ -47,4 +47,78 @@ pub fn fenced_journals(observations: &[JournalObservation]) -> Option<Vec<bool>>
         index += 1;
     }
     Some(fenced)
+}
+
+/// What a release observed of one retained copy and of everything that could still depend on it.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+pub struct CopyObservation {
+    /// The journal is a draining logkeeper.
+    pub journal_draining: bool,
+    /// The record's copy custody names the journal.
+    pub retained: bool,
+    /// The journal is in the serving ensemble.
+    pub serving: bool,
+    /// The current ensemble was installed by a recorded handoff, so it and the checkpoint hold every acknowledged entry.
+    pub durable_elsewhere: bool,
+    /// A field outside copy custody still names the journal: a pending placement, a transfer source, a writer handoff or a hold.
+    pub otherwise_named: bool,
+    /// The checkpoint's journal decision counts the journal's vote.
+    pub checkpoint_decision: bool,
+    /// A journal placement, move, cell transfer, checkpoint transfer or writer handoff is in flight.
+    pub handoff_in_flight: bool,
+    /// A recovery, replay capture, replay region, staged checkpoint, unapplied payload trim or suffix pin is pending.
+    pub recovery_or_replay: bool,
+    /// The record is a staged fork, or a staged fork of it is pending.
+    pub fork: bool,
+    /// The deployment is being deleted, so its disposal must retire every retained copy.
+    pub erasure: bool,
+    /// The deployment's journals are in installed-journal custody.
+    pub installed: bool,
+}
+
+/// Why a release is refused: the first unmet condition, in the order the fields are declared.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+pub enum CopyDependent {
+    NotDraining,
+    NotRetained,
+    Serving,
+    NotDurable,
+    OtherReference,
+    CheckpointDecision,
+    HandoffInFlight,
+    RecoveryOrReplay,
+    Fork,
+    Erasure,
+    Installed,
+}
+
+#[cfg(verus_keep_ghost)]
+verus! {
+
+pub open spec fn releasable(o: CopyObservation) -> bool {
+    o.journal_draining && o.retained && !o.serving && o.durable_elsewhere && !o.otherwise_named && !o.checkpoint_decision
+        && !o.handoff_in_flight && !o.recovery_or_replay && !o.fork && !o.erasure && !o.installed
+}
+
+}
+
+/// None when the copy may leave custody; otherwise the dependent that keeps it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures (out is None) == releasable(*observation),
+))]
+pub fn copy_dependent(observation: &CopyObservation) -> Option<CopyDependent> {
+    if !observation.journal_draining { return Some(CopyDependent::NotDraining); }
+    if !observation.retained { return Some(CopyDependent::NotRetained); }
+    if observation.serving { return Some(CopyDependent::Serving); }
+    if !observation.durable_elsewhere { return Some(CopyDependent::NotDurable); }
+    if observation.otherwise_named { return Some(CopyDependent::OtherReference); }
+    if observation.checkpoint_decision { return Some(CopyDependent::CheckpointDecision); }
+    if observation.handoff_in_flight { return Some(CopyDependent::HandoffInFlight); }
+    if observation.recovery_or_replay { return Some(CopyDependent::RecoveryOrReplay); }
+    if observation.fork { return Some(CopyDependent::Fork); }
+    if observation.erasure { return Some(CopyDependent::Erasure); }
+    if observation.installed { return Some(CopyDependent::Installed); }
+    None
 }

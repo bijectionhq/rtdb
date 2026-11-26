@@ -60,6 +60,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi decommission-logkeeper --directory DIR --member ID\n\
+       rtdb-multi release-journal-copy --directory DIR --name NAME --member ID\n\
        rtdb-multi place-journals --directory DIR --name NAME --journals ID,ID,ID [--cell-secret FILE]\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
@@ -1245,6 +1246,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let member = admin::decommission_logkeeper(directory.as_ref(), &rtdb_directory::MemberId(arguments.required("member")?.into())).await?;
             println!("{}", serde_json::to_string_pretty(&member).expect("a member record serializes"));
+            Ok(())
+        }
+        "release-journal-copy" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let name = arguments.required("name")?;
+            let record = directory.deployment_by_name(name).await?
+                .ok_or_else(|| rtdb_types::Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
+            let released = admin::release_journal_copy(directory.as_ref(), &record.id, &rtdb_directory::MemberId(arguments.required("member")?.into())).await?;
+            println!("{}", serde_json::to_string_pretty(&released).expect("a deployment record serializes"));
             Ok(())
         }
         "list" => {
