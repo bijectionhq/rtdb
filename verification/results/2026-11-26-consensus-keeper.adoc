@@ -52,6 +52,24 @@ At 64 clients one Transact returned "The write outcome is unknown. Recover it wi
 Before keeper batches the consensus journal stayed near 600 commits/s at every client count.
 The causes and the fixes are in Logkeeper's design proposal: per-round WAL cost, four entries per replication message, and a flat 500 ms backoff on refused peer frames.
 
+=== Comparison after the snapshot page-budget fix at `1e8a0df`
+
+The 64-client failure above came from the keeper, not from RTDB.
+A snapshot could rewrite at most 12 index pages since the previous one, and 256-record keeper batches change hundreds, so the snapshot failed and OpenRaft stopped the stream's group.
+Logkeeper `67c0a16` removes that budget, sends 64 entries per replication message instead of 4, and retries a refused peer append after 5 ms doubling to 500 ms instead of a flat 500 ms.
+Logkeeper `423854d` adds a WAL stall watchdog, 128 writes per WAL round and stream slot release on delete, and `1e8a0df` fixes a placement panic when the first two voters both become ineligible.
+The same comparison at `1e8a0df`, with every acknowledged commit verified:
+
+[cols="1,1,1,1,1",options="header"]
+|===
+|Clients |File journal commits/s |Stream Writer commits/s |Consensus commits/s |Consensus p50 / p99 ms
+
+|1 |206 |540 |531 |1.7 / 4.6
+|4 |250 |1,438 |1,066 |3.4 / 14.4
+|16 |250 |4,383 |2,896 |4.7 / 20.6
+|64 |248 |6,635 |5,790 |9.3 / 18.0
+|===
+
 === First run, before keeper batches, at `749260e`
 
 [cols="2,1,1,1,1,1",options="header"]
@@ -125,5 +143,5 @@ The debug `rtdb-db` test binary needs `RUST_MIN_STACK=16777216`. Without it, `na
 
 == Open
 
-* Throughput above 16 clients and the 64-client unknown outcome, through the Logkeeper design proposal phases.
+* Throughput and tail latency at 4 and 16 clients, through the Logkeeper design proposal phases.
 * Bijection hosted cells and the installed ordered journals still use their existing journals. The old journals stay until this switch is qualified in a hosted cell.
