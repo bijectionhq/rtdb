@@ -549,7 +549,8 @@ impl Session {
             return Err(crate::sql_snapshots::unretained());
         }
         let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
-        let current_time = match world_time.or(options.clock_time) {
+        let explicit_time = world_time.or(options.clock_time);
+        let mut current_time = match explicit_time {
             Some(time) => time,
             None if options.snapshot_token.is_some() => Instant::default(),
             None => self.cancellation.run_until_cancelled(self.service.fresh_query_instant()).await
@@ -562,6 +563,10 @@ impl Session {
                 (basis, capture, None)
             }
         };
+        // A sampled receiver clock can trail the system time the log assigned to a transaction already in the snapshot.
+        if explicit_time.is_none() && options.snapshot_token.is_none() && let Some(latest) = snapshot.databases.values().flatten().flatten().max() {
+            current_time = current_time.max(*latest);
+        }
         Ok((QueryBasis { snapshot, replica_capture, resume_token, has_await_floor, snapshot_time: options.snapshot_time, current_time, timezone: self.effective_timezone().to_owned() }, applied))
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
