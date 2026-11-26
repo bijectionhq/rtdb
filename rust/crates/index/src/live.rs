@@ -296,7 +296,13 @@ pub struct LiveTable {
     canonical_entity_iids: bool,
     located: LocatedLeaves,
     joined_types: JoinedTypes,
+    /// The last appended column types, the table's column types they were merged into, and the merge, kept across versions:
+    /// a table written with one schema merges the same two maps on every append.
+    schema_merge: Option<Arc<SchemaMerge>>,
 }
+
+#[derive(Debug)]
+struct SchemaMerge { table: StructFields<LogicalType>, appended: StructFields<LogicalType>, merged: StructFields<LogicalType> }
 
 /// This table's column types joined with a table catalog's contributed types, for the last catalog they were joined with.
 /// Both are replaced rather than changed, so a cloned table, about to become another version, starts empty.
@@ -316,7 +322,7 @@ impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), declared_columns: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default(), joined_types: JoinedTypes::default() }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), declared_columns: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default(), joined_types: JoinedTypes::default(), schema_merge: None }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
@@ -522,7 +528,16 @@ impl LiveTable {
             return Err(invalid("Live table system time moved backwards"));
         }
         let mut next = self.clone();
-        next.column_types = merge_column_types(&next.column_types, column_types);
+        next.column_types = match &self.schema_merge {
+            Some(memo) if identical_types(&memo.table, &self.column_types) && identical_types(&memo.appended, column_types) => memo.merged.clone(),
+            _ => {
+                let merged = merge_column_types(&self.column_types, column_types);
+                next.schema_merge = Some(Arc::new(SchemaMerge {
+                    table: self.column_types.clone(), appended: column_types.clone(), merged: merged.clone(),
+                }));
+                merged
+            }
+        };
         next.last_system_time = Some(system_time);
         Ok(next)
     }
@@ -2076,6 +2091,48 @@ fn batches_built_from_other_batches_rows_keep_the_headers_and_put_types_a_fresh_
     let originated = staged.tables()[&table].batch().unwrap();
     assert!(originated.view().has_origin_column());
     same_as_fresh(originated.as_ref());
+}
+
+#[cfg(test)]
+#[test]
+fn repeated_appends_merge_column_types_as_a_fresh_merge_does_in_field_order() {
+    use rtdb_types::ScalarType;
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let nested = |names: [&str; 2]| LogicalType::Struct(names.into_iter().map(|name| (name.to_owned(), int.clone())).collect());
+    let ab = StructFields::from([("a".to_owned(), int.clone()), ("b".to_owned(), nested(["x", "y"]))]);
+    let ba = StructFields::from([("b".to_owned(), nested(["x", "y"])), ("a".to_owned(), int.clone())]);
+    let ab_yx = StructFields::from([("a".to_owned(), int.clone()), ("b".to_owned(), nested(["y", "x"]))]);
+    let c = StructFields::from([("c".to_owned(), LogicalType::Scalar(ScalarType::Utf8).maybe())]);
+    assert!(ab == ba && !identical_types(&ab, &ba));
+    assert!(ab == ab_yx && !identical_types(&ab, &ab_yx));
+    let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+    let mut expected = StructFields::new();
+    for types in [&ba, &ba, &ba, &ab, &ab, &ab_yx, &ab_yx, &c, &c, &c, &ba, &ba] {
+        live = live.append(&TableWrite::new(types.clone(), None), Timestamp(1)).unwrap();
+        expected = merge_column_types(&expected, types);
+        assert!(identical_types(live.column_types(), &expected), "{:?} differs from {expected:?}", live.column_types());
+    }
+}
+
+/// Whether two column-type maps are equal in the order of their fields and union legs at every depth too, which `==` ignores.
+fn identical_types(left: &StructFields<LogicalType>, right: &StructFields<LogicalType>) -> bool {
+    left.len() == right.len() && left.iter().zip(right.iter())
+        .all(|((left_name, left), (right_name, right))| left_name == right_name && identical_type(left, right))
+}
+
+fn identical_type(left: &LogicalType, right: &LogicalType) -> bool {
+    match (left, right) {
+        (LogicalType::Struct(left), LogicalType::Struct(right)) => identical_types(left, right),
+        (LogicalType::Union(left), LogicalType::Union(right)) =>
+            left.len() == right.len() && left.iter().zip(right.iter()).all(|(left, right)| identical_type(left, right)),
+        (LogicalType::List { kind: left_kind, element: left }, LogicalType::List { kind: right_kind, element: right }) =>
+            left_kind == right_kind && identical_type(left, right),
+        (LogicalType::Maybe(left), LogicalType::Maybe(right)) => identical_type(left, right),
+        (LogicalType::RunEndEncoded { width: left_width, value: left }, LogicalType::RunEndEncoded { width: right_width, value: right }) =>
+            left_width == right_width && identical_type(left, right),
+        (LogicalType::Struct(_) | LogicalType::Union(_) | LogicalType::List { .. } | LogicalType::Maybe(_) | LogicalType::RunEndEncoded { .. }, _) => false,
+        (LogicalType::Nothing | LogicalType::Null | LogicalType::Scalar(_), _) => left == right,
+    }
 }
 
 /// `row_column_types` of the events' put documents, without collecting each document's types when they all match the first's.
