@@ -125,12 +125,14 @@ impl Service {
         {
             return self.family_readback_action(call, action);
         }
+        // Each arm boxes its own future, so a call allocates its arm's state rather than the
+        // largest arm's.
         let outcome = match action.r#type.as_str() {
-            CAPABILITIES if appointment::is_managed(&call) => async {
+            CAPABILITIES if appointment::is_managed(&call) => Box::pin(async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 self.managed_appointment_capabilities(&call).await
-            }.await,
-            CAPABILITIES if original_family_landing::is_managed_family(&call) => async {
+            }).await,
+            CAPABILITIES if original_family_landing::is_managed_family(&call) => Box::pin(async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 let family = self.managed_family(&call).await?;
                 let mut features = [
@@ -155,8 +157,8 @@ impl Service {
                     }),
                     server_time_micros: self.0.node.now().0,
                 }.encode_to_vec())
-            }.await,
-            CAPABILITIES if call.session.caller.principal.workload_grant().is_some() => async {
+            }).await,
+            CAPABILITIES if call.session.caller.principal.workload_grant().is_some() => Box::pin(async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 let database = self.require_workload_root_read(&call).await?;
                 let driver = database.serving_driver().ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
@@ -185,8 +187,8 @@ impl Service {
                     }),
                     server_time_micros: self.0.node.now().0,
                 }.encode_to_vec())
-            }.await,
-            CAPABILITIES => async {
+            }).await,
+            CAPABILITIES => Box::pin(async {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 let mut features = Vec::new();
                 if !self.follower_only() {
@@ -321,38 +323,38 @@ impl Service {
                     server_time_micros: if scoped { 0 } else { self.0.node.now().0 },
                 }
                 .encode_to_vec())
-            }.await,
+            }).await,
             exact_read::OPEN => match decode(action.body) {
-                Ok(request) => self.open_exact_read(&call, request).await.map(|reply| reply.encode_to_vec()),
+                Ok(request) => rtdb_types::boxed(|| self.open_exact_read(&call, request)).await.map(|reply| reply.encode_to_vec()),
                 Err(status) => Err(status),
             },
             exact_read::CLOSE => decode::<proto::CloseExactReadRequest>(action.body)
                 .and_then(|request| self.close_exact_read(&call, &request.scope)),
-            scoped_hold::ACTION => self.scoped_hold_action(&call, &action.body).await,
-            custody::RELEASE => self.custody_release_action(&call, &action.body).await,
-            original_family_landing::ACTION => self.original_family_landing(&call, &action.body).await,
-            original_family_landing::private_replay::ACTION => self.original_private_replay(&call, &action.body).await,
+            scoped_hold::ACTION => rtdb_types::boxed(|| self.scoped_hold_action(&call, &action.body)).await,
+            custody::RELEASE => rtdb_types::boxed(|| self.custody_release_action(&call, &action.body)).await,
+            original_family_landing::ACTION => rtdb_types::boxed(|| self.original_family_landing(&call, &action.body)).await,
+            original_family_landing::private_replay::ACTION => rtdb_types::boxed(|| self.original_private_replay(&call, &action.body)).await,
             OFFER_DECISION_CLOCK => match decode(action.body) {
-                Ok(request) => self.v1_offer_decision_clock(&call, request).await,
+                Ok(request) => rtdb_types::boxed(|| self.v1_offer_decision_clock(&call, request)).await,
                 Err(status) => Err(status),
             },
             appointment::PREPARE => match decode(action.body) {
-                Ok(request) => self.prepare_funded_appointment(&call, request).await,
+                Ok(request) => rtdb_types::boxed(|| self.prepare_funded_appointment(&call, request)).await,
                 Err(status) => Err(status),
             },
             appointment::ACTIVATE => match decode(action.body) {
-                Ok(request) => self.activate_funded_appointment(&call, request).await,
+                Ok(request) => rtdb_types::boxed(|| self.activate_funded_appointment(&call, request)).await,
                 Err(status) => Err(status),
             },
-            name if store::ACTIONS.contains(&name) => self.store_action(&call, name, action.body).await,
-            "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
-            MANAGED_WORKLOAD => self.managed_workload_action(&call, action.body).await,
+            name if store::ACTIONS.contains(&name) => rtdb_types::boxed(|| self.store_action(&call, name, action.body)).await,
+            "rtdb.v1.Transact" => rtdb_types::boxed(|| self.v1_transact(&call, action.body)).await,
+            MANAGED_WORKLOAD => rtdb_types::boxed(|| self.managed_workload_action(&call, action.body)).await,
             TX_STATUS => match decode(action.body) {
-                Ok(request) => self.v1_tx_status(&call, request).await,
+                Ok(request) => rtdb_types::boxed(|| self.v1_tx_status(&call, request)).await,
                 Err(status) => Err(status),
             },
             #[cfg(feature = "multi")]
-            name if crate::admin::ACTIONS.contains(&name) => self.admin_action(&call, name, action.body).await,
+            name if crate::admin::ACTIONS.contains(&name) => rtdb_types::boxed(|| self.admin_action(&call, name, action.body)).await,
             _ => Err(error::unsupported("admin")),
         };
         let result = outcome.map_err(|status| call.error(status))?;
