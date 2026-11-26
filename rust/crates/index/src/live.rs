@@ -56,8 +56,6 @@ impl IndexBatch {
     fn from_written_headers(owned: OwnedBatch, headers: Vec<EventHeader>) -> Result<Arc<Self>> {
         let header_reservation = owned.reservation().budget().reserve(Self::header_bytes(headers.len())?)?;
         let events = EventBatch::new(owned.batch().clone())?;
-        debug_assert!(headers.len() == events.len()
-            && headers.iter().enumerate().all(|(row, header)| events.header(row).is_ok_and(|decoded| decoded == *header)));
         Self::with_decoded_headers(owned, events, headers, header_reservation)
     }
     fn with_decoded_headers(
@@ -1640,8 +1638,7 @@ impl TransactionBuffer {
         if let Some(position) = position { header.commit_position = position; }
         let _key = self.budget.reserve(key.len().checked_add(4096).ok_or_else(|| invalid("Owned key is too large"))?)?;
         let keys = arrow_array::BinaryArray::from_iter_values([key]);
-        let batch = keyed_put_batch(content, &[header], keys, source_bytes, &self.budget)?;
-        self.append_batch_inner(table, batch, None, Some(vec![header]))?;
+        self.append_written_puts(table, vec![header], |headers, budget| keyed_put_batch(content, headers, keys, source_bytes, budget))?;
         if let Some(position) = position { self.consume_owned_position(position); }
         Ok(position.and_then(NonZeroU32::new))
     }
@@ -1662,15 +1659,51 @@ impl TransactionBuffer {
         &mut self, table: &TableRef, documents: arrow_array::ArrayRef, headers: Vec<EventHeader>, source_bytes: Option<usize>,
     ) -> Result<()> {
         self.require_unpositioned(table)?;
-        let batch = rtdb_format::data::owned_put_batch(documents, &headers, source_bytes, &self.budget)?;
-        self.append_batch_inner(table, batch, None, Some(headers))
+        self.append_written_puts(table, headers, |headers, budget| rtdb_format::data::owned_put_batch(documents, headers, source_bytes, budget))
     }
 
     fn append_unpositioned_batch(
         &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
     ) -> Result<()> {
         self.require_unpositioned(table)?;
-        self.append_batch_inner(table, batch, assembled_declarations, None)
+        let rows = batch.batch().num_rows();
+        if rows == 0 { return Ok(()); }
+        if batch.batch().schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_ok() {
+            return Err(invalid("The transaction buffer assigns Arrow event positions"));
+        }
+        let ordinals = self.next_ordinals(rows)?;
+        let end = ordinals.end;
+        let transaction = self.tx_key.tx_id;
+        let positions = ordinals.map(|ordinal| EventPosition { transaction, ordinal });
+        let positioned = rtdb_format::data::append_event_positions(&batch, positions, &self.budget)?;
+        self.push_batch(table, IndexBatch::from_owned(positioned)?, assembled_declarations, end)
+    }
+
+    /// Writes puts with `write` from `headers` once their event positions are assigned, so the staged rows are encoded
+    /// from the very headers the batch keeps.
+    fn append_written_puts(
+        &mut self, table: &TableRef, mut headers: Vec<EventHeader>,
+        write: impl FnOnce(&[EventHeader], &Arc<MemoryBudget>) -> Result<OwnedBatch>,
+    ) -> Result<()> {
+        if headers.iter().any(|header| header.position.is_some()) {
+            return Err(invalid("The transaction buffer assigns Arrow event positions"));
+        }
+        let ordinals = self.next_ordinals(headers.len())?;
+        let end = ordinals.end;
+        let transaction = self.tx_key.tx_id;
+        for (header, ordinal) in headers.iter_mut().zip(ordinals) {
+            header.position = Some(EventPosition { transaction, ordinal });
+        }
+        let batch = write(&headers, &self.budget)?;
+        if headers.is_empty() { return Ok(()); }
+        self.push_batch(table, IndexBatch::from_written_headers(batch, headers)?, None, end)
+    }
+
+    fn next_ordinals(&self, rows: usize) -> Result<std::ops::Range<u64>> {
+        let start = self.next_event_ordinal;
+        let rows = u64::try_from(rows).map_err(|_| invalid("Event ordinal exhausted"))?;
+        let end = start.checked_add(rows).ok_or_else(|| invalid("Event ordinal exhausted"))?;
+        Ok(start..end)
     }
 
     fn require_unpositioned(&self, table: &TableRef) -> Result<()> {
@@ -1683,28 +1716,11 @@ impl TransactionBuffer {
         Ok(())
     }
 
-    /// `written_headers` are the headers `batch` was written from, in row order, where the caller has them.
-    fn append_batch_inner(
-        &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
-        written_headers: Option<Vec<EventHeader>>,
+    /// Stages a positioned batch whose event ordinals end before `end`.
+    fn push_batch(
+        &mut self, table: &TableRef, batch: Arc<IndexBatch>, assembled_declarations: Option<&StructFields<LogicalType>>,
+        end: u64,
     ) -> Result<()> {
-        let rows = batch.batch().num_rows();
-        if rows == 0 { return Ok(()); }
-        if batch.batch().schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_ok() {
-            return Err(invalid("The transaction buffer assigns Arrow event positions"));
-        }
-        let start = self.next_event_ordinal;
-        let end = start.checked_add(rows as u64).ok_or_else(|| invalid("Event ordinal exhausted"))?;
-        let transaction = self.tx_key.tx_id;
-        let positions = (start..end).map(move |ordinal| EventPosition { transaction, ordinal });
-        let positioned = rtdb_format::data::append_event_positions(&batch, positions.clone(), &self.budget)?;
-        let batch = match written_headers {
-            Some(mut headers) if headers.len() == rows => {
-                for (header, position) in headers.iter_mut().zip(positions) { header.position = Some(position); }
-                IndexBatch::from_written_headers(positioned, headers)?
-            }
-            _ => IndexBatch::from_owned(positioned)?,
-        };
         if !batch.has_system_time(self.tx_key.system_time) {
             return Err(invalid("Transaction batch has another system time"));
         }
@@ -2011,6 +2027,55 @@ fn staged_mixed_row_and_arrow_writes_keep_vector_layout_and_command_order() {
     let expected = owned_event_batch(&reference, Some(batch.put_types().clone()), true, &memory).unwrap();
     let ipc = |batch: &RecordBatch| rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(batch)).unwrap();
     assert_eq!(ipc(batch.arrow()), ipc(expected.batch()));
+}
+
+#[cfg(test)]
+#[test]
+fn staged_put_headers_are_the_headers_their_rows_decode_to() {
+    use arrow_array::Int64Array;
+
+    let memory = MemoryBudget::new(16 << 20);
+    let base = crate::PartitionState::empty(Default::default()).unwrap();
+    let key = TransactionKey { tx_id: rtdb_types::TxId(7), system_time: Timestamp(10) };
+    let mut transaction = TransactionBuffer::new(base.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+    let table = TableRef::new("public", "docs");
+    let header = |id: i64, from: i64| EventHeader {
+        position: None, commit_position: 0, iid: EntityId::Integer(id).iid(), system_from: key.system_time,
+        valid_time: Interval::new(Timestamp(from), Timestamp::MAX).unwrap(), op: EventOp::Put,
+    };
+    let documents = |ids: Vec<i64>| -> ArrayRef {
+        let ids: ArrayRef = Arc::new(Int64Array::from(ids));
+        Arc::new(StructArray::new(vec![Field::new("_id", DataType::Int64, false)].into(), vec![ids], None))
+    };
+
+    transaction.append_put_documents(&table, documents(vec![1, 2]), vec![header(1, 3), header(2, 5)], None).unwrap();
+    transaction.append_put_documents(&table, documents(vec![3]), vec![header(3, 7)], None).unwrap();
+    let mismatched = transaction.append_put_documents(&table, documents(vec![4, 5]), vec![header(4, 0)], None);
+    assert!(mismatched.is_err(), "a header count that differs from the documents is refused");
+    let positioned = EventHeader { position: Some(EventPosition { transaction: key.tx_id, ordinal: 9 }), ..header(6, 0) };
+    assert!(transaction.append_put_documents(&table, documents(vec![6]), vec![positioned], None).is_err());
+
+    let pending = &transaction.tables[&table];
+    assert_eq!(pending.batches.len(), 2);
+    let mut ordinals = Vec::new();
+    for PendingBatch { batch, .. } in &pending.batches {
+        for row in 0..batch.len() {
+            let header = batch.header(row).unwrap();
+            assert_eq!(header, batch.view().header(row).unwrap());
+            ordinals.push(header.position.unwrap().ordinal);
+        }
+    }
+    assert_eq!(ordinals, [0, 1, 2]);
+    assert_eq!(transaction.next_event_ordinal, 3);
+
+    let event = StoredEvent {
+        position: None, origin: None, commit_position: 0,
+        entity_key: None, iid: EntityId::Integer(1).iid(), system_from: key.system_time,
+        valid_time: Interval::new(Timestamp(3), Timestamp::MAX).unwrap(),
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])), recency: None,
+    };
+    let copied = IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap();
+    assert_eq!(copied.header(0).unwrap(), copied.view().header(0).unwrap());
 }
 
 #[cfg(test)]
