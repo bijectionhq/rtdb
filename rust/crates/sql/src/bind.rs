@@ -277,16 +277,14 @@ impl Context<'_> {
         }
     }
 
-    pub(crate) fn recover_column(&mut self, resolved: Result<Expr>, names: &[Identifier]) -> Result<Expr> {
-        match resolved {
-            Err(error) if error.code == "xtdb/column-not-found" && !self.diagnostics.is_empty() => {
-                let chain = names.iter().rev().map(Identifier::normalized).collect::<Vec<_>>();
-                self.diagnostics.push(PlanningDiagnostic::new(error.message.unwrap_or(error.code))
-                    .with_detail("chain", serde_json::json!(chain)));
-                Ok(Expr::Literal(Value::Null))
-            }
-            resolved => resolved,
-        }
+    /// A name no scope has fails the statement, unless earlier diagnostics already doom it; then it joins them and binds as NULL.
+    pub(crate) fn missing_column(&mut self, names: &[Identifier]) -> Result<Expr> {
+        let missing = Unresolved::Missing.into_anomaly(names);
+        if self.diagnostics.is_empty() { return Err(missing); }
+        let chain = names.iter().rev().map(Identifier::normalized).collect::<Vec<_>>();
+        self.diagnostics.push(PlanningDiagnostic::new(missing.message.unwrap_or(missing.code))
+            .with_detail("chain", serde_json::json!(chain)));
+        Ok(Expr::Literal(Value::Null))
     }
 
     pub(crate) fn record_column_demand(&mut self, id: ColumnId) {

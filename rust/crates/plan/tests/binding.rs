@@ -70,6 +70,21 @@ fn scope_rejects_ambiguous_names_and_preserves_qualifiers() {
 }
 
 #[test]
+fn lookup_says_why_a_name_matched_no_single_field() {
+    let mut binder = Binder::default();
+    let ty = LogicalType::Scalar(ScalarType::I64);
+    let a = binder.field("price", Some("a".into()), ty.clone()).unwrap();
+    let b = binder.field("price", Some("b".into()), ty).unwrap();
+    let schema = Schema::new(vec![a.clone(), b]).unwrap();
+    assert_eq!(schema.lookup(&[Identifier::unquoted("price")]), Err(Unresolved::Ambiguous));
+    assert_eq!(schema.lookup(&[Identifier::unquoted("cost")]), Err(Unresolved::Missing));
+    assert_eq!(schema.lookup(&[Identifier::unquoted("a"), Identifier::unquoted("price")]), Ok(&a));
+    let missing = Unresolved::Missing.into_anomaly(&[Identifier::unquoted("a"), Identifier::unquoted("cost")]);
+    assert_eq!((missing.code.as_str(), missing.message.as_deref()), ("xtdb/column-not-found", Some("Column not found: a.cost")));
+    assert_eq!(Unresolved::Ambiguous.into_anomaly(&[Identifier::unquoted("price")]).code, "xtdb/ambiguous-column");
+}
+
+#[test]
 fn base_table_column_qualifiers_match_database_schema_and_alias_as_one_namespace() {
     let field = |id, database: &str, schema: &str, alias: &str| Field { id: ColumnId(id), name: "v".into(),
         qualifier: Some(ColumnQualifier::BaseTable { database: database.into(), schema: schema.into(), alias: alias.into() }),

@@ -170,21 +170,39 @@ impl Schema {
     /// Accepts left-to-right identifiers, matching up to database.schema.alias.column for base tables or alias.column for alias scopes.
     /// Earlier components are ignored; missing or multiple matches return a name-resolution anomaly.
     pub fn resolve(&self, name: &[Identifier]) -> Result<&Field> {
+        self.lookup(name).map_err(|unresolved| unresolved.into_anomaly(name))
+    }
+    /// Resolves as `resolve` does, saying why a name matched no single field instead of raising.
+    pub fn lookup(&self, name: &[Identifier]) -> std::result::Result<&Field, Unresolved> {
         let parts: Vec<_> = name.iter().map(Identifier::normalized).collect();
-        let matches: Vec<_> = self.0.iter().filter(|field| match parts.split_last() {
+        let mut matches = self.0.iter().filter(|field| match parts.split_last() {
             Some((column, [])) => !field.qualified_only && &field.name == column,
             Some((column, qualifiers)) => &field.name == column && field.qualifier.as_ref().is_some_and(|qualifier| qualifier.matches(qualifiers)),
             None => false,
-        }).collect();
-        match matches.as_slice() {
-            [field] => Ok(field),
-            [] => Err(Anomaly::incorrect("xtdb/column-not-found", format!("Column not found: {}", parts.join(".")))),
-            _ => Err(Anomaly::incorrect("xtdb/ambiguous-column", format!("Ambiguous column: {}", parts.join(".")))),
+        });
+        match (matches.next(), matches.next()) {
+            (Some(field), None) => Ok(field),
+            (None, _) => Err(Unresolved::Missing),
+            (Some(_), Some(_)) => Err(Unresolved::Ambiguous),
         }
     }
     pub fn concat(&self, other: &Self) -> Result<Self> { Self::new(self.0.iter().chain(&other.0).cloned().collect()) }
     pub fn nullable(&self) -> Result<Self> {
         Self::new(self.0.iter().cloned().map(|mut field| { field.data_type = field.data_type.maybe(); field }).collect())
+    }
+}
+
+/// Why a column name matched no single field of a schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unresolved { Missing, Ambiguous }
+
+impl Unresolved {
+    pub fn into_anomaly(self, name: &[Identifier]) -> Anomaly {
+        let parts = name.iter().map(Identifier::normalized).collect::<Vec<_>>().join(".");
+        match self {
+            Self::Missing => Anomaly::incorrect("xtdb/column-not-found", format!("Column not found: {parts}")),
+            Self::Ambiguous => Anomaly::incorrect("xtdb/ambiguous-column", format!("Ambiguous column: {parts}")),
+        }
     }
 }
 

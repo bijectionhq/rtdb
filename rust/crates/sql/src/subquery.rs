@@ -1,5 +1,5 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, JoinKind, NamedExpr, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, JoinKind, NamedExpr, Relation, RelationNode, Schema, UnaryOp, Unresolved};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, aggregate_relation, error};
@@ -26,7 +26,8 @@ pub(crate) enum ExpressionScope<'a> {
     TablePeriod,
 }
 impl ExpressionScope<'_> {
-    pub(crate) fn resolve(self, context: &mut Context<'_>, names: &[Identifier]) -> Result<Expr> {
+    /// The column a name refers to, or `None` when no visible scope has it.
+    pub(crate) fn resolve(self, context: &mut Context<'_>, names: &[Identifier]) -> Result<Option<Expr>> {
         match self {
             Self::Columns(schema) => context.resolve_column(names, schema),
             Self::TablePeriod => {
@@ -153,28 +154,27 @@ impl ExpressionAttachment {
 }
 
 impl Context<'_> {
-    pub(crate) fn resolve_column(&mut self, names: &[Identifier], schema: &Schema) -> Result<Expr> {
+    /// The column `names` refers to in `schema` or a visible outer scope, or `None` when none has it; an ambiguous name is an error.
+    pub(crate) fn resolve_column(&mut self, names: &[Identifier], schema: &Schema) -> Result<Option<Expr>> {
         let schema = Schema::new(schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
-        let missing = match schema.resolve(names) {
+        match schema.lookup(names) {
             Ok(field) => {
                 self.record_column_demand(field.id);
-                return Ok(field.expression());
+                return Ok(Some(field.expression()));
             }
-            Err(error) if error.code != "xtdb/column-not-found" => return Err(error),
-            Err(error) => error,
-        };
+            Err(Unresolved::Missing) => {}
+            Err(unresolved) => return Err(unresolved.into_anomaly(names)),
+        }
         for scope in (0..self.outer_scopes.len()).rev() {
             if !self.outer_scopes[scope].visible { continue; }
             let schema = Schema::new(self.outer_scopes[scope].schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
-            match schema.resolve(names) {
-                Ok(field) => {
-                    return self.capture_outer(scope, field);
-                }
-                Err(error) if error.code != "xtdb/column-not-found" => return Err(error),
-                Err(_) => {},
+            match schema.lookup(names) {
+                Ok(field) => return self.capture_outer(scope, field).map(Some),
+                Err(Unresolved::Missing) => {}
+                Err(unresolved) => return Err(unresolved.into_anomaly(names)),
             }
         }
-        Err(missing)
+        Ok(None)
     }
 
     fn capture_outer(&mut self, scope: usize, field: &Field) -> Result<Expr> {
@@ -211,7 +211,7 @@ impl Context<'_> {
     pub(crate) fn wildcard_source_id(&mut self, names: &[Identifier], schema: &Schema) -> Result<Option<ColumnId>> {
         let find = |schema: &Schema| -> Result<Option<ColumnId>> {
             let schema = Schema::new(schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
-            match schema.resolve(names) { Ok(field) => Ok(Some(field.id)), Err(error) if error.code == "xtdb/column-not-found" => Ok(None), Err(error) => Err(error) }
+            match schema.lookup(names) { Ok(field) => Ok(Some(field.id)), Err(Unresolved::Missing) => Ok(None), Err(unresolved) => Err(unresolved.into_anomaly(names)) }
         };
         let mut id = find(schema)?;
         if id.is_none() {

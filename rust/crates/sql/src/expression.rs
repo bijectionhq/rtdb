@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Expr, Field, PercentileFraction, PercentileKind, Schema, SqlNotice, UnaryOp};
+use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Expr, Field, PercentileFraction, PercentileKind, Schema, SqlNotice, UnaryOp, Unresolved};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast::{self as ast, Spanned};
 
@@ -57,11 +57,10 @@ impl Context<'_> {
                 } else if let Some(constant) = catalog_constant(std::slice::from_ref(&name), None)? {
                     constant
                 } else {
-                    match input.scope().resolve(self, std::slice::from_ref(&name)) {
-                        Err(missing) if missing.code == "xtdb/column-not-found" && name.normalized() == "user" => {
-                            call("current_user".into(), Vec::new())?
-                        }
-                        resolved => self.recover_column(resolved, std::slice::from_ref(&name))?,
+                    match input.scope().resolve(self, std::slice::from_ref(&name))? {
+                        Some(column) => column,
+                        None if name.normalized() == "user" => call("current_user".into(), Vec::new())?,
+                        None => self.missing_column(std::slice::from_ref(&name))?,
                     }
                 }
             }
@@ -72,8 +71,10 @@ impl Context<'_> {
                 } else if let Some(constant) = catalog_constant(&names, None)? {
                     constant
                 } else {
-                    let resolved = input.scope().resolve(self, &names);
-                    self.recover_column(resolved, &names)?
+                    match input.scope().resolve(self, &names)? {
+                        Some(column) => column,
+                        None => self.missing_column(&names)?,
+                    }
                 }
             }
             ast::Expr::Value(value) => match &value.value {
@@ -706,7 +707,7 @@ pub(crate) fn references_unqualified_names(expr: &ast::Expr, names: &std::collec
 pub(crate) fn reject_ambiguous_columns(expr: &ast::Expr, schema: &Schema) -> Result<()> {
     let names = match expr { ast::Expr::Identifier(name) => Some(vec![identifier(name)]), ast::Expr::CompoundIdentifier(names) => Some(names.iter().map(identifier).collect()), _ => None };
     if let Some(names) = names {
-        if let Err(error) = schema.resolve(&names) { if error.code == "xtdb/ambiguous-column" { return Err(error); } }
+        if let Err(Unresolved::Ambiguous) = schema.lookup(&names) { return Err(Unresolved::Ambiguous.into_anomaly(&names)); }
     }
     for child in children(expr) { reject_ambiguous_columns(child, schema)?; }
     Ok(())
