@@ -1393,7 +1393,7 @@ mod live_coverage_tests {
     use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, TableRef, Timestamp, Value};
 
     #[test]
-    fn fts_arrow_live_postings_and_uncovered_suffix_match_and_rank_across_merged_chunks() {
+    fn fts_arrow_live_postings_and_uncovered_suffix_match_and_rank_across_appended_chunks() {
         use rtdb_query::LiveSearchTerms;
         let memory = MemoryBudget::new(8 << 20);
         let runtime = SearchRuntime::new(4 << 20);
@@ -1412,8 +1412,8 @@ mod live_coverage_tests {
         let prefix = append(&root, 1, "report report paid");
         let extended = append(&prefix, 2, "report open paid");
         let divergent = append(&prefix, 2, "novel");
-        assert_eq!(extended.batches().count(), 1);
-        assert!(!Arc::ptr_eq(prefix.batches().next().unwrap(), extended.batches().next().unwrap()));
+        assert_eq!(extended.batches().count(), 2);
+        assert!(Arc::ptr_eq(prefix.batches().next().unwrap(), extended.batches().next().unwrap()));
 
         runtime.publish_live("db", &prefix, "body", rtdb_text::Analyzer::Simple, &token).unwrap();
         let (initial, covered) = runtime.live_pages("db", &extended, "body", rtdb_text::Analyzer::Simple);
@@ -1429,8 +1429,8 @@ mod live_coverage_tests {
         let phrase = rtdb_text::Query::parse(r#""report paid""#);
         let scorer = rtdb_text::Scorer::new(phrase.clone(), None);
         assert_eq!(terms.matches(batch, 0, &phrase), Some(true));
-        assert_eq!(terms.matches(batch, 1, &phrase), None);
-        assert_eq!(terms.matches(divergent.batches().next().unwrap(), 0, &phrase), None);
+        assert_eq!(terms.matches(extended.batches().nth(1).unwrap(), 0, &phrase), None);
+        assert_eq!(terms.matches(divergent.batches().nth(1).unwrap(), 0, &phrase), None);
         assert_eq!(terms.score(batch, 0, &scorer).unwrap().to_bits(), scorer.bm25_text("report report paid").to_bits());
         drop(terms);
         let matching = rtdb_text::Query::parse("report");

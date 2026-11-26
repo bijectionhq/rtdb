@@ -25,6 +25,10 @@ impl std::fmt::Debug for SnapshotMemos {
     }
 }
 
+/// Each table's column types joined with the table catalog's, for the snapshot whose memos hold them.
+#[derive(Default)]
+struct JoinedColumnTypes(parking_lot::Mutex<BTreeMap<TableRef, StructFields<LogicalType>>>);
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     trie_catalog: Arc<TrieCatalog>,
@@ -300,13 +304,13 @@ impl Snapshot {
         declarations
     }
 
-    /// A table's column types; with only its applied segment live, they are joined once per segment and table catalog.
+    /// A table's column types, joined once per snapshot.
     pub fn column_types(&self, table: &TableRef) -> StructFields<LogicalType> {
-        let join = || self.column_types_for(table, self.column_names(table));
-        match self.durable.tables().get(table) {
-            Some(segment) if self.layered.get(table).is_none_or(Vec::is_empty) => segment.joined_column_types(&self.table_catalog, join),
-            _ => join(),
-        }
+        let memo = self.memo::<JoinedColumnTypes>();
+        if let Some(types) = memo.0.lock().get(table) { return types.clone(); }
+        let types = self.column_types_for(table, self.column_names(table));
+        memo.0.lock().insert(table.clone(), types.clone());
+        types
     }
     pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> StructFields<LogicalType> {
         let sources: Vec<_> = self.durable.tables().get(table).into_iter().chain(self.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();

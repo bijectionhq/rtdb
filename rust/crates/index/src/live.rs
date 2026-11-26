@@ -286,7 +286,7 @@ impl LiveRowLineage {
 pub struct LiveTable {
     table: TableRef,
     block_index: BlockIndex,
-    chunks: Vec<(u32, Arc<IndexBatch>)>,
+    chunks: Chunks,
     row_count: u32,
     lineage: LiveRowLineage,
     column_types: Arc<StructFields<LogicalType>>,
@@ -295,53 +295,149 @@ pub struct LiveTable {
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
     located: LocatedLeaves,
-    joined_types: JoinedTypes,
-    /// The last appended column types, the table's column types they were merged into, and the merge, kept across versions:
-    /// a table written with one schema merges the same two maps on every append.
-    schema_merge: Option<Arc<SchemaMerge>>,
 }
 
-#[derive(Debug)]
-struct SchemaMerge { table: Arc<StructFields<LogicalType>>, appended: StructFields<LogicalType>, merged: Arc<StructFields<LogicalType>> }
+/// The most chunks a live table appends before it merges them into its merged chunks.
+const TAIL_CHUNKS: usize = 32;
+/// The most rows merging puts into one chunk.
+const MERGED_CHUNK_ROWS: usize = 8192;
 
-/// This table's column types joined with a table catalog's contributed types, for the last catalog they were joined with.
-/// Both are replaced rather than changed, so a cloned table, about to become another version, starts empty.
-#[derive(Debug, Default)]
-struct JoinedTypes(std::sync::Mutex<Option<(std::sync::Weak<crate::catalog::TableCatalog>, StructFields<LogicalType>)>>);
-impl Clone for JoinedTypes { fn clone(&self) -> Self { Self::default() } }
+/// Chunks appended since the table last merged its tail, one per append, in slots each set at most once.
+/// Every version holding a prefix of the slots shares them; an append from a version whose next slot is already taken copies its prefix into slots of its own.
+#[derive(Debug)]
+struct TailChunks([OnceLock<(u32, Arc<IndexBatch>)>; TAIL_CHUNKS]);
+
+impl TailChunks {
+    fn new() -> Self { Self(std::array::from_fn(|_| OnceLock::new())) }
+}
+
+fn published(slot: &OnceLock<(u32, Arc<IndexBatch>)>) -> &(u32, Arc<IndexBatch>) {
+    slot.get().expect("a version counts only the tail slots set before it was made")
+}
+
+/// A live table's chunks, each with the row address it starts at: merged chunks, then the first `tail_len` tail slots.
+/// Appending sets the next tail slot, so a version is published without copying or merging the chunks of the one it follows.
+#[derive(Clone, Debug, Default)]
+struct Chunks {
+    merged: Arc<Vec<(u32, Arc<IndexBatch>)>>,
+    tail: Option<Arc<TailChunks>>,
+    tail_len: usize,
+}
+
+impl Chunks {
+    fn len(&self) -> usize { self.merged.len() + self.tail_len }
+    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn tail(&self) -> &[OnceLock<(u32, Arc<IndexBatch>)>] {
+        match &self.tail { Some(tail) => &tail.0[..self.tail_len], None => &[] }
+    }
+    fn get(&self, index: usize) -> Option<&(u32, Arc<IndexBatch>)> {
+        match index.checked_sub(self.merged.len()) {
+            None => self.merged.get(index),
+            Some(index) => self.tail().get(index).map(published),
+        }
+    }
+    fn first(&self) -> Option<&(u32, Arc<IndexBatch>)> { self.get(0) }
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &(u32, Arc<IndexBatch>)> + Clone + '_ {
+        self.merged.iter().chain(self.tail().iter().map(published))
+    }
+    /// The chunks holding `row` or any later row.
+    fn from_row(&self, row: u32) -> impl Iterator<Item = &(u32, Arc<IndexBatch>)> + '_ {
+        let ended = |(start, batch): &(u32, Arc<IndexBatch>)| u64::from(*start) + batch.len() as u64 <= u64::from(row);
+        let merged = self.merged.partition_point(ended);
+        let tail = self.tail();
+        let in_tail = if merged == self.merged.len() { tail.partition_point(|slot| ended(published(slot))) } else { 0 };
+        self.merged[merged..].iter().chain(tail[in_tail..].iter().map(published))
+    }
+    /// The last chunk starting at or before `row`, and `row`'s offset in it, as `last_started_chunk` finds it in all the chunks.
+    fn last_started(&self, row: u32) -> Option<(usize, u32)> {
+        let tail = self.tail();
+        let in_tail = tail.partition_point(|slot| published(slot).0 <= row);
+        match in_tail.checked_sub(1) {
+            Some(index) => Some((self.merged.len() + index, row - published(&tail[index]).0)),
+            None => crate::row_address::last_started_chunk(self.merged.as_slice(), row),
+        }
+    }
+
+    fn push(&mut self, start: u32, batch: Arc<IndexBatch>) -> Result<()> {
+        if self.tail_len == TAIL_CHUNKS { self.merge_tail()?; }
+        let tail = self.tail.get_or_insert_with(|| Arc::new(TailChunks::new()));
+        if let Err(chunk) = tail.0[self.tail_len].set((start, batch)) {
+            let own = TailChunks::new();
+            for (slot, taken) in own.0.iter().zip(&tail.0[..self.tail_len]) {
+                let _ = slot.set(published(taken).clone());
+            }
+            let _ = own.0[self.tail_len].set(chunk);
+            *tail = Arc::new(own);
+        }
+        self.tail_len += 1;
+        Ok(())
+    }
+
+    /// Moves the tail into the merged chunks: consecutive tail chunks of one layout are concatenated up to `MERGED_CHUNK_ROWS`,
+    /// and each result merges into the chunk before it while that is no larger, so the chunks keep their row addresses.
+    fn merge_tail(&mut self) -> Result<()> {
+        let tail: Vec<(u32, Arc<IndexBatch>)> = self.tail().iter().map(|slot| published(slot).clone()).collect();
+        self.tail = None;
+        self.tail_len = 0;
+        let merged = Arc::make_mut(&mut self.merged);
+        let mut first = 0;
+        while let Some((start, head)) = tail.get(first) {
+            let schema = head.arrow().schema_ref();
+            let mut end = first + 1;
+            let mut rows = head.len();
+            while let Some((_, next)) = tail.get(end)
+                && next.arrow().schema_ref() == schema
+                && rows.checked_add(next.len()).is_some_and(|total| total <= MERGED_CHUNK_ROWS)
+            {
+                rows += next.len();
+                end += 1;
+            }
+            let batch = if end - first == 1 {
+                Arc::clone(head)
+            } else {
+                LiveTable::concat_live_chunks(schema, tail[first..end].iter().map(|(_, batch)| batch.as_ref()), head.arrow_reservation().budget())?
+            };
+            let count = u32::try_from(batch.len()).map_err(invalid)?;
+            crate::row_address::append_chunk(merged, *start, count, batch)
+                .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
+            merge_small_chunks(merged)?;
+            first = end;
+        }
+        Ok(())
+    }
+}
+
+/// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
+/// stay within `MERGED_CHUNK_ROWS`, so a table written a row per transaction is read from chunks of up to that many rows.
+/// A merged chunk starts where the earlier one did.
+fn merge_small_chunks(chunks: &mut Vec<(u32, Arc<IndexBatch>)>) -> Result<()> {
+    while let [.., (_, previous), (_, last)] = chunks.as_slice() {
+        if !LiveTable::can_merge_chunk(previous, last.len(), last.arrow().schema_ref()) { break; }
+        let merged = LiveTable::concat_live_chunks(previous.arrow().schema_ref(), [previous.as_ref(), last.as_ref()].into_iter(),
+            previous.arrow_reservation().budget())?;
+        crate::row_address::replace_last_two(chunks, merged);
+    }
+    Ok(())
+}
 
 /// A trie leaf's rows in iid order, each located in its table's chunks with its header copied out.
 #[derive(Debug)]
 pub struct LocatedRows { pub located: Vec<(u32, u32)>, pub headers: Vec<EventHeader>, _reservation: Option<Arc<MemoryReservation>> }
 
 /// The leaves a snapshot's scans have located, keyed by the leaf's address in the snapshot's own trie.
-/// A row's location depends on the chunk layout, which every append can change, so a cloned table starts empty.
+/// A row's location depends on the chunk layout, which an append that merges the tail changes, so a cloned table starts empty.
 #[derive(Debug, Default)]
 struct LocatedLeaves(std::sync::Mutex<std::collections::HashMap<usize, Arc<LocatedRows>>>);
 impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: Arc::default(), declared_columns: Arc::default(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default(), joined_types: JoinedTypes::default(), schema_merge: None }
+        Self { table, block_index, chunks: Chunks::default(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: Arc::default(), declared_columns: Arc::default(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn row_count(&self) -> u32 { self.row_count }
     pub fn column_types(&self) -> &StructFields<LogicalType> { &self.column_types }
-
-    /// The column types `join` computes for this table under `catalog`, reused while the catalog is the same one.
-    pub(crate) fn joined_column_types(&self, catalog: &Arc<crate::catalog::TableCatalog>, join: impl FnOnce() -> StructFields<LogicalType>)
-        -> StructFields<LogicalType> {
-        if let Ok(joined) = self.joined_types.0.lock()
-            && let Some((joined_with, types)) = joined.as_ref()
-            && std::ptr::eq(joined_with.as_ptr(), Arc::as_ptr(catalog))
-        {
-            return types.clone();
-        }
-        let types = join();
-        if let Ok(mut joined) = self.joined_types.0.lock() { *joined = Some((Arc::downgrade(catalog), types.clone())); }
-        types
-    }
     pub fn declared_columns(&self) -> &StructFields<LogicalType> { &self.declared_columns }
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
@@ -351,12 +447,11 @@ impl LiveTable {
     /// The unconsumed batches and the prefix to skip in the first one.
     /// A live table preserves row addresses when it merges its Arrow chunks.
     pub fn batches_from(&self, row: u32) -> impl Iterator<Item = (&Arc<IndexBatch>, usize)> {
-        let first = self.chunks.partition_point(|(start, batch)| u64::from(*start) + batch.len() as u64 <= u64::from(row));
-        self.chunks[first..].iter().map(move |(start, batch)| (batch, row.saturating_sub(*start) as usize))
+        self.chunks.from_row(row).map(move |(start, batch)| (batch, row.saturating_sub(*start) as usize))
     }
     fn locate_row(&self, row: u32) -> Result<(usize, u32)> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
-        crate::row_address::last_started_chunk(&self.chunks, row)
+        self.chunks.last_started(row)
             .ok_or_else(|| invalid("Live table row has no owning batch"))
     }
     pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
@@ -453,11 +548,14 @@ impl LiveTable {
     /// The header of `row`, without taking a handle on its batch.
     pub fn header(&self, row: u32) -> Result<EventHeader> {
         let (index, offset) = self.locate_row(row)?;
-        self.chunks[index].1.header(offset as usize)
+        self.chunk(index)?.header(offset as usize)
+    }
+    fn chunk(&self, index: usize) -> Result<&Arc<IndexBatch>> {
+        Ok(&self.chunks.get(index).ok_or_else(|| invalid("Live table chunk is absent"))?.1)
     }
     pub fn row(&self, row: u32) -> Result<RowSource> {
         let (index, offset) = self.locate_row(row)?;
-        Ok(RowSource { batch: Arc::clone(&self.chunks[index].1), row: offset as usize })
+        Ok(RowSource { batch: Arc::clone(self.chunk(index)?), row: offset as usize })
     }
 
     fn iid_rows(&self, iid: Iid, prepaid: Option<&Arc<MemoryBudget>>) -> Result<(Option<Arc<LocatedRows>>, std::ops::Range<usize>)> {
@@ -509,7 +607,7 @@ impl LiveTable {
         let Some(row) = matches.next() else { return Ok(None); };
         if matches.next().is_some() { return Ok(None); }
         let (chunk, offset) = rows.located[row];
-        Ok(self.chunks[chunk as usize].0.checked_add(offset))
+        Ok(self.chunks.get(chunk as usize).ok_or_else(|| invalid("Live table chunk is absent"))?.0.checked_add(offset))
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
         let mut next = self.with_appended_schema(&write.column_types, system_time)?;
@@ -519,8 +617,7 @@ impl LiveTable {
         if let Some(batch) = &write.batch {
             self.validate_append(std::iter::once(batch.as_ref()), write.adopted_history, system_time)?;
             next.canonical_entity_iids = self.canonical_entity_iids && batch.has_canonical_iids().unwrap_or(false);
-            next.append_indexed_chunk(self.row_count, Arc::clone(batch))?;
-            next.merge_small_chunks()?;
+            next.append_indexed_chunk(Arc::clone(batch))?;
         }
         Ok(next)
     }
@@ -529,22 +626,15 @@ impl LiveTable {
         if self.last_system_time.is_some_and(|previous| previous > system_time) {
             return Err(invalid("Live table system time moved backwards"));
         }
-        let (column_types, schema_merge) = match &self.schema_merge {
-            Some(memo) if (Arc::ptr_eq(&memo.table, &self.column_types) || identical_types(&memo.table, &self.column_types))
-                && identical_types(&memo.appended, column_types) => (Arc::clone(&memo.merged), Arc::clone(memo)),
-            _ => {
-                let merged = merge_column_types(&self.column_types, column_types);
-                // A merge that changes nothing shares the table's types, so the next append recognises its memo by identity.
-                let merged = if identical_types(&merged, &self.column_types) { Arc::clone(&self.column_types) } else { Arc::new(merged) };
-                let memo = Arc::new(SchemaMerge { table: Arc::clone(&self.column_types), appended: column_types.clone(), merged: Arc::clone(&merged) });
-                (merged, memo)
-            }
+        let column_types = if absorbs_column_types(&self.column_types, column_types) {
+            Arc::clone(&self.column_types)
+        } else {
+            Arc::new(merge_column_types(&self.column_types, column_types))
         };
         Ok(Self {
             table: self.table.clone(), block_index: self.block_index, chunks: self.chunks.clone(), row_count: self.row_count,
             lineage: self.lineage.clone(), column_types, declared_columns: Arc::clone(&self.declared_columns), trie: self.trie.clone(),
             last_system_time: Some(system_time), canonical_entity_iids: self.canonical_entity_iids, located: LocatedLeaves::default(),
-            joined_types: JoinedTypes::default(), schema_merge: Some(schema_merge),
         })
     }
 
@@ -588,67 +678,20 @@ impl LiveTable {
         Ok(())
     }
 
-    fn append_indexed_chunk(&mut self, chunk_start: u32, batch: Arc<IndexBatch>) -> Result<()> {
+    fn append_indexed_chunk(&mut self, batch: Arc<IndexBatch>) -> Result<()> {
         let count = u32::try_from(batch.len()).map_err(invalid)?;
         let first_new_row = self.row_count;
-        self.row_count = crate::row_address::append_chunk(&mut self.chunks, chunk_start, count, batch)
-            .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
-        let added = self.row_count.checked_sub(first_new_row).ok_or_else(|| invalid("Merged chunk does not cover the retained rows"))?;
-        self.trie = self.trie.add_range(self, first_new_row, added)?;
-        if added > 0 { self.lineage.append(self.row_count); }
+        let row_count = first_new_row.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
+        self.chunks.push(first_new_row, batch)?;
+        self.row_count = row_count;
+        self.trie = self.trie.add_range(self, first_new_row, count)?;
+        if count > 0 { self.lineage.append(self.row_count); }
         Ok(())
     }
 
     fn can_merge_chunk(previous: &IndexBatch, rows: usize, schema: &SchemaRef) -> bool {
-        const MERGED_CHUNK_ROWS: usize = 8192;
         previous.len() <= rows && rows <= MERGED_CHUNK_ROWS.saturating_sub(previous.len())
             && previous.arrow().schema_ref() == schema
-    }
-
-    fn coalesce_pending_runs<'a>(
-        &'a self, runs: impl Iterator<Item = &'a IndexBatch> + Clone, declared: &StructFields<LogicalType>,
-        system_time: Timestamp, budget: &Arc<MemoryBudget>,
-    ) -> Result<Option<Self>> {
-        let Some(first) = runs.clone().next() else { return Ok(None); };
-        let schema = first.arrow().schema_ref();
-        let mut rows = runs.clone().try_fold(0usize, |rows, batch| {
-            rows.checked_add(batch.len()).ok_or_else(|| invalid("Write batch size overflow"))
-        })?;
-        let mut start_chunk = self.chunks.len();
-        // Earlier chunks can become eligible as the candidate grows, so plan the full tail before copying.
-        for (_, previous) in self.chunks.iter().rev() {
-            if !Self::can_merge_chunk(previous, rows, schema) { break; }
-            rows += previous.len();
-            start_chunk -= 1;
-        }
-        let tail = &self.chunks[start_chunk..];
-        let Some((start, oldest)) = tail.first() else { return Ok(None); };
-
-        let column_types = declare_column_types(first.put_types(), declared);
-        let mut next = self.with_appended_schema(&column_types, system_time)?;
-        self.validate_append(runs.clone(), false, system_time)?;
-        if next.canonical_entity_iids {
-            let mut scratch = None;
-            next.canonical_entity_iids = runs.clone().all(|batch| batch.verify_canonical_iids(budget, &mut scratch).unwrap_or(false));
-        }
-        let inputs = tail.iter().map(|(_, batch)| batch.as_ref()).chain(runs);
-        let merged = Self::concat_live_chunks(schema, inputs, oldest.arrow_reservation().budget())?;
-        next.chunks.truncate(start_chunk);
-        next.append_indexed_chunk(*start, merged)?;
-        Ok(Some(next))
-    }
-
-    /// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
-    /// stay small, so a table written a row per transaction is read from chunks of up to 8192 rows.
-    /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
-    fn merge_small_chunks(&mut self) -> Result<()> {
-        while let [.., (_, previous), (_, last)] = self.chunks.as_slice() {
-            if !Self::can_merge_chunk(previous, last.len(), last.arrow().schema_ref()) { break; }
-            let merged = Self::concat_live_chunks(previous.arrow().schema_ref(), [previous.as_ref(), last.as_ref()].into_iter(),
-                previous.arrow_reservation().budget())?;
-            crate::row_address::replace_last_two(&mut self.chunks, merged);
-        }
-        Ok(())
     }
 
     fn concat_live_chunks<'a>(
@@ -743,7 +786,7 @@ impl BlockPages<'_> {
             let bytes = rows.len().checked_mul(32).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| invalid("Invalid block row selection size"))?;
             let result = self.memory.reserve(bytes).and_then(|_scratch| {
                 let positions = rows.iter().map(|&row| {
-                    let (index, offset) = crate::row_address::last_started_chunk(&self.table.chunks, row)
+                    let (index, offset) = self.table.chunks.last_started(row)
                         .ok_or_else(|| invalid("Live table row has no owning batch"))?;
                     Ok((index, offset as usize))
                 }).collect::<Result<Vec<_>>>()?;
@@ -771,7 +814,7 @@ impl BlockPages<'_> {
         let _scratch = self.memory.reserve(bound)?;
         let events = rows.iter().map(|&row| {
             let (chunk, offset) = self.table.locate_row(row)?;
-            let batch = &self.table.chunks[chunk].1;
+            let batch = self.table.chunk(chunk)?;
             batch.view().event_ref(offset as usize, &batch.put_field_types)
         }).collect::<Result<Vec<_>>>()?;
         let batch = owned_event_batch(&events, Some(self.table.column_types.as_ref().clone()), true, &self.memory)?;
@@ -802,7 +845,7 @@ impl BlockPages<'_> {
         let mut aligned = Vec::with_capacity(selected.len());
         let mut slots = BTreeMap::new();
         for (chunk, rows) in selected {
-            let input = self.table.chunks[chunk].1.arrow();
+            let input = self.table.chunk(chunk)?.arrow();
             let Some(columns) = self.align_chunk(input, &rows, &mut reservation)? else { return Ok(None); };
             slots.insert(chunk, aligned.len());
             aligned.push(columns);
@@ -1222,17 +1265,7 @@ impl PendingTable {
     fn append_since(
         &self, written: WritePosition, segment: &LiveTable, system_time: Timestamp, budget: &Arc<MemoryBudget>,
     ) -> Result<LiveTable> {
-        let batch = if written == self.position() {
-            None
-        } else if let Some(runs) = self.compatible_runs_since(written) {
-            let batches = runs.iter().map(|run| run.batch.as_ref());
-            if let Some(next) = segment.coalesce_pending_runs(batches, &self.declared, system_time, budget)? {
-                return Ok(next);
-            }
-            Some(Self::concat_runs(runs, budget)?)
-        } else {
-            Some(self.assemble_since(written, budget)?)
-        };
+        let batch = if written == self.position() { None } else { Some(self.copy_since(written, budget)?) };
         segment.append(&TableWrite::new(self.declared.clone(), batch), system_time)
     }
 
@@ -1747,6 +1780,9 @@ fn document_type_bytes(name: &str, ty: &LogicalType, previous: Option<&LogicalTy
         .and_then(|bytes| bytes.checked_mul(8)).ok_or_else(|| invalid("Declared schema size overflow"))
 }
 
+#[cfg(test)]
+mod differential_tests;
+
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-live-index", message.to_string()) }
 
 #[cfg(test)]
@@ -2169,6 +2205,13 @@ fn table_write_declarations_join_the_written_types_as_declare_column_types_does(
     }
 }
 
+/// Whether `merge_column_types(table, appended)` would give `table` back unchanged, in field and leg order too.
+fn absorbs_column_types(table: &StructFields<LogicalType>, appended: &StructFields<LogicalType>) -> bool {
+    let appended_absent = absent_type(appended);
+    appended.keys().all(|name| table.contains_key(name))
+        && table.iter().all(|(name, ty)| identical_type(&ty.join(appended.get(name).unwrap_or(&appended_absent)), ty))
+}
+
 /// Whether two column-type maps are equal in the order of their fields and union legs at every depth too, which `==` ignores.
 fn identical_types(left: &StructFields<LogicalType>, right: &StructFields<LogicalType>) -> bool {
     left.len() == right.len() && left.iter().zip(right.iter())
@@ -2442,7 +2485,7 @@ mod chunk_tests {
     }
 
     #[test]
-    fn incremental_snapshot_coalesces_funded_runs_within_one_copy_budget() {
+    fn an_incremental_snapshot_appends_the_runs_written_since_its_last_read_as_one_chunk() {
         let memory = MemoryBudget::new(32 << 20);
         let state = crate::PartitionState::empty(Default::default()).unwrap();
         let table = TableRef::new("public", "docs");
@@ -2484,16 +2527,9 @@ mod chunk_tests {
         assert_eq!(transaction.snapshot().err().unwrap().code, "rtdb/memory-budget-exceeded");
         drop(denied);
 
-        let pending_bytes = transaction.tables[&table].batches[2..].iter()
-            .map(|run| run.batch.arrow().get_array_memory_size()).sum::<usize>();
-        let tail_bytes = previous.batches().map(|batch| batch.arrow().get_array_memory_size()).sum::<usize>();
-        assert!(2 * tail_bytes < pending_bytes);
-        let headroom = 4096 + 3 * pending_bytes;
-        let hold = memory.reserve(memory.available_bytes() - headroom).unwrap();
         let current = transaction.snapshot().unwrap().segments(&table).remove(0);
-        drop(hold);
 
-        assert_eq!(current.batches().count(), 1);
+        assert_eq!(current.batches().map(|batch| batch.len()).collect::<Vec<_>>(), [2, 1, 2]);
         assert_eq!(current.row_count(), 5);
         assert!(proof.is_prefix_of(current.row_lineage()));
         assert_eq!(previous.row_count(), 3);
@@ -2502,16 +2538,20 @@ mod chunk_tests {
             let mut expected = event(id);
             expected.position = Some(EventPosition { transaction: key.tx_id, ordinal: u64::from(id) });
             let row = u32::from(id);
-            assert_eq!(current.locate(row).unwrap(), (0, row));
+            let at = match row { 0 | 1 => (0, row), 2 => (1, 0), _ => (2, row - 3) };
+            assert_eq!(current.locate(row).unwrap(), at);
             assert_eq!(current.header(row).unwrap(), expected.header());
             assert_eq!(current.row(row).unwrap().event().unwrap(), expected);
             if row < previous.row_count() {
                 assert_eq!(previous.header(row).unwrap(), current.header(row).unwrap());
+                assert_eq!(previous.locate(row).unwrap(), at);
             }
         }
         assert!(!state.open_snapshot(None).contains_table(&table));
         let staged = transaction.stage().unwrap();
-        assert_eq!(staged.tables()[&table].batch().unwrap().arrow(), current.batches().next().unwrap().arrow());
+        let staged_batch = staged.tables()[&table].batch().unwrap();
+        assert_eq!(staged_batch.len(), 5);
+        for row in 0..5u32 { assert_eq!(staged_batch.header(row as usize).unwrap(), current.header(row).unwrap()); }
         state.apply(&staged).unwrap();
         assert_eq!(state.open_snapshot(Some(key.tx_id)).segments(&table)[0].row_count(), 5);
 
@@ -2533,7 +2573,8 @@ mod chunk_tests {
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
         }
-        assert!(live.chunks.len() <= 8, "{} chunks", live.chunks.len());
+        assert!(live.chunks.len() <= 8 + TAIL_CHUNKS, "{} chunks", live.chunks.len());
+        assert!(live.chunks.merged.len() <= 8, "{} merged chunks", live.chunks.merged.len());
         for id in [0u32, 1, 1023, 1024, 8191, 8192, 9999] {
             assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
         }
@@ -2557,7 +2598,8 @@ mod chunk_tests {
             }).collect::<Vec<_>>();
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
         }
-        assert!(live.chunks.len() <= 4, "{} chunks", live.chunks.len());
+        assert!(live.chunks.merged.len() <= 4, "{} merged chunks", live.chunks.merged.len());
+        assert!(live.chunks.len() <= 4 + TAIL_CHUNKS, "{} chunks", live.chunks.len());
         assert_eq!(live.row_count, 8192);
     }
 
@@ -2571,7 +2613,7 @@ mod chunk_tests {
         assert!(Arc::ptr_eq(&located, &live.located_rows(leaf).unwrap()));
         assert_eq!(located.headers.iter().map(|header| header.system_from).collect::<OrderedSet<_>>(), (0..3).map(Timestamp).collect());
         let appended = live.append(&put(3, &memory), Timestamp(3)).unwrap();
-        assert_eq!(appended.chunks.len(), 1);
+        assert_eq!(appended.chunks.len(), 4);
         for id in 0..3 {
             let iid = EntityId::Integer(i64::from(id)).iid();
             assert_eq!(live.iid(id).unwrap(), iid);

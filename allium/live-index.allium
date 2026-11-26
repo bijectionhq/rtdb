@@ -13,8 +13,10 @@
 --   A live table is a VALUE, and a transaction writes it through a TRANSIENT derived from that value.
 --   The transient appends only, and what it appends the value it came from cannot see; committing it yields the table's next value, and applying a transaction installs those values.
 --   A table's immutable row lineage advances when rows are appended.
---   Arrow chunk coalescing preserves row addresses and lineage.
---   An incremental transaction snapshot keeps compatible pending Arrow runs funded until it copies them and the eligible chunk tail into their replacement chunk in row-address order.
+--   Appending to a live table adds one chunk to its tail and publishes the new row count and trie root, without copying or merging the chunks the previous value holds.
+--   A value reads only the tail chunks it counts, each set once and never changed, so neither a later append nor another append from the same value changes the rows or row addresses it sees.
+--   A full tail merges into the table's merged chunks, preserving row addresses and lineage.
+--   An incremental transaction snapshot appends the pending Arrow runs written since its last read as one chunk.
 --   A holder of an earlier snapshot retains its original chunks and their funding.
 --   The row lineage starts a new generation at its revision limit.
 --   The derived index builds coverage anew for that generation.
