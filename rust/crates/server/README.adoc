@@ -72,7 +72,9 @@ Classic installations require a separate migration that preserves their data and
 == Node configuration
 
 The node applies indexing enablement, skipped transaction IDs, trie limits, flush policy, compactor options, GC options and database membership from its startup settings.
-`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` controls the allocation ceiling shared by the cache and execution regions; without either, it is half the physical or cgroup-limited memory, and at least one GiB.
+`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` controls the allocation ceiling shared by the cache and execution regions.
+Without either, it is half the memory the process may use: physical memory, lowered to the tightest `memory.max` (cgroup v2) or `memory.limit_in_bytes` (cgroup v1) on the process's own cgroup, as `/proc/self/cgroup` names it, or on any ancestor.
+A small container therefore gets a budget below one GiB rather than one the kernel would kill before it refuses; one GiB applies only when neither memory figure is known.
 `ParsedConfiguration` owns startup settings and their allocation reservations until they transfer into the execution region.
 CLI and embedded startup reserve parser events before parsing, each expanded YAML alias value before construction, and environment values before copying.
 The data-only EDN adapter uses the same charged environment lookup and a bound on its input-derived syntax tree.

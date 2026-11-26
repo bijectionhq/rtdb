@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use crate::config::{CustodyProviderSettings, NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings, parse_custody_provider_config};
 
 mod memory;
-pub use memory::{MEMORY_LIMIT_FLOOR_BYTES, default_memory_limit_bytes, scaled_memory_limit};
+pub use memory::{UNKNOWN_MEMORY_LIMIT_BYTES, default_memory_limit_bytes, scaled_memory_limit};
 
 #[cfg(feature = "multi")]
 mod admin;
