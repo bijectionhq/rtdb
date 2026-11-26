@@ -34,6 +34,10 @@ const RECEIVER_CLOCK: &str = "query.receiver-clock";
 const APPLIED_POSITION: &str = "query.applied-position";
 const FOLLOWER_PROGRESS: &str = "query.follower-progress";
 pub const OWNED_HOSTED_FEATURE: &str = "owned.hosted";
+/// The attested contract Bijection speaks (`rtdb.store.v1`).
+pub const STORE_API: &str = "rtdb.store.v1";
+/// The store admits Bijection's placement fence grant (version 6).
+pub const STORE_PLACEMENT_FENCE_FEATURE: &str = "store.placement-fence";
 pub const RETIRED_ORIGINAL_FAMILY_FEATURE: &str = "owned.retired-original-family";
 pub const RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE: &str = "owned.retired-original-family-recovery";
 const MAX_PAGE_ROWS: u32 = 4096;

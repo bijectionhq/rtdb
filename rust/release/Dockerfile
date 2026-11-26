@@ -65,7 +65,7 @@ STOPSIGNAL SIGTERM
 
 FROM runtime-environment AS multi
 LABEL io.rtdb.hosted-protocol=227 io.rtdb.pgwire-arrow-copy-out=true
-LABEL io.rtdb.capabilities='{"api":"rtdb.v1","features":["owned.hosted","owned.retired-original-family","owned.retired-original-family-recovery"]}'
+LABEL io.rtdb.capabilities='{"api":"rtdb.store.v1","features":["store.placement-fence"]}'
 RUN apt-get update \
     && apt-get install --no-install-recommends -y curl jq netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*

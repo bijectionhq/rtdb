@@ -354,7 +354,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         #[derive(serde::Serialize)]
         struct HostedCapabilities {
             api: &'static str,
-            features: [&'static str; 3],
+            features: [&'static str; 1],
         }
         #[derive(serde::Serialize)]
         struct MultiBuildInfo {
@@ -373,13 +373,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 227 } else { 56 },
+            // Bijection speaks only the ordered-bytes store; the placement
+            // fence grant admits its workload issuer's store sessions.
             capabilities: cfg!(feature = "s3-key-vault").then_some(HostedCapabilities {
-                api: "rtdb.v1",
-                features: [
-                    rtdb_flight_sql::OWNED_HOSTED_FEATURE,
-                    rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_FEATURE,
-                    rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE,
-                ],
+                api: rtdb_flight_sql::STORE_API,
+                features: [rtdb_flight_sql::STORE_PLACEMENT_FENCE_FEATURE],
             }),
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
