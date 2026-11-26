@@ -151,6 +151,29 @@ impl ObservedDirectory {
 
 #[async_trait::async_trait]
 impl Directory for ObservedDirectory {
+    async fn receiver_clock(&self, domain: uuid::Uuid) -> Result<Option<rtdb_directory::ReceiverClockSample>> { self.inner.receiver_clock(domain).await }
+    async fn publish_receiver_clock(&self, domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp) -> Result<()> {
+        self.inner.publish_receiver_clock(domain, publisher, observation).await
+    }
+    async fn installed_journal_reservations(&self) -> Result<Vec<uuid::Uuid>> { self.inner.installed_journal_reservations().await }
+    async fn rebind_classic_flight(&self, previous: &rtdb_directory::classic_flight::Commission, replacement: &rtdb_directory::classic_flight::Commission) -> Result<()> {
+        self.inner.rebind_classic_flight(previous, replacement).await
+    }
+    async fn fence_checkpoint_transfer(&self, selection: &rtdb_directory::CheckpointTransferSelection) -> Result<rtdb_directory::CheckpointTransferFence> {
+        self.inner.fence_checkpoint_transfer(selection).await
+    }
+    async fn record_checkpoint_transfer_terminal(&self, terminal: &rtdb_directory::CheckpointTransferTerminal) -> Result<rtdb_directory::CheckpointTransferTerminal> {
+        self.inner.record_checkpoint_transfer_terminal(terminal).await
+    }
+    async fn record_checkpoint_transfer_bootstrap(&self, bootstrap: &rtdb_directory::CheckpointTransferBootstrap) -> Result<rtdb_directory::CheckpointTransferBootstrap> {
+        self.inner.record_checkpoint_transfer_bootstrap(bootstrap).await
+    }
+    async fn reserve_checkpoint_transfer_replica(&self, replica: &rtdb_directory::CheckpointTransferReplica) -> Result<rtdb_directory::CheckpointTransferReplica> {
+        self.inner.reserve_checkpoint_transfer_replica(replica).await
+    }
+    async fn activate_checkpoint_transfer(&self, activation: &rtdb_directory::CheckpointTransferActivation) -> Result<rtdb_directory::CheckpointTransferActivation> {
+        self.inner.activate_checkpoint_transfer(activation).await
+    }
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> { self.inner.reserve_installed_journal(id).await }
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
     async fn stage_fork(&self, child: DeploymentRecord, preparation: rtdb_directory::ForkPreparation) -> Result<DeploymentRecord> {
