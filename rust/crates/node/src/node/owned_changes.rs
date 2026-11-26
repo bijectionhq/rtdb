@@ -1033,7 +1033,7 @@ pub async fn archived_changes_at_cut(
     context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
     after: impl Into<OwnedChangeEdge>, through: impl Into<OwnedChangeEdge>, limit: usize, reverse: bool,
 ) -> Result<OwnedMergedChanges> {
-    let present = context.current_time.as_micros()?;
+    let present = context.owned_held_cut().ok_or_else(change_feed_uncovered)?;
     let after = after.into();
     let through = through.into();
     let root = relation.root_relation().unwrap_or_else(|| relation.clone());
@@ -1142,9 +1142,7 @@ pub async fn archived_versions_at_cut(
     selected: Timestamp, request: OwnedVersionRequest,
 ) -> Result<OwnedVersionPage> {
     // No earlier archive window can prove absence across a missing base.
-    let database = context.catalog.database(context.catalog.default_database())?;
-    let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
-    if snapshot.system_time_cap() != Some(context.current_time.as_micros()?) { return Err(change_feed_uncovered()); }
+    if context.owned_held_cut().is_none() { return Err(change_feed_uncovered()); }
     read_versions_at_cut(
         Arc::clone(&context), owner, relation, id, selected, context.owned_position_cut(),
         request, || Ok(Arc::clone(&context)),
@@ -1176,7 +1174,7 @@ async fn read_versions_at_cut(
     }
     let database = journal_context.catalog.database(journal_context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
-    let present = journal_context.current_time.as_micros()?;
+    let present = journal_context.owned_held_cut().ok_or_else(change_feed_uncovered)?;
     if selected > present { return Err(change_feed_uncovered()); }
     let mut page = OwnedVersionPage {
         floor: Timestamp::MIN,

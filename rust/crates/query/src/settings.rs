@@ -179,6 +179,14 @@ impl QueryContext {
         self.with_wire_cut(system_time, current_time)
     }
 
+    /// The system cut an owned read holds: its one partition's cap.
+    /// A receiver-clocked read keeps its query clock apart from this cut.
+    pub fn owned_held_cut(&self) -> Option<Timestamp> {
+        let database = self.catalog.database(&self.catalog.default_database).ok()?;
+        let [snapshot] = database.partitions.as_slice() else { return None; };
+        snapshot.system_time_cap()
+    }
+
     /// Reuses the captured store generation and lease while lowering one owned read's system cap.
     pub fn with_owned_system_cut(
         &self, system_time: Timestamp, cancellation: &tokio_util::sync::CancellationToken,

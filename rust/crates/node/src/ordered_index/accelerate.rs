@@ -802,7 +802,7 @@ pub(super) async fn owned_page(
         ));
     }
 
-    let present = context.current_time.as_micros()?;
+    let present = context.owned_held_cut().ok_or_else(super::uncovered_owned_range)?;
     let valid_at = valid_at.unwrap_or(present);
     valid_at.next()?;
     if cover_until.is_some_and(|until| until <= valid_at) {
@@ -926,7 +926,7 @@ pub(super) async fn owned_count(
     compound_bound(&mut range, &fields, request.lower, true, false, &context.memory)?;
     compound_bound(&mut range, &fields, request.upper, false, true, &context.memory)?;
     request.valid_at.next()?;
-    let present = context.current_time.as_micros()?;
+    let present = context.owned_held_cut().ok_or_else(super::uncovered_owned_range)?;
     if lifetime.is_some() && request.valid_at != present {
         return Err(super::uncovered_owned_range());
     }

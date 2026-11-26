@@ -349,12 +349,9 @@ fn owned_context_at_position(
 }
 
 fn owned_context_at_system(context: Arc<QueryContext>, system: Timestamp) -> Result<Arc<QueryContext>> {
-    let held = context.current_time.as_micros()?;
-    let database = context.catalog.database(context.catalog.default_database())?;
-    let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
-    if snapshot.system_time_cap() != Some(held) || system > held {
+    let Some(held) = context.owned_held_cut().filter(|held| system <= *held) else {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/history-cut", "Owned history requires an exact retained system cut"));
-    }
+    };
     if system == held {
         Ok(context)
     } else {
@@ -753,10 +750,7 @@ pub async fn open_archived_world_unique_window(
     if shadow.root_relation().is_none() {
         return Err(address_unavailable());
     }
-    let system = context.current_time.as_micros()?;
-    let database = context.catalog.database(context.catalog.default_database())?;
-    let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
-    if snapshot.system_time_cap() != Some(system) {
+    if context.owned_held_cut().is_none() {
         return Err(address_unavailable());
     }
     open_unique_window(context, owner, shadow, column, Some(key), valid, fetch).await
@@ -1445,9 +1439,6 @@ pub async fn read_archived_held_clock(
     let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
     let media_end = snapshot.tx_basis().filter(|end| snapshot.system_time_cap() == Some(end.system_time))
         .ok_or_else(unavailable)?;
-    if media_end.system_time != context.current_time.as_micros()? {
-        return Err(unavailable());
-    }
     let selected = context.with_owned_transaction_cut(through, &context.cancellation)?;
     let publication = if let Some(publication) = exact {
         if publication.system_time != system || !publication.at_or_before(through) {
@@ -1489,7 +1480,7 @@ pub async fn select_owned_world_clock(
     floor: TransactionKey, initial: Timestamp, requested: Timestamp,
 ) -> Result<Option<(TransactionKey, Timestamp)>> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
-    let cap = context.current_time.as_micros()?;
+    let cap = context.owned_held_cut().ok_or_else(unavailable)?;
     let Some((latest, publication)) = read_owned_world_clock_publication(Arc::clone(context), owner, world).await?
     else { return Ok(None); };
     if floor.tx_id.0 < 0 || floor.tx_id >= publication.tx_id || publication.system_time > cap || initial >= latest {

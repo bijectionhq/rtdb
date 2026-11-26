@@ -3280,7 +3280,7 @@ impl OwnedReadSession {
         rtdb_types::OwnedRelation::new(relation.name())?;
         self.admit_root_system(relation, system).await?;
         let context = self.relation_context(relation)?;
-        if context.current_time.as_micros()? == system {
+        if context.owned_held_cut() == Some(system) {
             Ok(context)
         } else {
             context.with_owned_system_cut(system, &context.cancellation)
