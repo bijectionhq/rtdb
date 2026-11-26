@@ -133,6 +133,7 @@ impl CatalogColumns {
                     else if let Some(builder) = builder.downcast_mut::<BooleanBuilder>() { builder.append_null(); }
                     else if let Some(builder) = builder.downcast_mut::<Date32Builder>() { builder.append_null(); }
                     else if let Some(builder) = builder.downcast_mut::<DurationNanosecondBuilder>() { builder.append_null(); }
+                    else if let Some(builder) = builder.downcast_mut::<TimestampMicrosecondBuilder>() { builder.append_null(); }
                     else if let Some(builder) = builder.downcast_mut::<StructBuilder>() {
                         for index in 0..builder.num_fields() {
                             builder.field_builder::<TimestampMicrosecondBuilder>(index).ok_or_else(catalog_layout)?.append_null();
