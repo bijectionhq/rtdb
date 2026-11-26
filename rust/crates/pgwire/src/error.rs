@@ -97,4 +97,73 @@ mod tests {
         assert_eq!(error.code, "rtdb.pgwire/integer-out-of-range");
         assert_eq!(state(&error), "22003");
     }
+
+    /// RTDB `incorrect` codes named like a limit that still report upstream's `08P01` default.
+    /// Each is either a validation error that rightly keeps it or a limit still owed a kind; a code given a kind leaves the list.
+    const LIMIT_SHAPED_PROTOCOL_VIOLATIONS: &[&str] = &[
+        "rtdb.auth/http-limit", "rtdb.auth/response-too-large", "rtdb.expr/allocation-size", "rtdb.flight-sql/lease-size", "rtdb.index/schema-size",
+        "rtdb.index/snapshot-size", "rtdb.metrics/allocation-overflow", "rtdb.metrics/export-size", "rtdb.metrics/render-limit",
+        "rtdb.multi/assertion-family-size", "rtdb.multi/assertion-size", "rtdb.multi/replay-broker-size", "rtdb.node/invalid-memory-budget",
+        "rtdb.node/preparation-size", "rtdb.owned/change-group-too-large", "rtdb.owned/count-bound", "rtdb.owned/merged-change-commit-size",
+        "rtdb.owned/nearest-limit", "rtdb.owned/prepared-generation-bound", "rtdb.owned/purge-handle-bound", "rtdb.owned/range-bound",
+        "rtdb.owned/range-limit", "rtdb.owned/read-size", "rtdb.owned/replica-inline-bound", "rtdb.owned/search-limit",
+        "rtdb.pgwire/history-label-bound", "rtdb.plan/aggregate-size", "rtdb.plan/catalog-size", "rtdb.plan/qualifier-size",
+        "rtdb.plan/regex-metadata-size", "rtdb.plan/settings-size", "rtdb.query/expression-size", "rtdb.query/parameter-size",
+        "rtdb.server/invalid-memory-budget", "rtdb.storage/message-too-large", "rtdb.store/invalid-bound", "rtdb.temporal/ceiling-size",
+        "rtdb.temporal/history-row-size", "rtdb.tx/allocation-overflow", "rtdb.types/clojure-index-size", "rtdb.types/java-text-size",
+        "rtdb/allocation-bound", "rtdb/binary-width", "rtdb/change-limit", "rtdb/classic-projection-size", "rtdb/column-size",
+        "rtdb/decision-clock-record-size", "rtdb/iid-run-width", "rtdb/journal-record-too-large", "rtdb/list-size", "rtdb/rank-bound",
+        "rtdb/reservation-budget", "rtdb/reservation-size", "rtdb/run-end-overflow", "rtdb/run-end-selection-width", "rtdb/run-end-width",
+        "rtdb/time-overflow", "rtdb/time-width", "rtdb/trie-row-overflow", "rtdb/trie-size", "rtdb/type-size", "rtdb/value-size-overflow",
+    ];
+
+    const LIMIT_SUFFIXES: [&str; 9] = ["-size", "-overflow", "-limit", "-budget", "-bound", "-width", "-exceeded", "-too-large", "-capacity"];
+
+    /// The `rtdb*` codes a source file raises as `incorrect`, read from the literal that follows the constructor.
+    fn incorrect_codes(source: &str) -> Vec<&str> {
+        let mut codes = Vec::new();
+        for opener in ["Anomaly::incorrect(", "Category::Incorrect,"] {
+            for (start, _) in source.match_indices(opener) {
+                let rest = source[start + opener.len()..].trim_start();
+                let Some(literal) = rest.strip_prefix('"') else { continue };
+                let Some(end) = literal.find('"') else { continue };
+                if literal[..end].starts_with("rtdb") { codes.push(&literal[..end]); }
+            }
+        }
+        codes
+    }
+
+    fn rust_sources(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { rust_sources(&path, files); } else if path.extension().is_some_and(|extension| extension == "rs") { files.push(path); }
+        }
+    }
+
+    #[test]
+    fn no_rtdb_limit_code_reports_a_protocol_violation_unless_listed() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(crates).unwrap() {
+            let source = entry.unwrap().path().join("src");
+            if source.is_dir() { rust_sources(&source, &mut files); }
+        }
+        let mut limit_codes = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            limit_codes.extend(incorrect_codes(&text).into_iter().filter(|code| LIMIT_SUFFIXES.iter().any(|suffix| code.ends_with(suffix))).map(str::to_owned));
+        }
+        let reported = |code: &str| {
+            let error = Anomaly::incorrect(code, "detail");
+            let error = match AnomalyKind::from_wire_code(code) { Some(kind) => error.with_kind(kind), None => error };
+            state(&error).to_owned()
+        };
+        let unlisted = limit_codes.iter().filter(|code| reported(code) == "08P01" && !LIMIT_SHAPED_PROTOCOL_VIOLATIONS.contains(&code.as_str())).collect::<Vec<_>>();
+        assert!(unlisted.is_empty(), "limit codes reporting 08P01 without a kind: {unlisted:?}");
+        let stale = LIMIT_SHAPED_PROTOCOL_VIOLATIONS.iter().filter(|code| !limit_codes.contains(**code) || reported(code) != "08P01").collect::<Vec<_>>();
+        assert!(stale.is_empty(), "listed codes no longer raised, or now given a kind: {stale:?}");
+        for code in ["rtdb/list-offset-overflow", "rtdb.sql/batch-size", "rtdb.query/shared-plan-size", "rtdb/decimal-width"] {
+            assert_eq!(reported(code), "54000", "{code}");
+        }
+    }
 }
