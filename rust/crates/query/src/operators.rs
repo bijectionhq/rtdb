@@ -1002,11 +1002,32 @@ pub(crate) fn equality_cell_hash(value: &Value, timezone: &str) -> u32 {
             .fold(TEMPORAL_HASH ^ fields.len() as u32, |hash, value| combine_equality_hash(hash, equality_cell_hash(value, timezone))),
         // Ranges compare structurally; sets and maps do too, but their struct members compare regardless of field order.
         Value::TimestampTzRange { .. } => rtdb_columnar::hash_value(value, 0).map_or(TEMPORAL_HASH, |cell| cell as u32),
-        Value::Set(values) if holds_temporal(value) => TEMPORAL_HASH ^ values.len() as u32,
-        Value::Map { entries, .. } if holds_temporal(value) => TEMPORAL_HASH ^ entries.len() as u32,
+        Value::Set(_) | Value::Map { .. } if holds_temporal(value) => TEMPORAL_HASH ^ member_hash(value, timezone),
         value if holds_temporal(value) => TEMPORAL_HASH,
         value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
     }
+}
+
+/// A hash that a set's or map's members equal under `rows_equal` share whatever order they arrive in: set members and
+/// map entries add up rather than fold, and struct fields, which compare regardless of order there, add up by name.
+fn member_hash(value: &Value, timezone: &str) -> u32 {
+    let unordered = |tag: u32, len: usize, hashes: &mut dyn Iterator<Item = u32>| {
+        hashes.fold(tag ^ len as u32, |sum, hash| sum.wrapping_add(combine_equality_hash(0, hash)))
+    };
+    match value {
+        Value::Set(values) => unordered(0x51e7_0001, values.len(), &mut values.iter().map(|value| member_hash(value, timezone))),
+        Value::Map { entries, .. } => unordered(0x3a90_0002, entries.len(), &mut entries.iter()
+            .map(|(key, value)| combine_equality_hash(member_hash(key, timezone), member_hash(value, timezone)))),
+        Value::Struct(fields) => unordered(0x57c7_0003, fields.len(), &mut fields.iter()
+            .map(|(name, value)| combine_equality_hash(field_name_hash(name), member_hash(value, timezone)))),
+        Value::List(values) | Value::FixedSizeList(values) => values.iter()
+            .fold(0x11e7_0004 ^ values.len() as u32, |hash, value| combine_equality_hash(hash, member_hash(value.as_ref(), timezone))),
+        value => equality_cell_hash(value, timezone),
+    }
+}
+
+fn field_name_hash(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193))
 }
 
 pub(crate) fn combine_equality_hash(hash: u32, cell: u32) -> u32 {
@@ -1441,6 +1462,30 @@ mod equality_allocation_tests {
         let later = [holder(timestamp(86_400_000_001, Microsecond, None))];
         assert!(!rows_equal(&micros, &later, "UTC", &memory).unwrap());
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn sets_and_maps_of_date_times_hash_by_their_members_in_any_order() {
+        use rtdb_types::TimeUnit::{Microsecond, Millisecond};
+        let at = |seconds: i64| timestamp(seconds * 1_000_000, Microsecond, None);
+        let set = Value::Set(vec![at(1), at(2), Value::DateDay(3)]);
+        let reordered = Value::Set(vec![Value::DateDay(3), timestamp(2_000, Millisecond, None), at(1)]);
+        assert_eq!(equality_hash(&[set], "UTC"), equality_hash(&[reordered], "UTC"));
+        let structs = |first: bool| {
+            let fields = [("at".to_owned(), at(1)), ("n".to_owned(), Value::I64(1))];
+            let fields = if first { fields } else { let [a, b] = fields; [b, a] };
+            Value::Set(vec![Value::Struct(rtdb_types::StructFields::from(fields))])
+        };
+        assert_eq!(equality_hash(&[structs(true)], "UTC"), equality_hash(&[structs(false)], "UTC"));
+        let map = |entries: Vec<(Value, Value)>| Value::Map { entries, sorted: false };
+        assert_eq!(
+            equality_hash(&[map(vec![(Value::I64(1), at(1)), (Value::I64(2), at(2))])], "UTC"),
+            equality_hash(&[map(vec![(Value::I64(2), at(2)), (Value::I64(1), at(1))])], "UTC"),
+        );
+        let sets: std::collections::HashSet<u32> = (0..1_000i64)
+            .map(|second| equality_hash(&[Value::Set(vec![at(second), at(second + 1)])], "UTC"))
+            .collect();
+        assert!(sets.len() > 990, "same-size sets spread: {} distinct hashes", sets.len());
     }
 
     #[test]
