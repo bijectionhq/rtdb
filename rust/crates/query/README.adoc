@@ -353,6 +353,8 @@ The source fixtures in `rtdb-sql/tests/explain.rs` and `rtdb-node/tests/explain.
 Private page and replay tests cover retained-buffer lifetime and cancellation while materialization is suspended.
 These tests have not run.
 Full optimizer equivalence, including decorrelation, projection fusion, symbol allocation, and scan-column order, remains unqualified.
+Decorrelation ports the reference's rules 1, 2, 8 and 9, `apply-table-col->unnest`, `select-mark-join->semi-join` and selection pushdown past applies: a correlated scalar subquery becomes a single join, which keeps its cardinality check, and a lateral subquery over an aggregate with groups becomes a grouping over the join with numbered input rows.
+A dependent plan with a volatile call, and an ungrouped aggregate under a lateral join, keep their applies.
 Append projections, windows and UNNEST retain the input columns required by their expressions and those requested by their parents.
 For conjunctive filters, expressions with fewer column dependencies can reach the scan before multi-column expressions.
 Scan explanations use the reference traversal order of the symbol set and the resulting text set.

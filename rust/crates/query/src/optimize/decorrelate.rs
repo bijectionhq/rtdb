@@ -5,7 +5,7 @@
 //! A rule answers `Ok(None)` where it does not apply, which keeps the apply; an error building a rewrite fails the plan.
 
 use std::sync::Arc;
-use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, JoinKind, NamedExpr, OrdinalityScope, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, CastTarget, ColumnId, Expr, Field, JoinKind, NamedExpr, OrdinalityScope, PercentileFraction, Relation, RelationNode, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use super::{Ids, with_children};
 
@@ -45,10 +45,17 @@ impl Correlation<'_> {
         while let Some(relation) = pending.pop() {
             let mut found = false;
             each_expression(relation, &mut |expression| found |= self.in_expression(expression));
+            if let RelationNode::Aggregate { aggregates, .. } = relation.node() { found |= self.in_fractions(aggregates); }
             if found { return true; }
             pending.extend(relation.children().into_iter().map(Arc::as_ref));
         }
         false
+    }
+
+    /// Whether a percentile reads its fraction from a bound parameter, which no expression can replace.
+    fn in_fractions(&self, aggregates: &[AggregateExpr]) -> bool {
+        aggregates.iter().any(|aggregate| matches!(&aggregate.function,
+            AggregateFunction::Percentile { fraction: PercentileFraction::Parameter { index }, .. } if self.binds(*index)))
     }
 
     /// Replaces each bound parameter with the input expression it is bound to.
@@ -106,21 +113,28 @@ fn numbers_rows(expression: &Expr) -> bool {
 
 /// The apply rebuilt over its rewritten children, as a join where one of the reference's rules applies.
 fn apply(input: Arc<Relation>, dependent: Arc<Relation>, arguments: &[(usize, Expr)], kind: ApplyKind, output: Option<&Field>, schema: &Schema, ids: &mut Ids) -> Result<Arc<Relation>> {
-    let applied = Arc::new(Relation::new(schema.clone(), RelationNode::Apply {
-        input: Arc::clone(&input), dependent: Arc::clone(&dependent), arguments: arguments.to_vec(), kind, output: output.cloned(),
-    })?);
-    if !movable(&dependent) { return Ok(applied); }
+    if let Some(rewritten) = rewrite(&input, &dependent, arguments, kind, output, schema, ids)? { return Ok(rewritten); }
+    Ok(Arc::new(Relation::new(schema.clone(), RelationNode::Apply { input, dependent, arguments: arguments.to_vec(), kind, output: output.cloned() })?))
+}
+
+/// The apply as a join, where one of the reference's rules applies.
+fn rewrite(input: &Arc<Relation>, dependent: &Arc<Relation>, arguments: &[(usize, Expr)], kind: ApplyKind, output: Option<&Field>, schema: &Schema, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    if !movable(dependent) { return Ok(None); }
     let correlation = Correlation { arguments };
-    let attempt = if !correlation.references(&dependent) {
-        uncorrelated(&input, &dependent, kind, output, schema)
-    } else {
-        match (kind, output) {
-            (ApplyKind::Inner | ApplyKind::Left | ApplyKind::Semi | ApplyKind::Anti, _) => lateral(&input, &dependent, &correlation, kind, schema),
-            (ApplyKind::Scalar, Some(output)) => scalar_aggregate(&input, &dependent, &correlation, output, ids),
-            _ => Ok(None),
+    if !correlation.references(dependent) { return uncorrelated(input, dependent, kind, output, schema); }
+    match (kind, output) {
+        (ApplyKind::Inner, _) => {
+            if let Some(joined) = lateral(input, dependent, &correlation, kind, schema)? { return Ok(Some(joined)); }
+            if let Some(unnested) = column_table(input, dependent, &correlation, ids)? { return restore(unnested, schema); }
+            grouped_lateral(input, dependent, &correlation, schema, ids)
         }
-    };
-    Ok(attempt?.unwrap_or(applied))
+        (ApplyKind::Left | ApplyKind::Single | ApplyKind::Semi | ApplyKind::Anti, _) => lateral(input, dependent, &correlation, kind, schema),
+        (ApplyKind::Scalar, Some(output)) => match scalar_aggregate(input, dependent, &correlation, output, ids)? {
+            Some(grouped) => Ok(Some(grouped)),
+            None => scalar_single(input, dependent, &correlation, output, ids),
+        },
+        _ => Ok(None),
+    }
 }
 
 /// Rule 1: `R A⊗ E = R ⊗ E` where E reads no parameter bound from R.
@@ -151,6 +165,7 @@ fn lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Corre
         ApplyKind::Inner => JoinKind::Inner,
         // Over the rows a left join supplies nulls for, a projection could compute a value the apply would not.
         ApplyKind::Left if spanning && lifted.computed.is_empty() => JoinKind::Left,
+        ApplyKind::Single if spanning && lifted.computed.is_empty() => JoinKind::Single,
         ApplyKind::Semi if spanning => JoinKind::Semi,
         ApplyKind::Anti if spanning => JoinKind::Anti,
         _ => return Ok(None),
@@ -181,7 +196,7 @@ fn scalar_aggregate(input: &Arc<Relation>, dependent: &Arc<Relation>, correlatio
         _ => return Ok(None),
     };
     let RelationNode::Aggregate { input: source, groups, aggregates } = aggregate.node() else { return Ok(None) };
-    if !groups.is_empty() || !aggregates.iter().all(empty_group_safe) { return Ok(None); }
+    if !groups.is_empty() || !aggregates.iter().all(empty_group_safe) || correlation.in_fractions(aggregates) { return Ok(None); }
     if input.schema().fields().iter().any(|field| rtdb_plan::validate_equality_types(&field.data_type, &field.data_type).is_err()) { return Ok(None); }
     let Some(lifted) = lift(source, correlation, false)? else { return Ok(None) };
     let conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
@@ -215,6 +230,107 @@ fn scalar_aggregate(input: &Arc<Relation>, dependent: &Arc<Relation>, correlatio
     let expressions = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
         .chain([NamedExpr { field: output.clone(), expr: value }]).collect();
     Ok(Some(Arc::new(grouped.project(expressions)?)))
+}
+
+/// Rule 2 for a scalar subquery: `R A_scalar (π v (σp E)) = π columns(R),v (R ⟕¹p E)` where E reads no parameter bound
+/// from R, as the reference's single-join apply becomes a single join.
+/// The single join rejects an input row that more than one row of E matches, as the apply's cardinality check does.
+fn scalar_single(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, output: &Field, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    let [source] = dependent.schema().fields() else { return Ok(None) };
+    let Some(lifted) = lift(dependent, correlation, false)? else { return Ok(None) };
+    let conditions: Vec<Expr> = lifted.filters.into_iter().map(|filter| correlation.substitute(filter)).collect();
+    if !spans(&conditions, input.schema(), lifted.base.schema()) { return Ok(None); }
+    let computed = lifted.computed.into_iter().find(|named| named.field.id == source.id).map(|named| correlation.substitute(named.expr));
+    let (right, matched) = match &computed {
+        // Over the rows the join supplies nulls for, a computed value must stay null, as the apply's empty result is.
+        Some(value) if !matches!(value, Expr::Column { .. }) => {
+            let matched = hidden(ids.next()?, "_dep_countable", LogicalType::Scalar(ScalarType::Bool));
+            (Arc::new(Arc::clone(&lifted.base).extend(vec![NamedExpr { field: matched.clone(), expr: Expr::Literal(Value::Bool(true)) }])?), Some(matched))
+        }
+        _ => (lifted.base, None),
+    };
+    let joined = Arc::new(Relation::join(Arc::clone(input), right, JoinKind::Single, conjunction(conditions))?);
+    let value = match (computed, matched) {
+        (Some(value), Some(matched)) => Expr::Case { branches: vec![(Expr::unary(UnaryOp::IsNull, matched.expression()), Expr::Literal(Value::Null))], otherwise: Box::new(value) },
+        (Some(value), None) => value,
+        (None, _) => match joined.schema().get(source.id) { Some(field) => field.expression(), None => return Ok(None) },
+    };
+    let expressions = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+        .chain([NamedExpr { field: output.clone(), expr: value }]).collect();
+    Ok(Some(Arc::new(joined.project(expressions)?)))
+}
+
+/// Rule 8: `R A× (G A,F E) = G A ∪ columns(R),F (R A× E)`, for a lateral subquery over an aggregate with groups.
+/// The ordinality the input is numbered with keeps duplicate input rows in groups of their own.
+/// An aggregate without groups gives a row even for an input row E is empty for, which the grouped form would drop.
+fn grouped_lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, schema: &Schema, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    let (projection, aggregate) = match dependent.node() {
+        RelationNode::Project { input: aggregate, expressions } if matches!(aggregate.node(), RelationNode::Aggregate { .. }) => (Some(expressions), aggregate),
+        _ => (None, dependent),
+    };
+    let RelationNode::Aggregate { input: source, groups, aggregates } = aggregate.node() else { return Ok(None) };
+    if groups.is_empty() || correlation.in_fractions(aggregates) { return Ok(None); }
+    if projection.is_some_and(|expressions| expressions.iter().any(|named| numbers_rows(&named.expr))) { return Ok(None); }
+    if input.schema().fields().iter().any(|field| rtdb_plan::validate_equality_types(&field.data_type, &field.data_type).is_err()) { return Ok(None); }
+    let number = hidden(ids.next()?, "_row_number", LogicalType::Scalar(ScalarType::I64));
+    let numbered = Arc::new(Arc::clone(input).with_ordinality(number.clone(), OrdinalityScope::Relation)?);
+    let applied = ApplyKind::Inner.result_schema(numbered.schema(), source.schema(), None)?;
+    let Some(rows) = rewrite(&numbered, source, correlation.arguments, ApplyKind::Inner, None, &applied, ids)? else { return Ok(None) };
+    let carried = || input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() });
+    let groups: Vec<NamedExpr> = carried().chain([NamedExpr { field: number.clone(), expr: number.expression() }])
+        .chain(groups.iter().map(|group| NamedExpr { field: group.field.clone(), expr: correlation.substitute(group.expr.clone()) })).collect();
+    let aggregates: Vec<AggregateExpr> = aggregates.iter().map(|aggregate| AggregateExpr {
+        filter: aggregate.filter.clone().map(|filter| correlation.substitute(filter)), ..aggregate.clone()
+    }).collect();
+    let grouped_schema = Schema::new(groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|aggregate| aggregate.field.clone())).collect())?;
+    let grouped = Arc::new(Relation::new(grouped_schema, RelationNode::Aggregate { input: rows, groups, aggregates })?);
+    let expressions: Vec<NamedExpr> = match projection {
+        Some(expressions) => carried().chain(expressions.iter().map(|named| NamedExpr { field: named.field.clone(), expr: correlation.substitute(named.expr.clone()) })).collect(),
+        None => carried().chain(aggregate.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })).collect(),
+    };
+    restore(Arc::new(grouped.project(expressions)?), schema)
+}
+
+/// `apply-table-col->unnest`: `R A× T(l)`, the table of the elements of a list `l` read from R, as `μ l (R)`, with the
+/// table's row numbers as the unnest's ordinality, and the selections and projections over the table evaluated over the
+/// unnest.
+fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    match dependent.node() {
+        RelationNode::Filter { input: table, predicate } => {
+            let Some(unnested) = column_table(input, table, correlation, ids)? else { return Ok(None) };
+            Ok(Some(Arc::new(unnested.filter(correlation.substitute(predicate.clone()))?)))
+        }
+        RelationNode::Project { input: table, expressions } => {
+            if expressions.iter().any(|named| numbers_rows(&named.expr)) { return Ok(None); }
+            let Some(unnested) = column_table(input, table, correlation, ids)? else { return Ok(None) };
+            let expressions = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+                .chain(expressions.iter().map(|named| NamedExpr { field: named.field.clone(), expr: correlation.substitute(named.expr.clone()) })).collect();
+            Ok(Some(Arc::new(unnested.project(expressions)?)))
+        }
+        RelationNode::ColumnTable { expr, element } => unnest(input, expr, element, None, correlation, ids),
+        RelationNode::Ordinality { input: table, field, scope: OrdinalityScope::Page } => match table.node() {
+            RelationNode::ColumnTable { expr, element } => unnest(input, expr, element, Some(field), correlation, ids),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// The elements of the list `expr` reads from each input row, the input row's columns beside each, and the element's
+/// position where `ordinality` names a column for it.
+fn unnest(input: &Arc<Relation>, expr: &Expr, element: &Field, ordinality: Option<&Field>, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    let list = correlation.substitute(expr.clone());
+    let staged = hidden(ids.next()?, "_unnest", list.data_type());
+    let extended = Arc::new(Arc::clone(input).extend(vec![NamedExpr { field: staged.clone(), expr: list }])?);
+    // An unnest numbers its elements as 32-bit integers, and a row-numbered table as 64-bit ones.
+    let position = match ordinality { Some(_) => Some(hidden(ids.next()?, "_ordinal", LogicalType::Scalar(ScalarType::I32))), None => None };
+    let fields = extended.schema().fields().iter().cloned().chain([element.clone()]).chain(position.clone()).collect();
+    let unnested = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Unnest {
+        input: extended, expr: staged.expression(), element: element.clone(), ordinality: position.clone(), outer: false,
+    })?);
+    let (Some(ordinality), Some(position)) = (ordinality, position) else { return Ok(Some(unnested)) };
+    let cast = Expr::Cast { expr: Box::new(position.expression()), target: CastTarget::Fixed(ordinality.data_type.clone()) };
+    Ok(Some(Arc::new(unnested.extend(vec![NamedExpr { field: ordinality.clone(), expr: cast }])?)))
 }
 
 /// Whether the aggregate over a group whose rows its filter rejects gives what it gives over an empty input.

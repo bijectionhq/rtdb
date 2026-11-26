@@ -105,6 +105,44 @@ fn scalar(dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>) -> Arc<Relati
     apply(&customers(), dependent, arguments, ApplyKind::Scalar, Some(output))
 }
 
+fn grouped(input: Arc<Relation>, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>) -> Arc<Relation> {
+    let schema = Schema::new(groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|aggregate| aggregate.field.clone())).collect()).unwrap();
+    Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups, aggregates }).unwrap())
+}
+
+fn lookup_key() -> Field { integer(30, "key") }
+fn lookup_name() -> Field { integer(31, "name") }
+
+/// A table with at most one row per key, and keys no customer has.
+fn lookup() -> Arc<Relation> {
+    values(vec![lookup_key(), lookup_name()], &[&[Some(1), Some(100)], &[Some(3), None], &[Some(6), Some(600)], &[None, Some(700)]])
+}
+
+/// The lookup row of the customer bound to parameter 0.
+fn customer_lookup() -> Arc<Relation> { select(lookup(), equals(lookup_key().expression(), parameter(0, &customer_id()))) }
+
+fn tags() -> Field { typed(40, "tags", LogicalType::list(int().maybe()).maybe()) }
+
+/// Customers with a list of tags each: several, none, null, and one with a null element; one customer appears twice.
+fn tagged() -> Arc<Relation> {
+    let list = |elements: &[Option<i64>]| Expr::Literal(Value::list(elements.iter().map(|element| element.map_or(Value::Null, Value::I64)).collect()));
+    let rows = vec![
+        vec![literal(1), list(&[Some(10), Some(20)])], vec![literal(2), list(&[])], vec![literal(3), Expr::Literal(Value::Null)],
+        vec![literal(4), list(&[Some(30), None])], vec![literal(4), list(&[Some(30), None])],
+    ];
+    Arc::new(Relation::new(Schema::new(vec![customer_id(), tags()]).unwrap(), RelationNode::Values { rows }).unwrap())
+}
+
+/// `SELECT t.*, u.* FROM t JOIN LATERAL UNNEST(t.tags) [WITH ORDINALITY] AS u ON <selected>`, as an apply over the tag
+/// table, binding the tags to parameter 0 and the customer to parameter 1.
+fn unnested(numbered: bool, selected: Option<Expr>) -> Arc<Relation> {
+    let element = integer(41, "tag");
+    let table = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(), RelationNode::ColumnTable { expr: parameter(0, &tags()), element }).unwrap());
+    let table = if numbered { Arc::new(table.with_ordinality(typed(42, "n", int()), rtdb_plan::OrdinalityScope::Page).unwrap()) } else { table };
+    let table = match selected { Some(predicate) => select(table, predicate), None => table };
+    apply(&tagged(), table, vec![(0, tags().expression()), (1, customer_id().expression())], ApplyKind::Inner, None)
+}
+
 /// Each correlated query, and whether its applies are all rewritten into joins.
 fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
     let count = typed(12, "count", int());
@@ -113,6 +151,16 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
     let summed = aggregate(customer_orders(), vec![counted(total.clone(), AggregateFunction::Sum, Some(order_amount().expression()), None)]);
     let large = Expr::binary(BinaryOp::Gt, order_amount().expression(), parameter(1, &customer_region()));
     let distinct = Arc::new(Relation::new(Schema::new(vec![order_customer()]).unwrap(), RelationNode::Distinct { input: keep(customer_orders(), &[order_customer()]) }).unwrap());
+    let amount_group = integer(21, "amount_group");
+    let per_amount = grouped(customer_orders(), vec![NamedExpr { field: amount_group.clone(), expr: order_amount().expression() }],
+        vec![counted(typed(22, "per_amount", int()), AggregateFunction::CountStar, None, None)]);
+    let shifted = integer(23, "shifted");
+    let per_amount_shifted = Arc::new(Arc::clone(&per_amount).project(vec![
+        NamedExpr { field: amount_group.clone(), expr: amount_group.expression() },
+        NamedExpr { field: shifted.clone(), expr: Expr::binary(BinaryOp::Add, typed(22, "per_amount", int()).expression(), parameter(1, &customer_region())) },
+    ]).unwrap());
+    let defaulted = Expr::Coalesce(vec![lookup_name().expression(), literal(0)]);
+    let defaulted_name = Arc::new(customer_lookup().project(vec![NamedExpr { field: typed(32, "defaulted", defaulted.data_type()), expr: defaulted }]).unwrap());
     vec![
         ("exists", exists(one(customer_orders()), by_customer(), false, None), true),
         ("not exists", exists(one(customer_orders()), by_customer(), true, None), true),
@@ -137,7 +185,16 @@ fn corpus() -> Vec<(&'static str, Arc<Relation>, bool)> {
         ("in", quantified(false, true), true),
         ("not in", quantified(true, true), true),
         ("in as a value", quantified(false, false), true),
-        ("scalar subquery of several rows", scalar(keep(customer_orders(), &[order_amount()]), by_customer()), false),
+        ("scalar subquery of several rows", scalar(keep(customer_orders(), &[order_amount()]), by_customer()), true),
+        ("scalar value of at most one row", scalar(keep(customer_lookup(), &[lookup_name()]), by_customer()), true),
+        ("scalar computed value", scalar(defaulted_name, by_customer()), true),
+        ("lateral single", apply(&customers(), customer_lookup(), by_customer(), ApplyKind::Single, None), true),
+        ("lateral grouped", apply(&customers(), Arc::clone(&per_amount), by_customer(), ApplyKind::Inner, None), true),
+        ("lateral grouped with a correlated projection", apply(&customers(), per_amount_shifted,
+            vec![(0, customer_id().expression()), (1, customer_region().expression())], ApplyKind::Inner, None), true),
+        ("lateral unnest", unnested(false, None), true),
+        ("lateral unnest with ordinality", unnested(true, None), true),
+        ("lateral unnest with a correlated selection", unnested(true, Some(Expr::binary(BinaryOp::Gt, integer(41, "tag").expression(), parameter(1, &customer_id())))), true),
     ]
 }
 
@@ -229,6 +286,37 @@ fn a_correlated_aggregate_becomes_a_grouped_left_join_over_numbered_input_rows()
     assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Ordinality { scope: rtdb_plan::OrdinalityScope::Relation, .. })), 1);
     assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Aggregate { groups, .. } if groups.len() == 3)), 1,
         "grouped by both customer columns and the row number");
+}
+
+#[test]
+fn a_correlated_scalar_value_becomes_a_single_join() {
+    let prepared = prepare(scalar(keep(customer_lookup(), &[lookup_name()]), by_customer())).unwrap();
+    assert_eq!((applies(&prepared), joins(&prepared, JoinKind::Single)), (0, 1), "{prepared:?}");
+}
+
+#[test]
+fn a_correlated_grouped_lateral_becomes_a_grouping_over_numbered_input_rows() {
+    let per_amount = grouped(customer_orders(), vec![NamedExpr { field: integer(21, "amount_group"), expr: order_amount().expression() }],
+        vec![counted(typed(22, "per_amount", int()), AggregateFunction::CountStar, None, None)]);
+    let prepared = prepare(apply(&customers(), per_amount, by_customer(), ApplyKind::Inner, None)).unwrap();
+    assert_eq!(applies(&prepared), 0, "{prepared:?}");
+    assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Aggregate { groups, .. } if groups.len() == 4)), 1,
+        "grouped by both customer columns, the row number and the subquery's own group");
+}
+
+#[test]
+fn a_lateral_list_table_becomes_an_unnest() {
+    let prepared = prepare(unnested(true, None)).unwrap();
+    assert_eq!(applies(&prepared), 0, "{prepared:?}");
+    assert_eq!(count_nodes(&prepared, &|node: &RelationNode| matches!(node, RelationNode::Unnest { ordinality: Some(_), outer: false, .. })), 1, "{prepared:?}");
+}
+
+#[test]
+fn an_ungrouped_lateral_aggregate_keeps_its_apply() {
+    // It has a row for every customer, including those without orders, which a grouping over the join would drop.
+    let count = aggregate(customer_orders(), vec![counted(typed(12, "count", int()), AggregateFunction::CountStar, None, None)]);
+    let prepared = prepare(apply(&customers(), count, by_customer(), ApplyKind::Inner, None)).unwrap();
+    assert_eq!(applies(&prepared), 1, "{prepared:?}");
 }
 
 #[test]

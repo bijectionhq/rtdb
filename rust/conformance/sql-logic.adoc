@@ -58,7 +58,7 @@ The existing 384MiB capacity/admission witness remains unchanged for nonmetadata
 Missing tables and columns remain production errors.
 Direct mode submits original SQL unchanged.
 Both requested `decorrelate?` variants execute separately through the native production Apply operators.
-The native engine has no decorrelation optimizer; these result assertions establish no optimizer, performance, or plan-golden parity.
+These result assertions establish no optimizer, performance, or plan-golden parity with the reference's decorrelation.
 
 == Pinned validation rules
 
