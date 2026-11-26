@@ -27,6 +27,13 @@ async fn query(context: &Arc<QueryContext>, sql: &str) -> Result<Vec<StructField
     Ok(rows)
 }
 fn op(name: &str) -> Value { Value::Keyword(Keyword::from_name(name)) }
+/// The operators that pass their input pages through without allocating, so may report a peak of zero; every other
+/// operator allocates its own output and must report a positive peak.
+const PASS_THROUGH_OPERATORS: [&str; 2] = ["project", "rename"];
+fn assert_operator_peak(row: &StructFields<Value>) {
+    let pass_through = PASS_THROUGH_OPERATORS.iter().any(|name| row["op"] == op(name));
+    assert!(matches!(row["peak_memory_bytes"], Value::I64(value) if value > 0 || pass_through && value == 0), "{row:?}");
+}
 
 #[tokio::test]
 async fn analyze_distinguishes_independent_scalar_join_and_correlated_apply() {
@@ -191,14 +198,24 @@ async fn api_test_explain_analyze_counts_production_pages_and_subtracts_direct_c
         assert_eq!(row["page_count"], Value::I64(1));
         assert_eq!(row["row_count"], Value::I64(3));
         assert!(matches!(row["time_to_first_page"], Value::Duration { .. }));
-        let own_allocation = row["op"] == op("table");
-        assert!(matches!(row["peak_memory_bytes"], Value::I64(value) if value > 0 || !own_allocation && value == 0), "{row:?}");
+        assert_operator_peak(row);
         let children = rows[index + 1..].iter().take_while(|child| depth(child) > depth(row)).filter(|child| depth(child) == depth(row) + 2);
         assert_eq!(duration(&row["self_time"]), duration(&row["total_time"]) - children.map(|child| duration(&child["total_time"])).sum::<i64>());
     }
     assert!(rows.windows(2).all(|rows| rows[0]["query_peak_memory_bytes"] == rows[1]["query_peak_memory_bytes"]));
     assert!(rows.iter().all(|row| matches!((&row["peak_memory_bytes"], &row["query_peak_memory_bytes"]),
         (Value::I64(op_peak), Value::I64(query_peak)) if op_peak < query_peak)));
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn explain_analyze_reports_a_positive_peak_for_each_allocating_operator() {
+    let context = context(2);
+    let rows = query(&context, "EXPLAIN ANALYZE SELECT n, COUNT(*) AS c FROM (VALUES (3), (1), (2), (1)) AS t(n) GROUP BY n ORDER BY n").await.unwrap();
+    for names in [&["order-by", "sort"][..], &["group-by"], &["table"]] {
+        assert!(rows.iter().any(|row| names.iter().any(|name| row["op"] == op(name))), "{names:?} in {rows:?}");
+    }
+    for row in &rows { assert_operator_peak(row); }
     assert_eq!(context.memory.used_bytes(), 0);
 }
 
