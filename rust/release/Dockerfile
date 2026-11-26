@@ -78,6 +78,9 @@ ENTRYPOINT ["/usr/local/bin/rtdb-multi-entrypoint"]
 LABEL io.rtdb.held-root-catalog=true
 
 FROM runtime-environment AS runtime
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y wget \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /source/rust/target/release/rtdb /usr/local/bin/rtdb
 COPY --from=build /source/rust/target/release/rtdb-config /usr/local/bin/rtdb-config
 COPY --from=build /source/rust/target/release/librtdb_ffi.so /usr/local/lib/librtdb_ffi.so
@@ -89,5 +92,8 @@ ENV LD_PRELOAD=libjemalloc.so.2
 ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 USER rtdb
 EXPOSE 5432 3000 8080
+VOLUME /var/lib/rtdb
+HEALTHCHECK --start-period=15s --timeout=3s \
+    CMD wget -q --spider http://localhost:8080/healthz/alive || exit 1
 ENTRYPOINT ["/usr/local/bin/rtdb"]
 CMD ["node", "--file", "/etc/rtdb/config.yaml"]

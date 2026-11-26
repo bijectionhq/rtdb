@@ -105,6 +105,17 @@ fn cluster_default_image_config_funds_the_required_remote_disk_cache() {
 }
 
 #[test]
+fn default_image_config_starts_without_a_password_and_takes_xtdb_password_like_upstream() {
+    let image = include_str!("../../../release/default.yaml");
+    let config = NodeConfiguration::from_yaml_with_environment(image, &|_| None, false).unwrap();
+    assert!(matches!(config.auth, AuthConfig::SingleRootUser { password: None }));
+    let config = NodeConfiguration::from_yaml_with_environment(image, &|name| (name == "XTDB_PASSWORD").then(|| "from-env".into()), false).unwrap();
+    let AuthConfig::SingleRootUser { password: Some(password) } = config.auth else { panic!("XTDB_PASSWORD sets the root password") };
+    assert_eq!(password.expose(), "from-env");
+    assert_eq!(config.health.unwrap().port, 8080);
+}
+
+#[test]
 fn startup_defaults_match_the_pinned_factories() {
     let config = decode("{}").unwrap();
     assert_eq!(config.server.unwrap().port, 0);

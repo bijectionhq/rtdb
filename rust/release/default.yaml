@@ -11,5 +11,3 @@ flightSql:
 healthz:
   host: 0.0.0.0
   port: 8080
-authn: !SingleRootUser
-  password: !Env RTDB_ROOT_PASSWORD

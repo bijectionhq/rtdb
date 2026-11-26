@@ -59,9 +59,12 @@ Build success leaves qualification at `built_unqualified`; the package makes no 
 Reproducibility requires rerunning the same selection and comparing artifacts; a recorded recipe alone does not establish byte-identical builds.
 
 The default native image starts a local persistent node using `/var/lib/rtdb/log` and `/var/lib/rtdb/storage`.
-Mount persistent storage at `/var/lib/rtdb` with ownership for UID/GID 20000.
-Set `RTDB_ROOT_PASSWORD` for the default root account or mount an explicit configuration and select it with `node --file`.
+Mount persistent storage at `/var/lib/rtdb` with ownership for UID/GID 20000; the image declares it as a volume, as upstream's declares `/var/lib/xtdb`.
+As in upstream's image, the default root account trusts every connection unless `XTDB_PASSWORD` is set, in which case it requires that password; mount an explicit configuration and select it with `node --file` for anything else.
+The cluster configurations still read the root password from `RTDB_ROOT_PASSWORD`, which the Terraform module supplies.
 The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
+Its `HEALTHCHECK` polls `/healthz/alive` with `wget` after a fifteen-second start period, as upstream's does.
+Logs go to stdout; `XTDB_LOG_FORMAT=json` and `XTDB_LOGGING_LEVEL[_NS]` behave as upstream's.
 The image uses jemalloc with a background purge thread, a one-second dirty-page decay and immediate release of muzzy pages.
 `playground --port 5439 --flight-sql-port 3000` selects the original client-suite mode.
 The process receives SIGTERM directly and drains its database and listener owners before returning.
