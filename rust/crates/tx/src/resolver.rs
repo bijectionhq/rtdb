@@ -4831,6 +4831,8 @@ impl<'a> OutputColumn<'a> {
                 }
                 Ok(Value::Struct(values))
             }
+            // A Null-typed column (all of its cells null) has the bottom logical type, which the reader refuses to read.
+            Self::Cells(_, array) if array.data_type() == &arrow_schema::DataType::Null => Ok(Value::Null),
             Self::Cells(reader, array) => reader.read(*array, row),
             Self::Iids(array) => Ok(if array.is_null(row) { Value::Null } else { Value::FixedSizeBinary(array.value(row).to_vec()) }),
             Self::Times(array) => Ok(if array.is_null(row) { Value::Null } else { time_value(Timestamp(array.value(row))) }),
