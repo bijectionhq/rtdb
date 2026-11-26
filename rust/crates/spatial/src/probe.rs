@@ -586,7 +586,7 @@ mod tests {
             vec![Arc::new(NullArray::new(1)), Arc::new(StringArray::from(vec!["text"]))],
         ).unwrap();
         let wrapped = StructArray::new(
-            vec![Arc::new(Field::new("v2_value", union.data_type().clone(), false))].into(),
+            vec![Arc::new(Field::new("v2_value", union.data_type().clone(), true))].into(),
             vec![Arc::new(union)],
             None,
         );
