@@ -1596,22 +1596,45 @@ impl ReplicationDriver {
                     let placed = self.check_placed_terminal(record.envelope.term, message)?;
                     let leading = self.leader.is_some();
                     let own = own_readback_term(self.leader.as_ref().map(|leader| leader.term.0), record.envelope.term.0);
-                    let expected_tx_id = message.tx_id.unwrap_or_default();
-                    let expected_source = SourcePosition(crate::replay_progress::replayed_source(
-                        message.src_msg_id,
-                        self.config.external_source,
-                        self.progress.source_position().0,
-                        expected_tx_id,
-                    ));
-                    let expected_image = chain_tx_image_digest(
-                        self.applied_image.expected_digest,
-                        record.metadata.position,
-                        expected_tx_id,
-                        message.system_time_micros.unwrap_or_default(),
-                        message.committed.unwrap_or_default(),
-                        expected_source,
-                        message.table_data.keys().map(String::as_str),
-                    );
+                    // The leader's own read-back is authenticated by its fingerprint and may carry no decoded body,
+                    // so its expected image is the resolved transaction it appended.
+                    let own_resolved = own.then(|| self.leader.as_ref()
+                        .and_then(|leader| leader.pending_tx_at(record.envelope.term_sequence))
+                        .map(|(_, resolved)| Arc::clone(resolved))).flatten();
+                    let expected_image = match &own_resolved {
+                        Some(resolved) => {
+                            let key = resolved.result().tx_key();
+                            let names: Vec<String> = resolved.writes().tables().keys()
+                                .map(|table| format!("{}/{}", table.schema, table.table)).collect();
+                            chain_tx_image_digest(
+                                self.applied_image.expected_digest,
+                                record.metadata.position,
+                                key.tx_id.0,
+                                key.system_time.0,
+                                resolved.result().committed(),
+                                resolved.source_position(),
+                                names.iter().map(String::as_str),
+                            )
+                        }
+                        None => {
+                            let expected_tx_id = message.tx_id.unwrap_or_default();
+                            let expected_source = SourcePosition(crate::replay_progress::replayed_source(
+                                message.src_msg_id,
+                                self.config.external_source,
+                                self.progress.source_position().0,
+                                expected_tx_id,
+                            ));
+                            chain_tx_image_digest(
+                                self.applied_image.expected_digest,
+                                record.metadata.position,
+                                expected_tx_id,
+                                message.system_time_micros.unwrap_or_default(),
+                                message.committed.unwrap_or_default(),
+                                expected_source,
+                                message.table_data.keys().map(String::as_str),
+                            )
+                        }
+                    };
                     if !self.applied_image.observe_authenticated(record.metadata.position.0, expected_image) {
                         return Err(invalid("Authenticated transaction record regressed the applied image chain"));
                     }
