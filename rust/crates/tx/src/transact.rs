@@ -12,7 +12,8 @@ pub use rtdb_index::branches::{
     store::{KeyRange, StoreBound, StoreWrite},
 };
 use rtdb_index::branches::store::{
-    StoreStamp, VALUE_COLUMN, check_bounds, check_placeholders, decode_bound_value, stamp_writes, store_table,
+    StoreStamp, VALUE_COLUMN, check_bounds, check_derives, check_placeholders, decode_bound_value, resolve_derives, stamp_writes,
+    store_table,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
@@ -338,6 +339,8 @@ pub struct StoreAppend {
     pub writes: Vec<StoreWrite>,
     #[serde(default)]
     pub bounds: Vec<StoreBound>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derives: Vec<Vec<u8>>,
     pub window: Window,
 }
 
@@ -1403,8 +1406,9 @@ impl TransactState {
         }
         check_placeholders(&append.writes)?;
         check_bounds(&append.bounds)?;
+        let decoded_derives = check_derives(&append.derives, &append.writes)?;
         let head = view.index.head();
-        let mutates = !append.writes.is_empty() || !append.bounds.is_empty();
+        let mutates = !append.writes.is_empty() || !append.bounds.is_empty() || !decoded_derives.is_empty();
         let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
             key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
         };
@@ -1507,8 +1511,13 @@ impl TransactState {
         } else if commits {
             let stamp = StoreStamp { micros: now.0, version: position };
             let mut ops: Vec<Op> = Vec::new();
+            // Derived writes resolve at the ordering point against the line the
+            // prior state holds, after the reads, window and bounds are judged
+            // and before plain writes (T3). They never change the outcome.
+            let prior_view = view.index.view(MAIN_BRANCH, At::Latest, Layer::Merged, guard_time)?;
+            let derived = resolve_derives(&prior_view, &decoded_derives, stamp)?;
             let bound_writes = bound_updates.into_iter().map(|(key, next)| (key, Some(next.to_be_bytes().to_vec())));
-            for (key, value) in stamp_writes(&append.writes, stamp)?.into_iter().chain(bound_writes) {
+            for (key, value) in derived.into_iter().chain(stamp_writes(&append.writes, stamp)?).chain(bound_writes) {
                 let id = EntityId::Binary(key);
                 // Consecutive puts and deletes keep their order, so a later write of a key wins.
                 match (value, ops.last_mut()) {

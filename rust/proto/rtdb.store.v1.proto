@@ -156,6 +156,15 @@ message AppendRequest {
   // version after the reads and window. A bound with min > max fails with
   // INVALID_ARGUMENT before anything is ordered.
   repeated Bound bounds = 7;
+  // Derived writes (vendor/bijection-store-derive, T3): each entry is an
+  // encoded store_read::derive::Derive. Applied in order after the reads, window
+  // and bounds are judged and before plain writes. Never change the append's
+  // outcome, and emitted writes do not count toward any request size limit.
+  repeated bytes derives = 8;
+  // Optional SHA-256 digest of Bijection's store_read::derive source; when
+  // present it must match RTDB's vendored DERIVE_DIGEST or the append fails
+  // with rtdb.store/derive-version.
+  optional string derive_digest = 9;
 }
 
 message AppendReply {

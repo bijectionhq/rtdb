@@ -33,10 +33,29 @@ Concurrent `Bound`s on the same key never add to `reads` and never conflict with
 A committing append receives its stamp: the clock sample in microseconds and the commit's version.
 The store overwrites every stamp placeholder of the writes (16 zero bytes at a named offset of a key or value) with the stamp's encoding, micros big-endian with the sign bit flipped and then the version big-endian, so stamped keys sort in commit order.
 A key placeholder lies at or past the key's partition prefix (a big-endian `u16` length, then that many bytes).
-A placeholder out of bounds, over non-zero bytes or inside the prefix, a value placeholder on a delete, a `Bound` with `min > max`, and a stamped key that could land on another write's key (equal length and equal bytes outside both placeholders) are request errors, decided before anything is ordered.
-An append with no writes or bounds only validates: it is recorded at a new version with no effects, the version it answers it validated through.
+A placeholder out of bounds, over non-zero bytes or inside the prefix, a value placeholder on a delete, a `Bound` with `min > max`, a malformed or unconfined derive, and a stamped key that could land on another write's key (equal length and equal bytes outside both placeholders) are request errors, decided before anything is ordered.
+An append with no writes, bounds or derived writes only validates: it is recorded at a new version with no effects, the version it answers it validated through.
 Every outcome but `outside` is a receipt under the append's idempotency key, so a retry returns the first outcome: a commit with its first stamp, a conflict, a bound refusal, or a validation with its version, even after a later write that a fresh judgement would conflict with.
 The key belongs to its first request; another request under it is refused.
+
+*Derived writes.* A write may be a _derive_ (`AppendRequest.derives`, encoded by Bijection's `store_read::derive` and vendored verbatim as `rust/vendor/bijection-store-derive`), also called retire-on-write.
+It names a row's derived-line manifest prefix, the lookup levels in which its previous line is found (the target world's own, then each ancestor bounded by its fork stamp), an interval `[from, to)` of the `i64` valid axis (`from` may be the stamp's micros), and the row's new derived entries over that interval, or `Purge` on erasure, expiry or a hold's last lift.
+Each entry is one of four kinds, each with one exact law:
+
+* a _marker_ (a path or posting entry): a stamped enter where its coverage begins, and a stamped leave marker (an empty value) where an entry the new image does not re-enter loses coverage;
+* a _boundary_ (counted search statistics): a stamped precomputed delta; the row contributes the boundaries of its segments that reach the line's horizon (the furthest valid instant any of its writes asserted), and the store writes exactly the difference of that set;
+* an _edged_ boundary (a timeline aggregate): a record keyed by its valid-time edge, `identity ‖ ordered(edge) ‖ stamp ‖ ordinal`, `+v` where coverage begins and `−v` where it ends, so a read at instant `t` sums the records with edge at or before `t`; an erasure retracts it unless it is retained;
+* a _single_ (an expiry entry): one key, deleted when its entry loses coverage.
+
+At the ordering point, after the reads, the window and the bounds are judged, the store takes the latest manifest, at or below its bound, of the first level that has one, re-roots it into the target world, and applies Bijection's one total function `apply`: an entry the line already holds identically over the whole interval writes nothing, so an identical re-put emits no index key.
+It stores the new manifest at the stamp, with the concrete marker and single keys it wrote, which is the exact inventory a `Purge` deletes (with every manifest version) after retracting the line's live boundaries and unretained edged contributions.
+Derives apply in write order, before plain writes, and each sees the manifest left by earlier derives of the same row in the same append.
+Emitted writes count toward no request size limit, and are recorded in the transaction's effects, so recovery replays them without re-deriving and a vendored upgrade never rewrites history.
+A derive's entries and lookup levels share its manifest's partition prefix (entries also its world), no plain write may overlap a derive's manifest prefix, and nothing derived is returned.
+*A derive never changes an append's outcome*: the store reads the manifest only to emit, never to judge, and a malformed stored manifest is a store fault, not an outcome.
+Its emitted writes refuse later appends and wake watches like any other write, so conflicts and wakes are exact per row.
+The store decodes no value and knows no index.
+RTDB pins the vendored source by SHA-256 (`DERIVE_DIGEST`) and refuses a mismatched `derive_digest` with `rtdb.store/derive-version`.
 
 `rtdb.store.v1.Watch`:: Reports the first version after `after` that wrote into one of its ranges, waiting up to a bounded time.
 It always reports how far it inspected, so a caller resumes from there.

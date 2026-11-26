@@ -22,6 +22,7 @@ serde.workspace = true
 sha2.workspace = true
 imbl.workspace = true
 store_filter = { package = "bijection-store-filter", path = "../../vendor/bijection-store-filter" }
+store_derive = { package = "bijection-store-derive", path = "../../vendor/bijection-store-derive" }
 
 [lints]
 workspace = true

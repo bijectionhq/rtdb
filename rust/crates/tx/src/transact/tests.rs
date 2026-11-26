@@ -57,7 +57,7 @@ fn store_append_with_bounds(
     Transact {
         key: vec![key; 16], require: Vec::new(), window: Window::default(),
         guards: reads.into_iter().map(|range| Guard::Unwritten { range, since: basis(since) }).collect(),
-        ops: vec![Op::Store(StoreAppend { writes, bounds, window })], otherwise: Vec::new(), requires: Vec::new(),
+        ops: vec![Op::Store(StoreAppend { writes, bounds, derives: Vec::new(), window })], otherwise: Vec::new(), requires: Vec::new(),
         custody_request_digest: None, request_memory: None,
     }
 }
@@ -129,6 +129,69 @@ fn the_vendored_store_judge_is_bijections_pinned_copy() {
     let source = include_bytes!("../../../../vendor/bijection-store-judge/src/judge.rs");
     let digest = Sha256::digest(source).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(digest, BIJECTION_STORE_JUDGE_SHA256, "vendor/bijection-store-judge drifted from Bijection's judge.rs");
+}
+
+#[test]
+fn a_store_derive_diffs_retires_and_purges_atomically() {
+    use rtdb_index::branches::store::{
+        Projection, StoreRead,
+        store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind},
+    };
+    let mut state = TransactState::new(INCARNATION);
+    let place = |inner: &[u8]| [vec![0u8, 1, b'p'], vec![0u8; 16], inner.to_vec()].concat();
+    let manifest_prefix = place(b"row1\x04");
+    let idx_a = place(b"idx/a");
+    let idx_b = place(b"idx/b");
+    let level = vec![DeriveLevel { prefix: manifest_prefix.clone(), through: None }];
+    let marker = |id: &Vec<u8>| DeriveEntry {
+        kind: EntryKind::Marker,
+        identity: id.clone(),
+        key_stamp: None,
+        enter_value: vec![1],
+        leave_value: Vec::new(),
+    };
+    let make = |key: u8, since: u64, reads: Vec<KeyRange>, derive: Derive| Transact {
+        key: vec![key; 16],
+        require: Vec::new(),
+        window: Window::default(),
+        guards: reads.into_iter().map(|range| Guard::Unwritten { range, since: basis(since) }).collect(),
+        ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
+        otherwise: Vec::new(),
+        requires: Vec::new(),
+        custody_request_digest: None,
+        request_memory: None,
+    };
+    let d_a = Derive {
+        manifest_prefix: manifest_prefix.clone(),
+        levels: level.clone(),
+        mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: i64::MAX }, entries: vec![marker(&idx_a)] },
+    };
+    let d_b = Derive {
+        manifest_prefix: manifest_prefix.clone(),
+        levels: level,
+        mode: DeriveMode::Replace { interval: DeriveInterval::FromStamp { to: i64::MAX }, entries: vec![marker(&idx_b)] },
+    };
+    let d_purge = Derive { manifest_prefix: manifest_prefix.clone(), levels: Vec::new(), mode: DeriveMode::Purge };
+
+    // 1. Enter idx_a.
+    let c1 = plan(&state, &make(1, 0, Vec::new(), d_a.clone()), 1, 100, DEFAULT);
+    apply(&mut state, 1, c1.record()).unwrap();
+    // 2. Identical re-put writes no new key in idx_a; reader of idx_a since 1 validates.
+    let c2 = plan(&state, &make(2, 1, Vec::new(), d_a), 2, 200, DEFAULT);
+    apply(&mut state, 2, c2.record()).unwrap();
+    let range_a = KeyRange { start: idx_a.clone(), end: Some([idx_a[..idx_a.len() - 1].to_vec(), vec![b'b']].concat()) };
+    let val = plan(&state, &store_append(3, 1, vec![range_a.clone()], Vec::new(), Window::default()), 3, 300, DEFAULT);
+    assert_eq!(apply(&mut state, 3, val.record()).unwrap().outcome, Outcome::Then);
+    // 3. Move to idx_b writes leave in idx_a; reader of idx_a since 2 conflicts.
+    let c4 = plan(&state, &make(4, 3, Vec::new(), d_b), 4, 400, DEFAULT);
+    apply(&mut state, 4, c4.record()).unwrap();
+    let stale = plan(&state, &store_append(5, 2, vec![range_a.clone()], Vec::new(), Window::default()), 5, 500, DEFAULT);
+    assert_eq!(apply(&mut state, 5, stale.record()).unwrap().outcome, Outcome::Otherwise { failed: vec![0] });
+    // 4. Purge deletes all markers and manifests.
+    let c6 = plan(&state, &make(6, 5, Vec::new(), d_purge), 6, 600, DEFAULT);
+    apply(&mut state, 6, c6.record()).unwrap();
+    let read_a = StoreRead { range: range_a, after: None, limit: 16, projection: Projection::Keys, filter: None, reverse: false };
+    assert!(state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(600)).unwrap().store_page(&read_a).unwrap().entries.is_empty());
 }
 
 #[test]
@@ -1643,7 +1706,7 @@ fn every_shape() -> Transact {
             Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent: true },
             Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(-1)], valid: Some(ValidTime::Literal(Interval::from_micros(1, 2).unwrap())) },
             Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by".into(), column: "a".into(), additional_columns: Vec::new() }) },
-            Op::Store(StoreAppend { writes: vec![StoreWrite { key: vec![0; 16], value: None, key_stamp: Some(0), value_stamp: None }], bounds: vec![StoreBound { key: vec![1; 16], delta: -1, min: 0, max: 9 }], window: Window::default() }),
+            Op::Store(StoreAppend { writes: vec![StoreWrite { key: vec![0; 16], value: None, key_stamp: Some(0), value_stamp: None }], bounds: vec![StoreBound { key: vec![1; 16], delta: -1, min: 0, max: 9 }], derives: Vec::new(), window: Window::default() }),
         ],
         otherwise: vec![Op::DropBranch { branch: "child".into() }],
         requires: Vec::new(), custody_request_digest: None, request_memory: None,
