@@ -182,12 +182,14 @@ pub(crate) struct ProtocolSession {
     portals: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
     replay_permit: Option<GatewayReplayPermit>,
+    /// The encoding environment last built, with the session's parameters revision it copied.
+    environment_cache: Option<(u64, Arc<SessionEnvironment>)>,
 }
 impl ProtocolSession {
     pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
         let reported_settings = session.state().settings_revision();
         Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
-            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None, replay_permit: None }
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None, replay_permit: None, environment_cache: None }
     }
     pub fn extended(&self) -> bool { self.extended }
     pub fn portal_deadline(&self) -> Option<std::time::Instant> {
@@ -196,8 +198,21 @@ impl ProtocolSession {
     pub fn expire_portals(&mut self, now: std::time::Instant) {
         self.portals.retain(|_, portal| portal.retention_deadline().is_none_or(|deadline| deadline > now));
     }
-    pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
-    fn environment(&self) -> Result<SessionEnvironment> { SessionEnvironment::new(self.session.state().parameter_entries(), self.session.state().effective_timezone(), self.node.memory()) }
+    pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.environment_cache = None; self.session.state_mut().close(); }
+    fn environment(&mut self) -> Result<Arc<SessionEnvironment>> {
+        let state = self.session.state();
+        let revision = state.parameters_revision();
+        let timezone = state.effective_timezone();
+        if let Some((cached, environment)) = &self.environment_cache
+            && *cached == revision && environment.parameter("timezone") == Some(timezone) {
+            return Ok(Arc::clone(environment));
+        }
+        self.environment_cache = None;
+        let environment = Arc::new(SessionEnvironment::new(state.parameter_entries(), timezone, self.node.memory())?);
+        self.environment_cache = Some((revision, Arc::clone(&environment)));
+        Ok(environment)
+    }
+    fn fallback(&self) -> PgType { SessionEnvironment::fallback_for(self.session.state().parameter("fallback_output_format")) }
     fn token(&self) -> CancellationToken { self.session.state().cancellation().child_token() }
     fn register_statement(&mut self, name: Cow<'_, str>, prepared: Arc<Prepared>) -> Result<()> {
         let capacity = match &name { Cow::Borrowed(name) => name.len(), Cow::Owned(name) => name.capacity() };
@@ -276,7 +291,7 @@ impl ProtocolSession {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
             if self.extended { self.skip_until_sync = true; }
             self.session.state_mut().fail_transaction();
-            writer.error(&error, self.environment()?.fallback(), false).await?;
+            writer.error(&error, self.fallback(), false).await?;
         }
         Ok(())
     }
@@ -359,8 +374,8 @@ impl ProtocolSession {
             b'D' => {
                 let kind = input.byte()?; let name = input.string()?; input.end()?;
                 match kind {
-                    b'S' => { if let Some(statement) = self.statements.get(name) { let statement = &statement.prepared; if !matches!(statement.ordinary_kind(), Some(PreparedKind::Empty | PreparedKind::Keywords)) { writer.parameters(&statement.oids).await?; } Self::description(statement.columns.as_deref(), self.environment()?.fallback(), writer).await?; } else { writer.empty(b'n').await?; } },
-                    b'P' => Self::description(self.portals.get(name).and_then(|portal| portal.columns.as_deref()), self.environment()?.fallback(), writer).await?,
+                    b'S' => { if let Some(statement) = self.statements.get(name) { let statement = &statement.prepared; if !matches!(statement.ordinary_kind(), Some(PreparedKind::Empty | PreparedKind::Keywords)) { writer.parameters(&statement.oids).await?; } Self::description(statement.columns.as_deref(), self.fallback(), writer).await?; } else { writer.empty(b'n').await?; } },
+                    b'P' => Self::description(self.portals.get(name).and_then(|portal| portal.columns.as_deref()), self.fallback(), writer).await?,
                     _ => return Err(protocol("Invalid describe target")),
                 }
             }
@@ -373,7 +388,7 @@ impl ProtocolSession {
                 result?;
             }
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
-            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit(None).await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
+            b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit(None).await }; if let Err(error) = result { writer.error(&error, self.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'c' => {
                 input.end()?;
@@ -384,7 +399,7 @@ impl ProtocolSession {
                 match result {
                     Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?,
                     Err(error) if self.extended => return Err(error),
-                    Err(error) => writer.error(&error, self.environment()?.fallback(), false).await?,
+                    Err(error) => writer.error(&error, self.fallback(), false).await?,
                 }
                 if !self.extended { self.report_ready(writer).await?; }
             }
@@ -780,7 +795,7 @@ impl ProtocolSession {
         let result = self.simple_statements(source, permit, writer).await;
         if let Err(error) = result {
             if error.anomaly().code == "xtdb.pgwire/connection-error" { return Err(error.anomaly().clone()); }
-            writer.error(error.anomaly(), self.environment()?.fallback(), false).await?;
+            writer.error(error.anomaly(), self.fallback(), false).await?;
         }
         if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
@@ -878,7 +893,7 @@ impl ProtocolSession {
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, None, Vec::new(), &[]).await?;
-        if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
+        if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.fallback(), writer).await?; }
         self.execute(&mut portal, 0, commit_dml_before_reply, permit, writer).await
     }
 
@@ -889,7 +904,7 @@ impl ProtocolSession {
             } else {
                 self.session.state_mut().fail_transaction();
             }
-            writer.error(&error, self.environment()?.fallback(), false).await?;
+            writer.error(&error, self.fallback(), false).await?;
         }
         Ok(())
     }
@@ -2189,6 +2204,42 @@ mod tests {
         assert!(!frontend.statements.contains_key("wire"));
         assert!(wrapper.upgrade().is_none());
         assert_eq!(writer.into_inner(), b"C\0\0\0\x0cPREPARE\0\x33\0\0\0\x04");
+        frontend.close();
+        assert_eq!(memory.used_bytes(), baseline);
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_encoding_environment_follows_parameters_and_the_effective_timezone() {
+        let (mut frontend, driver) = test_frontend(false).await;
+        let memory = Arc::clone(frontend.node.memory());
+        let baseline = memory.used_bytes();
+        let first = frontend.environment().unwrap();
+        assert!(Arc::ptr_eq(&first, &frontend.environment().unwrap()));
+        assert_eq!(first.parameter("datestyle"), None);
+
+        frontend.session.state_mut().set_parameter("datestyle", Some("iso8601".into())).unwrap();
+        let styled = frontend.environment().unwrap();
+        assert_eq!(styled.parameter("datestyle"), Some("iso8601"));
+        assert_eq!(first.parameter("datestyle"), None);
+
+        frontend.session.state_mut().set_timezone("Europe/Paris").unwrap();
+        let zoned = frontend.environment().unwrap();
+        assert_eq!(zoned.parameter("timezone"), Some("Europe/Paris"));
+        assert_eq!(zoned.parameter("datestyle"), Some("iso8601"));
+
+        frontend.session.state_mut().reset().unwrap();
+        let reset = frontend.environment().unwrap();
+        assert_eq!(reset.parameter("datestyle"), None);
+        assert_eq!(reset.parameter("timezone"), Some(frontend.session.state().effective_timezone()));
+
+        for setting in [None, Some("json-ld"), Some("JSON_LD"), Some("transit"), Some("Transit"), Some("edn")] {
+            frontend.session.state_mut().set_parameter("fallback_output_format", setting.map(str::to_owned)).unwrap();
+            assert_eq!(frontend.fallback(), frontend.environment().unwrap().fallback(), "{setting:?}");
+        }
+
+        drop((first, styled, zoned, reset));
         frontend.close();
         assert_eq!(memory.used_bytes(), baseline);
         drop(frontend);

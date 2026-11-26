@@ -29,7 +29,9 @@ impl SessionEnvironment {
         Ok(Self { parameters, _reservation: Some(reservation) })
     }
     pub fn parameter(&self, name: &str) -> Option<&str> { self.parameters.get(name).and_then(Option::as_deref) }
-    pub fn fallback(&self) -> PgType { match self.parameter("fallback_output_format").map(str::to_ascii_lowercase).as_deref() { Some("json-ld" | "json_ld") => PgType::JsonLd, Some("transit") => PgType::Transit, _ => PgType::Json } }
+    pub fn fallback(&self) -> PgType { Self::fallback_for(self.parameter("fallback_output_format")) }
+    /// The type a `Default` column takes under a session's `fallback_output_format` setting.
+    pub fn fallback_for(setting: Option<&str>) -> PgType { match setting.map(str::to_ascii_lowercase).as_deref() { Some("json-ld" | "json_ld") => PgType::JsonLd, Some("transit") => PgType::Transit, _ => PgType::Json } }
 }
 
 /// Null and undefined produce no payload; other values retain their serialization reservation in the result.

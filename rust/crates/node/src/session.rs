@@ -288,6 +288,8 @@ pub struct Session {
     await_token: Option<RetainedText>,
     await_token_revision: u64,
     settings_revision: u64,
+    /// Advances whenever a parameter is set, restored, reset or cleared.
+    parameters_revision: u64,
     last_submitted: Option<LastSubmittedTx>,
     parameters: BTreeMap<String, Parameter>,
     gateway_key: Option<(RetainedText, u64)>,
@@ -303,7 +305,7 @@ impl Session {
         let database = RetainedText::new(database.into(), service.memory())?;
         let timezone = RetainedText::new(timezone, service.memory())?;
         Ok(Self { service, database, lifecycle: Lifecycle::Open(None), auto_commit: true, default_access_mode: None,
-            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, last_submitted: None, parameters: BTreeMap::new(), gateway_key: None, idempotency_sequence: None, cancellation: parent.child_token() })
+            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, parameters_revision: 0, last_submitted: None, parameters: BTreeMap::new(), gateway_key: None, idempotency_sequence: None, cancellation: parent.child_token() })
     }
     fn ensure_open(&self) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::Closed) { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); }
@@ -388,6 +390,7 @@ impl Session {
             self.settings_revision = self.settings_revision.wrapping_add(1);
         }
         self.parameters.insert(name, Parameter { value, _entry: entry });
+        self.parameters_revision = self.parameters_revision.wrapping_add(1);
         Ok(())
     }
     pub fn set_gateway_key(&mut self, key: String) -> Result<()> {
@@ -396,6 +399,8 @@ impl Session {
         Ok(())
     }
     pub fn settings_revision(&self) -> u64 { self.settings_revision }
+    /// Changes whenever `parameter_entries` might; the effective timezone changes independently of it.
+    pub fn parameters_revision(&self) -> u64 { self.parameters_revision }
 
     /// Encodes the mutable settings of the idle session for restoration after a gateway reconnect.
     pub fn encode_gateway_settings(&self) -> Result<(Vec<u8>, Arc<MemoryReservation>)> {
@@ -436,6 +441,7 @@ impl Session {
         }
         self.parameters.retain(|name, _| !portable_parameter(name));
         self.parameters.append(&mut restored);
+        self.parameters_revision = self.parameters_revision.wrapping_add(1);
         self.timezone = timezone;
         self.default_access_mode = settings.access_mode;
         self.settings_revision = self.settings_revision.wrapping_add(1);
@@ -530,6 +536,7 @@ impl Session {
         self.ensure_open()?;
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/discard-in-tx", "DISCARD ALL cannot run inside a transaction block")); }
         self.parameters.retain(|name, _| name == "application_name");
+        self.parameters_revision = self.parameters_revision.wrapping_add(1);
         self.timezone = self.initial_timezone.clone();
         self.replace_await_token(None);
         self.last_submitted = None;
@@ -794,7 +801,7 @@ impl Session {
         if let CommitResult::Executed(tx) = &result { if let Some(error) = tx.error() { return Err(error.clone()); } }
         Ok(result)
     }
-    pub fn close(&mut self) { self.cancellation.cancel(); self.lifecycle = Lifecycle::Closed; self.parameters.clear(); self.await_token = None; self.last_submitted = None; }
+    pub fn close(&mut self) { self.cancellation.cancel(); self.lifecycle = Lifecycle::Closed; self.parameters.clear(); self.parameters_revision = self.parameters_revision.wrapping_add(1); self.await_token = None; self.last_submitted = None; }
 }
 
 impl Drop for Session { fn drop(&mut self) { self.cancellation.cancel(); } }
