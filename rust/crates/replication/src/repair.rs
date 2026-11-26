@@ -667,7 +667,8 @@ async fn replay(
     {
         let record = logs.decode_replica(raw)?.ok_or_else(|| invalid("The repair interval contains an unknown replica record"))?;
         let position = record.metadata.position;
-        if reached.0.checked_add(1) != Some(position.0) || position > through {
+        // Local replica offsets are byte positions, so consecutive records are not one offset apart.
+        if position <= reached || position > through {
             return Err(invalid("The repair interval does not cover the selected replica prefix"));
         }
         reached = position;
