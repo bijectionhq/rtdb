@@ -1076,6 +1076,7 @@ impl Context<'_> {
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, with_ordinality, json_path, index_hints } => {
                 if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(grammar_rejected("A table sample or dialect-specific table modifier")); }
+                grammar_table_name(name)?;
                 if let Some(args) = args {
                     if let Some(ranked) = RankedTable::from_name(name) && args.settings.is_none() {
                         return self.ranked_table(ranked, &args.args, alias.as_ref(), *with_ordinality, purpose);
@@ -1481,6 +1482,7 @@ impl Context<'_> {
     }
 
     fn target(&self, name: &ast::ObjectName) -> Result<QualifiedTable> {
+        grammar_table_name(name)?;
         let parts = identifiers(name)?.iter().map(Identifier::normalized).collect::<Vec<_>>();
         let (database, table) = match parts.as_slice() {
             [table] => (self.catalog.default_database().to_owned(), TableRef::new(self.options.search_path.first().cloned().unwrap_or_else(|| "public".into()), table)),
@@ -1560,6 +1562,14 @@ const GRAMMAR_REJECTION: &str = "Errors parsing SQL statement:\n  - ";
 /// A construct the vendor parser admits but the reference `Sql.g4` grammar has no production for.
 pub(crate) fn grammar_rejected(construct: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("xtdb/sql-error", format!("{GRAMMAR_REJECTION}{construct} is not part of the XTDB SQL grammar"))
+}
+
+/// `Sql.g4`'s `identifier` admits an unquoted keyword only when it is non-reserved, whereas the vendor parser reads any word as a table name.
+fn grammar_table_name(name: &ast::ObjectName) -> Result<()> {
+    match name.0.iter().filter_map(ast::ObjectNamePart::as_ident).find(|part| part.quote_style.is_none() && !crate::parser::is_unquoted_identifier(&part.value)) {
+        Some(reserved) => Err(grammar_rejected(format!("The reserved word {} as a table name", reserved.value))),
+        None => Ok(()),
+    }
 }
 
 fn is_grammar_rejection(error: &Anomaly) -> bool {

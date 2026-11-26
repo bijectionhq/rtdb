@@ -108,6 +108,18 @@ fn quoted_identifiers_after_a_date_keyword_and_out_of_range_integers_are_sql_err
 }
 
 #[test]
+fn reserved_words_name_tables_only_when_quoted() {
+    for sql in ["SELECT FROM WHERE", "SELECT * FROM where", "SELECT * FROM docs, order", "INSERT INTO order (_id) VALUES (1)", "DELETE FROM where", "UPDATE where SET a = 1"] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+        assert!(error.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - "), "{sql}");
+    }
+    for sql in [r#"SELECT * FROM "where""#, r#"INSERT INTO "order" (_id) VALUES (1)"#, "SELECT * FROM time", "SELECT * FROM public.docs"] {
+        prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+}
+
+#[test]
 fn hex_quote_literals_are_outside_the_reference_grammar() {
     for sql in ["SELECT X'00'", "INSERT INTO docs (_id, a) VALUES (1, x'DEADBEEF')", "SELECT X'0'"] {
         let error = rejection(sql);

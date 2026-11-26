@@ -114,6 +114,8 @@ The separate PostgreSQL DML parameter-description path still needs qualification
 `WITH RECURSIVE` retains the pinned planner's Unsupported anomaly `xtdb.sql/recursive-ctes`, including when the body does not refer to itself.
 Prepared-statement commands, COPY, and database lifecycle commands use the separate shared control parser described below.
 The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
+Table names are the exception: an unquoted reserved word naming a FROM table or a DML target is a grammar rejection, as `Sql.g4`'s `identifier` admits only non-reserved keywords, so `SELECT FROM WHERE` is a parse error rather than a missing table `where`.
+Column references and aliases still use sqlparser's classification.
 Query-level `SETTING` prefixes bind default valid/system extents into table scans, with explicit table extents taking precedence.
 The passive `QuerySettings` value retains clock, snapshot-token and snapshot-time metadata alongside the prepared relation; repeated settings are all planned and the last occurrence determines the value.
 Its passive `SettingValue` distinguishes literals, unadmitted `CLOCK_TIME` timestamp literals, parameters and unevaluated forms, retaining the parameter count of forms whose scalar type is never needed.
@@ -341,6 +343,8 @@ Compilation, execution, differential assertions, and exact diagnostic matching r
 
 `parse_control` recognizes BEGIN and START TRANSACTION characteristics, SET TRANSACTION, COMMIT modes, ROLLBACK, session settings, SHOW, SQL PREPARE and EXECUTE, COPY input, and database attachment controls.
 Control parsing retains expression syntax for scalar binding independently of a live database catalog.
+Names in SHOW, SET, SET ROLE, ATTACH and DETACH DATABASE and the COPY FROM target follow the reference `identifier` rule: an unquoted reserved word is an `xtdb/sql-error`, so `SHOW ALL` fails to parse as it does in the reference.
+`SHOW TRANSACTION ISOLATION LEVEL`, `SHOW AWAIT_TOKEN`, `SHOW SNAPSHOT_TOKEN`, `SHOW CLOCK_TIME`, `SET AWAIT_TOKEN` and `SET ROLE NONE` keep their dedicated reference productions; `SET SESSION AWAIT_TOKEN` is rejected.
 Session parameter values admit no `X'hex'` literal.
 The parser checks the literal positions in session settings and transaction ASYNC options before collecting the command.
 Binding compiles the final transaction options in option order and resolves a CLOCK_TIME timestamp literal at that stage.

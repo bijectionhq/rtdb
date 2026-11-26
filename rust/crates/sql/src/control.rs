@@ -213,6 +213,15 @@ impl ControlParser<'_> {
         self.index += 1;
         Ok(identifier)
     }
+    /// `Sql.g4`'s `identifier`: an unquoted grammar keyword names something only when it is non-reserved.
+    fn grammar_identifier(&mut self) -> Result<Identifier> {
+        let token = self.index;
+        let identifier = self.identifier()?;
+        if !identifier.quoted && !crate::parser::is_unquoted_identifier(&identifier.text) {
+            return Err(sql_error(format!("Expected an identifier, found the reserved word {}", identifier.text), self.source, self.tokens[token].span));
+        }
+        Ok(identifier)
+    }
     fn statement_name(&mut self) -> Result<String> {
         let token = self.index;
         let identifier = self.identifier()?;
@@ -322,7 +331,7 @@ impl ControlParser<'_> {
         if self.eat("ROLLBACK") { return Ok(ControlStatement::Rollback); }
         if self.eat("SET") {
             if self.eat("TRANSACTION") { return Ok(ControlStatement::SetTransaction(self.transaction_options(false)?)); }
-            if self.eat("ROLE") { self.identifier()?; return Ok(ControlStatement::SetRole); }
+            if self.eat("ROLE") { if !self.eat("NONE") { self.grammar_identifier()?; } return Ok(ControlStatement::SetRole); }
             let session = self.eat("SESSION");
             if session && self.eat("CHARACTERISTICS") {
                 self.expect("AS")?; self.expect("TRANSACTION")?;
@@ -335,7 +344,8 @@ impl ControlParser<'_> {
                 }
                 return Ok(ControlStatement::SetSessionCharacteristics(access));
             }
-            let mut name = self.identifier()?.normalized();
+            let await_token = !session && self.eat("AWAIT_TOKEN");
+            let mut name = if await_token { "await_token".into() } else { self.grammar_identifier()?.normalized() };
             if name == "bijection" && self.token(Token::Period) {
                 self.expect("AT")?;
                 name = "bijection.at".into();
@@ -346,7 +356,7 @@ impl ControlParser<'_> {
             let value = self.expression()?;
             return Ok(match name.as_str() {
                 "timezone" => ControlStatement::SetTimeZone(value),
-                "await_token" if !session => ControlStatement::SetAwaitToken(value),
+                _ if await_token => ControlStatement::SetAwaitToken(value),
                 _ => {
                     if !is_literal(&value) { return Err(self.error("Session parameter requires a literal")); }
                     ControlStatement::SetParameter { name, value }
@@ -360,9 +370,15 @@ impl ControlParser<'_> {
                 else { self.expect("SEQUENCES")?; DiscardTarget::Sequences }));
         }
         if self.eat("SHOW") {
-            let mut name = self.identifier()?.normalized();
+            if self.eat("TRANSACTION") {
+                self.expect("ISOLATION")?; self.expect("LEVEL")?;
+                return Ok(ControlStatement::Show { name: "transaction_isolation".into() });
+            }
+            if let Some(keyword) = ["AWAIT_TOKEN", "SNAPSHOT_TOKEN", "CLOCK_TIME"].into_iter().find(|keyword| self.eat(keyword)) {
+                return Ok(ControlStatement::Show { name: keyword.to_ascii_lowercase() });
+            }
+            let mut name = self.grammar_identifier()?.normalized();
             if name == "time" { self.expect("ZONE")?; name = "timezone".into(); }
-            if name == "transaction" { self.expect("ISOLATION")?; self.expect("LEVEL")?; name = "transaction_isolation".into(); }
             return Ok(ControlStatement::Show { name });
         }
         if self.eat("EXECUTE") {
@@ -374,11 +390,11 @@ impl ControlParser<'_> {
             return Ok(ControlStatement::Execute { name, arguments });
         }
         if self.eat("ATTACH") {
-            self.expect("DATABASE")?; let name = self.identifier()?.normalized();
+            self.expect("DATABASE")?; let name = self.grammar_identifier()?.normalized();
             let configuration_yaml = if self.eat("WITH") { Some(self.string()?) } else { None };
             return Ok(ControlStatement::AttachDatabase { name, configuration_yaml, source: self.source.trim().to_owned() });
         }
-        if self.eat("DETACH") { self.expect("DATABASE")?; return Ok(ControlStatement::DetachDatabase { name: self.identifier()?.normalized() }); }
+        if self.eat("DETACH") { self.expect("DATABASE")?; return Ok(ControlStatement::DetachDatabase { name: self.grammar_identifier()?.normalized() }); }
         self.expect("COPY")?;
         if self.token(Token::LParen) {
             let start = self.index;
@@ -411,8 +427,8 @@ impl ControlParser<'_> {
             };
             return Ok(ControlStatement::CopyOut { query: source.text().into(), format });
         }
-        let mut table = vec![self.identifier()?];
-        if self.token(Token::Period) { table.push(self.identifier()?); }
+        let mut table = vec![self.grammar_identifier()?];
+        if self.token(Token::Period) { table.push(self.grammar_identifier()?); }
         self.expect("FROM")?; self.expect("STDIN")?; self.expect("WITH")?;
         if !self.token(Token::LParen) { return Err(self.error("COPY requires WITH parentheses")); }
         let mut format = None;

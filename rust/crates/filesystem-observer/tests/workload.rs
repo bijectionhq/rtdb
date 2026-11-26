@@ -7,10 +7,10 @@ fn proof(kind:&str,sql:&str)->Result<serde_json::Value,Box<dyn std::error::Error
 
 #[test]
 fn production_parser_separates_literal_management_words_from_actual_management() {
-    for sql in ["SELECT 'ATTACH DATABASE escape'", "SELECT 1 AS \"ATTACH\"", "/* ATTACH DATABASE escape */ SELECT 1"] {
+    for sql in ["SELECT 'ATTACH DATABASE escaped'", "SELECT 1 AS \"ATTACH\"", "/* ATTACH DATABASE escaped */ SELECT 1"] {
         assert!(proof("read",sql).is_ok(),"{sql}");
     }
-    for sql in ["ATTACH DATABASE escape", "DETACH DATABASE xtdb", "PREPARE s AS SELECT 1", "EXECUTE s", "GRANT root TO bob", "SELECT 1; ATTACH DATABASE escape", "EXPLAIN GRANT root TO bob", "ALTER DATABASE xtdb SET storage = 'outside'"] {
+    for sql in ["ATTACH DATABASE escaped", "DETACH DATABASE xtdb", "PREPARE s AS SELECT 1", "EXECUTE s", "GRANT root TO bob", "SELECT 1; ATTACH DATABASE escaped", "EXPLAIN GRANT root TO bob", "ALTER DATABASE xtdb SET storage = 'outside'"] {
         assert!(proof("transaction_statement",sql).is_err(),"{sql}");
     }
 }
@@ -18,9 +18,9 @@ fn production_parser_separates_literal_management_words_from_actual_management()
 #[test]
 fn begin_and_fixed_generated_controls_have_explicit_policy_roles() {
     assert!(proof("begin","BEGIN READ WRITE WITH (METADATA = 1)").is_ok());
-    assert!(proof("begin","BEGIN; ATTACH DATABASE escape").is_err());
+    assert!(proof("begin","BEGIN; ATTACH DATABASE escaped").is_err());
     assert!(proof("read","SET AWAIT_TOKEN = 'value'").is_err());
-    assert!(proof("generated","SET AWAIT_TOKEN = 'value''; ATTACH DATABASE escape'").is_ok());
+    assert!(proof("generated","SET AWAIT_TOKEN = 'value''; ATTACH DATABASE escaped'").is_ok());
     assert!(proof("generated","SHOW LATEST_COMPLETED_TXS").is_ok());
     assert!(proof("mutation","INSERT INTO prices (_id, price) VALUES (1, 112)").is_ok());
     assert!(proof("read","INSERT INTO prices (_id) VALUES (1)").is_err());

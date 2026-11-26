@@ -109,3 +109,17 @@ fn sql_parser_session_literals_and_typed_control_parameters() {
     let Some(ControlStatement::SetTimeZone(Expr::Parameter { index: 0, data_type })) = parse_control("SET TIME ZONE ?", &options).unwrap() else { panic!() };
     assert_eq!(data_type, LogicalType::Scalar(ScalarType::Utf8));
 }
+
+#[test]
+fn control_names_follow_the_reference_identifier_rule() {
+    for source in ["SHOW ALL", "SHOW where", "SET ALL = 1", "SET SESSION AWAIT_TOKEN = 'x'", "SET ROLE ALL", "DETACH DATABASE from", "COPY order FROM STDIN WITH ()", "SET x = X'00'"] {
+        let error = parse_control(source, &PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error", "{source}");
+    }
+    for (source, name) in [("SHOW \"all\"", "all"), ("SHOW TRANSACTION ISOLATION LEVEL", "transaction_isolation"), ("SHOW AWAIT_TOKEN", "await_token"),
+        ("SHOW snapshot_token", "snapshot_token"), ("SHOW CLOCK_TIME", "clock_time"), ("SHOW TIME ZONE", "timezone"), ("SHOW database", "database")] {
+        assert_eq!(parse(source), ControlStatement::Show { name: name.into() }, "{source}");
+    }
+    assert_eq!(parse("SET ROLE NONE"), ControlStatement::SetRole);
+    assert!(matches!(parse("SET AWAIT_TOKEN = 'x'"), ControlStatement::SetAwaitToken(_)));
+}
