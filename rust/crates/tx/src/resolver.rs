@@ -1262,14 +1262,9 @@ impl<'a> OpenTransaction<'a> {
             iid: iids.iid(row)?, system_from: system_time,
             valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
         });
-        if matches!(documents.data_type(), DataType::Union(..)) {
-            match mutation_layout_batch(documents.as_ref(), &read_header, memory) {
-                Ok(Some((put, declarations))) => return self.buffer.append_assembled_put_batch(table, put, &declarations),
-                Ok(None) => (),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Err(error),
-                // The per-document path below reports the first row's own error.
-                Err(_) => (),
-            }
+        if matches!(documents.data_type(), DataType::Union(..))
+            && let Some((put, declarations)) = mutation_layout_batch(documents.as_ref(), &read_header, memory)? {
+            return self.buffer.append_assembled_put_batch(table, put, &declarations);
         }
         let mut start = 0;
         while start < batch.num_rows() {
@@ -4054,14 +4049,14 @@ impl<'a> OpenTransaction<'a> {
             .map(|(field, column)| (Arc::clone(field), Arc::clone(column))).unzip();
         let content = rtdb_columnar::build_struct_array(fields.into(), &columns, array.len(), None)?;
         if create_only {
+            // A header error is left to the ordered replay, which reports it after any earlier row's conflict.
             if array.len() > 1
                 && let Ok(headers) = (0..array.len()).map(header).collect::<Result<Vec<_>>>()
-                && let Ok(true) = self.insert_batch_is_absent(table, &headers).await
-                && self.buffer.append_put_documents(table, Arc::clone(&content), headers, documents.source_bytes()).is_ok()
+                && self.insert_batch_is_absent(table, &headers).await?
             {
-                return Ok(());
+                return self.buffer.append_put_documents(table, content, headers, documents.source_bytes());
             }
-            // Replay in order when the group cannot commit, so a later conflict cannot mask an earlier failure.
+            // Replay in order when the group conflicts, so a later conflict cannot mask an earlier failure.
             for row in 0..array.len() {
                 let event = header(row)?;
                 if let Some(cursor) = self.scan_insert_intervals(table, [event.iid].into(), event.valid_time, &["_iid"]).await? {
@@ -4603,8 +4598,16 @@ impl rtdb_format::data::EncodedEvent for MutationPut<'_> {
     fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
         self.document.fields().iter().all(|field| fields.contains_key(field.name()))
     }
-    fn put_cell(&self, _: &str, _: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
-        Err(Anomaly::unsupported("rtdb.tx/mutation-layout", "The put payload needs its original Arrow layout"))
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
+        let Some(index) = self.document.fields().iter().position(|field| field.name() == name) else {
+            return Ok(std::borrow::Cow::Owned(match ty { LogicalType::Nothing => Value::Undefined, _ => Value::Null }));
+        };
+        let field = &self.document.fields()[index];
+        let value = match rtdb_columnar::from_field(field)? {
+            LogicalType::Nothing => Value::Undefined,
+            stored => rtdb_columnar::read_value_as(&stored, field, self.document.column(index).as_ref(), self.row)?,
+        };
+        Ok(std::borrow::Cow::Owned(value))
     }
     fn put_column(&self, name: &str) -> Option<rtdb_format::data::PutColumn<'_>> {
         use rtdb_format::data::PutColumn;
@@ -6265,6 +6268,40 @@ mod tests {
             crate::ipc::encode(batch.schema_ref(), [batch], &memory).unwrap()
         };
         assert_eq!(encode(old).as_slice(), encode(combined).as_slice());
+    }
+
+    #[test]
+    fn heterogeneous_mutation_layout_reads_any_cell_and_reports_its_own_errors() {
+        use arrow_array::{Int64Array, StringArray, StructArray, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Field, UnionFields};
+        use rtdb_format::data::EncodedEvent;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let a = StructArray::new(vec![Field::new("_id", DataType::Int64, false), Field::new("label", DataType::Utf8, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec![Some("one")]))], None);
+        let b = StructArray::new(vec![Field::new("_id", DataType::Int64, false)].into(),
+            vec![Arc::new(Int64Array::from(vec![2]))], None);
+        let header = |row: usize| EventHeader { position: None, commit_position: 0, iid: Iid([row as u8; 16]),
+            system_from: Timestamp(10), valid_time: Interval::ALL, op: EventOp::Put };
+
+        let put = MutationPut { document: &a, row: 0, header: header(0) };
+        assert_eq!(*put.put_cell("label", &LogicalType::Scalar(ScalarType::Utf8)).unwrap(), Value::Utf8("one".into()));
+        let absent = MutationPut { document: &b, row: 0, header: header(1) };
+        assert_eq!(*absent.put_cell("label", &LogicalType::Scalar(ScalarType::Utf8)).unwrap(), Value::Null);
+        assert_eq!(*absent.put_cell("label", &LogicalType::Nothing).unwrap(), Value::Undefined);
+
+        let fields = UnionFields::try_new([0, 1], [
+            Field::new("first", a.data_type().clone(), false), Field::new("second", b.data_type().clone(), false),
+        ]).unwrap();
+        let input = UnionArray::try_new(fields, ScalarBuffer::from(vec![0, 1]), Some(ScalarBuffer::from(vec![0, 0])), vec![
+            Arc::new(a.clone()), Arc::new(b.clone()),
+        ]).unwrap();
+        let (batch, _) = mutation_layout_batch(&input, |row| Ok(header(row)), &memory).unwrap().expect("differing layouts batch together");
+        assert_eq!(batch.batch().num_rows(), 2);
+        let refused = |row| if row == 1 { Err(Anomaly::incorrect("xtdb.indexer/invalid-valid-times", "test")) } else { Ok(header(row)) };
+        let error = mutation_layout_batch(&input, refused, &memory).unwrap_err();
+        assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
     }
 
     #[test]
