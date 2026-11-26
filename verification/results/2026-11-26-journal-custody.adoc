@@ -1,0 +1,27 @@
+= RTDB kernel study results, 2026-11-26: journal custody
+
+== Logkeeper decommission and copy release
+
+A logkeeper leaves a Multi cell by drain, journal balance, copy release (`rust/crates/multi/src/admin/release.rs`) and decommission (`rust/crates/multi/src/admin/decommission.rs`).
+The directory fences every deployment write that newly names a logkeeper on its eligibility epoch (`rust/crates/directory/src/journal_fence.rs`), so a placement planned before a decommission certificate cannot land after it.
+
+[cols="1,4",options="header"]
+|===
+|Evidence |Result
+
+|Lean 4.35.0, link:../lean/JournalCustody.lean[JournalCustody.lean]
+|Seven audited theorems proved with at most `propext` and `Quot.sound`, with no `sorry`.
+Under arbitrary interleavings of stale placements, no deployment retains a certified or decommissioned journal; a copy is released only with no dependent and outside the ensemble; every acknowledged entry stays in the checkpoint or on the ensemble; a decommission lands only with no custody; and a reachable state decommissions an evacuated, released journal.
+All five model controls failed at their declared theorems.
+
+|Verus 0.2026.11.02.8bf68ee, link:../verus/journal_custody/README.md[journal_custody]
+|14 functions verified in the shipped `journal_admission.rs` and the area's laws.
+All six source controls failed at their declared functions with 13 verified.
+
+|Native tests, `rtdb-directory` and `rtdb-multi`
+|The directory contract refuses an eligibility change without an epoch bump and any write that newly names a certified journal, on every directory that runs it.
+Two interleaving tests land a placement planned on an eligible logkeeper after its drain and certification, and between the decommission's last check and its retirement write; both landed without the fence and are refused with it.
+Release refusals cover each dependent kind, and the cell test drains, balances, releases and decommissions a logkeeper while its deployment keeps writing and recovers on the remaining journals.
+|===
+
+The Lean and Verus checks ran on mac-mini-2 through `verify_journal_custody_lean` and `verify_verus` from `verification/run.py` on the selected area only, not the full runner.

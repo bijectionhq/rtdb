@@ -478,6 +478,38 @@ def verify_shared_plans_lean(args, scratch):
     verify_lean_model(args, scratch, path, "shared-plans", controls, 10)
 
 
+def verify_journal_custody_lean(args, scratch):
+    path = Path("verification/lean/JournalCustody.lean")
+    controls = {
+        "admit-a-stale-observation": (
+            "(hseen : s.seen j obs = true) (hfence : s.epoch j = obs) :",
+            "(hseen : s.seen j obs = true) (hfence : obs ≤ s.epoch j) :",
+            ["an_evacuated_journal_is_released_and_decommissioned", "an_evacuated_journal_is_released_and_decommissioned", "step_inv"],
+        ),
+        "certify-without-an-epoch": (
+            "      Step s { s with stage := upd s.stage j .certified, epoch := upd s.epoch j (s.epoch j + 1) }",
+            "      Step s { s with stage := upd s.stage j .certified }",
+            ["an_evacuated_journal_is_released_and_decommissioned", "step_inv", "step_inv"],
+        ),
+        "certify-without-the-scan": (
+            "  | certify (s : State) (j : Nat) (h : s.stage j = .draining) (hscan : ∀ d, s.ref d j = false) :",
+            "  | certify (s : State) (j : Nat) (h : s.stage j = .draining) :",
+            ["an_evacuated_journal_is_released_and_decommissioned", "decommission_requires_no_custody", "step_inv", "step_inv"],
+        ),
+        "release-with-a-dependent": (
+            "(href : s.ref d j = true) (hens : s.ens d j = false) (hdeps : s.deps d j = false) :",
+            "(href : s.ref d j = true) (hens : s.ens d j = false) :",
+            ["a_release_has_no_dependents", "a_release_has_no_dependents", "an_evacuated_journal_is_released_and_decommissioned", "step_inv", "step_inv"],
+        ),
+        "release-a-serving-copy": (
+            "(href : s.ref d j = true) (hens : s.ens d j = false) (hdeps : s.deps d j = false) :",
+            "(href : s.ref d j = true) (hdeps : s.deps d j = false) :",
+            ["a_release_has_no_dependents", "a_release_has_no_dependents", "an_evacuated_journal_is_released_and_decommissioned", "an_evacuated_journal_is_released_and_decommissioned", "step_inv", "step_inv", "step_inv"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "journal-custody", controls, 7)
+
+
 def verify_partitioned_top_k(args, scratch):
     path = Path("verification/lean/PartitionedTopK.lean")
     controls = {
@@ -2196,6 +2228,7 @@ def verify_lean(args, scratch):
             verify_search_windows(args, scratch)
             verify_search_member_bounds(args, scratch)
             verify_shared_plans_lean(args, scratch)
+            verify_journal_custody_lean(args, scratch)
             verify_partitioned_top_k(args, scratch)
             verify_catalog_recovery(args, scratch)
             verify_checkpoint_discovery(args, scratch)

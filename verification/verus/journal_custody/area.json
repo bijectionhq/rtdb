@@ -1,0 +1,121 @@
+{
+  "summary": "Eligibility epoch succession, the journal reference fence and journal copy release admission.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 14,
+  "controls": {
+    "keep-the-epoch-on-a-change": {
+      "defect": "A member write that changes its eligibility may keep its epoch, so a stale placement still matches it.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "find": "    if eligibility_changed { stored < next } else { stored <= next }\n}",
+          "replace": "    stored <= next\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "function": "epoch_follows",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "skip-the-eligibility-check": {
+      "defect": "A write that newly names a certified journal is admitted.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "find": "        if observation.newly_named && !observation.accepts_references { return None; }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "function": "fenced_journals",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "leave-a-journal-unfenced": {
+      "defect": "A newly named journal is admitted without holding its epoch in the commit.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "find": "        fenced.push(observation.newly_named);",
+          "replace": "        fenced.push(false);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "function": "fenced_journals",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "release-with-a-live-fork": {
+      "defect": "A copy a staged fork depends on is released.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "find": "    if observation.fork { return Some(CopyDependent::Fork); }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "function": "copy_dependent",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "release-before-durability": {
+      "defect": "A copy is released before a recorded handoff shows the ensemble holds every acknowledged entry.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "find": "    if !observation.durable_elsewhere { return Some(CopyDependent::NotDurable); }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "function": "copy_dependent",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "release-a-serving-copy": {
+      "defect": "A copy on a member of the serving ensemble is released.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "find": "    if observation.serving { return Some(CopyDependent::Serving); }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/journal_admission.rs",
+          "function": "copy_dependent",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    }
+  }
+}
