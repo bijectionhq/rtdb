@@ -2088,9 +2088,9 @@ async fn check_held_root_rank_flight() {
         owned_native_actions: true, ..FlightConfig::default()
     }).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
-    for (relation, ids) in [
-        ("rank_alpha", vec![EntityIdRef::Integer(1), EntityIdRef::String("a")]),
-        ("rank_beta", vec![EntityIdRef::String("a")]),
+    for (relation, path, ids) in [
+        ("rank_alpha", "alpha_body", vec![EntityIdRef::Integer(1), EntityIdRef::String("a")]),
+        ("rank_beta", "beta_body", vec![EntityIdRef::String("a")]),
     ] {
         let mut prefix = Vec::new();
         frame(&mut prefix, relation);
@@ -2099,7 +2099,7 @@ async fn check_held_root_rank_flight() {
         client.action("rtdb.owned.DeclareRelation.v1", declaration.into()).await.unwrap();
 
         let path = RecordBatch::try_from_iter([
-            ("_id", Arc::new(StringArray::from(vec!["by_body"])) as arrow_array::ArrayRef),
+            ("_id", Arc::new(StringArray::from(vec![path])) as arrow_array::ArrayRef),
             ("column", Arc::new(StringArray::from(vec!["body"]))),
             ("analyzer", Arc::new(StringArray::from(vec!["simple"]))),
         ]).unwrap();
@@ -2121,9 +2121,9 @@ async fn check_held_root_rank_flight() {
     frame_bytes.extend(i64::MIN.to_be_bytes());
     frame_bytes.extend(0u32.to_be_bytes());
     frame_bytes.extend(2u16.to_be_bytes());
-    for relation in ["rank_beta", "rank_alpha"] {
+    for (relation, path) in [("rank_beta", "beta_body"), ("rank_alpha", "alpha_body")] {
         frame(&mut frame_bytes, relation);
-        frame(&mut frame_bytes, "by_body");
+        frame(&mut frame_bytes, path);
     }
     let mut digest = Sha256::new();
     digest.update(b"rtdb.owned.search.held.v5\0");
