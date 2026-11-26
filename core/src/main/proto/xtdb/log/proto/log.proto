@@ -68,7 +68,9 @@ message BlockUploaded {
     bytes catalog_sha256 = 7;
     // The block catalog's naming epoch, when above 0: its compaction outputs carry trie keys XTDB cannot parse,
     // so the record is framed for XTDB to refuse. See dev/doc/db.allium (XtdbRefusesRtdbExtensionRecords).
-    int64 naming_epoch = 8;
+    // Numbered far above upstream's fields so that a field upstream adds next cannot collide with it.
+    int64 naming_epoch = 1000;
+    reserved 8;
 }
 
 message FlushBlock {
