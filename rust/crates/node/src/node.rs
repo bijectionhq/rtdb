@@ -1011,9 +1011,10 @@ impl Node {
 
     fn outcome_query(&self, query: OutcomeQuery, context: &Arc<QueryContext>, arguments: &[Value]) -> Result<PreparedQuery> {
         let types = arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
-        let mut slot = self.outcome_queries[query as usize].lock()
-            .map_err(|_| Anomaly::fault("rtdb.node/outcome-query", "Outcome statement cache was poisoned"))?;
-        if let Some(prepared) = &*slot { return prepared.bind(context, &types, false); }
+        let slot = &self.outcome_queries[query as usize];
+        fn poisoned<T>(_: T) -> Anomaly { Anomaly::fault("rtdb.node/outcome-query", "Outcome statement cache was poisoned") }
+        let kept = slot.lock().map_err(poisoned)?.clone();
+        if let Some(prepared) = kept { return prepared.bind(context, &types, false); }
         let options = rtdb_sql::PrepareOptions {
             parameter_types: types.iter().cloned().enumerate().collect(),
             default_timezone: context.timezone.clone(),
@@ -1024,7 +1025,7 @@ impl Node {
         Arc::make_mut(&mut planning).memory = Arc::clone(self.memory());
         let prepared = PreparedSql::prepare(query.sql(), &planning, options, ResultSignaturePolicy::Dynamic)?;
         let bound = prepared.bind(context, &types, false)?;
-        *slot = Some(prepared);
+        *slot.lock().map_err(poisoned)? = Some(prepared);
         Ok(bound)
     }
 

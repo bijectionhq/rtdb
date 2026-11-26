@@ -1401,6 +1401,30 @@ async fn native_internal_reads_return_stored_transaction_result_and_role_members
     }).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_awaits_of_stored_outcomes_each_read_their_own_transaction() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let mut results = Vec::new();
+        for id in 0..9 {
+            let result = session.state_mut().execute_tx(vec![put(&node, id, id)], AutonomousTxOptions::default()).await.unwrap();
+            assert!(result.committed());
+            results.push(result);
+        }
+        let stored = results[..8].to_vec();
+        let awaits = stored.iter().map(|expected| {
+            let node = node.clone();
+            let tx_id = expected.tx_key().tx_id;
+            tokio::spawn(async move { node.await_transaction("xtdb", tx_id, &Authority, &CancellationToken::new()).await })
+        }).collect::<Vec<_>>();
+        for (expected, awaited) in stored.iter().zip(futures::future::join_all(awaits).await) {
+            assert_eq!(&awaited.unwrap().unwrap(), expected);
+        }
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
 #[tokio::test]
 async fn native_sql_and_xtql_admit_unsigned_external_parameters_before_binding() {
     let (node, driver) = running(options(), services()).await;
