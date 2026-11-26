@@ -10,13 +10,14 @@ use tonic::Status;
 
 use crate::{error::{invalid, status}, state::Owner, wire};
 
-const VERSION: &[u8] = b"RTDBFT\x03";
+const VERSION: &[u8] = b"RTDBFT\x04";
 const MAC_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
 const RUN: u8 = 1;
 const INSPECT: u8 = 2;
 
 /// A self-contained query ticket; nothing about an issued ticket is retained by the server.
+/// A run ticket is unsigned and redeemable by any session, as the reference's `QueryTicket.Run` is; an inspection is signed for its session.
 pub(crate) enum Ticket {
     Run(QueryRun),
     Inspect(Inspection),
@@ -80,7 +81,7 @@ impl TicketBasis {
     }
 }
 
-/// Binds a ticket to the session that described it, under the service's ticket key.
+/// Binds an inspection ticket to the session that described it, under the service's ticket key.
 pub(crate) struct Binding<'a> { pub mac: Hmac<Sha256>, pub session: &'a str, pub owner: Owner }
 
 const SIGN: u8 = 0;
@@ -183,20 +184,28 @@ impl Ticket {
                 put_bytes(&mut bytes, run.params.as_deref())?;
             }
         }
-        let tag = binding.sign(&bytes).finalize().into_bytes();
-        bytes.extend_from_slice(&tag);
+        if let Self::Inspect(_) = self {
+            let tag = binding.sign(&bytes).finalize().into_bytes();
+            bytes.extend_from_slice(&tag);
+        }
         if bytes.capacity() > bound { return Err(Status::internal("Query ticket exceeds its encoding reservation")); }
         Ok(wire::retain(bytes, charge))
     }
 
-    /// A ticket signed for another session or by another service reads as unknown.
+    /// An inspection signed for another session or by another service reads as unknown; a run ticket decodes for any session.
     pub fn decode(bytes: &Bytes, binding: &Binding<'_>) -> Result<Self, Status> {
         if !bytes.starts_with(VERSION) { return Err(invalid("invalid ticket version")); }
         if bytes.len() == VERSION.len() { return Ok(Self::Empty); }
-        let split = bytes.len().checked_sub(MAC_BYTES).filter(|split| *split > VERSION.len())
-            .ok_or_else(|| invalid("truncated ticket"))?;
-        binding.sign(&bytes[..split]).verify_slice(&bytes[split..]).map_err(|_| Status::not_found("unknown query ticket"))?;
-        let mut body = bytes.slice(VERSION.len()..split);
+        let end = match bytes[VERSION.len()] {
+            INSPECT => {
+                let split = bytes.len().checked_sub(MAC_BYTES).filter(|split| *split > VERSION.len())
+                    .ok_or_else(|| invalid("truncated ticket"))?;
+                binding.sign(&bytes[..split]).verify_slice(&bytes[split..]).map_err(|_| Status::not_found("unknown query ticket"))?;
+                split
+            }
+            _ => bytes.len(),
+        };
+        let mut body = bytes.slice(VERSION.len()..end);
         let ticket = match body.get_u8() {
             INSPECT => {
                 let database = take_string(&mut body)?;
@@ -364,19 +373,36 @@ mod tests {
     }
 
     #[test]
-    fn ticket_is_unknown_to_another_session_owner_or_service_and_rejects_tampering() {
+    fn run_ticket_is_redeemable_by_another_session_owner_or_service() {
         let memory = MemoryBudget::new(1 << 20);
         let owner = Owner::Authenticated(Uuid::from_bytes([7; 16]));
         let signer = binding("session", owner, b"key");
         let encoded = run(Cut::Visible(BTreeMap::new()), None).encode(&signer, &memory).unwrap();
+        for other in [binding("other", owner, b"key"), binding("session", Owner::Anonymous, b"key"), binding("session", owner, b"restarted")] {
+            let Ok(Ticket::Run(decoded)) = Ticket::decode(&encoded, &other) else { panic!("run ticket for another session") };
+            assert_eq!((decoded.database.as_str(), decoded.sql.as_str()), ("xtdb", "SELECT ?"));
+        }
+        assert!(Ticket::decode(&encoded.slice(..encoded.len() - 1), &signer).is_err());
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(Ticket::decode(&Bytes::from(trailing), &signer).is_err());
+        assert!(Ticket::decode(&Bytes::from_static(b"RTDBFT\x03"), &signer).is_err());
+    }
+
+    #[test]
+    fn inspection_ticket_is_unknown_to_another_session_owner_or_service_and_rejects_tampering() {
+        let memory = MemoryBudget::new(1 << 20);
+        let owner = Owner::Authenticated(Uuid::from_bytes([7; 16]));
+        let signer = binding("session", owner, b"key");
+        let encoded = Ticket::Inspect(Inspection { database: "xtdb".into(), transaction: None, sql: "SHOW search_path".into(), search_path: Vec::new() })
+            .encode(&signer, &memory).unwrap();
         for other in [binding("other", owner, b"key"), binding("session", Owner::Anonymous, b"key"), binding("session", owner, b"restarted")] {
             assert_eq!(Ticket::decode(&encoded, &other).err().unwrap().code(), tonic::Code::NotFound);
         }
         let mut tampered = encoded.to_vec();
         tampered[VERSION.len() + 8] ^= 1;
         assert_eq!(Ticket::decode(&Bytes::from(tampered), &signer).err().unwrap().code(), tonic::Code::NotFound);
-        assert!(Ticket::decode(&encoded.slice(..encoded.len() - 1), &signer).is_err());
-        assert!(Ticket::decode(&Bytes::from_static(b"RTDBFT\x02"), &signer).is_err());
+        assert!(Ticket::decode(&encoded.slice(..VERSION.len() + 1), &signer).is_err());
     }
 
     #[test]

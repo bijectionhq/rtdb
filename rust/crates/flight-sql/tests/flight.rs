@@ -263,7 +263,7 @@ async fn placed_flight_sessions_scope_catalogs_tickets_and_handles_to_their_atta
 
     let info = first.info("SELECT 42::BIGINT AS n", None).await;
     let ticket = info.endpoint[0].ticket.clone().unwrap();
-    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 42);
 
     let transaction = first.begin().await;
@@ -503,7 +503,7 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
     let ticket = Any::decode(info.endpoint[0].ticket.as_ref().unwrap().ticket.as_ref()).unwrap();
     let handle = TicketStatementQuery::decode(ticket.value).unwrap().statement_handle;
-    assert!(handle.starts_with(b"RTDBFT\x03"));
+    assert!(handle.starts_with(b"RTDBFT\x04"));
 
     let text = RecordBatch::try_from_iter([("label", Arc::new(StringArray::from(vec!["new"])) as arrow_array::ArrayRef)]).unwrap();
     client.upload(command, vec![text]).await;
@@ -515,8 +515,7 @@ async fn ticket_carries_its_arrow_parameters_across_rebind() {
     let rows = client.redeem(&current).await;
     assert_eq!(rows[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "new");
     let mut other = Client::connect(&running.server, None).await;
-    let request = other.request(info.endpoint[0].ticket.clone().unwrap());
-    assert_eq!(other.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(integer(&other.redeem(&info).await[0], 0, 0), 41, "another session redeems a query ticket, as the reference's QueryTicket.Run");
     running.stop().await;
 }
 
@@ -621,13 +620,12 @@ async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads()
 }
 
 #[tokio::test]
-async fn authenticated_handles_and_query_tickets_require_the_original_session() {
+async fn authenticated_handles_require_the_original_session_but_query_tickets_do_not() {
     let running = Running::start(Some("correct"), FlightConfig::default()).await;
     let mut first = Client::connect(&running.server, Some("xtdb:correct")).await; let mut second = Client::connect(&running.server, Some("xtdb:correct")).await;
     let handle = first.begin().await; assert_eq!(second.end(handle.clone(), true).await.unwrap_err().code(), tonic::Code::NotFound);
     first.end(handle, false).await.unwrap(); let info = first.info("SELECT 1::bigint AS n", None).await;
-    let request = second.request(info.endpoint[0].ticket.clone().unwrap());
-    assert_eq!(second.client.do_get(request).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(integer(&second.redeem(&info).await[0], 0, 0), 1);
     assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 1);
     running.stop().await;
 }
