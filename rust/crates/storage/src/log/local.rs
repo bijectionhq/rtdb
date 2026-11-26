@@ -506,7 +506,7 @@ impl LocalLog {
             }).await?
         };
         if let Some(keys) = &self.keys { keys.require_local_offset(next as i64)?; }
-        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() })
+        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone(), held: None })
     }
 }
 
@@ -584,6 +584,8 @@ struct LocalTail {
     path: Arc<PathBuf>, lineage: Option<Uuid>, progress: Arc<Progress>, maximum: usize, after: LogOffset, next: u64,
     reads: Arc<IoRegion>,
     keys: Option<Arc<ClassicObjectKeys>>,
+    /// The journal the last read went through, kept open for the next one.
+    held: Option<JournalFile>,
 }
 
 impl LocalTail {
@@ -594,8 +596,9 @@ impl LocalTail {
         let keys = self.keys.clone();
         let payload_limit = payload_limit.max(maximum);
         let lineage = self.lineage;
-        let (records, next) = self.reads.read(self.path.clone(), (self.next, tip), move |path, &(next, tip)| {
-            let mut file = open_at(path, lineage, next)?;
+        let held = self.held.take();
+        let (records, next, held) = self.reads.read(self.path.clone(), (self.next, tip), move |path, &(next, tip)| {
+            let mut file = reopen_at(held, path, lineage, next)?;
             let mut records = Vec::new();
             let mut payload_bytes = 0usize;
             while file.stream_position().map_err(|error| Error::io(path.as_path(), error))? <= tip.0 as u64 {
@@ -609,8 +612,9 @@ impl LocalTail {
                 records.push(record);
             }
             let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))?;
-            Ok::<_, Error>((records, next))
+            Ok::<_, Error>((records, next, file))
         }).await?;
+        self.held = Some(held);
         let last = records.last().ok_or_else(|| corrupt(&self.path, self.next, "durable tip yielded no record"))?;
         self.after = last.metadata.offset;
         self.next = next;
@@ -625,6 +629,13 @@ impl LogTail for LocalTail {
     }
 
     fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
+}
+
+/// The journal at `next`, reading through `held` while the path still names that file.
+fn reopen_at(held: Option<JournalFile>, path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile> {
+    let Some(mut file) = held.filter(|file| file.is_at(path).unwrap_or(false)) else { return open_at(path, lineage, next); };
+    file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
+    Ok(file)
 }
 
 fn open_at(path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile> {
@@ -642,10 +653,13 @@ impl LogReplayTail for LocalTail {
 
         let maximum = self.maximum;
         let lineage = self.lineage;
-        self.reads.read(self.path.clone(), self.next, move |path, &next| {
-            let mut file = open_at(path, lineage, next)?;
-            Ok(Some(read_record_header(&mut file, path, maximum)?.replay_head()))
-        }).await
+        let held = self.held.take();
+        let (head, held) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
+            let mut file = reopen_at(held, path, lineage, next)?;
+            Ok((read_record_header(&mut file, path, maximum)?.replay_head(), file))
+        }).await?;
+        self.held = Some(held);
+        Ok(Some(head))
     }
 
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
@@ -659,8 +673,9 @@ impl LogReplayTail for LocalTail {
         let maximum = self.maximum;
         let keys = self.keys.clone();
         let lineage = self.lineage;
-        let (record, next) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
-            let mut file = open_at(path, lineage, next)?;
+        let held = self.held.take();
+        let (record, next, held) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
+            let mut file = reopen_at(held, path, lineage, next)?;
             let header = read_record_header(&mut file, path, maximum)?;
             if header.replay_head() != head {
                 return Err(corrupt(path, next, "log replay head changed before delivery"));
@@ -670,8 +685,9 @@ impl LogReplayTail for LocalTail {
             }
             let record = read_record_body(&mut file, path, header, keys.as_deref())?.retain(reservation)?;
             let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))?;
-            Ok((record, next))
+            Ok((record, next, file))
         }).await?;
+        self.held = Some(held);
         self.after = record.metadata.offset;
         self.next = next;
         Ok(record)
@@ -1001,6 +1017,7 @@ mod tests {
             next: 0,
             reads: Arc::clone(&log.reads),
             keys: None,
+            held: None,
         };
         for (limit, from, to) in [(8, 0, 2), (5, 2, 3), (5, 3, 4), (5, 4, 5)] {
             let batch = tail.poll_with_payload_limit(Duration::ZERO, limit).await.unwrap();
@@ -1079,5 +1096,33 @@ mod retention_tests {
         writer.file.seek(SeekFrom::Start(before.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
         assert_eq!(read_record(&mut writer.file, &path, 1024, None)?.payload.as_ref(), b"surviving suffix");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod held_journal_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn a_tail_reads_through_its_open_journal_until_the_path_names_another() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        fs::write(&path, b"first").unwrap();
+        let mut held = reopen_at(None, &path, None, 1).unwrap();
+        let mut text = String::new();
+        held.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "irst");
+
+        let replacement = directory.path().join("LOG.next");
+        fs::write(&replacement, b"second").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let mut reopened = reopen_at(Some(held), &path, None, 0).unwrap();
+        text.clear();
+        reopened.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "second");
+
+        fs::remove_file(&path).unwrap();
+        assert!(reopen_at(Some(reopened), &path, None, 0).is_err());
     }
 }

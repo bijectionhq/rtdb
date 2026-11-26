@@ -60,6 +60,23 @@ impl JournalFile {
         Ok(Self { file, lineage })
     }
 
+    /// Whether `path` still names this open file, so that reading through it reads the journal at that path.
+    pub(super) fn is_at(&self, path: &Path) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current = match fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(Error::io(path, error)),
+            };
+            let held = self.file.metadata().map_err(|error| Error::io(path, error))?;
+            Ok((held.dev(), held.ino()) == (current.dev(), current.ino()))
+        }
+        #[cfg(not(unix))]
+        { let _ = path; Ok(false) }
+    }
+
     pub(super) fn open(path: &Path, expected: Option<Uuid>) -> Result<Option<Self>> {
         let journal = match File::open(path) {
             Ok(file) => Some(Self::inspect_header(file, path)?),
