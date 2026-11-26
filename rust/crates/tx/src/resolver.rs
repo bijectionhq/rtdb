@@ -519,7 +519,7 @@ impl TxResolver {
                         Some(table) if !error.context.contains_key("table") => error.with_transit_context("table", &T::table_ref(table))?,
                         _ => error,
                     };
-                    let error = if error.code == "xtdb/assert-failed" {
+                    let error = if error.code == footprint_grant_state::ASSERT_FAILED {
                         match &request.guard {
                             Some(SourceGuard::Application(guard)) => {
                                 let guard_time = crate::guard_attribution::guard_time_at(index, guard.after_bootstrap, guard.submitted_at.0);
@@ -1104,7 +1104,7 @@ impl<'a> OpenTransaction<'a> {
             Mutation::Erase { table, input } => (Some(table), input, MutationKind::Erase),
             Mutation::Assert { input, message } => {
                 let mut cursor = execute(input, context, arguments, syntax).await?;
-                if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
+                if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, footprint_grant_state::ASSERT_FAILED, message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
             Mutation::CreateTable { table, columns } => {

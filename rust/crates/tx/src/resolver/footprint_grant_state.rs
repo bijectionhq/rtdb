@@ -40,17 +40,19 @@ pub(crate) fn work_key_id(work_key: &str) -> u64 {
     ])
 }
 
+/// XTDB's code for a failed `ASSERT`, the conflict a transaction raises against data that changed under it.
+pub(crate) const ASSERT_FAILED: &str = "xtdb/assert-failed";
+
+fn footprint_grant_fenced() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/footprint-grant-fenced", "Target footprint is fenced by a live durable SS8 grant")
+}
+
+/// Whether an abort is one of the optimistic conflicts a work key's durable grant debits: a failed assertion, or a write
+/// fenced by another work key's grant. These are the only conflicts the resolver raises for data that changed under a
+/// transaction; its other conflicts (expired deadlines, existing declarations, stale owned observations) are not debited.
 pub(crate) fn is_definite_occ_conflict(error: &Anomaly) -> bool {
     error.category == AnomalyCategory::Conflict
-        && matches!(
-            error.code.as_str(),
-            "rtdb.owned/conflict"
-                | "rtdb.hosted/control-stale"
-                | "rtdb.owned/range-conflict"
-                | "rtdb.owned/point-conflict"
-                | "rtdb.owned/footprint-grant-fenced"
-                | "xtdb/assert-failed"
-        )
+        && (error.code == ASSERT_FAILED || error.code == footprint_grant_fenced().code)
 }
 
 #[derive(Clone, Debug)]
@@ -256,11 +258,7 @@ impl OpenTransaction<'_> {
             });
             if !footprint_grant::writer_may_apply(writer, overlapping, grant.active, matches_holder)
             {
-                return Err(Anomaly::new(
-                    AnomalyCategory::Conflict,
-                    "rtdb.owned/footprint-grant-fenced",
-                    "Target footprint is fenced by a live durable SS8 grant",
-                ));
+                return Err(footprint_grant_fenced());
             }
         }
         Ok(())
@@ -501,5 +499,18 @@ impl OpenTransaction<'_> {
             self.write_ss8_grant_row(promoted)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_grant_debits_only_the_conflicts_the_resolver_raises_for_changed_data() {
+        assert!(is_definite_occ_conflict(&footprint_grant_fenced()));
+        assert!(is_definite_occ_conflict(&Anomaly::new(AnomalyCategory::Conflict, ASSERT_FAILED, "Assert failed")));
+        assert!(!is_definite_occ_conflict(&Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "deadline")));
+        assert!(!is_definite_occ_conflict(&Anomaly::incorrect(ASSERT_FAILED, "not a conflict")));
     }
 }
