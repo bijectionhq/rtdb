@@ -462,10 +462,10 @@ impl OwnedScalar {
 impl DecodedKeys {
     const CHARGE_STEP: usize = 64 * 1024;
 
-    fn get(&mut self, index: usize, columns: &[Column], row: usize, memory: &Arc<MemoryBudget>) -> Result<&Decoded> {
+    fn get<'c>(&mut self, index: usize, columns: impl Iterator<Item = &'c Column>, row: usize, memory: &Arc<MemoryBudget>) -> Result<&Decoded> {
         if self.keys.len() <= index { self.keys.resize_with(index + 1, || None); }
         if self.keys[index].is_none() {
-            let scalars = columns.iter().map(|column| match DirectKey::read(column, row) {
+            let scalars = columns.map(|column| match DirectKey::read(column, row) {
                 Some(DirectKey::Scalar(scalar)) => OwnedScalar::of(scalar),
                 _ => None,
             }).collect::<Option<Box<[OwnedScalar]>>>();
@@ -664,7 +664,7 @@ impl BatchKeyIndex {
         self.positions.find(u64::from(hash), all, context, |index, position| {
             let (batch, projected) = &batches[position.batch];
             if direct
-                && let Decoded::Scalars(stored) = decoded.get(index, &batch.columns, position.row, &context.memory)?
+                && let Decoded::Scalars(stored) = decoded.get(index, batch.columns.iter(), position.row, &context.memory)?
                 && let Some(equal) = decoded_equal(key.direct_parts(), stored)
             {
                 return Ok(equal);
@@ -749,6 +749,7 @@ impl BatchKeyIndex {
                 .ok_or_else(size_error)?,
         )?;
         let mut current = Positions::default();
+        let mut current_decoded = DecodedKeys::default();
         let previous = self.positions.rows.len();
         let mut picks = Vec::with_capacity(batch.len);
         let mut hashes = Vec::with_capacity(batch.len);
@@ -762,7 +763,17 @@ impl BatchKeyIndex {
                 visit(row, index, false)?;
                 continue;
             }
-            let known = current.find(u64::from(hash), false, context, |_, position| {
+            let direct = key.decodable();
+            let known = current.find(u64::from(hash), false, context, |index, position| {
+                if direct {
+                    let selected = positions.map(|positions| positions.iter().map(|&position| &batch.columns[position]));
+                    let columns = selected.into_iter().flatten().chain(positions.is_none().then(|| batch.columns.iter()).into_iter().flatten());
+                    if let Decoded::Scalars(stored) = current_decoded.get(index, columns, position.row, &context.memory)?
+                        && let Some(equal) = decoded_equal(key.direct_parts(), stored)
+                    {
+                        return Ok(equal);
+                    }
+                }
                 key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected }, positions, context)
             })?;
             let index = previous
