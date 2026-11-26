@@ -957,7 +957,7 @@ impl TableWrite {
         Self { column_types, declared_columns: StructFields::new(), batch, adopted_history: false }
     }
     pub fn with_declarations(mut self, declared_columns: StructFields<LogicalType>) -> Self {
-        self.column_types = declare_column_types(&self.column_types, &declared_columns);
+        if !declared_columns.is_empty() { self.column_types = declare_column_types(&self.column_types, &declared_columns); }
         self.declared_columns = declared_columns;
         self
     }
@@ -2151,6 +2151,21 @@ fn appended_versions_keep_their_own_column_types_and_declarations_while_sharing_
     for (live, (column_types, declarations)) in versions.iter().zip(&expected) {
         assert!(identical_types(live.column_types(), column_types), "{:?} differs from {column_types:?}", live.column_types());
         assert!(identical_types(live.declared_columns(), declarations), "{:?} differs from {declarations:?}", live.declared_columns());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn table_write_declarations_join_the_written_types_as_declare_column_types_does() {
+    use rtdb_types::ScalarType;
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    let written = StructFields::from([("b".to_owned(), LogicalType::from_legs([text.clone(), int.clone()])), ("a".to_owned(), int.clone())]);
+    let declared = StructFields::from([("c".to_owned(), text.clone()), ("a".to_owned(), text.clone().maybe())]);
+    for declarations in [StructFields::new(), declared] {
+        let write = TableWrite::new(written.clone(), None).with_declarations(declarations.clone());
+        assert!(identical_types(write.column_types(), &declare_column_types(&written, &declarations)));
+        assert!(identical_types(write.declared_columns(), &declarations));
     }
 }
 
