@@ -235,7 +235,6 @@ pub struct Node {
     read_fence: Option<Arc<dyn ReadFence>>,
     scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
     placement_slots: Option<Arc<Semaphore>>,
-    sql_snapshots: Arc<crate::sql_snapshots::SqlSnapshots>,
     outcome_queries: Arc<[std::sync::Mutex<Option<PreparedSql>>; 4]>,
     shared_plans: Arc<rtdb_query::SharedPlans>,
 }
@@ -327,8 +326,7 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics,
             catalog: Arc::clone(&catalog), factory: Arc::clone(&factory), owner: run.token.clone() });
         let node = Self { catalog, factory, commands, run, runtime, read_fence, scan_fragmenter, placement_slots,
-            sql_snapshots: Arc::default(), outcome_queries: Default::default(), shared_plans };
-        node.sql_snapshots.start(node.run.token.clone());
+            outcome_queries: Default::default(), shared_plans };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -841,41 +839,6 @@ impl Node {
             };
             let replay = replay.with_serving(database.native_serving_authority.clone(), storage);
             recovered.replay_sql_erasure(&database.logs, replay, store, cancellation).await
-        }).await
-    }
-
-    pub(crate) async fn recover_sql_snapshot(
-        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
-        cancellation: &CancellationToken,
-    ) -> Result<crate::sql_snapshots::RecoveredSqlSnapshot> {
-        database.object_store().require_erasure_catalog(Some(cut)).await?;
-        let replay = cancellation.run_until_cancelled(
-            rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
-        ).await.ok_or_else(cancelled)??;
-        let installed = &database.storage;
-        installed.object_store().require_erasure_catalog(Some(cut)).await?;
-        let storage = if let Some(owner) = replay.provider() {
-            let view = installed.object_store().open_log_snapshot(owner).await?;
-            Arc::new(BufferPool::with_budget(view, Arc::clone(installed.budget())))
-        } else {
-            Arc::clone(installed)
-        };
-        let dependencies = Arc::new(replay.custody());
-        rtdb_storage::IoRegion::retaining(dependencies, async {
-            let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
-                Arc::clone(&storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
-            let mut recovered = match checkpoint {
-                Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
-                    database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
-                    .await.ok_or_else(cancelled)??,
-                None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
-            };
-            let replay = replay.with_serving(database.native_serving_authority.clone(), Arc::clone(&storage));
-            let suffix = recovered.replay_snapshot_suffix(&database.logs, replay, cancellation).await?;
-            recovered.partition.publish_catalog_cut(cut)?;
-            let partition = recovered.partition.snapshot();
-            let storage = (!Arc::ptr_eq(installed, &storage)).then_some(storage);
-            Ok(crate::sql_snapshots::RecoveredSqlSnapshot { partition, suffix, storage })
         }).await
     }
 
@@ -4565,9 +4528,8 @@ impl NativeSessionService {
     }
 
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        let registry = &self.node.sql_snapshots;
         let admission = Arc::new(crate::sql_snapshots::SqlSnapshotAdmission {
-            node: self.node.clone(), registry: Arc::clone(registry), identity: Arc::clone(&self.identity),
+            node: self.node.clone(), identity: Arc::clone(&self.identity),
         });
         let context = self.node.query_context_in_placement(
             database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation,
@@ -4592,7 +4554,7 @@ impl NativeSessionService {
         } else {
             context
         };
-        let context = registry.with_issuer(context, self.user(), self.node.clone(), self.placement.clone());
+        let context = crate::sql_snapshots::with_issuer(context, self.user(), self.placement.clone());
         Ok(if basis.has_await_floor { context } else { context.with_snapshot_admission(admission) })
     }
 

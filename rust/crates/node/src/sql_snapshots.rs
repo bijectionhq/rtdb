@@ -1,258 +1,151 @@
-use std::{collections::HashMap, sync::{Arc, Weak}, time::Duration};
+//! Stateless SQL snapshot tokens.
+//!
+//! As in XTDB, a snapshot token carries its read basis itself: the transaction head and system-time cap it was issued
+//! at, with the evaluation clock and time zone. Redeeming it reads the database's current catalog capped at that basis,
+//! so no server-side table, catalog hold or expiry is involved; the token stays valid for as long as the history it
+//! names exists. Where the database has a placed-receipt codec the basis is sealed, binding it to the issuing principal
+//! and history; otherwise it is plain, and grants nothing a `SNAPSHOT_TIME` setting would not.
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use std::sync::{Arc, Weak};
+
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rtdb_query::QueryContext;
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, Instant, PlacedAttemptScope, ReplicaPosition, Result, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, Instant, Result, Timestamp, TransactionKey};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
-/// How long a token's exact catalog cut stays readable: the read lease it holds against storage GC.
-/// A cut is a set of trie and block objects rather than a system time XTDB could re-read at will, so a token outliving the
-/// lease would name objects GC is free to delete.
-const HOLD_FOR: Duration = Duration::from_secs(60);
-const DURABLE_PREFIX: &str = "rtdb-snapshot-v2:";
+const SEALED_PREFIX: &str = "rtdb-sealed-snapshot-v3:";
+const PLAIN_PREFIX: &str = "rtdb-snapshot-v3:";
 const MAX_ENVELOPE_BYTES: usize = 2048;
 
-#[derive(Serialize, Deserialize)]
+/// The read basis a token names.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExactSnapshot {
+struct SnapshotBasis {
+    /// The issuing principal and history fingerprint; present only in a sealed token.
     owner: Option<String>,
+    history: Option<[u8; 32]>,
     database: String,
-    history: [u8; 32],
-    cut: CatalogCut,
+    /// The storage generation the basis was read from, which a redeeming catalog must share.
+    cut: Option<CatalogCut>,
     head: Option<TransactionKey>,
-    block: BlockIndex,
     cap: Option<Timestamp>,
     clock: Instant,
     timezone: String,
-    issued: Timestamp,
-    replay: Option<SnapshotReplayBase>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-enum SnapshotReplayBase {
-    Genesis,
-    Checkpoint { block: BlockIndex, boundary: ReplicaPosition, root: [u8; 32] },
-}
-
-impl ExactSnapshot {
-    fn capture(
-        view: &rtdb_query::SqlSnapshotView, database: &crate::Database,
-        owner: Option<&str>, scope: PlacedAttemptScope, issued: Timestamp,
-    ) -> Result<Option<Self>> {
-        if view.catalog.database_names().count() != 1 || database.name() != view.database() {
-            return Ok(None);
-        }
+impl SnapshotBasis {
+    fn capture(view: &rtdb_query::SqlSnapshotView) -> Result<Self> {
+        if view.catalog.database_names().count() != 1 { return Err(unretained()); }
         let captured = view.catalog.database(view.database())?;
-        let [snapshot] = captured.partitions.as_slice() else { return Ok(None); };
-        if !Arc::ptr_eq(&captured.storage, &database.storage) || snapshot.has_overlays() {
-            return Ok(None);
-        }
-        let Some(cut) = snapshot.catalog_cut() else { return Ok(None); };
-        let replay = match snapshot.table_catalog().block() {
-            Some(block) => block.boundary_replica_position().zip(block.publication_sha256())
-                .filter(|(boundary, _)| *boundary <= cut.through && boundary.epoch() == cut.replica_epoch)
-                .map(|(boundary, root)| SnapshotReplayBase::Checkpoint { block: block.block_index(), boundary, root }),
-            None if snapshot.block_index() == BlockIndex(0) => Some(SnapshotReplayBase::Genesis),
-            None => None,
+        let [snapshot] = captured.partitions.as_slice() else { return Err(unretained()); };
+        if snapshot.has_overlays() { return Err(unretained()); }
+        Ok(Self {
+            owner: None, history: None, database: view.database().to_owned(), cut: snapshot.catalog_cut(),
+            head: snapshot.tx_basis(), cap: snapshot.system_time_cap(), clock: view.current_time,
+            timezone: view.timezone.clone(),
+        })
+    }
+
+    /// The system time the basis reads at: its cap, or its head when it carries no lower cap.
+    fn system_time(&self) -> Option<Timestamp> {
+        self.cap.or(self.head.map(|head| head.system_time))
+    }
+
+    fn encode(mut self, owner: Option<&str>, codec: Option<&dyn crate::placed_receipts::PlacedReceiptCodec>) -> Result<String> {
+        let token = match codec {
+            Some(codec) => {
+                self.owner = owner.map(str::to_owned);
+                self.history = Some(codec.scope().history_fingerprint());
+                let sealed = codec.seal_snapshot(&serde_json::to_vec(&self).map_err(|_| unretained())?)?;
+                format!("{SEALED_PREFIX}{sealed}")
+            }
+            None => format!("{PLAIN_PREFIX}{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&self).map_err(|_| unretained())?)),
         };
-        Ok(Some(Self {
-            owner: owner.map(str::to_owned), database: view.database().to_owned(),
-            history: scope.history_fingerprint(), cut, head: snapshot.tx_basis(),
-            block: snapshot.block_index(), cap: snapshot.system_time_cap(),
-            clock: view.current_time, timezone: view.timezone.clone(), issued, replay,
-        }))
-    }
-
-    fn matches(&self, snapshot: &rtdb_index::Snapshot) -> bool {
-        !snapshot.has_overlays() && snapshot.catalog_cut() == Some(self.cut)
-            && snapshot.tx_basis() == self.head && snapshot.block_index() == self.block
-    }
-
-    fn is_live(&self, now: Timestamp) -> bool {
-        now >= self.issued && now.0.checked_sub(self.issued.0)
-            .is_some_and(|age| age < HOLD_FOR.as_micros() as i64)
-    }
-}
-
-/// The views behind the node's live snapshot tokens.
-/// Each entry is charged to the node's memory and held by its read lease alone, so one session's tokens never evict another's.
-#[derive(Default)]
-pub(crate) struct SqlSnapshots {
-    entries: parking_lot::Mutex<HashMap<String, Arc<SqlSnapshot>>>,
-}
-
-pub(crate) struct SqlSnapshot {
-    pub(crate) owner: Option<Arc<str>>,
-    pub(crate) view: rtdb_query::SqlSnapshotView,
-    expires: tokio::time::Instant,
-    _charge: Arc<MemoryReservation>,
-}
-
-impl SqlSnapshots {
-    fn issue(
-        &self, owner: Option<Arc<str>>, view: rtdb_query::SqlSnapshotView, memory: &Arc<MemoryBudget>,
-        database: Option<&crate::Database>, issued: Timestamp,
-    ) -> Result<String> {
-        let mut token = None;
-        if let Some(database) = database
-            && let Some(codec) = database.await_authority.codec()
-            && let Some(exact) = ExactSnapshot::capture(&view, database, owner.as_deref(), codec.scope(), issued)?
-        {
-            let encoded = serde_json::to_vec(&exact).map_err(|_| unretained())?;
-            let sealed = codec.seal_snapshot(&encoded)?;
-            if sealed.len() > MAX_ENVELOPE_BYTES { return Err(unretained()); }
-            token = Some(format!("{DURABLE_PREFIX}{sealed}"));
-        }
-        let token = token.unwrap_or_else(|| format!("rtdb-snapshot:{}", Uuid::new_v4()));
-        let bytes = view.retained_bytes()?.checked_add(owner.as_ref().map_or(0, |owner| owner.len()) + 256)
-            .and_then(|bytes| bytes.checked_add(token.len())).ok_or_else(unretained)?;
-        let charge = memory.reserve(bytes)?;
-        let mut expires = tokio::time::Instant::now() + HOLD_FOR;
-        if let Some(cutoff) = view.catalog.read_lease().and_then(|lease| lease.provider_cutoff())
-            && view.catalog.database(view.database())?.storage.object_store().local_erasure_custody().is_some()
-        {
-            expires = expires.min(cutoff.into());
-        }
-        let view = with_expiry(view, expires.into_std());
-        let entry = Arc::new(SqlSnapshot { owner, view, expires, _charge: charge });
-        let replaced = self.entries.lock().insert(token.clone(), entry);
-        drop(replaced);
+        if token.len() > MAX_ENVELOPE_BYTES { return Err(unretained()); }
         Ok(token)
     }
 
-    pub(crate) fn start(self: &Arc<Self>, cancellation: tokio_util::sync::CancellationToken) {
-        let registry = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut ticks = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => break,
-                    _ = ticks.tick() => {}
-                }
-                let Some(registry) = registry.upgrade() else { break; };
-                registry.release_expired(tokio::time::Instant::now());
+    /// Decodes and authenticates a token for `owner`; a sealed token needs the codec that sealed it.
+    fn decode(token: &str, owner: Option<&str>, codec: Option<&dyn crate::placed_receipts::PlacedReceiptCodec>) -> Result<Self> {
+        if token.len() > MAX_ENVELOPE_BYTES { return Err(unretained()); }
+        if let Some(sealed) = token.strip_prefix(SEALED_PREFIX) {
+            let codec = codec.ok_or_else(unretained)?;
+            let basis: Self = serde_json::from_slice(&codec.open_snapshot(sealed).map_err(|_| unretained())?)
+                .map_err(|_| unretained())?;
+            if basis.owner.as_deref() != owner || basis.history != Some(codec.scope().history_fingerprint()) {
+                return Err(unretained());
             }
-        });
+            return Ok(basis);
+        }
+        let plain = token.strip_prefix(PLAIN_PREFIX).filter(|plain| !plain.is_empty()).ok_or_else(unretained)?;
+        let basis: Self = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(plain).map_err(|_| unretained())?)
+            .map_err(|_| unretained())?;
+        if basis.owner.is_some() || basis.history.is_some() { return Err(unretained()); }
+        Ok(basis)
     }
 
-    fn release_expired(&self, now: tokio::time::Instant) {
-        self.entries.lock().retain(|_, entry| entry.expires > now);
+    /// Caps `current` at this basis, as XTDB reads a snapshot token against the snapshot it opens.
+    /// A basis after the current head refuses with `xtdb/unindexed-tx`, as in XTDB.
+    fn read_at(&self, current: &rtdb_index::Snapshot) -> Result<rtdb_index::Snapshot> {
+        if current.has_overlays() { return Err(unretained()); }
+        if let (Some(issued), Some(redeemed)) = (self.cut, current.catalog_cut())
+            && (issued.storage_version != redeemed.storage_version || issued.storage_epoch != redeemed.storage_epoch)
+        {
+            return Err(unretained());
+        }
+        let Some(head) = self.head else {
+            // An empty basis has no system time to cap a later transaction below.
+            if current.tx_basis().is_some() { return Err(unretained()); }
+            return Ok(current.clone());
+        };
+        if current.tx_basis().is_none_or(|present| present.tx_id < head.tx_id || present.system_time < head.system_time) {
+            return Err(Anomaly::incorrect("xtdb/unindexed-tx",
+                format!("system-time ({}) is after the latest completed tx", head.system_time.0)));
+        }
+        current.clone().with_system_time_cap(self.system_time()).map_err(|_| unretained())
     }
-
-    fn select(&self, token: &str, owner: Option<&str>, database: &str) -> Option<Arc<SqlSnapshot>> {
-        self.entries.lock().get(token).filter(|entry| {
-            entry.owner.as_deref() == owner && entry.view.database() == database
-                && tokio::time::Instant::now() < entry.expires
-        }).map(Arc::clone)
-    }
-
-    pub(crate) fn with_issuer(
-        self: &Arc<Self>, context: Arc<QueryContext>, owner: Option<&str>,
-        node: crate::Node, database: Option<Weak<crate::Database>>,
-    ) -> Arc<QueryContext> {
-        let registry = Arc::downgrade(self);
-        let owner = owner.map(Arc::<str>::from);
-        context.with_snapshot_token_issuer(Arc::new(move |view| {
-            let registry = registry.upgrade().ok_or_else(unretained)?;
-            let database = database.as_ref().and_then(Weak::upgrade);
-            registry.issue(owner.clone(), view, node.memory(), database.as_deref(), node.now())
-        }))
-    }
-
 }
 
-fn with_expiry(mut view: rtdb_query::SqlSnapshotView, deadline: std::time::Instant) -> rtdb_query::SqlSnapshotView {
-    let lease = Arc::new(rtdb_storage::ReadLease::until(deadline));
-    let lease = view.catalog.read_lease().map_or_else(|| Arc::clone(&lease), |original| original.earlier(Arc::clone(&lease)));
-    view.catalog = view.catalog.with_read_lease(lease);
-    view
+/// Lets `context` issue tokens for the views it executes.
+pub(crate) fn with_issuer(context: Arc<QueryContext>, owner: Option<&str>, database: Option<Weak<crate::Database>>) -> Arc<QueryContext> {
+    let owner = owner.map(Arc::<str>::from);
+    context.with_snapshot_token_issuer(Arc::new(move |view| {
+        let database = database.as_ref().and_then(Weak::upgrade);
+        let codec = database.as_deref().filter(|database| database.name() == view.database())
+            .and_then(|database| database.await_authority.codec());
+        SnapshotBasis::capture(&view)?.encode(owner.as_deref(), codec)
+    }))
 }
 
 pub(crate) fn unretained() -> Anomaly {
-    Anomaly::new(AnomalyCategory::Unavailable, "rtdb/snapshot-unretained", "The exact SQL snapshot cannot be readmitted")
-}
-
-pub(crate) struct RecoveredSqlSnapshot {
-    pub(crate) partition: rtdb_index::Snapshot,
-    pub(crate) suffix: Option<Arc<dyn Send + Sync>>,
-    pub(crate) storage: Option<Arc<rtdb_storage::cache::BufferPool>>,
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb/snapshot-unretained", "The SQL snapshot token cannot be redeemed here")
 }
 
 pub(crate) struct SqlSnapshotAdmission {
     pub(crate) node: crate::Node,
-    pub(crate) registry: Arc<SqlSnapshots>,
     pub(crate) identity: Arc<dyn crate::SessionIdentity>,
 }
 
 impl SqlSnapshotAdmission {
+    /// Redeems a token against the current context's catalog, with no server-side state.
     pub(crate) async fn restore(
         &self, token: &str, current: &QueryContext, cancellation: &CancellationToken,
     ) -> Result<rtdb_query::SqlSnapshotView> {
         use rtdb_plan::Catalog;
 
         let name = current.catalog.default_database();
-        if let Some(retained) = self.registry.select(token, self.identity.user(), name) {
-            if current.timezone != retained.view.timezone { return Err(unretained()); }
-            self.node.admit_retained_catalog(&retained.view.catalog, self.identity.as_ref(), cancellation).await?;
-            return Ok(retained.view.clone());
-        }
-        let envelope = token.strip_prefix(DURABLE_PREFIX)
-            .filter(|sealed| !sealed.is_empty() && sealed.len() <= MAX_ENVELOPE_BYTES)
-            .ok_or_else(unretained)?;
         self.node.admit_retained_catalog(&current.catalog, self.identity.as_ref(), cancellation).await?;
         let database = self.node.catalog().database(name).map_err(|_| unretained())?;
         let current_database = current.catalog.database(name)?;
         if !Arc::ptr_eq(&database.storage, &current_database.storage) || current.catalog.database_names().count() != 1 {
             return Err(unretained());
         }
-        let codec = database.await_authority.codec().ok_or_else(unretained)?;
-        let bytes = codec.open_snapshot(envelope).map_err(|_| unretained())?;
-        let exact: ExactSnapshot = serde_json::from_slice(&bytes).map_err(|_| unretained())?;
-        if exact.owner.as_deref() != self.identity.user() || exact.database != name
-            || exact.history != codec.scope().history_fingerprint() || exact.timezone != current.timezone
-            || !exact.is_live(self.node.now())
-        {
-            return Err(unretained());
-        }
-        let expiry = exact.issued.0.checked_add(HOLD_FOR.as_micros() as i64).ok_or_else(unretained)?;
-        let remaining = expiry.checked_sub(self.node.now().0).and_then(|micros| u64::try_from(micros).ok())
-            .filter(|micros| *micros > 0 && *micros <= HOLD_FOR.as_micros() as u64).ok_or_else(unretained)?;
-        let deadline = std::time::Instant::now().checked_add(Duration::from_micros(remaining)).ok_or_else(unretained)?;
+        let basis = SnapshotBasis::decode(token, self.identity.user(), database.await_authority.codec())?;
+        if basis.database != name || basis.timezone != current.timezone { return Err(unretained()); }
         let [partition] = current_database.partitions.as_slice() else { return Err(unretained()); };
-        let recovered = if exact.matches(partition) {
-            RecoveredSqlSnapshot { partition: partition.clone(), suffix: None, storage: None }
-        } else {
-            let cut = partition.catalog_cut().filter(|cut| cut.storage_version == exact.cut.storage_version
-                && cut.storage_epoch == exact.cut.storage_epoch && cut.replica_epoch == exact.cut.replica_epoch)
-                .ok_or_else(unretained)?;
-            if cut.through < exact.cut.through {
-                tokio::time::timeout_at(deadline.into(), database.await_installed(
-                    |prefix| prefix.replica >= exact.cut.through, cancellation,
-                )).await.map_err(|_| unretained())??;
-            }
-            let checkpoint = match exact.replay.as_ref().ok_or_else(unretained)? {
-                SnapshotReplayBase::Genesis if exact.block == BlockIndex(0) => None,
-                SnapshotReplayBase::Genesis => return Err(unretained()),
-                SnapshotReplayBase::Checkpoint { block, boundary, root } => Some(rtdb_replication::PublishedCheckpoint {
-                    block: *block, boundary: *boundary, root_sha256: Some(*root),
-                }),
-            };
-            let recovery = self.node.recover_sql_snapshot(&database, exact.cut, checkpoint, cancellation);
-            tokio::time::timeout_at(deadline.into(), recovery).await.map_err(|_| unretained())?
-                .map_err(|error| {
-                    if matches!(error.code.as_str(), "rtdb/erased-under-view" | "xtdb/operation-cancelled") { error }
-                    else { unretained() }
-                })?
-        };
-        if !exact.matches(&recovered.partition) || !exact.is_live(self.node.now()) { return Err(unretained()); }
-        let snapshot = recovered.partition.with_system_time_cap(exact.cap).map_err(|_| unretained())?;
-        let view = rtdb_query::SqlSnapshotView::from_exact_partition(
-            current, snapshot, exact.clock, recovered.suffix, recovered.storage,
-        )?;
-        let view = with_expiry(view, deadline);
+        let snapshot = basis.read_at(partition)?;
+        let view = rtdb_query::SqlSnapshotView::from_exact_partition(current, snapshot, basis.clock, None, None)?;
         self.node.admit_retained_catalog(&view.catalog, self.identity.as_ref(), cancellation).await?;
         Ok(view)
     }
@@ -269,66 +162,61 @@ impl rtdb_query::SnapshotAdmission for SqlSnapshotAdmission {
 mod tests {
     use super::*;
     use rtdb_index::{PartitionState, TransactionBuffer};
-    use rtdb_types::{StorageEpoch, StorageVersion, TxId};
+    use rtdb_types::{ReplicaPosition, StorageEpoch, StorageVersion, TxId};
 
-    #[tokio::test]
-    async fn one_owners_tokens_never_evict_anothers_and_each_releases_its_charge_on_expiry() {
-        use rtdb_query::{CatalogSnapshot, DatabaseSnapshot};
-        use rtdb_storage::{MemoryStore, cache::BufferPool};
-
-        let view = || rtdb_query::SqlSnapshotView {
-            catalog: CatalogSnapshot::new("xtdb", [("xtdb".into(), DatabaseSnapshot {
-                partitions: vec![],
-                storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
-            })].into_iter().collect(), false).unwrap(),
-            current_time: Instant::new(60, 0).unwrap(),
-            timezone: "UTC".into(),
-        };
-        let memory = MemoryBudget::new(1 << 30);
-        let registry = SqlSnapshots::default();
-        let alice: Option<Arc<str>> = Some("alice".into());
-        let first = registry.issue(alice.clone(), view(), &memory, None, Timestamp(0)).unwrap();
-        for _ in 0..1000 {
-            registry.issue(Some("mallory".into()), view(), &memory, None, Timestamp(0)).unwrap();
+    fn basis(head: Option<TransactionKey>, cap: Option<Timestamp>, cut: CatalogCut) -> SnapshotBasis {
+        SnapshotBasis {
+            owner: None, history: None, database: "xtdb".into(), cut: Some(cut), head, cap,
+            clock: Instant::new(60, 123).unwrap(), timezone: "UTC".into(),
         }
-        assert!(registry.select(&first, Some("alice"), "xtdb").is_some());
-        assert!(registry.select(&first, Some("mallory"), "xtdb").is_none());
+    }
 
-        assert!(memory.used_bytes() > 0);
-        registry.release_expired(tokio::time::Instant::now() + HOLD_FOR);
-        assert!(registry.select(&first, Some("alice"), "xtdb").is_none());
-        assert_eq!(memory.used_bytes(), 0);
+    fn cut() -> CatalogCut {
+        CatalogCut { storage_version: StorageVersion(2), storage_epoch: StorageEpoch(7), replica_epoch: StorageEpoch(1), through: ReplicaPosition(20) }
     }
 
     #[test]
-    fn an_exact_resume_distinguishes_tied_appends_and_keeps_the_original_clock() {
-        let memory = MemoryBudget::new(1 << 20);
+    fn a_plain_token_carries_its_whole_basis_and_needs_no_server_state() {
+        let issued = basis(Some(TransactionKey { tx_id: TxId(5), system_time: Timestamp(22) }), Some(Timestamp(19)), cut());
+        let token = basis(issued.head, issued.cap, cut()).encode(Some("alice"), None).unwrap();
+        assert!(token.starts_with(PLAIN_PREFIX));
+        let redeemed = SnapshotBasis::decode(&token, Some("someone else"), None).unwrap();
+        assert_eq!(redeemed, issued, "a plain token names only its basis, like an XTDB time basis");
+        assert_eq!(redeemed.system_time(), Some(Timestamp(19)));
+        assert!(SnapshotBasis::decode("rtdb-snapshot:6f9619ff-8b86-d011-b42d-00c04fc964ff", None, None).is_err(),
+            "a token of the retired server-side registry is refused");
+        assert!(SnapshotBasis::decode(&format!("{SEALED_PREFIX}abc"), None, None).is_err(),
+            "a sealed token needs the database's codec");
+        let mut claimed = basis(None, None, cut());
+        claimed.owner = Some("alice".into());
+        let forged = format!("{PLAIN_PREFIX}{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claimed).unwrap()));
+        assert!(SnapshotBasis::decode(&forged, Some("alice"), None).is_err(), "a plain token cannot claim an owner");
+    }
+
+    #[test]
+    fn redeeming_caps_the_current_catalog_at_the_issued_basis_whenever_it_is_redeemed() {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
         let partition = PartitionState::empty(rtdb_trie::TrieConfig::default()).unwrap();
-        let head = TransactionKey { tx_id: TxId(5), system_time: Timestamp(22) };
-        let cut = CatalogCut {
-            storage_version: StorageVersion(2), storage_epoch: StorageEpoch(7),
-            replica_epoch: StorageEpoch(1), through: ReplicaPosition(20),
-        };
         let apply = |key| {
             let write = TransactionBuffer::new(partition.snapshot(), key, Arc::clone(&memory)).unwrap().stage().unwrap();
             partition.apply(&write).unwrap();
         };
+        let head = TransactionKey { tx_id: TxId(5), system_time: Timestamp(22) };
         apply(head);
-        partition.publish_catalog_cut(cut).unwrap();
-        let snapshot = partition.snapshot();
-        let clock = Instant::new(60, 123).unwrap();
-        let exact = ExactSnapshot {
-            owner: Some("alice".to_owned()), database: "xtdb".to_owned(), history: [3; 32], cut,
-            head: Some(head), block: snapshot.block_index(), cap: Some(Timestamp(19)),
-            clock, timezone: "UTC".to_owned(), issued: Timestamp(61_000_000), replay: Some(SnapshotReplayBase::Genesis),
-        };
-        let restored: ExactSnapshot = serde_json::from_slice(&serde_json::to_vec(&exact).unwrap()).unwrap();
-        assert!(restored.matches(&snapshot));
-        assert_eq!(restored.cap, Some(Timestamp(19)));
-        assert_eq!(restored.clock, clock);
-        assert!(restored.is_live(Timestamp(120_999_999)));
-        assert!(!restored.is_live(Timestamp(121_000_000)));
-        apply(TransactionKey { tx_id: TxId(6), system_time: head.system_time });
-        assert!(!restored.matches(&partition.snapshot()));
+        partition.publish_catalog_cut(cut()).unwrap();
+        let issued = basis(Some(head), Some(Timestamp(22)), cut());
+
+        // Later transactions and catalog generations do not invalidate the token: there is no expiry or hold.
+        apply(TransactionKey { tx_id: TxId(6), system_time: Timestamp(30) });
+        partition.publish_catalog_cut(CatalogCut { through: ReplicaPosition(40), ..cut() }).unwrap();
+        let redeemed = issued.read_at(&partition.snapshot()).unwrap();
+        assert_eq!(redeemed.system_time_cap(), Some(Timestamp(22)));
+        assert_eq!(redeemed.tx_basis().map(|key| key.tx_id), Some(TxId(6)));
+
+        let ahead = basis(Some(TransactionKey { tx_id: TxId(9), system_time: Timestamp(90) }), None, cut());
+        assert_eq!(ahead.read_at(&partition.snapshot()).unwrap_err().code, "xtdb/unindexed-tx");
+        let other_generation = basis(Some(head), None, CatalogCut { storage_epoch: StorageEpoch(8), ..cut() });
+        assert_eq!(other_generation.read_at(&partition.snapshot()).unwrap_err().code, "rtdb/snapshot-unretained");
+        assert!(basis(None, None, cut()).read_at(&partition.snapshot()).is_err(), "an empty basis cannot cap a later transaction");
     }
 }

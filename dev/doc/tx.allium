@@ -309,8 +309,11 @@
 -- The clock target must be at or before source append.
 -- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
--- A placed SQL snapshot token seals its journal generation and checkpoint digest.
--- After restart, the reader can rebuild the exact retained cut from that checkpoint and its protected suffix.
+-- A SQL snapshot token is stateless, as in XTDB: it carries its read basis (transaction head, system-time cap, storage
+-- generation, evaluation clock and time zone). A placed database seals the basis, binding it to the issuing principal
+-- and journal history; otherwise it is plain. Redeeming it caps the current catalog at that basis, after a restart or on
+-- another node alike, with no server-side table, catalog hold or expiry; a basis after the current head refuses with
+-- `xtdb/unindexed-tx`, and erased rows stay erased.
 -- Ordered readmission protects the selected published checkpoint and its exact suffix in one journal decision.
 -- It opens the checkpoint's sealed manifest under that hold and admits physical suffix files from applicable replayed records.
 -- An inaccessible checkpoint member cannot be replaced by a similarly named object.
@@ -577,16 +580,18 @@ value TxBasisToken {
 }
 
 value ExactSnapshotToken {
-    -- An opaque authenticated reference to a captured applied cut, including empty partitions, original history, catalog and ancestry.
-    -- The reference binds interpretation and authorization scope, temporal selectors, the exact query clock and timezone.
-    -- Use requires current authorization, custody and an available hold.
+    -- A stateless token carrying its read basis, as XTDB's snapshot token carries a time basis: the transaction head and
+    -- system-time cap it was issued at, the storage generation, the exact query clock and timezone.
+    -- A placed database seals it to the issuing principal and history.
+    -- Use requires current authorization; it needs no hold and does not expire. It reads the current catalog capped at the
+    -- basis, so it stays valid while the history it names exists.
 }
 
 value ReadBasis {
     -- The first query of a transaction pins an exact applied cut and its evaluation context.
     -- A fresh admission satisfies the effective causal prerequisite, waits for apply and obtains the residence hold.
     -- The system-time cap filters events only inside that cut.
-    -- An exact re-admission checks the issued cut and interpretation before opening storage.
+    -- A token re-admission checks the issued basis and interpretation, then caps the current catalog at it.
     -- A conflicting selector or a causal requirement beyond that cut refuses.
     snapshot_token: ExactSnapshotToken
     snapshot_time: Timestamp?
