@@ -44,6 +44,20 @@ impl SqlSnapshotView {
         catalog.reset_sql_snapshot_view(suffix, original_storage);
         Ok(Self { catalog, current_time, timezone: current.timezone.clone() })
     }
+
+    /// The current catalog with each named database's partitions replaced, read at the current clock and zone,
+    /// as a redeemed XTDB snapshot token is.
+    pub fn from_partitions(current: &QueryContext, partitions: BTreeMap<String, Vec<rtdb_index::Snapshot>>) -> Result<Self> {
+        let mut catalog = current.catalog.clone();
+        for (name, replaced) in partitions {
+            let database = catalog.databases_mut().get_mut(&name)
+                .filter(|database| database.partitions.len() == replaced.len())
+                .ok_or_else(|| invalid("snapshot-scope", "A redeemed snapshot must replace admitted partitions"))?;
+            database.partitions = replaced;
+        }
+        catalog.reset_sql_snapshot_view(None, None);
+        Ok(Self { catalog, current_time: current.current_time, timezone: current.timezone.clone() })
+    }
 }
 
 pub(crate) struct ReadBasis {

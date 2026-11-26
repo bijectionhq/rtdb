@@ -309,11 +309,15 @@
 -- The clock target must be at or before source append.
 -- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
--- A SQL snapshot token is stateless, as in XTDB: it carries its read basis (transaction head, system-time cap, storage
--- generation, evaluation clock and time zone). A placed database seals the basis, binding it to the issuing principal
--- and journal history; otherwise it is plain. Redeeming it caps the current catalog at that basis, after a restart or on
--- another node alike, with no server-side table, catalog hold or expiry; a basis after the current head refuses with
--- `xtdb/unindexed-tx`, and erased rows stay erased.
+-- A SQL snapshot token is XTDB's: base64 protobuf `TimeBasis`, one system time per partition of each database read
+-- (`xtdb.basis/->time-basis-str`), so an XTDB-issued token redeems here and the reverse. It carries no clock or zone:
+-- redeeming reads the current catalog capped at those times with the redeeming session's clock and zone, after a
+-- restart or on another node alike, with no server-side table, catalog hold or expiry. A time after a partition's
+-- latest completed transaction refuses with `xtdb/unindexed-tx`; a token that does not decode refuses with
+-- `xtdb.basis/invalid-basis` (incorrect); erased rows stay erased.
+-- RTDB-only: a placed database seals the token (`rtdb-sealed-snapshot-v4:`), binding it to the issuing principal,
+-- journal history and storage generation; a sealed token read on another generation refuses with
+-- `rtdb/snapshot-unretained` (incorrect), and an XTDB node refuses it as an invalid basis.
 -- Ordered readmission protects the selected published checkpoint and its exact suffix in one journal decision.
 -- It opens the checkpoint's sealed manifest under that hold and admits physical suffix files from applicable replayed records.
 -- An inaccessible checkpoint member cannot be replaced by a similarly named object.
@@ -580,9 +584,8 @@ value TxBasisToken {
 }
 
 value ExactSnapshotToken {
-    -- A stateless token carrying its read basis, as XTDB's snapshot token carries a time basis: the transaction head and
-    -- system-time cap it was issued at, the storage generation, the exact query clock and timezone.
-    -- A placed database seals it to the issuing principal and history.
+    -- XTDB's time basis: a system time per partition of each database read. No clock or zone.
+    -- RTDB-only: a placed database seals it to the issuing principal, history and storage generation.
     -- Use requires current authorization; it needs no hold and does not expire. It reads the current catalog capped at the
     -- basis, so it stays valid while the history it names exists.
 }
@@ -591,7 +594,7 @@ value ReadBasis {
     -- The first query of a transaction pins an exact applied cut and its evaluation context.
     -- A fresh admission satisfies the effective causal prerequisite, waits for apply and obtains the residence hold.
     -- The system-time cap filters events only inside that cut.
-    -- A token re-admission checks the issued basis and interpretation, then caps the current catalog at it.
+    -- A token re-admission decodes the time basis, then caps the current catalog at it under the session's clock and zone.
     -- A conflicting selector or a causal requirement beyond that cut refuses.
     snapshot_token: ExactSnapshotToken
     snapshot_time: Timestamp?
@@ -605,7 +608,8 @@ value Unspecified {
 value ReadOnly {
     -- Characteristics declared by BEGIN or SET TRANSACTION READ ONLY, evaluated then and held until the first query pins the read basis.
     -- Each absent option takes its default at the pin.
-    -- A snapshot token selects its original cap, clock and timezone. Fresh admission can specify a cap and evaluation clock.
+    -- A snapshot token selects its original system times; the clock and zone are the session's, and CLOCK_TIME may set the clock.
+    -- Fresh admission can specify a cap and evaluation clock.
     --   await_token — overrides the connection's await_token for this transaction's pin.
     --                 Validated (decoded) when declared; the await itself happens at the pin.
     snapshot_token: ExactSnapshotToken?
@@ -1445,7 +1449,7 @@ rule CommitWriting {
 -- An applied prefix remains a causal basis after receipt expiry.
 -- An ordered erasure can collect settled evidence after its retention, holds and export obligations end.
 -- Before pinning an implicit read basis, redeem the attempt and wait for its exact installed applied prefix.
--- A supplied exact snapshot token fixes the original applied cut and evaluation context.
+-- A supplied snapshot token fixes the original system times; the evaluation context is the redeeming session's.
 -- A frozen placed attachment confirms await tokens from its own admitted checkpoint before pinning the read basis.
 
 rule CommitNoOp {

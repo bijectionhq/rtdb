@@ -1652,36 +1652,49 @@ async fn cancelled_sleep_in_begin_options_does_not_publish_a_partial_transaction
 }
 
 #[tokio::test]
-async fn sql_snapshot_tokens_reopen_original_position_and_query_clock() {
+async fn sql_snapshot_tokens_are_xtdb_time_bases_read_at_the_redeeming_clock() {
     let services = NodeServices {
-        resources: Arc::new(NativeResources::default().with_log_clock(Arc::new(|| Ok(Timestamp(1_000_000))))),
+        resources: Arc::new(NativeResources::default().with_log_clock({ let clock = Arc::new(AtomicI64::new(1_000_000)); Arc::new(move || Ok(Timestamp(clock.fetch_add(1_000, Ordering::Relaxed)))) })),
         ..services()
     };
     let (node, driver) = running(options(), services).await;
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
     let first = writer.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap().unwrap().tx_key();
     let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
-    let original = rows(reader.query_sql("SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
-    let Value::Utf8(token) = original[0][2].clone() else { panic!("expected a snapshot token"); };
+    let original = rows(reader.query_sql("SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    let Value::Utf8(token) = original[0][1].clone() else { panic!("expected a snapshot token"); };
+    let expected = rtdb_format::basis::encode_time_basis(&rtdb_types::TimeBasis {
+        databases: BTreeMap::from([("xtdb".to_owned(), vec![Some(first.system_time.into())])]),
+    });
+    assert_eq!(token, expected, "the token is XTDB's base64 protobuf TimeBasis");
     let next = writer.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap().unwrap().tx_key();
-    // The frozen log ties the two transactions (T7: no tick is minted), so the
-    // token reopens the first by its position alone.
-    assert_eq!(next.system_time, first.system_time);
-    assert!(first.tx_id < next.tx_id);
+    // A time basis names system times only, as XTDB's, so the reopened read needs the second transaction later.
+    assert!(next.system_time > first.system_time);
     let live = rows(reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await;
     assert_eq!(live, [vec![Value::I64(20)]]);
     let reopened = rows(reader.query_sql(
-        "SETTING SNAPSHOT_TOKEN=? SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
+        "SETTING SNAPSHOT_TOKEN=? SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
         vec![Value::Utf8(token.clone())],
     ).await.unwrap()).await;
     assert_eq!(reopened, original);
+    let invalid = match reader.query_sql("SETTING SNAPSHOT_TOKEN=? SELECT value FROM docs", vec![Value::Utf8("rtdb-snapshot-v3:e30".into())]).await {
+        Ok(cursor) => rows_result(cursor).await.unwrap_err(),
+        Err(error) => error,
+    };
+    assert_eq!((invalid.category, invalid.code.as_str()), (rtdb_types::AnomalyCategory::Incorrect, "xtdb.basis/invalid-basis"));
     reader.state_mut().begin_with(TransactionSettings {
         access: Some(AccessSettings::ReadOnly(ReadOnlySettings { snapshot_token: OptionUpdate::Set(token), ..Default::default() })),
         ..Default::default()
     }).unwrap();
-    let reopened = rows(reader.query_sql("SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
-    assert_eq!(reopened, original);
+    let reopened = rows(reader.query_sql("SELECT value, SNAPSHOT_TOKEN, CURRENT_TIMESTAMP FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    assert_eq!(reopened.iter().map(|row| row[..2].to_vec()).collect::<Vec<_>>(), original);
+    assert_ne!(reopened[0][2], Value::Null, "the clock comes from the redeeming session, not the token");
     stop(&node, driver).await;
+}
+
+async fn rows_result(mut cursor: QueryCursor) -> Result<()> {
+    while cursor.next_batch().await?.is_some() {}
+    Ok(())
 }
 
 async fn rows(mut cursor: QueryCursor) -> Vec<Vec<Value>> {
